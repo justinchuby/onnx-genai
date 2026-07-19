@@ -49,6 +49,14 @@ fn write_f32(path: &str, data: &[f32]) -> Result<()> {
     fs::write(path, bytes).with_context(|| format!("writing {path}"))
 }
 
+fn write_i64(path: &str, data: &[i64]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(data.len() * 8);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    fs::write(path, bytes).with_context(|| format!("writing {path}"))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
@@ -117,8 +125,26 @@ fn main() -> Result<()> {
         .get(output_endpoint)
         .with_context(|| format!("output endpoint '{output_endpoint}' not produced"))?;
     let shape = value.shape().to_vec();
-    let data = value.to_vec_f32()?;
-    write_f32(out_path, &data)?;
-    eprintln!("wrote {output_endpoint} shape {shape:?} ({} elems) -> {out_path}", data.len());
+    // Integer outputs (e.g. the final token sequence of a masked-diffusion loop)
+    // are written as little-endian i64; everything else as little-endian f32.
+    use onnx_genai::ort::DataType;
+    match value.dtype() {
+        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+            let data = value.to_vec_i64()?;
+            write_i64(out_path, &data)?;
+            eprintln!(
+                "wrote {output_endpoint} shape {shape:?} ({} i64 elems) -> {out_path}",
+                data.len()
+            );
+        }
+        _ => {
+            let data = value.to_vec_f32()?;
+            write_f32(out_path, &data)?;
+            eprintln!(
+                "wrote {output_endpoint} shape {shape:?} ({} f32 elems) -> {out_path}",
+                data.len()
+            );
+        }
+    }
     Ok(())
 }

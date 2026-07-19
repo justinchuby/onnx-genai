@@ -1157,7 +1157,20 @@ impl SchedulerRegistry {
                 let mask_token_id = cfg
                     .mask_token_id
                     .context("masked_diffusion scheduler requires 'mask_token_id'")?;
-                Ok(Arc::new(MaskedDiffusion { mask_token_id }) as Arc<dyn Scheduler>)
+                let temperature = cfg.temperature.unwrap_or(0.0);
+                if temperature < 0.0 {
+                    anyhow::bail!("masked_diffusion temperature must be >= 0");
+                }
+                if cfg.block_length.is_some() {
+                    anyhow::bail!(
+                        "masked_diffusion semi-autoregressive 'block_length' is not yet \
+                         supported; omit it to use a single block over the masked region"
+                    );
+                }
+                Ok(Arc::new(MaskedDiffusion {
+                    mask_token_id,
+                    temperature,
+                }) as Arc<dyn Scheduler>)
             }),
         );
         Self { factories }
@@ -1186,13 +1199,58 @@ impl Default for SchedulerRegistry {
     }
 }
 
-/// Masked (discrete) language diffusion: the loop-carried tensor is an int64
-/// token sequence, the denoiser emits `[B, S, V]` logits, and each step commits
-/// the highest-confidence still-masked positions (argmax), unmasking them
-/// progressively so all masked positions are filled by the final step.
+/// Masked (discrete) language diffusion — LLaDA-style low-confidence remasking.
+///
+/// The loop-carried tensor is an int64 token sequence `[B, S]` (prompt tokens
+/// plus a masked generation region), the denoiser emits `[B, S, V]` logits, and
+/// each step commits a scheduled number of the highest-confidence still-masked
+/// positions per sequence, unmasking progressively so all masked positions are
+/// filled by the final step.
+///
+/// Faithful to `ML-GSAI/LLaDA`'s `generate` (single-block, `cfg_scale = 0`):
+///   * the chosen token per position is the argmax of the (optionally
+///     Gumbel-noised) logits (`add_gumbel_noise`; identity at `temperature = 0`);
+///   * the confidence that ranks positions for remasking is the clean-softmax
+///     probability of that chosen token (`remasking = "low_confidence"`);
+///   * the number of tokens committed at step `i` follows the even split of the
+///     masked count across the remaining steps (`get_num_transfer_tokens`),
+///     which `commit = ceil(remaining / remaining_steps)` reproduces exactly.
 #[derive(Debug, Clone)]
 struct MaskedDiffusion {
     mask_token_id: i64,
+    temperature: f32,
+}
+
+impl MaskedDiffusion {
+    /// Argmax token id and its clean-softmax confidence for one logit row.
+    ///
+    /// `gumbel` supplies one uniform sample in `(0, 1)` per vocab entry when
+    /// `temperature > 0`; it is ignored (and may be empty) at `temperature = 0`.
+    fn predict_row(&self, row: &[f32], gumbel: &[f64]) -> (i64, f32) {
+        // Clean-softmax denominator (numerically stable) for the confidence.
+        let max_logit = row.iter().copied().fold(f32::MIN, f32::max);
+        let sum_exp: f32 = row.iter().map(|&x| (x - max_logit).exp()).sum();
+
+        // Chosen token: argmax of the (optionally Gumbel-noised) logits.
+        // LLaDA: logits.exp() / (-log u)^temperature, i.e. argmax of
+        // `logit - temperature * ln(-ln u)`.
+        let mut best_index = 0usize;
+        let mut best_score = f32::MIN;
+        for (j, &logit) in row.iter().enumerate() {
+            let score = if self.temperature > 0.0 {
+                let u = gumbel[j];
+                logit - self.temperature * (-u.ln()).ln() as f32
+            } else {
+                logit
+            };
+            if score > best_score {
+                best_score = score;
+                best_index = j;
+            }
+        }
+        let confidence = (row[best_index] - max_logit).exp() / sum_exp;
+        (best_index as i64, confidence)
+    }
 }
 
 impl Scheduler for MaskedDiffusion {
@@ -1204,47 +1262,81 @@ impl Scheduler for MaskedDiffusion {
         logits: &Value,
     ) -> anyhow::Result<Value> {
         let token_shape = tokens.shape().to_vec();
-        let toks = tokens.to_vec_i64()?;
-        let n = toks.len();
+        let tokens = tokens.to_vec_i64()?;
+        let sequence_count = tokens.len();
         let logit_shape = logits.shape();
         let vocab = *logit_shape
             .last()
             .context("masked_diffusion logits must be rank >= 1")? as usize;
-        if vocab == 0 || n == 0 || logits.numel() != n * vocab {
+        if vocab == 0 || sequence_count == 0 || logits.numel() != sequence_count * vocab {
             anyhow::bail!(
                 "masked_diffusion shape mismatch: tokens {token_shape:?}, logits {logit_shape:?}"
             );
         }
-        let lg = logits.to_vec_f32()?;
-        // Per-position argmax + confidence (max logit).
-        let mut pred = vec![0i64; n];
-        let mut conf = vec![f32::MIN; n];
-        for i in 0..n {
-            let row = &lg[i * vocab..(i + 1) * vocab];
-            let mut best = (0usize, f32::MIN);
-            for (j, &x) in row.iter().enumerate() {
-                if x > best.1 {
-                    best = (j, x);
+        // Split the flat token buffer into per-sequence rows so top-k selection
+        // and the transfer schedule are computed independently per sequence
+        // (matching LLaDA's per-batch-row `topk`). Rank-1 inputs are one row.
+        let sequence_length = *token_shape.last().unwrap_or(&(sequence_count as i64)) as usize;
+        let batch = sequence_count
+            .checked_div(sequence_length)
+            .unwrap_or(0);
+
+        let all_logits = logits.to_vec_f32()?;
+        let remaining_steps = num_steps.saturating_sub(step).max(1);
+        let mut output = tokens.clone();
+
+        for row_index in 0..batch.max(1) {
+            let start = row_index * sequence_length;
+            let end = start + sequence_length;
+            let row_tokens = &tokens[start..end];
+
+            // Predicted token + confidence for every still-masked position.
+            let mut candidates: Vec<(usize, i64, f32)> = Vec::new();
+            for (offset, &token) in row_tokens.iter().enumerate() {
+                if token != self.mask_token_id {
+                    continue;
                 }
+                let position = start + offset;
+                let logit_row = &all_logits[position * vocab..(position + 1) * vocab];
+                let gumbel = if self.temperature > 0.0 {
+                    gumbel_uniforms(step, position, vocab)
+                } else {
+                    Vec::new()
+                };
+                let (predicted, confidence) = self.predict_row(logit_row, &gumbel);
+                candidates.push((position, predicted, confidence));
             }
-            pred[i] = best.0 as i64;
-            conf[i] = best.1;
-        }
-        // Commit the highest-confidence still-masked positions this step.
-        let mut masked: Vec<usize> = (0..n).filter(|&i| toks[i] == self.mask_token_id).collect();
-        let mut out = toks.clone();
-        if !masked.is_empty() {
-            masked.sort_by(|&a, &b| {
-                conf[b].partial_cmp(&conf[a]).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let remaining_steps = num_steps.saturating_sub(step).max(1);
-            let commit = masked.len().div_ceil(remaining_steps);
-            for &i in masked.iter().take(commit) {
-                out[i] = pred[i];
+            if candidates.is_empty() {
+                continue;
+            }
+            // Commit the highest-confidence subset for this step. The even split
+            // of the masked count over the remaining steps equals
+            // ceil(remaining / remaining_steps).
+            candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            let commit = candidates.len().div_ceil(remaining_steps);
+            for &(position, predicted, _) in candidates.iter().take(commit) {
+                output[position] = predicted;
             }
         }
-        Value::from_slice_i64(&out, &token_shape).map_err(Into::into)
+        Value::from_slice_i64(&output, &token_shape).map_err(Into::into)
     }
+}
+
+/// One uniform sample in `(0, 1)` per vocab entry for Gumbel-max sampling,
+/// seeded deterministically from `(step, position)` so a run is reproducible.
+///
+/// Note: this is reproducible across onnx-genai runs but is NOT bit-identical to
+/// LLaDA's `torch.rand`-based sampling; parity tests exercise `temperature = 0`.
+fn gumbel_uniforms(step: usize, position: usize, vocab: usize) -> Vec<f64> {
+    use rand::{Rng, SeedableRng};
+    let seed = (step as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(position as u64);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    (0..vocab)
+        // Clamp away from 0 and 1 to keep -ln(-ln u) finite.
+        .map(|_| rng.random::<f64>().clamp(1e-9, 1.0 - 1e-9))
+        .collect()
 }
 
 /// DDIM (η = 0, epsilon-prediction) noise schedule, precomputed per inference

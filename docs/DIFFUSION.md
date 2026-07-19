@@ -183,10 +183,27 @@ prompt is honored end-to-end.
 
 ## 7. Language diffusion
 
-`masked_diffusion` drives **discrete** (text) diffusion: the loop-carried tensor is an int64 token
-sequence, the denoiser emits `[B, S, V]` logits, and each step commits the highest-confidence
-still-masked positions (argmax), unmasking progressively so all masked positions are filled by the
-final step. Configured with `mask_token_id`.
+`masked_diffusion` drives **discrete** (text) diffusion — LLaDA-style low-confidence remasking. The
+loop-carried tensor is an int64 token sequence `[B, S]` (fixed prompt tokens plus a masked
+generation region), the denoiser emits `[B, S, V]` logits, and each step commits a scheduled number
+of the highest-confidence still-masked positions per sequence, unmasking progressively so all masked
+positions are filled by the final step.
+
+Faithful to `ML-GSAI/LLaDA`'s `generate` (single block, `cfg_scale = 0`):
+
+- the chosen token per masked position is the argmax of the (optionally Gumbel-noised) logits
+  (`add_gumbel_noise`; identity at `temperature = 0`);
+- the confidence that ranks positions for remasking is the **clean-softmax probability** of that
+  chosen token (`remasking = "low_confidence"`), not the raw logit;
+- the number of tokens committed at step `i` is the even split of the masked count across the
+  remaining steps (`get_num_transfer_tokens`), which `ceil(remaining / remaining_steps)` reproduces
+  exactly (proven in `scripts/masked_diffusion_parity.py`);
+- top-k selection is **per sequence** (matching LLaDA's per-batch-row `topk`).
+
+Configured via `scheduler_config`: `mask_token_id` (required), `temperature` (default 0), and
+`block_length` (semi-autoregressive; not yet wired — single block only). Validated exactly against
+the reference LLaDA algorithm by `scripts/masked_diffusion_parity.py` (a deterministic coupled ONNX
+LM driven by both the reference `generate` and onnx-genai — identical token sequences).
 
 ---
 

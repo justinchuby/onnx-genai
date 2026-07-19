@@ -1544,6 +1544,15 @@
           "format": "float",
           "minimum": 0.0
         },
+        "block_length": {
+          "description": "Semi-autoregressive block length for a `masked_diffusion` scheduler, in\ntokens. When set (and smaller than the masked generation region), each\nstep only commits tokens inside the current left-to-right block, matching\nLLaDA's semi-autoregressive remasking. Defaults to a single block\nspanning the whole masked region.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
         "kind": {
           "description": "Scheduler algorithm; `\"ddim\"` is supported.",
           "type": "string"
@@ -1571,6 +1580,14 @@
             "string",
             "null"
           ]
+        },
+        "temperature": {
+          "description": "Sampling temperature for a `masked_diffusion` scheduler. `0` (default)\nselects each masked position's argmax token deterministically; a positive\nvalue applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before\nthe argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for\nremasking is always the clean-softmax probability of the chosen token.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
         },
         "use_exponential_sigmas": {
           "description": "Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)\ninstead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive\nwith `use_karras_sigmas` (Karras takes precedence).",

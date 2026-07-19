@@ -748,6 +748,20 @@ pub struct SchedulerSpec {
     /// each step commits the highest-confidence still-masked positions.
     pub mask_token_id: Option<i64>,
 
+    /// Sampling temperature for a `masked_diffusion` scheduler. `0` (default)
+    /// selects each masked position's argmax token deterministically; a positive
+    /// value applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before
+    /// the argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for
+    /// remasking is always the clean-softmax probability of the chosen token.
+    pub temperature: Option<f32>,
+
+    /// Semi-autoregressive block length for a `masked_diffusion` scheduler, in
+    /// tokens. When set (and smaller than the masked generation region), each
+    /// step only commits tokens inside the current left-to-right block, matching
+    /// LLaDA's semi-autoregressive remasking. Defaults to a single block
+    /// spanning the whole masked region.
+    pub block_length: Option<usize>,
+
     /// Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the
     /// default linspace spacing. Applies to sigma-space schedulers (`euler`,
     /// `dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.
