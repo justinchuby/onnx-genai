@@ -236,6 +236,52 @@ pipeline:
 }
 
 #[test]
+fn multi_input_cfg_overrides_all_conditioning_ports() -> anyhow::Result<()> {
+    // SDXL-style multi-conditioning CFG: denoiser_dualcond has TWO conditioning
+    // inputs (denoised = sample + cond_a + cond_b). Both must be overridden with
+    // their `.uncond` embeddings on the unconditional pass.
+    //   cond   pass: 0 + a + b
+    //   uncond pass: 0 + a.uncond + b.uncond
+    //   guided = uncond + scale*(cond - uncond)
+    // With a=[1..], b=[10..], a.uncond=b.uncond=0, scale=2, seed 0:
+    //   guided = 0 + 2*((a+b) - 0) = 2*(a+b).
+    // If only cond_a were overridden (bug), b.uncond would leak (=b), giving a
+    // different result — so this distinguishes multi- from single-port CFG.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_dualcond.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 1
+    guidance_scale: 2.0
+    cfg_conditioning_input: cond_a
+";
+    let dir = fixture_with_metadata("diffusion-dualcond", &["denoiser_dualcond.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let a = [1.0f32, 1.0, 1.0, 1.0];
+    let b = [10.0f32, 10.0, 10.0, 10.0];
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond_a", Value::from_slice_f32(&a, &[1, 4])?)
+        .with_input("denoiser.cond_b", Value::from_slice_f32(&b, &[1, 4])?)
+        .with_input("denoiser.cond_a.uncond", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond_b.uncond", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").expect("guided output").to_vec_f32()?;
+    for got in &denoised {
+        assert!((got - 22.0).abs() < 1e-5, "guided {got} != 22 (= 2*(1+10))");
+    }
+    Ok(())
+}
+
+#[test]
 fn iterative_threads_multiple_independent_loop_carried_tensors() -> anyhow::Result<()> {
     // denoiser_multi has two loop-carried states x, y and constant cond:
     //   x_next = (x + cond) * 0.5   (loop-carried x)

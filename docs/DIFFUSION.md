@@ -198,6 +198,10 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
 
 - **Samplers:** euler, euler_ancestral, ddim, dpmpp_2m (+Karras). Not yet: other DPM++ variants,
   exponential/beta sigma spacings, other SDE/ancestral samplers.
-- **Models:** single-text-encoder SD 1.x-style. SDXL (dual text encoder + pooled embeds +
-  `time_ids`), LoRA weight merging, and ControlNet are not yet wired.
+- **Models:** single-text-encoder SD 1.x-style. **Multi-input classifier-free guidance is now
+  supported** — the unconditional pass overrides *every* denoiser input port that has a supplied
+  `{denoiser}.{port}.uncond` embedding (not just one), so SDXL's `encoder_hidden_states` +
+  pooled `text_embeds` (sharing `time_ids`) can both be guided. The remaining SDXL work is the
+  dual-text-encoder export + `time_ids` conditioning + driver. LoRA weight merging and ControlNet
+  are not yet wired.
 - **img2img** is supported; inpainting (mask) is not.

@@ -11,6 +11,7 @@ models/
 !tests/fixtures/tiny-diffusion/denoiser.onnx
 !tests/fixtures/tiny-diffusion/vae.onnx
 !tests/fixtures/tiny-diffusion/denoiser_multi.onnx
+!tests/fixtures/tiny-diffusion/denoiser_dualcond.onnx
 !tests/fixtures/tiny-diffusion/denoiser_step.onnx
 !tests/fixtures/tiny-dit-diffusion/denoiser.onnx
 !tests/fixtures/tiny-masked-diffusion/lm.onnx

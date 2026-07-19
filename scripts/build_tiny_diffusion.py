@@ -94,6 +94,31 @@ def build_denoiser_multi(path: Path) -> None:
     save_model(ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-diffusion"), path)
 
 
+def build_denoiser_dualcond(path: Path) -> None:
+    # Two independent conditioning inputs (like SDXL's encoder_hidden_states +
+    # pooled text_embeds): denoised = sample + cond_a + cond_b. Used to exercise
+    # multi-input classifier-free guidance (both cond_a and cond_b must be
+    # overridden with their `.uncond` embeddings on the unconditional pass).
+    sample = tensor_value("sample", ir.DataType.FLOAT, [1, 4])
+    cond_a = tensor_value("cond_a", ir.DataType.FLOAT, [1, 4])
+    cond_b = tensor_value("cond_b", ir.DataType.FLOAT, [1, 4])
+
+    ab = node("Add", [cond_a, cond_b], "ab")
+    out = node("Add", [sample, ab.outputs[0]], "denoised")
+    out.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+    out.outputs[0].shape = ir.Shape([1, 4])
+
+    graph = ir.Graph(
+        [sample, cond_a, cond_b],
+        [out.outputs[0]],
+        nodes=[ab, out],
+        initializers=[],
+        opset_imports={"": 13},
+        name="tiny_diffusion_denoiser_dualcond",
+    )
+    save_model(ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-diffusion"), path)
+
+
 def build_denoiser_step(path: Path) -> None:
     # Step-aware denoiser: consumes a per-step timestep scalar `t`.
     #   denoised = sample + t   (t broadcasts over [1,4])
@@ -203,6 +228,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     build_denoiser(output_dir / "denoiser.onnx")
     build_denoiser_multi(output_dir / "denoiser_multi.onnx")
+    build_denoiser_dualcond(output_dir / "denoiser_dualcond.onnx")
     build_denoiser_step(output_dir / "denoiser_step.onnx")
     build_vae(output_dir / "vae.onnx")
     write_metadata(output_dir / "inference_metadata.yaml")

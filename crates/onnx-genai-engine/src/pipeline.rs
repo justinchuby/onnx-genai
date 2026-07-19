@@ -316,19 +316,30 @@ impl PipelineEngine {
             .session(&plan.denoiser)
             .with_context(|| format!("pipeline denoiser '{}' was not loaded", plan.denoiser))?;
 
-        // Precompute the CFG unconditional conditioning once: the caller may
-        // supply `{denoiser}.{port}.uncond` (the empty-prompt embedding, to match
-        // real SD CFG); otherwise the conditioning is zeroed as a fallback.
-        let cfg_uncond: Option<(String, Value)> = if guidance.is_some() {
-            let port = plan
+        // Precompute the CFG unconditional conditioning once. Any denoiser input
+        // port with a supplied `{denoiser}.{port}.uncond` embedding is overridden
+        // on the unconditional pass — this supports multi-conditioning models
+        // (e.g. SDXL overrides both `encoder_hidden_states` and pooled
+        // `text_embeds`, while sharing `time_ids`). The primary
+        // `cfg_conditioning_input` is additionally zeroed when no `.uncond` is
+        // supplied (the zeros fallback for a single-conditioning SD model).
+        let cfg_uncond: Vec<(String, Value)> = if guidance.is_some() {
+            let primary = plan
                 .cfg_conditioning_input
                 .clone()
                 .context("classifier-free guidance requires cfg_conditioning_input")?;
-            let cond_endpoint = format!("{}.{}", plan.denoiser, port);
-            let uncond_endpoint = format!("{}.{}.uncond", plan.denoiser, port);
-            let value = if let Some(u) = constants.get(&uncond_endpoint) {
-                clone_value(u)?
-            } else {
+            let mut overrides: Vec<(String, Value)> = Vec::new();
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for info in denoiser.inputs() {
+                let port = info.name.as_str();
+                let uncond_endpoint = format!("{}.{}.uncond", plan.denoiser, port);
+                if let Some(u) = constants.get(&uncond_endpoint) {
+                    overrides.push((port.to_string(), clone_value(u)?));
+                    seen.insert(port.to_string());
+                }
+            }
+            if !seen.contains(&primary) {
+                let cond_endpoint = format!("{}.{}", plan.denoiser, primary);
                 let cond = constants
                     .get(&cond_endpoint)
                     .or_else(|| {
@@ -338,11 +349,14 @@ impl PipelineEngine {
                             .and_then(|e| constants.get(&e.from))
                     })
                     .with_context(|| format!("cfg conditioning '{cond_endpoint}' not found"))?;
-                Value::from_slice_f32(&vec![0.0f32; cond.numel()], cond.shape())?
-            };
-            Some((port, value))
+                overrides.push((
+                    primary.clone(),
+                    Value::from_slice_f32(&vec![0.0f32; cond.numel()], cond.shape())?,
+                ));
+            }
+            overrides
         } else {
-            None
+            Vec::new()
         };
 
         // `carried` holds the value to feed each loop-carried INPUT port next
@@ -421,7 +435,7 @@ impl PipelineEngine {
             // per output port:  pred = uncond + scale * (cond - uncond).
             let out_map = if let Some(scale) = guidance {
                 let mut cfg_overrides = scale_overrides.clone();
-                if let Some((port, value)) = &cfg_uncond {
+                for (port, value) in &cfg_uncond {
                     cfg_overrides.retain(|(p, _)| *p != port.as_str());
                     cfg_overrides.push((port.as_str(), value));
                 }
