@@ -32,22 +32,14 @@ pub struct BlockQuantizedMoEKernel {
     format: BlockFormat,
 }
 
+struct ValidatedMetadata {
+    attributes: MoeAttributes,
+    format: BlockFormat,
+}
+
 impl KernelFactory for BlockQuantizedMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        validate_attributes(node)?;
-        let attributes = MoeAttributes::from_block_quantized_node(node)?;
-        let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-        if layout_version != LAYOUT_VERSION {
-            return Err(error(format!(
-                "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-            )));
-        }
-        let format = node
-            .attr("format")
-            .ok_or_else(|| error("missing required string attribute 'format'"))?
-            .as_str()
-            .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-            .and_then(BlockFormat::parse)?;
+        let ValidatedMetadata { attributes, format } = validate_metadata(node, None)?;
         Ok(Box::new(BlockQuantizedMoEKernel { attributes, format }))
     }
 }
@@ -57,13 +49,9 @@ pub(crate) fn unsupported_reason(
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
-    if let Err(err) = BlockQuantizedMoEFactory.create(node, &[]) {
-        return Some(Cow::Owned(err.to_string()));
-    }
-    let result = validate_claim_metadata(node, shapes, input_dtypes);
-    result
+    validate_metadata(node, Some((shapes, input_dtypes)))
         .err()
-        .map(|reason| Cow::Owned(format!("{OP}: {reason}")))
+        .map(|error| Cow::Owned(error.to_string()))
 }
 
 impl Kernel for BlockQuantizedMoEKernel {
@@ -377,10 +365,36 @@ fn validate_attributes(node: &Node) -> Result<()> {
     Ok(())
 }
 
+fn validate_metadata(
+    node: &Node,
+    claim_metadata: Option<(&[Shape], &[DataType])>,
+) -> Result<ValidatedMetadata> {
+    validate_attributes(node)?;
+    let attributes = MoeAttributes::from_block_quantized_node(node)?;
+    let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
+    if layout_version != LAYOUT_VERSION {
+        return Err(error(format!(
+            "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
+        )));
+    }
+    let format = node
+        .attr("format")
+        .ok_or_else(|| error("missing required string attribute 'format'"))?
+        .as_str()
+        .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
+        .and_then(BlockFormat::parse)?;
+    if let Some((shapes, dtypes)) = claim_metadata {
+        validate_claim_metadata(node, shapes, dtypes, &attributes, format).map_err(error)?;
+    }
+    Ok(ValidatedMetadata { attributes, format })
+}
+
 fn validate_claim_metadata(
     node: &Node,
     shapes: &[Shape],
     dtypes: &[DataType],
+    attributes: &MoeAttributes,
+    format: BlockFormat,
 ) -> std::result::Result<(), String> {
     if !(5..=9).contains(&node.inputs.len()) {
         return Err(format!(
@@ -468,18 +482,16 @@ fn validate_claim_metadata(
             shapes[6].len()
         ));
     }
-    validate_partial_claim_shapes(node, shapes)?;
+    validate_partial_claim_shapes(node, shapes, attributes, format)?;
     Ok(())
 }
 
-fn validate_partial_claim_shapes(node: &Node, shapes: &[Shape]) -> std::result::Result<(), String> {
-    let format = node
-        .attr("format")
-        .and_then(|attr| attr.as_str())
-        .ok_or_else(|| "missing format".to_string())
-        .and_then(|value| BlockFormat::parse(value).map_err(|err| err.to_string()))?;
-    let attributes =
-        MoeAttributes::from_block_quantized_node(node).map_err(|err| err.to_string())?;
+fn validate_partial_claim_shapes(
+    node: &Node,
+    shapes: &[Shape],
+    attributes: &MoeAttributes,
+    format: BlockFormat,
+) -> std::result::Result<(), String> {
     let hidden = shapes[0].last().and_then(|dim| dim.as_static());
     let experts = shapes[1][1].as_static();
     let rows = shapes[0][..shapes[0].len() - 1]
