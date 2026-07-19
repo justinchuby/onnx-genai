@@ -19,6 +19,7 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 function findBinary(name) {
   // Prefer the optimized release build; only fall back to debug (much slower
   // for real models) with a loud warning so the demo stays high-performance.
+  if (process.platform === "win32" && !name.endsWith(".exe")) name += ".exe";
   const release = join(REPO, "target", "release", name);
   if (existsSync(release)) return release;
   const debug = join(REPO, "target", "debug", name);
@@ -153,6 +154,58 @@ function runLanguage() {
   return { kind: "language", maskId, numSteps, seqLen, metadata, frames, perf };
 }
 
+// Render a full image (text-encode + denoise + VAE decode -> PNG) with
+// run_comfyui, returning the PNG as a data URL plus wall-clock + render stats.
+// Honors the execution provider from the environment (set ONNX_GENAI_EP=cuda in
+// the shell that launches the demo for GPU rendering; see README).
+function runImage() {
+  const bin = findBinary("run_comfyui");
+  const workflow = join(SD_PACKAGE, "workflow.json");
+  if (!existsSync(workflow)) {
+    throw new Error(
+      `no workflow.json in ${SD_PACKAGE}; the exported package must include one ` +
+        `(see README), or point ONNX_GENAI_SD_PACKAGE at a package that has it`
+    );
+  }
+  const outPng = join(mkdtempSync(join(tmpdir(), "ogimg-")), "out.png");
+  const started = Date.now();
+  const r = spawnSync(
+    bin,
+    ["--workflow", workflow, "--pipeline-dir", SD_PACKAGE, "--output", outPng],
+    {
+      encoding: "utf8",
+      maxBuffer: 64 << 20,
+      env: { ...process.env, DYLD_LIBRARY_PATH: `${ortLibDir()}:${process.env.DYLD_LIBRARY_PATH || ""}` },
+    }
+  );
+  if (r.status !== 0) throw new Error(r.stderr || "run_comfyui failed");
+  const wallMs = Date.now() - started;
+  if (!existsSync(outPng)) throw new Error(`run_comfyui reported success but ${outPng} is missing`);
+  const image = `data:image/png;base64,${readFileSync(outPng).toString("base64")}`;
+  const renderMatch =
+    /\[render\]\s*finite=(\w+)\s*min=([-\d.]+)\s*max=([-\d.]+)\s*mean=([-\d.]+)\s*var=([-\d.]+)/.exec(
+      r.stderr || ""
+    );
+  const render = renderMatch
+    ? {
+        finite: renderMatch[1] === "true",
+        min: Number(renderMatch[2]),
+        max: Number(renderMatch[3]),
+        mean: Number(renderMatch[4]),
+        var: Number(renderMatch[5]),
+      }
+    : null;
+  const metaPath = join(SD_PACKAGE, "inference_metadata.yaml");
+  return {
+    kind: "image",
+    package: SD_PACKAGE,
+    metadata: existsSync(metaPath) ? YAML.parse(readFileSync(metaPath, "utf8")) : null,
+    image,
+    wallMs,
+    render,
+  };
+}
+
 const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") return json(res, 204, {});
   try {
@@ -170,15 +223,7 @@ const server = createServer(async (req, res) => {
       if (!SD_PACKAGE) {
         return json(res, 400, { error: "no Stable Diffusion package configured; set ONNX_GENAI_SD_PACKAGE (see README)" });
       }
-      // Image runs are wired the same way (run_diffusion + step dumps); left to
-      // the operator to point at a built SD package. Returns the config + note.
-      const metaPath = join(SD_PACKAGE, "inference_metadata.yaml");
-      return json(res, 200, {
-        kind: "image",
-        package: SD_PACKAGE,
-        metadata: existsSync(metaPath) ? YAML.parse(readFileSync(metaPath, "utf8")) : null,
-        note: "image run wiring uses run_diffusion + step dumps; use run_comfyui for the full text-encode + VAE decode path",
-      });
+      return json(res, 200, runImage());
     }
     if (req.url === "/api/health") return json(res, 200, { ok: true, lmPackage: LM_PACKAGE, sdPackage: SD_PACKAGE || null });
     return json(res, 404, { error: "not found" });

@@ -459,7 +459,20 @@ function render() {
         const res = await postText("/api/run/image", "{}");
         runOut.innerHTML = "";
         if (res.metadata) showViz(res.metadata as Metadata);
-        runOut.appendChild(el("div", "note", res.note ?? "Image run configured."));
+        if (res.image) {
+          const figure = el("div", "image-result");
+          const img = el("img") as HTMLImageElement;
+          img.src = res.image as string;
+          img.alt = "rendered image";
+          figure.appendChild(img);
+          const meta: string[] = [];
+          if (typeof res.wallMs === "number") meta.push(`${(res.wallMs / 1000).toFixed(1)} s wall`);
+          if (res.render && res.render.finite === false) meta.push("⚠ non-finite output");
+          figure.appendChild(el("div", "note", `text-encode → denoise → VAE decode${meta.length ? " · " + meta.join(" · ") : ""}`));
+          runOut.appendChild(figure);
+        } else {
+          runOut.appendChild(el("div", "note", res.note ?? "Image run configured."));
+        }
         runOut.appendChild(
           el("div", "note", `package: ${res.package ?? "(set ONNX_GENAI_SD_PACKAGE)"}`)
         );

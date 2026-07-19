@@ -104,3 +104,14 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 1
 .timing-fill { height: 100%; background: var(--accent); border-radius: 5px; }
 .timing-fill.step { background: var(--denoiser); }
 .timing-ms { flex: 0 0 74px; text-align: right; color: var(--muted); font-family: ui-monospace, monospace; }
+
+.image-result {
+  margin-top: 12px;
+}
+.image-result img {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  image-rendering: auto;
+  background: var(--mask);
+}

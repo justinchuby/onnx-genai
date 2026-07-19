@@ -13,10 +13,11 @@ Diffusion). It:
    so everyone can see exactly what will run.
 3. **Runs it and animates the reverse process** — for language diffusion, the
    tokens un-masking step by step; for image diffusion, the latent denoising to
-   an image.
+   an image. The image tab renders a **real PNG** (full text-encode → denoise →
+   VAE-decode) and shows it inline with the wall-clock time.
 
-The backend drives the **real** onnx-genai runtime (the `run_diffusion` and
-`comfyui_to_metadata` binaries) — nothing is simulated.
+The backend drives the **real** onnx-genai runtime (the `run_diffusion`,
+`run_comfyui`, and `comfyui_to_metadata` binaries) — nothing is simulated.
 
 ```
 ┌─────────────┐   config (ComfyUI / native)   ┌──────────────┐   spawn    ┌────────────────────┐
@@ -31,7 +32,14 @@ The backend drives the **real** onnx-genai runtime (the `run_diffusion` and
 - Built onnx-genai binaries (from the repo root):
   ```bash
   cargo build --release -p onnx-genai --bin run_diffusion
+  cargo build --release -p onnx-genai --bin run_comfyui       # renders the image PNG
   cargo build --release -p onnx-genai-comfyui-config --bin comfyui_to_metadata
+  ```
+  To build with the **CUDA** execution provider (image rendering on an NVIDIA
+  GPU), point `ORT_ROOT` at a GPU ONNX Runtime and add `--features cuda`:
+  ```powershell
+  $env:ORT_ROOT="C:\path\to\onnxruntime-win-x64-gpu_cuda12-1.27.0"
+  cargo build --release -p onnx-genai --bin run_comfyui --bin run_diffusion --features cuda
   ```
 - The prebuilt ONNX Runtime dylib is found automatically under `target/`.
 
@@ -70,15 +78,41 @@ use a real SD package to see the GPU win in the it/s card.
   un-masking dynamics (toy vocabulary, real algorithm).
 - **Config load + visualization** works for any ComfyUI or native config with no
   model present.
-- **Image diffusion** needs a real Stable Diffusion package built from scratch by
-  Mobius. Point the demo at it with `ONNX_GENAI_SD_PACKAGE=/path/to/pkg`:
+- **Image diffusion** needs a real Stable Diffusion package. Build one from a
+  Hugging Face checkpoint with the bundled exporter (no Mobius required):
   ```bash
-  # in a Mobius checkout (conda `onnx` env):
-  python -c "from mobius import build_diffusers_pipeline; from mobius.integrations.onnx_genai import write_onnx_genai_config; \
-             pkg = build_diffusers_pipeline('OFA-Sys/small-stable-diffusion-v0'); \
-             pkg.save('/tmp/sd-pkg'); write_onnx_genai_config(pkg, '/tmp/sd-pkg', source='OFA-Sys/small-stable-diffusion-v0')"
+  python scripts/export_sd_package.py --output /tmp/sd-pkg --model runwayml/stable-diffusion-v1-5 --size 384
+  ```
+  Then point the demo at it (the image tab will render a real PNG):
+  ```bash
   ONNX_GENAI_SD_PACKAGE=/tmp/sd-pkg npm run dev
   ```
+  The default `--size 384` (latent 48×48) keeps fp32 SD 1.5 within ~8 GB of
+  VRAM; larger sizes need more memory. Spatial axes are dynamic, so you can also
+  change `width`/`height` in the package's `workflow.json` without re-exporting.
+- **Real language diffusion** (beyond the bundled fixture): export a masked
+  masked-diffusion LM (e.g. `kuleshov-group/mdlm-owt`) to a package and point the
+  demo at it with `ONNX_GENAI_LM_PACKAGE=/path/to/pkg` and
+  `ONNX_GENAI_LM_SEQ_LEN=64` (the sequence length the demo seeds with masks).
+
+## Running on an NVIDIA GPU (CUDA EP)
+
+Build the binaries with `--features cuda` (see Prerequisites), then set
+`ONNX_GENAI_EP=cuda` with the CUDA runtime on `PATH` before starting the demo.
+On Windows (PowerShell), a full GPU launch with real SD + MDLM packages looks
+like:
+
+```powershell
+$env:ONNX_GENAI_EP="cuda"
+$env:ONNX_GENAI_SD_PACKAGE="C:\path\to\sd15-package"
+$env:ONNX_GENAI_LM_PACKAGE="C:\path\to\mdlm-pipeline"
+$env:ONNX_GENAI_LM_SEQ_LEN="64"
+npm run dev
+```
+
+The demo server inherits these from the launching shell, so set them (and the
+CUDA `PATH` entries) in the same shell you run `npm run dev` in. SD 1.5 at 384px
+renders in ~14 s per image on an 8 GB laptop GPU.
 
 ## Performance
 
@@ -128,7 +162,10 @@ For the language tab, **Use bundled fixture** both loads the config and runs it.
 ## Files
 
 - `server/index.mjs` — Node API: translate ComfyUI→native, parse native config,
-  run a pipeline with per-step dumps, return frames.
+  run a language pipeline with per-step dumps, and render an image PNG via
+  `run_comfyui`; returns frames / the rendered image.
+- `scripts/export_sd_package.py` — reproducible Stable-Diffusion → onnx-genai
+  package exporter (dynamic spatial axes, DDIM, writes the package + workflow).
 - `src/` — Vite + TypeScript UI: config loader, DAG/strategy view, run animation
   (`main.ts`, `style.css`).
 - `samples/` — example ComfyUI and native configs to load.

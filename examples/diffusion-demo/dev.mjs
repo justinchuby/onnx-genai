@@ -2,7 +2,7 @@
 import { spawn } from "node:child_process";
 
 function run(cmd, args, name) {
-  const p = spawn(cmd, args, { stdio: "pipe", shell: false });
+  const p = spawn(cmd, args, { stdio: "pipe", shell: process.platform === "win32" });
   const tag = `[${name}] `;
   p.stdout.on("data", (d) => process.stdout.write(tag + d.toString().replace(/\n(?=.)/g, "\n" + tag)));
   p.stderr.on("data", (d) => process.stderr.write(tag + d.toString().replace(/\n(?=.)/g, "\n" + tag)));
@@ -14,4 +14,5 @@ function run(cmd, args, name) {
 }
 
 run("node", ["server/index.mjs"], "api");
-run("npx", ["vite"], "web");
+const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+run(npx, ["vite"], "web");

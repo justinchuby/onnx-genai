@@ -74,12 +74,24 @@ fn main() -> Result<()> {
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
     for spec in &args[4..] {
         // endpoint:[dtype:]d,d,..:path   (dtype in {f32,i64}, default f32)
+        // The path is parsed as the tail after the shape so that Windows paths
+        // (e.g. `C:\dir\seed.i64`) containing a drive-letter colon still work.
         let parts: Vec<&str> = spec.split(':').collect();
-        let (endpoint, dtype, shape_str, path) = match parts.as_slice() {
-            [ep, shape, path] => (*ep, "f32", *shape, *path),
-            [ep, dt, shape, path] => (*ep, *dt, *shape, *path),
-            _ => bail!("bad input spec '{spec}' (expected endpoint:[dtype:]d,d,..:path)"),
+        if parts.len() < 3 {
+            bail!("bad input spec '{spec}' (expected endpoint:[dtype:]d,d,..:path)");
+        }
+        let endpoint = parts[0];
+        let (dtype, shape_index) = if parts[1] == "f32" || parts[1] == "i64" {
+            (parts[1], 2)
+        } else {
+            ("f32", 1)
         };
+        if parts.len() < shape_index + 2 {
+            bail!("bad input spec '{spec}' (expected endpoint:[dtype:]d,d,..:path)");
+        }
+        let shape_str = parts[shape_index];
+        let path = parts[shape_index + 1..].join(":");
+        let path = path.as_str();
         let shape: Vec<i64> = shape_str
             .split(',')
             .map(|d| d.trim().parse::<i64>())
