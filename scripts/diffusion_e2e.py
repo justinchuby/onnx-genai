@@ -145,26 +145,28 @@ def main() -> int:
         input_names=["latent"], output_names=["image"], opset_version=17, dynamo=False,
     )
 
-    ts_yaml = "".join(f"      - {t}.0\n" for t in timesteps)
-    (pdir / "inference_metadata.yaml").write_text(
-        "pipeline:\n  models:\n"
-        "    text_encoder:\n      filename: text_encoder.onnx\n      type: encoder\n"
-        "    denoiser:\n      filename: unet.onnx\n      type: denoiser\n"
-        "    vae:\n      filename: vae.onnx\n      type: vae\n"
-        "  dataflow:\n"
-        "    - from: text_encoder.last_hidden_state\n      to: denoiser.encoder_hidden_states\n"
-        "    - from: denoiser.noise_pred\n      to: denoiser.sample\n"
-        "    - from: denoiser.sample\n      to: vae.latent\n"
-        "  strategy:\n    kind: iterative\n    denoiser: denoiser\n"
-        f"    num_steps: {args.steps}\n    timestep_input: timestep\n"
-        f"    guidance_scale: {args.guidance}\n"
-        "    cfg_conditioning_input: encoder_hidden_states\n"
-        "    timesteps:\n" + ts_yaml +
-        "    scheduler_config:\n      kind: ddim\n      num_train_timesteps: 1000\n"
-        "      beta_start: 0.00085\n      beta_end: 0.012\n      beta_schedule: scaled_linear\n"
-        "      prediction_type: epsilon\n"
-        "  phases:\n    text_encoder:\n      run_on: prompt_only\n    vae:\n      run_on: final_only\n"
+    # Pipeline metadata emitted by the Mobius integration (proves Mobius can
+    # declare the full runnable composite, not just the denoiser).
+    from mobius.integrations.onnx_genai import (
+        SchedulerConfig,
+        build_diffusion_pipeline_metadata,
     )
+    import yaml as _yaml
+
+    meta = build_diffusion_pipeline_metadata(
+        num_inference_steps=args.steps,
+        denoiser_filename="unet.onnx",
+        vae_filename="vae.onnx",
+        vae_latent_input="latent",
+        text_encoder_filename="text_encoder.onnx",
+        guidance_scale=args.guidance,
+        timesteps=[float(t) for t in timesteps],
+        scheduler=SchedulerConfig(
+            kind="ddim", num_train_timesteps=1000, beta_start=0.00085,
+            beta_end=0.012, beta_schedule="scaled_linear", prediction_type="epsilon",
+        ),
+    )
+    (pdir / "inference_metadata.yaml").write_text(_yaml.safe_dump(meta, sort_keys=False))
 
     # External inputs: token ids (prompt), initial latent, and the uncond embedding.
     ids_cond.numpy().astype("<i8").tofile(pdir / "ids.i64")
