@@ -98,3 +98,8 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 
 - **2026-07-19T16:15:00Z — Activation precision fix:** Added true f64 Selu/ThresholdedRelu computation and precision-sensitive tests; activations landed as `39edb76` after Luv approval.
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Fixed OneHot out-of-range indices to all-off and required BitShift direction (`49d8827`); Gaff approved the correction.

@@ -515,7 +515,11 @@ expert-related buffers (input staging, output staging for dispatch).
 
 ## 8. Communication Primitives
 
-### 8.1 Intra-Node (Multi-GPU within one machine)
+> **DEPRECATED:** The `DispatchTransport` trait defined in this section is superseded
+> by the `Communicator` trait. See [MEMORY_ARCHITECTURE.md §6](./MEMORY_ARCHITECTURE.md).
+> Use `Communicator` for all new work.
+
+### 8.1 Intra-Node Bandwidth Reference
 
 | Method | Bandwidth | Latency | Use Case |
 |---|---|---|---|
@@ -524,37 +528,7 @@ expert-related buffers (input staging, output staging for dispatch).
 | DLPack zero-copy | Same as underlying | Minimal | Share tensors between ORT sessions in genai-server |
 | Host staging (PCIe) | ~32 GB/s per direction | ~10 μs | Fallback, always works |
 
-**Preferred path for session-per-GPU:** CUDA IPC or DLPack to avoid host round-trips.
-
-```rust
-/// Communication backend trait for expert dispatch.
-pub trait DispatchTransport: Send + Sync {
-    /// Send hidden states to a target GPU's ORT session.
-    async fn send(&self, target: GpuId, data: &Tensor) -> Result<()>;
-
-    /// Receive expert output from a GPU's ORT session.
-    async fn recv(&self, source: GpuId) -> Result<Tensor>;
-
-    /// AllReduce across all GPUs (for attention TP).
-    async fn all_reduce(&self, data: &mut Tensor) -> Result<()>;
-
-    /// All-to-All: each GPU sends different data to every other GPU (for MoE EP).
-    async fn all_to_all(&self, send_bufs: &[Tensor], recv_bufs: &mut [Tensor]) -> Result<()>;
-}
-
-/// CUDA IPC implementation — zero-copy between GPU sessions on same node.
-pub struct CudaIpcTransport { /* ... */ }
-
-/// Host-staged implementation — works everywhere, higher latency.
-pub struct HostStagedTransport { /* ... */ }
-
-/// Thunderbolt/network implementation — for cross-node (Mac Studio cluster, etc.).
-pub struct NetworkTransport { /* ... */ }
-```
-
-### 8.2 Cross-Node (Mac Studio cluster, multi-server)
-
-For cross-node deployment (e.g., 3× Mac Studio via Thunderbolt 5):
+### 8.2 Cross-Node Bandwidth Reference
 
 | Method | Bandwidth | Notes |
 |---|---|---|
@@ -562,16 +536,6 @@ For cross-node deployment (e.g., 3× Mac Studio via Thunderbolt 5):
 | RDMA / InfiniBand | 200-400 Gbps | Data center multi-server |
 | TCP/IP (gRPC) | Limited by NIC | Fallback, high latency |
 
-Cross-node MoE is feasible but latency-constrained:
-- 16 active experts × ~4 KB hidden state = ~64 KB per token dispatch
-- At 10 GB/s (TB5): 64 KB / 10 GB/s ≈ 6.4 μs per dispatch (acceptable)
-- But: must also transfer expert outputs back: 16 × 4 KB = 64 KB → another 6.4 μs
-- Total dispatch overhead per MoE layer: ~13 μs (TB5) vs ~0.1 μs (NVLink)
-
-For **batch inference** this is fine (amortize over batch). For **interactive latency**
-with 100+ MoE layers, 100 × 13 μs = 1.3 ms overhead per token — acceptable.
-
----
 
 ## 9. Integration with nxrt EP Negotiation
 

@@ -22,3 +22,8 @@ Hired as an additional Code Reviewer (alongside Gaff) as the codebase grew to 9 
 
 
 - **2026-07-19T16:15:00Z — CPU-EP review:** Rejected activation f32-only and f64-narrowing implementations, then approved Sapper’s true-f64 correction; activations landed as `39edb76`.
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Approved AffineGrid/Col2Im/CenterCropPad (`8e49948`) with a non-blocking Col2Im dilation-test nit.

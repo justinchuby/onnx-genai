@@ -2229,3 +2229,476 @@ The fix commit does not modify LpNormalization or the registry/count assertion. 
 **By:** Sapper
 **What:** Added a dedicated f64 activation execution path and precision-sensitive Selu and ThresholdedRelu f64 tests.
 **Why:** Float64 inputs must not be narrowed through f32 computation, which loses precision before results are written.
+
+
+## 2026-07-19T18:20:00Z — Scribe inbox merge (CPU-EP op coverage 936→975)
+
+<!-- merged from bryant-conformance-975.md -->
+
+### 2026-07-19: Refresh backend conformance baseline to 975 passes
+**By:** Bryant
+**What:** Updated the ONNX backend node-test baseline at `c69d047` to 975 passed, 790 failed, and 1,765 skipped, preserving all prior dated measurements.
+**Why:** Batch 3 added 39 passing cases across BitShift, OneHot, Compress, LpPool, GlobalLpPool, SpaceToDepth, AffineGrid, Col2Im, and CenterCropPad.
+
+<!-- merged from bryant-lppool-spacetodepth.md -->
+
+### 2026-07-19: Reuse pooling infrastructure for LpPool
+**By:** Bryant
+**What:** Implement LpPool and GlobalLpPool in the existing N-D pooling module, and implement dtype-agnostic SpaceToDepth as a separate movement kernel. Register LpPool at opset 18, GlobalLpPool at opset 2, and SpaceToDepth at opset 13.
+**Why:** LpPool shares AveragePool's window, padding, stride, dilation, auto-pad, and ceil-mode semantics, while SpaceToDepth is a pure byte-preserving layout transformation. Reusing those paths minimizes duplicated indexing logic and preserves strided-input support.
+
+<!-- merged from chew-rereview-lppool-spacetodepth.md -->
+
+### 2026-07-19: LpPool/SpaceToDepth fix re-review
+**By:** Chew
+**What:** 🟢 APPROVE commit `014cf02` on `bryant/lppool-spacetodepth`.
+**Why:** Both prior blockers are resolved. SpaceToDepth now maps output channels as `(block_h * block + block_w) * C + channel`, and its corrected C>1 oracle is exactly `[1, 11, 2, 12, 3, 13, 4, 14]`. Shared pooling shape inference now applies the ONNX ceil-mode final adjustment, removing the all-padding trailing window. The new LpPool regression uses input shape `[1,1,4]`, kernel `[2]`, stride `[3]`, pads `[0,2]`, output shape `[1,1,2]`, and expected values `[sqrt(5), 4]`.
+
+Validation:
+- Both focused regression tests passed.
+- All 10 pooling tests passed, including AveragePool, MaxPool, GlobalAveragePool/GlobalMaxPool, and LpPool coverage.
+- `cargo test -p onnx-runtime-ep-cpu` passed: 566 passed, 0 failed, 1 ignored; doctest target also passed with its single test ignored.
+
+<!-- merged from chew-review-lppool-spacetodepth.md -->
+
+### 2026-07-19: LpPool / GlobalLpPool / SpaceToDepth CPU review
+**By:** Chew
+**What:** 🔴 REJECT commit `62fcb62`. Revision owner: **Deckard** (different from Bryant).
+**Why:** Two operator-contract defects are blocking.
+
+1. **SpaceToDepth uses the wrong channel ordering for `C > 1`.** At `crates/onnx-runtime-ep-cpu/src/kernels/space_to_depth.rs:64`, `channel * block * block + block_h * block + block_w` flattens `[C, block_h, block_w]`. ONNX SpaceToDepth is the inverse of DepthToSpace DCR and flattens `[block_h, block_w, C]`; the channel index must be `(block_h * block + block_w) * c + channel`. For input `[1,2,2,2]` containing channel planes `[1,2,3,4]` and `[11,12,13,14]`, ONNX ReferenceEvaluator 1.22.0 returns `[1,11,2,12,3,13,4,14]`, while the test at `space_to_depth.rs:120-126` incorrectly blesses `[1,2,3,4,11,12,13,14]`. Replace that oracle and add/retain the single-channel hand-worked case.
+
+2. **`ceil_mode` can emit a window starting entirely in right padding.** `crates/onnx-runtime-ep-cpu/src/kernels/pooling.rs:56-68` computes the ceiling output size but omits ONNX's required final adjustment when `(out - 1) * stride >= input_size + pad_begin`. Example: input `[1,1,4]`, kernel `[2]`, stride `[3]`, pads `[0,2]`, `ceil_mode=1`. ONNX ReferenceEvaluator returns shape `[1,1,2]` with `[sqrt(5), 4]`; this kernel expects shape `[1,1,3]` and appends a spurious all-padding zero. This directly affects the newly registered LpPool. Add a dedicated LpPool ceil-mode regression.
+
+The core Lp computations are otherwise correct: `sum(abs(x)^p)^(1/p)`, default `p=2`, zero-equivalent padding, GlobalLpPool over all spatial axes, and the tested 1D/2D/3D, strides, explicit pads, dilations, SAME_UPPER, and SAME_LOWER references are hand-computed rather than tautological. However, the Lp tests omit `ceil_mode`, and the multi-channel SpaceToDepth reference is meaningfully wrong.
+
+Registry accounting is correct: the parent asserted `PHASE1_OPS.len() + 71`; three registrations produce `+74` at `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:1411`, with lookup checks at lines 1427-1429.
+
+**Verification:** `cargo test -p onnx-runtime-ep-cpu` passed: 565 passed, 0 failed, 1 ignored; doctest: 0 passed, 1 ignored. Passing tests do not cover the two failing contract cases above.
+
+<!-- merged from deckard-affinegrid-col2im-crop.md -->
+
+### 2026-07-19: Add CPU spatial rearrangement and grid kernels
+**By:** Deckard
+**What:** Added pure-Rust CPU EP kernels for AffineGrid (opset 20), Col2Im (opset 18), and CenterCropPad (opset 18), including registry entries and unit coverage.
+**Why:** ONNX backend node coverage requires these standard spatial/movement operators; implementations preserve centered crop/pad placement, Col2Im overlap accumulation, and AffineGrid corner alignment semantics.
+
+Ops: AffineGrid, Col2Im, CenterCropPad; opsets: 20, 18, 18; new registry count: PHASE1_OPS.len() + 74 (173); test result: `cargo test -p onnx-runtime-ep-cpu` passed.
+
+<!-- merged from deckard-lppool-spacetodepth-fix.md -->
+
+### 2026-07-19: Correct SpaceToDepth and ceil-mode pooling conformance
+**By:** Deckard
+**What:** Changed SpaceToDepth channel flattening to DCR order and added ONNX's ceil-mode trailing-padding window adjustment to shared pooling output sizing, with regressions for both.
+**Why:** The rejected implementation produced incorrect multi-channel SpaceToDepth ordering and an invalid all-padding LpPool output window.
+
+<!-- merged from gaff-rereview-onehot-bitshift.md -->
+
+### 2026-07-19: OneHot/BitShift/Compress fix re-review
+**By:** Gaff
+**What:** 🟢 APPROVE commit `49d8827` on `pris/bitshift-onehot-compress`.
+**Why:** Both prior blockers are resolved. OneHot now accepts only indices in `[-depth, depth - 1]`, adds `depth` once for valid negatives, and leaves out-of-range rows off. Its corrected test proves depth-3 inputs `-1`, `3`, and `-4` produce the last category, all-off, and all-off respectively. BitShift now errors when `direction` is absent, retains explicit `LEFT`/`RIGHT` handling, and still rejects every other value through the `Some(_)` error arm; the new missing-direction test exercises the required-attribute failure. Compress has no diff from `49d8827^` and remains unchanged. `cargo test -p onnx-runtime-ep-cpu` passed: 566 passed, 0 failed, 1 ignored; doctests 0 passed, 0 failed, 1 ignored.
+
+<!-- merged from gaff-review-bitshift-onehot-compress.md -->
+
+### 2026-07-19: Reject BitShift, OneHot, and Compress CPU EP commit
+**By:** Gaff
+**What:** 🔴 REJECT commit `9ca9375`. Deckard should revise it; Pris is locked out from revising the rejected artifact.
+**Why:**
+
+1. **Blocking — OneHot maps out-of-range indices to valid categories.** `onehot.rs:79-80` applies `rem_euclid(depth)` to every index. ONNX requires indices outside `[-depth, depth-1]` to produce an all-off vector. With depth 3, both `3` and `-4` are out of range, but this code maps them to categories 0 and 2. The test at `onehot.rs:130-142` encodes the incorrect `-4` behavior. Deckard should range-check first, skip out-of-range indices, and only add `depth` once for valid negative indices.
+
+2. **Blocking — BitShift silently defaults a required attribute.** The ONNX BitShift schema requires `direction`; `bitshift.rs:25-27` treats a missing attribute as `RIGHT`. Deckard should reject missing values and retain rejection of values other than `LEFT`/`RIGHT`.
+
+The large-shift panic risk is guarded by `checked_shl`/`checked_shr` at `bitshift.rs:48,52`, so the tested width-sized shift does not panic. The `u64` cast to `u32` can truncate very large amounts, but ONNX leaves over-width behavior platform-defined.
+
+Compress selection is correct for an explicit/negative axis, omitted-axis flattening, and short/long conditions; the implementation ignores condition entries beyond the selected dimension. Its tests are meaningful, though a longer-than-dimension case would improve coverage.
+
+Registry accounting is consistent: `PHASE1_OPS` has 101 names, `mod.rs:1415` asserts `+72`, totaling 173. `kernels::tests::registry_has_all_phase1_ops` passed. Full `cargo test -p onnx-runtime-ep-cpu` passed (566 tests; one pre-existing dead-code warning).
+
+<!-- merged from gaff-review-conformance-975.md -->
+
+### 2026-07-19: Review conformance refresh to 975 passes
+**By:** Gaff
+**Verdict:** 🟢 APPROVE
+
+**What:** Reviewed commit `eef2c81` in `/home/justinchu/wt-conf2`.
+
+**Why:** The documentation and generated result data consistently report 975
+passed, 790 failed, and 1,765 skipped tests (3,530 total). The
+`ONNX backend test` section preserves the dated 360, 875, 921, and 936 history
+entries, adds the 975 entry dated 2026-07-19, and retains the reproduction
+command `maturin develop --release --no-default-features`.
+
+The result file contains 3,530 well-formed tab-separated rows: 1,765 CPU rows
+(975 passed, 790 failed) and 1,765 skipped CUDA rows. Relative to the prior
+version, row count, device/test names, ordering, and table format are unchanged;
+exactly 39 CPU rows changed from `failed` to `passed`. The file is neither
+truncated nor reformatted, and its header agrees with both the table contents
+and `docs/EP_CONFORMANCE.md`.
+
+<!-- merged from luv-review-affinegrid-col2im-crop.md -->
+
+### 2026-07-19: Review commit 8e49948 — AffineGrid, Col2Im, CenterCropPad
+**By:** Luv
+**Verdict:** 🟡 APPROVE-WITH-NITS (landable)
+
+**What:** Reviewed the full commit diff and validated all three CPU kernels.
+
+**Correctness:**
+- `affine_grid.rs:26-35,83-113` implements the ONNX/PyTorch normalized base grid correctly: `align_corners=1` uses `2*i/(size-1)-1` with singleton dimensions at zero; `align_corners=0` uses `(2*i+1)/size-1`. Coordinate order, homogeneous affine multiplication, and `[N,H,W,2]` / `[N,D,H,W,3]` output traversal are correct.
+- `col2im.rs:110-170` computes block counts with dilation, begin/end padding, and stride; indexes kernel and block positions lexicographically; and sums overlapping contributions into the reconstructed image.
+- `center_crop_pad.rs:42-101` resolves negative axes, preserves unlisted axes, uses the required floor split on the leading side for odd crop/pad differences, and zero-fills padding.
+- Registrations use the correct minimum opsets at `kernels/mod.rs:480-491`.
+
+**Tests:** The references are explicit and non-tautological. AffineGrid covers both `align_corners` modes and 3-D translation; Col2Im covers overlapping sums, padding/stride, and 3-D folding; CenterCropPad covers crop, pad, mixed operation, negative axes, and preservation of unlisted dimensions.
+
+**Nit:** `col2im.rs:219-235` is named as a dilation test but passes `dilations=[1,1]`. Add a genuinely non-unit dilation case in follow-up coverage; the implementation itself at `col2im.rs:112,147-149` is correct.
+
+**Validation:**
+- `cargo test -p onnx-runtime-ep-cpu registry_has_all_phase1_ops`: 1 passed; registry count `PHASE1_OPS + 74` confirmed.
+- `cargo test -p onnx-runtime-ep-cpu`: 567 passed, 0 failed, 1 ignored; doctest ignored.
+
+<!-- merged from pris-bitshift-onehot-compress.md -->
+
+### 2026-07-19: CPU BitShift, OneHot, and Compress kernels
+**By:** Pris
+**What:** Added opset-11 CPU kernels and registrations for BitShift, OneHot, and Compress.
+**Why:** Complete the missing ONNX backend node coverage with broadcast-aware shifts, OneHot negative-index wrapping, and axis-aware compression.
+
+Summary: Implemented BitShift, OneHot, and Compress at opset 11; registry count is 173 (PHASE1_OPS + 72); cargo test -p onnx-runtime-ep-cpu passed (565 passed, 1 ignored).
+
+<!-- merged from sapper-onehot-bitshift-fix.md -->
+
+### 2026-07-19: Correct OneHot index bounds and require BitShift direction
+**By:** Sapper
+**What:** Updated CPU EP OneHot to emit all-off vectors for indices outside `[-depth, depth - 1]`, and made BitShift reject nodes without the required `direction` attribute.
+**Why:** These changes restore ONNX operator conformance identified by review, preventing invalid OneHot category selection and silent BitShift semantic defaults.
+
+
+---
+
+## 2026-07-19 — Scribe inbox merge (CPU-EP op coverage Batch 4)
+
+<!-- merged from pris-isinf-eyelike-pow.md -->
+
+### 2026-07-19: Add CPU IsInf and EyeLike support and mixed-type Pow
+**By:** Pris
+**What:** Registered IsInf at opset 10 and EyeLike at opset 9, and made Pow accept numeric exponents independent of the base tensor dtype.
+**Why:** ONNX backend cases require sign-selective infinity detection, offset/dtype-controlled identity generation, and Pow results typed as the base input.
+
+<!-- merged from bryant-dropout-split.md -->
+
+### 2026-07-19: Add deterministic Dropout paths and complete Split edge handling
+**By:** Bryant
+**What:** Added CPU Dropout registrations at opsets 13 and 22 with bit-exact evaluation/zero-ratio identity behavior and all-true optional masks. Added an explicit Split opset-18 registration, validated `num_outputs` and output metadata, and covered explicit zero-size parts, uneven splits, and a zero-size final part.
+**Why:** ONNX backend conformance requires deterministic Dropout evaluation semantics and Split's opset-18 ceil-chunk behavior. Non-zero training Dropout is rejected explicitly because ONNX does not define a portable seeded RNG stream, rather than emitting silently incompatible random results.
+
+<!-- merged from deckard-gridsample.md -->
+
+### 2026-07-19: CPU GridSample kernel
+**By:** Deckard
+**What:** Added a float32 CPU GridSample kernel with 2-D linear/nearest/cubic and volumetric linear/nearest sampling, all three padding modes, align-corners handling, and opset-16/opset-20 registrations.
+**Why:** The CPU EP must claim GridSample backend nodes while preserving ONNX normalized-coordinate, reflection-boundary, cubic A=-0.75, and nearest ties-to-even behavior.
+
+<!-- merged from chew-review-dropout-split.md -->
+
+### 2026-07-19: Approve Bryant's CPU Dropout and Split implementation
+**By:** Chew
+**What:** 🟢 APPROVE — reviewed commit `4565e68`. Dropout copies data bit-exactly and emits an all-true Bool mask in inference (including nonzero ratio), handles omitted optional inputs and f16/bf16/f32/f64 ratio decoding, and deliberately rejects nonzero training RNG with a clear documented limitation. Its ignored `seed` is correct for the supported deterministic paths. Split correctly normalizes negative axes; honors split-input over legacy attribute; validates sizes, shapes, and dtypes; and implements opset-18 ceil-sized leading chunks with the final remainder, including zero-size final outputs.
+**Why:** This matches ONNX Dropout 13/22 and Split 1/18 behavior for supported valid models. `cargo test -p onnx-runtime-ep-cpu --lib` passed (590 tests), and `cargo test -p onnx-runtime-ep-cpu --lib registry` passed; the registry assertion is internally consistent at `PHASE1_OPS.len() + 80` for the two additional Split/Dropout version entries.
+
+<!-- merged from luv-review-isinf-eyelike-pow.md -->
+
+### 2026-07-19: Reject IsInf/EyeLike/Pow review
+
+**By:** Luv
+
+**What:** 🔴 REJECT. Assign Deckard to fix `EyeLike` before merge. `eye_typed` and `eye_bool` compute `row as i64 + k` directly (lines 74 and 86). `k` is a valid unrestricted ONNX `int64`; for a 2-row tensor and `k = i64::MAX`, the row-1 addition overflows and panics in debug builds rather than producing the required all-zero matrix. Use checked/wider arithmetic or bounds checks that avoid addition overflow, and add extreme positive/negative-offset coverage. Also validate `dtype` through a checked `i64 -> i32` conversion: line 29 currently truncates an out-of-range ONNX enum value into a valid dtype.
+
+**Why:** The IsInf sign flags/defaults, Bool output, NaN handling, and f16/f32/f64 paths are correct; EyeLike's normal offset/dtype logic is correct; and Pow now accepts mixed numeric exponents, broadcasts them, and retains the base output dtype. `cargo test -p onnx-runtime-ep-cpu --lib` passed (593 passed, 1 ignored), and `cargo test -p onnx-runtime-ep-cpu --lib registry` passed. The valid extreme `EyeLike.k` input nevertheless violates required diagonal-offset behavior by panicking, so this cannot be approved.
+
+<!-- merged from gaff-review-gridsample.md -->
+
+### 2026-07-19: Reject GridSample opset split
+**By:** Gaff
+**What:** 🔴 REJECT — reassign the correction to Sapper. The implementation correctly applies the two unnormalization formulas, uses `(x, y[, z])` against `(W, H[, D])`, and its reflection limits agree with the `align_corners` convention. Both requested crate test commands pass (588 library tests; registry selector test).
+**Why:** ONNX GridSample opset 16 is 2-D only; 3-D input is introduced at opset 20. `mod.rs` registers the identical version-unaware `GridSampleFactory` for keys 16 and 20 (lines 488–493), while `grid_sample.rs` accepts rank 5 unconditionally (lines 186–204). Therefore an opset-16 model with `[N,C,D,H,W]` executes trilinear/nearest sampling instead of being rejected, violating the opset-16 schema. Use distinct version-configured factories/kernels (or equivalent) so only the opset-20 registration permits rank 5, and add a regression test.
+
+<!-- merged from sapper-fix-gridsample-opset.md -->
+
+### 2026-07-19: Gate GridSample volumetric inputs by ONNX opset
+**By:** Sapper
+**What:** Threaded GridSample's registered since-version into the kernel; opset 16 now rejects rank-5 inputs while opset 20 accepts rank-4 and rank-5 inputs.
+**Why:** ONNX added 3D GridSample support in opset 20, so accepting it at opset 16 violates the operator schema.
+
+<!-- merged from deckard-fix-eyelike-overflow.md -->
+
+### 2026-07-19: EyeLike checked diagonal arithmetic and dtype validation
+**By:** Deckard
+**What:** Replaced EyeLike's overflowing diagonal calculation with checked signed arithmetic and strict dtype-attribute conversion; added extreme-offset and dtype-override regressions.
+**Why:** ONNX permits any `k`, so extreme offsets must yield zeros rather than panic, and dtype attributes must not truncate into unintended output types.
+
+<!-- merged from luv-rereview-eyelike.md -->
+
+# Luv re-review — EyeLike / IsInf / Pow
+
+**Verdict: 🟢 APPROVE**
+
+Reviewed Deckard's fix commit `114180e` on `pris/isinf-eyelike-pow`.
+
+- `EyeLike` computes diagonal indices with `checked_add` and checked conversion/bounds filtering. Multi-row inputs with `k = i64::MAX` or `i64::MIN` therefore yield all zeros without overflow/panic; regression coverage is present.
+- The `dtype` attribute now uses `i32::try_from` before ONNX type lookup, rejecting out-of-range values instead of silently truncating. Execution verifies that the declared dtype overrides the input dtype, and the added regression covers every supported EyeLike output dtype plus invalid values.
+- `IsInf` and `Pow` are unchanged by `114180e` and remain correct from the prior review.
+
+Validation passed:
+- `cargo test -p onnx-runtime-ep-cpu --lib` — 597 passed, 1 ignored
+- `cargo test -p onnx-runtime-ep-cpu --lib registry` — 1 passed
+
+<!-- merged from gaff-rereview-gridsample.md -->
+
+# Gaff re-review: GridSample opset gate
+
+**Verdict: 🟢 APPROVE**
+
+Reviewed fix commit `61d5e638ea98c75803eb130d35158397087896b6`.
+
+- The registry registers version-carrying `GridSampleFactory` instances for opsets 16 and 20, matching the existing `since_version` factory/kernel pattern used by `Attention`.
+- Rank-5 volumetric input now fails under the opset-16 factory with the clear error `GridSample: 3D input requires opset 20 or later`; rank 4 remains valid for both versions and rank 5 is valid at opset 20.
+- The interpolation implementation is unchanged; the patch only threads the registered version, gates rank-5 execution, and adjusts/adds tests.
+- Regression coverage exercises rank-4 at opsets 16 and 20, rank-5 failure at 16, and rank-5 success at 20.
+
+Validation passed:
+
+- `cargo test -p onnx-runtime-ep-cpu --lib` — 588 passed, 0 failed, 1 ignored.
+- `cargo test -p onnx-runtime-ep-cpu --lib registry` — 2 passed, 0 failed.
+
+<!-- merged from bryant-conformance-1012.md -->
+
+### 2026-07-19: Refresh ONNX backend node conformance to Batch 4
+**By:** Bryant
+**What:** Regenerated the authoritative ONNX backend node-test result set at 3,530 total cases: 1,012 passed, 753 failed, and 1,765 skipped. Updated EP conformance history and documented Batch-4 coverage for Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample.
+**Why:** Batch 4 raised CPU node coverage by 37 cases on main commit `9c250c6`; the checked-in documentation and per-test data must match the measured backend run.
+
+<!-- merged from gaff-review-conformance-1012.md -->
+
+### 2026-07-19: Review — Batch-4 conformance documentation refresh (`8c2a264`)
+**By:** Gaff
+**What:** 🟢 APPROVE
+**Why:** Commit scope is exactly the two intended files: `docs/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`; no `.squad/`, kernel, or formatting-only files are part of the commit. The results header reports total/passed/failed/skipped as 3530/1012/753/1765, and tab-separated row counts independently match (1012 passed, 753 failed, 1765 skipped; 3530 total). Arithmetic is consistent. The documentation retains the 360@2026-07-14 and 875/921/936/975 history, adds the dated 2026-07-19 1012/753/1765 entry, and accurately names the Batch-4 Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample coverage.
+
+
+## 2026-07-19 — Scribe inbox merge (18:05Z)
+
+<!-- merged from tyrell-glm-e2e-bringup.md -->
+
+### GLM-5.2 (glm_moe_dsa) tiny synthetic E2E bring-up
+
+- **Date:** 2026-07-19
+- **By:** Tyrell (GLM/MoE integration lead)
+- **What:** Got a tiny synthetic `glm_moe_dsa` (GLM-5.2 MLA + IndexShare DSA + MoE)
+  model running END-TO-END through the onnx-genai engine: mobius export →
+  `Engine::from_dir` → greedy prefill on `[1,2,3,4]` + **8 decode steps → 8
+  in-vocab tokens**, no panics, consistent shapes. Fixed one blocking bug.
+- **Why:** User bar was a structural E2E run ("要能流畅跑起来"). Real trained
+  weights are unavailable, so target was a random-weight tiny model exercising
+  the real graph (MLA attention, DSA indexer, MoE routing).
+
+#### Result
+- ✅ **Runs E2E.** prompt `[1,2,3,4]` → tokens `[216,174,125,49,147,20,31,205]`
+  (random weights, so values are not meaningful — structural success only).
+- Artifact dir: `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny/`
+  (`model.onnx` + `model.onnx.data` + `inference_metadata.yaml` +
+  `tokenizer.json`). Built by `mobius/export_glm_tiny.py` (untracked helper).
+
+#### Bug found + fixed (1)
+- **mobius** `src/mobius/models/glm_moe_dsa.py:83` (`GlmMoeDsaIndexer.project_key`):
+  passed `rotary_embedding_dim=index_head_dim // 2` (=4) to the opset-24
+  `RotaryEmbedding` op. The indexer shares the model rotary cache (sized
+  `qk_rope_head_dim/2` = 4 = full rotation of the 8-dim key). The op then
+  expected a cos cache of `(4)/2 = 2` and failed at runtime:
+  `Input 'cos_cache' dimension 2 should be same as head_size / 2 or
+  rotary_embedding_dim / 2, got 4`. Fix: `rotary_embedding_dim=0` (full
+  rotation), matching the main MLA q_rope/k_rope calls. + regression test
+  `test_indexer_rotary_uses_full_rotation`.
+
+#### No onnx-genai runtime fixes were needed
+The engine + Microsoft ORT already ran the primitive-op GLM graph correctly
+once the mobius rope bug was fixed. Only artifact added on the onnx-genai side:
+gated E2E test `crates/onnx-genai-engine/tests/glm_tiny_synthetic_e2e.rs`.
+
+#### Important finding: custom pkg.nxrt kernels are NOT exercised
+- The mobius fp32 export emits **only primitive ONNX ops**: `ai.onnx::Attention`
+  (opset-24 MLA), `RMSNormalization`, `RotaryEmbedding`, TopK/Gather/Scatter
+  (DSA indexer), and MatMul/Sigmoid/TopK (MoE routing). It emits **none** of
+  the runtime custom ops (`pkg.nxrt::BlockQuantizedMoE`,
+  `CompressedSparseAttention`, `SparseKvGather`, `BlockQuantizedMatMul`) nor
+  `com.microsoft::QMoE`.
+- The engine runs on the default **ORT decode backend**. The `native-backend`
+  (custom `pkg.nxrt` CPU EP) auto-selects only when the model contains
+  `pkg.nxrt::BlockQuantizedMatMul` (`engine.rs:model_proto_requires_native_backend`),
+  which this graph does not.
+- **Consequence:** exercising BlockQuantizedMoE / CompressedSparseAttention /
+  SparseKvGather end-to-end through the engine is **not currently possible** —
+  it needs a mobius export mode that emits those `pkg.nxrt` op types. That mode
+  does not exist yet. The kernels remain covered by their own unit tests in
+  `crates/onnx-runtime-ep-cpu`. This is the one remaining gap vs. the original
+  stretch goal; the primary "run smoothly E2E" bar is met.
+
+#### Commits (local, NOT pushed)
+- onnx-genai worktree `/home/justinchu/wt-glm` (branch `tyrell/glm-e2e`):
+  `bd908bf` test(engine): add gated tiny synthetic glm_moe_dsa E2E smoke test
+- mobius `/home/justinchu/mobius` (branch `glm5.2-moe-export`):
+  `1198522` fix(glm_moe_dsa): indexer RoPE must rotate full index_head_dim
+
+#### Mobius-side changes needed (for coordinator)
+- Land mobius `1198522` (rope fix + test) — required for any glm_moe_dsa E2E.
+- To later exercise the real custom ops, a mobius export mode emitting
+  `pkg.nxrt` ops (BlockQuantizedMoE / CompressedSparseAttention / SparseKvGather)
+  is required; not yet implemented.
+
+<!-- merged from chew-review-glm-e2e.md -->
+
+# Chew review — GLM-5.2 tiny synthetic E2E
+
+Reviewed 2026-07-19 by Chew (numerics/model-conversion fidelity). No source changes made by this review.
+
+## Mobius `1198522` (`glm5.2-moe-export`): 🟢 APPROVE
+
+- `GlmMoeDsaIndexer.project_key` now emits `rotary_embedding_dim=0` (`src/mobius/models/glm_moe_dsa.py:77-97`). Under the ONNX opset-24 `RotaryEmbedding` contract, zero selects full-head rotation; for `index_head_dim=8`, this makes the required cos/sin cache last dimension `8 / 2 = 4`. This agrees with the shared indexer cache and corrects the prior half-rotation setting, which would require cache dimension `2`.
+- The main MLA `k_rope` path likewise omits the attribute / uses the full-rotation default (`src/mobius/models/glm_moe_dsa.py:272-278`), so the indexer is now consistent with the existing MLA RoPE representation.
+- Regression coverage exports the tiny model, selects indexer-named `RotaryEmbedding` nodes, and asserts an explicit zero or omitted (op default zero) `rotary_embedding_dim` (`src/mobius/models/glm_moe_dsa_test.py:124-156`).
+- Validation: `/home/justinchu/mobius/.venv/bin/python -m pytest src/mobius/models/glm_moe_dsa_test.py -q` — **7 passed**.
+
+## onnx-genai `bd908bf` (`tyrell/glm-e2e`): 🟢 APPROVE
+
+- The sole changed file is the new integration test `crates/onnx-genai-engine/tests/glm_tiny_synthetic_e2e.rs`; no production files, `e2e_mobius_heads.rs`, or `tests/e2e/mobius_heads.json` changed.
+- The test is unconditionally `#[ignore]` (`:19-21`) and additionally treats absent/invalid `GLM_TINY_E2E_DIR` as an explicit skip (`:22-36`), matching the opt-in artifact pattern and preventing missing artifacts from breaking CI.
+- It structurally verifies `Engine::from_dir`, greedy prefill plus eight generated tokens, exact requested length, and in-vocabulary token IDs (`:38-71`), without making semantic claims for random synthetic weights.
+- Validation: `cargo test -p onnx-genai-engine --no-run` — **passed**. With `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny` present, `GLM_TINY_E2E_DIR=/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny cargo test -p onnx-genai-engine --test glm_tiny_synthetic_e2e -- --ignored --nocapture` — **1 passed**, producing 8 token IDs.
+
+<!-- merged from deckard-deepseek-v2-e2e.md -->
+
+# DeepSeek-V2 tiny MLA + MoE E2E
+
+- Date: 2026-07-19
+- Decision: The synthetic `deepseek_v2` MLA + MoE export is directly consumable by the existing onnx-genai engine; no runtime or metadata changes were required.
+- Evidence: `/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny` loaded via `Engine::from_dir` and greedily generated eight tokens from `[1, 2, 3, 4]`: `[42, 237, 198, 2, 186, 81, 210, 149]`.
+- Export: Mobius helper `export_deepseek_v2_tiny.py` builds the first `deepseek_v2` test config (MLA plus 4 local experts, 2 selected experts, softmax/group-limited greedy routing, and one shared expert), fills FP32 random weights, and writes ONNX metadata. `tokenizer.json` is copied from the GLM tiny artifact.
+- Validation: `DEEPSEEK_V2_TINY_E2E_DIR=/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny cargo test -p onnx-genai-engine --test deepseek_e2e -- --ignored --nocapture` passed.
+- Commits: onnx-genai `0caaf32`; mobius `2b629cc`.
+- Note: a full `cargo test -p onnx-genai-engine` had 18 pre-existing fixture failures because `tests/fixtures/tiny-llm/model.onnx` is absent in this worktree; its 122 non-fixture tests passed. The new targeted test passed cleanly.
+
+<!-- merged from gaff-review-deepseek-v2-e2e.md -->
+
+# Gaff review: DeepSeek-V2 tiny synthetic E2E
+
+Date: 2026-07-19
+
+## onnx-genai `0caaf32` — 🟢 APPROVE
+
+- Additive new integration-test file only: `crates/onnx-genai-engine/tests/deepseek_e2e.rs`; it does not touch `e2e_mobius_heads.rs`, the GLM test, production code, or manifests.
+- The test is `#[ignore]` and also accepts its artifact location only through `DEEPSEEK_V2_TINY_E2E_DIR`; an unset or absent directory exits successfully, so ordinary CI does not require artifacts.
+- It loads the model and uses `Engine::generate` with a four-token prompt, which exercises prefill plus the requested eight generated/decode tokens. It verifies exact output count and vocabulary bounds (`< 256`) without asserting random-weight semantics.
+- `cargo test -p onnx-genai-engine --no-run` passed.
+- With the supplied artifacts, `DEEPSEEK_V2_TINY_E2E_DIR=/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny cargo test -p onnx-genai-engine --test deepseek_e2e -- --ignored --nocapture` passed and produced `[42, 237, 198, 2, 186, 81, 210, 149]`.
+
+## mobius `2b629cc` — 🟢 APPROVE
+
+- Additive standalone exporter only: `export_deepseek_v2_tiny.py`; no existing Mobius model code is modified.
+- The script compiles with `python -m py_compile`, creates the registered `deepseek_v2` tiny graph, deterministically fills non-constant initializers, and writes ONNX plus inference metadata.
+- Relevant existing checks passed: `src/mobius/components/_deepseek_mla_test.py` (21 passed) and `tests/build_graph_test.py -k deepseek_v2` (16 passed, 1284 deselected).
+- The initially suggested `src/mobius/models/deepseek_test.py` does not exist; this commit is a standalone script, so no importable production module was added.
+
+Both diffs pass `git diff --check`. No files were staged or pushed.
+
+<!-- merged from tyrell-glm-quant-e2e.md -->
+
+# Decision note — Quantized tiny GLM (glm_moe_dsa) E2E through onnx-genai
+
+**Author:** Tyrell (GLM/MoE integration lead)
+**Date:** 2026-07-19
+**Status:** ✅ Success (MatMulNBits E2E) · QMoE-for-GLM = documented mobius gap
+
+## (a) Did quantized GLM run E2E?
+
+**Yes — clean on the first run, no runtime fixes required.**
+
+```
+GLM_TINY_Q4_E2E_DIR=/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4 \
+  cargo test -p onnx-genai-engine --test glm_tiny_quant_e2e -- --ignored --nocapture
+```
+
+Output:
+```
+glm_tiny_quant_e2e: prompt=[1, 2, 3, 4] generated 8 tokens: [40, 114, 90, 146, 244, 107, 84, 138]
+test glm_tiny_quant_e2e ... ok
+```
+
+Prefill + 8 decode, no panic, all tokens in-vocab (< 256). Bar「要能流畅跑起来才算成功」met — the real int4 GEMM kernel executes through the full GLM graph (MLA + IndexShare DSA + per-expert MoE MLPs).
+
+## (b) Exact ops / domains emitted (q4 artifact)
+
+Model: `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4/model.onnx`
+
+- **`com.microsoft::MatMulNBits` × 34** — all int4, `block_size=32`, `bits=4`, **asymmetric (uint8 zero_points on all 34)**. `accuracy_level` not emitted (=0) → runtime takes the default int4 dequant→f32 GEMM path (with zero points). Covers attention projections (q_a/q_b/kv_a/kv_b/o), dense MLP, indexer, MTP, **and every routed + shared MoE expert's gate/up/down**.
+- **`ai.onnx::MatMul` × 4** — unquantized leftovers (router gate / small projections that mobius keeps dense).
+- Attention ×2, RotaryEmbedding ×6, RMSNormalization ×9, LayerNormalization ×2, TopK ×3, plus routing/reshape glue.
+- **`QMoE`: 0. `MoE` (fused): 0.**
+
+MatMulNBits **confirmed present and executed**. QMoE **not** emitted (see (d)).
+
+## (c) Bugs found + fixed
+
+**None in the onnx-genai runtime.** The CPU `MatMulNBits` kernel (`crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs`) already handles int4 block-32 asymmetric (uint8 zero_points), partial last block (`k.div_ceil(block_size)`), and the MLA/DSA/MoE-decomposed GLM shapes without modification. No new unit test needed because no kernel bug surfaced.
+
+One export-helper detail worth noting: `_fill_random_weights` had to learn `UINT8` (packed int4 weights + bit-packed zero points) — the fp32 helper only handled FLOAT/FLOAT16/INT. Added in `export_glm_tiny_quant.py` (random 0–255 uint8). Without it the packed-weight/zero-point initializers would have been filled as f32.
+
+## (d) Remaining blocker + root cause: QMoE-for-GLM
+
+**QMoE (`com.microsoft::QMoE`) is NOT emitted for GLM — and cannot be without new mobius feature work.** Root cause:
+
+- The GLM/DeepSeek MoE path (`src/mobius/models/deepseek.py` `DeepSeekV3TextModel`, `src/mobius/components/_moe.py` `MoELayer`) builds routed experts as a **`ModuleList` of per-expert `MLP`s**. When quantized, each expert MLP's linears go through `_linear_class(config)` → `QuantizedLinear` → **per-expert MatMulNBits**. There is no fused-expert tensor and no fused MoE op on this path.
+- **mobius has no QMoE emitter anywhere.** Grep across `src/mobius` for `QMoE`/`op.QMoE` = 0 hits. The only fused-MoE emitter is **gemma4** (`src/mobius/models/gemma4.py:1265`), and it emits the **unquantized `com.microsoft::MoE`** (fp) over `fc1_experts_weights`/`fc2_experts_weights` stacked tensors — gated on `ep_capabilities().supports_fused_moe`, with a static per-expert unroll fallback. nemotron_h/granitemoehybrid follow the same fused-**MoE** (not QMoE) shape. So the mission's premise that gemma4/nemotron "already emit QMoE" is inaccurate: they emit fp fused MoE, not quantized QMoE.
+- Note: the **onnx-genai runtime already has a CPU QMoE kernel** (`crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs`) + CUDA QMoE. So the runtime side is ready; the gap is purely the **mobius emitter**.
+
+### What QMoE-for-GLM would require (scoping)
+1. A fused-expert representation on the GLM/DeepSeek MoE path: stack per-expert gate/up/down into `fc1_experts_weights [E, 2*inter, H]` / `fc2_experts_weights [E, H, inter]` (mirror gemma4's `_remap_moe_expert_weights` + interleave logic), rather than a `ModuleList`.
+2. **Quantized** expert tensors: block-quantize the stacked expert weights to the QMoE layout (per-expert packed int4 weights + per-block scales + optional zero-points, one set per fc1/fc2) and emit `com.microsoft::QMoE` with the SwiGLU schema attrs (`activation_type`, `k`, `normalize_routing_weights`, `swiglu_fusion`, etc.), gated on an EP `supports_fused_qmoe` capability with a per-expert-MatMulNBits fallback.
+3. Reconcile GLM's sigmoid + `noaux_tc` group TopK routing (correction bias, `routed_scaling_factor`, shared expert) with QMoE's internal top-k/normalize semantics — GLM routing is richer than gemma4's plain softmax, so either pre-compute router_probs and pass them in, or extend the router emission.
+4. Cross-check the runtime QMoE kernel's expected weight/scale/zero-point layout (`crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs`) against whatever mobius emits, and add a gated E2E variant.
+
+This is a real feature (new quantized fused-MoE emitter + routing reconciliation), not a config flip. **Per STEP 6, stopping at MatMulNBits-quantized GLM running E2E** — a genuine win: int4 GEMM is exercised through the entire GLM graph including all MoE experts.
+
+## (e) Commits (local only, NOT pushed)
+
+- **onnx-genai worktree** `/home/justinchu/wt-glmq` (branch `tyrell/glm-quant-e2e`):
+  - `7ca2b8a` test(engine): add gated quantized tiny glm_moe_dsa E2E smoke test
+- **mobius** `/home/justinchu/mobius` (branch `glm5.2-moe-export`):
+  - `c5740c4` tools: add quantized tiny glm_moe_dsa export helper (`export_glm_tiny_quant.py`)
+
+Artifact: `/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4/` (model.onnx + .data, inference_metadata.yaml, tokenizer.json reused from fp32 artifacts).
+
+Both `_linear_class`-driven MatMulNBits emission and the runtime int4 kernel were already correct; the work was (1) a quantized export helper, (2) op inspection to confirm MatMulNBits/no-QMoE, (3) a gated E2E test proving the quantized GLM runs smoothly.
+
+<!-- merged from luv-review-glm-quant-e2e.md -->
+
+# Luv review — quantized GLM E2E
+
+**Reviewed:** 2026-07-19 17:55Z
+**Author:** Tyrell
+
+## onnx-genai `7ca2b8a` — 🟢 APPROVE
+
+- Diff is one new, isolated integration test: `crates/onnx-genai-engine/tests/glm_tiny_quant_e2e.rs`. It does not touch `deepseek_e2e.rs`, `e2e_mobius_heads.rs`, or production code.
+- The test is explicitly `#[ignore]`; it additionally returns success with a clear message if `GLM_TINY_Q4_E2E_DIR` is unset or absent, so normal CI and explicit artifact-less invocations are safe.
+- Structural assertions are appropriate for random weights: model load, generation configured for eight new tokens, exact token count, and IDs below the tiny model's 256-token vocabulary limit.
+- `cargo test -p onnx-genai-engine --no-run` passed.
+- With `GLM_TINY_Q4_E2E_DIR=/home/justinchu/glm-e2e-artifacts/glm-5.2-tiny-q4`, the ignored test passed and generated `[40, 114, 90, 146, 244, 107, 84, 138]`.
+- Direct ONNX inspection found 34 `com.microsoft::MatMulNBits` nodes and no `QMoE` nodes, confirming the stated quantized execution path.
+
+## mobius `c5740c4` — 🟢 APPROVE
+
+- The commit is additive: it creates only the standalone `export_glm_tiny_quant.py` helper. No importable `mobius/` production module or model-graph emission code changed; no mobius regression test was required.
+- The helper independently configures int4/block-32/asymmetric quantization and handles UINT8 initializers for packed quantized weights/zero points. Its generated artifact is validated by the passing engine E2E above.
+- `c5740c4` is present at `origin/glm5.2-moe-export` as claimed.

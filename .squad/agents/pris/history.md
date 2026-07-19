@@ -90,3 +90,8 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 
 
 - **2026-07-19T16:15:00Z — CPU-EP reduction wave:** Authored ReduceLogSumExp opset-18 axes-input support, boolean ReduceMax/Min, and empty-set ReduceSum handling in `dc229c1`; Deckard corrected omitted-axes/noop semantics and the fix landed as `6e97ee6`.
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Authored BitShift/OneHot/Compress CPU coverage (`9ca9375`); after review lockout, Sapper corrected OneHot bounds and BitShift required direction (`49d8827`), then Gaff approved.

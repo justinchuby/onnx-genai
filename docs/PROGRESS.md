@@ -4,9 +4,32 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T14:10Z — CPU-EP op-coverage wave advanced backend node conformance to 921 passing._
+_Last updated: 2026-07-19T22:20Z — ConvTranspose/Unique CPU kernels, fused QMoE export, and kernel benchmarks landed._
 
-**Current `origin/main` implementation HEAD:** `4c05ede`.
+**Current `origin/main` implementation HEAD:** `6a7755c`.
+
+## 2026-07-19 — CPU kernel quality and fused MoE batch
+
+- **ConvTranspose + Unique CPU kernels ✅ landed (`7219025`, `6a7755c`):** ConvTranspose covers 1D/2D/3D, groups, bias, dilation, strides, padding, output padding, and explicit output shapes with 11 conformance tests. Unique adds six conformance cases with O(n log n) grouping, correct NaN/signed-zero semantics, and numeric/bool/bf16 support. String returns a safe unsupported-dtype error pending runtime-level String tensor storage. Batch tracking estimates backend node coverage at approximately **1,023→1,029 passing**; a full conformance refresh is pending.
+- **Fused GLM/DeepSeek QMoE emitter ✅ landed (`fe3e342`; Mobius `93cbcf7`):** quantized routed experts can emit one expert-major int4 `com.microsoft::QMoE` node instead of per-expert `MatMulNBits`. The gated tiny-model E2E covers prefill and decode through **ORT's contrib QMoE CPU kernel, not the native Rust kernel**.
+- **Kernel benchmark harness ✅ landed (`d89a47e`, `59b17ad`):** Criterion microbenchmarks, fixed numeric regressions, and thread-matched ORT baselines are available. Medium-f32 MatMul is currently about **21.4× slower at one thread and 16.4× slower at eight threads** than ORT.
+- **CPU-kernel quality bar:** new kernels must not be slower than ORT for equivalent work and should provide broader dtype coverage where the runtime can safely represent those dtypes.
+- **MLAS-style SIMD GEMM port 🚧 IN PROGRESS:** Deckard's `deckard/mlas-gemm` work remains open and is expected to address the MatMul gap.
+
+## 2026-07-19 — GLM-5.2 / DeepSeek E2E
+
+- **GLM-5.2 fp32 E2E ✅ landed (`bd908bf`):** the tiny synthetic `glm_moe_dsa` harness runs MLA + IndexShare DSA + MoE through prefill and eight decode steps. Mobius `1198522` fixed the real exporter bug: the indexer RoPE must rotate the full `index_head_dim`.
+- **GLM-5.2 int4 E2E ✅ landed (`daa3518`):** the quantized harness runs the full graph through prefill and eight decode steps with **34 `com.microsoft::MatMulNBits`** nodes (block-32 asymmetric int4), including every routed and shared expert MLP. No runtime fix was required; Mobius `c5740c4` provides the export helper and UINT8 initializer filling.
+- **DeepSeek-V2 E2E ✅ landed (`0caaf32`):** the shared MLA + MoE path loads and generates eight tokens with the tiny fp32 export; Mobius `2b629cc` provides the exporter helper. DeepSeek-V4 remains blocked upstream because a usable reference configuration/export artifact is unavailable.
+- **Quantized-expert follow-up:** fused `com.microsoft::QMoE` emission now has synthetic E2E coverage through ORT's contrib kernel. Real-checkpoint expert packing and native-Rust QMoE/BQMoE E2E coverage remain follow-up work; the random-weight harness establishes structural execution, not real-weight semantic correctness.
+
+## 2026-07-19 — CPU-EP op coverage 975→1,012
+
+- **CPU-EP coverage ✅ landed (`8c2a264`):** added Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample. Backend node conformance advanced **975→1,012 passing (+37 backend tests)**, with 753 failing and 1,765 skipped. Two 🔴 reject→lockout-fix→🟢 approve cycles completed: Deckard fixed EyeLike overflow/dtype validation after Pris's lockout, and Sapper fixed GridSample's opset-16 rank gate after Deckard's lockout.
+
+## 2026-07-19 — CPU-EP op coverage 936→975
+
+- **CPU-EP coverage ✅ landed (`eef2c81`):** added BitShift, OneHot, Compress, LpPool, GlobalLpPool, SpaceToDepth, AffineGrid, Col2Im, and CenterCropPad. Backend node conformance advanced **936→975 passing (+39 backend tests)**, with 790 failing and 1,765 skipped. Two 🔴 reject→fix→approve review cycles completed.
 
 
 ## 2026-07-19 — CPU-EP op coverage 921→936

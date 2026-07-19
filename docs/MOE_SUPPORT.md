@@ -399,81 +399,10 @@ bytes so performance and imbalance are observable.
 
 ## 7. Expert residency and streaming
 
-### 7.1 Separate expert store
+> **Consolidated.** See [MEMORY_ARCHITECTURE.md §2-3](./MEMORY_ARCHITECTURE.md).
+> Expert residency, the `ExpertStore` trait, governor integration, cache policy,
+> and prefetch design are consolidated there.
 
-Create a future `ExpertStore` abstraction in the engine/model-management layer (or a
-dedicated weight-storage crate), not in `onnx-genai-kv`:
-
-```rust
-trait ExpertStore {
-    fn ensure_resident(&self, layer: usize, experts: &[u32], device: Device)
-        -> Result<ExpertLease>;
-    fn prefetch(&self, layer: usize, experts: &[u32], device: Device);
-    fn observe_routes(&self, layer: usize, experts: &[u32]);
-}
-```
-
-An `ExpertLease` pins immutable expert slices for the duration of a kernel launch.
-Eviction cannot invalidate an in-flight pointer. Backing tiers are:
-
-- **hot:** VRAM, GPU compute;
-- **warm:** pinned/pageable host RAM, CPU compute or fast H2D;
-- **cold:** memory-mapped/read-only model external data on disk.
-
-Use the page-table/tiering lessons from `onnx-genai-kv`, but define weight-specific
-page identity, immutable backing, alignment, transfer, and lease semantics.
-
-### 7.2 Resource Governor integration
-
-The VRAM ceiling must cover:
-
-```text
-resident dense weights
-+ hot expert cache
-+ KV cache
-+ activations/scratch
-+ ORT/EP overhead
-<= configured VRAM limit
-```
-
-`VramBreakdown` can reserve model weights, activations, and ORT overhead before
-deriving KV capacity, but those engine-supplied reservations are currently all zero.
-Therefore this design is not yet an enforceable whole-runtime memory ceiling. Phase 3
-must first connect real EP/model weight usage, activation/scratch high-water marks,
-and ORT/EP allocations to the governor, then add an explicit `hot_expert_bytes`
-component and coordinated rebalancing between expert and KV budgets. Lowering a
-ceiling must:
-
-1. cancel speculative prefetch reservations;
-2. evict unleased coldest experts;
-3. demote eligible KV according to the existing priority order;
-4. shrink the active batch if scratch/activation pressure remains; and
-5. fail clearly if the resident dense set plus minimum scratch cannot fit.
-
-Do not let independent KV and expert LRUs compete blindly for the last VRAM pages.
-The governor is authoritative; both managers receive sub-budgets and return usage.
-
-### 7.3 Cache policy and prefetch
-
-Track, per layer and expert:
-
-- frequency and last-use step;
-- bytes and current tier;
-- load latency by source tier;
-- in-flight/pinned/leased state;
-- prefetch hit/miss/waste;
-- tokens served while resident.
-
-Default admission should be LFRU-like with hysteresis. Prefetch sources, ordered from
-least speculative to most speculative:
-
-1. exact routes already computed for the current fused op;
-2. union of routes across the admitted batch;
-3. recent per-layer heat;
-4. predicted next-layer routes.
-
-Prediction must be optional and budgeted. It must not evict a leased expert or a
-demonstrably hotter resident expert merely to chase a weak prediction.
 
 ## 8. Scheduling, batching, and expert parallelism
 

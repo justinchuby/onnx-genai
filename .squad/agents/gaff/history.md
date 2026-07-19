@@ -97,3 +97,8 @@ Reviewed Deckard's fix for the cudarc CUDA-version-feature conflict. Verified al
 
 
 - **2026-07-19T16:15:00Z — Conformance review:** Approved the 936/829/1765 conformance refresh with non-blocking attribution nits; artifacts landed as `4c05ede`.
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Rejected initial BitShift/OneHot/Compress, approved Sapper’s fix (`49d8827`), and approved the 975 conformance refresh (`eef2c81`).

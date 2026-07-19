@@ -45,19 +45,24 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+pub mod conv_transpose;
+pub mod dropout;
 pub mod elementwise;
 pub mod expand;
+pub mod eye_like;
 pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
 pub mod gather;
 pub mod gelu;
 pub mod gemm;
+pub mod grid_sample;
 pub mod group_query_attention;
 pub mod hardmax;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
+pub mod is_inf;
 pub mod layernorm;
 pub mod log_softmax;
 pub mod logical;
@@ -91,6 +96,7 @@ pub mod sparse_kv_gather;
 pub mod split;
 pub mod transpose;
 pub mod unary_math;
+pub mod unique;
 pub mod unsqueeze;
 pub mod where_op;
 pub mod window;
@@ -183,6 +189,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Flatten",
     "Squeeze",
     "Split",
+    "Unique",
     "Pad",
     "ConstantOfShape",
     "Size",
@@ -205,6 +212,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "QuantizeLinear",
     "DequantizeLinear",
     "DynamicQuantizeLinear",
+    "Dropout",
 ];
 
 /// Whether `op_type` is one of the Phase-1 ops the CPU EP can run.
@@ -422,6 +430,11 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
     reg.register(OpKey::new("Mod", "", 10), Box::new(elementwise::ModFactory));
     reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
+    reg.register(OpKey::new("IsInf", "", 10), Box::new(is_inf::IsInfFactory));
+    reg.register(
+        OpKey::new("EyeLike", "", 9),
+        Box::new(eye_like::EyeLikeFactory),
+    );
     reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
     reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
     reg.register(OpKey::new("Sum", "", 1), Box::new(elementwise::SumFactory));
@@ -482,7 +495,28 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
     reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
     reg.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
+    reg.register(OpKey::new("Split", "", 18), Box::new(split::SplitFactory));
+    reg.register(
+        OpKey::new("Unique", "", 11),
+        Box::new(unique::UniqueFactory),
+    );
+    reg.register(
+        OpKey::new("Dropout", "", 13),
+        Box::new(dropout::DropoutFactory),
+    );
+    reg.register(
+        OpKey::new("Dropout", "", 22),
+        Box::new(dropout::DropoutFactory),
+    );
     reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
+    reg.register(
+        OpKey::new("GridSample", "", 16),
+        Box::new(grid_sample::GridSampleFactory { since_version: 16 }),
+    );
+    reg.register(
+        OpKey::new("GridSample", "", 20),
+        Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
+    );
     reg.register(
         OpKey::new("AffineGrid", "", 20),
         Box::new(affine_grid::AffineGridFactory),
@@ -490,6 +524,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("Col2Im", "", 18),
         Box::new(col2im::Col2ImFactory),
+    );
+    reg.register(
+        OpKey::new("ConvTranspose", "", 1),
+        Box::new(conv_transpose::ConvTransposeFactory),
     );
     reg.register(
         OpKey::new("CenterCropPad", "", 18),
@@ -1440,7 +1478,8 @@ mod tests {
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 78);
+        // GridSample has separate opset-16 and opset-20 registrations.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 85);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1459,6 +1498,13 @@ mod tests {
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
+        assert!(reg.lookup("Split", "", 18).is_some());
+        assert!(reg.lookup("Unique", "", 11).is_some());
+        assert!(reg.lookup("Dropout", "", 13).is_some());
+        assert!(reg.lookup("Dropout", "", 22).is_some());
+        assert!(reg.lookup("GridSample", "", 16).is_some());
+        assert!(reg.lookup("GridSample", "", 20).is_some());
+        assert!(reg.lookup("ConvTranspose", "", 22).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());

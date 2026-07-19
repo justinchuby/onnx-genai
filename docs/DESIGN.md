@@ -2981,6 +2981,9 @@ model, and let me turn that down while a game is running."* The **Resource Gover
 is the engine-level component that owns those user-facing byte budgets, maps them
 down onto the existing page/token machinery, and lets the user **adjust them live**.
 
+> See also [MEMORY_ARCHITECTURE.md](./MEMORY_ARCHITECTURE.md) for how the ResourceGovernor
+> integrates with weight residency, expert stores, and distributed coordination.
+
 It does not replace the §26.4 `MemoryBudget` or the §3.2.3 tiered store — it sits
 **above** them as the single source of truth for *how many bytes we are allowed to
 use per tier*, and drives them:
@@ -9192,7 +9195,10 @@ CPU and CUDA EPs need fused routing gather/scatter plus grouped, expert-batched 
 The CUDA design extends the existing cuBLASLt GEMM seam; the CPU design extends the
 existing batched MatMul seam and adds compressed-domain int4 expert compute.
 
-Expert weights are immutable model data, **not KV cache**. A future expert store
+Expert weights are immutable model data, **not KV cache**.
+
+> See also [MEMORY_ARCHITECTURE.md](./MEMORY_ARCHITECTURE.md) for the consolidated
+> weight residency and expert store design. A future expert store
 should reuse the page-table, tiering, LRU, promotion, and lease concepts from
 `onnx-genai-kv` while keeping a separate weight API. Expert-major external-data
 slices move among:

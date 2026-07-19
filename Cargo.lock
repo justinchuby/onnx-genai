@@ -1708,6 +1708,7 @@ dependencies = [
  "async-trait",
  "half",
  "llguidance",
+ "memmap2",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
  "onnx-genai-metadata",
@@ -1943,6 +1944,7 @@ version = "0.1.0-dev.2"
 dependencies = [
  "bindgen",
  "cmake",
+ "criterion",
  "half",
  "libm",
  "onnx-runtime-ep-api",
