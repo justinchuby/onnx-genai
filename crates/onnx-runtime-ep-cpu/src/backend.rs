@@ -95,13 +95,24 @@ impl CpuBackend {
         }
         if value.eq_ignore_ascii_case("simd") {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            return Some(Self::SimdX86);
+            return Some(Self::simd_x86_or_generic(has_simd_x86()));
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            return Some(Self::Generic);
         }
         if value.eq_ignore_ascii_case("mlas") {
             #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
             return Some(Self::Mlas);
         }
         None
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn simd_x86_or_generic(supported: bool) -> Self {
+        if supported {
+            Self::SimdX86
+        } else {
+            Self::Generic
+        }
     }
 }
 
@@ -157,7 +168,7 @@ mod tests {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert_eq!(
             CpuBackend::from_env_override(Some("SIMD".into())),
-            Some(CpuBackend::SimdX86)
+            Some(CpuBackend::simd_x86_or_generic(has_simd_x86()))
         );
         #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
         assert_eq!(
@@ -165,5 +176,11 @@ mod tests {
             Some(CpuBackend::Mlas)
         );
         assert_eq!(CpuBackend::from_env_override(Some("unknown".into())), None);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn forced_simd_falls_back_to_generic_without_required_cpu_features() {
+        assert_eq!(CpuBackend::simd_x86_or_generic(false), CpuBackend::Generic);
     }
 }
