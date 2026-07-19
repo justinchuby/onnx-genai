@@ -45,6 +45,7 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+pub mod conv_transpose;
 pub mod dropout;
 pub mod elementwise;
 pub mod expand;
@@ -517,6 +518,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("Col2Im", "", 18),
         Box::new(col2im::Col2ImFactory),
+    );
+    reg.register(
+        OpKey::new("ConvTranspose", "", 1),
+        Box::new(conv_transpose::ConvTransposeFactory),
     );
     reg.register(
         OpKey::new("CenterCropPad", "", 18),
@@ -1468,7 +1473,7 @@ mod tests {
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 84);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 85);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1492,6 +1497,7 @@ mod tests {
         assert!(reg.lookup("Dropout", "", 22).is_some());
         assert!(reg.lookup("GridSample", "", 16).is_some());
         assert!(reg.lookup("GridSample", "", 20).is_some());
+        assert!(reg.lookup("ConvTranspose", "", 22).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
