@@ -1691,6 +1691,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-comfyui-config"
+version = "0.1.0-dev.2"
+dependencies = [
+ "onnx-genai-metadata",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "onnx-genai-engine"
 version = "0.1.0-dev.2"
 dependencies = [
