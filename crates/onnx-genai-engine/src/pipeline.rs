@@ -463,18 +463,28 @@ impl PipelineEngine {
         if let Some(scheduler) = scheduler {
             scheduler.reset();
         }
+        // Denoiser timestep schedule: prefer the plan's explicit `strategy.timesteps`,
+        // otherwise fall back to the scheduler's own timesteps (so from-scratch
+        // packages that omit the table still drive the denoiser with the correct
+        // diffusion timesteps rather than the raw step index).
+        let scheduler_timesteps: Option<Vec<f32>> = if plan.timesteps.is_some() {
+            None
+        } else {
+            scheduler.and_then(|scheduler| scheduler.timesteps())
+        };
         // Partial (img2img) loops start at `start_step`; the seed is then the
         // encoded image already noised to `timesteps[start_step]`.
         let denoise_start = std::time::Instant::now();
         for step in start_step..num_steps {
             let step_start = std::time::Instant::now();
             let is_first = step == start_step;
-            // Timestep/sigma for this step: explicit schedule when provided,
-            // otherwise the 0-based step index.
+            // Timestep/sigma for this step: explicit plan schedule when provided,
+            // else the scheduler's timesteps, else the 0-based step index.
             let timestep = plan
                 .timesteps
                 .as_ref()
-                .map(|ts| ts[step])
+                .or(scheduler_timesteps.as_ref())
+                .and_then(|ts| ts.get(step).copied())
                 .unwrap_or(step as f32);
 
             // Raw (unscaled) loop-carried sample feeding each loop input this
@@ -566,8 +576,8 @@ impl PipelineEngine {
                     let uncond_value = uncond_out.get(port).with_context(|| {
                         format!("unconditional pass did not produce '{}.{port}'", plan.denoiser)
                     })?;
-                    let cond_v = cond_value.to_vec_f32()?;
-                    let uncond_v = uncond_value.to_vec_f32()?;
+                    let cond_v = cond_value.to_vec_f32_lossy()?;
+                    let uncond_v = uncond_value.to_vec_f32_lossy()?;
                     let guided: Vec<f32> = uncond_v
                         .iter()
                         .zip(&cond_v)
@@ -670,7 +680,7 @@ impl PipelineEngine {
             // scheduler's per-step input scaling (Euler) and CFG's unconditional
             // conditioning embedding.
             if let Some((_, over_value)) = overrides.iter().find(|(p, _)| *p == port) {
-                inputs.push((port.to_string(), clone_value(over_value)?));
+                inputs.push((port.to_string(), coerce_value_to_dtype(over_value, info.dtype)?));
                 continue;
             }
             // Per-step timestep injection takes precedence for its port. Honor
@@ -706,7 +716,7 @@ impl PipelineEngine {
                     .or(routed)
                     .with_context(|| format!("missing pipeline input '{endpoint}'"))?
             };
-            inputs.push((port.to_string(), clone_value(value)?));
+            inputs.push((port.to_string(), coerce_value_to_dtype(value, info.dtype)?));
         }
         let refs = inputs
             .iter()
@@ -744,7 +754,7 @@ impl PipelineEngine {
             )
         })?;
         let elem: usize = sample.shape().iter().map(|&d| d as usize).product();
-        let data = all.to_vec_f32()?;
+        let data = all.to_vec_f32_lossy()?;
         let want = num_steps * elem;
         if data.len() != want {
             anyhow::bail!(
@@ -847,7 +857,7 @@ impl PipelineEngine {
                 .get(&endpoint)
                 .or(routed)
                 .with_context(|| format!("missing pipeline input '{endpoint}'"))?;
-            inputs.push((info.name.clone(), clone_value(value)?));
+            inputs.push((info.name.clone(), coerce_value_to_dtype(value, info.dtype)?));
         }
         Ok(inputs)
     }
@@ -1072,6 +1082,27 @@ struct SinglePassPlan {
     dataflow: Vec<DataflowEdge>,
 }
 
+/// Coerce a float tensor to a model input's declared float dtype so the f32-space
+/// pipeline math (schedulers, classifier-free guidance) can feed an fp16 / bf16
+/// model and read its outputs back. Non-float dtypes and already-matching dtypes
+/// are cloned unchanged.
+fn coerce_value_to_dtype(value: &Value, target: DataType) -> anyhow::Result<Value> {
+    if value.dtype() == target {
+        return clone_value(value);
+    }
+    match (value.dtype(), target) {
+        (
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16,
+        ) => {
+            let data = value.to_vec_f32_lossy()?;
+            Value::from_f32_slice_as(&data, value.shape(), target)
+                .map_err(|e| anyhow::anyhow!("failed to coerce value to {target:?}: {e}"))
+        }
+        _ => clone_value(value),
+    }
+}
+
 /// Dump one iterative step's loop-carried tensor to `ONNX_GENAI_STEP_DUMP_DIR`
 /// (when set) as `step_{i}_{port}.json` — used by the diffusion demo to animate
 /// the reverse process. Best-effort; failures are ignored (never affects a run).
@@ -1210,6 +1241,20 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
     /// DPM-Solver++ leave the seed unscaled and return `1.0` (the default).
     fn init_noise_sigma(&self) -> f32 {
         1.0
+    }
+
+    /// The per-step denoiser timesteps this scheduler feeds to the model, matching
+    /// the diffusers scheduler it emulates (e.g. `[999.0, 966.0, ..., 33.0]` for a
+    /// 30-step DPM-Solver++ linspace schedule). Length equals the loop step count.
+    ///
+    /// The pipeline uses these when the plan does not carry an explicit
+    /// `strategy.timesteps` schedule, so from-scratch packages that omit the
+    /// timestep table still drive the denoiser with the correct diffusion
+    /// timesteps rather than the raw `0..num_steps` step index. Returns `None`
+    /// for schedulers with no meaningful timestep (e.g. discrete token diffusion),
+    /// leaving the pipeline to fall back to the step index.
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        None
     }
 
     /// Build the unconditional loop-carried sample for classifier-free guidance
@@ -1622,6 +1667,7 @@ fn gumbel_uniforms(step: usize, position: usize, vocab: usize) -> Vec<f64> {
 #[derive(Debug, Clone)]
 struct DdimSchedule {
     steps: Vec<(f32, f32)>,
+    timesteps: Vec<f32>,
 }
 
 impl DdimSchedule {
@@ -1665,8 +1711,10 @@ impl DdimSchedule {
         let step_ratio = num_train_timesteps / num_steps;
         let ascending: Vec<usize> = (0..num_steps).map(|i| i * step_ratio).collect();
         let mut steps = Vec::with_capacity(num_steps);
+        let mut timesteps = Vec::with_capacity(num_steps);
         for k in 0..num_steps {
             let t = ascending[num_steps - 1 - k];
+            timesteps.push(t as f32);
             let a_t = alpha_cumprod[t];
             let a_prev = if k + 1 < num_steps {
                 alpha_cumprod[ascending[num_steps - 1 - (k + 1)]]
@@ -1675,7 +1723,7 @@ impl DdimSchedule {
             };
             steps.push((a_t, a_prev));
         }
-        Ok(Self { steps })
+        Ok(Self { steps, timesteps })
     }
 
     /// Apply one DDIM step to `sample` given the model's noise prediction `eps`.
@@ -1713,8 +1761,12 @@ impl Scheduler for DdimSchedule {
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
         let stepped =
-            DdimSchedule::step(self, step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
+            DdimSchedule::step(self, step, &sample.to_vec_f32_lossy()?, &model_output.to_vec_f32_lossy()?)?;
         Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
     }
 }
 
@@ -1728,6 +1780,8 @@ impl Scheduler for DdimSchedule {
 struct EulerSchedule {
     /// Inference sigmas, descending, with a trailing `0.0`. Length `num_steps + 1`.
     sigmas: Vec<f32>,
+    /// Per-step denoiser timesteps (fractional), length `num_steps`.
+    timesteps: Vec<f32>,
 }
 
 impl EulerSchedule {
@@ -1750,7 +1804,9 @@ impl EulerSchedule {
         if let Some(sigmas) =
             spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
         {
-            return Ok(Self { sigmas });
+            let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+            let timesteps = sigmas[..num_steps].iter().map(|&s| sigma_to_t(&train, s)).collect();
+            return Ok(Self { sigmas, timesteps });
         }
         let denom = (num_train_timesteps - 1) as f32;
         let (lo, hi, square) = match beta_schedule {
@@ -1781,13 +1837,15 @@ impl EulerSchedule {
             train_sigmas[low] * (1.0 - frac) + train_sigmas[high] * frac
         };
         let mut sigmas = Vec::with_capacity(num_steps + 1);
+        let mut timesteps = Vec::with_capacity(num_steps);
         for k in 0..num_steps {
             let idx = num_steps - 1 - k;
             let t = idx as f32 * denom / ts_denom;
+            timesteps.push(t);
             sigmas.push(interp(t));
         }
         sigmas.push(0.0);
-        Ok(Self { sigmas })
+        Ok(Self { sigmas, timesteps })
     }
 
     /// `x / sqrt(sigma^2 + 1)` — scale the raw sample for the denoiser input.
@@ -1819,7 +1877,11 @@ impl Scheduler for EulerSchedule {
         model_output: &Value,
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
-        let stepped = self.step_vec(step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
+        let stepped = self.step_vec(
+            step,
+            &sample.to_vec_f32_lossy()?,
+            &model_output.to_vec_f32_lossy()?,
+        )?;
         Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
     }
 
@@ -1830,12 +1892,16 @@ impl Scheduler for EulerSchedule {
         sample: &Value,
     ) -> anyhow::Result<Option<Value>> {
         let shape = sample.shape().to_vec();
-        let scaled = self.scale(step, &sample.to_vec_f32()?);
+        let scaled = self.scale(step, &sample.to_vec_f32_lossy()?);
         Ok(Some(Value::from_slice_f32(&scaled, &shape)?))
     }
 
     fn init_noise_sigma(&self) -> f32 {
         self.sigmas[0]
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
     }
 }
 
@@ -1850,6 +1916,7 @@ impl Scheduler for EulerSchedule {
 #[derive(Debug, Clone)]
 struct EulerAncestral {
     sigmas: Vec<f32>,
+    timesteps: Vec<f32>,
 }
 
 impl EulerAncestral {
@@ -1870,7 +1937,7 @@ impl EulerAncestral {
             num_steps,
             spacing,
         )?;
-        Ok(Self { sigmas: euler.sigmas })
+        Ok(Self { sigmas: euler.sigmas, timesteps: euler.timesteps })
     }
 }
 
@@ -1898,8 +1965,8 @@ impl Scheduler for EulerAncestral {
         noise: Option<&Value>,
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
-        let x = sample.to_vec_f32()?;
-        let eps = model_output.to_vec_f32()?;
+        let x = sample.to_vec_f32_lossy()?;
+        let eps = model_output.to_vec_f32_lossy()?;
         let sigma_from = self.sigmas[step];
         let sigma_to = self.sigmas[step + 1];
         let sigma_up = (sigma_to * sigma_to * (sigma_from * sigma_from - sigma_to * sigma_to)
@@ -1908,7 +1975,7 @@ impl Scheduler for EulerAncestral {
             .sqrt();
         let sigma_down = (sigma_to * sigma_to - sigma_up * sigma_up).max(0.0).sqrt();
         let dt = sigma_down - sigma_from;
-        let noise = noise.context("euler_ancestral requires per-step noise")?.to_vec_f32()?;
+        let noise = noise.context("euler_ancestral requires per-step noise")?.to_vec_f32_lossy()?;
         if noise.len() != x.len() {
             anyhow::bail!("euler_ancestral noise length {} != sample {}", noise.len(), x.len());
         }
@@ -1925,19 +1992,24 @@ impl Scheduler for EulerAncestral {
         sample: &Value,
     ) -> anyhow::Result<Option<Value>> {
         let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
-        let scaled: Vec<f32> = sample.to_vec_f32()?.iter().map(|&x| x / factor).collect();
+        let scaled: Vec<f32> = sample.to_vec_f32_lossy()?.iter().map(|&x| x / factor).collect();
         Ok(Some(Value::from_slice_f32(&scaled, sample.shape())?))
     }
 
     fn init_noise_sigma(&self) -> f32 {
         self.sigmas[0]
     }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
+    }
 }
 
 /// DPM-Solver++ (2M) — a fast *multistep* deterministic scheduler and the default
 /// sampler in most Stable Diffusion / ComfyUI workflows. Order-2 in log-SNR (λ)
 /// space using the previous step's data prediction (`x0`), with a first-order step
-/// at the start and (for <15 steps) a first-order final step. Matches diffusers
+/// at the start and a first-order final step (when `<15` steps or the final sigma
+/// is zero, matching diffusers `final_sigmas_type="zero"`). Matches diffusers
 /// `DPMSolverMultistepScheduler(algorithm_type="dpmsolver++", solver_type="midpoint")`.
 /// Unlike Euler it does NOT scale the model input (`scale_model_input` is identity)
 /// and its `init_noise_sigma` is 1.0 (the seed is unscaled).
@@ -1945,6 +2017,8 @@ impl Scheduler for EulerAncestral {
 struct Dpmpp2m {
     /// Inference sigmas, descending, with a trailing `0.0`. Length `num_steps + 1`.
     sigmas: Vec<f32>,
+    /// Per-step denoiser timesteps, length `num_steps`.
+    timesteps: Vec<f32>,
     /// Previous step's data prediction (`x0`) for the multistep update. Reset at
     /// step 0 of each denoise loop; interior-mutable so `step` keeps `&self`.
     prev_x0: Mutex<Option<Vec<f32>>>,
@@ -1970,8 +2044,11 @@ impl Dpmpp2m {
         if let Some(sigmas) =
             spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
         {
+            let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+            let timesteps = sigmas[..num_steps].iter().map(|&s| sigma_to_t(&train, s)).collect();
             return Ok(Self {
                 sigmas,
+                timesteps,
                 prev_x0: Mutex::new(None),
             });
         }
@@ -2001,6 +2078,7 @@ impl Dpmpp2m {
             .collect();
         ts_int.reverse();
         ts_int.pop();
+        let timesteps: Vec<f32> = ts_int.iter().map(|&t| t as f32).collect();
         let mut sigmas: Vec<f32> = ts_int
             .iter()
             .map(|&t| train[t.min(num_train_timesteps - 1)])
@@ -2008,6 +2086,7 @@ impl Dpmpp2m {
         sigmas.push(0.0);
         Ok(Self {
             sigmas,
+            timesteps,
             prev_x0: Mutex::new(None),
         })
     }
@@ -2045,6 +2124,23 @@ fn training_sigmas(
         out.push(((1.0 - prod) / prod).sqrt());
     }
     Ok(out)
+}
+
+/// Interpolate a diffusion timestep from a sigma, matching diffusers
+/// `SchedulerMixin._sigma_to_t`. `train` holds the ascending training sigmas
+/// (index = training timestep). Finds the bracketing training sigmas in log space
+/// and linearly interpolates the (fractional) timestep. Used to recover the
+/// denoiser timesteps for sigma-space schedules (Karras / exponential) where the
+/// timesteps are not the sigma indices.
+fn sigma_to_t(train: &[f32], sigma: f32) -> f32 {
+    let log_sigma = sigma.max(1e-10).ln();
+    let count = train.iter().filter(|&&s| s.max(1e-10).ln() <= log_sigma).count();
+    let low_idx = count.saturating_sub(1).min(train.len().saturating_sub(2));
+    let high_idx = low_idx + 1;
+    let low = train[low_idx].max(1e-10).ln();
+    let high = train[high_idx].max(1e-10).ln();
+    let weight = ((low - log_sigma) / (low - high)).clamp(0.0, 1.0);
+    (1.0 - weight) * low_idx as f32 + weight * high_idx as f32
 }
 
 /// Karras (rho=7) sigma schedule from the training sigma range, descending, with
@@ -2153,8 +2249,8 @@ impl Scheduler for Dpmpp2m {
         model_output: &Value,
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
-        let x = sample.to_vec_f32()?;
-        let eps = model_output.to_vec_f32()?;
+        let x = sample.to_vec_f32_lossy()?;
+        let eps = model_output.to_vec_f32_lossy()?;
         if x.len() != eps.len() {
             anyhow::bail!("dpm++ sample/eps length mismatch: {} vs {}", x.len(), eps.len());
         }
@@ -2180,7 +2276,14 @@ impl Scheduler for Dpmpp2m {
             .prev_x0
             .lock()
             .map_err(|_| anyhow::anyhow!("dpm++ scheduler state poisoned"))?;
-        let lower_order_final = step + 1 == num_steps && num_steps < 15;
+        // Match diffusers `DPMSolverMultistepScheduler`: the final step drops to
+        // the first-order update when `lower_order_final` applies. diffusers sets
+        // that at the last step whenever `num_steps < 15` OR the final sigma is
+        // zero (`final_sigmas_type="zero"`, the default this schedule uses). The
+        // second-order update divides by the log-SNR step `h`, which is infinite
+        // when the final sigma is zero — so skipping it there also avoids the
+        // resulting non-finite latent.
+        let lower_order_final = step + 1 == num_steps && (num_steps < 15 || s_next <= 0.0);
         // First step of the loop (prev cleared by reset) or the low-order final
         // step both use the first-order update.
         let first_order = lower_order_final || prev.is_none();
@@ -2215,6 +2318,10 @@ impl Scheduler for Dpmpp2m {
         if let Ok(mut prev) = self.prev_x0.lock() {
             *prev = None;
         }
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
     }
 }
 
@@ -2550,6 +2657,57 @@ mod tests {
         assert!(DdimSchedule::with_schedule(1, 0.1, 0.2, "linear", 1).is_err()); // num_train < 2
         assert!(DdimSchedule::with_schedule(4, 0.1, 0.2, "linear", 0).is_err()); // num_steps == 0
         assert!(DdimSchedule::with_schedule(4, 0.1, 0.2, "linear", 5).is_err()); // num_steps > num_train
+    }
+
+    #[test]
+    fn dpmpp_timesteps_match_diffusers_linspace() {
+        // Classic Stable Diffusion 1.x schedule (1000 train steps, scaled_linear).
+        // diffusers `DPMSolverMultistepScheduler(timestep_spacing="linspace")`
+        // uses `linspace(0, num_train-1, num_steps+1).round()[::-1][:-1]`.
+        let num_train = 1000usize;
+        let num_steps = 25usize;
+        let sched = Dpmpp2m::with_schedule(num_train, 0.00085, 0.012, "scaled_linear", num_steps, "")
+            .expect("schedule builds");
+        let timesteps = sched.timesteps().expect("dpm++ exposes timesteps");
+        let denom = (num_train - 1) as f32;
+        let mut expected: Vec<f32> = (0..=num_steps)
+            .map(|j| (j as f32 * denom / num_steps as f32).round_ties_even())
+            .collect();
+        expected.reverse();
+        expected.pop();
+        assert_eq!(timesteps.len(), num_steps);
+        assert!((timesteps[0] - 999.0).abs() < 1e-3, "first timestep {}", timesteps[0]);
+        for (got, want) in timesteps.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-3, "timestep {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn ddim_exposes_descending_integer_timesteps() {
+        let sched =
+            DdimSchedule::with_schedule(1000, 0.00085, 0.012, "scaled_linear", 4).expect("builds");
+        // step_ratio = 250, ascending = [0, 250, 500, 750], reversed for inference.
+        assert_eq!(sched.timesteps(), Some(vec![750.0, 500.0, 250.0, 0.0]));
+    }
+
+    #[test]
+    fn dpmpp_final_step_stays_finite_with_zero_final_sigma() {
+        // With >= 15 steps and a zero final sigma (final_sigmas_type="zero"), the
+        // last step must drop to the first-order update; the second-order update
+        // divides by an infinite log-SNR step at sigma=0 and would emit NaN/inf.
+        let num_steps = 20usize;
+        let sched = Dpmpp2m::with_schedule(1000, 0.00085, 0.012, "scaled_linear", num_steps, "")
+            .expect("schedule builds");
+        sched.reset();
+        let mut sample = Value::from_slice_f32(&[1.0, -0.5, 0.25], &[3]).unwrap();
+        for step in 0..num_steps {
+            let eps = Value::from_slice_f32(&[0.3, -0.2, 0.1], &[3]).unwrap();
+            sample = sched.step(step, num_steps, &sample, &eps).unwrap();
+        }
+        assert!(
+            sample.to_vec_f32().unwrap().iter().all(|value| value.is_finite()),
+            "final dpm++ sample must be finite"
+        );
     }
 
     fn component(role: &str) -> PipelineComponentSpec {

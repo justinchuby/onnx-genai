@@ -40,3 +40,7 @@ path = "src/bin/onnx-genai.rs"
 [[bin]]
 name = "run_comfyui"
 path = "src/bin/run_comfyui.rs"
+
+[[bin]]
+name = "render_sd"
+path = "src/bin/render_sd.rs"
