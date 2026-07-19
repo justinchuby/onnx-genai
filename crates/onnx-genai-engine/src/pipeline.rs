@@ -808,10 +808,11 @@ struct DdimSchedule {
 }
 
 impl DdimSchedule {
-    fn new(
+    fn with_schedule(
         num_train_timesteps: usize,
         beta_start: f32,
         beta_end: f32,
+        beta_schedule: &str,
         num_steps: usize,
     ) -> anyhow::Result<Self> {
         if num_train_timesteps < 2 {
@@ -822,12 +823,24 @@ impl DdimSchedule {
                 "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
             );
         }
-        // Linear beta schedule -> cumulative product of alphas.
+        // Beta schedule -> cumulative product of alphas.
+        //   linear:        beta_i = lerp(beta_start, beta_end)
+        //   scaled_linear: beta_i = lerp(sqrt(beta_start), sqrt(beta_end))^2  (Stable Diffusion)
         let denom = (num_train_timesteps - 1) as f32;
+        let (lo, hi, square) = match beta_schedule {
+            "linear" => (beta_start, beta_end, false),
+            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+            other => anyhow::bail!(
+                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+            ),
+        };
         let mut alpha_cumprod = Vec::with_capacity(num_train_timesteps);
         let mut prod = 1.0f32;
         for i in 0..num_train_timesteps {
-            let beta = beta_start + (beta_end - beta_start) * (i as f32) / denom;
+            let mut beta = lo + (hi - lo) * (i as f32) / denom;
+            if square {
+                beta *= beta;
+            }
             prod *= 1.0 - beta;
             alpha_cumprod.push(prod);
         }
@@ -1088,8 +1101,13 @@ fn build_scheduler(
     let num_train = cfg.num_train_timesteps.unwrap_or(1000);
     let beta_start = cfg.beta_start.unwrap_or(0.00085);
     let beta_end = cfg.beta_end.unwrap_or(0.012);
-    Ok(Some(DdimSchedule::new(
-        num_train, beta_start, beta_end, num_steps,
+    let beta_schedule = cfg.beta_schedule.as_deref().unwrap_or("linear");
+    Ok(Some(DdimSchedule::with_schedule(
+        num_train,
+        beta_start,
+        beta_end,
+        beta_schedule,
+        num_steps,
     )?))
 }
 
@@ -1174,7 +1192,7 @@ mod tests {
         // num_steps=1 => timestep t=0 => a_t=0.5, a_prev=1.0 (final step).
         //   x0_hat = (x - sqrt(0.5)*e) / sqrt(0.5)
         //   next   = sqrt(1)*x0_hat + sqrt(0)*e = x0_hat
-        let sched = DdimSchedule::new(2, 0.5, 0.5, 1).expect("schedule builds");
+        let sched = DdimSchedule::with_schedule(2, 0.5, 0.5, "linear", 1).expect("schedule builds");
         // x=1, e=0 -> next = 1/sqrt(0.5) = sqrt(2) ~= 1.41421356
         let n0 = sched.step(0, &[1.0], &[0.0]).unwrap();
         assert!((n0[0] - std::f32::consts::SQRT_2).abs() < 1e-5, "{}", n0[0]);
@@ -1185,9 +1203,9 @@ mod tests {
 
     #[test]
     fn ddim_new_rejects_invalid_step_counts() {
-        assert!(DdimSchedule::new(1, 0.1, 0.2, 1).is_err()); // num_train < 2
-        assert!(DdimSchedule::new(4, 0.1, 0.2, 0).is_err()); // num_steps == 0
-        assert!(DdimSchedule::new(4, 0.1, 0.2, 5).is_err()); // num_steps > num_train
+        assert!(DdimSchedule::with_schedule(1, 0.1, 0.2, "linear", 1).is_err()); // num_train < 2
+        assert!(DdimSchedule::with_schedule(4, 0.1, 0.2, "linear", 0).is_err()); // num_steps == 0
+        assert!(DdimSchedule::with_schedule(4, 0.1, 0.2, "linear", 5).is_err()); // num_steps > num_train
     }
 
     fn component(role: &str) -> PipelineComponentSpec {

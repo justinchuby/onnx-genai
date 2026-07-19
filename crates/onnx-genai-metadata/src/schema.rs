@@ -728,6 +728,10 @@ pub struct SchedulerSpec {
     #[schemars(range(min = 0.0))]
     pub beta_end: Option<f32>,
 
+    /// Beta schedule shape: `"linear"` (default) or `"scaled_linear"` (Stable
+    /// Diffusion).
+    pub beta_schedule: Option<String>,
+
     /// Model output parameterization; `"epsilon"` is supported (default).
     pub prediction_type: Option<String>,
 }

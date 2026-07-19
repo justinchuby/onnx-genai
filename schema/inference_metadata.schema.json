@@ -1518,6 +1518,13 @@
           "format": "float",
           "minimum": 0.0
         },
+        "beta_schedule": {
+          "description": "Beta schedule shape: `\"linear\"` (default) or `\"scaled_linear\"` (Stable\nDiffusion).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "beta_start": {
           "description": "Linear beta-schedule start (default 0.00085).",
           "type": [
