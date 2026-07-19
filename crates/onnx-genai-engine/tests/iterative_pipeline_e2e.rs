@@ -306,3 +306,75 @@ pipeline:
     }
     Ok(())
 }
+
+#[test]
+fn iterative_ddim_scheduler_transforms_loop_carried_sample() -> anyhow::Result<()> {
+    // denoiser_step outputs `denoised = sample + t`. With timestep_input=t and
+    // no explicit schedule, step 0 injects t=0, so the model output (treated as
+    // the noise prediction eps) equals the input sample. DDIM(num_train=2,
+    // beta=0.5, num_steps=1) then maps sample=1, eps=1 -> sqrt(2) - 1.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 1
+    timestep_input: t
+    scheduler_config:
+      kind: ddim
+      num_train_timesteps: 2
+      beta_start: 0.5
+      beta_end: 0.5
+";
+    let dir = fixture_with_metadata("diffusion-ddim", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request =
+        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+
+    // Post-scheduler sample is published under the input-port key.
+    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let expected = std::f32::consts::SQRT_2 - 1.0;
+    for got in &sample {
+        assert!((got - expected).abs() < 1e-5, "sample {got} != {expected}");
+    }
+    // The raw model output (eps) is still published under the output-port key.
+    let eps = out.get("denoiser.denoised").expect("model output").to_vec_f32()?;
+    for got in &eps {
+        assert!((got - 1.0).abs() < 1e-5, "eps {got} != 1.0");
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_scheduler_kind_is_rejected_at_load() -> anyhow::Result<()> {
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 2
+    scheduler_config:
+      kind: euler
+";
+    let dir = fixture_with_metadata("diffusion-bad-scheduler", &["denoiser.onnx"], metadata)?;
+    let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
+        .err()
+        .expect("unsupported scheduler kind must be rejected");
+    assert!(err.to_string().contains("scheduler kind"), "unexpected: {err}");
+    Ok(())
+}

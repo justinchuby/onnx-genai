@@ -1106,6 +1106,17 @@
             "null"
           ]
         },
+        "scheduler_config": {
+          "description": "Optional diffusion scheduler applied to the denoiser's loop-carried\noutput (treating it as a noise prediction) each step.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchedulerSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "speculative": {
           "description": "Runtime-specific speculative execution parameters."
         },
@@ -1484,6 +1495,53 @@
       },
       "required": [
         "dtype"
+      ]
+    },
+    "SchedulerSpec": {
+      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\nand applies one scheduler step per iteration. Currently only `ddim`\n(η = 0, epsilon-prediction) with a linear beta schedule is supported.",
+      "type": "object",
+      "properties": {
+        "beta_end": {
+          "description": "Linear beta-schedule end (default 0.012).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "beta_start": {
+          "description": "Linear beta-schedule start (default 0.00085).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "kind": {
+          "description": "Scheduler algorithm; `\"ddim\"` is supported.",
+          "type": "string"
+        },
+        "num_train_timesteps": {
+          "description": "Training timesteps the noise schedule was defined over (default 1000).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 2
+        },
+        "prediction_type": {
+          "description": "Model output parameterization; `\"epsilon\"` is supported (default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
       ]
     },
     "SharedKvGroup": {

@@ -670,6 +670,11 @@ pub struct PipelineStrategy {
     #[serde(default)]
     pub timesteps: Option<Vec<f32>>,
 
+    /// Optional diffusion scheduler applied to the denoiser's loop-carried
+    /// output (treating it as a noise prediction) each step.
+    #[serde(default)]
+    pub scheduler_config: Option<SchedulerSpec>,
+
     /// Classifier-free guidance scale or equivalent strategy-specific multiplier.
     #[schemars(range(min = 0.0))]
     pub guidance_scale: Option<f32>,
@@ -694,6 +699,32 @@ pub struct PipelineStrategyStage {
 
     /// Optional phase gate for the stage.
     pub run_on: Option<PhaseRunOn>,
+}
+
+/// Diffusion scheduler configuration for an iterative strategy.
+///
+/// The runtime treats the denoiser's loop-carried output as a noise prediction
+/// and applies one scheduler step per iteration. Currently only `ddim`
+/// (η = 0, epsilon-prediction) with a linear beta schedule is supported.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct SchedulerSpec {
+    /// Scheduler algorithm; `"ddim"` is supported.
+    pub kind: String,
+
+    /// Training timesteps the noise schedule was defined over (default 1000).
+    #[schemars(range(min = 2))]
+    pub num_train_timesteps: Option<usize>,
+
+    /// Linear beta-schedule start (default 0.00085).
+    #[schemars(range(min = 0.0))]
+    pub beta_start: Option<f32>,
+
+    /// Linear beta-schedule end (default 0.012).
+    #[schemars(range(min = 0.0))]
+    pub beta_end: Option<f32>,
+
+    /// Model output parameterization; `"epsilon"` is supported (default).
+    pub prediction_type: Option<String>,
 }
 
 /// Pipeline execution strategy family.

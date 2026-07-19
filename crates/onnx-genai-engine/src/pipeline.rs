@@ -14,7 +14,7 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_metadata::{
     DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
-    PipelineVisionConfig,
+    PipelineVisionConfig, SchedulerSpec,
 };
 use onnx_genai_ort::{
     PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
@@ -303,7 +303,13 @@ impl PipelineEngine {
             .session(&plan.denoiser)
             .with_context(|| format!("pipeline denoiser '{}' was not loaded", plan.denoiser))?;
 
-        let mut loop_state: HashMap<String, Value> = HashMap::new();
+        // `carried` holds the value to feed each loop-carried INPUT port next
+        // step (keyed by input port); `last_outputs` holds the denoiser's raw
+        // outputs from the final step (keyed by output port). Keeping them
+        // separate from the immutable `constants` pool prevents an output whose
+        // name collides with a conditioning input from clobbering it.
+        let mut carried: HashMap<String, Value> = HashMap::new();
+        let mut last_outputs: HashMap<String, Value> = HashMap::new();
         for step in 0..plan.num_steps {
             // Timestep/sigma for this step: explicit schedule when provided,
             // otherwise the 0-based step index.
@@ -312,6 +318,9 @@ impl PipelineEngine {
                 .as_ref()
                 .map(|ts| ts[step])
                 .unwrap_or(step as f32);
+            // Value fed to each loop-carried input this step (needed by the
+            // scheduler, which transforms `(sample, model_output)`).
+            let mut sample_in: HashMap<String, Value> = HashMap::new();
             let mut inputs: Vec<(String, Value)> = Vec::new();
             for info in denoiser.inputs() {
                 let port = info.name.as_str();
@@ -321,22 +330,17 @@ impl PipelineEngine {
                     inputs.push((port.to_string(), Value::from_slice_f32(&[timestep], &[1])?));
                     continue;
                 }
-                let value = if let Some((out_port, _)) =
-                    plan.loop_edges.iter().find(|(_, in_port)| in_port == port)
-                {
+                let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
+                let value = if is_loop {
                     // Loop-carried: step 0 seeds from the external initial
-                    // tensor; later steps read the previous step's output.
+                    // tensor; later steps read the carried value for this port.
                     if step == 0 {
                         constants.get(&endpoint).with_context(|| {
                             format!("missing iterative pipeline seed '{endpoint}' at step 0")
                         })?
                     } else {
-                        loop_state.get(out_port).with_context(|| {
-                            format!(
-                                "loop-carried output '{}.{out_port}' was not produced at step {}",
-                                plan.denoiser,
-                                step - 1
-                            )
+                        carried.get(port).with_context(|| {
+                            format!("loop-carried input '{endpoint}' was not produced")
                         })?
                     }
                 } else {
@@ -352,7 +356,11 @@ impl PipelineEngine {
                         .or(routed)
                         .with_context(|| format!("missing pipeline input '{endpoint}'"))?
                 };
-                inputs.push((port.to_string(), clone_value(value)?));
+                let cloned = clone_value(value)?;
+                if is_loop {
+                    sample_in.insert(port.to_string(), clone_value(value)?);
+                }
+                inputs.push((port.to_string(), cloned));
             }
             let refs = inputs
                 .iter()
@@ -361,16 +369,44 @@ impl PipelineEngine {
             let outputs = denoiser.run(&refs).map_err(|e| {
                 anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
             })?;
+            let mut out_map: HashMap<String, Value> = HashMap::new();
             for (name, value) in denoiser.output_names().iter().zip(outputs) {
-                loop_state.insert(name.clone(), value);
+                out_map.insert(name.clone(), value);
             }
+
+            // Compute the next value for each loop-carried input. Without a
+            // scheduler this is identity feedback (output -> input). With a
+            // scheduler the output is a noise prediction and the next sample is
+            // `scheduler.step(sample_in, prediction)`.
+            for (out_port, in_port) in &plan.loop_edges {
+                let model_output = out_map.get(out_port).with_context(|| {
+                    format!("denoiser did not produce loop output '{}.{out_port}'", plan.denoiser)
+                })?;
+                let next = if let Some(scheduler) = &plan.scheduler {
+                    let sample = sample_in.get(in_port).with_context(|| {
+                        format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
+                    })?;
+                    let shape = sample.shape().to_vec();
+                    let stepped =
+                        scheduler.step(step, &sample.to_vec_f32()?, &model_output.to_vec_f32()?)?;
+                    Value::from_slice_f32(&stepped, &shape)?
+                } else {
+                    clone_value(model_output)?
+                };
+                carried.insert(in_port.clone(), next);
+            }
+            last_outputs = out_map;
         }
 
-        // Publish the final denoiser outputs, then run final-phase components
-        // (e.g. a VAE) once over the combined tensor pool.
+        // Publish the final denoiser outputs (raw predictions) and the final
+        // loop-carried samples, then run final-phase components once. A VAE can
+        // route from either the output port or the (post-scheduler) sample port.
         let mut tensors = constants;
-        for (name, value) in loop_state {
-            tensors.insert(format!("{}.{}", plan.denoiser, name), value);
+        for (out_port, value) in last_outputs {
+            tensors.insert(format!("{}.{}", plan.denoiser, out_port), value);
+        }
+        for (in_port, value) in carried {
+            tensors.insert(format!("{}.{}", plan.denoiser, in_port), value);
         }
         self.run_prompt_phase_components(&plan.final_components, &mut tensors)?;
         Ok(tensors)
@@ -707,7 +743,87 @@ struct IterativePlan {
     /// Explicit per-step timestep schedule (length == `num_steps`); when absent
     /// the 0-based step index is fed instead.
     timesteps: Option<Vec<f32>>,
+    /// Optional DDIM scheduler applied to loop-carried edges (treats the
+    /// denoiser output as a noise prediction; `None` = identity feedback).
+    scheduler: Option<DdimSchedule>,
     dataflow: Vec<DataflowEdge>,
+}
+
+/// DDIM (η = 0, epsilon-prediction) noise schedule, precomputed per inference
+/// step as `(alpha_cumprod_t, alpha_cumprod_prev)`.
+///
+/// Diffusion-standard update for a model that predicts noise `eps`:
+///   `x0_hat = (x_t - sqrt(1 - a_t) * eps) / sqrt(a_t)`
+///   `x_prev = sqrt(a_prev) * x0_hat + sqrt(1 - a_prev) * eps`
+#[derive(Debug, Clone)]
+struct DdimSchedule {
+    steps: Vec<(f32, f32)>,
+}
+
+impl DdimSchedule {
+    fn new(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        num_steps: usize,
+    ) -> anyhow::Result<Self> {
+        if num_train_timesteps < 2 {
+            anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+        }
+        if num_steps == 0 || num_steps > num_train_timesteps {
+            anyhow::bail!(
+                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
+            );
+        }
+        // Linear beta schedule -> cumulative product of alphas.
+        let denom = (num_train_timesteps - 1) as f32;
+        let mut alpha_cumprod = Vec::with_capacity(num_train_timesteps);
+        let mut prod = 1.0f32;
+        for i in 0..num_train_timesteps {
+            let beta = beta_start + (beta_end - beta_start) * (i as f32) / denom;
+            prod *= 1.0 - beta;
+            alpha_cumprod.push(prod);
+        }
+        // Evenly spaced inference timesteps, descending (diffusers convention).
+        let step_ratio = num_train_timesteps / num_steps;
+        let ascending: Vec<usize> = (0..num_steps).map(|i| i * step_ratio).collect();
+        let mut steps = Vec::with_capacity(num_steps);
+        for k in 0..num_steps {
+            let t = ascending[num_steps - 1 - k];
+            let a_t = alpha_cumprod[t];
+            let a_prev = if k + 1 < num_steps {
+                alpha_cumprod[ascending[num_steps - 1 - (k + 1)]]
+            } else {
+                1.0
+            };
+            steps.push((a_t, a_prev));
+        }
+        Ok(Self { steps })
+    }
+
+    /// Apply one DDIM step to `sample` given the model's noise prediction `eps`.
+    fn step(&self, k: usize, sample: &[f32], eps: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if sample.len() != eps.len() {
+            anyhow::bail!(
+                "scheduler sample/eps length mismatch: {} vs {}",
+                sample.len(),
+                eps.len()
+            );
+        }
+        let (a_t, a_prev) = self.steps[k];
+        let sqrt_a_t = a_t.sqrt();
+        let sqrt_one_minus_a_t = (1.0 - a_t).sqrt();
+        let sqrt_a_prev = a_prev.sqrt();
+        let sqrt_one_minus_a_prev = (1.0 - a_prev).sqrt();
+        Ok(sample
+            .iter()
+            .zip(eps)
+            .map(|(&x, &e)| {
+                let x0_hat = (x - sqrt_one_minus_a_t * e) / sqrt_a_t;
+                sqrt_a_prev * x0_hat + sqrt_one_minus_a_prev * e
+            })
+            .collect())
+    }
 }
 
 impl PipelinePlan {
@@ -839,6 +955,7 @@ impl PipelinePlan {
             loop_edges,
             timestep_input: spec.strategy.timestep_input.clone(),
             timesteps: spec.strategy.timesteps.clone(),
+            scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps)?,
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -885,6 +1002,36 @@ fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result
         }
     }
     Ok(prompt_components)
+}
+
+/// Build a DDIM scheduler from the declared config, or `None` when no scheduler
+/// is configured. Only `ddim` + `epsilon` prediction is supported today.
+fn build_scheduler(
+    config: Option<&SchedulerSpec>,
+    num_steps: usize,
+) -> anyhow::Result<Option<DdimSchedule>> {
+    let Some(cfg) = config else {
+        return Ok(None);
+    };
+    if cfg.kind != "ddim" {
+        anyhow::bail!(
+            "unsupported scheduler kind '{}' (only 'ddim' is supported)",
+            cfg.kind
+        );
+    }
+    if let Some(prediction) = cfg.prediction_type.as_deref()
+        && prediction != "epsilon"
+    {
+        anyhow::bail!(
+            "unsupported scheduler prediction_type '{prediction}' (only 'epsilon' is supported)"
+        );
+    }
+    let num_train = cfg.num_train_timesteps.unwrap_or(1000);
+    let beta_start = cfg.beta_start.unwrap_or(0.00085);
+    let beta_end = cfg.beta_end.unwrap_or(0.012);
+    Ok(Some(DdimSchedule::new(
+        num_train, beta_start, beta_end, num_steps,
+    )?))
 }
 
 fn autoregressive_decoder(strategy: &PipelineStrategy) -> Option<String> {
@@ -960,6 +1107,29 @@ mod tests {
     use super::*;
     use onnx_genai_metadata::{PhaseConfig, PipelineComponentSpec, PipelineStrategyStage};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn ddim_step_matches_hand_computed_closed_form() {
+        // num_train=2, beta_start=beta_end=0.5 => betas=[0.5,0.5],
+        // alphas=[0.5,0.5], alpha_cumprod=[0.5,0.25].
+        // num_steps=1 => timestep t=0 => a_t=0.5, a_prev=1.0 (final step).
+        //   x0_hat = (x - sqrt(0.5)*e) / sqrt(0.5)
+        //   next   = sqrt(1)*x0_hat + sqrt(0)*e = x0_hat
+        let sched = DdimSchedule::new(2, 0.5, 0.5, 1).expect("schedule builds");
+        // x=1, e=0 -> next = 1/sqrt(0.5) = sqrt(2) ~= 1.41421356
+        let n0 = sched.step(0, &[1.0], &[0.0]).unwrap();
+        assert!((n0[0] - std::f32::consts::SQRT_2).abs() < 1e-5, "{}", n0[0]);
+        // x=1, e=1 -> x0_hat = (1 - sqrt(0.5))/sqrt(0.5) = sqrt(2) - 1 ~= 0.41421356
+        let n1 = sched.step(0, &[1.0], &[1.0]).unwrap();
+        assert!((n1[0] - (std::f32::consts::SQRT_2 - 1.0)).abs() < 1e-5, "{}", n1[0]);
+    }
+
+    #[test]
+    fn ddim_new_rejects_invalid_step_counts() {
+        assert!(DdimSchedule::new(1, 0.1, 0.2, 1).is_err()); // num_train < 2
+        assert!(DdimSchedule::new(4, 0.1, 0.2, 0).is_err()); // num_steps == 0
+        assert!(DdimSchedule::new(4, 0.1, 0.2, 5).is_err()); // num_steps > num_train
+    }
 
     fn component(role: &str) -> PipelineComponentSpec {
         PipelineComponentSpec {
@@ -1069,6 +1239,7 @@ pipeline:
                 num_steps: None,
                 timestep_input: None,
                 timesteps: None,
+                scheduler_config: None,
                 guidance_scale: None,
                 state: None,
                 stages: vec![
@@ -1088,6 +1259,7 @@ pipeline:
                             num_steps: None,
                             timestep_input: None,
                             timesteps: None,
+                            scheduler_config: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
@@ -1110,6 +1282,7 @@ pipeline:
                             num_steps: None,
                             timestep_input: None,
                             timesteps: None,
+                            scheduler_config: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
