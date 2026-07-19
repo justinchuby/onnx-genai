@@ -1362,13 +1362,13 @@ distributed:
 rank registration and potential tensor injection. An attacker joining as a fake rank
 could corrupt all-reduce results or exfiltrate model weights.
 
-### D10: Model metadata hint namespace (`pkg.nxrt.hint.*`)
+### D10: Model metadata hint namespace (`com.nxrt.hint.*`)
 
 **Decision:** Runtime-advisory hints are stored in ONNX `metadata_props`
 (`map<string, string>`) on `NodeProto` using a structured namespace:
 
 ```
-pkg.nxrt.hint.{category}.{specific}
+com.nxrt.hint.{category}.{specific}
 ```
 
 **Categories:**
@@ -1379,7 +1379,7 @@ pkg.nxrt.hint.{category}.{specific}
 
 **Per-config specialization (optional):**
 ```
-pkg.nxrt.hint.config.{config_name}.{category}.{specific}
+com.nxrt.hint.config.{config_name}.{category}.{specific}
 ```
 
 Allows the same model to carry different hints for different deployment scenarios.
@@ -1387,19 +1387,19 @@ Allows the same model to carry different hints for different deployment scenario
 **Example — same model, multiple configs:**
 ```
 # Generic (default)
-pkg.nxrt.hint.placement.shard_axis: "0"
-pkg.nxrt.hint.placement.shard_count: "8"
-pkg.nxrt.hint.expert.affinity_group: "routing_cluster_0"
-pkg.nxrt.hint.expert.activation_frequency: "0.73"
-pkg.nxrt.hint.memory.tier: "hot"
+com.nxrt.hint.placement.shard_axis: "0"
+com.nxrt.hint.placement.shard_count: "8"
+com.nxrt.hint.expert.affinity_group: "routing_cluster_0"
+com.nxrt.hint.expert.activation_frequency: "0.73"
+com.nxrt.hint.memory.tier: "hot"
 
 # 4×Mac Studio specialization
-pkg.nxrt.hint.config.mac_cluster.placement.shard_count: "4"
-pkg.nxrt.hint.config.mac_cluster.memory.tier: "unified"
+com.nxrt.hint.config.mac_cluster.placement.shard_count: "4"
+com.nxrt.hint.config.mac_cluster.memory.tier: "unified"
 
 # Single-GPU specialization
-pkg.nxrt.hint.config.single_gpu.expert.prefetch_window: "2"
-pkg.nxrt.hint.config.single_gpu.memory.offload_priority: "1"
+com.nxrt.hint.config.single_gpu.expert.prefetch_window: "2"
+com.nxrt.hint.config.single_gpu.memory.offload_priority: "1"
 ```
 
 **Resolution logic:**
@@ -1411,20 +1411,20 @@ fn resolve_hint(
 ) -> Option<String> {
     // 1. Specialized config hint takes priority
     if let Some(cfg) = active_config {
-        let specialized = format!("pkg.nxrt.hint.config.{cfg}.{key}");
+        let specialized = format!("com.nxrt.hint.config.{cfg}.{key}");
         if let Some(v) = node_metadata.get(&specialized) {
             return Some(v.clone());
         }
     }
     // 2. Fallback to generic hint
-    node_metadata.get(&format!("pkg.nxrt.hint.{key}")).cloned()
+    node_metadata.get(&format!("com.nxrt.hint.{key}")).cloned()
 }
 ```
 
 **Relationship with ONNX native sharding (D6):**
 - ONNX `ShardingSpecProto` → structured TP/PP placement (protobuf fields)
-- `pkg.nxrt.hint.*` → runtime-specific scheduling/memory/precision (metadata_props)
-- Both coexist; ONNX spec handles what it standardizes, `pkg.nxrt.hint.*` handles
+- `com.nxrt.hint.*` → runtime-specific scheduling/memory/precision (metadata_props)
+- Both coexist; ONNX spec handles what it standardizes, `com.nxrt.hint.*` handles
   everything else (expert affinity, precision hints, tier preferences, config
   specialization)
 
@@ -1546,7 +1546,7 @@ All questions consolidated from source documents, with decisions.
 11. **Expert-aware scheduling across sessions.** When multiple sessions share a device,
     should the governor prefer expert affinity?
     **Decision:** Model export tools (Mobius) annotate expert affinity groups at
-    export time via `pkg.nxrt.hint.expert.affinity_group` (see D10). Runtime uses
+    export time via `com.nxrt.hint.expert.affinity_group` (see D10). Runtime uses
     hints to seed scheduling; no hints → LRU fallback. Phase 3+.
 
 12. **Prefetch speculation budget.** How many speculative prefetch bytes before the
