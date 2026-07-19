@@ -504,11 +504,11 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
     reg.register(
         OpKey::new("GridSample", "", 16),
-        Box::new(grid_sample::GridSampleFactory),
+        Box::new(grid_sample::GridSampleFactory { since_version: 16 }),
     );
     reg.register(
         OpKey::new("GridSample", "", 20),
-        Box::new(grid_sample::GridSampleFactory),
+        Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
     );
     reg.register(
         OpKey::new("AffineGrid", "", 20),

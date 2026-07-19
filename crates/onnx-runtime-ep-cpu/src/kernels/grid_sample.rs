@@ -23,9 +23,12 @@ pub struct GridSampleKernel {
     mode: Mode,
     padding_mode: PaddingMode,
     align_corners: bool,
+    since_version: u32,
 }
 
-pub struct GridSampleFactory;
+pub struct GridSampleFactory {
+    pub since_version: u32,
+}
 
 impl KernelFactory for GridSampleFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -65,6 +68,7 @@ impl KernelFactory for GridSampleFactory {
                 .and_then(Attribute::as_int)
                 .unwrap_or(0)
                 != 0,
+            since_version: self.since_version,
         }))
     }
 }
@@ -186,6 +190,11 @@ impl Kernel for GridSampleKernel {
         if !matches!(rank, 4 | 5) {
             return Err(EpError::KernelFailed(
                 "GridSample: X must have rank 4 (2-D) or 5 (volumetric)".into(),
+            ));
+        }
+        if rank == 5 && self.since_version < 20 {
+            return Err(EpError::KernelFailed(
+                "GridSample: 3D input requires opset 20 or later".into(),
             ));
         }
         if grid_shape.len() != rank
@@ -369,13 +378,20 @@ impl Kernel for GridSampleKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::{build_cpu_registry, testutil::Owned};
+    use onnx_runtime_ir::{Node, NodeId};
 
-    fn kernel(mode: Mode, padding_mode: PaddingMode, align_corners: bool) -> GridSampleKernel {
+    fn kernel(
+        since_version: u32,
+        mode: Mode,
+        padding_mode: PaddingMode,
+        align_corners: bool,
+    ) -> GridSampleKernel {
         GridSampleKernel {
             mode,
             padding_mode,
             align_corners,
+            since_version,
         }
     }
 
@@ -384,13 +400,13 @@ mod tests {
         let x = Owned::f32(&[1, 1, 2, 2], &[1., 2., 3., 4.]);
         let grid = Owned::f32(&[1, 1, 2, 2], &[-1., -1., 0., 0.]);
         let mut nearest = Owned::zeros_f32(&[1, 1, 1, 2]);
-        kernel(Mode::Nearest, PaddingMode::Zeros, true)
+        kernel(16, Mode::Nearest, PaddingMode::Zeros, true)
             .execute(&[x.view(), grid.view()], &mut [nearest.view_mut()])
             .unwrap();
         assert_eq!(nearest.to_f32(), vec![1., 1.]);
 
         let mut linear = Owned::zeros_f32(&[1, 1, 1, 2]);
-        kernel(Mode::Linear, PaddingMode::Zeros, true)
+        kernel(16, Mode::Linear, PaddingMode::Zeros, true)
             .execute(&[x.view(), grid.view()], &mut [linear.view_mut()])
             .unwrap();
         assert_eq!(linear.to_f32(), vec![1., 2.5]);
@@ -401,19 +417,19 @@ mod tests {
         let x = Owned::f32(&[1, 1, 1, 3], &[10., 20., 30.]);
         let grid = Owned::f32(&[1, 1, 3, 2], &[-2., 0., 2., 0., -1.5, 0.]);
         let mut zeros = Owned::zeros_f32(&[1, 1, 1, 3]);
-        kernel(Mode::Nearest, PaddingMode::Zeros, true)
+        kernel(16, Mode::Nearest, PaddingMode::Zeros, true)
             .execute(&[x.view(), grid.view()], &mut [zeros.view_mut()])
             .unwrap();
         assert_eq!(zeros.to_f32(), vec![0., 0., 10.]);
 
         let mut border = Owned::zeros_f32(&[1, 1, 1, 3]);
-        kernel(Mode::Nearest, PaddingMode::Border, true)
+        kernel(16, Mode::Nearest, PaddingMode::Border, true)
             .execute(&[x.view(), grid.view()], &mut [border.view_mut()])
             .unwrap();
         assert_eq!(border.to_f32(), vec![10., 30., 10.]);
 
         let mut reflection = Owned::zeros_f32(&[1, 1, 1, 3]);
-        kernel(Mode::Nearest, PaddingMode::Reflection, true)
+        kernel(16, Mode::Nearest, PaddingMode::Reflection, true)
             .execute(&[x.view(), grid.view()], &mut [reflection.view_mut()])
             .unwrap();
         assert_eq!(reflection.to_f32(), vec![20., 20., 10.]);
@@ -421,12 +437,12 @@ mod tests {
         let edge = Owned::f32(&[1, 1, 1, 2], &[4., 8.]);
         let grid = Owned::f32(&[1, 1, 1, 2], &[-1., 0.]);
         let mut unaligned = Owned::zeros_f32(&[1, 1, 1, 1]);
-        kernel(Mode::Linear, PaddingMode::Zeros, false)
+        kernel(16, Mode::Linear, PaddingMode::Zeros, false)
             .execute(&[edge.view(), grid.view()], &mut [unaligned.view_mut()])
             .unwrap();
         assert_eq!(unaligned.to_f32(), vec![2.]);
         let mut aligned = Owned::zeros_f32(&[1, 1, 1, 1]);
-        kernel(Mode::Linear, PaddingMode::Zeros, true)
+        kernel(16, Mode::Linear, PaddingMode::Zeros, true)
             .execute(&[edge.view(), grid.view()], &mut [aligned.view_mut()])
             .unwrap();
         assert_eq!(aligned.to_f32(), vec![4.]);
@@ -437,7 +453,7 @@ mod tests {
         let x = Owned::f32(&[1, 1, 1, 4], &[0., 10., 20., 30.]);
         let grid = Owned::f32(&[1, 1, 1, 2], &[-0.25, 0.]);
         let mut out = Owned::zeros_f32(&[1, 1, 1, 1]);
-        kernel(Mode::Cubic, PaddingMode::Border, true)
+        kernel(16, Mode::Cubic, PaddingMode::Border, true)
             .execute(&[x.view(), grid.view()], &mut [out.view_mut()])
             .unwrap();
         assert!((out.to_f32()[0] - 11.660_156).abs() < 1e-5);
@@ -448,14 +464,55 @@ mod tests {
         let x = Owned::f32(&[1, 1, 2, 2, 2], &[0., 1., 2., 3., 4., 5., 6., 7.]);
         let grid = Owned::f32(&[1, 1, 2, 1, 3], &[-1., -1., -1., 0., 0., 0.]);
         let mut nearest = Owned::zeros_f32(&[1, 1, 1, 2, 1]);
-        kernel(Mode::Nearest, PaddingMode::Zeros, true)
+        kernel(20, Mode::Nearest, PaddingMode::Zeros, true)
             .execute(&[x.view(), grid.view()], &mut [nearest.view_mut()])
             .unwrap();
         assert_eq!(nearest.to_f32(), vec![0., 0.]);
         let mut linear = Owned::zeros_f32(&[1, 1, 1, 2, 1]);
-        kernel(Mode::Linear, PaddingMode::Zeros, true)
+        kernel(20, Mode::Linear, PaddingMode::Zeros, true)
             .execute(&[x.view(), grid.view()], &mut [linear.view_mut()])
             .unwrap();
         assert_eq!(linear.to_f32(), vec![0., 3.5]);
+    }
+
+    #[test]
+    fn registry_gates_volumetric_input_to_opset20() {
+        let registry = build_cpu_registry();
+        let node = Node::new(NodeId(0), "GridSample", vec![], vec![]);
+        let input_2d = Owned::f32(&[1, 1, 1, 1], &[1.]);
+        let grid_2d = Owned::f32(&[1, 1, 1, 2], &[0., 0.]);
+        let input_3d = Owned::f32(&[1, 1, 1, 1, 1], &[1.]);
+        let grid_3d = Owned::f32(&[1, 1, 1, 1, 3], &[0., 0., 0.]);
+
+        for opset in [16, 20] {
+            let mut output = Owned::zeros_f32(&[1, 1, 1, 1]);
+            registry
+                .lookup("GridSample", "", opset)
+                .unwrap()
+                .create(&node, &[])
+                .unwrap()
+                .execute(&[input_2d.view(), grid_2d.view()], &mut [output.view_mut()])
+                .unwrap();
+            assert_eq!(output.to_f32(), vec![1.]);
+        }
+
+        let mut output = Owned::zeros_f32(&[1, 1, 1, 1, 1]);
+        let err = registry
+            .lookup("GridSample", "", 16)
+            .unwrap()
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[input_3d.view(), grid_3d.view()], &mut [output.view_mut()])
+            .unwrap_err();
+        assert!(err.to_string().contains("3D input requires opset 20"));
+
+        registry
+            .lookup("GridSample", "", 20)
+            .unwrap()
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[input_3d.view(), grid_3d.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_f32(), vec![1.]);
     }
 }
