@@ -523,7 +523,7 @@ pub enum ResourceError {
         global_pages: usize,
     },
     HostQuotaDenied {
-        device: DeviceId,
+        device: LocalDeviceId,
         requested_bytes: u64,
         host_available_bytes: u64,
         suggestions: Vec<Remedy>,
@@ -557,15 +557,24 @@ The HostGovernor provides a **single source of truth** for shared memory.
 ```rust
 trait HostGovernor: Send + Sync {
     /// A device requests host RAM pages for offload (VRAM → host).
+    /// A device requests host RAM pages for offload (VRAM → host).
+    /// `device` is a local ordinal — HostGovernor is per-machine, so local
+    /// identification suffices. In distributed contexts, ClusterCoordinator
+    /// maps `GlobalDeviceId` → `(NodeId, LocalDeviceId)` before dispatching
+    /// to the appropriate node's HostGovernor.
     fn request_host_pages(
         &self,
-        device: DeviceId,
+        device: LocalDeviceId,
         bytes: usize,
         priority: Priority,
     ) -> Result<HostAllocation>;
 
     /// Release previously granted host pages.
     fn release_host_pages(&self, alloc: HostAllocation);
+
+    /// Non-blocking: enqueue a pressure request. Returns immediately.
+    /// Caller waits on the returned Notify, NOT under any lock.
+    fn enqueue_pressure_request(&self, request: PressureRequest) -> Arc<Notify>;
 
     /// Current host RAM limit.
     fn host_ram_limit(&self) -> ResourceLimit;
@@ -583,13 +592,24 @@ trait HostGovernor: Send + Sync {
     fn snapshot(&self) -> HostSnapshot;
 }
 
+/// Local device identifier — ordinal within a single machine.
+/// HostGovernor uses this because it is per-machine scoped.
+pub struct LocalDeviceId(pub u32);
+
+/// Global device identifier for cross-node contexts.
+/// ClusterCoordinator maps: GlobalDeviceId → (NodeId, LocalDeviceId).
+pub struct GlobalDeviceId {
+    pub node: NodeId,
+    pub local: LocalDeviceId,
+}
+
 /// Snapshot of machine-wide shared memory usage.
 pub struct HostSnapshot {
     pub host_ram_limit_bytes: u64,
     pub host_ram_used_bytes: u64,
     pub host_ram_headroom_bytes: u64,
     /// Per-device breakdown of host RAM usage.
-    pub per_device_host_usage: Vec<(DeviceId, u64)>,
+    pub per_device_host_usage: Vec<(LocalDeviceId, u64)>,
     pub disk_spill_limit_bytes: Option<u64>,
     pub disk_spill_used_bytes: u64,
     pub pinned_memory_bytes: u64,
@@ -611,44 +631,93 @@ When a DeviceGovernor needs to offload data from device memory to host RAM:
 5. **Release:** DeviceGovernor calls `release_host_pages()` when data is
    promoted back to VRAM or no longer needed.
 
-### 5.3.1 Lock Ordering and Deadlock Prevention
+### 5.3.1 Deadlock Prevention: Epoch-Based Non-Blocking Pressure Protocol
 
+**INVARIANT: No thread ever WAITS while holding a governor lock.**
+
+The earlier "lock ordering" approach (Host → Device[0] → Device[1]) is
+insufficient because: a HostGovernor lock serializing requests means a waiting
+request holds the lock, but a reclaiming device needs that same lock to release
+pages — deadlock.
+
+Instead, we use an **epoch-based non-blocking protocol:**
+
+```rust
+/// Pressure protocol — non-blocking, epoch-based.
+///
+/// INVARIANT: No thread ever WAITS while holding a governor lock.
+///
+/// Protocol:
+/// 1. DeviceGovernor needs host pages:
+///    - Acquire HostGovernor lock BRIEFLY (not while waiting)
+///    - Create a PressureRequest { epoch, device, bytes_needed }
+///    - Release HostGovernor lock immediately
+///    - Wait on a Notify/condvar (NOT under any lock)
+///
+/// 2. HostGovernor processes pressure:
+///    - Background task drains PressureRequest queue
+///    - Sends ReclaimNotice to other DeviceGovernors (non-blocking channel)
+///    - Does NOT wait for reclaim completion under its own lock
+///
+/// 3. Other DeviceGovernor receives ReclaimNotice:
+///    - Evicts pages at its own pace
+///    - Calls host.release_pages() which briefly locks HostGovernor to update ledger
+///    - HostGovernor checks if any pending PressureRequest can now be satisfied
+///    - If yes, notifies the waiting device via its condvar
+///
+/// No lock is ever held while waiting for another actor.
+
+pub struct PressureRequest {
+    pub epoch: u64,
+    pub device: LocalDeviceId,
+    pub bytes_needed: usize,
+    pub notify: Arc<Notify>,  // woken when satisfied
+}
 ```
-Lock acquisition order (MUST be followed to prevent deadlock):
-1. HostGovernor lock (coarsest)
-2. DeviceGovernor[0] lock
-3. DeviceGovernor[1] lock
-4. ... (by device ordinal)
 
-Rule: A thread holding a DeviceGovernor lock MUST NOT acquire the
-HostGovernor lock. If a DeviceGovernor needs host pages, it must
-release its own lock first, acquire HostGovernor, then re-acquire
-its device lock and re-validate.
-```
+**The rule is simple: no lock is held across an await/wait point.**
 
-**Pressure flow:**
+**Pressure flow under this model:**
 
-- **HostGovernor under pressure** → notifies all DeviceGovernors to stop offloading
-  (via a non-blocking pressure signal, not a lock acquisition).
-- **DeviceGovernor under pressure** → requests host pages from HostGovernor
-  (following lock order: release device lock, acquire host lock, re-acquire device
-  lock, re-validate state).
-- **Circular pressure (both under pressure simultaneously)** → DeviceGovernor
-  evicts to disk (cold tier) instead of host, breaking the cycle.
+1. **DeviceGovernor needs host pages:**
+   - Briefly locks HostGovernor to enqueue `PressureRequest`.
+   - Releases lock immediately.
+   - Waits on `notify` (no lock held).
 
-**Request cancellation and timeout:** Host page requests carry a deadline. If the
-HostGovernor cannot satisfy the request within the deadline (e.g., waiting for
-cross-device reclaim), it returns `HostQuotaDenied` rather than blocking
-indefinitely. The requesting DeviceGovernor can then fall back to disk spill or
-reject its own caller.
+2. **HostGovernor background task:**
+   - Drains pressure queue (under brief lock).
+   - Sends `ReclaimNotice` to other DeviceGovernors via non-blocking channels.
+   - Never waits for reclaim completion.
 
-**Test scenario — two devices simultaneously offloading under host pressure:**
-1. GPU 0 releases its device lock, requests 10GB from HostGovernor.
-2. GPU 1 simultaneously releases its device lock, requests 8GB from HostGovernor.
-3. HostGovernor lock serializes both requests. First wins (FIFO); second either
-   fits in remaining headroom or triggers cross-device pressure/disk spill.
-4. Both GPUs re-acquire their device locks and re-validate (state may have changed
-   while locks were released).
+3. **Reclaiming DeviceGovernor:**
+   - Receives `ReclaimNotice` asynchronously.
+   - Evicts pages at its own pace.
+   - Calls `host.release_pages()` — briefly locks HostGovernor to update ledger.
+   - HostGovernor checks pending requests and wakes satisfied waiters.
+
+**Why this cannot deadlock:**
+- No thread holds a lock while waiting for another thread.
+- `release_pages()` only briefly locks HostGovernor to update counters and check
+  pending requests — it never waits for external events under that lock.
+- All cross-actor communication is via non-blocking channels or condvar wakeups.
+
+**Epoch semantics:** Each `PressureRequest` carries a monotonic epoch. Stale
+requests (from a previous reconfigure cycle) are discarded. A DeviceGovernor that
+no longer needs pages (e.g., session ended) cancels by dropping its `Notify`.
+
+**Timeout:** If a `PressureRequest` is not satisfied within a deadline, the
+waiting device's condvar times out and the DeviceGovernor falls back to disk
+spill or returns `HostQuotaDenied` to its caller.
+
+**Test scenario — two devices simultaneously requesting under host pressure:**
+1. GPU 0 enqueues PressureRequest(epoch=42, 10GB), releases lock, waits on notify_0.
+2. GPU 1 enqueues PressureRequest(epoch=43, 8GB), releases lock, waits on notify_1.
+3. Background task sends ReclaimNotice to both GPUs (non-blocking channel).
+4. GPU 0 evicts 5GB, calls release_pages() → HostGovernor updates ledger, checks
+   pending: GPU 1's 8GB still unsatisfied. Wakes nobody yet.
+5. GPU 1 evicts 12GB, calls release_pages() → HostGovernor updates ledger, checks
+   pending: GPU 0's 10GB now satisfiable. Wakes notify_0.
+6. GPU 0 proceeds. GPU 1's request satisfied by remaining headroom. Wakes notify_1.
 
 ### 5.4 Config Surface
 
@@ -767,7 +836,7 @@ trait ClusterCoordinator: Send + Sync {
     fn register_shared_weight(
         &self,
         region: &WeightRegion,
-        device: DeviceId,
+        device: LocalDeviceId,
     ) -> Result<SharedWeightHandle>;
 
     /// Acquire a read-only view of a shared weight. Ref-counted;
@@ -909,12 +978,12 @@ For multi-node (e.g., Mac Studio cluster), the coordinator splits into:
 │ └── Session 1 (GPU 1)     │    │ └── Session 3 (MLX)       │
 └───────────┬───────────────┘    └───────────┬───────────────┘
             │                                │
-            └───────── GlobalCoordinator ─────┘
+            └───────── ClusterCoordinator ──────┘
                        (in genai-server)
 ```
 
-Cross-node expert migration transfers weights via the Communicator (§6). Within a
-node, shared weights use zero-copy IPC. The `GlobalCoordinator` delegates intra-node
+Cross-node expert migration transfers weights via the Communicator (§7). Within a
+node, shared weights use zero-copy IPC. The `ClusterCoordinator` delegates intra-node
 sharing to the `LocalCoordinator`.
 
 ---
@@ -923,35 +992,27 @@ sharing to the `LocalCoordinator`.
 
 The `Communicator` trait is the runtime-level communication abstraction for
 distributed inference. It lives alongside EPs in the runtime — EPs produce
-tensors; the Communicator moves them between devices. Full design in
-[DISTRIBUTED_RUNTIME.md §3](./DISTRIBUTED_RUNTIME.md).
+tensors; the Communicator moves them between devices.
 
-### 7.1 Core Trait
+> See [DISTRIBUTED_RUNTIME.md §3.1](./DISTRIBUTED_RUNTIME.md) for the canonical
+> `Communicator` trait definition (including `CommHandle`, `all_to_all_v`,
+> `exchange_counts`). This section summarizes the interface and focuses on how
+> communication interacts with memory governance.
+
+### 7.1 Core Trait (Summary)
+
+The canonical `Communicator` trait (defined in DISTRIBUTED_RUNTIME.md §3.1)
+provides:
+
+- **Collectives:** `all_reduce`, `all_to_all`, `all_to_all_v`, `all_gather`,
+  `broadcast`, `reduce_scatter`
+- **Point-to-point:** `send`, `recv` with `CommHandle` for async completion
+- **Synchronization:** `barrier`
+- **Metadata:** `rank()`, `world_size()`, `backend_name()`, `exchange_counts()`
 
 ```rust
-#[async_trait]
-pub trait Communicator: Send + Sync {
-    fn rank(&self) -> Rank;
-    fn world_size(&self) -> usize;
-    fn backend_name(&self) -> &str;
-
-    // ── Collectives ──
-    async fn all_reduce(&self, tensor: &mut DeviceBuffer, len: usize, dtype: DType, op: ReduceOp) -> Result<()>;
-    async fn all_to_all(&self, send_bufs: &[&DeviceBuffer], recv_bufs: &mut [&mut DeviceBuffer], chunk_sizes: &[usize], dtype: DType) -> Result<()>;
-    async fn all_gather(&self, send_buf: &DeviceBuffer, recv_buf: &mut DeviceBuffer, count: usize, dtype: DType) -> Result<()>;
-    async fn broadcast(&self, buffer: &mut DeviceBuffer, len: usize, dtype: DType, root: Rank) -> Result<()>;
-    async fn reduce_scatter(&self, send_buf: &DeviceBuffer, recv_buf: &mut DeviceBuffer, count: usize, dtype: DType, op: ReduceOp) -> Result<()>;
-
-    // ── Point-to-point ──
-    async fn send(&self, buffer: &DeviceBuffer, len: usize, dtype: DType, dest: Rank) -> Result<()>;
-    async fn recv(&self, buffer: &mut DeviceBuffer, len: usize, dtype: DType, source: Rank) -> Result<()>;
-
-    // ── Synchronization ──
-    async fn barrier(&self) -> Result<()>;
-}
-
+// Summarized — see DISTRIBUTED_RUNTIME.md §3.1 for full definition.
 pub struct Rank(pub u32);
-
 pub enum ReduceOp { Sum, Product, Min, Max }
 ```
 
@@ -1018,21 +1079,12 @@ Full design in [DISTRIBUTED_RUNTIME.md §5](./DISTRIBUTED_RUNTIME.md).
 
 ### 8.1 Format Negotiation at Boundaries
 
-```rust
-pub struct TensorFormat {
-    pub dtype: DType,
-    pub layout: TensorLayout,
-    pub quantization: Option<QuantFormat>,
-}
-
-pub struct FormatConverter {
-    pub source: TensorFormat,
-    pub target: TensorFormat,
-    pub convert_on: DeviceId,
-}
-```
+> See [DISTRIBUTED_RUNTIME.md §5.2](./DISTRIBUTED_RUNTIME.md) for the canonical
+> `TensorFormat` definition (including `DType`, `TensorLayout`, `QuantFormat`).
 
 The runtime inserts format conversion nodes at EP boundaries automatically.
+Conversion placement (`convert_on: DeviceId`) is determined by the graph
+partitioner based on bandwidth and compute cost heuristics.
 
 ### 8.2 Mixing Scenarios
 
@@ -1202,19 +1254,88 @@ coherence. Separate DeviceGovernor and HostGovernor would create a false dichoto
 - No copy between "host" and "device" — just pointer sharing.
 - Apple's `recommendedMaxWorkingSetSize` provides the device partition hint.
 
-**Double-accounting prevention:** When `UnifiedGovernor` is stored as both
-`devices[0]` and `host`, the same physical memory pool is behind both trait
-interfaces. The governor internally tracks a single `total_used` counter.
-Allocations via `request_device_memory()` and `request_host_pages()` draw from
-the same pool — there is no risk of double-counting because the `UnifiedGovernor`
-is one object with one internal state. The `DeviceGovernor` trait represents the
-'wired/GPU-pinned' partition; the `HostGovernor` trait represents the 'available
-for offload/overflow' partition. Their sum equals the single memory pool ceiling.
+**Double-accounting prevention via `PhysicalAllocationId` ledger:**
 
-On unified memory, an "offload" operation (device → host) does not copy data or
-create a second allocation. It reclassifies the allocation from the device
-partition to the host partition — changing residency priority without moving bytes.
-Snapshots always reconcile to one physical total.
+When `UnifiedGovernor` is stored as both `devices[0]` and `host`, both trait
+interfaces modify the **same internal ledger**. Every allocation is tracked by a
+unique identity — not anonymous counters:
+
+```rust
+/// Every physical memory allocation has a unique identity.
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+pub struct PhysicalAllocationId(u64);
+
+/// Unified governor tracks allocations by identity, not just counters.
+pub struct UnifiedGovernor {
+    total_capacity: usize,
+    /// Master ledger: every live allocation tracked by ID.
+    allocations: HashMap<PhysicalAllocationId, AllocationEntry>,
+    /// Logical classification for budget tracking.
+    device_wired: usize,   // "GPU-pinned" partition
+    host_available: usize, // "offload/overflow" partition
+}
+
+pub struct AllocationEntry {
+    pub id: PhysicalAllocationId,
+    pub size: usize,
+    pub class: AllocationClass,
+    pub refcount: u32,
+}
+
+#[derive(Clone, Copy)]
+pub enum AllocationClass {
+    DeviceWired,    // counted against device budget
+    HostAvailable,  // counted against host budget
+}
+
+impl UnifiedGovernor {
+    /// Reclassify an allocation (e.g., "unwire" GPU pages → host available).
+    /// This is what "offload" means on unified memory — no copy, just reclassify.
+    pub fn reclassify(
+        &mut self,
+        id: PhysicalAllocationId,
+        new_class: AllocationClass,
+    ) -> Result<()> {
+        let entry = self.allocations.get_mut(&id)
+            .ok_or(Error::UnknownAllocation)?;
+        let old_class = entry.class;
+        // Adjust counters
+        match old_class {
+            AllocationClass::DeviceWired => self.device_wired -= entry.size,
+            AllocationClass::HostAvailable => self.host_available -= entry.size,
+        }
+        entry.class = new_class;
+        match new_class {
+            AllocationClass::DeviceWired => self.device_wired += entry.size,
+            AllocationClass::HostAvailable => self.host_available += entry.size,
+        }
+        Ok(())
+    }
+
+    /// Snapshot is always consistent: device_wired + host_available ≤ total_capacity.
+    pub fn snapshot(&self) -> UnifiedSnapshot {
+        debug_assert!(self.device_wired + self.host_available <= self.total_capacity);
+        UnifiedSnapshot {
+            total: self.total_capacity,
+            device_wired: self.device_wired,
+            host_available: self.host_available,
+            free: self.total_capacity - self.device_wired - self.host_available,
+        }
+    }
+}
+```
+
+**Key invariants:**
+
+- Every allocation has a `PhysicalAllocationId` — no anonymous counters.
+- "Offload" on unified memory = `reclassify(id, HostAvailable)` — zero copy.
+- `request_device_memory()` creates an entry with class `DeviceWired`.
+- `request_host_pages()` creates an entry with class `HostAvailable`.
+- The two trait interfaces CANNOT double-count because they modify the SAME ledger.
+- **Aliasing:** if the same physical pages are accessed by both CPU and GPU (common
+  on unified), they have ONE allocation entry with ONE class. The dominant accessor
+  determines class.
+- Snapshots always reconcile: `device_wired + host_available ≤ total_capacity`.
 
 ```text
 MemoryTopology::Unified

@@ -30,6 +30,7 @@
 12. [Cross-Session Memory Coordination](#12-cross-session-memory-coordination)
 13. [Open Questions](#13-open-questions)
 14. [References](#14-references)
+15. [Appendix A: Hypothetical Workloads (Pending Validation)](#appendix-a-hypothetical-workloads-pending-validation)
 
 ---
 
@@ -133,7 +134,7 @@ pub trait Communicator: Send + Sync {
     // ── Identity ──
 
     /// This participant's rank in the communication group.
-    fn rank(&self) -> Rank;
+    fn rank(&self) -> RankId;
 
     /// Total number of participants.
     fn world_size(&self) -> usize;
@@ -191,18 +192,38 @@ pub trait Communicator: Send + Sync {
     ) -> Result<CommHandle>;
 
     /// Variable-size all-to-all for MoE dynamic routing.
-    /// Each rank sends `send_counts[i]` elements starting at `send_offsets[i]`
-    /// to rank `i`, and receives `recv_counts[i]` elements into `recv_offsets[i]`.
-    /// Counts are in elements (not bytes). The count exchange is implicit —
-    /// all ranks must agree on counts before calling.
+    ///
+    /// Two-phase operation:
+    /// 1. Count exchange: all ranks call `exchange_counts()` to agree on recv_counts
+    /// 2. Data transfer: call `all_to_all_v()` with the agreed counts
+    ///
+    /// This separation ensures no rank must guess receive buffer sizes.
+
+    /// Exchange send counts to determine recv counts for variable-size all-to-all.
+    ///
+    /// Each rank provides `send_counts[i]` = number of elements to send to rank `i`.
+    /// Returns `recv_counts[i]` = number of elements rank `i` will send to us.
+    async fn exchange_counts(
+        &self,
+        send_counts: &[usize],
+    ) -> Result<Vec<usize>>;
+
+    /// Variable-size all-to-all data transfer.
+    ///
+    /// **Validation:** The implementation asserts:
+    /// - `send_counts.len() == world_size` and `recv_counts.len() == world_size`
+    /// - `send_offsets.len() == world_size` and `recv_offsets.len() == world_size`
+    /// - `sum(send_counts[i]) * spec.element_size() <= send_buf.len()`
+    /// - `sum(recv_counts[i]) * spec.element_size() <= recv_buf.len()`
     async fn all_to_all_v(
         &self,
         send_buf: &DeviceBuffer,
         send_counts: &[usize],
         send_offsets: &[usize],
         recv_buf: &mut DeviceBuffer,
-        recv_counts: &[usize],
+        recv_counts: &[usize],  // from exchange_counts()
         recv_offsets: &[usize],
+        spec: &WireTensorSpec,  // dtype + format for byte validation
     ) -> Result<CommHandle>;
 
     /// All-gather: each rank contributes a chunk; every rank receives the
@@ -221,7 +242,7 @@ pub trait Communicator: Send + Sync {
         buffer: &mut DeviceBuffer,
         len: usize,
         dtype: DType,
-        root: Rank,
+        root: RankId,
     ) -> Result<CommHandle>;
 
     /// Reduce-scatter: reduce + scatter in one step. Each rank ends with
@@ -243,7 +264,7 @@ pub trait Communicator: Send + Sync {
         buffer: &DeviceBuffer,
         len: usize,
         dtype: DType,
-        dest: Rank,
+        dest: RankId,
     ) -> Result<CommHandle>;
 
     /// Receive a buffer from a specific rank.
@@ -252,18 +273,20 @@ pub trait Communicator: Send + Sync {
         buffer: &mut DeviceBuffer,
         len: usize,
         dtype: DType,
-        source: Rank,
+        source: RankId,
     ) -> Result<CommHandle>;
 
     // ── Synchronization ──
 
     /// Barrier: block until all ranks reach this point.
+    /// Unlike other operations, barrier is synchronous — it returns `Result<()>`
+    /// (NOT `CommHandle`) because all ranks must block until convergence.
     async fn barrier(&self) -> Result<()>;
 }
 
 /// Rank within a communication group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Rank(pub u32);
+pub struct RankId(pub u32);
 
 /// Reduction operation for collective reduce.
 #[derive(Clone, Copy, Debug)]
@@ -289,6 +312,17 @@ pub trait CommCompletion: Send {
     /// The stream will not proceed past this point until the comm is complete.
     fn attach_to_stream(&self, stream: &dyn DeviceStream) -> Result<()>;
 }
+
+/// Wire tensor specification for validating all_to_all_v transfers.
+pub struct WireTensorSpec {
+    pub dtype: DType,
+    pub element_size: usize,
+    pub format: TensorFormat,
+}
+
+impl WireTensorSpec {
+    pub fn element_size(&self) -> usize { self.element_size }
+}
 ```
 
 ### 3.2 Communication Groups
@@ -304,9 +338,9 @@ ranks create groups in the same deterministic order:
 /// "TP within node" (ranks 0-3 on node A) + "EP across nodes" (rank 0
 /// from each node).
 pub struct CommGroup {
-    pub id: CommGroupId,
+    pub id: GroupId,
     /// Ranks in this group (world-rank space).
-    pub members: Vec<Rank>,
+    pub members: Vec<RankId>,
 }
 
 /// Communication group registry. All groups must be registered before
@@ -323,7 +357,7 @@ impl GroupRegistry {
     pub fn compile(world: &dyn Communicator, plan: &[GroupSpec]) -> Result<Self>;
 
     /// Look up a pre-compiled sub-communicator by group ID.
-    pub fn get(&self, id: &GroupId) -> Option<&Arc<dyn Communicator>>;
+    pub fn get(&self, id: GroupId) -> Option<&Arc<dyn Communicator>>;
 }
 
 pub struct GroupSpec {
@@ -351,7 +385,7 @@ pub struct TransportCapability {
     pub recv_into: Vec<DeviceType>,
     /// If a device type is not in the above lists, the runtime must stage
     /// through a supported device (e.g., host memory).
-    pub staging_device: DeviceId,
+    pub staging_device: GlobalDeviceId,
 }
 ```
 
@@ -398,7 +432,7 @@ pub struct NcclCommunicator {
     comm: NcclComm,
     /// CUDA stream dedicated to communication (overlaps with compute).
     stream: CudaStream,
-    rank: Rank,
+    rank: RankId,
     world_size: usize,
 }
 
@@ -407,7 +441,7 @@ impl NcclCommunicator {
     ///
     /// Rank 0 generates the ID; other ranks receive it via a rendezvous
     /// mechanism (e.g., shared file, TCP socket, environment variable).
-    pub fn new(unique_id: NcclUniqueId, rank: Rank, world_size: usize) -> Result<Self>;
+    pub fn new(unique_id: NcclUniqueId, rank: RankId, world_size: usize) -> Result<Self>;
 }
 ```
 
@@ -421,7 +455,7 @@ impl NcclCommunicator {
 /// coordination (e.g., broadcasting the dispatch plan to all nodes).
 pub struct GlooCommunicator {
     context: GlooContext,
-    rank: Rank,
+    rank: RankId,
     world_size: usize,
 }
 ```
@@ -443,7 +477,7 @@ pub struct ThunderboltCommunicator {
     peers: Vec<TbPeerConnection>,
     /// Topology graph for optimal collective routing.
     topology: TbTopology,
-    rank: Rank,
+    rank: RankId,
     world_size: usize,
 }
 
@@ -451,7 +485,7 @@ pub struct ThunderboltCommunicator {
 pub enum TbTopology {
     /// Direct daisy-chain: Mac0 ↔ Mac1 ↔ Mac2 ↔ Mac3
     /// Best for ring all-reduce.
-    DaisyChain { order: Vec<Rank> },
+    DaisyChain { order: Vec<RankId> },
     /// Star through a TB5 hub: all nodes connect to a central switch.
     /// Best for tree-based collectives.
     Star { hub_id: String },
@@ -470,7 +504,7 @@ pub enum TbTopology {
 pub struct RdmaCommunicator {
     /// ibverbs queue pairs, one per peer.
     qps: Vec<IbvQueuePair>,
-    rank: Rank,
+    rank: RankId,
     world_size: usize,
     /// Whether GPUDirect RDMA is available (CUDA buffers → NIC directly).
     gpu_direct: bool,
@@ -490,7 +524,7 @@ pub struct RdmaCommunicator {
 pub struct InProcessCommunicator {
     /// Shared state across all simulated ranks.
     shared: Arc<InProcessSharedState>,
-    rank: Rank,
+    rank: RankId,
     world_size: usize,
 }
 
@@ -607,8 +641,8 @@ pub struct DeviceTopology {
 }
 
 pub struct DeviceInfo {
-    pub id: DeviceId,
-    pub rank: Rank,
+    pub id: GlobalDeviceId,
+    pub rank: RankId,
     pub ep_type: String,           // "cuda_ep", "mlx_ep", "cpu_ep"
     pub memory_bytes: u64,         // Total device memory
     pub compute_tflops: f32,       // Peak compute throughput
@@ -861,6 +895,11 @@ pub struct LocalDeviceId {
     pub ordinal: u32,
 }
 
+impl GlobalDeviceId {
+    /// Extract the local device ID for rank-local EP dispatch.
+    pub fn local(&self) -> LocalDeviceId { self.local.clone() }
+}
+
 impl DistributedCostModel {
     /// Communication cost of an edge between two devices.
     ///
@@ -915,7 +954,7 @@ pub struct PlacementConstraints {
     /// Nodes that MUST be on the same device (e.g., attention Q/K/V).
     pub colocate: Vec<Vec<NodeId>>,
     /// Nodes that MUST be on a specific device (e.g., EP claims).
-    pub pin: Vec<(NodeId, DeviceId)>,
+    pub pin: Vec<(NodeId, LocalDeviceId)>,
     /// Maximum allowed communication volume (bytes) across a boundary
     /// class (e.g., "cross-node" < 1 GB per step).
     pub max_cross_boundary_bytes: Option<u64>,
@@ -926,57 +965,55 @@ pub struct PlacementConstraints {
 
 ## 8. Distributed Execution Plan
 
-### 8.1 Compilation
+### 8.1 Compilation — Extending FrozenPlan
 
-The runtime compiles a distributed execution plan from the model graph,
-parallel strategy, and device topology. The plan is a DAG with explicit
-dependencies and per-group collective sequences:
+The runtime compiles a distributed execution plan as an **extension** of the
+existing `FrozenPlan` (see SCHEDULING.md). There is ONE plan representation —
+`FrozenPlan` owns compute partitions; `DistributedPlanExtension` adds
+communication steps and cross-partition dependencies:
 
 ```rust
-/// A compiled distributed execution plan represented as a DAG.
-///
-/// Plan compilation **proves** that every rank in a group submits an
-/// identical ordered collective signature. Independent compute steps
-/// can overlap communication. Buffer deallocation follows the final
-/// completion event referencing each buffer.
-pub struct ExecutionPlan {
-    pub steps: Vec<PlanStep>,
-    /// Adjacency list: steps[i] depends on steps[deps[i]].
-    pub deps: Vec<Vec<StepId>>,
-    /// Per-group collective sequence. Every rank in a group must submit
-    /// collectives in this exact order.
-    pub collective_sequences: HashMap<GroupId, Vec<StepId>>,
+/// Distributed execution extends FrozenPlan with communication metadata.
+/// There is ONE plan representation — no standalone ExecutionPlan struct.
+pub struct DistributedPlanExtension {
+    /// References steps in the base FrozenPlan by PartitionId.
+    /// Adds communication steps between partitions.
+    pub comm_steps: Vec<CommStep>,
+    /// Dependency edges (both compute and comm steps share one DAG).
+    pub deps: Vec<Vec<StepRef>>,
+    /// Per-group collective sequence for ordering validation.
+    pub collective_sequences: HashMap<GroupId, Vec<StepRef>>,
 }
 
-pub struct PlanStep {
-    pub id: StepId,
-    pub kind: StepKind,
-    pub rank: RankId,
-    pub group: Option<GroupId>,
+/// A step reference into either the base plan or comm extension.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub enum StepRef {
+    /// References a FrozenPlan partition (compute step).
+    Compute(PartitionId),
+    /// Index into `DistributedPlanExtension::comm_steps`.
+    Comm(usize),
+}
+
+pub struct CommStep {
+    pub op: CollectiveOp,
+    pub group: GroupId,
     pub stream: StreamId,
-    /// Buffers that must remain live until this step completes.
     pub buffer_deps: Vec<BufferId>,
 }
 
-pub enum StepKind {
-    Compute { partition: PartitionId, ep: EpId },
-    Collective { op: CollectiveOp },
-    Transfer { src: BufferId, dst: BufferId },
-    Barrier { group: GroupId },
-}
-
-pub type StepId = u32;
 pub type StreamId = u32;
 pub type BufferId = u32;
 ```
 
 The DAG structure enables:
-- **Overlap:** Independent compute steps on different streams execute
+- **Overlap:** Independent compute partitions on different streams execute
   concurrently with communication on the comm stream.
 - **Correctness:** The `collective_sequences` map is verified at compile time
   to ensure all ranks in a group submit collectives in the same order.
 - **Buffer safety:** A buffer's `BufferId` appears in `buffer_deps` of every
   step that reads it; deallocation is legal only after all such steps complete.
+- **No duplication:** Compute steps are `PartitionId` references into the
+  existing `FrozenPlan`; they are not re-defined here.
 
 ### 8.2 Example: TP Attention + EP MoE (One Transformer Block)
 
@@ -1008,7 +1045,105 @@ Step  Rank 0 (GPU 0)         Rank 1 (GPU 1)         Rank 2 (GPU 2)         Rank 
 ─────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────
 ```
 
-### 8.3 Execution Engine
+### 8.3 Async DAG Scheduler
+
+The execution engine uses an async DAG scheduler that maximizes
+compute/communication overlap by launching all ready steps concurrently
+and waiting for ANY in-flight operation (not all):
+
+```rust
+/// Async DAG scheduler for distributed execution with maximum overlap.
+pub struct DagScheduler {
+    frozen_plan: Arc<FrozenPlan>,
+    extension: Arc<DistributedPlanExtension>,
+    in_flight: HashMap<StepRef, CommHandle>,
+    completed: HashSet<StepRef>,
+}
+
+impl DagScheduler {
+    /// Execute the DAG with maximum compute/communication overlap.
+    pub async fn execute(&mut self, ctx: &ExecutionContext) -> Result<()> {
+        loop {
+            // Find all steps whose dependencies are satisfied
+            let ready: Vec<StepRef> = self.all_steps()
+                .filter(|s| !self.completed.contains(s))
+                .filter(|s| self.deps_of(s).iter()
+                    .all(|d| self.completed.contains(d)))
+                .collect();
+
+            if ready.is_empty() && self.in_flight.is_empty() {
+                break; // All done
+            }
+
+            // Launch all ready steps
+            for step_ref in &ready {
+                match step_ref {
+                    StepRef::Compute(partition_id) => {
+                        // Fire compute on its stream — non-blocking
+                        ctx.launch_compute(*partition_id)?;
+                        self.completed.insert(*step_ref);
+                    }
+                    StepRef::Comm(idx) => {
+                        let comm_step = &self.extension.comm_steps[*idx];
+                        match &comm_step.op {
+                            CollectiveOp::Barrier { group } => {
+                                // Barrier returns Result<()>, not CommHandle
+                                ctx.barrier(*group).await?;
+                                self.completed.insert(*step_ref);
+                            }
+                            _ => {
+                                let handle = ctx.launch_collective(
+                                    &comm_step.op,
+                                    comm_step.group,
+                                    comm_step.stream,
+                                )?;
+                                self.in_flight.insert(*step_ref, handle);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Wait for ANY in-flight operation to complete (not all!)
+            if !self.in_flight.is_empty() {
+                let completed_ref = self.wait_any().await?;
+                self.completed.insert(completed_ref);
+                self.in_flight.remove(&completed_ref);
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_any(&self) -> Result<StepRef> {
+        loop {
+            for (step_ref, handle) in &self.in_flight {
+                if handle.is_complete() {
+                    return Ok(*step_ref);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn all_steps(&self) -> impl Iterator<Item = StepRef> + '_ {
+        let compute_refs = self.frozen_plan.partitions.keys()
+            .map(|id| StepRef::Compute(*id));
+        let comm_refs = (0..self.extension.comm_steps.len())
+            .map(StepRef::Comm);
+        compute_refs.chain(comm_refs)
+    }
+
+    fn deps_of(&self, step: &StepRef) -> &[StepRef] {
+        let idx = match step {
+            StepRef::Compute(id) => id.0 as usize,
+            StepRef::Comm(i) => self.frozen_plan.partitions.len() + i,
+        };
+        &self.extension.deps[idx]
+    }
+}
+```
+
+### 8.4 Executor Entry Point
 
 ```rust
 /// Executes a distributed plan across ranks.
@@ -1018,55 +1153,34 @@ Step  Rank 0 (GPU 0)         Rank 1 (GPU 1)         Rank 2 (GPU 2)         Rank 
 /// references a compiled partition artifact. Communication steps select
 /// their sub-communicator via `GroupId` from the pre-compiled `GroupRegistry`.
 pub struct DistributedExecutor {
-    /// Pre-compiled partition artifacts, keyed by PartitionId.
-    partitions: HashMap<PartitionId, Arc<CompiledPartition>>,
-    /// Communicator for this execution group.
-    comm: Arc<dyn Communicator>,
-    /// Pre-compiled sub-communicators for strategy groups (TP, EP groups).
+    frozen_plan: Arc<FrozenPlan>,
+    extension: Arc<DistributedPlanExtension>,
     group_registry: GroupRegistry,
-    /// The compiled execution plan (DAG).
-    plan: ExecutionPlan,
 }
 
 impl DistributedExecutor {
-    /// Execute one forward pass (one token or one micro-batch).
-    ///
-    /// The `inputs` argument participates in tensor binding through the
-    /// plan's buffer map — input tensors are bound to `BufferId` slots
-    /// declared in the plan.
+    /// Execute one forward pass using async DAG scheduling.
     pub async fn forward(
         &self,
-        rank: Rank,
+        rank: RankId,
         inputs: &[Tensor],
     ) -> Result<Vec<Tensor>> {
-        // Bind inputs to the plan's buffer map
-        let mut buffers = self.plan.bind_inputs(inputs)?;
+        let ctx = ExecutionContext::new(
+            &self.frozen_plan,
+            &self.group_registry,
+            rank,
+            inputs,
+        )?;
 
-        // Execute steps in topological order respecting deps
-        for step in self.plan.topo_order_for_rank(rank) {
-            match &step.kind {
-                StepKind::Compute { partition, .. } => {
-                    let compiled = &self.partitions[partition];
-                    compiled.execute(&mut buffers)?;
-                }
-                StepKind::Collective { op } => {
-                    let comm = self.group_registry
-                        .get(&step.group.unwrap())
-                        .unwrap_or(&self.comm);
-                    let handle = self.execute_collective(comm, op, &mut buffers).await?;
-                    handle.wait()?;
-                }
-                StepKind::Transfer { src, dst } => {
-                    buffers.copy(*src, *dst)?;
-                }
-                StepKind::Barrier { group } => {
-                    let comm = self.group_registry.get(group).unwrap();
-                    comm.barrier().await?.wait()?;
-                }
-            }
-        }
+        let mut scheduler = DagScheduler {
+            frozen_plan: Arc::clone(&self.frozen_plan),
+            extension: Arc::clone(&self.extension),
+            in_flight: HashMap::new(),
+            completed: HashSet::new(),
+        };
 
-        Ok(self.plan.collect_outputs(&buffers, rank))
+        scheduler.execute(&ctx).await?;
+        Ok(ctx.collect_outputs(rank))
     }
 }
 ```
@@ -1104,13 +1218,13 @@ pub trait DispatchTransport: Send + Sync {
 pub struct CommunicatorDispatchTransport {
     comm: Arc<dyn Communicator>,
     /// The communication group used for expert dispatch.
-    ep_group: CommGroupId,
+    ep_group: GroupId,
 }
 
 #[async_trait]
 impl DispatchTransport for CommunicatorDispatchTransport {
     async fn send(&self, target: GpuId, data: &Tensor) -> Result<()> {
-        self.comm.send(&data.buffer, data.len(), data.dtype, Rank(target.0)).await
+        self.comm.send(&data.buffer, data.len(), data.dtype, RankId(target.0)).await
     }
 
     async fn all_to_all(
@@ -1134,7 +1248,7 @@ maps directly to this design:
 | MoE Doc Concept | Distributed Runtime Equivalent |
 |---|---|
 | Control plane (expert placement, rebalancing) | `HybridStrategy` + `ExpertPlacement` |
-| Data plane (NCCL collectives in GPU graph) | `DistributedPlan` steps |
+| Data plane (NCCL collectives in GPU graph) | `DistributedPlanExtension` comm steps |
 | Dispatch plan table | `ExpertParallel.placement` |
 | `MoeDispatchOp` (custom ONNX op) | `PlanStep::Collective(AllToAll)` |
 | `ExpertSession` trait | `ExecutionProvider` + rank-specific subgraph |
@@ -1164,12 +1278,6 @@ for heterogeneous EP mixing where collectives can't live inside any single EP.
 
 ## 10. Mac Studio Cluster as First-Class Target
 
-> **Note:** Kimi K3 is used as a hypothetical reference workload. The model has
-> not been publicly released at time of writing. All capacity and throughput
-> figures are upper-bound estimates derived from published architecture papers
-> (896 experts, 2.8T parameters). This section will be updated with measured
-> benchmarks when a reproducible model is available.
-
 ### 10.1 Reference Configuration
 
 ```
@@ -1184,9 +1292,6 @@ for heterogeneous EP mixing where collectives can't live inside any single EP.
 │  - MLX EP (unified memory, zero-copy compute)                   │
 │  - genai-server rank (Rust async runtime)                       │
 │  - ThunderboltCommunicator                                      │
-│                                                                  │
-│  Total: 2 TB unified memory → fits K3-class 2.8T model (FP4)   │
-│         + ~500 GB headroom for KV cache                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1209,9 +1314,9 @@ Bottleneck       │  Compute-bound       │  Interconnect-bound
 ### 10.3 Why No TP on Mac Studio
 
 Apple Silicon unified memory means a single Mac can hold the full attention
-layers alongside its expert shard. With 512 GB per node and ~350 GB of expert
-weights per node (2.8T / 4 / 2 for FP4), there's ~160 GB left — more than
-enough for attention weights (~15-20 GB for a 2.8T MoE's dense layers).
+layers alongside its expert shard. For released open-weight MoE models
+(e.g., Mixtral 8x22B, DeepSeek-V2), the attention weights easily fit within
+512 GB alongside the expert shard.
 
 This eliminates AllReduce for attention entirely. Only expert All-to-All crosses
 TB5 — a massive simplification:
@@ -1226,34 +1331,11 @@ Mac Studio execution per transformer block:
   6. combine()                          ← local
 ```
 
-### 10.4 Latency Analysis (Hypothetical)
+### 10.4 Performance Validation
 
-Hypothetical target (pending model release) — K3-class model (896 experts, top-16, 4096 hidden dim, BF16).
-All figures below are upper-bound estimates; peak link rate (12 GB/s) is used
-rather than measured collective throughput, which will be lower due to protocol
-overhead, topology contention, and fixed collective latency:
-
-```
-Per MoE layer All-to-All:
-  Dispatch: 16 experts × batch × 4096 × 2 bytes = ~131 KB per token
-  At 12 GB/s (TB5): 131 KB / 12 GB/s ≈ 11 μs
-  Round-trip (dispatch + gather): ~22 μs
-
-For 100 MoE layers:
-  Total comm overhead: 100 × 22 μs = 2.2 ms per token
-
-Compute per token (local experts):
-  ~50B active params × 2 FLOPs/param = 100 GFLOPS
-  At 22 TFLOPS (M3 Ultra): ~4.5 ms per token (compute-bound on Mac)
-
-Total per-token latency: ~4.5 ms compute + ~2.2 ms comm ≈ 6.7 ms
-  → ~150 tokens/sec (acceptable for interactive use)
-```
-
-The Mac Studio cluster is **estimated to be compute-bound** given the above
-assumptions — TB5 bandwidth appears sufficient because expert dispatch volumes
-are modest. This will be validated with measured benchmarks when a reproducible
-model is available.
+Latency analysis for this cluster target uses released open-weight MoE models
+(e.g., Mixtral 8x22B, DeepSeek-V2) as benchmarks. K3-class hypothetical
+workloads are deferred to [Appendix A](#appendix-a-hypothetical-workloads-pending-validation).
 
 ---
 
@@ -1265,7 +1347,7 @@ model is available.
 
 - Implement `Communicator` trait and `InProcessCommunicator`
 - Implement `TensorParallel` and `ExpertParallel` strategy structs
-- Implement `DistributedPlan` compilation from strategy + graph
+- Implement `DistributedPlanExtension` compilation from strategy + graph
 - Test with multiple CPU EPs in one process simulating multi-device
 - Verify correctness: distributed execution matches single-device results
 - **No real multi-GPU or networking code.**
@@ -1305,7 +1387,7 @@ fn distributed_matches_single_device() {
 - Implement `GlooCommunicator` as TCP fallback
 - Process rendezvous and rank assignment
 - Fault detection: abort all ranks and restart (consistent with MEMORY_ARCHITECTURE.md decision). Partial recovery/degraded execution deferred to Phase 4+.
-- **Hypothetical target (pending model release):** K3-class 2.8T on 4× Mac Studio M3 Ultra
+- **Target:** Released open-weight MoE model (e.g., Mixtral 8x22B, DeepSeek-V2). K3-class workloads deferred to [Appendix A](#appendix-a-hypothetical-workloads-pending-validation) pending model release.
 
 - **Acceptance criteria:** both documents use one failure-state machine and
   define communicator abort, request failure, cleanup, and restart ownership.
@@ -1326,9 +1408,12 @@ fn distributed_matches_single_device() {
 ## 12. Cross-Session Memory Coordination
 
 > **Consolidated.** See [MEMORY_ARCHITECTURE.md §4-5](./MEMORY_ARCHITECTURE.md).
-> Cross-session memory coordination, the `MemoryCoordinator` trait, budget
+> Cross-session memory coordination, the `ClusterCoordinator` trait, budget
 > arbitration, shared weight deduplication, and the relationship between
 > governors and coordinators are consolidated there.
+>
+> For memory pressure protocol (eviction signaling across ranks), see
+> MEMORY_ARCHITECTURE.md §6 (canonical definition).
 
 
 ## 13. Open Questions
@@ -1379,6 +1464,53 @@ fn distributed_matches_single_device() {
 12. **KV cache sharing granularity.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q12.
 
 13. **ClusterCoordinator placement.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q13.
+
+---
+
+## Appendix A: Hypothetical Workloads (Pending Validation)
+
+> **All figures below are theoretical upper bounds. Do not use for capacity
+> planning or milestone acceptance.**
+
+### K3-Class Model (Hypothetical)
+
+Kimi K3 is used as a hypothetical reference workload. The model has not been
+publicly released at time of writing. All capacity and throughput figures are
+upper-bound estimates derived from published architecture papers (896 experts,
+2.8T parameters). This section will be updated with measured benchmarks when
+a reproducible model is available.
+
+**Reference configuration:** 4× Mac Studio M3 Ultra (512 GB each) = 2 TB total.
+Fits K3-class 2.8T model (FP4) + ~500 GB headroom for KV cache.
+
+**Latency analysis (hypothetical):**
+
+K3-class model (896 experts, top-16, 4096 hidden dim, BF16).
+All figures are upper-bound estimates; peak link rate (12 GB/s) is used
+rather than measured collective throughput, which will be lower due to protocol
+overhead, topology contention, and fixed collective latency:
+
+```
+Per MoE layer All-to-All:
+  Dispatch: 16 experts × batch × 4096 × 2 bytes = ~131 KB per token
+  At 12 GB/s (TB5): 131 KB / 12 GB/s ≈ 11 μs
+  Round-trip (dispatch + gather): ~22 μs
+
+For 100 MoE layers:
+  Total comm overhead: 100 × 22 μs = 2.2 ms per token
+
+Compute per token (local experts):
+  ~50B active params × 2 FLOPs/param = 100 GFLOPS
+  At 22 TFLOPS (M3 Ultra): ~4.5 ms per token (compute-bound on Mac)
+
+Total per-token latency: ~4.5 ms compute + ~2.2 ms comm ≈ 6.7 ms
+  → ~150 tokens/sec (acceptable for interactive use)
+```
+
+The Mac Studio cluster is **estimated to be compute-bound** given the above
+assumptions — TB5 bandwidth appears sufficient because expert dispatch volumes
+are modest. This will be validated with measured benchmarks when a reproducible
+model is available.
 
 ---
 
