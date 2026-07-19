@@ -230,6 +230,34 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
 
 ---
 
+## 8b. Runtime LoRA (adapter gating) and live editing
+
+**Runtime LoRA** — switch/blend LoRA adapters at run time with **no re-export**. Because Mobius
+builds the diffusion UNet *from scratch*, the LoRA branch is baked directly into the graph with a
+runtime gate (no torch export, no ONNX surgery):
+
+- Build the UNet with `UNet2DConfig.lora_adapters = ((name, rank, scale), ...)`. Mobius wires a
+  `LoRALinear` into every attention projection (`to_q/to_k/to_v/to_out`) across all down/mid/up
+  blocks, computing `base(x) + (x @ A^T) @ B^T · scale · gate` from scratch (`models/unet.py` +
+  `components/_lora.py`). The `DenoisingTask` declares one scalar **`lora_gate.{name}`** input per
+  adapter.
+- At run time, feed the gate as an ordinary denoiser input:
+  `request.with_input("denoiser.lora_gate.{name}", scalar)` — `1.0` = active, `0.0` = off, or a
+  **blend strength**. No reload, no re-export. Multiple baked adapters = ComfyUI-style multi-LoRA.
+
+**Live editing (Tier A)** — the loop *dynamics* are also live via `IterativeOverrides`
+(`with_iterative_overrides`): override `num_steps` (rebuilds the scheduler), `guidance_scale` (cfg),
+and `start_step`, re-driving the *same loaded models*. Seed / prompt / negative are already live as
+per-request inputs. Together these give ComfyUI-like interactive editing without touching the models.
+
+> Status: the runtime-LoRA **graph mechanism is wired end-to-end and validated** (Mobius
+> `models/unet_lora_test.py` — full-UNet gate inputs + adapter params), and onnx-genai feeds the
+> gate via the existing per-request input path (no engine change). **Remaining:** load LoRA
+> `.safetensors` into the baked `lora_A/lora_B` params (key remapping across diffusers/PEFT/kohya
+> formats) and `gate=0 == base` / `gate=1 == diffusers-fused` parity on a real SD build.
+
+---
+
 ## 9. Limitations & roadmap
 
 - **Samplers:** euler, euler_ancestral, ddim, dpmpp_2m (+Karras). Not yet: other DPM++ variants,
