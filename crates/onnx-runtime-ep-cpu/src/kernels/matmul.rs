@@ -297,6 +297,55 @@ impl MatMulKernel {
         backend: CpuBackend,
     ) -> Result<()> {
         check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
+
+        // Direct f32 output fast path: when the output is a contiguous Float32
+        // CPU tensor that does not alias either input, GEMM writes straight into
+        // its backing buffer, skipping both the intermediate result `Vec<f32>`
+        // and the narrowing copy performed by `write_dense_f32_narrow`. Every
+        // other case (f16/bf16/f64, strided/non-contiguous, or a possibly
+        // aliasing output) uses the owned-buffer fallback below unchanged.
+        if output_is_direct_f32_eligible(&inputs[0], &inputs[1], &outputs[0]) {
+            let geom = matmul_geometry(&inputs[0], &inputs[1])?;
+            let out = &mut outputs[0];
+            // `validate()` confirms rank/dtype/offset invariants; it does NOT
+            // prove backing-buffer bounds — that is the executor's `view_bounds`
+            // contract for this SSA output. We still gate the pointer-slice on a
+            // logical length match against the computed result length so a
+            // mismatched shape errors BEFORE any GEMM write.
+            out.validate()?;
+            let numel = out.numel();
+            if numel != geom.result_len {
+                return Err(EpError::KernelFailed(format!(
+                    "MatMul: output element count {numel} does not match result length {}",
+                    geom.result_len
+                )));
+            }
+            // A zero-sized result writes nothing; return before forming a slice
+            // from a possibly-dangling zero-length output pointer.
+            if numel == 0 {
+                return Ok(());
+            }
+            let ptr = out.data_ptr_mut::<f32>();
+            // SAFETY: the eligibility check proved `out` is a CPU, Float32,
+            // row-major-contiguous view that does not alias either input's byte
+            // range, so no live input slice overlaps this buffer. `data_ptr_mut`
+            // applies `byte_offset` to select the element origin, and the
+            // executor's bounds contract guarantees `numel` initialized f32 slots
+            // exist there; `numel == geom.result_len` was just verified, so the
+            // GEMM writes exactly within bounds. The slice is the sole mutable
+            // borrow of this storage for the duration of the call.
+            let out_slice = unsafe { std::slice::from_raw_parts_mut(ptr, numel) };
+            return matmul_dense_into_with_backend(
+                &self.prepack.dense(0, &inputs[0])?,
+                &self.prepack.dense(1, &inputs[1])?,
+                &geom,
+                backend,
+                #[cfg(feature = "mlas")]
+                Some(&self.prepack),
+                out_slice,
+            );
+        }
+
         let out =
             matmul_dense_prepacked_with_backend(&inputs[0], &inputs[1], &self.prepack, backend)?;
         // If either operand was 1-D, the corresponding size-1 axis is squeezed
@@ -305,6 +354,58 @@ impl MatMulKernel {
         // element and rounds to the requested precision.
         write_dense_f32_narrow("MatMul", &mut outputs[0], &out)
     }
+}
+
+/// Whether `MatMulKernel::execute` may GEMM directly into `out`'s backing
+/// buffer instead of the intermediate-vector + narrowing fallback.
+///
+/// Requires a CPU, Float32, row-major-contiguous output whose byte range does
+/// not overlap either input. The overlap check mirrors the in-place fast-path
+/// convention used elsewhere in this crate (`kernels/activations.rs`,
+/// `kernels/elementwise.rs`): a same-device pointer-range test on the element
+/// origins. It is sound here because a zero-copy input operand
+/// (`to_dense_f32_widen` borrows only contiguous Float32 views) is read
+/// straight from its own contiguous `numel * 4` byte range, which this test
+/// covers exactly; any other input dtype/layout is materialized into a fresh
+/// owned buffer before the GEMM, so it cannot alias the output at all.
+fn output_is_direct_f32_eligible(a: &TensorView, b: &TensorView, out: &TensorMut) -> bool {
+    use onnx_runtime_ir::DataType;
+    use onnx_runtime_ir::DeviceType;
+
+    if out.device.device_type != DeviceType::Cpu
+        || out.dtype != DataType::Float32
+        || !out.is_contiguous()
+    {
+        return false;
+    }
+
+    let out_start = out.data.0 as usize;
+    // Row-major-contiguous Float32: the whole logical extent is one dense range
+    // starting at the element origin.
+    let out_origin = (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize;
+    let out_end = out_origin.saturating_add(out.byte_size());
+    let _ = out_start;
+
+    !std::iter::once(a)
+        .chain(std::iter::once(b))
+        .any(|input| output_overlaps_input(out_origin, out_end, input, out.device))
+}
+
+/// Pointer-range overlap test between the output byte range `[out_origin,
+/// out_end)` and one input's element-origin byte range, on the same device.
+/// Absent (null) inputs never overlap.
+fn output_overlaps_input(
+    out_origin: usize,
+    out_end: usize,
+    input: &TensorView,
+    out_device: onnx_runtime_ir::DeviceId,
+) -> bool {
+    if input.is_absent() || input.device != out_device {
+        return false;
+    }
+    let in_start = input.data_ptr::<u8>() as usize;
+    let in_end = in_start.saturating_add(input.byte_size());
+    out_origin < in_end && in_start < out_end
 }
 
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
@@ -359,6 +460,49 @@ fn matmul_dense_impl_with_backend(
     backend: CpuBackend,
     #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
+    // Owned-vector wrapper: compute geometry, allocate the result buffer, then
+    // GEMM into it via the shared `_into` helper. Used by callers that need an
+    // owned result (fused attention / fused MatMul+bias) and by the narrowing
+    // fallback in `MatMulKernel::execute`.
+    let geom = matmul_geometry(a, b)?;
+    let mut out = vec![0.0f32; geom.result_len];
+    matmul_dense_into_with_backend(
+        &a_dense,
+        &b_dense,
+        &geom,
+        backend,
+        #[cfg(feature = "mlas")]
+        prepack,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// Precomputed MatMul dimensions: 1-D promotion, inner-dim agreement, batch
+/// broadcast, and per-tile element counts. Computed once so both the owned and
+/// direct-output paths share exactly one geometry derivation.
+struct MatMulGeometry {
+    m: usize,
+    k: usize,
+    n: usize,
+    a_mat: usize,
+    b_mat: usize,
+    c_mat: usize,
+    a_batch: Vec<usize>,
+    b_batch: Vec<usize>,
+    a_batch_strides: Vec<i64>,
+    b_batch_strides: Vec<i64>,
+    batch_shape: Vec<usize>,
+    /// Promoted rank of B; the MLAS PackedB path applies only to a 2-D B.
+    #[cfg_attr(not(feature = "mlas"), allow(dead_code))]
+    b_promoted_rank: usize,
+    /// Total elements in the result: `batch_count * c_mat`.
+    result_len: usize,
+}
+
+/// Derive [`MatMulGeometry`] from the two operand views (numpy matmul
+/// semantics: 1-D promotion, inner-dim check, broadcast leading dims).
+fn matmul_geometry(a: &TensorView, b: &TensorView) -> Result<MatMulGeometry> {
     // Promote 1-D operands per numpy matmul: a [K] -> [1,K] (drop row after),
     // b [K] -> [K,1] (drop col after).
     let a_raw = a.shape;
@@ -393,50 +537,88 @@ fn matmul_dense_impl_with_backend(
     }
 
     // Broadcast the batch (leading) dimensions.
-    let a_batch = &a_shape[..a_shape.len() - 2];
-    let b_batch = &b_shape[..b_shape.len() - 2];
-    let batch_shape = broadcast_shapes(a_batch, b_batch)?;
+    let a_batch = a_shape[..a_shape.len() - 2].to_vec();
+    let b_batch = b_shape[..b_shape.len() - 2].to_vec();
+    let batch_shape = broadcast_shapes(&a_batch, &b_batch)?;
     let batch_count = numel(&batch_shape);
 
-    let a_batch_strides = compute_contiguous_strides(a_batch);
-    let b_batch_strides = compute_contiguous_strides(b_batch);
+    let a_batch_strides = compute_contiguous_strides(&a_batch);
+    let b_batch_strides = compute_contiguous_strides(&b_batch);
     let a_mat = m * k;
     let b_mat = k * n;
     let c_mat = m * n;
 
-    let mut out = vec![0.0f32; batch_count * c_mat];
+    Ok(MatMulGeometry {
+        m,
+        k,
+        n,
+        a_mat,
+        b_mat,
+        c_mat,
+        a_batch,
+        b_batch,
+        a_batch_strides,
+        b_batch_strides,
+        batch_shape,
+        b_promoted_rank: b_shape.len(),
+        result_len: batch_count * c_mat,
+    })
+}
+
+/// Run the GEMM (single, batched, or broadcast) into the caller-supplied
+/// row-major `out` slice. `out.len()` MUST equal `geom.result_len`; a mismatch
+/// returns an `EpError` before any write. This is the single code path shared by
+/// the owned-vector wrapper and the direct-output fast path.
+fn matmul_dense_into_with_backend(
+    a_dense: &[f32],
+    b_dense: &[f32],
+    geom: &MatMulGeometry,
+    backend: CpuBackend,
+    #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
+    out: &mut [f32],
+) -> Result<()> {
+    if out.len() != geom.result_len {
+        return Err(EpError::KernelFailed(format!(
+            "MatMul: output buffer length {} does not match result length {}",
+            out.len(),
+            geom.result_len
+        )));
+    }
 
     // Any zero dimension (batch, M, or N) yields an empty result — matching
     // numpy/ONNX reference semantics. Return before the compute loop, which
     // otherwise runs once even for a zero-sized batch (a `loop { … } while`) and
     // would index into empty operand slices.
     if out.is_empty() {
-        return Ok(out);
+        return Ok(());
     }
 
+    let (m, k, n) = (geom.m, geom.k, geom.n);
+    let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
+
     #[cfg(feature = "mlas")]
-    let packed_b = if backend == CpuBackend::Mlas && b_shape.len() == 2 {
-        prepack.and_then(|prepack| prepack.packed_b(&b_dense, k, n))
+    let packed_b = if backend == CpuBackend::Mlas && geom.b_promoted_rank == 2 {
+        prepack.and_then(|prepack| prepack.packed_b(b_dense, k, n))
     } else {
         None
     };
 
-    if batch_shape.is_empty() {
+    if geom.batch_shape.is_empty() {
         // No batch dims: a single matmul.
         #[cfg(feature = "mlas")]
         if let Some(packed_b) = packed_b {
-            gemm_packed(&a_dense, packed_b, &mut out, m, k, n)?;
+            gemm_packed(a_dense, packed_b, out, m, k, n)?;
         } else {
-            gemm_with_backend(backend, &a_dense, &b_dense, &mut out, m, k, n)?;
+            gemm_with_backend(backend, a_dense, b_dense, out, m, k, n)?;
         }
         #[cfg(not(feature = "mlas"))]
-        gemm_with_backend(backend, &a_dense, &b_dense, &mut out, m, k, n)?;
+        gemm_with_backend(backend, a_dense, b_dense, out, m, k, n)?;
     } else {
-        let mut bidx = vec![0usize; batch_shape.len()];
+        let mut bidx = vec![0usize; geom.batch_shape.len()];
         let mut b_out = 0usize;
         loop {
-            let a_off = broadcast_offset(&bidx, a_batch, &a_batch_strides) * a_mat;
-            let b_off = broadcast_offset(&bidx, b_batch, &b_batch_strides) * b_mat;
+            let a_off = broadcast_offset(&bidx, &geom.a_batch, &geom.a_batch_strides) * a_mat;
+            let b_off = broadcast_offset(&bidx, &geom.b_batch, &geom.b_batch_strides) * b_mat;
             let a_tile = &a_dense[a_off..a_off + a_mat];
             let c_tile = &mut out[b_out * c_mat..b_out * c_mat + c_mat];
             #[cfg(feature = "mlas")]
@@ -464,13 +646,13 @@ fn matmul_dense_impl_with_backend(
                 n,
             )?;
             b_out += 1;
-            if !next_index(&batch_shape, &mut bidx) {
+            if !next_index(&geom.batch_shape, &mut bidx) {
                 break;
             }
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Element offset of batch index `bidx` into a batch of shape `batch`,
@@ -886,5 +1068,259 @@ mod tests {
             kernel.prepack.dense[1].get().unwrap().as_ptr(),
             cached_weight
         );
+    }
+
+    // --- Direct f32 output path (Option A) --------------------------------
+
+    /// Reference row-major GEMM for verifying the direct path numerically.
+    fn naive_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for p in 0..k {
+                let aip = a[i * k + p];
+                for j in 0..n {
+                    c[i * n + j] += aip * b[p * n + j];
+                }
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn direct_f32_eligible_for_contiguous_cpu_output() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        assert!(output_is_direct_f32_eligible(
+            &a.view(),
+            &b.view(),
+            &out.view_mut()
+        ));
+    }
+
+    #[test]
+    fn direct_f32_rejects_non_f32_output() {
+        // f16 output must fall back to the narrowing writer.
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[2, 2]);
+        assert!(!output_is_direct_f32_eligible(
+            &a.view(),
+            &b.view(),
+            &out.view_mut()
+        ));
+    }
+
+    #[test]
+    fn direct_f32_2d_nonsquare_matches_reference() {
+        // A[2,3] @ B[3,4] contiguous f32: the direct path writes into `out`.
+        let a_data = [1., 2., 3., 4., 5., 6.];
+        let b_data = [1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.];
+        let a = Owned::f32(&[2, 3], &a_data);
+        let b = Owned::f32(&[3, 4], &b_data);
+        let mut out = Owned::zeros_f32(&[2, 4]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), naive_matmul(&a_data, &b_data, 2, 3, 4));
+    }
+
+    #[test]
+    fn direct_f32_batched_and_broadcast_match_reference() {
+        // Batched: two independent [2,2] matmuls into one contiguous output.
+        let a = Owned::f32(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let b = Owned::f32(&[2, 2, 2], &[1., 0., 0., 1., 2., 0., 0., 2.]);
+        let mut out = Owned::zeros_f32(&[2, 2, 2]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![1., 2., 3., 4., 10., 12., 14., 16.]);
+
+        // Broadcast B over the batch dim.
+        let a = Owned::f32(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let b = Owned::f32(&[2, 2], &[1., 0., 0., 1.]);
+        let mut out = Owned::zeros_f32(&[2, 2, 2]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![1., 2., 3., 4., 5., 6., 7., 8.]);
+    }
+
+    #[test]
+    fn direct_f32_matrix_times_vector() {
+        // A[2,3] @ b[3] -> [2] (b promoted to [3,1], result col squeezed).
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3], &[7., 9., 11.]);
+        let mut out = Owned::zeros_f32(&[2]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        // [1*7+2*9+3*11, 4*7+5*9+6*11] = [58, 139]
+        assert_eq!(out.to_f32(), vec![58., 139.]);
+    }
+
+    #[test]
+    fn direct_f32_vector_times_vector_scalar_result() {
+        // a[3] @ b[3] -> scalar (shape []), a promoted [1,3], b promoted [3,1].
+        let a = Owned::f32(&[3], &[1., 2., 3.]);
+        let b = Owned::f32(&[3], &[4., 5., 6.]);
+        let mut out = Owned::zeros_f32(&[]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        // 1*4 + 2*5 + 3*6 = 32
+        assert_eq!(out.to_f32(), vec![32.]);
+    }
+
+    #[test]
+    fn direct_f32_zero_sized_result_writes_nothing() {
+        // A zero batch dim yields an empty result; the direct path must return
+        // before any GEMM write.
+        let a = Owned::f32(&[0, 2, 3], &[]);
+        let b = Owned::f32(&[0, 3, 2], &[]);
+        let mut out = Owned::zeros_f32(&[0, 2, 2]);
+        assert!(output_is_direct_f32_eligible(
+            &a.view(),
+            &b.view(),
+            &out.view_mut()
+        ));
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert!(out.to_f32().is_empty());
+    }
+
+    #[test]
+    fn strided_f32_output_takes_fallback_and_is_correct() {
+        // A[2,2] @ B[2,2] into a NON-contiguous [2,2] output: row stride 3 over a
+        // [2,3] backing buffer. It must NOT take the direct path; the strided
+        // writer scatters into positions 0,1,3,4.
+        let a = Owned::f32(&[2, 2], &[1., 2., 3., 4.]);
+        let b = Owned::f32(&[2, 2], &[5., 6., 7., 8.]);
+        let mut out = Owned::zeros_f32(&[2, 3]).with_view(&[2, 2], &[3, 1]);
+        assert!(!out.view_mut().is_contiguous());
+        assert!(!output_is_direct_f32_eligible(
+            &a.view(),
+            &b.view(),
+            &out.view_mut()
+        ));
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        // C = [[19,22],[43,50]] scattered: buf[0]=19, buf[1]=22, buf[3]=43, buf[4]=50.
+        assert_eq!(out.to_f32(), vec![19., 22., 0., 43., 50., 0.]);
+    }
+
+    #[test]
+    fn mismatched_output_length_errors_before_write() {
+        // A[2,3] @ B[3,2] -> [2,2] (4 elems), but the output view has 6 elems.
+        // The direct path must error on the length check before any GEMM write.
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        let err = MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap_err();
+        assert!(format!("{err}").contains("does not match result length"));
+        // Nothing was written.
+        assert_eq!(out.to_f32(), vec![0.; 6]);
+    }
+
+    #[test]
+    fn output_overlaps_input_helper_detects_ranges() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId, DeviceType};
+
+        let buf = vec![0.0f32; 8];
+        let shape = [2usize, 2];
+        let strides = compute_contiguous_strides(&shape);
+        let base = buf.as_ptr() as usize;
+        let bytes = 4 * 4; // 4 f32
+
+        // Input covering buf[0..4].
+        let input = TensorView::new(
+            DevicePtr(buf.as_ptr() as *const std::ffi::c_void),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+
+        // Overlapping output starting inside the input range.
+        assert!(output_overlaps_input(
+            base + 8,
+            base + 8 + bytes,
+            &input,
+            DeviceId::cpu()
+        ));
+        // Disjoint output entirely past the input range.
+        assert!(!output_overlaps_input(
+            base + bytes,
+            base + 2 * bytes,
+            &input,
+            DeviceId::cpu()
+        ));
+        // Absent input never overlaps.
+        assert!(!output_overlaps_input(
+            base,
+            base + bytes,
+            &TensorView::absent(DataType::Float32),
+            DeviceId::cpu()
+        ));
+        // Different device is treated as non-overlapping (distinct address space).
+        assert!(!output_overlaps_input(
+            base,
+            base + bytes,
+            &input,
+            DeviceId::new(DeviceType::Cuda, 0)
+        ));
+        let _ = DevicePtrMut(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn aliasing_output_takes_fallback_and_is_correct() {
+        // DeviceIoBinding permits input/output aliasing. Construct an output that
+        // shares A's backing buffer; the direct path must be rejected and the
+        // owned-buffer fallback must still produce the correct result even though
+        // A is read while C is written to the same memory.
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId};
+
+        // A = [[1,2],[3,4]] shared with C; B = column swap so C = [[2,1],[4,3]].
+        let mut shared = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_buf = vec![0.0f32, 1.0, 1.0, 0.0];
+        let shape = vec![2usize, 2];
+        let strides = compute_contiguous_strides(&shape);
+        let a_ptr = shared.as_ptr() as *const std::ffi::c_void;
+        let c_ptr = shared.as_mut_ptr() as *mut std::ffi::c_void;
+
+        let a = TensorView::new(
+            DevicePtr(a_ptr),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        let b = TensorView::new(
+            DevicePtr(b_buf.as_ptr() as *const std::ffi::c_void),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        let mut c = TensorMut::new(
+            DevicePtrMut(c_ptr),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+
+        // Output aliases input A: direct path must be rejected.
+        assert!(!output_is_direct_f32_eligible(&a, &b, &c));
+
+        MatMulKernel::default().execute(&[a, b], &mut [c]).unwrap();
+        // Fallback computed the full result into a temp buffer before writing.
+        assert_eq!(shared, vec![2.0, 1.0, 4.0, 3.0]);
     }
 }
