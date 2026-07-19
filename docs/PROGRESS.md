@@ -8,13 +8,21 @@ _Last updated: 2026-07-19T22:20Z — ConvTranspose/Unique CPU kernels, fused QMo
 
 **Current `origin/main` implementation HEAD:** `6a7755c`.
 
+## 2026-07-19 — CPU GEMM parity and backend controls
+
+- **MLAS-style AVX2/FMA SIMD GEMM ✅ landed (`15e2f2e`):** new default `CpuBackend::SimdX86` (6×16 microkernel, panel packing, KC=256, rayon over disjoint C strips). Closed the medium-f32 MatMul-vs-ORT gap from ~21×/16× (1-/8-thread) down to **2.4×/5.1×**. (Gaff 🟢)
+- **User-selectable backend flag ✅ landed (`b1085df`→`f5c226b`→`fe6f4de`):** `ONNX_GENAI_BACKEND=auto|ort|native` env override; explicit config still wins over env; unsupported-op errors now append a "switch the flag" hint via `augment_backend_error`; ORT remains the default route. (Chew 🟢 after two reject→lockout→fix cycles)
+- **GEMM backend comparison ✅ landed (`181172e`):** `docs/GEMM_BACKEND_COMPARISON.md` — thread-matched MLAS vs oneDNN vs SimdX86. Finding: oneDNN only ~matches MLAS single-threaded (1.09–1.31×) but lags badly at 8 threads (3.76–4.87×), worse than our own SimdX86 on small shapes.
+- **oneDNN backend ✅ removed (`453d280`):** based on the comparison, oneDNN was not the parity path; removed feature/kernel/build.rs glue/submodule. 620 CPU-EP lib tests pass; registry count intact. (Luv 🟢)
+- **CPU-GEMM parity strategy 🚧:** vendoring MLAS source into an `mlas-sys` FFI crate (parity by construction + easy sync) — feasibility spike IN PROGRESS. Bench host is Intel Sapphire Rapids Xeon 8480C (AVX-512 + AMX), so the AVX2-only pure-Rust kernel is structurally ~2× behind; full parity needs AVX-512/AMX kernels, which MLAS already has.
+
 ## 2026-07-19 — CPU kernel quality and fused MoE batch
 
 - **ConvTranspose + Unique CPU kernels ✅ landed (`7219025`, `6a7755c`):** ConvTranspose covers 1D/2D/3D, groups, bias, dilation, strides, padding, output padding, and explicit output shapes with 11 conformance tests. Unique adds six conformance cases with O(n log n) grouping, correct NaN/signed-zero semantics, and numeric/bool/bf16 support. String returns a safe unsupported-dtype error pending runtime-level String tensor storage. Batch tracking estimates backend node coverage at approximately **1,023→1,029 passing**; a full conformance refresh is pending.
 - **Fused GLM/DeepSeek QMoE emitter ✅ landed (`fe3e342`; Mobius `93cbcf7`):** quantized routed experts can emit one expert-major int4 `com.microsoft::QMoE` node instead of per-expert `MatMulNBits`. The gated tiny-model E2E covers prefill and decode through **ORT's contrib QMoE CPU kernel, not the native Rust kernel**.
 - **Kernel benchmark harness ✅ landed (`d89a47e`, `59b17ad`):** Criterion microbenchmarks, fixed numeric regressions, and thread-matched ORT baselines are available. Medium-f32 MatMul is currently about **21.4× slower at one thread and 16.4× slower at eight threads** than ORT.
 - **CPU-kernel quality bar:** new kernels must not be slower than ORT for equivalent work and should provide broader dtype coverage where the runtime can safely represent those dtypes.
-- **MLAS-style SIMD GEMM port 🚧 IN PROGRESS:** Deckard's `deckard/mlas-gemm` work remains open and is expected to address the MatMul gap.
+- **MLAS-style SIMD GEMM port ✅ landed (`15e2f2e`):** `SimdX86` is now the default x86 fast path; the `mlas-sys` vendoring feasibility spike remains in progress for full AVX-512/AMX parity.
 
 ## 2026-07-19 — GLM-5.2 / DeepSeek E2E
 
