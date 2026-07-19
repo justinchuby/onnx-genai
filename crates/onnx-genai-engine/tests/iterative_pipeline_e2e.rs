@@ -383,6 +383,45 @@ pipeline:
 }
 
 #[test]
+fn iterative_dpmpp_2m_karras_runs() -> anyhow::Result<()> {
+    // use_karras_sigmas swaps in the Karras (rho=7) sigma schedule; verify it
+    // threads through the schema and runs. Numerical parity is covered by
+    // scripts/karras_parity.py + scripts/dpmpp_e2e.py (ONNX_GENAI_KARRAS=1).
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 5
+    timestep_input: t
+    scheduler_config:
+      kind: dpmpp_2m
+      num_train_timesteps: 1000
+      beta_start: 0.00085
+      beta_end: 0.012
+      beta_schedule: scaled_linear
+      use_karras_sigmas: true
+";
+    let dir = fixture_with_metadata("diffusion-dpmpp-karras", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request =
+        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    for got in &sample {
+        assert!(got.is_finite(), "dpm++ karras produced non-finite value {got}");
+    }
+    Ok(())
+}
+
+#[test]
 fn iterative_euler_scheduler_scales_input_and_steps() -> anyhow::Result<()> {
     // denoiser_step outputs `denoised = sample + t`. Euler scales the loop input
     // by 1/sqrt(sigma^2+1) BEFORE the denoiser, so with t=0 the model output

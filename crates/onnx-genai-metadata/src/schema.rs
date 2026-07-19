@@ -738,6 +738,11 @@ pub struct SchedulerSpec {
     /// Mask token id for a `masked_diffusion` (language-diffusion) scheduler:
     /// each step commits the highest-confidence still-masked positions.
     pub mask_token_id: Option<i64>,
+
+    /// Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the
+    /// default linspace spacing. Applies to sigma-space schedulers (`euler`,
+    /// `dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.
+    pub use_karras_sigmas: Option<bool>,
 }
 
 /// Pipeline execution strategy family.

@@ -28,10 +28,12 @@ PROMPT = "a photograph of an astronaut riding a horse"
 STEPS = 12
 CFG = 7.5
 SIZE = 256
+KARRAS = os.environ.get("ONNX_GENAI_KARRAS", "0") == "1"
+SPACING = "karras" if KARRAS else "normal"
 
 WORKFLOW = {
     "3": {"class_type": "KSampler", "inputs": {
-        "seed": 0, "steps": STEPS, "cfg": CFG, "sampler_name": "dpmpp_2m", "scheduler": "normal",
+        "seed": 0, "steps": STEPS, "cfg": CFG, "sampler_name": "dpmpp_2m", "scheduler": SPACING,
         "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0]}},
     "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "small-sd.safetensors"}},
     "5": {"class_type": "EmptyLatentImage", "inputs": {"width": SIZE, "height": SIZE, "batch_size": 1}},
@@ -80,7 +82,7 @@ def main() -> int:
     sched = DPMSolverMultistepScheduler(
         num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
         algorithm_type="dpmsolver++", solver_order=2, solver_type="midpoint",
-        use_karras_sigmas=False, timestep_spacing="linspace", final_sigmas_type="zero",
+        use_karras_sigmas=KARRAS, timestep_spacing="linspace", final_sigmas_type="zero",
         prediction_type="epsilon", lower_order_final=True,
     )
     sched.set_timesteps(STEPS)
@@ -129,7 +131,8 @@ def main() -> int:
     og_img = np.fromfile(out_path, dtype="<f4").reshape(1, 3, SIZE, SIZE)[0]
 
     diff = np.abs(og_img - img_ref)
-    print("\n=== onnx-genai DPM++2M (from ComfyUI) vs diffusers DPMSolverMultistep ===")
+    label = "DPM++2M Karras" if KARRAS else "DPM++2M"
+    print(f"\n=== onnx-genai {label} (from ComfyUI) vs diffusers DPMSolverMultistep ===")
     print(f"  max|diff|  = {diff.max():.3e}")
     print(f"  mean|diff| = {diff.mean():.3e}  (pixel range ~[-1,1])")
 

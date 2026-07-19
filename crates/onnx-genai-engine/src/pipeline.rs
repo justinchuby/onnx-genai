@@ -984,6 +984,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
+                    cfg.use_karras_sigmas.unwrap_or(false),
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1004,6 +1005,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
+                    cfg.use_karras_sigmas.unwrap_or(false),
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1228,6 +1230,7 @@ impl EulerSchedule {
         beta_end: f32,
         beta_schedule: &str,
         num_steps: usize,
+        use_karras: bool,
     ) -> anyhow::Result<Self> {
         if num_train_timesteps < 2 {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
@@ -1236,6 +1239,11 @@ impl EulerSchedule {
             anyhow::bail!(
                 "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
             );
+        }
+        if use_karras {
+            let sigmas =
+                karras_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?;
+            return Ok(Self { sigmas });
         }
         let denom = (num_train_timesteps - 1) as f32;
         let (lo, hi, square) = match beta_schedule {
@@ -1350,6 +1358,7 @@ impl Dpmpp2m {
         beta_end: f32,
         beta_schedule: &str,
         num_steps: usize,
+        use_karras: bool,
     ) -> anyhow::Result<Self> {
         if num_train_timesteps < 2 {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
@@ -1358,6 +1367,14 @@ impl Dpmpp2m {
             anyhow::bail!(
                 "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
             );
+        }
+        if use_karras {
+            let sigmas =
+                karras_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?;
+            return Ok(Self {
+                sigmas,
+                prev_x0: Mutex::new(None),
+            });
         }
         let denom = (num_train_timesteps - 1) as f32;
         let (lo, hi, square) = match beta_schedule {
@@ -1401,6 +1418,63 @@ impl Dpmpp2m {
 fn dpm_alpha_sigma(sigma: f32) -> (f32, f32) {
     let alpha_t = 1.0 / (sigma * sigma + 1.0).sqrt();
     (alpha_t, sigma * alpha_t)
+}
+
+/// Training sigmas `((1-alpha_cumprod)/alpha_cumprod)^0.5` over the beta schedule.
+fn training_sigmas(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let denom = (num_train_timesteps - 1) as f32;
+    let (lo, hi, square) = match beta_schedule {
+        "linear" => (beta_start, beta_end, false),
+        "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+        other => anyhow::bail!(
+            "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+        ),
+    };
+    let mut out = Vec::with_capacity(num_train_timesteps);
+    let mut prod = 1.0f32;
+    for i in 0..num_train_timesteps {
+        let mut beta = lo + (hi - lo) * (i as f32) / denom;
+        if square {
+            beta *= beta;
+        }
+        prod *= 1.0 - beta;
+        out.push(((1.0 - prod) / prod).sqrt());
+    }
+    Ok(out)
+}
+
+/// Karras (rho=7) sigma schedule from the training sigma range, descending, with
+/// a trailing `0.0`. Length `num_steps + 1`. Matches diffusers `_convert_to_karras`
+/// (identical for Euler and DPM++ since both derive min/max from the full range).
+fn karras_sigmas(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+    num_steps: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const RHO: f32 = 7.0;
+    let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+    let sigma_min = train[0];
+    let sigma_max = train[num_train_timesteps - 1];
+    let min_inv = sigma_min.powf(1.0 / RHO);
+    let max_inv = sigma_max.powf(1.0 / RHO);
+    let mut sigmas = Vec::with_capacity(num_steps + 1);
+    for k in 0..num_steps {
+        let ramp = if num_steps > 1 {
+            k as f32 / (num_steps - 1) as f32
+        } else {
+            0.0
+        };
+        sigmas.push((max_inv + ramp * (min_inv - max_inv)).powf(RHO));
+    }
+    sigmas.push(0.0);
+    Ok(sigmas)
 }
 
 impl Scheduler for Dpmpp2m {

@@ -1561,6 +1561,13 @@
             "string",
             "null"
           ]
+        },
+        "use_karras_sigmas": {
+          "description": "Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the\ndefault linspace spacing. Applies to sigma-space schedulers (`euler`,\n`dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "required": [
