@@ -4,13 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T13:35Z — unsupported-op executor tests hardened against op-registration staleness._
+_Last updated: 2026-07-19T14:10Z — CPU-EP op-coverage wave advanced backend node conformance to 921 passing._
 
-**Current `origin/main` HEAD:** `6ba4d96`.
+**Current `origin/main` implementation HEAD:** `0b38d59`.
 
 
 ## Current tiered-memory and interoperability milestones
 
+- **CPU-EP op-coverage wave ✅ landed (`5816d23`, `43c0315`, `0b38d59`):** CumSum was corrected to opset 14 with full schema dtype/direction/exclusive/negative-axis coverage; CumProd (opset 26), BitwiseAnd/Or/Xor/Not (opset 18), Hardmax (opset 13 with fp16/bf16), and Hann/Hamming/Blackman windows (opset 17) were added. Bryant’s scan/window work was Chew 🟡 approved with nits; Pris’s initial Bitwise/Hardmax slice was Luv 🔴 rejected and locked out, then Deckard’s revision was Luv 🟢 approved. ONNX backend CPU node conformance advanced from **875→921 passing** (**+46**).
 - **Unsupported-op executor tests ✅ hardened (`6ba4d96`, Pris; Bryant 🟢):** unsupported-op executor tests now use the never-registered sentinel `NxrtNeverRegisteredSentinelOp` instead of a mutable real operator, preventing future op registrations from silently invalidating handler-miss diagnostics.
 - **2026-07-19 conformance + CUDA drift ✅ recorded:** ONNX backend-test conformance was refreshed to **875/1,765** pure-Rust CPU node cases passing at `ec5118c` (890 failing; CUDA variants skipped). The CUDA token-index-10 CPU/GPU numeric drift was confirmed as SkipSimplifiedLayerNorm RMS FMA-contraction, already fixed by `de3c556` and verified through 64 tokens at `ccf994c`. The cudarc CUDA-version conflict blocking `onnx-genai-engine --features cuda,native-backend` is fixed at `db3f733`; the engine `cuda,native-backend` build is clean again and native CUDA decode parity was revalidated for 64 tokens.
 - **Zero-copy weight streaming ✅ DONE:** aligned mmap-backed external initializers are borrowed rather than copied; borrowed ownership and initializer-producer validation close the read-only mmap soundness boundary.
