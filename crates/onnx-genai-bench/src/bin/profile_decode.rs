@@ -108,7 +108,12 @@ fn load_real_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
                 .and_then(|value| value.as_str().map(ToString::to_string))
                 .is_some());
     if has_template {
-        ChatTemplate::from_model_dir(model_dir).ok()
+        Some(ChatTemplate::from_model_dir(model_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to load chat template from {}: {err}",
+                model_dir.display()
+            )
+        }))
     } else {
         None
     }
@@ -131,8 +136,13 @@ fn resolve_prompt(args: &Args) -> String {
                     rendered
                 }
                 Err(err) => {
-                    println!("prompt: chat template render failed ({err}); using raw prompt");
-                    args.prompt.clone()
+                    panic!(
+                        "chat template render failed for {}: {err}\n\
+                         (refusing to silently fall back to the raw prompt — that would \
+                         feed the model a different sequence and skew results; pass --raw \
+                         to benchmark the untemplated prompt on purpose)",
+                        args.model.display()
+                    );
                 }
             }
         }
