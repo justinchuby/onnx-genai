@@ -446,14 +446,27 @@ impl Engine {
             anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
         }
 
+        // Optional cap on the runtime-owned fixed-capacity KV buffer. Foundry /
+        // onnxruntime-genai `genai_config.json` models advertise the model's full
+        // `context_length` (e.g. 32k-131k) as their max sequence length, and the
+        // shared-buffer decode path pre-allocates a KV buffer of exactly that many
+        // tokens up front — regardless of how many tokens a request will actually
+        // generate. On memory-constrained devices that over-allocation exhausts
+        // VRAM (spilling to shared system memory over PCIe) even for short runs.
+        // `ONNX_GENAI_KV_MAX_LEN` caps that capacity to the caller's real
+        // generation budget (prompt + max_new_tokens), mirroring the native
+        // path's `ONNX_GENAI_CUDA_KV_MAX_LEN`. Unset = unchanged (full context).
+        let kv_shared_buffer_cap = shared_buffer_cap_from_env();
         let metadata_max_context = metadata
             .model
             .as_ref()
-            .and_then(|model| model.max_sequence_length);
+            .and_then(|model| model.max_sequence_length)
+            .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
         // Our own inference metadata (inference_metadata.yaml), not
         // onnxruntime-genai's genai_config.json, drives the runtime-owned
         // share-buffer KV path for GQA models.
-        let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata);
+        let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata)
+            .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
         let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
         let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
         let decode_path = detect_model_decode_path(
@@ -2203,6 +2216,23 @@ fn default_inference_metadata() -> InferenceMetadata {
     }
 }
 
+/// Optional cap (in tokens) on the runtime-owned fixed-capacity KV buffer,
+/// read from `ONNX_GENAI_KV_MAX_LEN`. Returns `None` when the variable is
+/// unset, empty, or unparseable (in which case the model's full advertised
+/// context length is used, preserving prior behavior).
+fn shared_buffer_cap_from_env() -> Option<usize> {
+    std::env::var("ONNX_GENAI_KV_MAX_LEN")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&cap| cap > 0)
+}
+
+/// Apply an optional KV-buffer capacity cap: the effective length is the
+/// smaller of the model's advertised max length and the cap, if any.
+fn cap_kv_len(model_max_len: usize, cap: Option<usize>) -> usize {
+    cap.map_or(model_max_len, |cap| model_max_len.min(cap))
+}
+
 /// Best-effort native metadata derived from an onnxruntime-genai
 /// `genai_config.json` in `model_dir`, used only when no
 /// `inference_metadata.yaml` is present. Returns `Ok(None)` when there is no
@@ -2423,6 +2453,21 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+
+    #[test]
+    fn cap_kv_len_uncapped_returns_model_max() {
+        assert_eq!(cap_kv_len(32_768, None), 32_768);
+    }
+
+    #[test]
+    fn cap_kv_len_caps_when_smaller() {
+        assert_eq!(cap_kv_len(40_960, Some(512)), 512);
+    }
+
+    #[test]
+    fn cap_kv_len_ignores_cap_larger_than_model_max() {
+        assert_eq!(cap_kv_len(512, Some(40_960)), 512);
+    }
 
     #[cfg(feature = "native-backend")]
     #[test]
