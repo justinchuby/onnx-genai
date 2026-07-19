@@ -1,4 +1,4 @@
-//! Sequence construction and scans: `Tile`, `Range`, and `CumSum`.
+//! Sequence construction and scans: `Tile`, `Range`, `CumSum`, and `CumProd`.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -7,6 +7,7 @@ use super::{
     check_arity, elem_size, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_bytes,
     write_dense_f32,
 };
+use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::numel;
 
 pub struct TileKernel;
@@ -150,59 +151,138 @@ impl KernelFactory for CumSumFactory {
 }
 impl Kernel for CumSumKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("CumSum", inputs, outputs, 2, 2, 1)?;
-        let axis = to_dense_i64(&inputs[1])?;
-        if axis.len() != 1 {
-            return Err(EpError::KernelFailed(
-                "CumSum: axis must be a scalar".into(),
-            ));
-        }
-        let rank = inputs[0].shape.len();
-        let raw = axis[0];
-        let axis = if raw < 0 { raw + rank as i64 } else { raw };
-        if axis < 0 || axis as usize >= rank {
-            return Err(EpError::KernelFailed("CumSum: axis out of range".into()));
-        }
-        let axis = axis as usize;
-        if outputs[0].dtype != inputs[0].dtype {
-            return Err(EpError::KernelFailed(
-                "CumSum: output dtype must match input".into(),
-            ));
-        }
-        match inputs[0].dtype {
-            DataType::Float32 => {
-                let mut out = to_dense_f32(&inputs[0])?;
-                scan(
-                    &mut out,
-                    inputs[0].shape,
-                    axis,
-                    self.exclusive,
-                    self.reverse,
-                    |a, b| a + b,
-                );
-                write_dense_f32(&mut outputs[0], &out)
-            }
-            DataType::Int64 => {
-                let mut out = to_dense_i64(&inputs[0])?;
-                scan(
-                    &mut out,
-                    inputs[0].shape,
-                    axis,
-                    self.exclusive,
-                    self.reverse,
-                    i64::wrapping_add,
-                );
-                let bytes: Vec<u8> = out.iter().flat_map(|v| v.to_le_bytes()).collect();
-                write_dense_bytes(&mut outputs[0], &bytes)
-            }
-            dtype => Err(EpError::KernelFailed(format!(
-                "CumSum: unsupported dtype {dtype:?}"
-            ))),
-        }
+        execute_cumulative(
+            "CumSum",
+            inputs,
+            outputs,
+            self.exclusive,
+            self.reverse,
+            CumulativeOp::Sum,
+        )
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         true
     }
+}
+
+pub struct CumProdKernel {
+    exclusive: bool,
+    reverse: bool,
+}
+pub struct CumProdFactory;
+impl KernelFactory for CumProdFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(CumProdKernel {
+            exclusive: node.attr("exclusive").and_then(|a| a.as_int()).unwrap_or(0) != 0,
+            reverse: node.attr("reverse").and_then(|a| a.as_int()).unwrap_or(0) != 0,
+        }))
+    }
+}
+impl Kernel for CumProdKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        execute_cumulative(
+            "CumProd",
+            inputs,
+            outputs,
+            self.exclusive,
+            self.reverse,
+            CumulativeOp::Product,
+        )
+    }
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CumulativeOp {
+    Sum,
+    Product,
+}
+
+fn execute_cumulative(
+    op: &str,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    exclusive: bool,
+    reverse: bool,
+    cumulative_op: CumulativeOp,
+) -> Result<()> {
+    check_arity(op, inputs, outputs, 2, 2, 1)?;
+    let axis_values = to_dense_i64(&inputs[1])?;
+    if axis_values.len() != 1 {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: axis must contain exactly one element"
+        )));
+    }
+    let rank = inputs[0].shape.len();
+    let raw = axis_values[0];
+    let axis = if raw < 0 { raw + rank as i64 } else { raw };
+    if axis < 0 || axis as usize >= rank {
+        return Err(EpError::KernelFailed(format!("{op}: axis out of range")));
+    }
+    if outputs[0].dtype != inputs[0].dtype {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: output dtype must match input"
+        )));
+    }
+
+    macro_rules! run {
+        ($ty:ty) => {
+            execute_cumulative_typed::<$ty>(
+                &inputs[0],
+                &mut outputs[0],
+                axis as usize,
+                exclusive,
+                reverse,
+                cumulative_op,
+            )
+        };
+    }
+    match inputs[0].dtype {
+        DataType::Uint32 => run!(u32),
+        DataType::Uint64 => run!(u64),
+        DataType::Int32 => run!(i32),
+        DataType::Int64 => run!(i64),
+        DataType::Float16 => run!(half::f16),
+        DataType::Float32 => run!(f32),
+        DataType::Float64 => run!(f64),
+        DataType::BFloat16 => run!(half::bf16),
+        dtype => Err(EpError::KernelFailed(format!(
+            "{op}: unsupported dtype {dtype:?}"
+        ))),
+    }
+}
+
+fn execute_cumulative_typed<T>(
+    input: &TensorView,
+    output: &mut TensorMut,
+    axis: usize,
+    exclusive: bool,
+    reverse: bool,
+    cumulative_op: CumulativeOp,
+) -> Result<()>
+where
+    T: NumericElem,
+{
+    let mut values = to_dense::<T>(input)?;
+    let identity = match cumulative_op {
+        CumulativeOp::Sum => 0.0,
+        CumulativeOp::Product => 1.0,
+    };
+    scan(
+        &mut values,
+        input.shape,
+        axis,
+        exclusive,
+        reverse,
+        T::from_f32_scalar(identity).to_acc(),
+        |left, right| match cumulative_op {
+            CumulativeOp::Sum => left.c_add(right),
+            CumulativeOp::Product => left.c_mul(right),
+        },
+    );
+    write_dense::<T>(output, &values)
 }
 
 fn float_range_count(start: f32, limit: f32, delta: f32) -> Result<usize> {
@@ -257,29 +337,33 @@ fn alloc_range_output<T>(count: usize) -> Result<Vec<T>> {
     Ok(out)
 }
 
-fn scan<T: Copy + Default>(
+fn scan<T, F>(
     values: &mut [T],
     shape: &[usize],
     axis: usize,
     exclusive: bool,
     reverse: bool,
-    add: impl Fn(T, T) -> T,
-) {
+    identity: T::Acc,
+    combine: F,
+) where
+    T: NumericElem,
+    F: Fn(T::Acc, T::Acc) -> T::Acc,
+{
     let inner = numel(&shape[axis + 1..]);
     let width = shape[axis];
     for outer in 0..numel(&shape[..axis]) {
         for i in 0..inner {
-            let mut total = T::default();
+            let mut total = identity;
             for n in 0..width {
                 let d = if reverse { width - 1 - n } else { n };
                 let offset = (outer * width + d) * inner + i;
-                let v = values[offset];
+                let value = values[offset].to_acc();
                 if exclusive {
-                    values[offset] = total;
-                    total = add(total, v);
+                    values[offset] = T::from_acc(total);
+                    total = combine(total, value);
                 } else {
-                    total = add(total, v);
-                    values[offset] = total;
+                    total = combine(total, value);
+                    values[offset] = T::from_acc(total);
                 }
             }
         }
@@ -383,5 +467,75 @@ mod tests {
         .execute(&[x.view(), a.view()], &mut [y.view_mut()])
         .unwrap();
         assert_eq!(y.to_f32(), vec![5., 3., 0.]);
+    }
+
+    #[test]
+    fn cumsum_negative_axis_int32() {
+        let x = Owned::i32(&[2, 3], &[1, 2, 3, 4, 5, 6]);
+        let axis = Owned::i64(&[1], &[-1]);
+        let mut y = Owned::zeros(DataType::Int32, &[2, 3]);
+        CumSumKernel {
+            exclusive: false,
+            reverse: false,
+        }
+        .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i32(), vec![1, 3, 6, 4, 9, 15]);
+    }
+
+    #[test]
+    fn cumsum_exclusive_axis_zero() {
+        let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let axis = Owned::i64(&[], &[0]);
+        let mut y = Owned::zeros_f32(&[2, 3]);
+        CumSumKernel {
+            exclusive: true,
+            reverse: false,
+        }
+        .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_f32(), vec![0., 0., 0., 1., 2., 3.]);
+    }
+
+    #[test]
+    fn cumprod_negative_axis_int32_exclusive() {
+        let x = Owned::i32(&[2, 3], &[1, 2, 3, 4, 5, 6]);
+        let axis = Owned::i64(&[], &[-1]);
+        let mut y = Owned::zeros(DataType::Int32, &[2, 3]);
+        CumProdKernel {
+            exclusive: true,
+            reverse: false,
+        }
+        .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_i32(), vec![1, 1, 2, 1, 4, 20]);
+    }
+
+    #[test]
+    fn cumprod_reverse_exclusive() {
+        let x = Owned::f32(&[3], &[2., 3., 4.]);
+        let axis = Owned::i64(&[], &[0]);
+        let mut y = Owned::zeros_f32(&[3]);
+        CumProdKernel {
+            exclusive: true,
+            reverse: true,
+        }
+        .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_f32(), vec![12., 4., 1.]);
+    }
+
+    #[test]
+    fn cumprod_2d_axis_zero() {
+        let x = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let axis = Owned::i64(&[1], &[0]);
+        let mut y = Owned::zeros_f32(&[2, 3]);
+        CumProdKernel {
+            exclusive: false,
+            reverse: false,
+        }
+        .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
+        .unwrap();
+        assert_eq!(y.to_f32(), vec![1., 2., 3., 4., 10., 18.]);
     }
 }

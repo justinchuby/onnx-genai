@@ -83,6 +83,7 @@ pub mod transpose;
 pub mod unary_math;
 pub mod unsqueeze;
 pub mod where_op;
+pub mod window;
 
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
@@ -705,8 +706,24 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         Box::new(sequence::RangeFactory),
     );
     reg.register(
-        OpKey::new("CumSum", "", 11),
+        OpKey::new("CumSum", "", 14),
         Box::new(sequence::CumSumFactory),
+    );
+    reg.register(
+        OpKey::new("CumProd", "", 26),
+        Box::new(sequence::CumProdFactory),
+    );
+    reg.register(
+        OpKey::new("HannWindow", "", 17),
+        Box::new(window::HannWindowFactory),
+    );
+    reg.register(
+        OpKey::new("HammingWindow", "", 17),
+        Box::new(window::HammingWindowFactory),
+    );
+    reg.register(
+        OpKey::new("BlackmanWindow", "", 17),
+        Box::new(window::BlackmanWindowFactory),
     );
     // Value selection.
     reg.register(OpKey::new("Clip", "", 1), Box::new(selection::ClipFactory));
@@ -1334,7 +1351,9 @@ mod tests {
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
         // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
         // private/contrib registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 58);
+        // CumProd and the three standard window generators add four more
+        // default-domain entries beyond the original Phase-1 set.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 62);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1343,6 +1362,11 @@ mod tests {
         assert!(reg.lookup("Softmax", "", 13).is_some());
         assert!(reg.lookup("LogSoftmax", "", 12).is_some());
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
+        assert!(reg.lookup("CumSum", "", 14).is_some());
+        assert!(reg.lookup("CumProd", "", 26).is_some());
+        assert!(reg.lookup("HannWindow", "", 17).is_some());
+        assert!(reg.lookup("HammingWindow", "", 17).is_some());
+        assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
