@@ -106,8 +106,13 @@ fn main() -> Result<()> {
         request = request.with_input(endpoint, value);
     }
 
+    let load_start = std::time::Instant::now();
     let mut engine = Engine::from_pipeline_dir(std::path::Path::new(pipeline_dir), EngineConfig::default())?;
+    let load_ms = load_start.elapsed().as_secs_f64() * 1e3;
+    let run_start = std::time::Instant::now();
     let outputs = engine.run_pipeline(request)?;
+    let run_ms = run_start.elapsed().as_secs_f64() * 1e3;
+    eprintln!("[timing] load={load_ms:.1}ms run={run_ms:.1}ms");
     let value = outputs
         .get(output_endpoint)
         .with_context(|| format!("output endpoint '{output_endpoint}' not produced"))?;
