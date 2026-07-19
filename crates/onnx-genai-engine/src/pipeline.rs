@@ -17,7 +17,7 @@ use onnx_genai_metadata::{
     PipelineVisionConfig, SchedulerSpec,
 };
 use onnx_genai_ort::{
-    PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
+    DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -397,9 +397,15 @@ impl PipelineEngine {
         for info in denoiser.inputs() {
             let port = info.name.as_str();
             let endpoint = format!("{}.{}", plan.denoiser, port);
-            // Per-step timestep injection takes precedence for its port.
+            // Per-step timestep injection takes precedence for its port. Honor
+            // the port dtype: real diffusion denoisers (DiT/UNet) declare an
+            // INT64 timestep, while others take a float sigma.
             if plan.timestep_input.as_deref() == Some(port) {
-                inputs.push((port.to_string(), Value::from_slice_f32(&[timestep], &[1])?));
+                let ts = match info.dtype {
+                    DataType::Int64 => Value::from_vec_i64(vec![timestep as i64], &[1])?,
+                    _ => Value::from_slice_f32(&[timestep], &[1])?,
+                };
+                inputs.push((port.to_string(), ts));
                 continue;
             }
             let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);

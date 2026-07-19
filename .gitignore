@@ -12,6 +12,7 @@ models/
 !tests/fixtures/tiny-diffusion/vae.onnx
 !tests/fixtures/tiny-diffusion/denoiser_multi.onnx
 !tests/fixtures/tiny-diffusion/denoiser_step.onnx
+!tests/fixtures/tiny-dit-diffusion/denoiser.onnx
 !crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
 !tests/fixtures/tiny-gemma4-assistant/model.onnx
 !tests/fixtures/tiny-gemma4-assistant/assistant/model.onnx

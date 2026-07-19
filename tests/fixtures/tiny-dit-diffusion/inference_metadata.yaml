@@ -1,0 +1,18 @@
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.noise_pred
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    timestep_input: timestep
+    scheduler_config:
+      kind: ddim
+      num_train_timesteps: 1000
+      beta_start: 0.00085
+      beta_end: 0.012

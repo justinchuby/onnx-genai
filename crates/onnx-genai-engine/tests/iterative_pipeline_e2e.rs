@@ -412,3 +412,43 @@ pipeline:
     assert!(err.to_string().contains("scheduler kind"), "unexpected: {err}");
     Ok(())
 }
+
+#[test]
+fn real_dit_denoiser_runs_through_ddim_iterative_pipeline() -> anyhow::Result<()> {
+    // A REAL diffusion-transformer denoiser built by Mobius
+    // (scripts/build_tiny_dit_diffusion.py): patch-embed + AdaLN + self/cross
+    // attention + FFN, with the standard contract
+    //   sample[B,4,H,W] + timestep[B](int64) + encoder_hidden_states[B,S,16]
+    //     -> noise_pred[B,4,H,W].
+    // This exercises rank-4 latents, an INT64 timestep injection, and the DDIM
+    // scheduler end-to-end (the metadata declares num_steps=3 + ddim).
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-dit-diffusion")
+        .canonicalize()?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+
+    let sample: Vec<f32> = (0..4 * 8 * 8).map(|i| (i as f32 % 7.0 - 3.0) * 0.1).collect();
+    let ehs: Vec<f32> = (0..4 * 16).map(|i| (i as f32 % 5.0 - 2.0) * 0.1).collect();
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&sample, &[1, 4, 8, 8])?)
+        .with_input(
+            "denoiser.encoder_hidden_states",
+            Value::from_slice_f32(&ehs, &[1, 4, 16])?,
+        );
+
+    let out = engine.run_pipeline(request)?;
+    // Post-scheduler latent, published under the input-port key.
+    let final_sample = out
+        .get("denoiser.sample")
+        .expect("scheduled latent")
+        .to_vec_f32()?;
+    assert_eq!(final_sample.len(), 4 * 8 * 8);
+    assert!(
+        final_sample.iter().all(|v| v.is_finite()),
+        "DiT diffusion produced non-finite latent"
+    );
+    // The raw noise prediction is also published under the output-port key.
+    let noise = out.get("denoiser.noise_pred").expect("noise_pred").to_vec_f32()?;
+    assert_eq!(noise.len(), 4 * 8 * 8);
+    Ok(())
+}
