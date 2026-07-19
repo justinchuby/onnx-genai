@@ -116,7 +116,7 @@ Evidence-based audit of `docs/DESIGN.md` (engine) + `docs/ORT2.md` (nxrt runtime
 
 11. **Resource Governor §26.11 — 🟡 engine wiring complete; live eviction deferred.** The engine now parses byte/fraction/`auto` limits, reads `EngineConfig.limits` and `allow_runtime_override` from YAML, exposes governor and per-tier resource snapshots, and guards runtime VRAM-limit updates (`1eebf5d`). The §26.11 design (`d6736e1`) remains the source for transactional lowering and actionable errors; immediate eviction to satisfy a lowered live limit is not yet implemented.
 
-12. **Multimodal / VLM & diffusion — 🟡/❌.** Image + audio **preprocessing** ✅ (`onnx-genai-preprocess`: bicubic/CLIP + tiling + log-mel), single-tensor `pixel_values` vision path ✅, audio input wired ✅. But full **Gemma4 VLM decode** (rank-3 pre-patchified tensors, `pixel_position_ids`, f16, embedding-model→`inputs_embeds` orchestration) is **blocked** on runtime + Mobius work (see the Gemma4 scoping notes above). **Diffusion pipelines are ❌**: §17 image diffusion (#16) not started, §29 language diffusion not started — `engine/src/pipeline.rs` carries only `denoiser: None` placeholders.
+12. **Multimodal / VLM & diffusion — 🟡/❌.** Image + audio **preprocessing** ✅ (`onnx-genai-preprocess`: bicubic/CLIP + tiling + log-mel), single-tensor `pixel_values` vision path ✅, audio input wired ✅. But full **Gemma4 VLM decode** (rank-3 pre-patchified tensors, `pixel_position_ids`, f16, embedding-model→`inputs_embeds` orchestration) is **blocked** on runtime + Mobius work (see the Gemma4 scoping notes above). **Diffusion execution seam ✅** (PR #35): `PipelineEngine::run_pipeline` runs `kind: iterative` denoise loops (loop-carried self-edges + constant conditioning + per-step timestep/sigma injection) and `single_pass` models, returning tensors. **Remaining**: scheduler step-transform (DDIM/Euler) + classifier-free guidance, then §17 image diffusion (#16, text-encoder→denoiser→VAE) and §29 language diffusion end-to-end.
 
 13. **Speculative decoding — ✅ correctness, 🟡 perf.** Draft + prompt-lookup + MTP + EAGLE-3 + Gemma4-assistant (shared-KV) proposers are implemented and **token-identical to greedy on real Gemma4 E2B weights on H200** (§27). Open item is **performance only** — real speedup still <1× (drafter lm_head cost); correctness is done. (Listed here because DESIGN framed it as design-only in the earlier phasing checklist; it is in fact implemented.)
 
@@ -139,7 +139,7 @@ Evidence-based audit of `docs/DESIGN.md` (engine) + `docs/ORT2.md` (nxrt runtime
 | 16 | Quantized models | ✅ Done | EP select + int8 KV; fp8/int8 KV **storage now selectable** end-to-end (#15) via `--kv-cache-dtype`/`ONNX_GENAI_KV_CACHE_DTYPE` (f32/int8/fp8_e4m3fn/fp8_e5m2) → `PageTensorConfig.dtype` |
 | 17 | Diffusion pipeline (image) | ❌ Missing | #16 |
 | 18,19 | ORT wrapper, dep graph | ✅ Done | |
-| 20 | Generalized pipeline | 🟡 Partial | AR/composite/single-pass/vision/audio ✅; iterative diffusion pending |
+| 20 | Generalized pipeline | 🟡 Partial | AR/composite/single-pass/vision/audio ✅; **iterative/diffusion execution seam ✅** (loop-carried denoise + per-step timestep injection, PR #35); scheduler step-transform (DDIM/Euler) + CFG pending |
 | 21 | Tool use / function calling | ✅ Done | Hermes-verified E2E |
 | 22 | Grammar constrained decoding | ✅ Done | llguidance JSON-schema/regex/lark |
 | 23 | FIM / infilling | ✅ Done | engine + `POST /v1/completions` |
