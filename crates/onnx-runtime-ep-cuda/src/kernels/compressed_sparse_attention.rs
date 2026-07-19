@@ -91,6 +91,8 @@ const OP: &str = "CompressedSparseAttention";
 /// the denominator and the value reduction, exactly like the oracle.
 const ATTENTION_MODULE: &str = "csa_ratio128_attention";
 const ATTENTION_ENTRY: &str = "csa_ratio128_sink_attention";
+const RATIO4_ATTENTION_MODULE: &str = "csa_ratio4_attention";
+const RATIO4_ATTENTION_ENTRY: &str = "csa_ratio4_sink_attention";
 const ATTENTION_BLOCK: u32 = 256;
 
 /// Stage-1 ratio-128 compressor.  Deliberately one thread owns a batch row: the
@@ -583,6 +585,129 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     }
 }
 "#;
+const RATIO4_ATTENTION_SOURCE: &str = r#"
+extern "C" __global__ void csa_ratio4_sink_attention(
+    const float* query, const float* current_kv, const unsigned char* compressed,
+    const int* selected, const float* sink, const float* bias, float* output, float* scores,
+    int batch, int sequence, int heads, int dim, int current_kv_len,
+    long long current_kv_base, long long query_start, int compressed_records,
+    int index_heads, int topk_width, int dense_candidates, int candidate_count,
+    int bias_present, int bias_b, int bias_h, int bias_s, int bias_k, float scale)
+{
+    const int row = blockIdx.x;
+    const int rows = batch * sequence * heads;
+    if (row >= rows) return;
+    const int h = row % heads;
+    const int bs = row / heads;
+    const int s = bs % sequence;
+    const int b = bs / sequence;
+    const float NEG = __int_as_float(0xff800000);
+    const long long position = query_start + (long long)s;
+    long long window = position + 1 - 128;
+    if (window < 0) window = 0;
+    const long long dense_start = current_kv_base > window ? current_kv_base : window;
+    float* row_scores = scores + (long long)row * candidate_count;
+    const long long q_base = ((long long)(b * sequence + s) * heads + h) * dim;
+    const int selected_base = ((b * index_heads) * sequence + s) * topk_width;
+    __shared__ float s_max;
+    __shared__ float s_denom;
+    __shared__ int s_valid;
+    if (threadIdx.x == 0) {
+        for (int c = 0; c < candidate_count; ++c) row_scores[c] = NEG;
+        float maximum = NEG;
+        for (int c = 0; c < dense_candidates; ++c) {
+            const long long absolute = dense_start + (long long)c;
+            if (absolute > position) continue;
+            const long long relative = absolute - current_kv_base;
+            if (relative < 0 || relative >= (long long)current_kv_len) continue;
+            const float* kv = current_kv + ((long long)b * current_kv_len + relative) * dim;
+            float acc = 0.0f;
+            for (int d = 0; d < dim; ++d)
+                acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
+            float score = __fmul_rn(acc, scale);
+            if (bias_present) {
+                const int bb = bias_b == 1 ? 0 : b;
+                const int bh = bias_h == 1 ? 0 : h;
+                const int bq = bias_s == 1 ? 0 : s;
+                const int bk = bias_k == 1 ? 0 : c;
+                score = __fadd_rn(score, bias[(((bb * bias_h + bh) * bias_s + bq) * bias_k + bk)]);
+            }
+            row_scores[c] = score; maximum = fmaxf(maximum, score);
+        }
+        for (int slot = 0; slot < topk_width; ++slot) {
+            const int record = selected[selected_base + slot];
+            if (record < 0 || record >= compressed_records) continue;
+            const unsigned char* packed = compressed + ((long long)b * compressed_records + record) * 583;
+            float acc = 0.0f;
+            for (int block = 0; block < 7; ++block) {
+                const float block_scale = e8m0_scale(packed[65 * block]);
+                for (int d = 0; d < 64; ++d)
+                    acc = __fadd_rn(acc, __fmul_rn(query[q_base + 64 * block + d],
+                        decode_e4m3fn(packed[65 * block + 1 + d]) * block_scale));
+            }
+            for (int d = 448; d < dim; ++d) {
+                const int tail = d - 448;
+                const unsigned short bits = (unsigned short)packed[455 + 2 * tail]
+                    | ((unsigned short)packed[455 + 2 * tail + 1] << 8);
+                acc = __fadd_rn(acc, __fmul_rn(query[q_base + d],
+                    __uint_as_float((unsigned int)bits << 16)));
+            }
+            const int c = dense_candidates + slot;
+            float score = __fmul_rn(acc, scale);
+            if (bias_present) {
+                const int bb = bias_b == 1 ? 0 : b;
+                const int bh = bias_h == 1 ? 0 : h;
+                const int bq = bias_s == 1 ? 0 : s;
+                const int bk = bias_k == 1 ? 0 : c;
+                score = __fadd_rn(score, bias[(((bb * bias_h + bh) * bias_s + bq) * bias_k + bk)]);
+            }
+            row_scores[c] = score; maximum = fmaxf(maximum, score);
+        }
+        if (maximum == NEG) s_valid = 0;
+        else {
+            float denom = 0.0f;
+            for (int c = 0; c < candidate_count; ++c)
+                if (row_scores[c] != NEG)
+                    denom = __fadd_rn(denom, (float)exp((double)(row_scores[c] - maximum)));
+            denom = __fadd_rn(denom, (float)exp((double)(sink[h] - maximum)));
+            s_max = maximum; s_denom = denom; s_valid = 1;
+        }
+    }
+    __syncthreads();
+    if (!s_valid) {
+        for (int d = threadIdx.x; d < dim; d += blockDim.x) output[q_base + d] = 0.0f;
+        return;
+    }
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float result = 0.0f;
+        for (int c = 0; c < candidate_count; ++c) {
+            const float score = row_scores[c];
+            if (score == NEG) continue;
+            const float probability = (float)exp((double)(score - s_max)) / s_denom;
+            float value;
+            if (c < dense_candidates) {
+                const long long relative = dense_start + (long long)c - current_kv_base;
+                value = current_kv[((long long)b * current_kv_len + relative) * dim + d];
+            } else {
+                const int record = selected[selected_base + c - dense_candidates];
+                const unsigned char* packed = compressed + ((long long)b * compressed_records + record) * 583;
+                if (d < 448) {
+                    const int block = d / 64, in_block = d % 64;
+                    value = decode_e4m3fn(packed[65 * block + 1 + in_block])
+                        * e8m0_scale(packed[65 * block]);
+                } else {
+                    const int tail = d - 448;
+                    const unsigned short bits = (unsigned short)packed[455 + 2 * tail]
+                        | ((unsigned short)packed[455 + 2 * tail + 1] << 8);
+                    value = __uint_as_float((unsigned int)bits << 16);
+                }
+            }
+            result = __fadd_rn(result, __fmul_rn(probability, value));
+        }
+        output[q_base + d] = result;
+    }
+}
+"#;
 
 /// Factory for the host-staged CUDA CSA kernel. It builds the CPU CSA kernel
 /// from the same node (reusing the CPU oracle's attribute validation and compute
@@ -613,10 +738,10 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // attention) to Device for ratio-128 with the f32 record cache, where
         // the host-staged compression already produces the dequantized candidate
         // records (`present_compressed_kv` == the f32 logical records). FP8
-        // ratio-128 records and ratio-4 stay host-staged this slice (device FP8
-        // dequant of candidate records is B2), and an attention_bias input keeps
-        // the run on the host oracle. Compression and writeback stay host, so
-        // `cuda_graph_compatible()` remains false.
+        // ratio-128 FP8 records remain host-staged this slice; ratio-4 B5
+        // dequantizes packed candidate records directly on device, including
+        // optional attention bias. Compression/writeback and B4's index readback
+        // keep `cuda_graph_compatible()` false.
         let cache_format = node
             .attr("cache_format")
             .and_then(|attribute| attribute.as_str())
@@ -626,7 +751,8 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let device_compression = ratio == 128 && !has_attention_bias;
         let device_index_compression = ratio == 4;
         let device_index_scoring = ratio == 4;
-        let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
+        let device_attention =
+            (ratio == 128 && cache_format == "f32" && !has_attention_bias) || ratio == 4;
         let configured_scale = node
             .attr("scale")
             .and_then(|attribute| attribute.as_float())
@@ -698,9 +824,8 @@ struct CompressedSparseAttentionKernel {
     /// B3: ratio-4 stage-2 index-key compression is independently finalized on
     /// the device; scoring and attention deliberately remain host-staged.
     device_index_compression: bool,
-    /// B4: ratio-4 stages 3–5 (index-query finalize, scoring, deterministic
-    /// top-k selection) run on device, overwriting `selected_indices` with the
-    /// device-resident result. Attention (stages 6–7) stays host-staged (B5).
+    /// B4/B5: ratio-4 selection writes device `selected_indices`; fused
+    /// candidate assembly and sparse attention consume it directly.
     device_index_scoring: bool,
     /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
     device_attention: bool,
@@ -859,6 +984,7 @@ impl CompressedSparseAttentionKernel {
                 "{OP}: device attention expects a scalar total_sequence_length"
             )));
         }
+
         let total = i64::from_ne_bytes(total_bytes[..8].try_into().expect("8 bytes")) as usize;
         let start = total.checked_sub(sequence).ok_or_else(|| {
             not_implemented(format!("{OP}: total < sequence in device attention"))
@@ -957,6 +1083,162 @@ impl CompressedSparseAttentionKernel {
         result.and(free)
     }
 
+    /// B5 stages 6–7 for ratio-4. The selected record IDs remain in the
+    /// device `selected_indices` output populated by B4; this kernel dereferences
+    /// those IDs into the packed FP8/BF16 cache directly rather than assembling a
+    /// dense selected-KV tensor.
+    fn run_device_ratio4_attention(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        staged: &[Vec<u8>],
+    ) -> Result<()> {
+        let [batch, sequence, heads, dim] = inputs[0].shape.try_into().map_err(|_| {
+            not_implemented(format!(
+                "{OP}: ratio-4 device attention requires rank-4 query"
+            ))
+        })?;
+        let current_kv_len = inputs[1].shape[1];
+        let compressed_records = outputs[1].shape[1];
+        let topk_width = outputs[5].shape[3];
+        let total =
+            i64::from_ne_bytes(staged[9].as_slice().try_into().map_err(|_| {
+                not_implemented(format!("{OP}: expected scalar total_sequence_length"))
+            })?) as usize;
+        let start = total.checked_sub(sequence).ok_or_else(|| {
+            not_implemented(format!("{OP}: total < sequence in ratio-4 attention"))
+        })?;
+        let current_kv_base = total.checked_sub(current_kv_len).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: current_kv longer than total in ratio-4 attention"
+            ))
+        })?;
+        let dense_candidates = if start == 0 {
+            current_kv_len.min(128)
+        } else {
+            128
+        };
+        let candidate_count = dense_candidates
+            .checked_add(topk_width)
+            .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 candidate count overflow")))?;
+        let rows = batch
+            .checked_mul(sequence)
+            .and_then(|n| n.checked_mul(heads))
+            .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 attention rows overflow")))?;
+        if rows == 0 || candidate_count == 0 {
+            return Ok(());
+        }
+        let mut bias_shape = [1i32; 4];
+        let bias_present = inputs.get(19).is_some_and(|input| !input.is_absent());
+        if bias_present {
+            let shape = inputs[19].shape;
+            bias_shape[4 - shape.len()..].copy_from_slice(
+                &shape
+                    .iter()
+                    .copied()
+                    .map(|n| {
+                        i32::try_from(n)
+                            .map_err(|_| not_implemented("CSA bias dimension exceeds i32"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        let scale = if self.configured_scale == 0.0 {
+            1.0f32 / (dim as f32).sqrt()
+        } else {
+            self.configured_scale
+        };
+        let scratch = self.runtime.alloc_raw(
+            rows.checked_mul(candidate_count)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 score scratch overflow")))?
+                .max(1),
+        )?;
+        let mut launch = || -> Result<()> {
+            let source = format!("{}\n{}", block_quant::source(), RATIO4_ATTENTION_SOURCE);
+            let func = self.runtime.nvrtc_function(
+                RATIO4_ATTENTION_MODULE,
+                &source,
+                RATIO4_ATTENTION_ENTRY,
+            )?;
+            let query = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+            let current_kv = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
+            let compressed = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+            let selected = cuptr(outputs[5].data_ptr_mut::<u8>() as *const c_void);
+            let sink = cuptr(inputs[10].data_ptr::<u8>() as *const c_void);
+            let bias = if bias_present {
+                cuptr(inputs[19].data_ptr::<u8>() as *const c_void)
+            } else {
+                cuptr(std::ptr::null::<c_void>())
+            };
+            let output = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+            let ints = [
+                batch,
+                sequence,
+                heads,
+                dim,
+                current_kv_len,
+                compressed_records,
+                self.index_num_heads,
+                topk_width,
+                dense_candidates,
+                candidate_count,
+            ]
+            .map(|n| {
+                i32::try_from(n).map_err(|_| not_implemented("CSA ratio-4 geometry exceeds i32"))
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+            let current_kv_base = current_kv_base as i64;
+            let start = start as i64;
+            let bias_present_i = i32::from(bias_present);
+            let grid = u32::try_from(rows)
+                .map_err(|_| not_implemented(format!("{OP}: ratio-4 attention rows exceed u32")))?;
+            let mut builder = self.runtime.stream().launch_builder(&func);
+            builder
+                .arg(&query)
+                .arg(&current_kv)
+                .arg(&compressed)
+                .arg(&selected)
+                .arg(&sink)
+                .arg(&bias)
+                .arg(&output)
+                .arg(&scratch)
+                .arg(&ints[0])
+                .arg(&ints[1])
+                .arg(&ints[2])
+                .arg(&ints[3])
+                .arg(&ints[4])
+                .arg(&current_kv_base)
+                .arg(&start)
+                .arg(&ints[5])
+                .arg(&ints[6])
+                .arg(&ints[7])
+                .arg(&ints[8])
+                .arg(&ints[9])
+                .arg(&bias_present_i)
+                .arg(&bias_shape[0])
+                .arg(&bias_shape[1])
+                .arg(&bias_shape[2])
+                .arg(&bias_shape[3])
+                .arg(&scale);
+            // SAFETY: every tensor is contiguous and the argument order matches
+            // `csa_ratio4_sink_attention`; B4 has already written selected IDs.
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (ATTENTION_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| driver_err("launch csa_ratio4_sink_attention", error))?;
+            self.runtime.synchronize()
+        };
+        let result = launch();
+        // SAFETY: scratch was allocated by this runtime and has not escaped.
+        let free = unsafe { self.runtime.free_raw(scratch) };
+        result.and(free)
+    }
     /// B2 stage-1.  The cache/carry graph outputs are the authoritative
     /// externally-visible state, so this kernel first copies exactly the past
     /// prefix, then mutates only the new carry slots and records.  This avoids a
@@ -1401,9 +1683,7 @@ impl Kernel for CompressedSparseAttentionKernel {
         }
 
         // B4 device stages 3–5: recompute `selected_indices` (output 5) on device
-        // from the freshly written device `present_index_key` (output 3),
-        // overwriting the host oracle's selection. Attention (stages 6–7) stays
-        // host-staged, so `Y` remains the host oracle result this slice.
+        // from the freshly written device `present_index_key` (output 3).
         if self.device_index_scoring
             && outputs.len() == 6
             && self.dispatch.mode(CsaPipelineStage::Selection) == CsaStageMode::Device
@@ -1411,19 +1691,20 @@ impl Kernel for CompressedSparseAttentionKernel {
             self.run_device_index_scoring(inputs, outputs)?;
         }
 
-        // B1 device stage-7: recompute `Y` on device for ratio-128 f32-cache,
-        // overwriting the host oracle's `Y`. Compression/state (outputs 1,2)
-        // remain the host-staged results just uploaded above; the freshly
-        // uploaded `present_compressed_kv` (output 1) is the f32 candidate-record
-        // buffer the device attention reads. This keeps the reduction order
-        // identical to the oracle (see `ATTENTION_SOURCE`).
+        // B1/B5 device stage-7: ratio-128 consumes f32 records; ratio-4 consumes
+        // the B4 device-selected IDs and packed records without a selected-KV
+        // materialization.
         if self.device_attention
             && self
                 .dispatch
                 .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
                 == CsaStageMode::Device
         {
-            self.run_device_attention(inputs, outputs, &staged)?;
+            if outputs.len() == 6 {
+                self.run_device_ratio4_attention(inputs, outputs, &staged)?;
+            } else {
+                self.run_device_attention(inputs, outputs, &staged)?;
+            }
         }
 
         self.runtime.synchronize()

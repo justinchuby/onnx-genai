@@ -486,6 +486,19 @@ fn ratio4_node(inputs: &[HostTensor]) -> (Graph, NodeId) {
     (graph, node)
 }
 
+fn ratio4_node_with_bias(inputs: &[HostTensor], bias: &HostTensor) -> (Graph, NodeId) {
+    let (mut graph, node) = ratio4_node(inputs);
+    let value = graph.create_named_value(
+        "attention_bias",
+        bias.dtype,
+        static_shape(bias.shape.iter().copied()),
+    );
+    graph.add_input(value);
+    graph.node_mut(node).inputs.resize(19, None);
+    graph.node_mut(node).inputs.push(Some(value));
+    (graph, node)
+}
+
 fn claim_metadata(inputs: &[HostTensor]) -> (Vec<onnx_runtime_ir::Shape>, Vec<DataType>) {
     (
         inputs
@@ -1372,6 +1385,78 @@ fn ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary() {
         decode_gpu[5], decode_cpu[5],
         "device deterministic top-k selection at the decode boundary"
     );
+}
+
+/// B5 exercises the complete ratio-4 device path through a prefill and two
+/// decodes. The bias is rank-4 so its candidate axis proves the device fused
+/// candidate ordering is `[dense window, selected slot 0]`, not record order.
+#[test]
+fn ratio4_device_fused_attention_prefill_then_two_decodes_with_bias_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    let full = ratio4_inputs_prefill(
+        PREFILL + 2,
+        ratio4_values(
+            (PREFILL + 2) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            17,
+            0.0015,
+        ),
+        ratio4_values((PREFILL + 2) * RATIO4_INDEX_HEADS, 19, 0.01),
+    );
+
+    let run = |mut inputs: Vec<HostTensor>, records: usize| -> Vec<Vec<u8>> {
+        let sequence = inputs[0].shape[1];
+        let dense_candidates = if inputs[1].shape[1] == sequence {
+            inputs[1].shape[1].min(128)
+        } else {
+            128
+        };
+        let bias = HostTensor::f32(
+            &[1, 1, sequence, dense_candidates + 1],
+            &ratio4_values(sequence * (dense_candidates + 1), 43, 0.0003),
+        );
+        let (graph, node) = ratio4_node_with_bias(&inputs, &bias);
+        inputs.push(bias);
+        let specs = ratio4_topk_output_specs(sequence, records, 1);
+        let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU ratio-4 CSA oracle");
+        let gpu = run_gpu(&ep, &graph, node, &inputs, &specs).expect("CUDA ratio-4 CSA");
+        assert_eq!(max_ulp(&gpu[0], &cpu[0]), 0, "ratio-4 fused Y");
+        for index in 1..6 {
+            assert_eq!(gpu[index], cpu[index], "ratio-4 output {index}");
+        }
+        cpu
+    };
+
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let first = run(prefill, PREFILL / RATIO4);
+
+    let decode = |position: usize, previous: &[Vec<u8>]| {
+        let mut inputs = full.clone();
+        for index in [0usize, 2, 3, 11, 12, 13, 14] {
+            inputs[index] = ratio4_sequence_slice(&full[index], position, 1);
+        }
+        inputs[1] = ratio4_sequence_slice(&full[1], 0, position + 1);
+        inputs[6] = HostTensor::u8(&[1, position / RATIO4, STORED_WIDTH], &previous[1]);
+        inputs[7] = HostTensor::f32(&[1, 8, 2, RATIO4_MAIN_WIDTH], &as_f32(&previous[2]));
+        inputs[8] = HostTensor::i32(&[1], &[position as i32]);
+        inputs[9] = HostTensor::i64(&[], &[(position + 1) as i64]);
+        inputs[17] = HostTensor::u8(
+            &[1, position / RATIO4, RATIO4_INDEX_STORED_WIDTH],
+            &previous[3],
+        );
+        inputs[18] = HostTensor::f32(
+            &[1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &as_f32(&previous[4]),
+        );
+        inputs
+    };
+    let second = run(decode(PREFILL, &first), (PREFILL + 1) / RATIO4);
+    let _third = run(decode(PREFILL + 1, &second), (PREFILL + 2) / RATIO4);
 }
 
 /// `supports_op` must reject, at claim time, ratio/dtype/attribute combinations
