@@ -1201,3 +1201,61 @@ failures elsewhere are unrelated and not touched here.)
 CUDA graph capture is now conservatively disabled whenever control-flow detection cannot cheaply inspect a model, including models larger than 512 MiB, unreadable models, and unparseable models. The invariant is: when in doubt, disable capture; capture is optional and must not risk ORT's control-flow slow path.
 
 Detection now records each ONNX node domain and treats `If`, `Loop`, and `Scan` as control flow only in the standard ONNX domains (`""` or `"ai.onnx"`). Custom-domain operators with those names do not disable CUDA graph capture.
+
+## 2026-07-19 — PR #32, IndexShare v1, and CSA B0 landing wave (07:55Z)
+
+<!-- merged from leon-pr32-rebase-fix.md -->
+
+### 2026-07-19: PR #32 rebase + build/review fixes
+**By:** Leon
+**What:** Rebased the EP-capabilities refactor onto `main`, retained the newer device-sampler, CUDA KV-copy, phased-run, BQMoE, multi-EP, and generic plugin behavior, and fixed the three Copilot review findings.
+**Why:** PR #32 was stacked on pre-#30 history; integrating both lines preserves EP-agnostic capability decisions without regressing current runtime, CUDA, plugin, or failure-classification behavior.
+
+<!-- merged from luv-pr32-review.md -->
+
+### 2026-07-19: PR #32 review
+**By:** Luv
+**What:** Approved PR #32 at `473f32f` after verifying the post-rebase ancestry, capability-based EP selection, half-precision argmax edge cases, opaque NamedGeneric options forwarding, retained CUDA/device-sampler/cuda_rt and BlockQuantizedMoE integration, and green CI.
+**Why:** `argmax_half_bits` now has the same NaN, all-`-inf`, tie, and first-element behavior as the f32 reference, including tested `[NaN, -inf] -> 1`; `EpSelection::new` shares `normalize_ep_name` with environment parsing; and NamedGeneric options reach the ORT append call. Workspace and CUDA builds passed; library tests passed 39/39 and 48/48. The broader ORT integration test command could not run fixture-dependent decode tests because `tests/fixtures/tiny-llm/model.onnx` is absent locally, while PR CI is green.
+
+<!-- merged from batty-indexshare-v1.md -->
+
+### 2026-07-19: IndexShare v1 CPU kernel + frozen ABI
+**By:** Batty
+**What:** Froze `pkg.nxrt::IndexShare` v1 as exporter-selected, deterministic f32 selected-token attention with explicit past/present KV, additive bias, strict dense-order indices, GQA/shared indices, and a CPU reference kernel.
+**Why:** The ratified D1-D4 defaults require a stable private-op boundary and an exact dense additive-mask oracle before Mobius emission and production EP implementations can replace the full-cache fallback.
+
+<!-- merged from chew-indexshare-review.md -->
+
+### 2026-07-19: IndexShare v1 numerical review
+**By:** Chew
+**What:** 🟡 APPROVE-WITH-NITS for `feat-indexshare-v1` at `b61fb81`. The CPU kernel validates ordered selected indices at execution, implements GQA and explicit past/present KV I/O, and exactly matches an independent full-cache dense additive-mask oracle in its selected-subset, GQA/shared-index, and causal/padding-bias tests.
+**Why:** The oracle independently builds a full `-inf`-masked score vector and performs softmax/value reduction in ascending dense-cache order; parity assertions use `assert_eq!`. Claim metadata validation has no tensor reads or allocations on the supported path and accepts Undefined optionals while rejecting present wrong dtypes. The sole coverage nit is that `rejects_invalid_index_rows_at_execution` omits the required `[-1, valid, ...]` non-trailing-sentinel case. Build and test pass (525 passed, 1 ignored); IndexShare has no Clippy diagnostics, although the crate retains 19 pre-existing Clippy warnings elsewhere.
+
+<!-- merged from sapper-csa-b0.md -->
+
+### 2026-07-19: CSA Phase B B0 scaffolding
+**By:** Sapper
+**What:** Added fixed-capacity CUDA CSA buffer reservation, all-Host per-stage dispatch and golden-capture seams, plus shared NVRTC block quant/dequant scaffolding with CPU-dequant round-trip tests.
+**Why:** Establish stable device-state and stage-parity seams without changing Phase A host-oracle numerics; D2/D3 are implemented as the official defaults.
+
+<!-- merged from chew-csa-b0-review.md -->
+
+### 2026-07-19: CSA Phase B B0 review
+**By:** Chew
+**What:** Rejected B0 (`fad07aa`) pending a replacement quant round-trip test and completion of the shared NVRTC quantization scaffold. `block_quant.rs:157-177` only asserts that CPU-dequantized data is finite and checks one scale exponent. It does not compare reconstructed values or packed codes to independently derived expected results, so an incorrect E4M3/E2M1 rounding implementation still passes. Additionally, `BLOCK_QUANT_CUH` at `block_quant.rs:41-53` contains only FP4 code selection; it explicitly defers FP8 E4M3FN encoding, scale derivation, clamping, and subnormal handling to B2, contrary to B0’s required shared FP8/FP4 quantizer scaffold.
+**Why:** B0’s numeric safety gate requires tests that fail on incorrect scale or rounding, and future device stages need the complete common NVRTC quant/dequant contract now. The all-Host path remains the CPU oracle, original CSA GPU test file is byte-unchanged, `cuda_graph_compatible()` remains false, no CSA dependency on `block_quantized_matmul` was found, and build/full CUDA EP tests passed (including the unchanged 11 CSA GPU tests). The test scaffolding nevertheless cannot establish the stated quantization correctness requirement.
+
+<!-- merged from deckard-csa-b0-fix.md -->
+
+### 2026-07-19: CSA B0 FP8 quant + real round-trip tests
+**By:** Deckard
+**What:** Added shared NVRTC FP8 E4M3 block-64 quantization with E8M0 power-of-two scaling, round-to-nearest-even encoding, saturation, and subnormal handling. Replaced tautological FP8/FP4 tests with hand-computed packed-code and CPU-dequantized-value assertions.
+**Why:** B0 needs a self-contained shared quant/dequant scaffold with a numerically meaningful oracle gate before later CSA device stages consume it.
+
+<!-- merged from chew-csa-b0-rereview.md -->
+
+### 2026-07-19: CSA B0 re-review
+**By:** Chew
+**What:** 🟢 APPROVE commit `5c308f7`. FP8 E4M3 and FP4 E2M1 quantization use the required scales, round-to-nearest-even behavior, saturation, and subnormal handling; independent hand-computed tests cover scale selection, ties, saturation, packed codes, and reconstructed values.
+**Why:** CUDA build and full EP tests passed, including 8 block-quant tests and all 11 unchanged CSA GPU tests. CSA remains graph-incompatible, and the coordinator may merge B0.

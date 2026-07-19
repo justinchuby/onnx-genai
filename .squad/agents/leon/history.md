@@ -85,3 +85,4 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 - 2026-07-18: CUDA CSA claim gate was corrected to mirror CPU ratio-specific contracts and parity tests, then superseded by Deckard's shared attention_bias validation; final CSA approval landed.
 - 2026-07-18T05:55:00Z — Added CPU CSA `supports_op` claim validation via unified factory dry-run on lockout reassignment (`2a08ef9`); Deckard approved.
 - 2026-07-19: Fixed PR #30 device sampling parity/safety; continuing PR #32 rebase, build, and review-comment fixes.
+- 2026-07-19T07:55:00Z: PR #32's EP-capabilities refactor merged at `9683a08` after the rebase and three review fixes.

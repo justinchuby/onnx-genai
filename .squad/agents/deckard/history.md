@@ -145,3 +145,4 @@ Authored native Engine/server backend integration in `66ec4b8`; Holden rejected 
 
 - **2026-07-18 — onnx-genai PyPI name reservation:** Added the pure-Python `onnx-genai` 0.0.0 placeholder under `python/onnx-genai/` and a dispatch-only Trusted Publishing sdist job in `publish.yml`; published successfully as run `29662713813`.
 - 2026-07-19: Hardened BQMoE symbolic claim validation (`776aeb5`) and rebased PR #30 without dropping either CUDA path.
+- 2026-07-19T07:55:00Z: Completed CSA B0's shared FP8 E4M3 scaffold and independent FP8/FP4 round-trip gates; B0 merged at `9c56d9c`.

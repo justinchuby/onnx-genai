@@ -86,3 +86,4 @@ Non-author review of Leon's `ort2_*` → `nxrt_*` C-ABI rename. Verified both fi
 
 - 2026-07-15 — Reviewed Mariette’s cpuinfo publish fix; approved (`65cc851`).
 - 2026-07-19: Reviewed PR #30 through four cycles and verified the rebased integration before merge.
+- 2026-07-19T07:55:00Z: PR #30's reviewed sampler and retry-safety integration remained intact through the subsequent EP-capabilities landing.

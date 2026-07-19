@@ -51,3 +51,4 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 - Repaired all four Phase-1 findings in `a77eed0`: bounded dequant residency, unaligned mmap provenance, endpoint-overflow rejection, and sum-of-distinct mapped-byte metrics.
 - Nabil 🟢 approved; 691 tests passed.
 - 2026-07-19: Reviewed BQMoE through three cycles and approved final zero-allocation claim gate (`67abdb5`).
+- 2026-07-19T07:55:00Z: Approved IndexShare v1 with a coverage nit that was addressed, and approved CSA B0 after full FP8/FP4 quantization and meaningful oracle tests.
