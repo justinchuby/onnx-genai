@@ -547,6 +547,38 @@ pipeline:
 }
 
 #[test]
+fn conflicting_karras_and_exponential_sigmas_rejected() -> anyhow::Result<()> {
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 4
+    timestep_input: t
+    scheduler_config:
+      kind: euler
+      use_karras_sigmas: true
+      use_exponential_sigmas: true
+";
+    let dir = fixture_with_metadata("diffusion-conflict-sigmas", &["denoiser_step.onnx"], metadata)?;
+    let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
+        .err()
+        .expect("conflicting karras+exponential must be rejected");
+    assert!(
+        err.to_string().contains("use_karras_sigmas and use_exponential_sigmas"),
+        "unexpected: {err}"
+    );
+    Ok(())
+}
+
+#[test]
 fn iterative_euler_exponential_sigmas_run() -> anyhow::Result<()> {
     // use_exponential_sigmas swaps in the exponential sigma schedule; verify it
     // threads through the schema and runs. Parity is covered by scripts/karras_parity.py.

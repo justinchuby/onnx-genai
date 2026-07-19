@@ -1079,7 +1079,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
-                    sigma_spacing(cfg),
+                    sigma_spacing(cfg)?,
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1100,7 +1100,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
-                    sigma_spacing(cfg),
+                    sigma_spacing(cfg)?,
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1121,7 +1121,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
-                    sigma_spacing(cfg),
+                    sigma_spacing(cfg)?,
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1711,15 +1711,23 @@ fn exponential_sigmas(
 }
 
 /// Select the sigma schedule the spec requests: `"karras"`, `"exponential"`, or
-/// the default `"linspace"`.
-fn sigma_spacing(cfg: &SchedulerSpec) -> &'static str {
-    if cfg.use_karras_sigmas.unwrap_or(false) {
+/// the default `"linspace"`. Rejects the conflicting case where both Karras and
+/// exponential are requested.
+fn sigma_spacing(cfg: &SchedulerSpec) -> anyhow::Result<&'static str> {
+    let karras = cfg.use_karras_sigmas.unwrap_or(false);
+    let exponential = cfg.use_exponential_sigmas.unwrap_or(false);
+    if karras && exponential {
+        anyhow::bail!(
+            "scheduler cannot set both use_karras_sigmas and use_exponential_sigmas"
+        );
+    }
+    Ok(if karras {
         "karras"
-    } else if cfg.use_exponential_sigmas.unwrap_or(false) {
+    } else if exponential {
         "exponential"
     } else {
         "linspace"
-    }
+    })
 }
 
 /// Precomputed sigmas for a non-linspace spacing (`karras`/`exponential`), or
