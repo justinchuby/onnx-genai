@@ -205,7 +205,9 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
   `encoder_hidden_states` and `text_embeds` while sharing `time_ids`. This needed **no
   SDXL-specific runtime code** — the composite pipeline (multiple dataflow edges + external
   constants + multi-input CFG) handles it. Matches diffusers to max|Δ|~4e-2 on tiny-random SDXL
-  weights (the exact multi-input CFG path is unit-tested to 1e-5). *Remaining:* wire SDXL detection
-  into the Mobius `checkpoint_export` / ComfyUI converter so SDXL workflows convert automatically.
+  weights (the exact multi-input CFG path is unit-tested to 1e-5). *Remaining:* an SDXL-aware
+  `run_comfyui.py` driver (dual tokenizers + `time_ids` computation); the Mobius **export side is
+  done** — `checkpoint_export` auto-detects SDXL and emits the dual-encoder + 5-input-UNet pipeline,
+  and `mobius convert-comfyui` routes both conditioning edges automatically.
 - LoRA weight merging and ControlNet are not yet wired.
 - **img2img** is supported; inpainting (mask) is not.
