@@ -12,6 +12,9 @@ use onnx_runtime_ir::{
 use onnx_runtime_session::{InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape};
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
+// This synthetic name must remain unregistered so unsupported-op error tests cannot go stale.
+const UNSUPPORTED_OP_SENTINEL: &str = "NxrtNeverRegisteredSentinelOp";
+
 // --- graph construction helpers --------------------------------------------
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
@@ -204,7 +207,7 @@ fn unsupported_op_error_is_actionable() {
     graph.opset_imports.insert(String::new(), 17);
     let x = input(&mut graph, "x", DataType::Float32, &[1]);
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
-    let mut node = Node::new(NodeId(0), "Conv", vec![Some(x)], vec![y]);
+    let mut node = Node::new(NodeId(0), UNSUPPORTED_OP_SENTINEL, vec![Some(x)], vec![y]);
     node.name = "unsupported_activation".to_string();
     graph.insert_node(node);
     graph.add_output(y);
@@ -213,13 +216,15 @@ fn unsupported_op_error_is_actionable() {
         Err(err) => err.to_string(),
         Ok(_) => panic!("unsupported operator unexpectedly built"),
     };
-    assert!(message.contains("Conv"), "{message}");
+    assert!(message.contains(UNSUPPORTED_OP_SENTINEL), "{message}");
     assert!(message.contains("ai.onnx"), "{message}");
     assert!(message.contains("unsupported_activation"), "{message}");
     assert!(message.contains("opset 17"), "{message}");
     assert!(message.contains("cpu_ep"), "{message}");
     assert!(
-        message.contains("no handler for ai.onnx::Conv at opset 17"),
+        message.contains(&format!(
+            "no handler for ai.onnx::{UNSUPPORTED_OP_SENTINEL} at opset 17"
+        )),
         "{message}"
     );
     assert!(message.contains("add a claim+handler"), "{message}");
@@ -278,7 +283,7 @@ fn unsupported_op_error_formats_unnamed_node_gracefully() {
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
     graph.insert_node(Node::new(
         NodeId(0),
-        "Conv",
+        UNSUPPORTED_OP_SENTINEL,
         vec![Some(x)],
         vec![y],
     ));
@@ -288,6 +293,7 @@ fn unsupported_op_error_formats_unnamed_node_gracefully() {
         Err(err) => err.to_string(),
         Ok(_) => panic!("unsupported operator unexpectedly built"),
     };
+    assert!(message.contains(UNSUPPORTED_OP_SENTINEL), "{message}");
     assert!(
         message.contains("node <unnamed node #0>, opset 0"),
         "{message}"
@@ -300,6 +306,7 @@ fn from_graph_rejects_missing_opset_import_at_load_time() {
     let mut graph = Graph::new();
     let x = input(&mut graph, "x", DataType::Float32, &[1]);
     let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    // Sigmoid is safe here: missing opset validation runs before operator lookup.
     let mut node = Node::new(NodeId(0), "Sigmoid", vec![Some(x)], vec![y]);
     node.name = "missing_opset_import".to_string();
     graph.insert_node(node);
