@@ -70,6 +70,8 @@ def main() -> int:
     ap.add_argument("--output", "-o", default="comfyui_out.png", help="Output PNG path.")
     ap.add_argument("--workdir", default=str(REPO / "target" / "run-comfyui"))
     ap.add_argument("--control-image", help="Control image for a ControlNet workflow (resized to WxH).")
+    ap.add_argument("--source-image", help="Source image for an inpainting workflow.")
+    ap.add_argument("--mask-image", help="Mask (white=inpaint region) for an inpainting workflow.")
     ap.add_argument("--lora", action="append", metavar="NAME=PATH", help="Resolve a ComfyUI LoRA name to a path (fused).")
     ap.add_argument("--controlnet", action="append", metavar="NAME=PATH", help="Resolve a ComfyUI ControlNet name to a diffusers dir/file (fused).")
     ap.add_argument("--compare", action="store_true", help="Also diff against a diffusers reference.")
@@ -167,6 +169,34 @@ def main() -> int:
         ]
 
     controlnet = bool(run_params.get("controlnet", False))
+    inpaint = bool(run_params.get("inpaint", False))
+    if inpaint:
+        from PIL import Image
+
+        ve = ort.InferenceSession(str(pdir / "vae_encoder.onnx"), providers=["CPUExecutionProvider"])
+        if getattr(args, "source_image", None) and getattr(args, "mask_image", None):
+            src = Image.open(args.source_image).convert("RGB").resize((wf.width, wf.height))
+            src_arr = (np.asarray(src, dtype=np.float32) / 127.5 - 1.0).transpose(2, 0, 1)[None]
+            m = Image.open(args.mask_image).convert("L").resize((wf.width, wf.height))
+            m_pix = (np.asarray(m, dtype=np.float32) / 255.0 > 0.5).astype(np.float32)  # 1 = inpaint
+        else:
+            print("  (no --source-image/--mask-image; using zeros + full mask)")
+            src_arr = np.zeros((1, 3, wf.height, wf.width), dtype=np.float32)
+            m_pix = np.ones((wf.height, wf.width), dtype=np.float32)
+        # masked image = source with the inpaint region zeroed; encode to a latent.
+        masked_src = (src_arr * (1.0 - m_pix)[None, None]).astype("<f4")
+        masked_latent = ve.run(None, {ve.get_inputs()[0].name: masked_src})[0].astype("<f4")
+        # mask downsampled to latent resolution.
+        mask_lat = np.asarray(
+            Image.fromarray((m_pix * 255).astype("uint8")).resize((sz, sz), Image.NEAREST),
+            dtype=np.float32,
+        )[None, None] / 255.0
+        mask_lat.astype("<f4").tofile(pdir / "mask.f32")
+        masked_latent.tofile(pdir / "masked_latent.f32")
+        inputs += [
+            f"denoiser.mask:1,1,{sz},{sz}:{pdir / 'mask.f32'}",
+            f"denoiser.masked_latent:1,{latent_ch},{sz},{sz}:{pdir / 'masked_latent.f32'}",
+        ]
     if controlnet:
         cond_ch = int(run_params.get("conditioning_channels", 3))
         from PIL import Image
@@ -187,6 +217,8 @@ def main() -> int:
     tag = "SDXL" if sdxl else "SD"
     if controlnet:
         tag += "+ControlNet"
+    if inpaint:
+        tag += "+Inpaint"
     print(f"rendering through onnx-genai ({tag}) ...", flush=True)
     subprocess.run(inputs, env=env, check=True)
     flat = np.fromfile(pdir / "image.f32", dtype="<f4")
