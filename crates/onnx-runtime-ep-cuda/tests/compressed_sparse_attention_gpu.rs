@@ -499,6 +499,25 @@ fn ratio4_node_with_bias(inputs: &[HostTensor], bias: &HostTensor) -> (Graph, No
     (graph, node)
 }
 
+/// Same node as [`ratio4_node`] but omitting the optional `selected_indices`
+/// (output 5), yielding a valid **5-output** ratio-4 node. `selected_indices` is
+/// optional for ratio-4, so both the CPU `validate_ratio_specific_v1_schema` and
+/// the CUDA `validate_ratio4_claim` accept 5..=6 outputs and still claim it. With
+/// no device-selected record stream to dereference, its fused-attention `Y` must
+/// come from the host oracle — never the ratio-128 device kernel.
+fn ratio4_node_five_outputs(inputs: &[HostTensor]) -> (Graph, NodeId) {
+    let (mut graph, node) = ratio4_node(inputs);
+    let dropped = graph
+        .node_mut(node)
+        .outputs
+        .pop()
+        .expect("ratio4_node builds 6 outputs");
+    if let Some(index) = graph.outputs.iter().position(|&value| value == dropped) {
+        graph.remove_output(index);
+    }
+    (graph, node)
+}
+
 fn claim_metadata(inputs: &[HostTensor]) -> (Vec<onnx_runtime_ir::Shape>, Vec<DataType>) {
     (
         inputs
@@ -1077,7 +1096,11 @@ fn ratio4_prefill_claim_and_execute_matches_cpu() {
     ];
     let cpu = run_cpu(&graph, node, &inputs, &output_specs).expect("CPU ratio-4 CSA kernel");
     let gpu = run_gpu(&ep, &graph, node, &inputs, &output_specs).expect("CUDA ratio-4 CSA kernel");
-    assert_f32_close(&gpu[0], &cpu[0], 1e-4, "ratio-4 Y");
+    assert_eq!(
+        max_ulp(&gpu[0], &cpu[0]),
+        0,
+        "ratio-4 fused Y (no bias) must be bit-exact vs the CPU oracle"
+    );
     assert_eq!(gpu[1], cpu[1], "ratio-4 compressed cache");
     assert_f32_close(&gpu[2], &cpu[2], 1e-4, "ratio-4 compression carry");
     assert_eq!(gpu[3], cpu[3], "ratio-4 index cache");
@@ -1459,9 +1482,84 @@ fn ratio4_device_fused_attention_prefill_then_two_decodes_with_bias_matches_cpu(
     let _third = run(decode(PREFILL + 1, &second), (PREFILL + 2) / RATIO4);
 }
 
-/// `supports_op` must reject, at claim time, ratio/dtype/attribute combinations
-/// the kernel does not correctly handle — rather than claiming the node and
-/// failing inside `execute` (doc §4.8).
+/// B5-1 regression cover. A ratio-4 node may OMIT the optional
+/// `selected_indices` (output 5) and still be claimed (both validators accept
+/// 5..=6 outputs). With no device-selected record stream, its fused `Y` must
+/// fall back to the host-staged oracle. The B5 regression instead keyed the
+/// device dispatch on `outputs.len() == 6`: a 5-output ratio-4 node fell into
+/// the `else` arm and ran `run_device_attention` (the ratio-128 kernel) over the
+/// ratio-4 583-byte packed FP8 cache reinterpreted as `f32×512` — out of bounds,
+/// clobbering the correct host-staged `Y`. Under the buggy dispatch this test's
+/// `Y` assertion fails; the ratio-keyed fix restores host-oracle fallback. Drives
+/// prefill→decode→decode and asserts every present output is bit-exact vs the
+/// independent CPU oracle.
+#[test]
+fn ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    let full = ratio4_inputs_prefill(
+        PREFILL + 2,
+        ratio4_values(
+            (PREFILL + 2) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            17,
+            0.0015,
+        ),
+        ratio4_values((PREFILL + 2) * RATIO4_INDEX_HEADS, 19, 0.01),
+    );
+
+    let run = |inputs: Vec<HostTensor>, records: usize| -> Vec<Vec<u8>> {
+        let sequence = inputs[0].shape[1];
+        let (graph, node) = ratio4_node_five_outputs(&inputs);
+        // Drop the `selected_indices` spec so exactly 5 outputs are requested,
+        // matching the 5-output node.
+        let mut specs = ratio4_topk_output_specs(sequence, records, 1);
+        specs.pop();
+        assert_eq!(specs.len(), 5, "5-output ratio-4 node has 5 output specs");
+        let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU ratio-4 CSA oracle");
+        let gpu = run_gpu(&ep, &graph, node, &inputs, &specs).expect("CUDA ratio-4 CSA");
+        assert_eq!(
+            max_ulp(&gpu[0], &cpu[0]),
+            0,
+            "5-output ratio-4 Y must be the bit-exact host oracle result, never \
+             the ratio-128 device kernel"
+        );
+        for index in 1..5 {
+            assert_eq!(gpu[index], cpu[index], "5-output ratio-4 output {index}");
+        }
+        cpu
+    };
+
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let first = run(prefill, PREFILL / RATIO4);
+
+    let decode = |position: usize, previous: &[Vec<u8>]| {
+        let mut inputs = full.clone();
+        for index in [0usize, 2, 3, 11, 12, 13, 14] {
+            inputs[index] = ratio4_sequence_slice(&full[index], position, 1);
+        }
+        inputs[1] = ratio4_sequence_slice(&full[1], 0, position + 1);
+        inputs[6] = HostTensor::u8(&[1, position / RATIO4, STORED_WIDTH], &previous[1]);
+        inputs[7] = HostTensor::f32(&[1, 8, 2, RATIO4_MAIN_WIDTH], &as_f32(&previous[2]));
+        inputs[8] = HostTensor::i32(&[1], &[position as i32]);
+        inputs[9] = HostTensor::i64(&[], &[(position + 1) as i64]);
+        inputs[17] = HostTensor::u8(
+            &[1, position / RATIO4, RATIO4_INDEX_STORED_WIDTH],
+            &previous[3],
+        );
+        inputs[18] = HostTensor::f32(
+            &[1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+            &as_f32(&previous[4]),
+        );
+        inputs
+    };
+    let second = run(decode(PREFILL, &first), (PREFILL + 1) / RATIO4);
+    let _third = run(decode(PREFILL + 1, &second), (PREFILL + 2) / RATIO4);
+}
 #[test]
 fn supports_op_rejects_unsupported_configs() {
     let Some(ep) = gpu() else { return };

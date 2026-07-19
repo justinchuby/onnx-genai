@@ -751,8 +751,13 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let device_compression = ratio == 128 && !has_attention_bias;
         let device_index_compression = ratio == 4;
         let device_index_scoring = ratio == 4;
-        let device_attention =
-            (ratio == 128 && cache_format == "f32" && !has_attention_bias) || ratio == 4;
+        let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
+        // B5 fused ratio-4 selection→attention runs on device, but ONLY when the
+        // node emits `selected_indices` (output 5). For a 5-output ratio-4 node
+        // that omits the optional `selected_indices`, there is no device-selected
+        // record stream to dereference, so `Y` must stay on the host oracle. This
+        // flag keys strictly on ratio; the output-count gate lives at dispatch.
+        let device_ratio4_attention = ratio == 4;
         let configured_scale = node
             .attr("scale")
             .and_then(|attribute| attribute.as_float())
@@ -769,7 +774,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             dispatch.set(CsaPipelineStage::IndexScoring, CsaStageMode::Device);
             dispatch.set(CsaPipelineStage::Selection, CsaStageMode::Device);
         }
-        if device_attention {
+        if device_attention || device_ratio4_attention {
             dispatch.set(CsaPipelineStage::CandidateAssembly, CsaStageMode::Device);
             dispatch.set(
                 CsaPipelineStage::SparseSinkSoftmaxAttention,
@@ -786,6 +791,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             device_index_compression,
             device_index_scoring,
             device_attention,
+            device_ratio4_attention,
             qk_rope_head_dim: usize::try_from(
                 node.attr("qk_rope_head_dim")
                     .and_then(|attribute| attribute.as_int())
@@ -829,6 +835,11 @@ struct CompressedSparseAttentionKernel {
     device_index_scoring: bool,
     /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
     device_attention: bool,
+    /// B5: ratio-4 fused selection→attention runs stage-6/7 on device, but only
+    /// when the node emits `selected_indices` (6 outputs). A 5-output ratio-4
+    /// node keeps `Y` from the host oracle — the device ratio-128 attention
+    /// kernel must never run for a ratio-4 node.
+    device_ratio4_attention: bool,
     qk_rope_head_dim: usize,
     /// Ratio-4 index-stream geometry (`index_num_heads`, `index_head_dim`);
     /// zero for ratio-128 where the index stream is absent.
@@ -1691,20 +1702,34 @@ impl Kernel for CompressedSparseAttentionKernel {
             self.run_device_index_scoring(inputs, outputs)?;
         }
 
-        // B1/B5 device stage-7: ratio-128 consumes f32 records; ratio-4 consumes
-        // the B4 device-selected IDs and packed records without a selected-KV
-        // materialization.
+        // B1 device stage-7: ratio-128 f32-cache consumes the f32 candidate
+        // records and recomputes `Y` on device. This path is never taken for
+        // ratio-4 (its cache is the packed FP8/BF16 583-byte record, not f32).
         if self.device_attention
             && self
                 .dispatch
                 .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
                 == CsaStageMode::Device
         {
-            if outputs.len() == 6 {
-                self.run_device_ratio4_attention(inputs, outputs, &staged)?;
-            } else {
-                self.run_device_attention(inputs, outputs, &staged)?;
-            }
+            self.run_device_attention(inputs, outputs, &staged)?;
+        }
+
+        // B5 device stage-6/7: ratio-4 fused selection→attention. Gated on the
+        // ratio-4 flag AND `selected_indices` presence (6 outputs) — the device
+        // kernel dereferences the B4 device-selected record IDs held in output 5.
+        // A 5-output ratio-4 node omits `selected_indices`, so there is nothing to
+        // dereference: `Y` stays the host-staged oracle result already uploaded
+        // above, and we must NOT fall through to `run_device_attention` (the
+        // ratio-128 kernel), which would read the 583-byte packed record as
+        // `f32×512` out of bounds and clobber the correct `Y`.
+        if self.device_ratio4_attention
+            && outputs.len() == 6
+            && self
+                .dispatch
+                .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
+                == CsaStageMode::Device
+        {
+            self.run_device_ratio4_attention(inputs, outputs, &staged)?;
         }
 
         self.runtime.synchronize()
