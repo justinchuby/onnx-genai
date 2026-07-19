@@ -2667,8 +2667,8 @@ mod tests {
 
     /// Build a valid ONNX model whose graph has the given `(domain, op_type)`
     /// nodes, plus `weight_floats` f32 elements of inline initializer data to
-    /// simulate an inline-weight export (the qwen3 case). The streaming scan
-    /// must `seek` past this initializer rather than reading it.
+    /// simulate an inline-weight export (the qwen3 case). The prost scan must
+    /// skip past this initializer (via `Buf::advance`) rather than reading it.
     fn write_scan_model_with_weights(
         nodes: &[(&str, &str)],
         weight_floats: usize,
@@ -2768,7 +2768,7 @@ mod tests {
     fn control_flow_scan_reads_nodes_past_large_inline_weights() {
         // Simulate an inline-weight export (like the qwen3 models, whose
         // `model.onnx` embeds >1 GB of weights): the graph carries a large
-        // initializer alongside its nodes. The streaming scan must still find
+        // initializer alongside its nodes. The prost scan must still find
         // the control-flow op — and, for a plain graph, must NOT be fooled into
         // conservatively reporting control flow just because the file is large.
         // 4 Mi f32 elements = 16 MiB of inline initializer data.
@@ -2798,12 +2798,13 @@ mod tests {
         // enable CUDA graph capture and trigger ORT's ~6x slower per-Run path).
         // Truncation either cuts the graph payload (its length header points past
         // EOF -> None) or stops before the graph is ever seen (no-graph -> None),
-        // so every non-empty prefix must fall back to conservative `true`.
+        // so every prefix (including the empty file) must fall back to
+        // conservative `true`.
         let full = write_scan_model(&[("", "MatMul"), ("", "If")]);
         let bytes = std::fs::read(&full).expect("read full model");
         std::fs::remove_file(&full).ok();
 
-        for truncated_len in 1..bytes.len() {
+        for truncated_len in 0..bytes.len() {
             let truncated = test_model_path(&format!("truncated-{truncated_len}"));
             std::fs::write(&truncated, &bytes[..truncated_len]).expect("write truncated model");
             assert!(
