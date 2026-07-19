@@ -869,6 +869,49 @@ fn masked_language_diffusion_refines_masked_sequence() -> anyhow::Result<()> {
 }
 
 #[test]
+fn iterative_num_steps_override_redrives_same_model() -> anyhow::Result<()> {
+    // Live override: the masked-diffusion fixture declares num_steps=4, but we can
+    // re-drive the *same* loaded model with a different step count (no reload).
+    // The scheduler is rebuilt for the new count; the fixture still refines the
+    // all-mask seed to its confidence-ranked target [2,3,4,5].
+    use onnx_genai_engine::IterativeOverrides;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-masked-diffusion")
+        .canonicalize()?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    for steps in [2usize, 8] {
+        let request = empty_request()
+            .with_input("denoiser.input_ids", Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?)
+            .with_iterative_overrides(IterativeOverrides {
+                num_steps: Some(steps),
+                ..Default::default()
+            });
+        let out = engine.run_pipeline(request)?;
+        let tokens = out.get("denoiser.input_ids").unwrap().to_vec_i64()?;
+        assert_eq!(tokens, vec![2, 3, 4, 5], "num_steps override {steps} must still refine");
+    }
+    Ok(())
+}
+
+#[test]
+fn iterative_override_rejects_invalid_start_step() -> anyhow::Result<()> {
+    use onnx_genai_engine::IterativeOverrides;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-masked-diffusion")
+        .canonicalize()?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    // start_step must be < the (overridden) num_steps.
+    let request = empty_request()
+        .with_input("denoiser.input_ids", Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?)
+        .with_iterative_overrides(IterativeOverrides {
+            start_step: Some(4),
+            ..Default::default()
+        });
+    assert!(engine.run_pipeline(request).is_err());
+    Ok(())
+}
+
+#[test]
 fn custom_user_scheduler_can_be_registered_and_run() -> anyhow::Result<()> {
     use onnx_genai_engine::{Scheduler, SchedulerRegistry};
     use onnx_genai_ort::Value as OrtValue;

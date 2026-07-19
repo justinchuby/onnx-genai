@@ -29,6 +29,26 @@ use std::path::Path;
 /// `component.output_name`.
 pub type PipelineTensors = HashMap<String, Value>;
 
+/// Per-request overrides for an iterative (diffusion) pipeline's loop
+/// parameters. This enables ComfyUI-style *live* editing — re-driving the same
+/// already-loaded models with different dynamics, with no re-export or reload.
+///
+/// The seed, prompt and negative prompt are already live: they are supplied as
+/// per-request inputs (`denoiser.sample`, `text_encoder.input_ids`, and any
+/// `*.uncond` conditioning), so only the loop *parameters* need overrides here.
+#[derive(Debug, Clone, Default)]
+pub struct IterativeOverrides {
+    /// Override the number of denoise steps. Rebuilds the scheduler for the new
+    /// step count; rejected when the pipeline declares an explicit per-step
+    /// timestep schedule (which is tied to the original step count).
+    pub num_steps: Option<usize>,
+    /// Override the classifier-free-guidance scale (ComfyUI `cfg`). `1.0`
+    /// disables guidance.
+    pub guidance_scale: Option<f32>,
+    /// Override the first step index of a partial (img2img) denoise loop.
+    pub start_step: Option<usize>,
+}
+
 /// A pipeline generation request.
 pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
@@ -39,6 +59,8 @@ pub struct PipelineGenerateRequest {
     /// This is known only after preprocessing and must be supplied before
     /// decoder KV allocation for encoder-free multimodal pipelines.
     pub num_image_tiles: Option<usize>,
+    /// Live overrides for an iterative pipeline's loop parameters.
+    pub iterative_overrides: IterativeOverrides,
 }
 
 impl PipelineGenerateRequest {
@@ -47,6 +69,7 @@ impl PipelineGenerateRequest {
             request,
             inputs: HashMap::new(),
             num_image_tiles: None,
+            iterative_overrides: IterativeOverrides::default(),
         }
     }
 
@@ -57,6 +80,13 @@ impl PipelineGenerateRequest {
 
     pub fn with_image_tile_count(mut self, num_image_tiles: usize) -> Self {
         self.num_image_tiles = Some(num_image_tiles);
+        self
+    }
+
+    /// Attach live overrides for an iterative pipeline's loop parameters
+    /// (steps / guidance scale / start step).
+    pub fn with_iterative_overrides(mut self, overrides: IterativeOverrides) -> Self {
+        self.iterative_overrides = overrides;
         self
     }
 }
@@ -319,8 +349,44 @@ impl PipelineEngine {
         let PipelinePlan::Iterative(plan) = &self.plan else {
             anyhow::bail!("internal error: run_iterative on a non-iterative plan");
         };
+
+        // Live overrides (ComfyUI-style): re-drive the already-loaded models with
+        // different loop parameters, no reload. Seed / prompt / negative are
+        // already live via per-request inputs, so only loop params are overridden.
+        let overrides = &request.iterative_overrides;
+        let num_steps = overrides.num_steps.unwrap_or(plan.num_steps);
+        let start_step = overrides.start_step.unwrap_or(plan.start_step);
+        if num_steps == 0 {
+            anyhow::bail!("iterative override num_steps must be >= 1");
+        }
+        if start_step >= num_steps {
+            anyhow::bail!(
+                "iterative override start_step ({start_step}) must be < num_steps ({num_steps})"
+            );
+        }
+        // Rebuild the scheduler when the step count changes (its schedule may be
+        // baked at build time). An explicit per-step timestep schedule is tied to
+        // the original step count, so reject a step-count override in that case.
+        let rebuilt_scheduler = if num_steps != plan.num_steps {
+            if plan.timesteps.is_some() {
+                anyhow::bail!(
+                    "cannot override num_steps for a pipeline with an explicit timestep schedule"
+                );
+            }
+            match &plan.scheduler_spec {
+                Some(spec) => Some(plan.scheduler_registry.build(spec, num_steps)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let scheduler = rebuilt_scheduler.as_ref().or(plan.scheduler.as_ref());
+
         // Classifier-free guidance scale (active only when set and != 1.0).
-        let guidance = plan.guidance_scale.filter(|s| *s != 1.0);
+        let guidance = overrides
+            .guidance_scale
+            .or(plan.guidance_scale)
+            .filter(|s| *s != 1.0);
         // `constants` holds external inputs + prompt-phase outputs and is NOT
         // mutated by the loop, so a denoiser whose output port shares a name
         // with a conditioning input cannot clobber that conditioning. Denoiser
@@ -388,13 +454,13 @@ impl PipelineEngine {
         let mut last_outputs: HashMap<String, Value> = HashMap::new();
         // Reset any multistep scheduler state before the loop (img2img reuses a
         // plan whose scheduler may hold state from a previous run).
-        if let Some(scheduler) = &plan.scheduler {
+        if let Some(scheduler) = scheduler {
             scheduler.reset();
         }
         // Partial (img2img) loops start at `start_step`; the seed is then the
         // encoded image already noised to `timesteps[start_step]`.
-        for step in plan.start_step..plan.num_steps {
-            let is_first = step == plan.start_step;
+        for step in start_step..num_steps {
+            let is_first = step == start_step;
             // Timestep/sigma for this step: explicit schedule when provided,
             // otherwise the 0-based step index.
             let timestep = plan
@@ -426,10 +492,10 @@ impl PipelineEngine {
             // them as per-port overrides; schedulers that don't scale (DDIM,
             // masked diffusion) leave the raw sample untouched.
             let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
-            if let Some(scheduler) = &plan.scheduler {
+            if let Some(scheduler) = scheduler {
                 for (_, in_port) in &plan.loop_edges {
                     let raw = &raw_samples[in_port];
-                    if let Some(scaled) = scheduler.scale_input(step, plan.num_steps, raw)? {
+                    if let Some(scaled) = scheduler.scale_input(step, num_steps, raw)? {
                         scaled_inputs.insert(in_port.clone(), scaled);
                     }
                 }
@@ -443,6 +509,7 @@ impl PipelineEngine {
             let cond_out = self.run_denoiser_pass(
                 denoiser,
                 plan,
+                start_step,
                 &constants,
                 &carried,
                 step,
@@ -464,7 +531,7 @@ impl PipelineEngine {
                 // per step from the current sample (owned here so its references
                 // live through the unconditional denoiser pass).
                 let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
-                if let Some(scheduler) = &plan.scheduler {
+                if let Some(scheduler) = scheduler {
                     for (_, in_port) in &plan.loop_edges {
                         let raw = &raw_samples[in_port];
                         if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
@@ -479,6 +546,7 @@ impl PipelineEngine {
                 let uncond_out = self.run_denoiser_pass(
                     denoiser,
                     plan,
+                    start_step,
                     &constants,
                     &carried,
                     step,
@@ -512,21 +580,21 @@ impl PipelineEngine {
                 let model_output = out_map.get(out_port).with_context(|| {
                     format!("denoiser did not produce loop output '{}.{out_port}'", plan.denoiser)
                 })?;
-                let next = if let Some(scheduler) = &plan.scheduler {
+                let next = if let Some(scheduler) = scheduler {
                     let sample = raw_samples.get(in_port).with_context(|| {
                         format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
                     })?;
                     if scheduler.needs_noise() {
-                        let noise = self.step_noise(plan, &constants, in_port, step, sample)?;
+                        let noise = self.step_noise(plan, num_steps, &constants, in_port, step, sample)?;
                         scheduler.step_with_noise(
                             step,
-                            plan.num_steps,
+                            num_steps,
                             sample,
                             model_output,
                             Some(&noise),
                         )?
                     } else {
-                        scheduler.step(step, plan.num_steps, sample, model_output)?
+                        scheduler.step(step, num_steps, sample, model_output)?
                     }
                 } else {
                     clone_value(model_output)?
@@ -559,6 +627,7 @@ impl PipelineEngine {
         &self,
         denoiser: &Session,
         plan: &IterativePlan,
+        start_step: usize,
         constants: &PipelineTensors,
         carried: &HashMap<String, Value>,
         step: usize,
@@ -589,7 +658,7 @@ impl PipelineEngine {
             }
             let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
             let value = if is_loop {
-                if step == plan.start_step {
+                if step == start_step {
                     constants.get(&endpoint).with_context(|| {
                         format!("missing iterative pipeline seed '{endpoint}' at start step")
                     })?
@@ -633,6 +702,7 @@ impl PipelineEngine {
     fn step_noise(
         &self,
         plan: &IterativePlan,
+        num_steps: usize,
         constants: &PipelineTensors,
         in_port: &str,
         step: usize,
@@ -647,13 +717,12 @@ impl PipelineEngine {
         })?;
         let elem: usize = sample.shape().iter().map(|&d| d as usize).product();
         let data = all.to_vec_f32()?;
-        let want = plan.num_steps * elem;
+        let want = num_steps * elem;
         if data.len() != want {
             anyhow::bail!(
                 "noise tensor '{endpoint}' has {} elements but expected {want} \
-                 ({} steps x {elem})",
+                 ({num_steps} steps x {elem})",
                 data.len(),
-                plan.num_steps
             );
         }
         let slice = &data[step * elem..(step + 1) * elem];
@@ -945,7 +1014,7 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
 enum PipelinePlan {
     Autoregressive(AutoregressivePlan),
     SinglePass(SinglePassPlan),
-    Iterative(IterativePlan),
+    Iterative(Box<IterativePlan>),
 }
 
 /// Token-by-token decoder pipeline (optionally with prompt-phase encoders).
@@ -1000,6 +1069,11 @@ struct IterativePlan {
     /// when guidance is active).
     cfg_conditioning_input: Option<String>,
     dataflow: Vec<DataflowEdge>,
+    /// The declared scheduler config, kept so a per-request `num_steps` override
+    /// can rebuild the scheduler (whose schedule may be baked at build time).
+    scheduler_spec: Option<SchedulerSpec>,
+    /// The scheduler registry, kept for the same per-request rebuild.
+    scheduler_registry: SchedulerRegistry,
 }
 
 /// A loop-carried transform applied to a denoiser's output at each iterative
@@ -2231,7 +2305,7 @@ impl PipelinePlan {
             }
         }
 
-        Ok(Self::Iterative(IterativePlan {
+        Ok(Self::Iterative(Box::new(IterativePlan {
             denoiser,
             num_steps,
             guidance_scale: spec.strategy.guidance_scale,
@@ -2244,7 +2318,9 @@ impl PipelinePlan {
             scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps, schedulers)?,
             cfg_conditioning_input: spec.strategy.cfg_conditioning_input.clone(),
             dataflow: spec.dataflow.clone(),
-        }))
+            scheduler_spec: spec.strategy.scheduler_config.clone(),
+            scheduler_registry: schedulers.clone(),
+        })))
     }
 
     fn autoregressive_plan(&self) -> anyhow::Result<&AutoregressivePlan> {
