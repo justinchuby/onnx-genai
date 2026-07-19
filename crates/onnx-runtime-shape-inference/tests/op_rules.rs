@@ -2301,6 +2301,18 @@ fn moe_and_qmoe_preserve_activation_shape() {
         assert_eq!(out_shape(&outs), vec![sym(0), c(4), c(512)]);
         assert_eq!(out_dtype(&outs), DataType::Float32);
     }
+
+    let n = with_domain(node("BlockQuantizedMoE", 5, 1), "pkg.nxrt");
+    let inputs = vec![
+        f32in(vec![sym(0), c(4), c(512)]),
+        f32in(vec![c(4), c(8)]),
+        tin(DataType::Uint8, vec![c(8), c(1024), c(2), c(136)]),
+        NodeIo::default(),
+        tin(DataType::Uint8, vec![c(8), c(512), c(4), c(136)]),
+    ];
+    let outs = run(&n, inputs, 1);
+    assert_eq!(out_shape(&outs), vec![sym(0), c(4), c(512)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
 #[test]

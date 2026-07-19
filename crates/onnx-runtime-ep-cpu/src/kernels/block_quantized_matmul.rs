@@ -49,7 +49,7 @@ const IQ4_NL_CODEBOOK: [i8; 16] = [
 // Vendored byte-for-byte from llama.cpp commit b15ca938, ggml-common.h.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockFormat {
+pub(super) enum BlockFormat {
     Mxfp4,
     Iq4Nl,
     Iq4Xs,
@@ -63,7 +63,7 @@ enum BlockFormat {
 }
 
 impl BlockFormat {
-    fn parse(value: &str) -> Result<Self> {
+    pub(super) fn parse(value: &str) -> Result<Self> {
         match value {
             "mxfp4" => Ok(Self::Mxfp4),
             "iq4_nl" => Ok(Self::Iq4Nl),
@@ -81,7 +81,7 @@ impl BlockFormat {
         }
     }
 
-    fn qk(self) -> usize {
+    pub(super) fn qk(self) -> usize {
         match self {
             Self::Mxfp4 => MXFP4_QK,
             Self::Iq4Nl => IQ4_NL_QK,
@@ -96,7 +96,7 @@ impl BlockFormat {
         }
     }
 
-    fn block_bytes(self) -> usize {
+    pub(super) fn block_bytes(self) -> usize {
         match self {
             Self::Mxfp4 => MXFP4_BLOCK_BYTES,
             Self::Iq4Nl => IQ4_NL_BLOCK_BYTES,
@@ -255,50 +255,57 @@ impl Kernel for BlockQuantizedMatMulKernel {
 impl BlockQuantizedMatMulKernel {
     fn dequantize_weight_kn(&self, packed: &TensorView) -> Result<Vec<f32>> {
         let packed = to_dense_bytes(packed)?;
-        let qk = self.format.qk();
-        let block_bytes = self.format.block_bytes();
-        let blocks = self.k.div_ceil(qk);
-        let expected_bytes = self
-            .n
-            .checked_mul(blocks)
-            .and_then(|value| value.checked_mul(block_bytes))
-            .ok_or_else(|| error("packed_B byte count overflow"))?;
-        if packed.len() != expected_bytes {
-            return Err(error(format!(
-                "packed_B must contain exactly {expected_bytes} bytes, got {}",
-                packed.len()
-            )));
-        }
-
-        let weight_elements = self
-            .k
-            .checked_mul(self.n)
-            .ok_or_else(|| error("dequantized weight element count overflow"))?;
-        let mut weight_kn = vec![0.0f32; weight_elements];
-        let block_row_elements = qk
-            .min(self.k)
-            .checked_mul(self.n)
-            .ok_or_else(|| error("dequantized block-row element count overflow"))?;
-        let decoder = self.format.decoder();
-        weight_kn
-            .par_chunks_mut(block_row_elements)
-            .enumerate()
-            .for_each(|(block_index, weight_rows)| {
-                let mut decoded = [0.0f32; IQ_SUPER_QK];
-                let valid = weight_rows.len() / self.n;
-                for output in 0..self.n {
-                    let packed_start = (output * blocks + block_index) * block_bytes;
-                    decoder(
-                        &packed[packed_start..packed_start + block_bytes],
-                        &mut decoded[..qk],
-                    );
-                    for (offset, value) in decoded[..valid].iter().copied().enumerate() {
-                        weight_rows[offset * self.n + output] = value;
-                    }
-                }
-            });
-        Ok(weight_kn)
+        dequantize_weight_kn(self.format, self.k, self.n, &packed)
     }
+}
+
+pub(super) fn dequantize_weight_kn(
+    format: BlockFormat,
+    k: usize,
+    n: usize,
+    packed: &[u8],
+) -> Result<Vec<f32>> {
+    let qk = format.qk();
+    let block_bytes = format.block_bytes();
+    let blocks = k.div_ceil(qk);
+    let expected_bytes = n
+        .checked_mul(blocks)
+        .and_then(|value| value.checked_mul(block_bytes))
+        .ok_or_else(|| error("packed_B byte count overflow"))?;
+    if packed.len() != expected_bytes {
+        return Err(error(format!(
+            "packed_B must contain exactly {expected_bytes} bytes, got {}",
+            packed.len()
+        )));
+    }
+
+    let weight_elements = k
+        .checked_mul(n)
+        .ok_or_else(|| error("dequantized weight element count overflow"))?;
+    let mut weight_kn = vec![0.0f32; weight_elements];
+    let block_row_elements = qk
+        .min(k)
+        .checked_mul(n)
+        .ok_or_else(|| error("dequantized block-row element count overflow"))?;
+    let decoder = format.decoder();
+    weight_kn
+        .par_chunks_mut(block_row_elements)
+        .enumerate()
+        .for_each(|(block_index, weight_rows)| {
+            let mut decoded = [0.0f32; IQ_SUPER_QK];
+            let valid = weight_rows.len() / n;
+            for output in 0..n {
+                let packed_start = (output * blocks + block_index) * block_bytes;
+                decoder(
+                    &packed[packed_start..packed_start + block_bytes],
+                    &mut decoded[..qk],
+                );
+                for (offset, value) in decoded[..valid].iter().copied().enumerate() {
+                    weight_rows[offset * n + output] = value;
+                }
+            }
+        });
+    Ok(weight_kn)
 }
 
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {

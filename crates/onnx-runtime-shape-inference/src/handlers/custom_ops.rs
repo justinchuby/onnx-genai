@@ -297,6 +297,7 @@ fn c(value: i64) -> DimExpr {
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "MoE", 1, moe);
     reg.register("com.microsoft", "QMoE", 1, moe);
+    reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
     reg.register(
         "pkg.nxrt",

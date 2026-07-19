@@ -1,8 +1,7 @@
 # `pkg.nxrt::BlockQuantizedMoE` v1 — Operator Design Note
 
-**Status:** DESIGN / ABI PROPOSAL — no kernel implementation. Requires Justin
-sign-off on the contract (see [Decisions for Justin](#decisions-for-justin))
-before any kernel work begins.
+**Status:** v1 ABI FROZEN — CPU reference oracle implemented after Justin/Roy
+sign-off.
 **Author:** Ripley (architect)
 **Date:** 2026-07-18
 **Scope:** ABI, dispatch semantics, decode reuse, determinism, shape inference,
@@ -51,6 +50,9 @@ Three existing contracts are the load-bearing precedents this ABI mirrors:
 ---
 
 ## 1. Operator ABI (v1)
+
+**v1 ABI FROZEN (2026-07-19).** The CPU reference oracle now implements this
+schema; the v1 positional inputs and attribute surface below are frozen.
 
 - **Domain:** `pkg.nxrt`
 - **Op type:** `BlockQuantizedMoE` (exact string the seam matches at

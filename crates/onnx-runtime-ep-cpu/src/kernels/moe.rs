@@ -56,6 +56,14 @@ impl KernelFactory for MoEFactory {
 
 impl MoeAttributes {
     pub(super) fn from_node(node: &Node) -> Result<Self> {
+        Self::from_node_impl(node, true)
+    }
+
+    pub(super) fn from_block_quantized_node(node: &Node) -> Result<Self> {
+        Self::from_node_impl(node, false)
+    }
+
+    fn from_node_impl(node: &Node, parse_sparse_mixer: bool) -> Result<Self> {
         let k = int_attr(node, "k", 1)?;
         if k <= 0 {
             return Err(error(format!("k must be > 0, got {k}")));
@@ -79,7 +87,7 @@ impl MoeAttributes {
             }
         };
         let normalize = bool_attr(node, "normalize_routing_weights", false)?;
-        if bool_attr(node, "use_sparse_mixer", false)? {
+        if parse_sparse_mixer && bool_attr(node, "use_sparse_mixer", false)? {
             return Err(error(
                 "use_sparse_mixer=1 is unsupported by the Phase-1 CPU reference kernel",
             ));
