@@ -2,6 +2,7 @@
 """Time the f32 shapes used by kernels.rs through ONNX Runtime CPU EP."""
 
 import argparse
+import statistics
 import time
 
 import numpy as np
@@ -46,7 +47,7 @@ def values(shape):
     return ((data - 125).astype(np.float32) / 64.0).reshape(shape)
 
 
-def run_case(name, onnx_model, feeds, warmup, iterations, threads):
+def run_case(name, onnx_model, feeds, warmup, iterations, repetitions, threads):
     session_options = ort.SessionOptions()
     session_options.intra_op_num_threads = threads
     # Each model contains one node, so inter-op parallelism is intentionally
@@ -59,15 +60,19 @@ def run_case(name, onnx_model, feeds, warmup, iterations, threads):
     )
     for _ in range(warmup):
         session.run(None, feeds)
-    start = time.perf_counter_ns()
-    for _ in range(iterations):
-        session.run(None, feeds)
-    elapsed = time.perf_counter_ns() - start
+    samples_us = []
+    for _ in range(repetitions):
+        start = time.perf_counter_ns()
+        for _ in range(iterations):
+            session.run(None, feeds)
+        elapsed = time.perf_counter_ns() - start
+        samples_us.append(elapsed / iterations / 1_000)
     print(
         f"{name:38} threads={threads} "
         f"(intra_op={session_options.intra_op_num_threads}, "
         f"inter_op={session_options.inter_op_num_threads}) "
-        f"{elapsed / iterations / 1_000:12.3f} us"
+        f"{statistics.median(samples_us):12.3f} us median "
+        f"({repetitions}x{iterations} runs)"
     )
 
 
@@ -124,6 +129,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="timed batches whose per-call times are reduced by median (default: 1)",
+    )
     parser.add_argument("--filter", default="")
     parser.add_argument(
         "--threads",
@@ -133,6 +144,12 @@ def main():
         help="intra-op thread counts to benchmark (default: 1 8)",
     )
     args = parser.parse_args()
+    if args.warmup < 0:
+        parser.error("--warmup must be non-negative")
+    if args.iterations < 1:
+        parser.error("--iterations must be positive")
+    if args.repetitions < 1:
+        parser.error("--repetitions must be positive")
     print(f"onnxruntime {ort.__version__}; provider=CPUExecutionProvider")
     for threads in args.threads:
         if threads < 1:
@@ -146,6 +163,7 @@ def main():
                     feeds,
                     args.warmup,
                     args.iterations,
+                    args.repetitions,
                     threads,
                 )
 

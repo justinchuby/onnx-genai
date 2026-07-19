@@ -58,7 +58,8 @@ shapes after warmup, excluding session construction:
 
 ```bash
 python crates/onnx-runtime-ep-cpu/benches/ort_baseline.py \
-  --filter matmul/medium --threads 1 8 --warmup 20 --iterations 200
+  --filter matmul/medium --threads 1 8 --warmup 20 \
+  --iterations 1000 --repetitions 9
 ```
 
 Run it on the same otherwise-idle machine as Criterion. Compare matching f32
@@ -67,6 +68,8 @@ rows and matching thread counts in microseconds. The script pins and prints
 because each generated graph contains one node. ORT support and optimization
 behavior for f16/bf16 on CPU varies by release, so f32 is the required common
 baseline; the Rust-only f16/bf16 rows guard the broader dtype surface.
+`--repetitions` reports the median of independently timed iteration batches,
+which is preferable to a single elapsed-time sample for recorded comparisons.
 
 ## Thread-matched MatMul comparison
 
