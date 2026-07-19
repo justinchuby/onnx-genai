@@ -123,10 +123,18 @@ pub(crate) struct CsaDeviceBufferManager {
     runtime: Arc<CudaRuntime>,
     pub(crate) layout: CsaBufferLayout,
     buffers: Vec<CUdeviceptr>,
+    /// B6 pooled scratch (index transform / scores / selection / attention
+    /// scores). Reserved once at runner init with stable addresses so the
+    /// device-only capture path never allocates per call.
+    workspaces: Vec<CUdeviceptr>,
 }
 
 impl CsaDeviceBufferManager {
-    pub(crate) fn reserve(runtime: Arc<CudaRuntime>, layout: CsaBufferLayout) -> Result<Self> {
+    pub(crate) fn reserve(
+        runtime: Arc<CudaRuntime>,
+        layout: CsaBufferLayout,
+        workspace_bytes: &[usize],
+    ) -> Result<Self> {
         let sizes = [
             layout.attention_r4_bytes,
             layout.attention_r4_carry_bytes,
@@ -137,14 +145,31 @@ impl CsaDeviceBufferManager {
             layout.dense_ring_bytes,
         ];
         let mut buffers = Vec::with_capacity(sizes.len());
+        let mut workspaces = Vec::with_capacity(workspace_bytes.len());
+        let rollback = |buffers: &mut Vec<CUdeviceptr>, workspaces: &mut Vec<CUdeviceptr>| {
+            for ptr in workspaces.drain(..).rev() {
+                // SAFETY: each pointer was allocated by this runtime and has not escaped.
+                let _ = unsafe { runtime.free_raw(ptr) };
+            }
+            for ptr in buffers.drain(..).rev() {
+                // SAFETY: each pointer was allocated by this runtime and has not escaped.
+                let _ = unsafe { runtime.free_raw(ptr) };
+            }
+        };
         for size in sizes {
             match runtime.alloc_raw(size) {
                 Ok(ptr) => buffers.push(ptr),
                 Err(error) => {
-                    for ptr in buffers.drain(..).rev() {
-                        // SAFETY: each pointer was allocated by this runtime and has not escaped.
-                        let _ = unsafe { runtime.free_raw(ptr) };
-                    }
+                    rollback(&mut buffers, &mut workspaces);
+                    return Err(error);
+                }
+            }
+        }
+        for &size in workspace_bytes {
+            match runtime.alloc_raw(size.max(1)) {
+                Ok(ptr) => workspaces.push(ptr),
+                Err(error) => {
+                    rollback(&mut buffers, &mut workspaces);
                     return Err(error);
                 }
             }
@@ -153,12 +178,22 @@ impl CsaDeviceBufferManager {
             runtime,
             layout,
             buffers,
+            workspaces,
         })
+    }
+
+    /// Stable address of pooled workspace `index` (reserved in `reserve`).
+    pub(crate) fn workspace(&self, index: usize) -> CUdeviceptr {
+        self.workspaces[index]
     }
 }
 
 impl Drop for CsaDeviceBufferManager {
     fn drop(&mut self) {
+        for ptr in self.workspaces.drain(..).rev() {
+            // SAFETY: this manager exclusively owns every pointer it reserved.
+            let _ = unsafe { self.runtime.free_raw(ptr) };
+        }
         for ptr in self.buffers.drain(..).rev() {
             // SAFETY: this manager exclusively owns every pointer it reserved.
             let _ = unsafe { self.runtime.free_raw(ptr) };

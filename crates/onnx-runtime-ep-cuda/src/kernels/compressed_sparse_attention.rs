@@ -67,6 +67,65 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "CompressedSparseAttention";
 
+/// Pooled workspace indices for the ratio-4 device-only capture path (D3).
+const WS_TRANSFORMED: usize = 0;
+const WS_SCORES: usize = 1;
+const WS_SELECTED: usize = 2;
+const WS_ATTN: usize = 3;
+/// The fused ratio-4 dense window is capped at 128 candidates (the sliding
+/// window), so `dense_candidates + topk_width <= 128 + topk_width` bounds the
+/// per-row attention score scratch stride.
+const RATIO4_DENSE_WINDOW: usize = 128;
+
+/// Fixed-capacity (D3) byte sizes for the ratio-4 pooled workspaces, computed
+/// from the reserved [`CsaBufferLayout`] so the device-only capture path never
+/// allocates per call. Returns an empty set for non-ratio-4 configs (they use
+/// no pooled scratch).
+fn ratio4_workspace_bytes(
+    node: &Node,
+    input_shapes: &[Vec<usize>],
+    layout: &CsaBufferLayout,
+) -> Vec<usize> {
+    let ratio = node
+        .attr("compression_ratio")
+        .and_then(|attribute| attribute.as_int())
+        .unwrap_or(0);
+    if ratio != 4 {
+        return Vec::new();
+    }
+    let query = match input_shapes.first() {
+        Some(shape) if shape.len() >= 4 => shape,
+        _ => return Vec::new(),
+    };
+    let attr_usize = |name: &str| -> usize {
+        node.attr(name)
+            .and_then(|attribute| attribute.as_int())
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    let batch = query[0];
+    let sequence = query[1];
+    let heads = query[2];
+    let index_heads = attr_usize("index_num_heads");
+    let index_dim = attr_usize("index_head_dim");
+    let max_records = layout.max_seq_len.div_ceil(4);
+    let max_topk = max_records.min(512);
+    let rows = batch.saturating_mul(sequence);
+    let rows_attn = rows.saturating_mul(heads);
+    let f32 = std::mem::size_of::<f32>();
+    let i32 = std::mem::size_of::<i32>();
+    vec![
+        rows.saturating_mul(index_heads)
+            .saturating_mul(index_dim)
+            .saturating_mul(f32),
+        rows.saturating_mul(max_records).saturating_mul(f32),
+        rows.saturating_mul(max_topk).saturating_mul(i32),
+        rows_attn
+            .saturating_mul(RATIO4_DENSE_WINDOW.saturating_add(max_topk))
+            .saturating_mul(f32),
+    ]
+}
+
 /// Device stage-7 (sparse sink-softmax attention) + stage-6 (candidate read)
 /// for **ratio-128** (B1). One CUDA block computes one `(batch, query, head)`
 /// output row, reproducing the CPU oracle's `ratio128_attention` numerics
@@ -103,6 +162,14 @@ const COMPRESSION_MODULE: &str = "csa_ratio128_compression";
 const COMPRESSION_ENTRY: &str = "csa_ratio128_compress";
 const INDEX_COMPRESSION_MODULE: &str = "csa_ratio4_index_compression";
 const INDEX_COMPRESSION_ENTRY: &str = "csa_ratio4_index_compress";
+/// B6 ratio-4 main KV compression (stage-1 for ratio-4). Combines the ratio-4
+/// 8-slot overlapped-pool + carry-rotation structure (identical to
+/// `csa_ratio4_index_compress`) with the ratio-128 hybrid FP8/BF16 583-byte
+/// finalize (`csa_ratio128_compress`), so the main compressed KV cache/carry
+/// (outputs 1/2) is produced fully on device. This is the last host-staged stage
+/// on the ratio-4 path; with it the whole ratio-4 decode is capture-clean.
+const MAIN4_COMPRESSION_MODULE: &str = "csa_ratio4_main_compression";
+const MAIN4_COMPRESSION_ENTRY: &str = "csa_ratio4_main_compress";
 /// B4 stage-3/4/5 ratio-4 index scoring + deterministic top-k selection.
 const INDEX_SELECT_MODULE: &str = "csa_ratio4_index_select";
 const INDEX_SELECT_ENTRY: &str = "csa_ratio4_index_select";
@@ -216,10 +283,11 @@ extern "C" __global__ void csa_ratio4_index_compress(
     const unsigned char* past_key, const float* past_carry,
     unsigned char* key, float* carry,
     int batch, int sequence, int dim, int rope_dim, int past_records, int key_records,
-    long long start)
+    const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
+    const long long start = *total_ptr - (long long)sequence;
     const int source_width = 2 * dim;
     const int carry_stride = 8 * 2 * source_width;
     for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
@@ -310,6 +378,117 @@ extern "C" __global__ void csa_ratio4_index_compress(
     }
 }
 "#;
+const MAIN4_COMPRESSION_SOURCE: &str = r#"
+__device__ __forceinline__ unsigned short csa_main4_bf16_bits(float x) {
+    unsigned int bits = __float_as_uint(x);
+    return (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+__device__ __forceinline__ float csa_main4_bf16(float x) {
+    return __uint_as_float((unsigned int)csa_main4_bf16_bits(x) << 16);
+}
+extern "C" __global__ void csa_ratio4_main_compress(
+    const float* kv, const float* gate, const float* ape, const float* norm,
+    const unsigned char* past_cache, const float* past_carry,
+    unsigned char* cache, float* carry,
+    int batch, int sequence, int dim, int rope_dim, int past_records, int cache_records,
+    const long long* total_ptr)
+{
+    const int b = blockIdx.x;
+    if (b >= batch || threadIdx.x != 0) return;
+    const long long start = *total_ptr - (long long)sequence;
+    const int source_width = 2 * dim;
+    const int carry_stride = 8 * 2 * source_width;
+    const int cache_width = 583;
+    // The graph outputs are the next state.  Copy the old carry/records; newly
+    // completed records are written below (stable-address, in-place update).
+    for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
+    for (int i = 0; i < past_records * cache_width; ++i)
+        cache[(b * cache_records) * cache_width + i] = past_cache[(b * past_records) * cache_width + i];
+    const float NEG = __int_as_float(0xff800000);
+    if (start == 0) {
+        for (int slot = 0; slot < 8; ++slot)
+            for (int state = 0; state < 2; ++state)
+                for (int d = 0; d < source_width; ++d)
+                    carry[b * carry_stride + ((slot * 2 + state) * source_width + d)] =
+                        state == 0 ? 0.0f : NEG;
+    }
+    int emitted = 0;
+    for (int s = 0; s < sequence; ++s) {
+        const long long pos = start + s;
+        const int phase = (int)(pos & 3);
+        const int slot = 4 + phase;
+        for (int d = 0; d < source_width; ++d) {
+            carry[b * carry_stride + ((slot * 2) * source_width + d)] =
+                kv[((b * sequence + s) * source_width) + d];
+            carry[b * carry_stride + ((slot * 2 + 1) * source_width + d)] =
+                __fadd_rn(gate[((b * sequence + s) * source_width) + d], ape[phase * source_width + d]);
+        }
+        if (((pos + 1) & 3) != 0) continue;
+        const long long block_start = pos + 1 - 4;
+
+        float record[512];
+        // Overlapped 8-candidate FP32 softmax pool (identical to the index stream).
+        for (int d = 0; d < dim; ++d) {
+            float maximum = NEG;
+            for (int candidate = 0; candidate < 8; ++candidate) {
+                const int source_dim = candidate < 4 ? d : dim + d;
+                maximum = fmaxf(maximum,
+                    carry[b * carry_stride + ((candidate * 2 + 1) * source_width + source_dim)]);
+            }
+            float numerator = 0.0f, denominator = 0.0f;
+            for (int candidate = 0; candidate < 8; ++candidate) {
+                const int source_dim = candidate < 4 ? d : dim + d;
+                const float score =
+                    carry[b * carry_stride + ((candidate * 2 + 1) * source_width + source_dim)];
+                if (score == NEG) continue;
+                const float weight = (float)exp((double)__fsub_rn(score, maximum));
+                numerator = __fadd_rn(numerator, __fmul_rn(weight,
+                    carry[b * carry_stride + ((candidate * 2) * source_width + source_dim)]));
+                denominator = __fadd_rn(denominator, weight);
+            }
+            record[d] = csa_main4_bf16(__fdiv_rn(numerator, denominator));
+        }
+        // RMSNorm → learned scale (hybrid FP8/BF16 finalize, ratio-128 identical).
+        float square_sum = 0.0f;
+        for (int d = 0; d < dim; ++d)
+            square_sum = __fadd_rn(square_sum, __fmul_rn(record[d], record[d]));
+        const float inverse_rms =
+            __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(square_sum, (float)dim), 1.0e-6f)));
+        for (int d = 0; d < dim; ++d)
+            record[d] = csa_main4_bf16(__fmul_rn(__fmul_rn(record[d], inverse_rms), norm[d]));
+        // Compressed RoPE tail (BF16-rounded per component), block-start phase.
+        for (int pair = 0; pair < rope_dim / 2; ++pair) {
+            const float ramp = fminf(1.0f, fmaxf(0.0f, ((float)pair - 15.0f) / 10.0f));
+            const float base = powf(160000.0f, -((float)(2 * pair)) / (float)rope_dim);
+            const float frequency =
+                __fadd_rn(__fmul_rn(base, 1.0f - ramp), __fmul_rn(base / 16.0f, ramp));
+            float sn, cs; sincosf((float)block_start * frequency, &sn, &cs);
+            const int d = dim - rope_dim + 2 * pair;
+            const float re = record[d], im = record[d + 1];
+            record[d] = csa_main4_bf16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
+            record[d + 1] = csa_main4_bf16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
+        }
+        unsigned char* dst = cache + (b * cache_records + past_records + emitted++) * cache_width;
+        for (int block = 0; block < 7; ++block)
+            quantize_fp8_e4m3_block(record + block * 64, dst + block * 65, dst + block * 65 + 1);
+        for (int d = 0; d < rope_dim; ++d) {
+            unsigned short bits = csa_main4_bf16_bits(record[dim - rope_dim + d]);
+            dst[455 + 2 * d] = (unsigned char)bits;
+            dst[455 + 2 * d + 1] = (unsigned char)(bits >> 8);
+        }
+        // Rotate current slots (4..8) into the previous window (0..4), clearing
+        // the current slots for the next block (identical to the index stream).
+        for (int previous = 0; previous < 4; ++previous)
+            for (int state = 0; state < 2; ++state)
+                for (int d = 0; d < source_width; ++d) {
+                    const int from = ((4 + previous) * 2 + state) * source_width + d;
+                    const int to = (previous * 2 + state) * source_width + d;
+                    carry[b * carry_stride + to] = carry[b * carry_stride + from];
+                    carry[b * carry_stride + from] = state == 0 ? 0.0f : NEG;
+                }
+    }
+}
+"#;
 /// B4 stages 3–5 for ratio-4: index-query finalize (RoPE → Hadamard `1/√ID` →
 /// FP4 E2M1 round-trip), `dot → relu → weighted-head-sum` scoring with causal +
 /// valid-length masking, and a deterministic top-k selection reproducing the CPU
@@ -365,13 +544,14 @@ extern "C" __global__ void csa_ratio4_index_select(
     float* scores,                   // [batch, sequence, records] scratch
     int* selected,                   // [batch, sequence, topk_width] scratch
     int batch, int sequence, int index_heads, int index_dim, int rope_dim,
-    int records, long long start, int topk_width)
+    int records, const long long* total_ptr, int topk_width)
 {
     const int bs = blockIdx.x;
     if (bs >= batch * sequence || threadIdx.x != 0) return;
     const int s = bs % sequence;
     const int b = bs / sequence;
-
+    // B6: the logical cursor is read on device from `total_sequence_length`.
+    const long long start = *total_ptr - (long long)sequence;
     const long long position = start + (long long)s;
     long long valid_ll = (position + 1) / 4;
     int limit = records;
@@ -469,6 +649,30 @@ extern "C" __global__ void csa_ratio4_index_select(
         row_selected[slot] = best;
         prev = best; prev_score = best_score;
     }
+}
+"#;
+/// B6 device replicate: broadcast the shared per-`(batch, query)` selected index
+/// set across every index head into `selected_indices` (output 5), replacing the
+/// B4 host readback + host replicate + H2D. One thread owns one output slot, so
+/// the launch is capture-clean.
+const INDEX_REPLICATE_MODULE: &str = "csa_ratio4_index_replicate";
+const INDEX_REPLICATE_ENTRY: &str = "csa_ratio4_index_replicate";
+const INDEX_REPLICATE_SOURCE: &str = r#"
+extern "C" __global__ void csa_ratio4_index_replicate(
+    const int* shared,   // [batch, sequence, topk_width]
+    int* selected,       // [batch, index_heads, sequence, topk_width]
+    int batch, int index_heads, int sequence, int topk_width)
+{
+    const long long total = (long long)batch * index_heads * sequence * topk_width;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int slot = (int)(i % topk_width);
+    long long tmp = i / topk_width;
+    const int s = (int)(tmp % sequence);
+    tmp /= sequence;
+    // tmp = b * index_heads + head; the shared set is head-independent.
+    const int b = (int)(tmp / index_heads);
+    selected[i] = shared[((long long)b * sequence + s) * topk_width + slot];
 }
 "#;
 const ATTENTION_SOURCE: &str = r#"
@@ -590,8 +794,8 @@ extern "C" __global__ void csa_ratio4_sink_attention(
     const float* query, const float* current_kv, const unsigned char* compressed,
     const int* selected, const float* sink, const float* bias, float* output, float* scores,
     int batch, int sequence, int heads, int dim, int current_kv_len,
-    long long current_kv_base, long long query_start, int compressed_records,
-    int index_heads, int topk_width, int dense_candidates, int candidate_count,
+    const long long* total_ptr, int compressed_records,
+    int index_heads, int topk_width, int scratch_stride,
     int bias_present, int bias_b, int bias_h, int bias_s, int bias_k, float scale)
 {
     const int row = blockIdx.x;
@@ -602,11 +806,18 @@ extern "C" __global__ void csa_ratio4_sink_attention(
     const int s = bs % sequence;
     const int b = bs / sequence;
     const float NEG = __int_as_float(0xff800000);
+    // B6: derive the logical cursors on device from `total_sequence_length`.
+    const long long total = *total_ptr;
+    const long long query_start = total - (long long)sequence;
+    const long long current_kv_base = total - (long long)current_kv_len;
+    int dense_candidates = 128;
+    if (query_start == 0) dense_candidates = current_kv_len < 128 ? current_kv_len : 128;
+    const int candidate_count = dense_candidates + topk_width;
     const long long position = query_start + (long long)s;
     long long window = position + 1 - 128;
     if (window < 0) window = 0;
     const long long dense_start = current_kv_base > window ? current_kv_base : window;
-    float* row_scores = scores + (long long)row * candidate_count;
+    float* row_scores = scores + (long long)row * scratch_stride;
     const long long q_base = ((long long)(b * sequence + s) * heads + h) * dim;
     const int selected_base = ((b * index_heads) * sequence + s) * topk_width;
     __shared__ float s_max;
@@ -732,7 +943,13 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // This is runner initialization, never capability claiming: reserve every
         // fixed-address stream now so an OOM fails before any execution.
         let layout = CsaBufferLayout::from_runner(node, input_shapes, ratio)?;
-        let device_state = CsaDeviceBufferManager::reserve(self.runtime.clone(), layout)?;
+        // B6 pooled scratch: the device-only capture path never allocates per
+        // call, so size every workspace to the fixed-capacity (D3) bound now and
+        // reserve stable addresses. Only the ratio-4 index/attention path uses
+        // them; other configs reserve nothing.
+        let workspace_bytes = ratio4_workspace_bytes(node, input_shapes, &layout);
+        let device_state =
+            CsaDeviceBufferManager::reserve(self.runtime.clone(), layout, &workspace_bytes)?;
 
         // B1: flip stage-6 (candidate read) + stage-7 (sparse sink-softmax
         // attention) to Device for ratio-128 with the f32 record cache, where
@@ -752,18 +969,35 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let device_index_compression = ratio == 4;
         let device_index_scoring = ratio == 4;
         let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
+        // B6: ratio-4 main KV compression (outputs 1/2) on device — the last
+        // host-staged ratio-4 stage. With it the whole ratio-4 decode is
+        // device-resident.
+        let device_main_compression = ratio == 4 && cache_format == "fp8_e4m3_block64";
         // B5 fused ratio-4 selection→attention runs on device, but ONLY when the
         // node emits `selected_indices` (output 5). For a 5-output ratio-4 node
         // that omits the optional `selected_indices`, there is no device-selected
         // record stream to dereference, so `Y` must stay on the host oracle. This
         // flag keys strictly on ratio; the output-count gate lives at dispatch.
         let device_ratio4_attention = ratio == 4;
+        // B6 capture eligibility: the fully device-resident ratio-4 fp8 config
+        // with the optional `selected_indices` present (6 outputs). Every output
+        // is produced by a device kernel reading device-resident cursors — no
+        // host round trip, no per-call alloc/free/sync — so the decode is
+        // capture-clean. All other configs keep `cuda_graph_compatible()==false`.
+        let capturable = device_main_compression
+            && device_index_compression
+            && device_index_scoring
+            && device_ratio4_attention
+            && node.outputs.len() == 6;
         let configured_scale = node
             .attr("scale")
             .and_then(|attribute| attribute.as_float())
             .unwrap_or(0.0);
         let mut dispatch = CsaStageDispatch::default();
         if device_compression {
+            dispatch.set(CsaPipelineStage::CompressionUpdate, CsaStageMode::Device);
+        }
+        if device_main_compression {
             dispatch.set(CsaPipelineStage::CompressionUpdate, CsaStageMode::Device);
         }
         if device_index_compression {
@@ -789,9 +1023,11 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             dispatch,
             device_compression,
             device_index_compression,
+            device_main_compression,
             device_index_scoring,
             device_attention,
             device_ratio4_attention,
+            capturable,
             qk_rope_head_dim: usize::try_from(
                 node.attr("qk_rope_head_dim")
                     .and_then(|attribute| attribute.as_int())
@@ -830,6 +1066,9 @@ struct CompressedSparseAttentionKernel {
     /// B3: ratio-4 stage-2 index-key compression is independently finalized on
     /// the device; scoring and attention deliberately remain host-staged.
     device_index_compression: bool,
+    /// B6: ratio-4 main KV compression (outputs 1/2) on device — the final
+    /// host-staged ratio-4 stage removed, making ratio-4 fully device-resident.
+    device_main_compression: bool,
     /// B4/B5: ratio-4 selection writes device `selected_indices`; fused
     /// candidate assembly and sparse attention consume it directly.
     device_index_scoring: bool,
@@ -840,6 +1079,11 @@ struct CompressedSparseAttentionKernel {
     /// node keeps `Y` from the host oracle — the device ratio-128 attention
     /// kernel must never run for a ratio-4 node.
     device_ratio4_attention: bool,
+    /// B6: the whole ratio-4 fp8 6-output decode is device-resident and
+    /// capture-clean. When set, `execute` takes the device-only path (no host
+    /// staging, no per-call alloc/free, cursor-driven launch) and
+    /// `cuda_graph_compatible()` returns `true`.
+    capturable: bool,
     qk_rope_head_dim: usize,
     /// Ratio-4 index-stream geometry (`index_num_heads`, `index_head_dim`);
     /// zero for ratio-128 where the index stream is absent.
@@ -1102,7 +1346,7 @@ impl CompressedSparseAttentionKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        staged: &[Vec<u8>],
+        sync: bool,
     ) -> Result<()> {
         let [batch, sequence, heads, dim] = inputs[0].shape.try_into().map_err(|_| {
             not_implemented(format!(
@@ -1112,31 +1356,18 @@ impl CompressedSparseAttentionKernel {
         let current_kv_len = inputs[1].shape[1];
         let compressed_records = outputs[1].shape[1];
         let topk_width = outputs[5].shape[3];
-        let total =
-            i64::from_ne_bytes(staged[9].as_slice().try_into().map_err(|_| {
-                not_implemented(format!("{OP}: expected scalar total_sequence_length"))
-            })?) as usize;
-        let start = total.checked_sub(sequence).ok_or_else(|| {
-            not_implemented(format!("{OP}: total < sequence in ratio-4 attention"))
-        })?;
-        let current_kv_base = total.checked_sub(current_kv_len).ok_or_else(|| {
-            not_implemented(format!(
-                "{OP}: current_kv longer than total in ratio-4 attention"
-            ))
-        })?;
-        let dense_candidates = if start == 0 {
-            current_kv_len.min(128)
-        } else {
-            128
-        };
-        let candidate_count = dense_candidates
+        // B6: the per-row attention scratch is the pooled workspace with a fixed
+        // stride bound (`RATIO4_DENSE_WINDOW + topk_width`). The kernel derives
+        // the actual `dense_candidates`/`candidate_count` on device from the
+        // `total_sequence_length` cursor, always <= this stride.
+        let scratch_stride = RATIO4_DENSE_WINDOW
             .checked_add(topk_width)
-            .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 candidate count overflow")))?;
+            .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 scratch stride overflow")))?;
         let rows = batch
             .checked_mul(sequence)
             .and_then(|n| n.checked_mul(heads))
             .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 attention rows overflow")))?;
-        if rows == 0 || candidate_count == 0 {
+        if rows == 0 || scratch_stride == 0 {
             return Ok(());
         }
         let mut bias_shape = [1i32; 4];
@@ -1159,96 +1390,83 @@ impl CompressedSparseAttentionKernel {
         } else {
             self.configured_scale
         };
-        let scratch = self.runtime.alloc_raw(
-            rows.checked_mul(candidate_count)
-                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
-                .ok_or_else(|| not_implemented(format!("{OP}: ratio-4 score scratch overflow")))?
-                .max(1),
+        let scratch = self.device_state.workspace(WS_ATTN);
+        let source = format!("{}\n{}", block_quant::source(), RATIO4_ATTENTION_SOURCE);
+        let func = self.runtime.nvrtc_function(
+            RATIO4_ATTENTION_MODULE,
+            &source,
+            RATIO4_ATTENTION_ENTRY,
         )?;
-        let mut launch = || -> Result<()> {
-            let source = format!("{}\n{}", block_quant::source(), RATIO4_ATTENTION_SOURCE);
-            let func = self.runtime.nvrtc_function(
-                RATIO4_ATTENTION_MODULE,
-                &source,
-                RATIO4_ATTENTION_ENTRY,
-            )?;
-            let query = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
-            let current_kv = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
-            let compressed = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
-            let selected = cuptr(outputs[5].data_ptr_mut::<u8>() as *const c_void);
-            let sink = cuptr(inputs[10].data_ptr::<u8>() as *const c_void);
-            let bias = if bias_present {
-                cuptr(inputs[19].data_ptr::<u8>() as *const c_void)
-            } else {
-                cuptr(std::ptr::null::<c_void>())
-            };
-            let output = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-            let ints = [
-                batch,
-                sequence,
-                heads,
-                dim,
-                current_kv_len,
-                compressed_records,
-                self.index_num_heads,
-                topk_width,
-                dense_candidates,
-                candidate_count,
-            ]
-            .map(|n| {
-                i32::try_from(n).map_err(|_| not_implemented("CSA ratio-4 geometry exceeds i32"))
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-            let current_kv_base = current_kv_base as i64;
-            let start = start as i64;
-            let bias_present_i = i32::from(bias_present);
-            let grid = u32::try_from(rows)
-                .map_err(|_| not_implemented(format!("{OP}: ratio-4 attention rows exceed u32")))?;
-            let mut builder = self.runtime.stream().launch_builder(&func);
-            builder
-                .arg(&query)
-                .arg(&current_kv)
-                .arg(&compressed)
-                .arg(&selected)
-                .arg(&sink)
-                .arg(&bias)
-                .arg(&output)
-                .arg(&scratch)
-                .arg(&ints[0])
-                .arg(&ints[1])
-                .arg(&ints[2])
-                .arg(&ints[3])
-                .arg(&ints[4])
-                .arg(&current_kv_base)
-                .arg(&start)
-                .arg(&ints[5])
-                .arg(&ints[6])
-                .arg(&ints[7])
-                .arg(&ints[8])
-                .arg(&ints[9])
-                .arg(&bias_present_i)
-                .arg(&bias_shape[0])
-                .arg(&bias_shape[1])
-                .arg(&bias_shape[2])
-                .arg(&bias_shape[3])
-                .arg(&scale);
-            // SAFETY: every tensor is contiguous and the argument order matches
-            // `csa_ratio4_sink_attention`; B4 has already written selected IDs.
-            unsafe {
-                builder.launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (ATTENTION_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|error| driver_err("launch csa_ratio4_sink_attention", error))?;
-            self.runtime.synchronize()
+        let query = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+        let current_kv = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
+        let compressed = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+        let selected = cuptr(outputs[5].data_ptr_mut::<u8>() as *const c_void);
+        let sink = cuptr(inputs[10].data_ptr::<u8>() as *const c_void);
+        let bias = if bias_present {
+            cuptr(inputs[19].data_ptr::<u8>() as *const c_void)
+        } else {
+            cuptr(std::ptr::null::<c_void>())
         };
-        let result = launch();
-        // SAFETY: scratch was allocated by this runtime and has not escaped.
-        let free = unsafe { self.runtime.free_raw(scratch) };
-        result.and(free)
+        let output = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        // B6: the logical cursor is read on device from `total_sequence_length`.
+        let total = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
+        let ints = [
+            batch,
+            sequence,
+            heads,
+            dim,
+            current_kv_len,
+            compressed_records,
+            self.index_num_heads,
+            topk_width,
+            scratch_stride,
+        ]
+        .map(|n| i32::try_from(n).map_err(|_| not_implemented("CSA ratio-4 geometry exceeds i32")))
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        let bias_present_i = i32::from(bias_present);
+        let grid = u32::try_from(rows)
+            .map_err(|_| not_implemented(format!("{OP}: ratio-4 attention rows exceed u32")))?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&query)
+            .arg(&current_kv)
+            .arg(&compressed)
+            .arg(&selected)
+            .arg(&sink)
+            .arg(&bias)
+            .arg(&output)
+            .arg(&scratch)
+            .arg(&ints[0])
+            .arg(&ints[1])
+            .arg(&ints[2])
+            .arg(&ints[3])
+            .arg(&ints[4])
+            .arg(&total)
+            .arg(&ints[5])
+            .arg(&ints[6])
+            .arg(&ints[7])
+            .arg(&ints[8])
+            .arg(&bias_present_i)
+            .arg(&bias_shape[0])
+            .arg(&bias_shape[1])
+            .arg(&bias_shape[2])
+            .arg(&bias_shape[3])
+            .arg(&scale);
+        // SAFETY: every tensor is contiguous and the argument order matches
+        // `csa_ratio4_sink_attention`; B4 has already written selected IDs.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (ATTENTION_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio4_sink_attention", error))?;
+        if sync {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
     /// B2 stage-1.  The cache/carry graph outputs are the authoritative
     /// externally-visible state, so this kernel first copies exactly the past
@@ -1328,28 +1546,40 @@ impl CompressedSparseAttentionKernel {
         self.runtime.synchronize()
     }
 
+    /// B6 device-only, capture-clean pipeline for the ratio-4 fp8 6-output
+    /// config. Every stage runs on device reading the `total_sequence_length`
+    /// cursor, writing directly into the graph-threaded outputs using the
+    /// pre-reserved stable-address scratch. No host staging, no per-call
+    /// alloc/free. The four kernels are serialized on the single compute stream:
+    /// main compression (outputs 1/2) → index compression (outputs 3/4) → index
+    /// scoring + replicate (output 5) → fused sparse attention (output 0). The
+    /// trailing stream sync is skipped while a CUDA graph is capturing (a sync is
+    /// illegal during capture); the graph replay/eager caller synchronizes.
+    fn run_capturable_ratio4(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        self.run_device_main_compression(inputs, outputs, false)?;
+        self.run_device_index_compression(inputs, outputs, false)?;
+        self.run_device_index_scoring(inputs, outputs, false)?;
+        self.run_device_ratio4_attention(inputs, outputs, false)?;
+        if !self.runtime.is_capturing()? {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
+    }
+
     fn run_device_index_compression(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        staged: &[Vec<u8>],
+        sync: bool,
     ) -> Result<()> {
         let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
         if batch == 0 || sequence == 0 {
             return Ok(());
         }
-        let total_bytes = &staged[9];
-        if total_bytes.len() != 8 {
-            return Err(not_implemented(format!(
-                "{OP}: device index compression expects scalar total_sequence_length"
-            )));
-        }
-        let total = i64::from_ne_bytes(total_bytes.as_slice().try_into().expect("8 bytes"));
-        let start = total.checked_sub(sequence as i64).ok_or_else(|| {
-            not_implemented(format!(
-                "{OP}: total < sequence in device index compression"
-            ))
-        })?;
         let dim = inputs[16].shape[0];
         let past_records = inputs[17].shape[1];
         let key_records = outputs[3].shape[1];
@@ -1365,6 +1595,8 @@ impl CompressedSparseAttentionKernel {
         let norm = cuptr(inputs[16].data_ptr::<u8>() as *const c_void);
         let past_key = cuptr(inputs[17].data_ptr::<u8>() as *const c_void);
         let past_carry = cuptr(inputs[18].data_ptr::<u8>() as *const c_void);
+        // B6: the logical cursor is read on device from `total_sequence_length`.
+        let total = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
         let key = cuptr(outputs[3].data_ptr_mut::<u8>() as *const c_void);
         let carry = cuptr(outputs[4].data_ptr_mut::<u8>() as *const c_void);
         let batch_i = i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
@@ -1394,7 +1626,7 @@ impl CompressedSparseAttentionKernel {
             .arg(&rope_i)
             .arg(&past_i)
             .arg(&records_i)
-            .arg(&start);
+            .arg(&total);
         // SAFETY: one serial thread owns each batch row, preserving every
         // order-dependent oracle reduction and carry transition.
         unsafe {
@@ -1405,19 +1637,100 @@ impl CompressedSparseAttentionKernel {
             })
         }
         .map_err(|error| driver_err("launch csa_ratio4_index_compress", error))?;
-        self.runtime.synchronize()
+        if sync {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
 
-    /// B4 stages 3–5 for ratio-4: index-query finalize + `dot→relu→
-    /// weighted-head-sum` scoring + deterministic top-k selection.  Reads the
-    /// freshly written device `present_index_key` (output 3), computes the
-    /// selection device-resident, then reads back the shared per-`(batch,query)`
-    /// index set (permitted by decision D5 — indices only) and writes the
-    /// per-index-head replicated `selected_indices` (output 5).
+    /// B6 ratio-4 stage-1: main compressed KV cache/carry (outputs 1/2) on
+    /// device via `csa_ratio4_main_compress`. Reads the logical cursor from the
+    /// device `total_sequence_length` scalar (input 9) — no host readback — so
+    /// the launch is capture-clean. `sync` is `false` inside a captured region.
+    fn run_device_main_compression(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        sync: bool,
+    ) -> Result<()> {
+        let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
+        if batch == 0 || sequence == 0 {
+            return Ok(());
+        }
+        let dim = inputs[5].shape[0];
+        let past_records = inputs[6].shape[1];
+        let cache_records = outputs[1].shape[1];
+        let source = format!("{}\n{}", block_quant::source(), MAIN4_COMPRESSION_SOURCE);
+        let func = self.runtime.nvrtc_function(
+            MAIN4_COMPRESSION_MODULE,
+            &source,
+            MAIN4_COMPRESSION_ENTRY,
+        )?;
+        let kv = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
+        let gate = cuptr(inputs[3].data_ptr::<u8>() as *const c_void);
+        let ape = cuptr(inputs[4].data_ptr::<u8>() as *const c_void);
+        let norm = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
+        let past_cache = cuptr(inputs[6].data_ptr::<u8>() as *const c_void);
+        let past_carry = cuptr(inputs[7].data_ptr::<u8>() as *const c_void);
+        let total = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
+        let cache = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+        let carry = cuptr(outputs[2].data_ptr_mut::<u8>() as *const c_void);
+        let batch_i = i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
+        let sequence_i =
+            i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
+        let dim_i = i32::try_from(dim).map_err(|_| not_implemented("CSA dimension exceeds i32"))?;
+        let rope_i = i32::try_from(self.qk_rope_head_dim)
+            .map_err(|_| not_implemented("CSA RoPE dimension exceeds i32"))?;
+        let past_i =
+            i32::try_from(past_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let records_i =
+            i32::try_from(cache_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&kv)
+            .arg(&gate)
+            .arg(&ape)
+            .arg(&norm)
+            .arg(&past_cache)
+            .arg(&past_carry)
+            .arg(&cache)
+            .arg(&carry)
+            .arg(&batch_i)
+            .arg(&sequence_i)
+            .arg(&dim_i)
+            .arg(&rope_i)
+            .arg(&past_i)
+            .arg(&records_i)
+            .arg(&total);
+        // SAFETY: one serial thread owns each batch row, preserving every
+        // order-dependent oracle reduction and the FP8 finalize byte layout.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio4_main_compress", error))?;
+        if sync {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
+    }
+
+    /// B6 stages 3–5 for ratio-4: index-query finalize + `dot→relu→
+    /// weighted-head-sum` scoring + deterministic top-k selection, then a device
+    /// head-broadcast into `selected_indices` (output 5). Runs entirely on device
+    /// — the logical cursor is read from `total_sequence_length` (input 9), the
+    /// scratch is the pre-reserved pooled workspaces (stable addresses, D3), and
+    /// the selection is replicated by `csa_ratio4_index_replicate`. No host
+    /// readback of indices (removes the B4/D5 host round trip), no per-call
+    /// alloc/free. `sync` is `false` inside a captured region.
     fn run_device_index_scoring(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        sync: bool,
     ) -> Result<()> {
         let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
         let index_heads = self.index_num_heads;
@@ -1428,154 +1741,122 @@ impl CompressedSparseAttentionKernel {
         if batch == 0 || sequence == 0 || index_heads == 0 || topk_width == 0 {
             return Ok(());
         }
-        let start = {
-            let total_bytes = inputs[9];
-            // `total_sequence_length` is a scalar Int64 device tensor.
-            let mut bytes = [0u8; 8];
-            // SAFETY: input 9 is a live device scalar of 8 bytes (Int64).
-            unsafe {
-                self.runtime.dtoh(
-                    &mut bytes,
-                    cuptr(total_bytes.data_ptr::<u8>() as *const c_void),
-                )?;
-            }
-            let total = i64::from_ne_bytes(bytes);
-            usize::try_from(total)
-                .ok()
-                .and_then(|total| total.checked_sub(sequence))
-                .ok_or_else(|| {
-                    not_implemented(format!("{OP}: total < sequence in device index scoring"))
-                })?
-        };
 
+        // Pooled, stable-address scratch reserved at runner init (D3). The pooled
+        // buffers are sized to the fixed-capacity bound, so the actual per-call
+        // `records`/`topk_width` strides always fit.
+        let transformed = self.device_state.workspace(WS_TRANSFORMED);
+        let scores = self.device_state.workspace(WS_SCORES);
+        let selected = self.device_state.workspace(WS_SELECTED);
+
+        let total = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
+        let index_query = cuptr(inputs[11].data_ptr::<u8>() as *const c_void);
+        let index_weight = cuptr(inputs[12].data_ptr::<u8>() as *const c_void);
+        let index_key = cuptr(outputs[3].data_ptr_mut::<u8>() as *const c_void);
+
+        let source = format!("{}\n{}", block_quant::source(), INDEX_SELECT_SOURCE);
+        let func = self
+            .runtime
+            .nvrtc_function(INDEX_SELECT_MODULE, &source, INDEX_SELECT_ENTRY)?;
+        let batch_i = i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
+        let sequence_i =
+            i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
+        let heads_i = i32::try_from(index_heads)
+            .map_err(|_| not_implemented("CSA index heads exceed i32"))?;
+        let dim_i = i32::try_from(index_dim)
+            .map_err(|_| not_implemented("CSA index dimension exceeds i32"))?;
+        let rope_i = i32::try_from(self.qk_rope_head_dim)
+            .map_err(|_| not_implemented("CSA RoPE dimension exceeds i32"))?;
+        let records_i =
+            i32::try_from(records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let topk_i =
+            i32::try_from(topk_width).map_err(|_| not_implemented("CSA topk exceeds i32"))?;
         let rows = batch * sequence;
-        let transformed_len = rows
+        let grid = u32::try_from(rows)
+            .map_err(|_| not_implemented(format!("{OP}: index scoring rows exceed u32")))?;
+
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&index_query)
+            .arg(&index_weight)
+            .arg(&index_key)
+            .arg(&transformed)
+            .arg(&scores)
+            .arg(&selected)
+            .arg(&batch_i)
+            .arg(&sequence_i)
+            .arg(&heads_i)
+            .arg(&dim_i)
+            .arg(&rope_i)
+            .arg(&records_i)
+            .arg(&total)
+            .arg(&topk_i);
+        // SAFETY: argument order/types match `csa_ratio4_index_select`; every
+        // pointer is a live contiguous allocation sized by the shapes above (the
+        // pooled scratch is fixed-capacity), and one block per `(batch, query)`
+        // row owns its scratch slices.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio4_index_select", error))?;
+
+        // B6 device replicate: broadcast the shared `[batch, sequence, topk]`
+        // selection across every index head into output 5 on device, replacing
+        // the B4 host readback + host replicate + H2D.
+        let replicate_source = INDEX_REPLICATE_SOURCE.to_string();
+        let replicate = self.runtime.nvrtc_function(
+            INDEX_REPLICATE_MODULE,
+            &replicate_source,
+            INDEX_REPLICATE_ENTRY,
+        )?;
+        let selected_out = cuptr(outputs[5].data_ptr_mut::<u8>() as *const c_void);
+        let total_slots = rows
             .checked_mul(index_heads)
-            .and_then(|value| value.checked_mul(index_dim))
-            .ok_or_else(|| not_implemented(format!("{OP}: index scoring workspace overflow")))?;
-        let scores_len = rows
-            .checked_mul(records.max(1))
-            .ok_or_else(|| not_implemented(format!("{OP}: index score buffer overflow")))?;
-        let selected_len = rows
-            .checked_mul(topk_width)
-            .ok_or_else(|| not_implemented(format!("{OP}: index selection buffer overflow")))?;
+            .and_then(|value| value.checked_mul(topk_width))
+            .ok_or_else(|| not_implemented(format!("{OP}: selected_indices size overflow")))?;
+        let replicate_grid = u32::try_from(total_slots.div_ceil(256).max(1))
+            .map_err(|_| not_implemented(format!("{OP}: replicate grid exceeds u32")))?;
+        let mut replicate_builder = self.runtime.stream().launch_builder(&replicate);
+        replicate_builder
+            .arg(&selected)
+            .arg(&selected_out)
+            .arg(&batch_i)
+            .arg(&heads_i)
+            .arg(&sequence_i)
+            .arg(&topk_i);
+        // SAFETY: `selected` holds `rows * topk_width` i32 values; output 5 is a
+        // live device allocation of `batch * index_heads * sequence * topk_width`
+        // i32 values; one thread writes one output slot.
+        unsafe {
+            replicate_builder.launch(LaunchConfig {
+                grid_dim: (replicate_grid, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio4_index_replicate", error))?;
 
-        let transformed = self
-            .runtime
-            .alloc_raw(transformed_len.checked_mul(4).unwrap_or(usize::MAX).max(1))?;
-        let scores = self
-            .runtime
-            .alloc_raw(scores_len.checked_mul(4).unwrap_or(usize::MAX).max(1))?;
-        let selected = self
-            .runtime
-            .alloc_raw(selected_len.checked_mul(4).unwrap_or(usize::MAX).max(1))?;
-
-        let index_key_ptr = cuptr(outputs[3].data_ptr_mut::<u8>() as *const c_void);
-        let run = || -> Result<Vec<i32>> {
-            let source = format!("{}\n{}", block_quant::source(), INDEX_SELECT_SOURCE);
-            let func =
-                self.runtime
-                    .nvrtc_function(INDEX_SELECT_MODULE, &source, INDEX_SELECT_ENTRY)?;
-            let index_query = cuptr(inputs[11].data_ptr::<u8>() as *const c_void);
-            let index_weight = cuptr(inputs[12].data_ptr::<u8>() as *const c_void);
-            let index_key = index_key_ptr;
-            let batch_i =
-                i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
-            let sequence_i =
-                i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
-            let heads_i = i32::try_from(index_heads)
-                .map_err(|_| not_implemented("CSA index heads exceed i32"))?;
-            let dim_i = i32::try_from(index_dim)
-                .map_err(|_| not_implemented("CSA index dimension exceeds i32"))?;
-            let rope_i = i32::try_from(self.qk_rope_head_dim)
-                .map_err(|_| not_implemented("CSA RoPE dimension exceeds i32"))?;
-            let records_i =
-                i32::try_from(records).map_err(|_| not_implemented("CSA records exceed i32"))?;
-            let start_i = start as i64;
-            let topk_i =
-                i32::try_from(topk_width).map_err(|_| not_implemented("CSA topk exceeds i32"))?;
-            let grid = u32::try_from(rows)
-                .map_err(|_| not_implemented(format!("{OP}: index scoring rows exceed u32")))?;
-
-            let mut builder = self.runtime.stream().launch_builder(&func);
-            builder
-                .arg(&index_query)
-                .arg(&index_weight)
-                .arg(&index_key)
-                .arg(&transformed)
-                .arg(&scores)
-                .arg(&selected)
-                .arg(&batch_i)
-                .arg(&sequence_i)
-                .arg(&heads_i)
-                .arg(&dim_i)
-                .arg(&rope_i)
-                .arg(&records_i)
-                .arg(&start_i)
-                .arg(&topk_i);
-            // SAFETY: argument order/types match `csa_ratio4_index_select`; every
-            // pointer is a live contiguous allocation sized by the shapes above,
-            // and one block per `(batch, query)` row owns its scratch slices.
-            unsafe {
-                builder.launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|error| driver_err("launch csa_ratio4_index_select", error))?;
+        if sync {
             self.runtime.synchronize()?;
-
-            let mut host = vec![0u8; selected_len * 4];
-            // SAFETY: `selected` covers exactly `selected_len` i32 values.
-            unsafe {
-                self.runtime.dtoh(&mut host, selected)?;
-            }
-            Ok(host
-                .chunks_exact(4)
-                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("4 bytes")))
-                .collect())
-        };
-
-        let selection = run();
-        // SAFETY: each scratch came from this runtime's `alloc_raw`, freed once.
-        let free = unsafe { self.runtime.free_raw(transformed) };
-        let free = free.and(unsafe { self.runtime.free_raw(scores) });
-        let free = free.and(unsafe { self.runtime.free_raw(selected) });
-        let shared = selection.and_then(|shared| free.map(|()| shared))?;
-
-        // Replicate the shared `[batch, sequence, topk_width]` selection across
-        // every index head into `[batch, index_heads, sequence, topk_width]`,
-        // exactly like the oracle's `write_shared_selected_i32`.
-        let row_width = sequence * topk_width;
-        let mut replicated = vec![-1i32; batch * index_heads * row_width];
-        for b in 0..batch {
-            let source = &shared[b * row_width..(b + 1) * row_width];
-            for head in 0..index_heads {
-                let destination = (b * index_heads + head) * row_width;
-                replicated[destination..destination + row_width].copy_from_slice(source);
-            }
         }
-        let bytes: Vec<u8> = replicated
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect();
-        if !bytes.is_empty() {
-            // SAFETY: output 5 is a live device allocation whose dense size equals
-            // `batch * index_heads * sequence * topk_width` i32 values.
-            unsafe {
-                self.runtime.htod(
-                    &bytes,
-                    cuptr(outputs[5].data_ptr_mut::<u8>() as *const c_void),
-                )?;
-            }
-        }
-        self.runtime.synchronize()
+        Ok(())
     }
 }
 
 impl Kernel for CompressedSparseAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        // B6: the fully device-resident ratio-4 fp8 6-output config runs a
+        // device-only pipeline — every stage reads the `total_sequence_length`
+        // cursor on device, uses pre-reserved stable-address scratch, and skips
+        // the final stream sync while a CUDA graph is capturing. No host staging,
+        // no per-call alloc/free, so the decode is capture-clean.
+        if self.capturable {
+            return self.run_capturable_ratio4(inputs, outputs);
+        }
         // Stage every present input host-side. Contiguity is required because the
         // host copy is a dense byte blit; the CPU oracle then reads it densely.
         let mut staged: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
@@ -1690,7 +1971,15 @@ impl Kernel for CompressedSparseAttentionKernel {
         if self.device_index_compression
             && self.dispatch.mode(CsaPipelineStage::IndexKeyUpdate) == CsaStageMode::Device
         {
-            self.run_device_index_compression(inputs, outputs, &staged)?;
+            self.run_device_index_compression(inputs, outputs, true)?;
+        }
+
+        // B6 device stage-1 for ratio-4: overwrite the host-oracle main
+        // compressed KV cache/carry with the device result (byte-exact FP8).
+        if self.device_main_compression
+            && self.dispatch.mode(CsaPipelineStage::CompressionUpdate) == CsaStageMode::Device
+        {
+            self.run_device_main_compression(inputs, outputs, true)?;
         }
 
         // B4 device stages 3–5: recompute `selected_indices` (output 5) on device
@@ -1699,7 +1988,7 @@ impl Kernel for CompressedSparseAttentionKernel {
             && outputs.len() == 6
             && self.dispatch.mode(CsaPipelineStage::Selection) == CsaStageMode::Device
         {
-            self.run_device_index_scoring(inputs, outputs)?;
+            self.run_device_index_scoring(inputs, outputs, true)?;
         }
 
         // B1 device stage-7: ratio-128 f32-cache consumes the f32 candidate
@@ -1729,7 +2018,7 @@ impl Kernel for CompressedSparseAttentionKernel {
                 .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
                 == CsaStageMode::Device
         {
-            self.run_device_ratio4_attention(inputs, outputs, &staged)?;
+            self.run_device_ratio4_attention(inputs, outputs, true)?;
         }
 
         self.runtime.synchronize()
@@ -1741,10 +2030,12 @@ impl Kernel for CompressedSparseAttentionKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // Host round-trip (D2H inputs, H2D outputs) plus per-copy stream syncs
-        // are illegal during CUDA-graph capture. Device-resident capture is a
-        // Phase-B goal (docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8).
-        false
+        // B6: the ratio-4 fp8 6-output config runs a fully device-resident,
+        // cursor-driven pipeline with pre-reserved stable-address scratch and no
+        // per-call alloc/free/sync, so it is capture-clean. Every other config
+        // still host-stages (D2H inputs, H2D outputs, per-copy syncs) — illegal
+        // during capture — so it stays non-capturable.
+        self.capturable
     }
 }
 

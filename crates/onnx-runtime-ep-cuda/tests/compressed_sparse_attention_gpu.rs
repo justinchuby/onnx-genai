@@ -1851,3 +1851,283 @@ fn supports_op_claims_omitted_ratio128_attention_bias() {
         "an omitted positional attention_bias must be treated as absent"
     );
 }
+
+/// Build the ratio-4 fp8 6-output decode step at `position` (a single query
+/// token) by threading the previous step's `present_*` state into `past_*`,
+/// mirroring the decode wiring used by the fused-attention decode tests.
+fn ratio4_decode_step(
+    full: &[HostTensor],
+    position: usize,
+    previous: &[Vec<u8>],
+) -> Vec<HostTensor> {
+    let mut inputs = full.to_vec();
+    for index in [0usize, 2, 3, 11, 12, 13, 14] {
+        inputs[index] = ratio4_sequence_slice(&full[index], position, 1);
+    }
+    inputs[1] = ratio4_sequence_slice(&full[1], 0, position + 1);
+    inputs[6] = HostTensor::u8(&[1, position / RATIO4, STORED_WIDTH], &previous[1]);
+    inputs[7] = HostTensor::f32(&[1, 8, 2, RATIO4_MAIN_WIDTH], &as_f32(&previous[2]));
+    inputs[8] = HostTensor::i32(&[1], &[position as i32]);
+    inputs[9] = HostTensor::i64(&[], &[(position + 1) as i64]);
+    inputs[17] = HostTensor::u8(
+        &[1, position / RATIO4, RATIO4_INDEX_STORED_WIDTH],
+        &previous[3],
+    );
+    inputs[18] = HostTensor::f32(
+        &[1, 8, 2, RATIO4_INDEX_COMPRESSOR_WIDTH],
+        &as_f32(&previous[4]),
+    );
+    inputs
+}
+
+/// Execute the node on the CUDA EP by capturing a single `execute` into a CUDA
+/// graph and replaying it via `cuGraphLaunch`. Uses one kernel instance so the
+/// pooled workspace addresses are stable across warmup/capture/replay. The
+/// output buffers are zeroed after warmup and before capture, so the returned
+/// bytes are produced solely by the graph replay (never the warmup pass).
+fn run_gpu_capture_replay(
+    ep: &CudaExecutionProvider,
+    graph: &Graph,
+    node: NodeId,
+    inputs: &[HostTensor],
+    output_specs: &[OutputSpec],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
+    use cudarc::driver::sys::{
+        CUgraph, CUgraphExec, CUstreamCaptureMode, cuGraphDestroy, cuGraphExecDestroy,
+        cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture,
+    };
+
+    let model = Model::new(graph);
+    let concrete: Vec<Vec<usize>> = inputs.iter().map(|input| input.shape.clone()).collect();
+    let kernel = ep.get_kernel(model.graph.node(node), &concrete, 1)?;
+    assert!(
+        kernel.cuda_graph_compatible(),
+        "ratio-4 fp8 6-output decode must advertise CUDA-graph capture eligibility"
+    );
+    let runtime = ep.runtime();
+
+    let mut buffers = Vec::<DeviceBuffer>::new();
+    for input in inputs {
+        let buffer = ep.allocate(input.bytes.len().max(1), 256)?;
+        if !input.bytes.is_empty() {
+            // SAFETY: allocation exactly covers the source tensor bytes.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+        }
+        buffers.push(buffer);
+    }
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect();
+    let input_views: Vec<TensorView> = inputs
+        .iter()
+        .zip(buffers.iter().zip(&strides))
+        .map(|(input, (buffer, strides))| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr() as *const _),
+                input.dtype,
+                &input.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect();
+
+    let out_strides: Vec<_> = output_specs
+        .iter()
+        .map(|spec| compute_contiguous_strides(&spec.shape))
+        .collect();
+    let out_lens: Vec<usize> = output_specs
+        .iter()
+        .map(|spec| spec.shape.iter().product::<usize>() * spec.dtype.byte_size())
+        .collect();
+    let mut out_buffers: Vec<DeviceBuffer> = out_lens
+        .iter()
+        .map(|len| ep.allocate((*len).max(1), 256))
+        .collect::<onnx_runtime_ep_api::Result<_>>()?;
+
+    let make_out_views = |out_buffers: &mut [DeviceBuffer]| -> Vec<TensorMut> {
+        out_buffers
+            .iter_mut()
+            .zip(output_specs.iter().zip(&out_strides))
+            .map(|(buffer, (spec, strides))| {
+                TensorMut::new(
+                    DevicePtrMut(buffer.as_mut_ptr()),
+                    spec.dtype,
+                    &spec.shape,
+                    strides,
+                    ep.device_id(),
+                )
+            })
+            .collect()
+    };
+
+    // Warmup: an eager execute compiles/caches every NVRTC kernel and primes the
+    // fixed-address device state before capture (module loads during capture are
+    // avoided by the cache hit).
+    {
+        let mut out_views = make_out_views(&mut out_buffers);
+        kernel.execute(&input_views, &mut out_views)?;
+    }
+    runtime.synchronize()?;
+
+    // Zero the outputs so the returned bytes come only from the graph replay.
+    for (buffer, len) in out_buffers.iter().zip(&out_lens) {
+        if *len > 0 {
+            let zeros = vec![0u8; *len];
+            // SAFETY: destination exactly covers the output allocation.
+            unsafe { runtime.htod(&zeros, cuptr(buffer.as_ptr()))? };
+        }
+    }
+    runtime.synchronize()?;
+
+    let stream = runtime.stream_ptr();
+    let mut graph_handle: CUgraph = std::ptr::null_mut();
+    let mut graph_exec: CUgraphExec = std::ptr::null_mut();
+
+    // Capture the device-only pipeline into a CUDA graph, then instantiate and
+    // launch it. The captured `execute` performs no host staging, no per-call
+    // alloc/free, and skips the trailing sync while capturing.
+    let captured = (|| -> onnx_runtime_ep_api::Result<()> {
+        // SAFETY: `stream` is the EP's live compute stream.
+        unsafe {
+            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+                .result()
+                .map_err(|error| {
+                    onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                        "cuStreamBeginCapture_v2: {error:?}"
+                    ))
+                })?;
+        }
+        let mut out_views = make_out_views(&mut out_buffers);
+        let record = kernel.execute(&input_views, &mut out_views);
+        drop(out_views);
+        // Always end capture to leave the stream in a clean state, even on error.
+        // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
+        let end = unsafe { cuStreamEndCapture(stream, &mut graph_handle) }
+            .result()
+            .map_err(|error| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!("cuStreamEndCapture: {error:?}"))
+            });
+        record?;
+        end?;
+        // SAFETY: `graph_handle` is a freshly captured non-null graph.
+        unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph_handle, 0) }
+            .result()
+            .map_err(|error| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                    "cuGraphInstantiateWithFlags: {error:?}"
+                ))
+            })?;
+        // SAFETY: `graph_exec` is instantiated; `stream` is the EP stream.
+        unsafe { cuGraphLaunch(graph_exec, stream) }
+            .result()
+            .map_err(|error| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!("cuGraphLaunch: {error:?}"))
+            })?;
+        runtime.synchronize()
+    })();
+
+    let mut outputs = Vec::new();
+    if captured.is_ok() {
+        for (buffer, len) in out_buffers.iter().zip(&out_lens) {
+            let mut host = vec![0u8; *len];
+            if *len > 0 {
+                // SAFETY: destination exactly covers the output allocation.
+                unsafe { runtime.dtoh(&mut host, cuptr(buffer.as_ptr()))? };
+            }
+            outputs.push(host);
+        }
+    }
+
+    if !graph_exec.is_null() {
+        // SAFETY: `graph_exec` was instantiated above and is destroyed once.
+        let _ = unsafe { cuGraphExecDestroy(graph_exec) }.result();
+    }
+    if !graph_handle.is_null() {
+        // SAFETY: `graph_handle` was captured above and is destroyed once.
+        let _ = unsafe { cuGraphDestroy(graph_handle) }.result();
+    }
+    for buffer in buffers {
+        ep.deallocate(buffer)?;
+    }
+    for buffer in out_buffers.drain(..) {
+        ep.deallocate(buffer)?;
+    }
+    captured.map(|()| outputs)
+}
+
+/// B6 — capture a ratio-4 fp8 6-output decode step into a CUDA graph, replay it,
+/// and assert **byte parity** between the eager decode and the replayed decode
+/// across every output (`Y` + all present state + `selected_indices`), AND
+/// bit-exact parity of the eager decode vs the INDEPENDENT CPU oracle. This is
+/// non-tautological: it byte-compares two independent executions (an eager launch
+/// and a graph replay from zeroed buffers) and independently checks both against
+/// the CPU oracle. It also asserts the config advertises capture eligibility.
+#[test]
+fn ratio4_capture_replay_decode_is_byte_identical_to_eager_and_cpu() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    let full = ratio4_inputs_prefill(
+        PREFILL + 1,
+        ratio4_values(
+            (PREFILL + 1) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            17,
+            0.0015,
+        ),
+        ratio4_values((PREFILL + 1) * RATIO4_INDEX_HEADS, 19, 0.01),
+    );
+
+    // Establish a real decode context: a prefill produces the past state that the
+    // single-token decode step then consumes.
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let (prefill_graph, prefill_node) = ratio4_node(&prefill);
+    let prefill_specs = ratio4_topk_output_specs(PREFILL, PREFILL / RATIO4, 1);
+    let first = run_gpu(&ep, &prefill_graph, prefill_node, &prefill, &prefill_specs)
+        .expect("CUDA ratio-4 prefill");
+
+    // Single-token decode step at position PREFILL.
+    let decode = ratio4_decode_step(&full, PREFILL, &first);
+    let records = (PREFILL + 1) / RATIO4;
+    let (graph, node) = ratio4_node(&decode);
+    let specs = ratio4_topk_output_specs(1, records, 1);
+
+    let cpu = run_cpu(&graph, node, &decode, &specs).expect("CPU ratio-4 decode oracle");
+    let eager = run_gpu(&ep, &graph, node, &decode, &specs).expect("CUDA ratio-4 eager decode");
+    let replay = run_gpu_capture_replay(&ep, &graph, node, &decode, &specs)
+        .expect("CUDA ratio-4 captured+replayed decode");
+
+    // Replay must be byte-identical to the eager device decode across all outputs.
+    let labels = [
+        "Y",
+        "present_compressed_kv",
+        "present_compression_carry",
+        "present_index_key",
+        "present_index_carry",
+        "selected_indices",
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        assert_eq!(
+            replay[index], eager[index],
+            "captured+replayed decode must be byte-identical to eager for {label}"
+        );
+    }
+
+    // Eager device decode must match the independent CPU oracle bit-for-bit.
+    assert_eq!(
+        max_ulp(&eager[0], &cpu[0]),
+        0,
+        "eager ratio-4 decode Y must be bit-exact vs the CPU oracle"
+    );
+    for (index, label) in labels.iter().enumerate().skip(1) {
+        assert_eq!(
+            eager[index], cpu[index],
+            "eager ratio-4 decode {label} must be byte-exact vs the CPU oracle"
+        );
+    }
+}

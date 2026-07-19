@@ -220,7 +220,14 @@ impl CudaRuntime {
         );
         let ptx_arch = ptx_arch_for(major, minor);
         let cubin_arch = cubin_arch_for(major, minor);
-        let stream = context.default_stream();
+        // A dedicated non-blocking stream (not the legacy NULL stream, which the
+        // driver refuses to capture) so device-resident kernels are eligible for
+        // CUDA-graph capture. The whole EP drives this single stream, so its
+        // ordering is self-contained and host-blocking `*_sync` copies remain
+        // correctly serialized against kernel launches.
+        let stream = context
+            .new_stream()
+            .map_err(|e| driver_err("create compute stream", e))?;
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
         Ok(Self {
@@ -510,6 +517,21 @@ impl CudaRuntime {
         self.stream
             .synchronize()
             .map_err(|e| driver_err("stream synchronize", e))
+    }
+
+    /// Whether the EP's compute stream is currently capturing into a CUDA graph.
+    /// A stream synchronize is illegal during capture, so device-resident kernels
+    /// use this to skip the trailing sync while a graph is being recorded.
+    pub fn is_capturing(&self) -> Result<bool> {
+        let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        // SAFETY: `stream_ptr` is this runtime's live stream and `status` is a
+        // valid out-pointer for the duration of the call.
+        unsafe {
+            cudarc::driver::sys::cuStreamIsCapturing(self.stream_ptr(), &mut status)
+                .result()
+                .map_err(|e| driver_err("cuStreamIsCapturing", e))?;
+        }
+        Ok(status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
     /// Allocate `bytes` (>= 1) of device memory, returning the raw device
