@@ -38,11 +38,29 @@ These small files were written for the spike and are **not** MLAS source:
   `core/common/common.h` but uses nothing from it on the path we compile;
   the stub avoids pulling ORT's `core/common` tree.
 
+## Local modifications
+
+The following vendored MLAS files contain small, in-source-marked patches:
+
+- `onnxruntime/core/mlas/lib/mlasi.h`
+- `onnxruntime/core/mlas/lib/threading.cpp`
+
+Each patch is marked with the exact `nxrt-mlas-mt` comment tag so it can be
+located with `grep`. The patches wire MLAS's standalone
+`BUILD_MLAS_NO_ONNXRUNTIME` parallel-for primitives to the pluggable host
+thread-pool hooks in `shim.cpp` (`MlasStandaloneParallelFor` and
+`MlasStandaloneMaxThreads`), so `MlasGemmBatch` runs multi-threaded on our
+Rayon pool.
+
+After re-vendoring from upstream, these two patches **MUST** be re-applied:
+grep the old tree for `nxrt-mlas-mt` first to locate them, and keep this
+section in sync with the patched files.
+
 ## How it is built
 
 `build.rs` compiles the subset with the `cc` crate (no cmake), grouping sources
 by ISA exactly as `cmake/onnxruntime_mlas.cmake` does for the `X86_64` branch,
 with `-DBUILD_MLAS_NO_ONNXRUNTIME` (MLAS's standalone CPUID/threading shim).
-No files under this directory were modified from upstream; the few TUs that rely
-on headers ORT supplies transitively are handled with compiler `-include` flags
-in `build.rs`.
+The vendored MLAS sources are otherwise unmodified from upstream; the few TUs
+that rely on headers ORT supplies transitively are handled with compiler
+`-include` flags in `build.rs`.
