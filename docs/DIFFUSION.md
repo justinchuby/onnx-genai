@@ -209,10 +209,13 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
   done** — `checkpoint_export` auto-detects SDXL and emits the dual-encoder + 5-input-UNet pipeline,
   `mobius convert-comfyui` routes both conditioning edges automatically, and **`run_comfyui.py`
   renders SDXL end-to-end** (dual tokenizers, `time_ids`, dual-conditioning negative-prompt uncond).
-- **LoRA** ✅ handled by **fusing into the base model before export** (no runtime LoRA support
-  needed): the ComfyUI translator collects stacked `LoraLoader` nodes (name + `strength_model`),
-  `checkpoint_export(loras=[(path, strength)])` runs diffusers `load_lora_weights` + `fuse_lora`,
-  and `mobius convert-comfyui --lora NAME=PATH` resolves the filenames. Validated
-  (`scripts/lora_e2e.py`): a fused export matches diffusers `load+fuse` to 7.9e-6 and differs from
-  the base by 0.63 (the LoRA takes effect). **ControlNet** is not yet wired.
+- **ControlNet** ✅ handled by a **combined ControlNet+UNet export** (like SDXL, no runtime change):
+  the denoiser is a fused ControlNet+UNet taking an extra constant `controlnet_cond` image input
+  (the ControlNet produces down/mid residuals injected into the UNet). The translator collects
+  `ControlNetApply` (name + strength), `checkpoint_export(controlnet=...)` fuses it, and
+  `mobius convert-comfyui --controlnet NAME=PATH` resolves it; `controlnet_cond` is an external
+  denoiser input (like SDXL `time_ids`) shared across the CFG cond/uncond passes. Validated
+  (`scripts/controlnet_e2e.py`): a fused export matches diffusers to 5.8e-6 and differs from base by
+  0.45 (ControlNet takes effect). *Remaining:* a control-image-aware `run_comfyui.py` driver; SDXL
+  ControlNet; inpainting.
 - **img2img** is supported; inpainting (mask) is not.
