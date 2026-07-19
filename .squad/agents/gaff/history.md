@@ -85,3 +85,4 @@ Non-author review of Leon's `ort2_*` → `nxrt_*` C-ABI rename. Verified both fi
 - 2026-07-14T19:05:00Z — UnsupportedOp enrichment was rejected because `u64::MAX` leaked as a user-facing opset. Useful node/domain/EP context survived; missing imports are now rejected during loading by Leon's merged validation.
 
 - 2026-07-15 — Reviewed Mariette’s cpuinfo publish fix; approved (`65cc851`).
+- 2026-07-19: Reviewed PR #30 through four cycles and verified the rebased integration before merge.

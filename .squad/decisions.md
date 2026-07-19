@@ -1027,3 +1027,177 @@ Also rechecked standard `Attention`: the landed omitted-optional gate remains co
 **By:** Deckard
 **What:** Reserved the `onnx-genai` PyPI name with a pure-Python placeholder at `python/onnx-genai/`, fixed at version `0.0.0`. Added the dispatch-only `publish-onnx-genai-sdist` job in `publish.yml`, publishing through PyPI Trusted Publishing with the `pypi` environment.
 **Why:** The placeholder and opt-in sdist publication reserve the package name without coupling it to the future native implementation or platform wheel release path.
+
+
+## 2026-07-19 — Scribe inbox merge (BQMoE v1, PR #30, and PR #34)
+
+<!-- merged from sapper-bqmoe-v1.md -->
+
+### 2026-07-19: BlockQuantizedMoE v1 CPU reference and frozen ABI
+**By:** Sapper
+**What:** Landed the CPU parity-oracle implementation for `pkg.nxrt::BlockQuantizedMoE` v1. Frozen inputs are: 0 `input` f32; 1 `router_logits` f32; 2 `fc1_experts_weights` u8; 3 optional `fc1_experts_bias` f32; 4 `fc2_experts_weights` u8; 5 optional `fc2_experts_bias` f32; 6 optional `fc3_experts_weights` u8; 7 optional `fc3_experts_bias` f32; 8 optional `router_weights` f32. Frozen attributes are `format`, `block_layout_version`, `k`, `activation_type`, `normalize_routing_weights`, `swiglu_fusion`, `activation_alpha`, `activation_beta`, and `swiglu_limit`.
+**Why:** The CPU kernel is the deterministic numerical oracle for the verified GLM/IQ profile. It shares `BlockFormat` and `dequantize_weight_kn` with `BlockQuantizedMatMul`, materializes resident packed tensors before selected-expert decoding, and defers expert-slice/device paging to D7. The CPU claim gate dry-runs attribute parsing and validates positional arity, omitted-input `Undefined` dtypes, concrete dtypes, and available shape metadata so unsupported nodes are declined before execution.
+
+<!-- merged from chew-bqmoe-rereview.md -->
+
+### 2026-07-19: BQMoE v1 re-review
+**By:** Chew
+**What:** 🔴 REJECT. The symbolic-shape claim-then-fail gap is closed: the partial validator covers all statically knowable execution shape relationships, optional `Undefined` slots are accepted as absent, present input dtypes are checked, the selected-expert and activation tests discriminate, and the frozen ABI matches. However, the claim path still violates the hardened zero-allocation requirement.
+**Why:** `unsupported_reason` calls `BlockQuantizedMoEFactory.create` at `crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs:60`; a valid claim reaches `Ok(Box::new(BlockQuantizedMoEKernel { ... }))` at line 51, allocating a heap object solely to validate attributes. Claiming is required to be a cheap metadata-only dry run that allocates nothing. Batty should extract a non-allocating shared attribute/config validator used by both `create` and `unsupported_reason`, leaving `Box::new` only in actual kernel construction, then add a focused allocation-free claim regression if the test harness supports it.
+
+<!-- merged from deckard-bqmoe-claimfix.md -->
+
+2026-07-19 — Unified BlockQuantizedMoE claim-shape validation in `validate_partial_claim_shapes`: every independently static axis is now checked for packed FC1/FC2/FC3 tensors, optional biases, router weights, and flattened router rows; the former fully-static-only second pass was removed. Added dense-reference tests for discriminating top-k expert selection, ReLU/GELU, SwiGLU alpha/beta/limit attributes, and symbolic claim rejection for invalid FC1 bias, FC3, and router-weight axes.
+
+<!-- merged from batty-bqmoe-zeroalloc.md -->
+
+### 2026-07-19: BQMoE claim zero-alloc fix
+**By:** Batty
+**What:** Routed BQMoE claim-time attribute, dtype, and symbolic-shape checks through a metadata validator that returns validated stack-owned configuration without constructing a kernel; factory creation reuses it before allocating the kernel box.
+**Why:** The hardened claim contract requires successful support checks to remain metadata-only and allocation-free while preserving exact agreement with construction and execution validation.
+
+<!-- merged from chew-bqmoe-rereview3.md -->
+
+### 2026-07-19: BQMoE v1 zero-alloc re-review
+**By:** Chew
+**What:** 🟢 APPROVE commit `67abdb5`. `unsupported_reason` now invokes metadata-only `validate_metadata(..., Some(...))`; its successful claim path parses stack-only `MoeAttributes`/`BlockFormat` and checks shape/dtype metadata without constructing a `BlockQuantizedMoEKernel`, `Box`, or weight buffer. `Factory::create` invokes the same validation with no claim metadata and then performs the sole `Box::new(BlockQuantizedMoEKernel { ... })` construction.
+**Why:** The prior successful-claim allocation is removed while ABI, symbolic-dimension deferral, static mismatch rejection, and `Undefined` omitted-option handling remain intact. Discriminating top-k and activation reference tests are present. `cargo build -p onnx-runtime-ep-cpu` and `cargo test -p onnx-runtime-ep-cpu` passed (520 passed, 1 ignored).
+
+<!-- merged from leon-pr30-device-sampler.md -->
+
+# PR #30 device sampler — fix note (Leon, Engine Dev / KV & Buffers)
+
+Branch: `perf/cuda-on-device-argmax` (worktree `pr30-fix`), pushed commit **9b062f9**.
+File: `crates/onnx-genai-ort/src/device_sampler.rs` (+ 1 call-site line in `decode.rs`).
+
+## Host sampling pipeline — exact semantics mirrored
+
+Source of truth: `onnx-genai-engine` `build_processor_chain` (order) +
+`logits.rs` processors + `sampling.rs::sample_categorical`.
+
+Order (each stage operates on the running logit array and masks pruned entries
+to `-inf`; every stage AFTER temperature recomputes softmax over the CURRENT,
+already-masked logits, i.e. renormalizes over survivors):
+
+1. **Temperature** — `logit /= temperature` when `is_finite && >0 && !=1`.
+2. **TopK** — sort non-NaN logits desc, `threshold = sorted[k-1]` (ties at the
+   threshold all kept → count-with-multiplicity, not distinct rank); mask
+   `logit < threshold` to `-inf`. Applied only when `top_k>0 && top_k<len`.
+3. **TopP** — softmax over current logits (already restricted to the top-k
+   survivors → renormalized), sort probs desc, keep the smallest prefix whose
+   cumulative mass `>= top_p`, mask the rest. Applied when `top_p < 1.0`.
+4. **MinP** — softmax over current logits, `top_prob = 1/exp_sum`, mask
+   `prob < min(min_p,1)*top_prob`. Applied when `min_p > 0`.
+5. **Final draw** — `sample_categorical`: fresh softmax over survivors, walk in
+   index order, return first token with running `cumulative > rng`. A non-finite
+   max (e.g. `+inf`) falls back to greedy = lowest-index max. Greedy path uses
+   argmax directly (lowest-index max, NaN ignored).
+
+The key parity insight: top-p/min-p must be computed on the **post-top-k
+renormalized** distribution, NOT as independent thresholds over the full vocab.
+
+## The four fixes
+
+1. **(HIGH, parity) Sequential filters.** Rewrote the `finish_row` CUDA kernel to
+   apply top-k → top-p(renorm) → min-p as sequential `-inf` masks, then a fresh
+   softmax inverse-CDF draw — exactly the host order. Previously it computed
+   three independent thresholds over the full-vocab softmax and combined them
+   with `max`, which kept a different nucleus. Reviewer counterexample
+   `[.505,.061,.040,10×.039]`, `top_k=3, top_p=0.9`: host keeps `{0,1}`, old
+   device kept `{0,1,2}`; fixed device now keeps `{0,1}`.
+   `device_sampler.rs:294-457` (finish_row).
+
+2. **(HIGH, correctness) `+inf` logits.** `expf(+inf - +inf) = NaN` poisoned the
+   softmax and forced token 0. Added an explicit `m == +inf` branch that does a
+   block-wide min-index reduction over the `+inf` entries and returns the
+   lowest-index `+inf` token — matching the host greedy fallback.
+   `device_sampler.rs:315-333`.
+
+3. **(HIGH, memory safety) Scratch growth.** `OutScratch::ensure` /
+   `WorkScratch::ensure` freed the old pointer BEFORE the fallible `malloc`, so an
+   alloc failure left a dangling `self.ptr` (double-free on retry/Drop). Reordered
+   to **allocate-new-first, then free-old-and-swap only after malloc succeeds**;
+   on failure the existing buffer is untouched and the error propagates, so `Drop`
+   can never double-free. `device_sampler.rs:~955-1005`.
+
+4. **(MED, hot-path perf) Per-decode allocations.** Added an allocation-free
+   single-row path: `argmax_into`/`sample_into` fill a caller slice, and a new
+   `sample_one` (trait method) reads the winner into a stack `[i32;1]` and returns
+   a scalar `u32` — removing the per-token `i32` vec + `u32` vec on the captured
+   decode path. `ctx_sync_enabled()` now caches the env read in a `OnceLock`
+   (no per-token `String` alloc). `decode.rs` captured path calls `sample_one`.
+
+## Tests (all pass; GPU present, so GPU tests really executed)
+
+`cargo test -p onnx-genai-ort --features cuda --lib` → 24 passed, 0 failed.
+Host-only `--lib` → 15 passed. New tests:
+
+- `device_algo_matches_host_oracle_cpu_sweep` — CPU port of the device kernel vs
+  a faithful port of the host processors + `sample_categorical`; identical tokens
+  over a grid of (temperature, top_k, top_p, min_p) × 7 seeds on 5 well-separated
+  distributions (3220 combos).
+- `counterexample_keeps_nucleus_zero_one` / `counterexample_matches_host_on_gpu`
+  — Gaff's case; token 2 never selectable, device==host for every seed (CPU+GPU).
+- `plus_inf_selects_lowest_index_cpu` / `_gpu` — single and multiple `+inf`.
+- Updated `categorical_matches_host_oracle_f32` and the multi-row test to assert
+  against the new faithful `host_oracle`.
+
+### Note on exact ties
+Token-for-token host parity is only well-defined for distinct distributions: the
+host TopP uses `sort_unstable` + keep-count, which breaks EXACT probability ties
+non-reproducibly. The device is deterministic (threshold keeps all tied tokens).
+The parity sweep therefore uses well-separated rows; the reviewer counterexample's
+nucleus boundary is distinct (`.040` vs `.039`) and passes exactly.
+
+Skipped: none required — a GPU was available. (Any `conv_gpu`/cuDNN-missing
+failures elsewhere are unrelated and not touched here.)
+
+<!-- merged from gaff-pr30-rereview3.md -->
+
+### 2026-07-19: PR #30 review cycle 3
+**By:** Gaff
+**What:** 🔴 REJECT. Batty correctly prevents post-run extraction/sampling failures from falling back to `step_standard`, and the `ONNX_GENAI_DEVICE_ARGMAX` lookup is correctly cached in a `OnceLock`. Two blockers remain: (1) `decode.rs:751-753` classifies every `run_with_binding_graph` error as `RunInvoked`, but `session.rs:355-381` contains fallible API lookup, run-options creation, and config insertion before the actual `RunWithBinding` call at `session.rs:383-385`; those pre-run failures are therefore propagated instead of safely retrying through the standard path. (2) `decode.rs:114-126` is tautological: it initializes the run count to one, manually constructs `RunInvoked`, and tests only the retry helper, never invoking `step_dispatch`, a model runner, or a failing sampler.
+**Why:** The requested phase split is incomplete for failures inside the session wrapper, and the regression test cannot catch either a future call-site misclassification or an accidental model replay. Roy should revise this artifact (Batty and Leon are locked out): expose phase-aware graph-run errors or split setup from invocation so only errors at/after the actual ORT run are `RunInvoked`, then add a non-tautological injected runner/sampler test proving a post-run sampling failure produces exactly one model invocation and no standard fallback. CUDA build and full CUDA-feature test suite passed; the named new test also passed, but only exercises the helper.
+
+<!-- merged from batty-pr30-decode-retry.md -->
+
+### 2026-07-19: Captured decode retry safety
+**By:** Batty
+**What:** Captured-step failures are classified at the ORT graph-run boundary. Setup/binding failures before the run are retryable through `step_standard`; any run invocation, output extraction, or sampling failure propagates without replaying the model. `ONNX_GENAI_DEVICE_ARGMAX` is resolved once through `OnceLock`.
+**Why:** A completed or potentially partially executed graph run may already have mutated shared KV buffers, so retrying would double-advance decode state. Caching the environment flag removes an environment lookup from every generated token.
+
+<!-- merged from roy-pr30-errclass-fix.md -->
+
+### 2026-07-19: PR #30 pre/post-run error classification fix
+**By:** Roy
+**What:** Split the CUDA captured-decode run entrypoint into phases. Added `Session::run_with_binding_graph_phased` returning a discriminated `RunPhaseError` (`Setup` vs `Invoked`): everything before the ORT `Run` call (API lookup, run-option creation, `gpu_graph_id` config entry) is `Setup`; only the `Run` call itself is `Invoked`. `run_with_binding_graph` now delegates and flattens via `RunPhaseError::into_inner`. In `decode.rs`, the captured-step call site maps `Setup -> CapturedStepError::PreRun` (retryable via `step_standard`) and `Invoked -> RunInvoked` (propagate, no replay) through a new `classify_run_phase` helper. Replaced the tautological `post_run_sampling_failure_does_not_rerun_model` test with a `FakeRunner` harness that mirrors the setup->invoke->sample phase ordering and asserts exact model-invocation counts: post-run sampler failure and run-call failure each invoke the model exactly once with NO `step_standard` fallback; a pre-run setup failure retries and invokes the model exactly once via the standard step. Added a mapping test for `classify_run_phase`.
+**Why:** Gaff (cycle 3) found that setup/binding failures originating inside `run_with_binding_graph` were mislabeled `RunInvoked` (propagated) when they are genuinely PRE-run and safe to retry, and that the existing no-rerun test proved nothing because it never ran a model or sampler. The KV cache double-advance invariant requires structural (not heuristic) knowledge of whether the model was invoked, so the run helper now reports that fact directly. Verified with `cargo build`/`cargo test -p onnx-genai-ort --features cuda` on a real GPU; all 4 new unit tests pass and the suite is green.
+
+<!-- merged from gaff-pr30-rereview4.md -->
+
+### 2026-07-19: PR #30 review cycle 4
+**By:** Gaff
+**What:** 🟢 APPROVE commit `b99d4ca`; the coordinator may run `gh pr merge 30 --rebase`.
+**Why:** `run_with_binding_graph_phased` classifies every failure before `RunWithBinding` as `Setup` and the run call itself as `Invoked`; the captured decode path structurally maps those to `PreRun` and `RunInvoked`, and only `PreRun` reaches `step_standard`. The replacement `FakeRunner` tests count actual simulated model invocations and exercise post-run propagation plus the pre-run retry closure. The phased wrapper preserves the tag for the captured caller while the legacy wrapper intentionally flattens it for unchanged callers. The CUDA build, full CUDA-feature crate test suite, and all four targeted retry tests passed. No regression to the earlier sampler or no-double-run fixes was found.
+
+<!-- merged from deckard-pr30-rebase.md -->
+
+### 2026-07-19: PR #30 rebase onto main
+**By:** Deckard
+**What:** Resolved conflicts in `crates/onnx-genai-ort/Cargo.toml` (twice), `crates/onnx-genai-ort/src/lib.rs` (twice), and `crates/onnx-genai-bench/src/bin/profile_decode.rs`; preserved main's CUDA runtime/shared-KV and chat-template profiling support alongside PR #30's device sampler, configurable CUDA API features, and sampling profiler options.
+**Why:** Rebase `perf/cuda-on-device-argmax` cleanly onto main while retaining both independently reviewed feature sets.
+
+<!-- merged from gaff-pr30-rebase-verify.md -->
+
+### 2026-07-19: PR #30 rebase integration verified
+**By:** Gaff
+**What:** 🟢 APPROVE PR #30 at `87baba8`; the coordinator may merge it with `gh pr merge 30 --rebase`.
+**Why:** The branch is FF-ready on `origin/main` (`67abdb5`), has no conflict markers, and preserves both CUDA integrations: `cuda_rt.rs`/`libloading` for shared-KV growth and the previously approved on-device sampler in `device_sampler.rs`/`cudarc`. (`cuda_argmax.rs` was not present at approved tip `b99d4ca`; `device_sampler.rs` is the actual module name.) Cargo enables both dependencies, both modules are CUDA-gated and wired from `decode.rs`, profile-decode retains main's chat-template path plus PR sampling options, and Roy's phased-error symbols/tests remain. CUDA build and full crate tests pass; targeted sampler and phased-error tests also pass. GPU sampler cases self-skipped because this host's CUDA 13.3 NVRTC emits PTX unsupported by driver 580, an environment mismatch rather than a rebase regression.
+
+<!-- merged from batty-pr34-controlflow.md -->
+
+# PR #34 control-flow capture safety fix
+
+CUDA graph capture is now conservatively disabled whenever control-flow detection cannot cheaply inspect a model, including models larger than 512 MiB, unreadable models, and unparseable models. The invariant is: when in doubt, disable capture; capture is optional and must not risk ORT's control-flow slow path.
+
+Detection now records each ONNX node domain and treats `If`, `Loop`, and `Scan` as control flow only in the standard ONNX domains (`""` or `"ai.onnx"`). Custom-domain operators with those names do not disable CUDA graph capture.

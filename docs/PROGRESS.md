@@ -4,9 +4,9 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-17T12:45:00Z — CUDA QMoE Phases 1–2, onnx-rs round 5, and WEIGHT_OFFLOAD Phase 2 landed._
+_Last updated: 2026-07-19T05:55:00Z — BQMoE v1 and PR #30 landed; PR triage refreshed._
 
-**Current `origin/main` HEAD:** `f04b858`.
+**Current `origin/main` HEAD:** `bd17d07`.
 
 
 ## Current tiered-memory and interoperability milestones
@@ -507,3 +507,18 @@ Published `nxrt` 0.1.0.dev2 as an sdist-only release through Trusted Publishing 
 ## 2026-07-18 — onnx-genai PyPI name reserved
 
 Reserved `onnx-genai` 0.0.0 on PyPI with a pure-Python placeholder at `python/onnx-genai/` and a dispatch-only Trusted Publishing job in `publish.yml`.
+
+## 2026-07-19 — BQMoE v1 + PR landing wave
+
+- **BlockQuantizedMoE v1 ✅ DONE / merged (`7f31162` → `776aeb5` → `67abdb5`, 2026-07-19; Sapper/Deckard/Batty; Chew 🔴→🔴→🟢):** CPU reference oracle and frozen `pkg.nxrt::BlockQuantizedMoE` v1 ABI landed. Claim-time validation now covers statically knowable symbolic-shape relationships and uses the same metadata validator as construction without allocating a kernel. CPU build and tests passed (520 passed, 1 ignored).
+- **PR #30 ✅ MERGED (`bd17d07`, 2026-07-19):** CUDA on-device argmax/sampling landed after host-parity sequential filtering, `+inf` handling, allocation-safety, allocation-free decode sampling, no post-run replay, phased setup-vs-invoked error classification, real FakeRunner regression tests, and rebase verification.
+- **PR #31 ✅ MERGED (`b56fff6`, 2026-07-19):** roadmap decision defaults refined.
+- **PR #33 ✅ MERGED (`3478f7a`, 2026-07-19):** prefix-cache tests now use the tiny-llm-scatter fixture.
+- **PR #34 ✅ MERGED (`7bca7b6`, 2026-07-19):** CUDA graph capture is conservatively disabled for control-flow models when inspection is unavailable or uncertain.
+- **PR #36 ✅ MERGED (`fbdfb9e`, 2026-07-19):** shared-KV capacity can be capped with `ONNX_GENAI_KV_MAX_LEN` to avoid VRAM over-allocation.
+- **PR #32 🔄 IN PROGRESS:** EP-agnostic runtime refactor is being rebased onto main with build fixes and three review comments outstanding; not yet landed.
+
+### Tiered implementation worklist
+
+- **Tier 0 ✅ DONE:** BQMoE v1 CPU oracle, frozen ABI, symbolic claim validation, and zero-allocation claim gate.
+- **Tiers 1–3:** remain open/unchanged; subsequent CUDA correctness, paging, and broader optimization work follows the frozen Tier-0 oracle.

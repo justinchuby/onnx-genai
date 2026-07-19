@@ -85,3 +85,4 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 
 - Delivered `be68145`: seven IR13 device/sharding protobuf messages with Model/Node wiring, checker and codec round trips, and `docs/ONNX_RS_SPEC_COVERAGE.md`.
 - Deckard's `b5ccd3c` correction made `SimpleShardedDimProto.dim` optional; Bryant 🟢 approved. Remaining parity gaps are in flight.
+- 2026-07-19: Landed BQMoE v1 CPU parity oracle and frozen ABI (`7f31162`).
