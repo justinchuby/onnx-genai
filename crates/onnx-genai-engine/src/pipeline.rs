@@ -265,6 +265,23 @@ impl PipelineEngine {
         &self.models.directory.spec
     }
 
+    /// The `init_noise_sigma` of the diffusion scheduler this pipeline drives.
+    ///
+    /// Returns `None` when the pipeline is not iterative (diffusion) or carries
+    /// no scheduler. The caller pre-scales the seed latent by this factor so it
+    /// lives in the scheduler's sigma space (`1.0` for DDIM / DPM-Solver++;
+    /// `sigmas[0]` for Euler / Euler-Ancestral). This lets a runner reuse the
+    /// exact scheduler the pipeline builds instead of duplicating the sigma math.
+    pub fn diffusion_init_noise_sigma(&self) -> Option<f32> {
+        match &self.plan {
+            PipelinePlan::Iterative(iterative) => iterative
+                .scheduler
+                .as_ref()
+                .map(|scheduler| scheduler.init_noise_sigma()),
+            _ => None,
+        }
+    }
+
     /// Execute a **non-autoregressive** pipeline (single-pass or iterative /
     /// diffusion) and return the final named output tensors, keyed by
     /// `component.output_name`.
@@ -1017,6 +1034,14 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
     ) -> anyhow::Result<Option<Value>> {
         Ok(None)
     }
+
+    /// The factor by which the caller must scale the initial random latent so it
+    /// lives in this scheduler's sigma space. Sigma-space samplers (Euler,
+    /// Euler-Ancestral) return their maximum sigma (`sigmas[0]`); DDIM and
+    /// DPM-Solver++ leave the seed unscaled and return `1.0` (the default).
+    fn init_noise_sigma(&self) -> f32 {
+        1.0
+    }
 }
 
 /// Builds a [`Scheduler`] from a declared [`SchedulerSpec`] and the loop length.
@@ -1399,13 +1424,6 @@ impl EulerSchedule {
         Ok(Self { sigmas })
     }
 
-    /// `init_noise_sigma` — the factor the caller must apply to the initial
-    /// random latent so it lives in the scheduler's sigma space.
-    #[allow(dead_code)]
-    fn init_noise_sigma(&self) -> f32 {
-        self.sigmas[0]
-    }
-
     /// `x / sqrt(sigma^2 + 1)` — scale the raw sample for the denoiser input.
     fn scale(&self, step: usize, sample: &[f32]) -> Vec<f32> {
         let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
@@ -1448,6 +1466,10 @@ impl Scheduler for EulerSchedule {
         let shape = sample.shape().to_vec();
         let scaled = self.scale(step, &sample.to_vec_f32()?);
         Ok(Some(Value::from_slice_f32(&scaled, &shape)?))
+    }
+
+    fn init_noise_sigma(&self) -> f32 {
+        self.sigmas[0]
     }
 }
 
@@ -1539,6 +1561,10 @@ impl Scheduler for EulerAncestral {
         let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
         let scaled: Vec<f32> = sample.to_vec_f32()?.iter().map(|&x| x / factor).collect();
         Ok(Some(Value::from_slice_f32(&scaled, sample.shape())?))
+    }
+
+    fn init_noise_sigma(&self) -> f32 {
+        self.sigmas[0]
     }
 }
 
