@@ -26,28 +26,6 @@ from pathlib import Path
 import numpy as np
 import onnx_ir as ir
 
-METADATA = """\
-pipeline:
-  models:
-    denoiser:
-      filename: denoiser.onnx
-      type: denoiser
-  dataflow:
-    - from: denoiser.noise_pred
-      to: denoiser.sample
-  strategy:
-    kind: iterative
-    denoiser: denoiser
-    num_steps: 3
-    timestep_input: timestep
-    scheduler_config:
-      kind: ddim
-      num_train_timesteps: 1000
-      beta_start: 0.00085
-      beta_end: 0.012
-"""
-
-
 def build(output_dir: Path) -> None:
     from mobius import build_from_module
     from mobius.models.dit import DiTConfig, DiTTransformer2DModel
@@ -75,7 +53,17 @@ def build(output_dir: Path) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ir.save(model, output_dir / "denoiser.onnx")
-    (output_dir / "inference_metadata.yaml").write_text(METADATA)
+
+    # Emit the onnx-genai pipeline metadata via the Mobius integration (the
+    # feature added in mobius integrations/onnx_genai) — proving the full chain:
+    # Mobius builds the denoiser AND declares the runnable iterative pipeline.
+    from mobius.integrations.onnx_genai import write_diffusion_pipeline_metadata
+
+    write_diffusion_pipeline_metadata(
+        str(output_dir),
+        num_inference_steps=3,
+        denoiser_filename="denoiser.onnx",
+    )
 
     # Smoke check with ONNX Runtime.
     import onnxruntime as ort
