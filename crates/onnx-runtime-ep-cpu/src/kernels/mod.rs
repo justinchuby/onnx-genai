@@ -662,6 +662,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("ReduceLogSumExp", "", 1),
         Box::new(reduce_ops::ReduceLogSumExpFactory),
     );
+    reg.register(
+        OpKey::new("ReduceLogSumExp", "", 18),
+        Box::new(reduce_ops::ReduceLogSumExpFactory),
+    );
     // Shape / data movement (dtype-agnostic byte movers).
     reg.register(OpKey::new("Concat", "", 1), Box::new(concat::ConcatFactory));
     reg.register(
@@ -1369,14 +1373,16 @@ mod tests {
         // opset-11 and opset-16 registrations. BatchNormalization,
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
-        // registrations over the Phase-1 op-name count in total. BitwiseAnd,
+        // registrations over the Phase-1 op-name count in total.
+        // ReduceLogSumExp adds a separate opset-18 axes-input registration.
+        // BitwiseAnd,
         // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
         // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 67);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 68);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1385,6 +1391,8 @@ mod tests {
         assert!(reg.lookup("Softmax", "", 13).is_some());
         assert!(reg.lookup("LogSoftmax", "", 12).is_some());
         assert!(reg.lookup("LogSoftmax", "", 13).is_some());
+        assert!(reg.lookup("ReduceLogSumExp", "", 17).is_some());
+        assert!(reg.lookup("ReduceLogSumExp", "", 18).is_some());
         assert!(reg.lookup("CumSum", "", 14).is_some());
         assert!(reg.lookup("CumProd", "", 26).is_some());
         assert!(reg.lookup("HannWindow", "", 17).is_some());

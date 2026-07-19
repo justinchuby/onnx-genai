@@ -17,9 +17,11 @@
 //! either a retained size-1 dim (keepdims) or nothing (squeezed).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, compute_contiguous_strides};
+use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32};
+use super::{
+    check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32,
+};
 use crate::strided::{next_index, numel};
 
 /// The reduction to apply over the selected axes.
@@ -154,6 +156,9 @@ reduce_factory!(ReduceLogSumExpFactory, ReduceOp::LogSumExp);
 impl Kernel for ReduceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 2, 1)?;
+        if matches!(self.op, ReduceOp::Max | ReduceOp::Min) && inputs[0].dtype == DataType::Bool {
+            return self.execute_bool(inputs, &mut outputs[0]);
+        }
         if matches!(self.op, ReduceOp::Sum) && inputs[0].dtype == onnx_runtime_ir::DataType::Int64 {
             return self.execute_i64_sum(inputs, &mut outputs[0]);
         }
@@ -218,10 +223,14 @@ impl Kernel for ReduceKernel {
         let out: Vec<f32> = if matches!(self.op, ReduceOp::LogSumExp) {
             acc.iter()
                 .zip(&logsumexp_max)
+                .take(kept_count)
                 .map(|(&sum, &max)| max + sum.ln())
                 .collect()
         } else {
-            acc.iter().map(|&a| self.op.finish(a)).collect()
+            acc.iter()
+                .take(kept_count)
+                .map(|&a| self.op.finish(a))
+                .collect()
         };
         let _ = self.keepdims;
         write_dense_f32(&mut outputs[0], &out)
@@ -301,8 +310,53 @@ impl ReduceKernel {
         let _ = self.keepdims;
         let bytes = sums
             .iter()
+            .take(numel(&kept_shape))
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
+        write_dense_bytes(output, &bytes)
+    }
+
+    fn execute_bool(&self, inputs: &[TensorView], output: &mut TensorMut) -> Result<()> {
+        let x = to_dense_bytes(&inputs[0])?;
+        let in_shape = inputs[0].shape;
+        let rank = in_shape.len();
+        let reduce = self.resolve_axes(inputs, rank)?;
+        let kept_shape = (0..rank)
+            .filter(|&axis| !reduce[axis])
+            .map(|axis| in_shape[axis])
+            .collect::<Vec<_>>();
+        let kept_count = numel(&kept_shape);
+        let in_strides = compute_contiguous_strides(in_shape);
+        let kept_strides = compute_contiguous_strides(&kept_shape);
+        let identity = matches!(self.op, ReduceOp::Min);
+        let mut values = vec![identity; kept_count];
+
+        if numel(in_shape) > 0 {
+            let mut index = vec![0; rank];
+            loop {
+                let mut input_offset = 0;
+                let mut output_offset = 0;
+                let mut kept_axis = 0;
+                for axis in 0..rank {
+                    input_offset += in_strides[axis] as usize * index[axis];
+                    if !reduce[axis] {
+                        output_offset += kept_strides[kept_axis] as usize * index[axis];
+                        kept_axis += 1;
+                    }
+                }
+                let value = x[input_offset] != 0;
+                values[output_offset] = match self.op {
+                    ReduceOp::Max => values[output_offset] || value,
+                    ReduceOp::Min => values[output_offset] && value,
+                    _ => unreachable!("boolean reduction is only valid for ReduceMax/ReduceMin"),
+                };
+                if !next_index(in_shape, &mut index) {
+                    break;
+                }
+            }
+        }
+
+        let bytes = values.into_iter().map(u8::from).collect::<Vec<_>>();
         write_dense_bytes(output, &bytes)
     }
 }
@@ -426,6 +480,42 @@ mod tests {
     }
 
     #[test]
+    fn log_sum_exp_axes_attribute_keepdims() {
+        let x = Owned::f32(&[2, 2], &[0., 1., 2., 3.]);
+        let mut out = Owned::zeros_f32(&[2, 1]);
+        run_attr(ReduceOp::LogSumExp, Some(vec![1]), &x, &mut out);
+        let expected = [1.0 + (-1_f32).exp().ln_1p(), 3.0 + (-1_f32).exp().ln_1p()];
+        assert!(
+            out.to_f32()
+                .iter()
+                .zip(expected)
+                .all(|(&actual, expected)| (actual - expected).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn log_sum_exp_axes_input_negative_axis_without_keepdims() {
+        let x = Owned::f32(&[2, 2], &[0., 1., 2., 3.]);
+        let axes = Owned::i64(&[1], &[-1]);
+        let mut out = Owned::zeros_f32(&[2]);
+        ReduceKernel {
+            op: ReduceOp::LogSumExp,
+            axes_attr: None,
+            keepdims: false,
+            noop_with_empty_axes: false,
+        }
+        .execute(&[x.view(), axes.view()], &mut [out.view_mut()])
+        .unwrap();
+        let expected = [1.0 + (-1_f32).exp().ln_1p(), 3.0 + (-1_f32).exp().ln_1p()];
+        assert!(
+            out.to_f32()
+                .iter()
+                .zip(expected)
+                .all(|(&actual, expected)| (actual - expected).abs() < 1e-6)
+        );
+    }
+
+    #[test]
     fn omitted_axes_reduce_all_for_opset18_reductions() {
         let x = Owned::f32(&[2, 2], &[-1., 2., -3., 4.]);
         let mut l1 = Owned::zeros_f32(&[1, 1]);
@@ -499,5 +589,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.to_f32(), vec![1., 2., 3.]);
+    }
+
+    #[test]
+    fn max_min_bool_inputs() {
+        let x = Owned::bool_(&[2, 3], &[false, true, false, true, true, false]);
+        let mut max = Owned::zeros(DataType::Bool, &[2, 1]);
+        run_attr(ReduceOp::Max, Some(vec![1]), &x, &mut max);
+        assert_eq!(max.to_bool(), vec![true, true]);
+
+        let mut min = Owned::zeros(DataType::Bool, &[2, 1]);
+        run_attr(ReduceOp::Min, Some(vec![1]), &x, &mut min);
+        assert_eq!(min.to_bool(), vec![false, false]);
+    }
+
+    #[test]
+    fn sum_empty_non_reduced_axis_is_empty() {
+        // Reducing axis 0 leaves the zero-sized axis 1 in the result.
+        let x = Owned::f32(&[2, 0], &[]);
+        let mut out = Owned::zeros_f32(&[0]);
+        run_attr(ReduceOp::Sum, Some(vec![0]), &x, &mut out);
+        assert!(out.to_f32().is_empty());
     }
 }
