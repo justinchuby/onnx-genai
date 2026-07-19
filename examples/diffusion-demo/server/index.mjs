@@ -17,26 +17,37 @@ const REPO = resolve(HERE, "..", "..", "..");
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
 function findBinary(name) {
-  for (const profile of ["release", "debug"]) {
-    const p = join(REPO, "target", profile, name);
-    if (existsSync(p)) return p;
+  // Prefer the optimized release build; only fall back to debug (much slower
+  // for real models) with a loud warning so the demo stays high-performance.
+  const release = join(REPO, "target", "release", name);
+  if (existsSync(release)) return release;
+  const debug = join(REPO, "target", "debug", name);
+  if (existsSync(debug)) {
+    console.warn(
+      `[diffusion-demo] WARNING: using DEBUG build of '${name}' (slow). ` +
+        `For high performance run: cargo build --release -p onnx-genai --bin ${name} ` +
+        `(see README).`
+    );
+    return debug;
   }
   throw new Error(`binary '${name}' not found under target/{release,debug}; build it first (see README)`);
 }
 
 function ortLibDir() {
-  // Locate <repo>/target/*/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib
+  // Locate <repo>/target/*/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib,
+  // preferring the release profile so it matches the release binary.
   const targetDir = join(REPO, "target");
-  const found = [];
-  for (const profile of safeReaddir(targetDir)) {
+  const collect = (profile) => {
+    const found = [];
     const buildDir = join(targetDir, profile, "build");
     for (const entry of safeReaddir(buildDir)) {
       if (!entry.startsWith("onnx-genai-ort-sys-")) continue;
       const lib = join(buildDir, entry, "out", "ort-prebuilt", "lib");
       if (existsSync(lib)) found.push(lib);
     }
-  }
-  return found.sort().at(-1) ?? "";
+    return found.sort().at(-1);
+  };
+  return collect("release") ?? collect("debug") ?? "";
 }
 
 function safeReaddir(dir) {

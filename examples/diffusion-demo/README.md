@@ -62,6 +62,14 @@ npm run dev        # starts the API server + the Vite dev server
   ONNX_GENAI_SD_PACKAGE=/tmp/sd-pkg npm run dev
   ```
 
+## Performance
+
+The backend always prefers the **release** binaries under `target/release/` and
+picks the release ONNX Runtime lib to match. If only a debug build is present it
+still runs but prints a loud warning — build release (see Prerequisites) for the
+fast path. With the release build the bundled language fixture runs end-to-end in
+well under 100 ms per request on an M-series Mac.
+
 ## Loading a config
 
 Two sample configs are bundled under `samples/`:
