@@ -198,10 +198,14 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
 
 - **Samplers:** euler, euler_ancestral, ddim, dpmpp_2m (+Karras). Not yet: other DPM++ variants,
   exponential/beta sigma spacings, other SDE/ancestral samplers.
-- **Models:** single-text-encoder SD 1.x-style. **Multi-input classifier-free guidance is now
-  supported** — the unconditional pass overrides *every* denoiser input port that has a supplied
-  `{denoiser}.{port}.uncond` embedding (not just one), so SDXL's `encoder_hidden_states` +
-  pooled `text_embeds` (sharing `time_ids`) can both be guided. The remaining SDXL work is the
-  dual-text-encoder export + `time_ids` conditioning + driver. LoRA weight merging and ControlNet
-  are not yet wired.
+- **Models:** SD 1.x-style **and SDXL** run through the same declarative pipeline. **SDXL is
+  validated end-to-end** (`scripts/sdxl_e2e.py`) — the two text encoders' penultimate hidden states
+  are concatenated into `encoder_hidden_states`, the pooled `text_embeds` and the `time_ids` vector
+  are routed as extra denoiser conditioning, and **multi-input CFG** guides both
+  `encoder_hidden_states` and `text_embeds` while sharing `time_ids`. This needed **no
+  SDXL-specific runtime code** — the composite pipeline (multiple dataflow edges + external
+  constants + multi-input CFG) handles it. Matches diffusers to max|Δ|~4e-2 on tiny-random SDXL
+  weights (the exact multi-input CFG path is unit-tested to 1e-5). *Remaining:* wire SDXL detection
+  into the Mobius `checkpoint_export` / ComfyUI converter so SDXL workflows convert automatically.
+- LoRA weight merging and ControlNet are not yet wired.
 - **img2img** is supported; inpainting (mask) is not.
