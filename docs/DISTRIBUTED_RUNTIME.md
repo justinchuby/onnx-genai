@@ -27,8 +27,9 @@
 9. [Integration with MoE Expert Parallelism](#9-integration-with-moe-expert-parallelism)
 10. [Mac Studio Cluster as First-Class Target](#10-mac-studio-cluster-as-first-class-target)
 11. [Phased Implementation](#11-phased-implementation)
-12. [Open Questions](#12-open-questions)
-13. [References](#13-references)
+12. [Cross-Session Memory Coordination](#12-cross-session-memory-coordination)
+13. [Open Questions](#13-open-questions)
+14. [References](#14-references)
 
 ---
 
@@ -1153,7 +1154,276 @@ fn distributed_matches_single_device() {
 
 ---
 
-## 12. Open Questions
+## 12. Cross-Session Memory Coordination
+
+### 12.1 Problem: Multiple Sessions, Shared Physical Memory
+
+When multiple ORT sessions run on the same machine (e.g., 8 sessions on 8×H200),
+each session has its own allocator, but physical memory is shared. Without
+coordination:
+
+- Cold experts occupy VRAM they'll never use during a given workload.
+- KV cache expansion in one session can OOM another.
+- Shared weights (attention, router, embeddings) are duplicated 8×.
+
+### 12.2 Relationship to WEIGHT_OFFLOAD.md
+
+[WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md) designs a three-tier weight residency system
+(cold mmap → warm host → hot device) with a `WeightResidencyManager` and
+`ResourceGovernor` that owns sub-budgets. That design is **single-session scoped**:
+
+| Concept | WEIGHT_OFFLOAD.md (single session) | Distributed (multi-session) |
+|---|---|---|
+| Scope | One session, one device | Multiple sessions, one or more devices |
+| Governor | Per-session `ResourceGovernor` | Global `MemoryCoordinator` above governors |
+| Expert policy | Heat-based LRU within session budget | Heat-based + cross-session migration |
+| KV cache | Session-owned page pool | Shared pool with prefix dedup |
+| Shared weights | Loaded once per session | Loaded once per machine, mmap'd by all |
+| Conflict resolution | Sub-budget hysteresis within session | Cross-session arbitration |
+
+**Key insight: the single-session design composes into the multi-session design.**
+Each session keeps its `WeightResidencyManager` and `ResourceGovernor`. The new
+`MemoryCoordinator` sits above them, adjusting per-session sub-budgets and
+orchestrating cross-session optimizations.
+
+### 12.3 Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                     genai-server                                 │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  MemoryCoordinator (global, per-machine)                   │  │
+│  │                                                            │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐  │  │
+│  │  │ Weight Dedup  │  │ KV Pool      │  │ Budget Arbiter  │  │  │
+│  │  │ (shared mmap) │  │ (prefix      │  │ (rebalance      │  │  │
+│  │  │               │  │  sharing)    │  │  sub-budgets)   │  │  │
+│  │  └──────────────┘  └──────────────┘  └─────────────────┘  │  │
+│  └───────┬───────────────────┬───────────────────┬────────────┘  │
+│          │                   │                   │               │
+│    ┌─────▼─────┐       ┌─────▼─────┐       ┌─────▼─────┐       │
+│    │ Session 0 │       │ Session 1 │       │ Session N │       │
+│    │           │       │           │       │           │       │
+│    │ Governor  │       │ Governor  │       │ Governor  │       │
+│    │ Residency │       │ Residency │       │ Residency │       │
+│    │ KV cache  │       │ KV cache  │       │ KV cache  │       │
+│    └───────────┘       └───────────┘       └───────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 12.4 MemoryCoordinator Interface
+
+```rust
+/// Global memory coordinator across sessions on one machine.
+///
+/// Sits above per-session ResourceGovernors, adjusting their budgets
+/// and providing cross-session optimizations.
+trait MemoryCoordinator: Send + Sync {
+    // ── Shared Weight Deduplication ──
+
+    /// Register a weight region for deduplication. Returns a handle
+    /// that multiple sessions can use without each allocating a copy.
+    /// Uses CUDA IPC / mmap for zero-copy sharing.
+    fn register_shared_weight(
+        &self,
+        region: &WeightRegion,
+        device: DeviceId,
+    ) -> Result<SharedWeightHandle>;
+
+    /// Acquire a read-only view of a shared weight. Ref-counted;
+    /// the weight stays resident as long as any session holds a view.
+    fn acquire_shared_view(
+        &self,
+        handle: &SharedWeightHandle,
+        session: SessionId,
+    ) -> Result<WeightView>;
+
+    // ── Cross-Session KV Cache ──
+
+    /// Request KV cache pages from the global pool.
+    /// May trigger eviction in other sessions if under pressure.
+    fn request_kv_pages(
+        &self,
+        session: SessionId,
+        num_pages: usize,
+        priority: PagePriority,
+    ) -> Result<Vec<PageHandle>>;
+
+    /// Release KV cache pages back to the global pool.
+    fn release_kv_pages(&self, pages: Vec<PageHandle>);
+
+    /// Check if a prefix is already cached by another session.
+    /// Enables cross-session prefix cache sharing.
+    fn lookup_prefix(
+        &self,
+        token_hash: u64,
+        num_tokens: usize,
+    ) -> Option<PrefixCacheHit>;
+
+    // ── Expert Migration ──
+
+    /// Migrate a cold expert's VRAM to another session that needs
+    /// the space (e.g., for a hot expert replica).
+    fn migrate_expert(
+        &self,
+        expert: ExpertId,
+        from: SessionId,
+        to: SessionId,
+    ) -> Result<()>;
+
+    /// Report expert activation frequencies from a session.
+    /// The coordinator uses this to make migration/replication decisions.
+    fn report_expert_heat(
+        &self,
+        session: SessionId,
+        layer: usize,
+        activations: &[(ExpertId, u32)],
+    );
+
+    // ── Budget Arbitration ──
+
+    /// Query global memory pressure across all sessions.
+    fn memory_pressure(&self) -> MemoryPressure;
+
+    /// Rebalance sub-budgets across sessions.
+    /// Called periodically or when pressure changes.
+    fn rebalance(&self) -> Vec<BudgetAdjustment>;
+}
+
+/// Result of rebalancing — tells a session to adjust its Governor.
+struct BudgetAdjustment {
+    session: SessionId,
+    new_kv_budget_bytes: usize,
+    new_expert_cache_bytes: usize,
+    reason: AdjustmentReason,
+}
+
+enum AdjustmentReason {
+    /// Another session needs more KV space for long context.
+    KvPressure { requesting_session: SessionId },
+    /// Expert heat changed; rebalance cache budgets.
+    ExpertHeatShift,
+    /// Global memory pressure; shrink everyone proportionally.
+    GlobalPressure,
+}
+```
+
+### 12.5 Three Strategies (Progressive)
+
+#### Strategy 1: Static Isolation (Phase 1)
+
+Each session gets a fixed budget. No cross-session coordination.
+
+```text
+8×H200, 141 GB each:
+  Session N: 88 GB weights + 43 GB KV + 10 GB scratch
+  No sharing. Simple. No coordination overhead.
+```
+
+Identical to running 8 independent processes. The per-session `ResourceGovernor`
+from WEIGHT_OFFLOAD.md operates unchanged.
+
+#### Strategy 2: Shared Weights + Shared KV Pool (Phase 2)
+
+Deduplicate shared weights; unify KV cache pool.
+
+```text
+8×H200, 1128 GB total:
+  Shared weights (attention/router/embed): 50 GB (stored ONCE via CUDA IPC)
+  Expert weights (per-session shard): 700 GB
+  KV cache (global pool): 350 GB  ← was 8×43=344 GB, now unified
+  Scratch: 28 GB
+
+  Savings vs static: 7 × 50 GB = 350 GB freed from weight duplication
+  → KV pool doubles to 350+350 = 700 GB
+```
+
+This is where `MemoryCoordinator.register_shared_weight()` and
+`request_kv_pages()` become active. Each session's `ResourceGovernor` receives
+adjusted budgets from the coordinator.
+
+**How it integrates with WEIGHT_OFFLOAD.md:**
+- The three-tier hierarchy (cold mmap → warm host → hot device) stays unchanged.
+- The `WeightResidencyManager` in each session still manages expert residency.
+- The coordinator adds a fourth source: **shared device mappings** via CUDA IPC
+  or `mmap` of another session's device allocation.
+- The `ResourceGovernor` sub-budget for "resident shared weights" becomes
+  zero for sessions 1-7 (they use shared views, not owned allocations).
+
+#### Strategy 3: Dynamic Expert Migration + Replication (Phase 3)
+
+The coordinator monitors expert heat and actively rebalances.
+
+```text
+Scenario: Coding workload activates experts 42, 87, 301 heavily.
+
+  Before: expert 42 on GPU 0 only → all tokens for expert 42
+          route through GPU 0 → GPU 0 becomes hotspot.
+
+  After:  coordinator replicates expert 42 to GPU 3 and GPU 5.
+          Dispatcher round-robins tokens across replicas.
+          GPU 0 load drops by 60%.
+
+  Cost:   3 × expert_size extra VRAM.
+  Paid by: evicting cold experts on GPU 3, 5 (their VRAM freed).
+```
+
+This extends the `observe_routes()` mechanism from WEIGHT_OFFLOAD.md §5.1:
+the per-session residency manager reports activation counts up to the
+coordinator, which makes global migration/replication decisions and pushes
+budget adjustments back down to per-session governors.
+
+### 12.6 Cross-Node Memory Coordination
+
+For a Mac Studio cluster (4 nodes), the coordinator splits into:
+
+- **Local MemoryCoordinator** per machine — handles CUDA IPC / mmap sharing.
+- **Global MemoryCoordinator** in genai-server — handles cross-node expert
+  migration (via Communicator), cross-node prefix cache lookup, and global
+  budget arbitration.
+
+```text
+┌─ Node 0 ─────────────────┐    ┌─ Node 1 ─────────────────┐
+│ LocalCoordinator          │    │ LocalCoordinator          │
+│ ├── Session 0 (GPU 0)     │    │ ├── Session 2 (MLX)       │
+│ └── Session 1 (GPU 1)     │    │ └── Session 3 (MLX)       │
+└───────────┬───────────────┘    └───────────┬───────────────┘
+            │                                │
+            └───────── GlobalCoordinator ─────┘
+                       (in genai-server)
+                       - cross-node migration
+                       - global KV prefix index
+                       - global budget view
+```
+
+Cross-node expert migration transfers weights via the `Communicator` (§3).
+Within a node, shared weights use zero-copy IPC. The two tiers compose
+naturally: the `GlobalCoordinator` delegates intra-node sharing to the
+`LocalCoordinator` and handles only inter-node transfers itself.
+
+### 12.7 Comparison: Single-Session (WEIGHT_OFFLOAD) vs Multi-Session (This Doc)
+
+| Concern | WEIGHT_OFFLOAD.md | This section |
+|---|---|---|
+| Weight dedup | N/A (one session) | CUDA IPC / mmap across sessions |
+| Expert heat tracking | `observe_routes()` per session | Same, plus cross-session aggregation |
+| KV cache pool | Per-session page pool | Global pool with per-session quotas |
+| Budget authority | Per-session `ResourceGovernor` | Global `MemoryCoordinator` → per-session Governors |
+| Eviction policy | Session-local LRU | Session-local LRU + global pressure signals |
+| Prefetch | Session-local route prediction | Same, plus cross-session prefix reuse |
+| Implementation order | Phase 1 (standalone) | Phase 2-3 (after single-session works) |
+
+**The single-session design is the foundation.** Every mechanism in
+WEIGHT_OFFLOAD.md — three-tier residency, `ExpertStore`, `ResourceGovernor`,
+heat-based admission — runs unchanged inside each session. The
+`MemoryCoordinator` is a coordination layer on top, not a replacement.
+
+---
+
+## 13. Open Questions
+
+> Renumbered from §12; previous items 1-10 preserved, new items 11-13 added.
 
 1. **Rendezvous mechanism.** How do distributed ranks discover each other?
    Options: (a) environment variables like `MASTER_ADDR`/`MASTER_PORT` (PyTorch
@@ -1200,10 +1470,28 @@ fn distributed_matches_single_device() {
     should it signal other ranks to evict sequences cooperatively? Or does the
     control plane manage this centrally?
 
+11. **CUDA IPC ownership semantics.** When session 0 allocates shared weights
+    and sessions 1-7 map them via IPC, who owns the allocation lifecycle? If
+    session 0 crashes, all other sessions lose access. Options: (a) dedicated
+    "weight server" process that outlives sessions, (b) shared mmap-backed
+    allocations that survive process death, (c) accept the coupling and restart
+    all sessions on any crash.
+
+12. **KV cache sharing granularity.** Global KV pool enables prefix sharing, but
+    different sessions may quantize KV differently (FP16 vs FP8). Do we enforce
+    uniform KV format across sessions, or support format conversion at share
+    boundaries?
+
+13. **MemoryCoordinator placement.** Should it run in the genai-server process,
+    or as a separate daemon? In-process is simpler; separate daemon survives
+    server restarts but adds IPC complexity. Related to the "weight server"
+    question in item 11.
+
 ---
 
-## 13. References
+## 14. References
 
+- [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md) — Three-tier weight residency, `ExpertStore`, `ResourceGovernor`
 - [MOE_EXPERT_PARALLELISM.md](./MOE_EXPERT_PARALLELISM.md) — Session-per-GPU MoE architecture, `DispatchTransport` trait
 - [HETEROGENEOUS_PLACEMENT.md](./HETEROGENEOUS_PLACEMENT.md) — CPU+CUDA fallback placement (ON HOLD)
 - [SCHEDULING.md](./SCHEDULING.md) — Adaptive scheduling, EP negotiation protocol (§8)
