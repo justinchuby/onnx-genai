@@ -31,6 +31,7 @@ pub mod activations;
 pub mod add;
 pub mod affine_grid;
 pub mod attention;
+pub mod bitshift;
 pub mod bitwise;
 pub mod block_dequant;
 pub mod block_quantized_matmul;
@@ -38,6 +39,7 @@ pub mod block_quantized_moe;
 pub mod cast;
 pub mod center_crop_pad;
 pub mod col2im;
+pub mod compress;
 pub mod compressed_sparse_attention;
 pub mod concat;
 pub mod constant;
@@ -67,6 +69,7 @@ pub mod movement_ops;
 pub mod norm_ops;
 #[cfg(feature = "onednn")]
 pub mod onednn;
+pub mod onehot;
 pub mod pad;
 pub mod pooling;
 pub mod qmoe;
@@ -149,6 +152,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "Or",
     "Xor",
     "Not",
+    "BitShift",
     "Equal",
     "Greater",
     "GreaterOrEqual",
@@ -187,6 +191,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "GatherND",
     "ScatterElements",
     "OneHot",
+    "Compress",
     "Tile",
     "Range",
     "CumSum",
@@ -746,6 +751,18 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("OneHot", "", 9),
         Box::new(indexing::OneHotFactory),
+    );
+    reg.register(
+        OpKey::new("OneHot", "", 11),
+        Box::new(onehot::OneHotFactory),
+    );
+    reg.register(
+        OpKey::new("BitShift", "", 11),
+        Box::new(bitshift::BitShiftFactory),
+    );
+    reg.register(
+        OpKey::new("Compress", "", 11),
+        Box::new(compress::CompressFactory),
     );
     reg.register(OpKey::new("Tile", "", 6), Box::new(sequence::TileFactory));
     reg.register(
