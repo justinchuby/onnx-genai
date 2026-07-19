@@ -673,25 +673,30 @@ impl<'a> DecodeSession<'a> {
     /// would be replayed by the host fallback, double-advancing the KV cache.
     /// This predicate lets the caller route straight to host sampling instead.
     ///
-    /// NOTE: the uncaptured persistent path ([`Self::step_persistent`] with
-    /// `use_graph == false`) is deliberately *excluded* here, so control-flow
-    /// models fall back to host sampling for non-greedy draws. Greedy decoding is
-    /// unaffected — it routes through [`Self::step_argmax`], gated on
-    /// `supports_argmax` rather than this predicate, and already reduces on the
-    /// device. Extending device *sampling* to the uncaptured path is a deferred
-    /// optimization: it would need the same double-advance care as the captured
-    /// path for the prompt-prefill step, for a payoff the on-device reduction's
-    /// synchronization cost largely cancels on these compute-bound models.
+    /// Both the captured decode graph and the uncaptured persistent path
+    /// ([`Self::step_persistent`] with `use_graph == false`, for control-flow
+    /// models) reduce the logits on the device, so either can device-sample. The
+    /// prompt-prefill (multi-token) step needs no special handling here: the
+    /// engine only invokes the device sampler for single-token steps
+    /// (`next_session_token_sampled` returns `Ok(None)` for a multi-token input
+    /// without advancing KV), so this stays a pure capability check.
     pub fn will_sample_on_device(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
-            let captured = self.mode == DecodeKvMode::SharedBuffer
-                && self.session.graph_capture()
-                && !self.graph_capture_disabled;
+            let shared_kv =
+                self.mode == DecodeKvMode::SharedBuffer && !self.graph_capture_disabled;
+            // The captured graph always reduces on device; the uncaptured path
+            // does so only when persistent decode is enabled.
+            let device_reduce = self.session.graph_capture() || persistent_uncaptured_enabled();
+            // `device_logits` mirrors the conditions under which
+            // `ensure_capture_state` sets `CaptureState::logits_on_device`, so a
+            // `true` here guarantees `step_persistent` returns a device-selected
+            // token (never host logits) for non-greedy params — no host-fallback
+            // replay, no double-advance.
             let device_logits = device_argmax_enabled()
                 && self.session.cuda_device_id().is_some()
                 && self.kv_allocator.is_some();
-            captured && device_logits
+            shared_kv && device_reduce && device_logits
         }
         #[cfg(not(feature = "cuda"))]
         {
