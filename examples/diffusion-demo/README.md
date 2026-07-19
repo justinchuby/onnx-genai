@@ -44,6 +44,24 @@ npm run dev        # starts the API server + the Vite dev server
 # open the printed http://localhost:5173
 ```
 
+### Running on the Apple-Silicon GPU (MLX EP)
+
+The pipeline can run on the GPU via the [onnxruntime-mlx](https://github.com/justinchuby/onnxruntime-mlx)
+plugin execution provider. Build its `libonnxruntime_mlx_ep.dylib`, then set the
+EP env vars before starting the backend:
+
+```bash
+export ONNX_GENAI_EP=metal
+export ONNX_GENAI_METAL_EP_LIB=/abs/path/onnxruntime-mlx/rust/target/release/libonnxruntime_mlx_ep.dylib
+npm run dev
+```
+
+onnx-genai registers the plugin and runs the diffusion denoiser on MLX, producing
+bit-identical results to CPU. Real Stable-Diffusion UNet blocks run **5–16× faster**
+than ORT CPU on the MLX EP (the whole block fuses into one MLX closure); the tiny
+bundled language fixture is too small to show a speedup (it is dispatch-bound), so
+use a real SD package to see the GPU win in the it/s card.
+
 ## What runs out of the box
 
 - **Language diffusion** works immediately using the bundled tiny masked-diffusion
