@@ -111,14 +111,23 @@ def get_num_transfer_tokens(mask_count: int, steps: int) -> np.ndarray:
     return counts
 
 
-def reference_generate(prompt: list[int], gen_length: int, steps: int, block_length: int) -> np.ndarray:
-    """Faithful LLaDA `generate` core: temperature=0, cfg=0, low_confidence.
+def reference_generate(
+    prompt: list[int],
+    gen_length: int,
+    steps: int,
+    block_length: int,
+    cfg_scale: float = 0.0,
+) -> np.ndarray:
+    """Faithful LLaDA `generate` core: temperature=0, low_confidence.
 
-    Supports semi-autoregressive block decoding (`block_length < gen_length`).
+    Supports semi-autoregressive block decoding (`block_length < gen_length`) and
+    unsupervised classifier-free guidance (`cfg_scale > 0`: the unconditional pass
+    re-masks the prompt, and `logits = un + (cfg_scale + 1) * (cond - un)`).
     """
     prompt_length = len(prompt)
     x = np.full((1, prompt_length + gen_length), MASK_TOKEN, dtype=np.int64)
     x[0, :prompt_length] = prompt
+    prompt_index = x != MASK_TOKEN  # marks the (fixed) prompt positions
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -132,7 +141,16 @@ def reference_generate(prompt: list[int], gen_length: int, steps: int, block_len
         num_transfer_tokens = get_num_transfer_tokens(int(block_mask.sum()), steps_per_block)
         for i in range(steps_per_block):
             mask_index = x == MASK_TOKEN
-            logits = model_logits(x)  # temperature 0 => argmax over clean logits
+            if cfg_scale > 0:
+                unconditional = x.copy()
+                unconditional[prompt_index] = MASK_TOKEN
+                conditional_logits = model_logits(x)
+                unconditional_logits = model_logits(unconditional)
+                logits = unconditional_logits + (cfg_scale + 1) * (
+                    conditional_logits - unconditional_logits
+                )
+            else:
+                logits = model_logits(x)  # temperature 0 => argmax over clean logits
             predicted = logits.argmax(axis=-1)  # [1, S]
             shifted = logits - logits.max(axis=-1, keepdims=True)
             probabilities = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
@@ -152,7 +170,7 @@ def reference_generate(prompt: list[int], gen_length: int, steps: int, block_len
     return x[0]
 
 
-def write_metadata(directory: Path, block_length: int | None) -> None:
+def write_metadata(directory: Path, block_length: int | None, cfg_scale: float = 0.0) -> None:
     lines = [
         "pipeline:",
         "  models:",
@@ -166,6 +184,12 @@ def write_metadata(directory: Path, block_length: int | None) -> None:
         "    kind: iterative",
         "    denoiser: denoiser",
         f"    num_steps: {STEPS}",
+    ]
+    if cfg_scale > 0:
+        # The runtime combines uncond + scale*(cond - uncond); LLaDA's effective
+        # multiplier is cfg_scale + 1, so that is the guidance_scale we declare.
+        lines.append(f"    guidance_scale: {cfg_scale + 1}")
+    lines += [
         "    scheduler_config:",
         "      kind: masked_diffusion",
         f"      mask_token_id: {MASK_TOKEN}",
@@ -224,27 +248,27 @@ def main() -> int:
     seed = np.full(SEQUENCE_LENGTH, MASK_TOKEN, dtype=np.int64)
     seed[: len(PROMPT)] = PROMPT
 
-    # (block_length metadata value, effective block length for the reference).
-    # None => single block spanning the whole generation region.
+    # (label, block_length metadata, effective block length, cfg_scale).
     cases = [
-        ("single block", None, gen_length),
-        ("semi-autoregressive (block_length=3)", 3, 3),
+        ("single block", None, gen_length, 0.0),
+        ("semi-autoregressive (block_length=3)", 3, 3, 0.0),
+        ("classifier-free guidance (cfg_scale=1.5)", None, gen_length, 1.5),
     ]
-    for label, block_metadata, block_length in cases:
+    for label, block_metadata, block_length, cfg_scale in cases:
         if gen_length % block_length != 0 or STEPS % (gen_length // block_length) != 0:
             raise SystemExit(f"bad test config for {label}")
-        expected = reference_generate(PROMPT, gen_length, STEPS, block_length)
+        expected = reference_generate(PROMPT, gen_length, STEPS, block_length, cfg_scale)
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             build_onnx_model(directory / "lm.onnx")
-            write_metadata(directory, block_metadata)
+            write_metadata(directory, block_metadata, cfg_scale)
             actual = run_onnx_genai(directory, seed)
         print(f"[{label}]")
         print(f"  reference (LLaDA): {expected.tolist()}")
         print(f"  onnx-genai:        {actual.tolist()}")
         assert np.array_equal(actual, expected), f"masked_diffusion diverged from LLaDA ({label})"
         assert MASK_TOKEN not in actual[len(PROMPT):], f"mask tokens remain ({label})"
-    print("PARITY OK: masked_diffusion == LLaDA generate (temp=0, cfg=0; single + semi-AR)")
+    print("PARITY OK: masked_diffusion == LLaDA generate (temp=0; single, semi-AR, CFG)")
     return 0
 
 

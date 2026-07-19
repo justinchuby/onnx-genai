@@ -341,37 +341,40 @@ impl PipelineEngine {
         // `cfg_conditioning_input` is additionally zeroed when no `.uncond` is
         // supplied (the zeros fallback for a single-conditioning SD model).
         let cfg_uncond: Vec<(String, Value)> = if guidance.is_some() {
-            let primary = plan
-                .cfg_conditioning_input
-                .clone()
-                .context("classifier-free guidance requires cfg_conditioning_input")?;
-            let mut overrides: Vec<(String, Value)> = Vec::new();
-            let mut seen: BTreeSet<String> = BTreeSet::new();
-            for info in denoiser.inputs() {
-                let port = info.name.as_str();
-                let uncond_endpoint = format!("{}.{}.uncond", plan.denoiser, port);
-                if let Some(u) = constants.get(&uncond_endpoint) {
-                    overrides.push((port.to_string(), clone_value(u)?));
-                    seen.insert(port.to_string());
+            if let Some(primary) = plan.cfg_conditioning_input.clone() {
+                let mut overrides: Vec<(String, Value)> = Vec::new();
+                let mut seen: BTreeSet<String> = BTreeSet::new();
+                for info in denoiser.inputs() {
+                    let port = info.name.as_str();
+                    let uncond_endpoint = format!("{}.{}.uncond", plan.denoiser, port);
+                    if let Some(u) = constants.get(&uncond_endpoint) {
+                        overrides.push((port.to_string(), clone_value(u)?));
+                        seen.insert(port.to_string());
+                    }
                 }
+                if !seen.contains(&primary) {
+                    let cond_endpoint = format!("{}.{}", plan.denoiser, primary);
+                    let cond = constants
+                        .get(&cond_endpoint)
+                        .or_else(|| {
+                            plan.dataflow
+                                .iter()
+                                .find(|e| e.to == cond_endpoint)
+                                .and_then(|e| constants.get(&e.from))
+                        })
+                        .with_context(|| format!("cfg conditioning '{cond_endpoint}' not found"))?;
+                    overrides.push((
+                        primary.clone(),
+                        Value::from_slice_f32(&vec![0.0f32; cond.numel()], cond.shape())?,
+                    ));
+                }
+                overrides
+            } else {
+                // No static conditioning input: the unconditional pass is a
+                // transform of the loop-carried sample (discrete language
+                // diffusion re-masks the prompt via `cfg_uncond_sample`).
+                Vec::new()
             }
-            if !seen.contains(&primary) {
-                let cond_endpoint = format!("{}.{}", plan.denoiser, primary);
-                let cond = constants
-                    .get(&cond_endpoint)
-                    .or_else(|| {
-                        plan.dataflow
-                            .iter()
-                            .find(|e| e.to == cond_endpoint)
-                            .and_then(|e| constants.get(&e.from))
-                    })
-                    .with_context(|| format!("cfg conditioning '{cond_endpoint}' not found"))?;
-                overrides.push((
-                    primary.clone(),
-                    Value::from_slice_f32(&vec![0.0f32; cond.numel()], cond.shape())?,
-                ));
-            }
-            overrides
         } else {
             Vec::new()
         };
@@ -453,6 +456,23 @@ impl PipelineEngine {
             let out_map = if let Some(scale) = guidance {
                 let mut cfg_overrides = scale_overrides.clone();
                 for (port, value) in &cfg_uncond {
+                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                    cfg_overrides.push((port.as_str(), value));
+                }
+                // Language-diffusion CFG: the unconditional pass feeds the
+                // loop-carried input with its prompt tokens re-masked. Computed
+                // per step from the current sample (owned here so its references
+                // live through the unconditional denoiser pass).
+                let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
+                if let Some(scheduler) = &plan.scheduler {
+                    for (_, in_port) in &plan.loop_edges {
+                        let raw = &raw_samples[in_port];
+                        if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
+                            prompt_masked_inputs.push((in_port.clone(), uncond_sample));
+                        }
+                    }
+                }
+                for (port, value) in &prompt_masked_inputs {
                     cfg_overrides.retain(|(p, _)| *p != port.as_str());
                     cfg_overrides.push((port.as_str(), value));
                 }
@@ -1042,6 +1062,20 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
     fn init_noise_sigma(&self) -> f32 {
         1.0
     }
+
+    /// Build the unconditional loop-carried sample for classifier-free guidance
+    /// from the current (conditional) one, when the guidance direction is a
+    /// transform of the loop state rather than a separate conditioning input.
+    ///
+    /// Discrete language diffusion (LLaDA) forms its unconditional pass by
+    /// re-masking the prompt tokens of the current sequence (`un_x[prompt] =
+    /// mask_id`); the pipeline feeds the returned value as the denoiser's
+    /// loop-carried input on the unconditional pass. Continuous (image)
+    /// schedulers return `None` (their unconditional direction comes from a
+    /// zeroed / `.uncond` conditioning input instead).
+    fn cfg_uncond_sample(&self, _sample: &Value) -> anyhow::Result<Option<Value>> {
+        Ok(None)
+    }
 }
 
 /// Builds a [`Scheduler`] from a declared [`SchedulerSpec`] and the loop length.
@@ -1235,6 +1269,27 @@ struct MaskedDiffusion {
 }
 
 impl MaskedDiffusion {
+    /// Capture each sequence's generation-region start (prompt length) on the
+    /// first use of a loop — the index of its first mask token. Cleared by
+    /// [`Scheduler::reset`]. Called from both `step` and `cfg_uncond_sample`, so
+    /// whichever runs first in a loop iteration records it from the seed.
+    fn ensure_generation_start(&self, tokens: &[i64], batch: usize, sequence_length: usize) {
+        let mut guard = self.generation_start.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let mut starts = Vec::with_capacity(batch);
+        for row_index in 0..batch {
+            let start = row_index * sequence_length;
+            let first_mask = tokens[start..start + sequence_length]
+                .iter()
+                .position(|&token| token == self.mask_token_id)
+                .unwrap_or(sequence_length);
+            starts.push(first_mask);
+        }
+        *guard = Some(starts);
+    }
+
     /// Argmax token id and its clean-softmax confidence for one logit row.
     ///
     /// `gumbel` supplies one uniform sample in `(0, 1)` per vocab entry when
@@ -1271,6 +1326,30 @@ impl Scheduler for MaskedDiffusion {
         *self.generation_start.lock().unwrap() = None;
     }
 
+    /// LLaDA unconditional pass: re-mask the prompt tokens of the current
+    /// sequence (`un_x[prompt] = mask_id`), leaving the generation region as-is.
+    fn cfg_uncond_sample(&self, sample: &Value) -> anyhow::Result<Option<Value>> {
+        let shape = sample.shape().to_vec();
+        let tokens = sample.to_vec_i64()?;
+        let count = tokens.len();
+        let sequence_length = *shape.last().unwrap_or(&(count as i64)) as usize;
+        if sequence_length == 0 {
+            return Ok(None);
+        }
+        let batch = count.checked_div(sequence_length).unwrap_or(0).max(1);
+        self.ensure_generation_start(&tokens, batch, sequence_length);
+        let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
+
+        let mut output = tokens;
+        for (row_index, &prompt_length) in generation_start.iter().enumerate() {
+            let row_start = row_index * sequence_length;
+            for offset in 0..prompt_length.min(sequence_length) {
+                output[row_start + offset] = self.mask_token_id;
+            }
+        }
+        Value::from_slice_i64(&output, &shape).map(Some).map_err(Into::into)
+    }
+
     fn step(
         &self,
         step: usize,
@@ -1296,23 +1375,8 @@ impl Scheduler for MaskedDiffusion {
         let sequence_length = *token_shape.last().unwrap_or(&(sequence_count as i64)) as usize;
         let batch = sequence_count.checked_div(sequence_length).unwrap_or(0).max(1);
 
-        // Capture each sequence's generation-region start (prompt length) on the
-        // first step of this loop; it is the index of the first mask token.
-        {
-            let mut guard = self.generation_start.lock().unwrap();
-            if guard.is_none() {
-                let mut starts = Vec::with_capacity(batch);
-                for row_index in 0..batch {
-                    let start = row_index * sequence_length;
-                    let first_mask = tokens[start..start + sequence_length]
-                        .iter()
-                        .position(|&token| token == self.mask_token_id)
-                        .unwrap_or(sequence_length);
-                    starts.push(first_mask);
-                }
-                *guard = Some(starts);
-            }
-        }
+        // Capture each sequence's generation-region start on the first step.
+        self.ensure_generation_start(&tokens, batch, sequence_length);
         let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
 
         let all_logits = logits.to_vec_f32()?;
@@ -2099,10 +2163,21 @@ impl PipelinePlan {
             );
         }
 
-        // Classifier-free guidance requires a declared conditioning input to
-        // zero on the unconditional pass.
+        // Classifier-free guidance normally requires a declared conditioning
+        // input to zero on the unconditional pass. Discrete language diffusion
+        // (`masked_diffusion`) is the exception: its unconditional pass re-masks
+        // the prompt of the loop-carried sample (via `Scheduler::cfg_uncond_sample`),
+        // so it needs no conditioning port.
         let guidance_active = spec.strategy.guidance_scale.is_some_and(|s| s != 1.0);
-        if guidance_active && spec.strategy.cfg_conditioning_input.is_none() {
+        let scheduler_supplies_uncond = spec
+            .strategy
+            .scheduler_config
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.kind == "masked_diffusion");
+        if guidance_active
+            && spec.strategy.cfg_conditioning_input.is_none()
+            && !scheduler_supplies_uncond
+        {
             anyhow::bail!(
                 "classifier-free guidance (guidance_scale != 1.0) requires \
                  'cfg_conditioning_input' naming the denoiser conditioning port to zero on the \

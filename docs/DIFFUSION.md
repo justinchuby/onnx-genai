@@ -204,10 +204,16 @@ Configured via `scheduler_config`: `mask_token_id` (required), `temperature` (de
 `block_length` (semi-autoregressive block decoding; default is a single block over the whole masked
 region). With `block_length` set, the generation region is split into contiguous left-to-right
 blocks, `num_steps` is divided evenly across the blocks, and each step only commits tokens inside the
-current block. Validated exactly against the reference LLaDA algorithm by
-`scripts/masked_diffusion_parity.py` — a deterministic coupled ONNX LM drives both the reference
-`generate` and onnx-genai, for **single-block and semi-autoregressive** cases, with identical token
-sequences.
+current block.
+
+**Unsupervised classifier-free guidance** is supported: set `strategy.guidance_scale` (no
+`cfg_conditioning_input` needed). The unconditional pass re-masks the prompt tokens of the current
+sequence (`Scheduler::cfg_uncond_sample`), and the runtime combines `uncond + scale·(cond − uncond)`.
+LLaDA's effective multiplier is `cfg_scale + 1`, so declare `guidance_scale = cfg_scale + 1`.
+
+Validated exactly against the reference LLaDA algorithm by `scripts/masked_diffusion_parity.py` — a
+deterministic coupled ONNX LM drives both the reference `generate` and onnx-genai for **single-block,
+semi-autoregressive, and classifier-free-guidance** cases, with identical token sequences.
 
 ---
 
