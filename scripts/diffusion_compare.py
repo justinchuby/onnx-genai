@@ -113,7 +113,7 @@ def main() -> int:
         input_names=["sample", "timestep", "encoder_hidden_states"],
         output_names=["noise_pred"],
         opset_version=17,
-        dynamic_axes={"sample": {0: "b"}, "encoder_hidden_states": {0: "b", 1: "s"}, "noise_pred": {0: "b"}},
+        dynamo=False,
     )
 
     # onnx-genai pipeline metadata: iterative DDIM with the exact diffusers timesteps.
