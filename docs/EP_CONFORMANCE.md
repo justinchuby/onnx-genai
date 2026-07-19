@@ -263,16 +263,16 @@ accepts its optional scalar int64 `k` input (including negative values) and defa
 ### CPU node-model coverage (2026-07-19)
 
 A fresh unfiltered ONNX 1.22.0 node-model run increased CPU coverage from the
-previously recorded **936/1,765** passing cases to **975/1,765** (790
+previously recorded **975/1,765** passing cases to **1,012/1,765** (753
 failures). CUDA remains unsupported by the CPU-only adapter, so all 1,765 CUDA
-variants are skipped. The run used the pure-Rust wheel (`maturin develop
---release --no-default-features`) built from commit `c69d047`.
+variants are skipped. The run used the existing pure-Rust wheel built from
+commit `9c250c6`.
 
 | Scope | Pass | Fail | Skip | Total |
 |---|---:|---:|---:|---:|
-| CPU node cases | 975 | 790 | 0 | 1,765 |
+| CPU node cases | 1,012 | 753 | 0 | 1,765 |
 | CUDA variants (unsupported device) | 0 | 0 | 1,765 | 1,765 |
-| **Collected node cases** | **975** | **790** | **1,765** | **3,530** |
+| **Collected node cases** | **1,012** | **753** | **1,765** | **3,530** |
 
 Measured CPU node-model history:
 
@@ -281,9 +281,13 @@ Measured CPU node-model history:
 - **2026-07-19:** 921 passed / 844 failed / 1,765 skipped.
 - **2026-07-19:** 936 passed / 829 failed / 1,765 skipped.
 - **2026-07-19:** 975 passed / 790 failed / 1,765 skipped.
+- **2026-07-19:** 1,012 passed / 753 failed / 1,765 skipped.
 
-The latest +39 cases come from newly added BitShift, OneHot, Compress, LpPool,
-GlobalLpPool, SpaceToDepth, AffineGrid, Col2Im, and CenterCropPad kernels.
+The latest Batch-4 +37 cases come from **Dropout** (opsets 13/22), **Split**
+(opsets 1/18, including `num_outputs`, uneven, and zero-size cases), **IsInf**
+(opsets 10/20), **EyeLike** (opset 9), mixed-type **Pow** coverage, and
+**GridSample** (opset 16 for 2D and opset 20 for 3D, with zeros, border, and
+reflection padding plus linear, nearest, and cubic modes).
 
 The largest current failing test-name/operator families are CastLike (96),
 SoftmaxCrossEntropyLoss/SCE (68), Attention (66), Cast (52), and Resize (39).
