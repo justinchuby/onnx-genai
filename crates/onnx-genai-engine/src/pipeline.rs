@@ -20,7 +20,7 @@ use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::path::Path;
 
 /// Named tensors supplied to or produced by pipeline components.
@@ -945,7 +945,7 @@ impl std::fmt::Debug for SchedulerRegistry {
 }
 
 impl SchedulerRegistry {
-    /// Registry with the built-in `ddim`, `euler` and `masked_diffusion` schedulers.
+    /// Registry with the built-in `ddim`, `euler`, `dpmpp_2m` and `masked_diffusion` schedulers.
     pub fn builtin() -> Self {
         let mut factories: HashMap<String, SchedulerFactory> = HashMap::new();
         factories.insert(
@@ -979,6 +979,26 @@ impl SchedulerRegistry {
                     );
                 }
                 let sched = EulerSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
+                    num_steps,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "dpmpp_2m".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported dpmpp_2m prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = Dpmpp2m::with_schedule(
                     cfg.num_train_timesteps.unwrap_or(1000),
                     cfg.beta_start.unwrap_or(0.00085),
                     cfg.beta_end.unwrap_or(0.012),
@@ -1304,6 +1324,151 @@ impl Scheduler for EulerSchedule {
         let shape = sample.shape().to_vec();
         let scaled = self.scale(step, &sample.to_vec_f32()?);
         Ok(Some(Value::from_slice_f32(&scaled, &shape)?))
+    }
+}
+
+/// DPM-Solver++ (2M) — a fast *multistep* deterministic scheduler and the default
+/// sampler in most Stable Diffusion / ComfyUI workflows. Order-2 in log-SNR (λ)
+/// space using the previous step's data prediction (`x0`), with a first-order step
+/// at the start and (for <15 steps) a first-order final step. Matches diffusers
+/// `DPMSolverMultistepScheduler(algorithm_type="dpmsolver++", solver_type="midpoint")`.
+/// Unlike Euler it does NOT scale the model input (`scale_model_input` is identity)
+/// and its `init_noise_sigma` is 1.0 (the seed is unscaled).
+#[derive(Debug)]
+struct Dpmpp2m {
+    /// Inference sigmas, descending, with a trailing `0.0`. Length `num_steps + 1`.
+    sigmas: Vec<f32>,
+    /// Previous step's data prediction (`x0`) for the multistep update. Reset at
+    /// step 0 of each denoise loop; interior-mutable so `step` keeps `&self`.
+    prev_x0: Mutex<Option<Vec<f32>>>,
+}
+
+impl Dpmpp2m {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+    ) -> anyhow::Result<Self> {
+        if num_train_timesteps < 2 {
+            anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+        }
+        if num_steps == 0 || num_steps > num_train_timesteps {
+            anyhow::bail!(
+                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
+            );
+        }
+        let denom = (num_train_timesteps - 1) as f32;
+        let (lo, hi, square) = match beta_schedule {
+            "linear" => (beta_start, beta_end, false),
+            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+            other => anyhow::bail!(
+                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+            ),
+        };
+        let mut train = Vec::with_capacity(num_train_timesteps);
+        let mut prod = 1.0f32;
+        for i in 0..num_train_timesteps {
+            let mut beta = lo + (hi - lo) * (i as f32) / denom;
+            if square {
+                beta *= beta;
+            }
+            prod *= 1.0 - beta;
+            train.push(((1.0 - prod) / prod).sqrt());
+        }
+        // Timesteps: linspace(0, num_train-1, num_steps+1) rounded to int, reversed,
+        // drop the last (the 0). Sigmas interpolate at those integer timesteps
+        // (integer => exact lookup). Trailing 0 for final_sigmas_type="zero".
+        let mut ts_int: Vec<usize> = (0..=num_steps)
+            .map(|j| (j as f32 * denom / num_steps as f32).round_ties_even() as usize)
+            .collect();
+        ts_int.reverse();
+        ts_int.pop();
+        let mut sigmas: Vec<f32> = ts_int
+            .iter()
+            .map(|&t| train[t.min(num_train_timesteps - 1)])
+            .collect();
+        sigmas.push(0.0);
+        Ok(Self {
+            sigmas,
+            prev_x0: Mutex::new(None),
+        })
+    }
+}
+
+/// `alpha_t = 1/sqrt(sigma^2+1)`, `sigma_t = sigma * alpha_t` (diffusers convention).
+fn dpm_alpha_sigma(sigma: f32) -> (f32, f32) {
+    let alpha_t = 1.0 / (sigma * sigma + 1.0).sqrt();
+    (alpha_t, sigma * alpha_t)
+}
+
+impl Scheduler for Dpmpp2m {
+    fn step(
+        &self,
+        step: usize,
+        num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let x = sample.to_vec_f32()?;
+        let eps = model_output.to_vec_f32()?;
+        if x.len() != eps.len() {
+            anyhow::bail!("dpm++ sample/eps length mismatch: {} vs {}", x.len(), eps.len());
+        }
+
+        let sigma = self.sigmas[step];
+        let (alpha_t0, sigma_t0) = dpm_alpha_sigma(sigma);
+        // Data prediction (x0) from the epsilon output: (x - sigma_t*eps)/alpha_t.
+        let x0: Vec<f32> = x
+            .iter()
+            .zip(&eps)
+            .map(|(&xi, &ei)| (xi - sigma_t0 * ei) / alpha_t0)
+            .collect();
+
+        let s_next = self.sigmas[step + 1];
+        let (a_t, sig_t) = dpm_alpha_sigma(s_next);
+        let (a_s0, sig_s0) = dpm_alpha_sigma(sigma);
+        let lam_t = a_t.ln() - sig_t.ln(); // +inf at the final step (sig_t == 0)
+        let lam_s0 = a_s0.ln() - sig_s0.ln();
+        let h = lam_t - lam_s0;
+        let neg_expm1 = (-h).exp() - 1.0; // exp(-h) - 1  (== -1 at the final step)
+
+        let mut prev = self
+            .prev_x0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dpm++ scheduler state poisoned"))?;
+        if step == 0 {
+            *prev = None; // reset at the start of each denoise loop
+        }
+        let lower_order_final = step + 1 == num_steps && num_steps < 15;
+        let first_order = step == 0 || lower_order_final || prev.is_none();
+
+        let out: Vec<f32> = if first_order {
+            x.iter()
+                .zip(&x0)
+                .map(|(&xi, &d0)| (sig_t / sig_s0) * xi - a_t * neg_expm1 * d0)
+                .collect()
+        } else {
+            let prev_x0 = prev.as_ref().unwrap();
+            let s_prev = self.sigmas[step - 1];
+            let (a_s1, sig_s1) = dpm_alpha_sigma(s_prev);
+            let lam_s1 = a_s1.ln() - sig_s1.ln();
+            let h0 = lam_s0 - lam_s1;
+            let r0 = h0 / h;
+            x.iter()
+                .enumerate()
+                .map(|(i, &xi)| {
+                    let d0 = x0[i];
+                    let d1 = (1.0 / r0) * (x0[i] - prev_x0[i]);
+                    (sig_t / sig_s0) * xi - a_t * neg_expm1 * d0 - 0.5 * a_t * neg_expm1 * d1
+                })
+                .collect()
+        };
+        *prev = Some(x0);
+        drop(prev);
+        Value::from_slice_f32(&out, &shape).map_err(Into::into)
     }
 }
 
