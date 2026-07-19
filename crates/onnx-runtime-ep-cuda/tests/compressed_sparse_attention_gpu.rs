@@ -744,6 +744,257 @@ fn ratio128_prefill_then_two_decodes_matches_cpu() {
     assert_eq!(after_decode2.cache.shape, vec![1, 1, STORED_WIDTH]);
 }
 
+// ---------------------------------------------------------------------------
+// B1: ratio-128 f32-cache DEVICE sink-softmax attention parity.
+//
+// With cache_format="f32", `present_compressed_kv` is the f32 dequantized
+// candidate-record buffer, so the CUDA kernel runs stage-6 (candidate read) +
+// stage-7 (sparse sink-softmax attention) on device (compression/state stay
+// host). Y must match the CPU oracle bit-for-bit (ULP=0). The all-Host fp8
+// tests above stay green (the device path only engages for f32 cache).
+// ---------------------------------------------------------------------------
+
+/// f32-record ratio-128 node: cache_format="f32", `present_compressed_kv` is
+/// f32 `[batch, next_records, DIM]`.
+fn ratio128_node_f32(inputs: &[HostTensor], next_records: usize) -> (Graph, NodeId) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(DOMAIN.into(), 1);
+    let names = [
+        "query",
+        "current_kv",
+        "compressor_kv",
+        "compressor_gate",
+        "compressor_ape",
+        "compressor_norm",
+        "past_compressed_kv",
+        "past_compression_carry",
+        "seqlens_k",
+        "total_sequence_length",
+        "head_sink",
+    ];
+    let node_inputs: Vec<_> = inputs
+        .iter()
+        .zip(names)
+        .map(|(input, name)| {
+            let value = graph.create_named_value(
+                name,
+                input.dtype,
+                static_shape(input.shape.iter().copied()),
+            );
+            graph.add_input(value);
+            Some(value)
+        })
+        .collect();
+
+    let batch = inputs[0].shape[0];
+    let sequence = inputs[0].shape[1];
+    let outputs = vec![
+        graph.create_named_value(
+            "Y",
+            DataType::Float32,
+            static_shape([batch, sequence, 1, DIM]),
+        ),
+        graph.create_named_value(
+            "present_compressed_kv",
+            DataType::Float32,
+            static_shape([batch, next_records, DIM]),
+        ),
+        graph.create_named_value(
+            "present_compression_carry",
+            DataType::Float32,
+            static_shape([batch, RATIO, 2, DIM]),
+        ),
+    ];
+    let mut node = Node::new(
+        NodeId(0),
+        "CompressedSparseAttention",
+        node_inputs,
+        outputs.clone(),
+    );
+    node.domain = DOMAIN.into();
+    node.attributes
+        .insert("num_heads".into(), Attribute::Int(1));
+    node.attributes
+        .insert("head_dim".into(), Attribute::Int(DIM as i64));
+    node.attributes
+        .insert("qk_rope_head_dim".into(), Attribute::Int(ROPE_DIM as i64));
+    node.attributes
+        .insert("compression_ratio".into(), Attribute::Int(RATIO as i64));
+    node.attributes.insert("causal".into(), Attribute::Int(1));
+    node.attributes
+        .insert("cache_layout_version".into(), Attribute::Int(1));
+    node.attributes
+        .insert("index_layout_version".into(), Attribute::Int(1));
+    node.attributes.insert(
+        "cache_format".into(),
+        Attribute::String("f32".as_bytes().to_vec()),
+    );
+    let node = graph.insert_node(node);
+    for output in outputs {
+        graph.add_output(output);
+    }
+    (graph, node)
+}
+
+/// Max-ULP (sign-magnitude ordered) between two f32 buffers, matching the GQA
+/// reference-parity metric.
+fn max_ulp(gpu: &[u8], cpu: &[u8]) -> u32 {
+    let gpu = as_f32(gpu);
+    let cpu = as_f32(cpu);
+    assert_eq!(gpu.len(), cpu.len(), "length mismatch");
+    gpu.iter()
+        .zip(&cpu)
+        .map(|(&g, &c)| {
+            let key = |v: f32| {
+                if v.is_sign_negative() {
+                    !v.to_bits()
+                } else {
+                    v.to_bits() | 0x8000_0000
+                }
+            };
+            key(g).abs_diff(key(c))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// One f32-cache `prefill/decode` step with the device attention stage engaged.
+/// Asserts bit-exact (ULP=0) `Y` parity plus state parity, returning the present
+/// state (with an f32 cache) and the device/CPU `Y` for further checks.
+fn run_step_f32(
+    ep: &CudaExecutionProvider,
+    inputs: &[HostTensor],
+    next_records: usize,
+) -> (Vec<f32>, Vec<f32>, CsaState) {
+    let sequence = inputs[0].shape[1];
+    let output_specs = vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, sequence, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, next_records, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, RATIO, 2, DIM],
+        },
+    ];
+    let (graph, node) = ratio128_node_f32(inputs, next_records);
+    let cpu = run_cpu(&graph, node, inputs, &output_specs).expect("CPU CSA kernel");
+    let gpu = run_gpu(ep, &graph, node, inputs, &output_specs).expect("CUDA CSA kernel");
+
+    let ulp = max_ulp(&gpu[0], &cpu[0]);
+    eprintln!("ratio128 f32 device attention: Y max_ulp={ulp}");
+    assert_eq!(
+        ulp, 0,
+        "device sink-softmax attention Y must match the CPU oracle bit-for-bit"
+    );
+    // State stays host-staged, so it is byte-identical to the oracle.
+    assert_eq!(gpu[1], cpu[1], "present_compressed_kv must match exactly");
+    assert_f32_close(&gpu[2], &cpu[2], 1e-4, "present_compression_carry");
+
+    let state = CsaState {
+        cache: HostTensor::f32(&output_specs[1].shape, &as_f32(&cpu[1])),
+        carry: HostTensor::f32(&output_specs[2].shape, &as_f32(&cpu[2])),
+    };
+    (as_f32(&gpu[0]), as_f32(&cpu[0]), state)
+}
+
+#[test]
+fn ratio128_f32_device_attention_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(
+        &[DIM],
+        &(0..DIM)
+            .map(|d| 0.75 + (d % 17) as f32 * 0.03125)
+            .collect::<Vec<_>>(),
+    );
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+
+    // Prefill positions 0..125 (S=126, total=126, next_records=0). Each query s
+    // sees only dense candidates with absolute<=s; the rest are `-1` invalid
+    // (skipped) — the fused invalid-candidate path. Attention is dense window +
+    // sink only.
+    let initial = CsaState {
+        cache: HostTensor::f32(&[1, 0, DIM], &[]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+    let prefill = ratio128_inputs(126, 0, 0, 126, 126, &ape, &norm, &sink, &initial);
+    let (_, _, after_prefill) = run_step_f32(&ep, &prefill, 0);
+
+    // Decode position 126 (total=127, still 0 compressed records): full 127-wide
+    // dense window + sink.
+    let decode1 = ratio128_inputs(1, 126, 0, 127, 127, &ape, &norm, &sink, &after_prefill);
+    let (_, _, after_decode1) = run_step_f32(&ep, &decode1, 0);
+
+    // Decode position 127 (total=128) crosses the 128 block boundary → emits the
+    // first f32 compressed record. valid_compressed=1, so the device attention
+    // now includes a completed compressed candidate alongside the full 128-wide
+    // dense window and the sink.
+    let decode2 = ratio128_inputs(1, 127, 0, 128, 128, &ape, &norm, &sink, &after_decode1);
+    let (_, _, after_decode2) = run_step_f32(&ep, &decode2, 1);
+    assert_eq!(after_decode2.cache.shape, vec![1, 1, DIM]);
+}
+
+#[test]
+fn ratio128_f32_device_attention_sink_material_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(
+        &[DIM],
+        &(0..DIM)
+            .map(|d| 0.75 + (d % 17) as f32 * 0.03125)
+            .collect::<Vec<_>>(),
+    );
+
+    // A single decode at position 4 (total=5, dense window 0..4, no compressed
+    // records). Run once with a negligible sink and once with a large positive
+    // sink: the large sink adds `exp(sink - max)` mass to the denominator,
+    // measurably shrinking `Y`. Both device runs must match the CPU oracle
+    // bit-for-bit, proving the sink-after-max term is reproduced exactly.
+    let carry = HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]);
+    let past = CsaState {
+        cache: HostTensor::f32(&[1, 0, DIM], &[]),
+        carry: carry.clone(),
+    };
+
+    let small_sink = HostTensor::f32(&[1], &[-30.0]);
+    let inputs_small = ratio128_inputs(1, 4, 0, 5, 5, &ape, &norm, &small_sink, &past);
+    let (y_small_gpu, y_small_cpu, _) = run_step_f32(&ep, &inputs_small, 0);
+
+    let large_sink = HostTensor::f32(&[1], &[6.0]);
+    let inputs_large = ratio128_inputs(1, 4, 0, 5, 5, &ape, &norm, &large_sink, &past);
+    let (y_large_gpu, y_large_cpu, _) = run_step_f32(&ep, &inputs_large, 0);
+
+    // The large sink must materially change the output (denominator dominated by
+    // the sink mass), not just perturb it in the last bits.
+    let max_delta = y_small_cpu
+        .iter()
+        .zip(&y_large_cpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_delta > 1e-2,
+        "sink term should materially change Y; max delta was {max_delta:e}"
+    );
+    // Device already asserted ULP=0 vs CPU inside run_step_f32; double-check the
+    // two device runs differ too (sink genuinely flows through the device path).
+    let device_delta = y_small_gpu
+        .iter()
+        .zip(&y_large_gpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        device_delta > 1e-2,
+        "device sink path inert: {device_delta:e}"
+    );
+}
+
 #[test]
 fn ratio4_prefill_claim_and_execute_matches_cpu() {
     let Some(ep) = gpu() else { return };

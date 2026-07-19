@@ -55,15 +55,156 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseAttentionFactory as CpuCsaFactory;
 use onnx_runtime_ir::{DataType, DeviceId, Dim, Node, Shape, as_static_shape};
 
-use crate::error::not_implemented;
+use crate::error::{driver_err, not_implemented};
 use crate::kernels::csa_device_state::{CsaBufferLayout, CsaDeviceBufferManager};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "CompressedSparseAttention";
+
+/// Device stage-7 (sparse sink-softmax attention) + stage-6 (candidate read)
+/// for **ratio-128** (B1). One CUDA block computes one `(batch, query, head)`
+/// output row, reproducing the CPU oracle's `ratio128_attention` numerics
+/// **bit-for-bit**:
+///
+/// * score/value reductions accumulate in pure f32 in **ascending candidate
+///   index order** (dense window first, then compressed records), matching the
+///   oracle's `dot` / `accumulate_value`. `__fadd_rn` / `__fmul_rn` keep every
+///   multiply-add un-fused so the device sum equals the CPU's non-FMA order.
+/// * the softmax is a faithful **two-pass** max → denominator → value reduction
+///   (NOT an online rescale), because a running rescale would reorder the f32
+///   sum and diverge from the oracle.
+/// * the learned `head_sink` is added to the denominator **after** the running
+///   max, as a logit-only mass (no value contribution).
+/// * `exp` is evaluated as `(float)exp((double)x)` — the same double-precision
+///   evaluation the GQA reference kernel uses to match glibc's correctly-rounded
+///   `expf` bit-for-bit.
+///
+/// An invalid/skipped candidate (the fused `-1` index: dense position past the
+/// causal limit, before the `current_kv` window, or a not-yet-completed
+/// compressed record) is represented by a `-inf` score and excluded from both
+/// the denominator and the value reduction, exactly like the oracle.
+const ATTENTION_MODULE: &str = "csa_ratio128_attention";
+const ATTENTION_ENTRY: &str = "csa_ratio128_sink_attention";
+const ATTENTION_BLOCK: u32 = 256;
+const ATTENTION_SOURCE: &str = r#"
+extern "C" __global__ void csa_ratio128_sink_attention(
+    const float* query,        // [batch, sequence, heads, dim]
+    const float* current_kv,   // [batch, current_kv_len, dim]
+    const float* compressed,   // [batch, compressed_records, dim]
+    const float* sink,         // [heads]
+    float* output,             // [batch, sequence, heads, dim]
+    float* scores,             // [rows * candidate_count] scratch
+    int batch, int sequence, int heads, int dim,
+    int current_kv_len,
+    long long current_kv_base,
+    long long query_start,
+    int compressed_records,
+    int dense_candidates,
+    int candidate_count,
+    float scale)
+{
+    const int row = blockIdx.x;
+    const int rows = batch * sequence * heads;
+    if (row >= rows) return;
+    const int h = row % heads;
+    int tmp = row / heads;
+    const int s = tmp % sequence;
+    const int b = tmp / sequence;
+
+    const float NEG = __int_as_float(0xff800000);
+    const long long position = query_start + (long long)s;
+    long long window = position + 1 - 128;
+    if (window < 0) window = 0;
+    const long long dense_start = current_kv_base > window ? current_kv_base : window;
+    const long long valid_compressed = (position + 1) / 128;
+    int comp_limit = compressed_records < (int)valid_compressed
+        ? compressed_records : (int)valid_compressed;
+
+    float* row_scores = scores + (long long)row * candidate_count;
+    const long long q_base = ((long long)(b * sequence + s) * heads + h) * dim;
+
+    __shared__ float s_max;
+    __shared__ float s_denom;
+    __shared__ int s_valid;
+
+    if (threadIdx.x == 0) {
+        for (int c = 0; c < candidate_count; ++c) row_scores[c] = NEG;
+        float maximum = NEG;
+        // Dense window candidates, ascending absolute position.
+        for (int c = 0; c < dense_candidates; ++c) {
+            const long long absolute = dense_start + (long long)c;
+            if (absolute > position) continue;
+            const long long relative = absolute - current_kv_base;
+            if (relative >= (long long)current_kv_len) continue;
+            const float* kv = current_kv + ((long long)b * current_kv_len + relative) * dim;
+            float acc = 0.0f;
+            for (int d = 0; d < dim; ++d)
+                acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
+            const float score = __fmul_rn(acc, scale);
+            row_scores[c] = score;
+            maximum = fmaxf(maximum, score);
+        }
+        // Completed compressed records, ascending.
+        for (int rec = 0; rec < comp_limit; ++rec) {
+            const float* kv = compressed + ((long long)b * compressed_records + rec) * dim;
+            float acc = 0.0f;
+            for (int d = 0; d < dim; ++d)
+                acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
+            const float score = __fmul_rn(acc, scale);
+            row_scores[dense_candidates + rec] = score;
+            maximum = fmaxf(maximum, score);
+        }
+        if (maximum == NEG) {
+            s_valid = 0;
+        } else {
+            float denom = 0.0f;
+            for (int c = 0; c < candidate_count; ++c) {
+                if (row_scores[c] != NEG)
+                    denom = __fadd_rn(denom, (float)exp((double)(row_scores[c] - maximum)));
+            }
+            // Sink is a logit-only denominator mass, added after the max.
+            denom = __fadd_rn(denom, (float)exp((double)(sink[h] - maximum)));
+            s_denom = denom;
+            s_valid = 1;
+        }
+        s_max = maximum;
+    }
+    __syncthreads();
+
+    if (s_valid == 0) {
+        for (int d = threadIdx.x; d < dim; d += blockDim.x)
+            output[q_base + d] = 0.0f;
+        return;
+    }
+
+    const float maximum = s_max;
+    const float denom = s_denom;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float result = 0.0f;
+        for (int c = 0; c < candidate_count; ++c) {
+            const float score = row_scores[c];
+            if (score == NEG) continue;
+            const float prob = (float)exp((double)(score - maximum)) / denom;
+            float val;
+            if (c < dense_candidates) {
+                const long long absolute = dense_start + (long long)c;
+                const long long relative = absolute - current_kv_base;
+                val = current_kv[(((long long)b * current_kv_len + relative) * dim) + d];
+            } else {
+                const int rec = c - dense_candidates;
+                val = compressed[(((long long)b * compressed_records + rec) * dim) + d];
+            }
+            result = __fadd_rn(result, __fmul_rn(prob, val));
+        }
+        output[q_base + d] = result;
+    }
+}
+"#;
 
 /// Factory for the host-staged CUDA CSA kernel. It builds the CPU CSA kernel
 /// from the same node (reusing the CPU oracle's attribute validation and compute
@@ -89,11 +230,42 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // fixed-address stream now so an OOM fails before any execution.
         let layout = CsaBufferLayout::from_runner(node, input_shapes, ratio)?;
         let device_state = CsaDeviceBufferManager::reserve(self.runtime.clone(), layout)?;
+
+        // B1: flip stage-6 (candidate read) + stage-7 (sparse sink-softmax
+        // attention) to Device for ratio-128 with the f32 record cache, where
+        // the host-staged compression already produces the dequantized candidate
+        // records (`present_compressed_kv` == the f32 logical records). FP8
+        // ratio-128 records and ratio-4 stay host-staged this slice (device FP8
+        // dequant of candidate records is B2), and an attention_bias input keeps
+        // the run on the host oracle. Compression and writeback stay host, so
+        // `cuda_graph_compatible()` remains false.
+        let cache_format = node
+            .attr("cache_format")
+            .and_then(|attribute| attribute.as_str())
+            .unwrap_or("f32")
+            .to_string();
+        let has_attention_bias = node.inputs.get(19).is_some_and(Option::is_some);
+        let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
+        let configured_scale = node
+            .attr("scale")
+            .and_then(|attribute| attribute.as_float())
+            .unwrap_or(0.0);
+        let mut dispatch = CsaStageDispatch::default();
+        if device_attention {
+            dispatch.set(CsaPipelineStage::CandidateAssembly, CsaStageMode::Device);
+            dispatch.set(
+                CsaPipelineStage::SparseSinkSoftmaxAttention,
+                CsaStageMode::Device,
+            );
+        }
+
         Ok(Box::new(CompressedSparseAttentionKernel {
             runtime: self.runtime.clone(),
             inner,
             device_state,
-            dispatch: CsaStageDispatch::default(),
+            dispatch,
+            device_attention,
+            configured_scale,
             golden_capture: CsaGoldenCapture::from_environment(),
         }))
     }
@@ -107,6 +279,10 @@ struct CompressedSparseAttentionKernel {
     // Kept alive for stable device addresses; B0 still uses graph-threaded state.
     device_state: CsaDeviceBufferManager,
     dispatch: CsaStageDispatch,
+    /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
+    device_attention: bool,
+    /// Raw `scale` attribute (0.0 → `1/sqrt(dim)`), resolved at launch.
+    configured_scale: f32,
     golden_capture: CsaGoldenCapture,
 }
 
@@ -227,6 +403,131 @@ impl CompressedSparseAttentionKernel {
         }
         self.inner.execute(inputs, outputs)
     }
+
+    /// B1 device stage-6/7 for ratio-128 (f32 cache). Launches the CUDA
+    /// sink-softmax attention kernel over the device query / `current_kv` /
+    /// candidate-record buffers, writing `Y` (output 0) directly and matching
+    /// the CPU oracle's `ratio128_attention` numerics bit-for-bit.
+    fn run_device_attention(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        staged: &[Vec<u8>],
+    ) -> Result<()> {
+        // Reproduce the oracle's derived attention geometry from the staged
+        // inputs and inferred output shapes (see the CPU
+        // `execute_stateful_ratio128` / `ratio128_attention`).
+        let query_shape = inputs[0].shape;
+        let batch = query_shape[0];
+        let sequence = query_shape[1];
+        let heads = query_shape[2];
+        let dim = query_shape[3];
+        let current_kv_len = inputs[1].shape[1];
+        let compressed_records = outputs[1].shape[1];
+
+        let total_bytes = &staged[9];
+        if total_bytes.len() != 8 {
+            return Err(not_implemented(format!(
+                "{OP}: device attention expects a scalar total_sequence_length"
+            )));
+        }
+        let total = i64::from_ne_bytes(total_bytes[..8].try_into().expect("8 bytes")) as usize;
+        let start = total.checked_sub(sequence).ok_or_else(|| {
+            not_implemented(format!("{OP}: total < sequence in device attention"))
+        })?;
+        let current_kv_base = total.checked_sub(current_kv_len).ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: current_kv longer than total in device attention"
+            ))
+        })?;
+        let dense_candidates = if start == 0 {
+            current_kv_len.min(128)
+        } else {
+            128
+        };
+        let candidate_count = dense_candidates + compressed_records;
+        let rows = batch * sequence * heads;
+        if rows == 0 || candidate_count == 0 {
+            return Ok(());
+        }
+
+        let scale = if self.configured_scale == 0.0 {
+            1.0f32 / (dim as f32).sqrt()
+        } else {
+            self.configured_scale
+        };
+
+        let query_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+        let current_kv_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
+        // Compressed candidate records are the freshly uploaded f32
+        // `present_compressed_kv` (output 1). When there are no completed
+        // records the pointer is unused by the kernel.
+        let compressed_ptr = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+        let sink_ptr = cuptr(inputs[10].data_ptr::<u8>() as *const c_void);
+        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+
+        let score_bytes = rows
+            .checked_mul(candidate_count)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| not_implemented(format!("{OP}: score scratch size overflow")))?;
+        let scratch = self.runtime.alloc_raw(score_bytes.max(1))?;
+
+        let launch = || -> Result<()> {
+            let func =
+                self.runtime
+                    .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, ATTENTION_ENTRY)?;
+            let batch_i = batch as i32;
+            let sequence_i = sequence as i32;
+            let heads_i = heads as i32;
+            let dim_i = dim as i32;
+            let current_kv_len_i = current_kv_len as i32;
+            let current_kv_base_i = current_kv_base as i64;
+            let query_start_i = start as i64;
+            let compressed_records_i = compressed_records as i32;
+            let dense_candidates_i = dense_candidates as i32;
+            let candidate_count_i = candidate_count as i32;
+            let grid = u32::try_from(rows)
+                .map_err(|_| not_implemented(format!("{OP}: attention row count exceeds u32")))?;
+
+            let stream = self.runtime.stream();
+            let mut builder = stream.launch_builder(&func);
+            builder
+                .arg(&query_ptr)
+                .arg(&current_kv_ptr)
+                .arg(&compressed_ptr)
+                .arg(&sink_ptr)
+                .arg(&output_ptr)
+                .arg(&scratch)
+                .arg(&batch_i)
+                .arg(&sequence_i)
+                .arg(&heads_i)
+                .arg(&dim_i)
+                .arg(&current_kv_len_i)
+                .arg(&current_kv_base_i)
+                .arg(&query_start_i)
+                .arg(&compressed_records_i)
+                .arg(&dense_candidates_i)
+                .arg(&candidate_count_i)
+                .arg(&scale);
+            // SAFETY: argument types and order match `csa_ratio128_sink_attention`;
+            // all pointers refer to live contiguous device allocations sized by
+            // the shapes above, and the scratch covers `rows * candidate_count`.
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (ATTENTION_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|error| driver_err("launch csa_ratio128_sink_attention", error))?;
+            self.runtime.synchronize()
+        };
+
+        let result = launch();
+        // SAFETY: `scratch` came from this runtime's `alloc_raw` and is freed once.
+        let free = unsafe { self.runtime.free_raw(scratch) };
+        result.and(free)
+    }
 }
 
 impl Kernel for CompressedSparseAttentionKernel {
@@ -328,6 +629,22 @@ impl Kernel for CompressedSparseAttentionKernel {
                 }
             }
         }
+
+        // B1 device stage-7: recompute `Y` on device for ratio-128 f32-cache,
+        // overwriting the host oracle's `Y`. Compression/state (outputs 1,2)
+        // remain the host-staged results just uploaded above; the freshly
+        // uploaded `present_compressed_kv` (output 1) is the f32 candidate-record
+        // buffer the device attention reads. This keeps the reduction order
+        // identical to the oracle (see `ATTENTION_SOURCE`).
+        if self.device_attention
+            && self
+                .dispatch
+                .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
+                == CsaStageMode::Device
+        {
+            self.run_device_attention(inputs, outputs, &staged)?;
+        }
+
         self.runtime.synchronize()
     }
 
