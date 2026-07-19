@@ -263,16 +263,16 @@ accepts its optional scalar int64 `k` input (including negative values) and defa
 ### CPU node-model coverage (2026-07-19)
 
 A fresh unfiltered ONNX 1.22.0 node-model run increased CPU coverage from the
-previously recorded **360/1,765** passing cases to **875/1,765** (890
+previously recorded **875/1,765** passing cases to **921/1,765** (844
 failures). CUDA remains unsupported by the CPU-only adapter, so all 1,765 CUDA
 variants are skipped. The run used the pure-Rust wheel (`maturin develop
---release --no-default-features`) built from commit `080f0ba`.
+--release --no-default-features`).
 
 | Scope | Pass | Fail | Skip | Total |
 |---|---:|---:|---:|---:|
-| CPU node cases | 875 | 890 | 0 | 1,765 |
+| CPU node cases | 921 | 844 | 0 | 1,765 |
 | CUDA variants (unsupported device) | 0 | 0 | 1,765 | 1,765 |
-| **Collected node cases** | **875** | **890** | **1,765** | **3,530** |
+| **Collected node cases** | **921** | **844** | **1,765** | **3,530** |
 
 The largest current failing test-name/operator families are CastLike (96),
 SoftmaxCrossEntropyLoss/SCE (68), Attention (66), Cast (52), and Resize (39).
@@ -287,6 +287,29 @@ operator gaps rather than adapter wiring errors:
   EP kernel is registered for `ai.onnx::Unique` at opset 11.
 - `test_upsample_nearest_cpu` fails while preparing the session because no CPU
   EP kernel is registered for `ai.onnx::Upsample` at opset 9.
+
+### Scan, window, bitwise, and Hardmax wave (2026-07-19)
+
+This +46-case wave fixed **CumSum** (including int32, exclusive/reverse, and
+negative-axis cases), added **CumProd**, **BitwiseAnd**, **BitwiseOr**,
+**BitwiseXor**, **BitwiseNot**, and **Hardmax** (including fp16/bf16), plus
+the **HannWindow**, **HammingWindow**, and **BlackmanWindow** kernels. The
+window `*_expanded` reference-decomposition variants still fail because they
+exercise a decomposition graph rather than the base window kernel.
+
+### Previous CPU node-model coverage (2026-07-19)
+
+The preceding unfiltered ONNX 1.22.0 node-model run increased CPU coverage from
+the 2026-07-14 **360/1,765** passing cases to **875/1,765** (890 failures).
+CUDA remained unsupported by the CPU-only adapter, so all 1,765 CUDA variants
+were skipped. The run used the pure-Rust wheel (`maturin develop --release
+--no-default-features`) built from commit `080f0ba`.
+
+| Scope | Pass | Fail | Skip | Total |
+|---|---:|---:|---:|---:|
+| CPU node cases | 875 | 890 | 0 | 1,765 |
+| CUDA variants (unsupported device) | 0 | 0 | 1,765 | 1,765 |
+| **Collected node cases** | **875** | **890** | **1,765** | **3,530** |
 
 The exact pass/fail/skip test-name set is recorded in
 `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`. Re-run
