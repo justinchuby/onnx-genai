@@ -49,6 +49,7 @@ pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
 pub mod identity;
+pub mod index_share;
 pub mod indexing;
 pub mod layernorm;
 pub mod log_softmax;
@@ -225,6 +226,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory),
+    );
+    reg.register(
+        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        Box::new(index_share::IndexShareFactory),
     );
     reg.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
@@ -1326,10 +1331,10 @@ mod tests {
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
         // registrations over the Phase-1 op-name count in total.
-        // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, SparseKvGather,
-        // CompressedSparseAttention, and GroupQueryAttention add private/contrib
-        // registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 57);
+        // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
+        // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
+        // private/contrib registrations.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 58);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1342,6 +1347,7 @@ mod tests {
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMoE", "pkg.nxrt", 1).is_some());
+        assert!(reg.lookup("IndexShare", "pkg.nxrt", 1).is_some());
         assert!(reg.lookup("SparseKvGather", "pkg.nxrt", 1).is_some());
         assert!(
             reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
