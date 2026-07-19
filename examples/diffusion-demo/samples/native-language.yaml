@@ -1,0 +1,23 @@
+# Native inference_metadata config for a masked language-diffusion pipeline.
+# Load this via the demo's "Load as native config" button to visualize it, or
+# adapt it for your own onnx-genai package (place as inference_metadata.yaml).
+pipeline:
+  models:
+    denoiser:
+      filename: model.onnx
+      type: denoiser
+  dataflow:
+    # The denoiser output feeds back into its own input each step: this is the
+    # iterative reverse-process loop (low-confidence remasking for LLaDA-style
+    # masked diffusion).
+    - from: denoiser.logits
+      to: denoiser.input_ids
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 4
+    timestep_input: timestep
+    scheduler_config:
+      kind: masked_diffusion
+      mask_token_id: 1
+      num_steps: 4

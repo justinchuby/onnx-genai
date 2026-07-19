@@ -1,0 +1,85 @@
+# onnx-genai diffusion demo
+
+A small **TypeScript** web app to show colleagues how onnx-genai runs diffusion
+pipelines from a **declarative config** — for both a **language-diffusion**
+model (LLaDA-style masked diffusion) and an **image-diffusion** model (Stable
+Diffusion). It:
+
+1. **Loads a pipeline config** — either a **ComfyUI** API-format workflow JSON
+   (translated to onnx-genai's native format on the fly) *or* a native
+   **`inference_metadata`** document (YAML or JSON).
+2. **Visualizes the config** — the component DAG (denoiser / VAE / text encoder
+   and their dataflow edges) and the strategy (scheduler, steps, guidance, …),
+   so everyone can see exactly what will run.
+3. **Runs it and animates the reverse process** — for language diffusion, the
+   tokens un-masking step by step; for image diffusion, the latent denoising to
+   an image.
+
+The backend drives the **real** onnx-genai runtime (the `run_diffusion` and
+`comfyui_to_metadata` binaries) — nothing is simulated.
+
+```
+┌─────────────┐   config (ComfyUI / native)   ┌──────────────┐   spawn    ┌────────────────────┐
+│  web (Vite) │ ────────────────────────────► │ server (Node)│ ─────────► │ onnx-genai binaries │
+│   TypeScript│ ◄──── DAG + per-step frames ── │              │ ◄── dumps ─│  (real runtime)     │
+└─────────────┘                                └──────────────┘            └────────────────────┘
+```
+
+## Prerequisites
+
+- Node 18+.
+- Built onnx-genai binaries (from the repo root):
+  ```bash
+  cargo build --release -p onnx-genai --bin run_diffusion
+  cargo build --release -p onnx-genai-comfyui-config --bin comfyui_to_metadata
+  ```
+- The prebuilt ONNX Runtime dylib is found automatically under `target/`.
+
+## Run
+
+```bash
+cd examples/diffusion-demo
+npm install
+npm run dev        # starts the API server + the Vite dev server
+# open the printed http://localhost:5173
+```
+
+## What runs out of the box
+
+- **Language diffusion** works immediately using the bundled tiny masked-diffusion
+  fixture (`tests/fixtures/tiny-masked-diffusion`): it is a *real* ONNX model run
+  through the real `masked_diffusion` scheduler, so you can watch the true
+  un-masking dynamics (toy vocabulary, real algorithm).
+- **Config load + visualization** works for any ComfyUI or native config with no
+  model present.
+- **Image diffusion** needs a real Stable Diffusion package built from scratch by
+  Mobius. Point the demo at it with `ONNX_GENAI_SD_PACKAGE=/path/to/pkg`:
+  ```bash
+  # in a Mobius checkout (conda `onnx` env):
+  python -c "from mobius import build_diffusers_pipeline; from mobius.integrations.onnx_genai import write_onnx_genai_config; \
+             pkg = build_diffusers_pipeline('OFA-Sys/small-stable-diffusion-v0'); \
+             pkg.save('/tmp/sd-pkg'); write_onnx_genai_config(pkg, '/tmp/sd-pkg', source='OFA-Sys/small-stable-diffusion-v0')"
+  ONNX_GENAI_SD_PACKAGE=/tmp/sd-pkg npm run dev
+  ```
+
+## Loading a config
+
+Two sample configs are bundled under `samples/`:
+
+- `samples/comfyui-txt2img.json` — a ComfyUI Stable-Diffusion workflow. Paste it
+  into the loader and click **Load as ComfyUI** (it is translated to the native
+  format on the fly), or send it to `/api/translate-comfyui`.
+- `samples/native-language.yaml` — a native `inference_metadata` masked
+  language-diffusion pipeline. Paste it and click **Load as native config**.
+
+For the language tab, **Use bundled fixture** both loads the config and runs it.
+
+## Files
+
+- `server/index.mjs` — Node API: translate ComfyUI→native, parse native config,
+  run a pipeline with per-step dumps, return frames.
+- `src/` — Vite + TypeScript UI: config loader, DAG/strategy view, run animation
+  (`main.ts`, `style.css`).
+- `samples/` — example ComfyUI and native configs to load.
+- `index.html`, `vite.config.ts`, `tsconfig.json`, `dev.mjs` — frontend wiring.
+
