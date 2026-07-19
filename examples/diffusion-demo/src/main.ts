@@ -157,32 +157,83 @@ function renderPipeline(meta: Metadata): HTMLElement {
   return wrap;
 }
 
+interface StageTiming {
+  component: string;
+  phase: string;
+  ms: number;
+  steps?: number;
+}
 interface Perf {
-  loadMs: number;
-  runMs: number;
-  numSteps: number;
-  stepsPerSecond: number | null;
-  msPerStep: number | null;
+  loadMs?: number;
+  runMs?: number;
+  numSteps?: number;
+  stepsPerSecond?: number | null;
+  msPerStep?: number | null;
+  stages?: StageTiming[];
+  stepMs?: (number | null)[];
 }
 
-// Render a prominent speed card (it/s), directly comparable to ComfyUI.
+// Render a prominent speed card (it/s), directly comparable to ComfyUI,
+// plus per-pipeline-stage and per-step timing breakdowns.
 function renderPerf(perf: Perf | null | undefined): HTMLElement | null {
-  if (!perf || perf.stepsPerSecond === null) return null;
+  if (!perf) return null;
   const card = el("div", "perf");
-  const big = el("div", "perf-big", `${perf.stepsPerSecond.toFixed(1)} it/s`);
-  card.appendChild(big);
-  const detail = el(
-    "div",
-    "perf-detail",
-    `${perf.numSteps} steps · ${perf.runMs.toFixed(1)} ms loop` +
-      (perf.msPerStep !== null ? ` · ${perf.msPerStep.toFixed(2)} ms/step` : "") +
-      ` · model load ${perf.loadMs.toFixed(0)} ms (excluded)`
-  );
-  card.appendChild(detail);
-  card.appendChild(
-    el("div", "perf-note", "it/s = reverse-process steps per second (same metric ComfyUI reports)")
-  );
-  return card;
+  if (perf.stepsPerSecond != null) {
+    card.appendChild(el("div", "perf-big", `${perf.stepsPerSecond.toFixed(1)} it/s`));
+    const detail = el(
+      "div",
+      "perf-detail",
+      `${perf.numSteps} steps · ${perf.runMs?.toFixed(1)} ms loop` +
+        (perf.msPerStep != null ? ` · ${perf.msPerStep.toFixed(2)} ms/step avg` : "") +
+        (perf.loadMs != null ? ` · model load ${perf.loadMs.toFixed(0)} ms (excluded)` : "")
+    );
+    card.appendChild(detail);
+    card.appendChild(
+      el("div", "perf-note", "it/s = reverse-process steps per second (same metric ComfyUI reports)")
+    );
+  }
+
+  // Per-pipeline-stage timing (encode / denoise / decode).
+  if (perf.stages && perf.stages.length) {
+    const stageBox = el("div", "timing-block");
+    stageBox.appendChild(el("div", "timing-title", "Pipeline stages"));
+    const maxMs = Math.max(...perf.stages.map((s) => s.ms), 0.0001);
+    for (const s of perf.stages) {
+      const rowEl = el("div", "timing-row");
+      const name = s.steps ? `${s.component} (${s.phase}, ${s.steps} steps)` : `${s.component} (${s.phase})`;
+      rowEl.appendChild(el("span", "timing-name", name));
+      const bar = el("div", "timing-bar");
+      const fill = el("div", "timing-fill");
+      fill.style.width = `${Math.max(2, (s.ms / maxMs) * 100)}%`;
+      bar.appendChild(fill);
+      rowEl.appendChild(bar);
+      rowEl.appendChild(el("span", "timing-ms", `${s.ms.toFixed(2)} ms`));
+      stageBox.appendChild(rowEl);
+    }
+    card.appendChild(stageBox);
+  }
+
+  // Per reverse-process step timing.
+  const stepMs = (perf.stepMs ?? []).filter((v): v is number => typeof v === "number");
+  if (stepMs.length) {
+    const stepBox = el("div", "timing-block");
+    stepBox.appendChild(el("div", "timing-title", "Per-step time"));
+    const maxMs = Math.max(...stepMs, 0.0001);
+    stepMs.forEach((ms, i) => {
+      const rowEl = el("div", "timing-row");
+      rowEl.appendChild(el("span", "timing-name", `step ${i + 1}`));
+      const bar = el("div", "timing-bar");
+      const fill = el("div", "timing-fill step");
+      fill.style.width = `${Math.max(2, (ms / maxMs) * 100)}%`;
+      bar.appendChild(fill);
+      rowEl.appendChild(bar);
+      rowEl.appendChild(el("span", "timing-ms", `${ms.toFixed(2)} ms`));
+      stepBox.appendChild(rowEl);
+    });
+    card.appendChild(stepBox);
+  }
+
+  return card.childNodes.length ? card : null;
 }
 
 // ---- Language un-masking animation ----

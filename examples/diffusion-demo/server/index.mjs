@@ -113,7 +113,11 @@ function runPipelineWithDump(packageDir, outputEndpoint, inputs) {
   const timing = timingMatch
     ? { loadMs: Number(timingMatch[1]), runMs: Number(timingMatch[2]) }
     : null;
-  return { frames, timing };
+  const stagesPath = join(dump, "stages.json");
+  const stages = existsSync(stagesPath)
+    ? JSON.parse(readFileSync(stagesPath, "utf8")).stages ?? []
+    : [];
+  return { frames, timing, stages };
 }
 
 // Language diffusion: seed an all-mask sequence and run masked_diffusion.
@@ -128,7 +132,7 @@ function runLanguage() {
   const buf = Buffer.alloc(seqLen * 8);
   for (let i = 0; i < seqLen; i++) buf.writeBigInt64LE(BigInt(maskId), i * 8);
   writeFileSync(seedPath, buf);
-  const { frames, timing } = runPipelineWithDump(LM_PACKAGE, "denoiser.input_ids", [
+  const { frames, timing, stages } = runPipelineWithDump(LM_PACKAGE, "denoiser.input_ids", [
     `denoiser.input_ids:i64:1,${seqLen}:${seedPath}`,
   ]);
   const metadata = metaText ? YAML.parse(metaText) : null;
@@ -140,8 +144,12 @@ function runLanguage() {
         // it/s, exactly as ComfyUI reports it: reverse-process steps per second.
         stepsPerSecond: timing.runMs > 0 ? (numSteps / timing.runMs) * 1000 : null,
         msPerStep: numSteps > 0 ? timing.runMs / numSteps : null,
+        // Per-pipeline-stage timings (encode / denoise / decode).
+        stages,
+        // Per reverse-process step wall-clock (ms), in step order.
+        stepMs: frames.map((f) => f.step_ms ?? null),
       }
-    : null;
+    : { stages, stepMs: frames.map((f) => f.step_ms ?? null) };
   return { kind: "language", maskId, numSteps, seqLen, metadata, frames, perf };
 }
 

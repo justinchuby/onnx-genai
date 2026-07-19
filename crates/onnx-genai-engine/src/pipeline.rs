@@ -245,7 +245,7 @@ impl PipelineEngine {
         )?;
 
         let mut tensors = pipeline_request.inputs;
-        self.run_prompt_phase_components(&ar.prompt_components, &mut tensors)?;
+        self.run_prompt_phase_components(&ar.prompt_components, &mut tensors, "prologue", None)?;
         let decoder_extras = self.decoder_extra_inputs(&ar.decoder, &tensors)?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
@@ -392,7 +392,13 @@ impl PipelineEngine {
         // with a conditioning input cannot clobber that conditioning. Denoiser
         // outputs live in a separate `loop_state`, keyed by output port.
         let mut constants = request.inputs;
-        self.run_prompt_phase_components(&plan.prompt_components, &mut constants)?;
+        let mut stage_timings: Vec<serde_json::Value> = Vec::new();
+        self.run_prompt_phase_components(
+            &plan.prompt_components,
+            &mut constants,
+            "encode",
+            Some(&mut stage_timings),
+        )?;
 
         let denoiser = self
             .models
@@ -459,7 +465,9 @@ impl PipelineEngine {
         }
         // Partial (img2img) loops start at `start_step`; the seed is then the
         // encoded image already noised to `timesteps[start_step]`.
+        let denoise_start = std::time::Instant::now();
         for step in start_step..num_steps {
+            let step_start = std::time::Instant::now();
             let is_first = step == start_step;
             // Timestep/sigma for this step: explicit schedule when provided,
             // otherwise the 0-based step index.
@@ -599,11 +607,24 @@ impl PipelineEngine {
                 } else {
                     clone_value(model_output)?
                 };
-                dump_iterative_step(&plan.denoiser, in_port, step, &next);
+                dump_iterative_step(
+                    &plan.denoiser,
+                    in_port,
+                    step,
+                    &next,
+                    step_start.elapsed().as_secs_f64() * 1e3,
+                );
                 carried.insert(in_port.clone(), next);
             }
             last_outputs = out_map;
         }
+        let denoise_ms = denoise_start.elapsed().as_secs_f64() * 1e3;
+        stage_timings.push(serde_json::json!({
+            "component": plan.denoiser,
+            "phase": "denoise",
+            "ms": denoise_ms,
+            "steps": num_steps - start_step,
+        }));
 
         // Publish the final denoiser outputs (raw predictions) and the final
         // loop-carried samples, then run final-phase components once. A VAE can
@@ -615,7 +636,13 @@ impl PipelineEngine {
         for (in_port, value) in carried {
             tensors.insert(format!("{}.{}", plan.denoiser, in_port), value);
         }
-        self.run_prompt_phase_components(&plan.final_components, &mut tensors)?;
+        self.run_prompt_phase_components(
+            &plan.final_components,
+            &mut tensors,
+            "decode",
+            Some(&mut stage_timings),
+        )?;
+        dump_stage_timings(&stage_timings);
         Ok(tensors)
     }
 
@@ -740,7 +767,7 @@ impl PipelineEngine {
             anyhow::bail!("internal error: run_single_pass on a non-single-pass plan");
         };
         let mut tensors = request.inputs;
-        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors)?;
+        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors, "prologue", None)?;
 
         let model = self
             .models
@@ -770,6 +797,8 @@ impl PipelineEngine {
         &self,
         components: &[String],
         tensors: &mut PipelineTensors,
+        phase: &str,
+        mut timings: Option<&mut Vec<serde_json::Value>>,
     ) -> anyhow::Result<()> {
         for component in components {
             let session = self
@@ -781,9 +810,17 @@ impl PipelineEngine {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
                 .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
             let outputs = session
                 .run(&refs)
                 .map_err(|e| anyhow::anyhow!("ORT pipeline component '{component}' failed: {e}"))?;
+            if let Some(sink) = timings.as_deref_mut() {
+                sink.push(serde_json::json!({
+                    "component": component,
+                    "phase": phase,
+                    "ms": started.elapsed().as_secs_f64() * 1e3,
+                }));
+            }
             for (name, value) in session.output_names().iter().zip(outputs) {
                 tensors.insert(format!("{component}.{name}"), value);
             }
@@ -1038,27 +1075,39 @@ struct SinglePassPlan {
 /// Dump one iterative step's loop-carried tensor to `ONNX_GENAI_STEP_DUMP_DIR`
 /// (when set) as `step_{i}_{port}.json` — used by the diffusion demo to animate
 /// the reverse process. Best-effort; failures are ignored (never affects a run).
-fn dump_iterative_step(denoiser: &str, port: &str, step: usize, value: &Value) {
+fn dump_iterative_step(denoiser: &str, port: &str, step: usize, value: &Value, step_ms: f64) {
     let Ok(dir) = std::env::var("ONNX_GENAI_STEP_DUMP_DIR") else {
         return;
     };
     let shape: Vec<i64> = value.shape().to_vec();
     // Emit int64 token sequences as integers (language diffusion) and everything
-    // else as f32 (image latents).
+    // else as f32 (image latents). `step_ms` is this step's wall-clock time.
     let payload = match value.dtype() {
         DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => value
             .to_vec_i64()
             .ok()
-            .map(|data| serde_json::json!({"dtype": "i64", "shape": shape, "data": data})),
+            .map(|data| serde_json::json!({"dtype": "i64", "shape": shape, "data": data, "step_ms": step_ms})),
         _ => value
             .to_vec_f32()
             .ok()
-            .map(|data| serde_json::json!({"dtype": "f32", "shape": shape, "data": data})),
+            .map(|data| serde_json::json!({"dtype": "f32", "shape": shape, "data": data, "step_ms": step_ms})),
     };
     if let Some(payload) = payload {
         let path = std::path::Path::new(&dir).join(format!("step_{step:04}_{denoiser}_{port}.json"));
         let _ = std::fs::write(path, payload.to_string());
     }
+}
+
+/// Write the per-pipeline-stage timing report (`stages.json`) to the step-dump
+/// directory when `ONNX_GENAI_STEP_DUMP_DIR` is set. Each entry is
+/// `{component, phase, ms[, steps]}`, covering the prompt encoders (`encode`),
+/// the denoiser loop total (`denoise`), and the final VAE-style pass (`decode`).
+fn dump_stage_timings(stages: &[serde_json::Value]) {
+    let Ok(dir) = std::env::var("ONNX_GENAI_STEP_DUMP_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("stages.json");
+    let _ = std::fs::write(path, serde_json::json!({ "stages": stages }).to_string());
 }
 
 #[derive(Debug, Clone)]

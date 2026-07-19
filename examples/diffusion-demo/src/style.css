@@ -94,3 +94,13 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 1
 .perf-big { font-size: 26px; font-weight: 700; color: var(--encoder); }
 .perf-detail { font-size: 12px; color: var(--text); margin-top: 2px; font-family: ui-monospace, monospace; }
 .perf-note { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+/* timing breakdown */
+.timing-block { margin-top: 12px; }
+.timing-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+.timing-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; font-size: 12px; }
+.timing-name { flex: 0 0 190px; color: var(--text); font-family: ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.timing-bar { flex: 1; height: 10px; background: var(--bg); border-radius: 5px; overflow: hidden; }
+.timing-fill { height: 100%; background: var(--accent); border-radius: 5px; }
+.timing-fill.step { background: var(--denoiser); }
+.timing-ms { flex: 0 0 74px; text-align: right; color: var(--muted); font-family: ui-monospace, monospace; }

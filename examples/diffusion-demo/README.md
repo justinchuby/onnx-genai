@@ -74,6 +74,9 @@ After a language run the UI shows a **speed card** with **it/s** (reverse-proces
 steps per second) — the exact metric ComfyUI reports. It is computed from the
 runtime's pure reverse-process loop time (model/session load is measured and
 **excluded**, matching how ComfyUI quotes it/s after the model is resident).
+The card also breaks down timing **per pipeline stage** (encode / denoise /
+decode) and **per reverse-process step**, so you can see exactly where the time
+goes.
 
 ### Beating ComfyUI (reproducible head-to-head)
 
