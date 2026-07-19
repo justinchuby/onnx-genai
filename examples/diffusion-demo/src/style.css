@@ -85,3 +85,12 @@ button:disabled { opacity: .5; cursor: default; }
 input[type=range] { flex: 1; }
 .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
 code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+/* perf card */
+.perf {
+  background: linear-gradient(135deg, #12261a, #0d1117);
+  border: 1px solid var(--encoder); border-radius: 10px; padding: 12px 16px; margin-bottom: 12px;
+}
+.perf-big { font-size: 26px; font-weight: 700; color: var(--encoder); }
+.perf-detail { font-size: 12px; color: var(--text); margin-top: 2px; font-family: ui-monospace, monospace; }
+.perf-note { font-size: 11px; color: var(--muted); margin-top: 4px; }

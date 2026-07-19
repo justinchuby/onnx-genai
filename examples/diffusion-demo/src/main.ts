@@ -157,13 +157,43 @@ function renderPipeline(meta: Metadata): HTMLElement {
   return wrap;
 }
 
+interface Perf {
+  loadMs: number;
+  runMs: number;
+  numSteps: number;
+  stepsPerSecond: number | null;
+  msPerStep: number | null;
+}
+
+// Render a prominent speed card (it/s), directly comparable to ComfyUI.
+function renderPerf(perf: Perf | null | undefined): HTMLElement | null {
+  if (!perf || perf.stepsPerSecond === null) return null;
+  const card = el("div", "perf");
+  const big = el("div", "perf-big", `${perf.stepsPerSecond.toFixed(1)} it/s`);
+  card.appendChild(big);
+  const detail = el(
+    "div",
+    "perf-detail",
+    `${perf.numSteps} steps · ${perf.runMs.toFixed(1)} ms loop` +
+      (perf.msPerStep !== null ? ` · ${perf.msPerStep.toFixed(2)} ms/step` : "") +
+      ` · model load ${perf.loadMs.toFixed(0)} ms (excluded)`
+  );
+  card.appendChild(detail);
+  card.appendChild(
+    el("div", "perf-note", "it/s = reverse-process steps per second (same metric ComfyUI reports)")
+  );
+  return card;
+}
+
 // ---- Language un-masking animation ----
-function renderLanguageRun(container: HTMLElement, frames: Frame[], maskId: number) {
+function renderLanguageRun(container: HTMLElement, frames: Frame[], maskId: number, perf?: Perf | null) {
   container.innerHTML = "";
   if (!frames.length) {
     container.appendChild(el("div", "err", "No frames returned."));
     return;
   }
+  const perfCard = renderPerf(perf);
+  if (perfCard) container.appendChild(perfCard);
   const last = frames[frames.length - 1];
   const seqLen = last.shape[last.shape.length - 1];
 
@@ -354,7 +384,7 @@ function render() {
           loadedMeta = null;
           runPanel.style.display = "";
         }
-        renderLanguageRun(runOut, res.frames as Frame[], res.maskId);
+        renderLanguageRun(runOut, res.frames as Frame[], res.maskId, res.perf as Perf);
       } catch (e) {
         setErr(runErr, String((e as Error).message));
       } finally {
@@ -373,7 +403,7 @@ function render() {
       if (currentTab === "language") {
         const res = await postText("/api/run/language", "{}");
         if (res.metadata && !loadedMeta) showViz(res.metadata as Metadata);
-        renderLanguageRun(runOut, res.frames as Frame[], res.maskId);
+        renderLanguageRun(runOut, res.frames as Frame[], res.maskId, res.perf as Perf);
       } else {
         const res = await postText("/api/run/image", "{}");
         runOut.innerHTML = "";

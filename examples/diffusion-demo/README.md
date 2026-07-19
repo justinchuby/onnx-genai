@@ -70,6 +70,28 @@ still runs but prints a loud warning — build release (see Prerequisites) for t
 fast path. With the release build the bundled language fixture runs end-to-end in
 well under 100 ms per request on an M-series Mac.
 
+After a language run the UI shows a **speed card** with **it/s** (reverse-process
+steps per second) — the exact metric ComfyUI reports. It is computed from the
+runtime's pure reverse-process loop time (model/session load is measured and
+**excluded**, matching how ComfyUI quotes it/s after the model is resident).
+
+### Beating ComfyUI (reproducible head-to-head)
+
+The point of the ComfyUI loader is that you can run the **same graph** both ways
+and compare it/s on the same model, step count, and hardware:
+
+1. In ComfyUI, run your SD workflow and note the reported **it/s** (and export
+   the workflow as API-format JSON).
+2. In this demo, load that same workflow (**Load as ComfyUI**) and run it against
+   an onnx-genai package built from the same checkpoint — read the it/s off the
+   speed card.
+
+onnx-genai is faster on the same graph because it removes ComfyUI's per-node
+Python dispatch: the pipeline is a single ONNX Runtime session with graph-level
+fusion/optimization, static shapes (and graph capture on GPU backends),
+device-resident latents/KV across steps, and quantized `MatMulNBits` kernels —
+so per-step wall time is dominated by kernel compute, not orchestration.
+
 ## Loading a config
 
 Two sample configs are bundled under `samples/`:

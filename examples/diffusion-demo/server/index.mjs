@@ -92,7 +92,9 @@ function translateComfyui(workflowJson) {
   return JSON.parse(r.stdout);
 }
 
-// Run an iterative pipeline, dumping each step; return the per-step frames.
+// Run an iterative pipeline, dumping each step; return the per-step frames and
+// the runtime timing parsed from run_diffusion (`load` = model/session load,
+// `run` = the pure reverse-process loop, i.e. the ComfyUI-comparable it/s time).
 function runPipelineWithDump(packageDir, outputEndpoint, inputs) {
   const bin = findBinary("run_diffusion");
   const dump = mkdtempSync(join(tmpdir(), "ogsteps-"));
@@ -107,7 +109,11 @@ function runPipelineWithDump(packageDir, outputEndpoint, inputs) {
     .filter((f) => f.startsWith("step_") && f.endsWith(".json"))
     .sort()
     .map((f) => JSON.parse(readFileSync(join(dump, f), "utf8")));
-  return frames;
+  const timingMatch = /\[timing\]\s*load=([\d.]+)ms\s*run=([\d.]+)ms/.exec(r.stderr || "");
+  const timing = timingMatch
+    ? { loadMs: Number(timingMatch[1]), runMs: Number(timingMatch[2]) }
+    : null;
+  return { frames, timing };
 }
 
 // Language diffusion: seed an all-mask sequence and run masked_diffusion.
@@ -122,11 +128,21 @@ function runLanguage() {
   const buf = Buffer.alloc(seqLen * 8);
   for (let i = 0; i < seqLen; i++) buf.writeBigInt64LE(BigInt(maskId), i * 8);
   writeFileSync(seedPath, buf);
-  const frames = runPipelineWithDump(LM_PACKAGE, "denoiser.input_ids", [
+  const { frames, timing } = runPipelineWithDump(LM_PACKAGE, "denoiser.input_ids", [
     `denoiser.input_ids:i64:1,${seqLen}:${seedPath}`,
   ]);
   const metadata = metaText ? YAML.parse(metaText) : null;
-  return { kind: "language", maskId, numSteps, seqLen, metadata, frames };
+  const perf = timing
+    ? {
+        loadMs: timing.loadMs,
+        runMs: timing.runMs,
+        numSteps,
+        // it/s, exactly as ComfyUI reports it: reverse-process steps per second.
+        stepsPerSecond: timing.runMs > 0 ? (numSteps / timing.runMs) * 1000 : null,
+        msPerStep: numSteps > 0 ? timing.runMs / numSteps : null,
+      }
+    : null;
+  return { kind: "language", maskId, numSteps, seqLen, metadata, frames, perf };
 }
 
 const server = createServer(async (req, res) => {
