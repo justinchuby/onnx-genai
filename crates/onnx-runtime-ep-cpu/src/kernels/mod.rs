@@ -30,6 +30,7 @@ use crate::strided::{elem_offset, next_index, numel};
 pub mod activations;
 pub mod add;
 pub mod attention;
+pub mod bitwise;
 pub mod block_dequant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
@@ -48,6 +49,7 @@ pub mod gather;
 pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
+pub mod hardmax;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
@@ -725,6 +727,22 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("BlackmanWindow", "", 17),
         Box::new(window::BlackmanWindowFactory),
     );
+    reg.register(
+        OpKey::new("BitwiseAnd", "", 18),
+        Box::new(bitwise::BitwiseAndFactory),
+    );
+    reg.register(
+        OpKey::new("BitwiseOr", "", 18),
+        Box::new(bitwise::BitwiseOrFactory),
+    );
+    reg.register(
+        OpKey::new("BitwiseXor", "", 18),
+        Box::new(bitwise::BitwiseXorFactory),
+    );
+    reg.register(
+        OpKey::new("BitwiseNot", "", 18),
+        Box::new(bitwise::BitwiseNotFactory),
+    );
     // Value selection.
     reg.register(OpKey::new("Clip", "", 1), Box::new(selection::ClipFactory));
     reg.register(
@@ -739,6 +757,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("NonZero", "", 9),
         Box::new(selection::NonZeroFactory),
+    );
+    reg.register(
+        OpKey::new("Hardmax", "", 13),
+        Box::new(hardmax::HardmaxFactory),
     );
     reg
 }
@@ -1347,13 +1369,14 @@ mod tests {
         // opset-11 and opset-16 registrations. BatchNormalization,
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
-        // registrations over the Phase-1 op-name count in total.
+        // registrations over the Phase-1 op-name count in total. BitwiseAnd,
+        // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
         // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 62);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 67);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
