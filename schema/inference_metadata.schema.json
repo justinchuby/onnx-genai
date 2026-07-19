@@ -1572,6 +1572,13 @@
             "null"
           ]
         },
+        "use_exponential_sigmas": {
+          "description": "Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)\ninstead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive\nwith `use_karras_sigmas` (Karras takes precedence).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "use_karras_sigmas": {
           "description": "Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the\ndefault linspace spacing. Applies to sigma-space schedulers (`euler`,\n`dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.",
           "type": [

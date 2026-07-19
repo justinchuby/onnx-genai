@@ -752,6 +752,11 @@ pub struct SchedulerSpec {
     /// default linspace spacing. Applies to sigma-space schedulers (`euler`,
     /// `dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.
     pub use_karras_sigmas: Option<bool>,
+
+    /// Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)
+    /// instead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive
+    /// with `use_karras_sigmas` (Karras takes precedence).
+    pub use_exponential_sigmas: Option<bool>,
 }
 
 /// Pipeline execution strategy family.

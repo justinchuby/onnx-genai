@@ -45,12 +45,22 @@ def karras_sigmas(num_train, beta_start, beta_end, num_steps):
     return sig
 
 
-def check(name, ref_sigmas, num_steps):
-    mine = np.array(karras_sigmas(NUM_TRAIN, BETA_START, BETA_END, num_steps))
+def exponential_sigmas(num_train, beta_start, beta_end, num_steps):
+    """exp(linspace(log sigma_max, log sigma_min, n)); append trailing 0."""
+    train = training_sigmas(num_train, beta_start, beta_end)
+    log_min, log_max = math.log(train[0]), math.log(train[-1])
+    ramp = [k / (num_steps - 1) for k in range(num_steps)] if num_steps > 1 else [0.0]
+    sig = [math.exp(log_max + r * (log_min - log_max)) for r in ramp]
+    sig.append(0.0)
+    return sig
+
+
+def check(name, ref_sigmas, num_steps, fn=karras_sigmas):
+    mine = np.array(fn(NUM_TRAIN, BETA_START, BETA_END, num_steps))
     ref = np.array([float(s) for s in ref_sigmas])
     diff = float(np.abs(mine - ref).max())
     print(f"{name}: my sigmas[:3]={mine[:3]}  ref[:3]={ref[:3]}  max|Δ|={diff:.3e}")
-    assert diff < 1e-4, f"{name} Karras sigma mismatch: {diff}"
+    assert diff < 1e-4, f"{name} sigma mismatch: {diff}"
 
 
 def main():
@@ -70,7 +80,14 @@ def main():
         d.set_timesteps(num_steps)
         check(f"dpm++karras N={num_steps}", d.sigmas, num_steps)
 
-    print("\nPARITY OK: Karras sigma schedule matches diffusers (euler + dpm++)")
+        ex = EulerDiscreteScheduler(
+            num_train_timesteps=NUM_TRAIN, beta_start=BETA_START, beta_end=BETA_END,
+            beta_schedule="scaled_linear", use_exponential_sigmas=True, timestep_spacing="linspace",
+        )
+        ex.set_timesteps(num_steps)
+        check(f"euler-exp    N={num_steps}", ex.sigmas, num_steps, exponential_sigmas)
+
+    print("\nPARITY OK: Karras + exponential sigma schedules match diffusers")
 
 
 if __name__ == "__main__":

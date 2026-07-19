@@ -1079,7 +1079,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
-                    cfg.use_karras_sigmas.unwrap_or(false),
+                    sigma_spacing(cfg),
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1100,7 +1100,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
-                    cfg.use_karras_sigmas.unwrap_or(false),
+                    sigma_spacing(cfg),
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1121,7 +1121,7 @@ impl SchedulerRegistry {
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
-                    cfg.use_karras_sigmas.unwrap_or(false),
+                    sigma_spacing(cfg),
                 )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
@@ -1346,7 +1346,7 @@ impl EulerSchedule {
         beta_end: f32,
         beta_schedule: &str,
         num_steps: usize,
-        use_karras: bool,
+        spacing: &str,
     ) -> anyhow::Result<Self> {
         if num_train_timesteps < 2 {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
@@ -1356,9 +1356,9 @@ impl EulerSchedule {
                 "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
             );
         }
-        if use_karras {
-            let sigmas =
-                karras_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?;
+        if let Some(sigmas) =
+            spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
+        {
             return Ok(Self { sigmas });
         }
         let denom = (num_train_timesteps - 1) as f32;
@@ -1471,16 +1471,16 @@ impl EulerAncestral {
         beta_end: f32,
         beta_schedule: &str,
         num_steps: usize,
-        use_karras: bool,
+        spacing: &str,
     ) -> anyhow::Result<Self> {
-        // Same sigma schedule as Euler (linspace interp or Karras).
+        // Same sigma schedule as Euler (linspace interp / Karras / exponential).
         let euler = EulerSchedule::with_schedule(
             num_train_timesteps,
             beta_start,
             beta_end,
             beta_schedule,
             num_steps,
-            use_karras,
+            spacing,
         )?;
         Ok(Self { sigmas: euler.sigmas })
     }
@@ -1565,7 +1565,7 @@ impl Dpmpp2m {
         beta_end: f32,
         beta_schedule: &str,
         num_steps: usize,
-        use_karras: bool,
+        spacing: &str,
     ) -> anyhow::Result<Self> {
         if num_train_timesteps < 2 {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
@@ -1575,9 +1575,9 @@ impl Dpmpp2m {
                 "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
             );
         }
-        if use_karras {
-            let sigmas =
-                karras_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?;
+        if let Some(sigmas) =
+            spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
+        {
             return Ok(Self {
                 sigmas,
                 prev_x0: Mutex::new(None),
@@ -1682,6 +1682,66 @@ fn karras_sigmas(
     }
     sigmas.push(0.0);
     Ok(sigmas)
+}
+
+/// Exponential sigma schedule: `exp(linspace(log(sigma_max), log(sigma_min), n))`,
+/// descending, trailing `0.0`. Same training-sigma min/max as Karras. Matches
+/// diffusers `_convert_to_exponential`.
+fn exponential_sigmas(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+    num_steps: usize,
+) -> anyhow::Result<Vec<f32>> {
+    let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+    let log_min = train[0].ln();
+    let log_max = train[num_train_timesteps - 1].ln();
+    let mut sigmas = Vec::with_capacity(num_steps + 1);
+    for k in 0..num_steps {
+        let ramp = if num_steps > 1 {
+            k as f32 / (num_steps - 1) as f32
+        } else {
+            0.0
+        };
+        sigmas.push((log_max + ramp * (log_min - log_max)).exp());
+    }
+    sigmas.push(0.0);
+    Ok(sigmas)
+}
+
+/// Select the sigma schedule the spec requests: `"karras"`, `"exponential"`, or
+/// the default `"linspace"`.
+fn sigma_spacing(cfg: &SchedulerSpec) -> &'static str {
+    if cfg.use_karras_sigmas.unwrap_or(false) {
+        "karras"
+    } else if cfg.use_exponential_sigmas.unwrap_or(false) {
+        "exponential"
+    } else {
+        "linspace"
+    }
+}
+
+/// Precomputed sigmas for a non-linspace spacing (`karras`/`exponential`), or
+/// `None` for the default `linspace` (which each scheduler builds itself).
+fn spacing_sigmas(
+    spacing: &str,
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+    num_steps: usize,
+) -> anyhow::Result<Option<Vec<f32>>> {
+    match spacing {
+        "karras" => Ok(Some(karras_sigmas(
+            num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps,
+        )?)),
+        "exponential" => Ok(Some(exponential_sigmas(
+            num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps,
+        )?)),
+        "linspace" | "" => Ok(None),
+        other => anyhow::bail!("unsupported sigma spacing '{other}' (karras/exponential/linspace)"),
+    }
 }
 
 impl Scheduler for Dpmpp2m {
