@@ -55,6 +55,7 @@ pub mod fused_matmul_bias;
 pub mod gather;
 pub mod gelu;
 pub mod gemm;
+pub mod grid_sample;
 pub mod group_query_attention;
 pub mod hardmax;
 pub mod identity;
@@ -501,6 +502,14 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         Box::new(dropout::DropoutFactory),
     );
     reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
+    reg.register(
+        OpKey::new("GridSample", "", 16),
+        Box::new(grid_sample::GridSampleFactory),
+    );
+    reg.register(
+        OpKey::new("GridSample", "", 20),
+        Box::new(grid_sample::GridSampleFactory),
+    );
     reg.register(
         OpKey::new("AffineGrid", "", 20),
         Box::new(affine_grid::AffineGridFactory),
@@ -1458,7 +1467,8 @@ mod tests {
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 82);
+        // GridSample has separate opset-16 and opset-20 registrations.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 84);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1480,6 +1490,8 @@ mod tests {
         assert!(reg.lookup("Split", "", 18).is_some());
         assert!(reg.lookup("Dropout", "", 13).is_some());
         assert!(reg.lookup("Dropout", "", 22).is_some());
+        assert!(reg.lookup("GridSample", "", 16).is_some());
+        assert!(reg.lookup("GridSample", "", 20).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
