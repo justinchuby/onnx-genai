@@ -4,9 +4,17 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T23:00Z — multi-threaded vendored MLAS f32 GEMM reaches ORT 8-thread parity (isolated GEMM); ConvTranspose/Unique CPU kernels, fused QMoE export, and kernel benchmarks landed._
+_Last updated: 2026-07-20T00:15Z — vendored MLAS f32 GEMM reaches ORT 8-thread parity (isolated GEMM); ConvTranspose/Unique CPU kernels, fused QMoE export, and kernel benchmarks landed._
 
 **Current `origin/main` implementation HEAD:** `6a7755c`.
+
+## 2026-07-20 — MLAS CPU-GEMM parity (vendored FFI)
+
+- **mlas-sys FFI crate ✅ vendored + merged (`556b0d8`):** ONNX Runtime's real MLAS f32 SGEMM is built standalone via `cc` (no cmake, `BUILD_MLAS_NO_ONNXRUNTIME`, and never `ORT_MINIMAL_BUILD`), MIT-licensed, and excluded from workspace default-members. The spike proved single-thread AVX-512F parity (beating ORT). (Gaff 🟢)
+- **MLAS wired into ep-cpu as opt-in `mlas` backend ✅ (`d696b7a`→`85087ac`):** feature-gated `CpuBackend::Mlas`, selected via `NXRT_CPU_GEMM_BACKEND=mlas`; default stays `SimdX86`; forced `simd` is guarded by `has_simd_x86()`; publish metadata is fixed. (Chew 🟢 after a reject→fix cycle)
+- **MLAS multi-thread parity ✅ (`8764b3d`→`ee7a6cd`):** a pluggable Rayon-backed parallel-for hook (`shim.cpp` `MlasStandaloneParallelFor`, vendored patches tagged `nxrt-mlas-mt`, documented in the crate provenance README) lets `MlasGemmBatch` use its own cache-aware partitioning on our Rayon pool without oversubscription. On Sapphire Rapids 32×512×512: **1t 129µs / 8t 32.3µs (~4× scaling)** vs ORT **131µs / 30.6µs** — f32 GEMM parity at both 1 and 8 threads. MLAS is the fastest ep-cpu backend at every tested shape. (Gaff 🟢 after a provenance reject→fix cycle)
+- **Status:** `mlas` remains OFF by default (opt-in); flipping the auto default to Mlas is a one-liner pending broader validation.
+- **Remaining levers (follow-ups, not yet done):** (a) per-call output-buffer/PackedB reuse — end-to-end 8-thread MatMul is currently allocation-bound (~147µs e2e vs ~32µs isolated GEMM), a backend-agnostic cost; (b) MLAS pre-packed B through the existing `MatMulPrepack` seam for constant weights; (c) fp16/bf16 MLAS entry points (dtype coverage ≥ ORT); (d) quantized MatMulNBits/int4 MLAS path (LLM decode); (e) `CpuBackend::Mlas` default flip once validated; (f) Windows MASM `.asm` build (currently Linux GAS `.S` only).
 
 ## 2026-07-19 — MLAS CPU-EP opt-in integration
 
@@ -27,7 +35,6 @@ _Last updated: 2026-07-19T23:00Z — multi-threaded vendored MLAS f32 GEMM reach
 - **Fused GLM/DeepSeek QMoE emitter ✅ landed (`fe3e342`; Mobius `93cbcf7`):** quantized routed experts can emit one expert-major int4 `com.microsoft::QMoE` node instead of per-expert `MatMulNBits`. The gated tiny-model E2E covers prefill and decode through **ORT's contrib QMoE CPU kernel, not the native Rust kernel**.
 - **Kernel benchmark harness ✅ landed (`d89a47e`, `59b17ad`):** Criterion microbenchmarks, fixed numeric regressions, and thread-matched ORT baselines are available. Medium-f32 MatMul is currently about **21.4× slower at one thread and 16.4× slower at eight threads** than ORT.
 - **CPU-kernel quality bar:** new kernels must not be slower than ORT for equivalent work and should provide broader dtype coverage where the runtime can safely represent those dtypes.
-- **MLAS-style SIMD GEMM port ✅ landed (`15e2f2e`):** `SimdX86` is now the default x86 fast path; the `mlas-sys` vendoring feasibility spike remains in progress for full AVX-512/AMX parity.
 
 ## 2026-07-19 — GLM-5.2 / DeepSeek E2E
 
