@@ -468,6 +468,10 @@ pub enum EngineDecodeBackend {
 pub struct EngineConfig {
     /// Decoder execution backend. [`EngineDecodeBackend::Auto`] preserves ORT
     /// for existing models and selects native execution only when required.
+    ///
+    /// When this remains `Auto`, `ONNX_GENAI_BACKEND` may select `auto`, `ort`,
+    /// or `native` instead. An explicit `Ort` or `Native` value always takes
+    /// precedence over the environment variable.
     pub decode_backend: EngineDecodeBackend,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.

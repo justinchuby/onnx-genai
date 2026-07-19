@@ -398,7 +398,8 @@ impl Engine {
         let decode_backend =
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?;
         if decode_backend == EngineDecodeBackend::Native {
-            return Self::from_native_model_directory(model_directory, config, &session_options);
+            return Self::from_native_model_directory(model_directory, config, &session_options)
+                .with_context(native_to_ort_hint);
         }
 
         // Auto-enable CUDA graph capture for models that will run the shared-KV
@@ -418,7 +419,8 @@ impl Engine {
             &model_directory.model_path,
             session_options.clone(),
         )
-        .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))
+        .with_context(ort_to_native_hint)?;
 
         // Resolve inference metadata. Our own `inference_metadata.yaml` is the
         // canonical source of truth. When a model ships without it (e.g. the
@@ -1043,13 +1045,9 @@ impl Engine {
             .native_session
             .as_mut()
             .context("native decoder session is unavailable")?;
-        native_session.generate_with_callback(
-            &prompt_tokens,
-            &options,
-            &chain,
-            &self.tokenizer,
-            callback,
-        )
+        native_session
+            .generate_with_callback(&prompt_tokens, &options, &chain, &self.tokenizer, callback)
+            .with_context(native_to_ort_hint)
     }
 
     #[cfg(not(feature = "native-backend"))]
@@ -2186,8 +2184,17 @@ fn resolve_decode_backend(
     model_path: &Path,
     requested: EngineDecodeBackend,
 ) -> anyhow::Result<EngineDecodeBackend> {
+    let requested = requested_decode_backend(requested)?;
     match requested {
-        EngineDecodeBackend::Ort => Ok(EngineDecodeBackend::Ort),
+        EngineDecodeBackend::Ort => {
+            if model_requires_native_backend(model_path)? {
+                anyhow::bail!(
+                    "model contains native-only operators (pkg.nxrt::BlockQuantizedMatMul); \
+                     set decode_backend = EngineDecodeBackend::Native (or ONNX_GENAI_BACKEND=native)"
+                );
+            }
+            Ok(EngineDecodeBackend::Ort)
+        }
         EngineDecodeBackend::Native => {
             #[cfg(feature = "native-backend")]
             {
@@ -2197,7 +2204,9 @@ fn resolve_decode_backend(
             {
                 let _ = model_path;
                 anyhow::bail!(
-                    "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
+                    "native decoder backend requires building onnx-genai-engine with the \
+                     'native-backend' feature; set decode_backend = EngineDecodeBackend::Ort \
+                     (or ONNX_GENAI_BACKEND=ort) to run this model on ONNX Runtime"
                 )
             }
         }
@@ -2210,7 +2219,10 @@ fn resolve_decode_backend(
                 #[cfg(not(feature = "native-backend"))]
                 {
                     anyhow::bail!(
-                        "model contains native-only BlockQuantizedMatMul operators; rebuild with the 'native-backend' feature"
+                        "model contains native-only operators (pkg.nxrt::BlockQuantizedMatMul); \
+                         rebuild with the 'native-backend' feature and select \
+                         decode_backend = EngineDecodeBackend::Native \
+                         (or ONNX_GENAI_BACKEND=native)"
                     );
                 }
             }
@@ -2219,29 +2231,67 @@ fn resolve_decode_backend(
     }
 }
 
-pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
-    #[cfg(feature = "native-backend")]
-    {
-        use prost::Message;
-
-        let bytes = std::fs::read(model_path).with_context(|| {
-            format!(
-                "Failed to inspect model '{}' for native operators",
-                model_path.display()
-            )
-        })?;
-        let model = onnx_runtime_loader::proto::ModelProto::decode(bytes.as_slice())
-            .context("Failed to parse ONNX model while selecting decoder backend")?;
-        return Ok(model_proto_requires_native_backend(&model));
-    }
-    #[cfg(not(feature = "native-backend"))]
-    {
-        let _ = model_path;
-        Ok(false)
+fn parse_backend_env(value: &str) -> anyhow::Result<EngineDecodeBackend> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(EngineDecodeBackend::Auto),
+        "ort" => Ok(EngineDecodeBackend::Ort),
+        "native" => Ok(EngineDecodeBackend::Native),
+        _ => anyhow::bail!(
+            "invalid ONNX_GENAI_BACKEND={value:?}; expected one of: auto, ort, native"
+        ),
     }
 }
 
-#[cfg(feature = "native-backend")]
+fn requested_decode_backend_with_env(
+    requested: EngineDecodeBackend,
+    env_value: Option<&str>,
+) -> anyhow::Result<EngineDecodeBackend> {
+    if requested != EngineDecodeBackend::Auto {
+        return Ok(requested);
+    }
+    env_value.map_or(Ok(EngineDecodeBackend::Auto), parse_backend_env)
+}
+
+pub(crate) fn requested_decode_backend(
+    requested: EngineDecodeBackend,
+) -> anyhow::Result<EngineDecodeBackend> {
+    let env_value = match std::env::var("ONNX_GENAI_BACKEND") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to read ONNX_GENAI_BACKEND: {error}"
+            ));
+        }
+    };
+    requested_decode_backend_with_env(requested, env_value.as_deref())
+}
+
+fn ort_to_native_hint() -> &'static str {
+    "ONNX Runtime could not load this model; if it requires native execution, \
+     set decode_backend = EngineDecodeBackend::Native (or ONNX_GENAI_BACKEND=native)"
+}
+
+fn native_to_ort_hint() -> &'static str {
+    "if this model uses operators unsupported by the native backend, \
+     set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) \
+     to run this model on ONNX Runtime"
+}
+
+pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
+    use prost::Message;
+
+    let bytes = std::fs::read(model_path).with_context(|| {
+        format!(
+            "Failed to inspect model '{}' for native operators",
+            model_path.display()
+        )
+    })?;
+    let model = onnx_runtime_loader::proto::ModelProto::decode(bytes.as_slice())
+        .context("Failed to parse ONNX model while selecting decoder backend")?;
+    Ok(model_proto_requires_native_backend(&model))
+}
+
 fn model_proto_requires_native_backend(model: &onnx_runtime_loader::proto::ModelProto) -> bool {
     const DOMAIN: &str = "pkg.nxrt";
     const OP_TYPE: &str = "BlockQuantizedMatMul";
@@ -2815,7 +2865,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "native-backend")]
     #[test]
     fn auto_backend_detection_reads_onnx_node_types_not_incidental_strings() {
         use onnx_runtime_loader::proto::{
@@ -2847,6 +2896,87 @@ mod tests {
         model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt".to_string();
         model.opset_import[0].version = 2;
         assert!(!model_proto_requires_native_backend(&model));
+    }
+
+    #[test]
+    fn backend_env_values_are_case_insensitive_and_reject_unknown_values() {
+        assert_eq!(
+            parse_backend_env("AuTo").unwrap(),
+            EngineDecodeBackend::Auto
+        );
+        assert_eq!(parse_backend_env("ORT").unwrap(), EngineDecodeBackend::Ort);
+        assert_eq!(
+            parse_backend_env("native").unwrap(),
+            EngineDecodeBackend::Native
+        );
+
+        let error = parse_backend_env("cuda").unwrap_err().to_string();
+        assert!(error.contains("ONNX_GENAI_BACKEND"), "{error}");
+        assert!(error.contains("auto, ort, native"), "{error}");
+    }
+
+    #[test]
+    fn explicit_backend_overrides_env_and_auto_honors_it() {
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Ort, Some("native")).unwrap(),
+            EngineDecodeBackend::Ort
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Native, Some("ort")).unwrap(),
+            EngineDecodeBackend::Native
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Auto, Some("ort")).unwrap(),
+            EngineDecodeBackend::Ort
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Auto, None).unwrap(),
+            EngineDecodeBackend::Auto
+        );
+    }
+
+    #[test]
+    fn forced_ort_reports_how_to_switch_for_native_only_model() {
+        use onnx_runtime_loader::proto::{
+            ModelProto,
+            onnx::{GraphProto, NodeProto, OperatorSetIdProto},
+        };
+        use prost::Message;
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    domain: "pkg.nxrt".to_string(),
+                    op_type: "BlockQuantizedMatMul".to_string(),
+                    ..NodeProto::default()
+                }],
+                ..GraphProto::default()
+            }),
+            opset_import: vec![OperatorSetIdProto {
+                domain: "pkg.nxrt".to_string(),
+                version: 1,
+            }],
+            ..ModelProto::default()
+        };
+        let path = test_model_path("native-only");
+        std::fs::write(&path, model.encode_to_vec()).expect("write native-only model");
+
+        let error = resolve_decode_backend(&path, EngineDecodeBackend::Ort)
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(path).ok();
+        assert!(error.contains("native-only operators"), "{error}");
+        assert!(error.contains("ONNX_GENAI_BACKEND=native"), "{error}");
+    }
+
+    #[cfg(not(feature = "native-backend"))]
+    #[test]
+    fn forced_native_without_feature_reports_how_to_switch() {
+        let error = resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
+        assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
     }
 
     fn test_capacities() -> CapacityProviders {
