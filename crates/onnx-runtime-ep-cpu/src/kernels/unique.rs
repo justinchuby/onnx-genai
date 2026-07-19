@@ -120,43 +120,7 @@ fn unique_plan(
     let item_count = axis.map_or_else(|| numel(shape), |axis| shape[axis]);
     let items = make_items(dense, shape, element_size, axis);
 
-    let mut unique_items: Vec<Vec<u8>> = Vec::new();
-    let mut first_indices = Vec::new();
-    let mut inverse_indices = Vec::with_capacity(item_count);
-    let mut counts = Vec::new();
-    for (index, item) in items.into_iter().enumerate() {
-        let group = unique_items
-            .iter()
-            .position(|unique| compare_items(dtype, unique, &item) == Ordering::Equal);
-        let group = match group {
-            Some(group) => {
-                counts[group] += 1;
-                group
-            }
-            None => {
-                let group = unique_items.len();
-                unique_items.push(item);
-                first_indices.push(index);
-                counts.push(1);
-                group
-            }
-        };
-        inverse_indices.push(group);
-    }
-
-    if sorted {
-        let mut order: Vec<usize> = (0..unique_items.len()).collect();
-        order.sort_by(|&a, &b| compare_items(dtype, &unique_items[a], &unique_items[b]));
-        let mut old_to_new = vec![0; order.len()];
-        for (new, &old) in order.iter().enumerate() {
-            old_to_new[old] = new;
-        }
-        first_indices = order.iter().map(|&old| first_indices[old]).collect();
-        counts = order.iter().map(|&old| counts[old]).collect();
-        for group in &mut inverse_indices {
-            *group = old_to_new[*group];
-        }
-    }
+    let (first_indices, inverse_indices, counts) = unique_groups(&items, dtype, item_count, sorted);
 
     Ok(UniquePlan {
         axis,
@@ -164,6 +128,57 @@ fn unique_plan(
         inverse_indices,
         counts,
     })
+}
+
+fn unique_groups(
+    items: &[Vec<u8>],
+    dtype: DataType,
+    item_count: usize,
+    sorted: bool,
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut order: Vec<usize> = (0..item_count).collect();
+    order.sort_unstable_by(|&a, &b| {
+        compare_items(dtype, &items[a], &items[b]).then_with(|| a.cmp(&b))
+    });
+
+    let mut first_indices = Vec::new();
+    let mut inverse_indices = vec![0; item_count];
+    let mut counts = Vec::new();
+    let mut previous_index: Option<usize> = None;
+    for &index in &order {
+        let new_group = previous_index.is_none_or(|previous| {
+            compare_items(dtype, &items[previous], &items[index]) != Ordering::Equal
+        });
+        if new_group {
+            first_indices.push(index);
+            counts.push(0);
+        } else if index < *first_indices.last().unwrap() {
+            *first_indices.last_mut().unwrap() = index;
+        }
+        let group = counts.len() - 1;
+        inverse_indices[index] = group;
+        counts[group] += 1;
+        previous_index = Some(index);
+    }
+
+    if !sorted {
+        let mut group_order: Vec<usize> = (0..first_indices.len()).collect();
+        group_order.sort_unstable_by_key(|&group| first_indices[group]);
+        let mut sorted_to_unsorted = vec![0; group_order.len()];
+        for (unsorted, &sorted) in group_order.iter().enumerate() {
+            sorted_to_unsorted[sorted] = unsorted;
+        }
+        first_indices = group_order
+            .iter()
+            .map(|&group| first_indices[group])
+            .collect();
+        counts = group_order.iter().map(|&group| counts[group]).collect();
+        for group in &mut inverse_indices {
+            *group = sorted_to_unsorted[*group];
+        }
+    }
+
+    (first_indices, inverse_indices, counts)
 }
 
 fn make_items(
@@ -222,6 +237,9 @@ fn gather_y(
 }
 
 fn compare_items(dtype: DataType, a: &[u8], b: &[u8]) -> Ordering {
+    if dtype == DataType::String {
+        return a.cmp(b);
+    }
     let size = dtype.byte_size();
     for (a, b) in a.chunks_exact(size).zip(b.chunks_exact(size)) {
         let ordering = compare_element(dtype, a, b);
@@ -244,7 +262,12 @@ fn compare_element(dtype: DataType, a: &[u8], b: &[u8]) -> Ordering {
         ($ty:ty) => {{
             let a = <$ty>::from_le_bytes(a.try_into().unwrap());
             let b = <$ty>::from_le_bytes(b.try_into().unwrap());
-            a.partial_cmp(&b).unwrap_or_else(|| a.total_cmp(&b))
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => a.partial_cmp(&b).unwrap(),
+            }
         }};
     }
     match dtype {
@@ -259,14 +282,22 @@ fn compare_element(dtype: DataType, a: &[u8], b: &[u8]) -> Ordering {
         DataType::Float16 => {
             let a = half::f16::from_le_bytes(a.try_into().unwrap());
             let b = half::f16::from_le_bytes(b.try_into().unwrap());
-            a.partial_cmp(&b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits()))
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => a.partial_cmp(&b).unwrap(),
+            }
         }
         DataType::BFloat16 => {
             let a = half::bf16::from_le_bytes(a.try_into().unwrap());
             let b = half::bf16::from_le_bytes(b.try_into().unwrap());
-            a.partial_cmp(&b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits()))
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => a.partial_cmp(&b).unwrap(),
+            }
         }
         DataType::Float32 => compare_float!(f32),
         DataType::Float64 => compare_float!(f64),
@@ -300,7 +331,8 @@ fn ensure_supported_dtype(dtype: DataType) -> Result<()> {
         | DataType::Float16
         | DataType::BFloat16
         | DataType::Float32
-        | DataType::Float64 => Ok(()),
+        | DataType::Float64
+        | DataType::String => Ok(()),
         _ => Err(EpError::KernelFailed(format!(
             "Unique: dtype {dtype:?} is unsupported"
         ))),
@@ -406,5 +438,88 @@ mod tests {
         assert_eq!(indices.to_i64(), vec![0, 1, 3, 4]);
         assert_eq!(inverse.to_i64(), vec![0, 1, 1, 2, 3, 2]);
         assert_eq!(counts.to_i64(), vec![1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn collapses_all_nan_payloads_and_signed_zero() {
+        let first_nan = f32::from_bits(0x7fc0_0001);
+        let second_nan = f32::from_bits(0x7fc0_1234);
+        let input = Owned::f32(&[4], &[first_nan, second_nan, -0.0, 0.0]);
+        let mut y = Owned::zeros_f32(&[2]);
+        let mut indices = Owned::zeros(DataType::Int64, &[2]);
+        let mut inverse = Owned::zeros(DataType::Int64, &[4]);
+        let mut counts = Owned::zeros(DataType::Int64, &[2]);
+
+        UniqueKernel {
+            axis: None,
+            sorted: true,
+        }
+        .execute(
+            &[input.view()],
+            &mut [
+                y.view_mut(),
+                indices.view_mut(),
+                inverse.view_mut(),
+                counts.view_mut(),
+            ],
+        )
+        .unwrap();
+
+        let values = y.to_f32();
+        assert_eq!(values[0], -0.0);
+        assert!(values[1].is_nan());
+        assert_eq!(indices.to_i64(), vec![2, 0]);
+        assert_eq!(inverse.to_i64(), vec![1, 1, 0, 0]);
+        assert_eq!(counts.to_i64(), vec![2, 2]);
+    }
+
+    #[test]
+    fn string_groups_are_lexicographic_or_first_seen() {
+        let strings = ["pear", "apple", "pear", "banana", "apple"];
+        let items: Vec<Vec<u8>> = strings
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+
+        let (indices, inverse, counts) = unique_groups(&items, DataType::String, items.len(), true);
+        assert_eq!(indices, vec![1, 3, 0]);
+        assert_eq!(inverse, vec![2, 0, 2, 1, 0]);
+        assert_eq!(counts, vec![2, 1, 2]);
+        assert_eq!(
+            indices
+                .iter()
+                .map(|&index| strings[index])
+                .collect::<Vec<_>>(),
+            vec!["apple", "banana", "pear"]
+        );
+
+        let (indices, inverse, counts) =
+            unique_groups(&items, DataType::String, items.len(), false);
+        assert_eq!(indices, vec![0, 1, 3]);
+        assert_eq!(inverse, vec![0, 1, 0, 2, 1]);
+        assert_eq!(counts, vec![2, 2, 1]);
+        assert_eq!(
+            indices
+                .iter()
+                .map(|&index| strings[index])
+                .collect::<Vec<_>>(),
+            vec!["pear", "apple", "banana"]
+        );
+    }
+
+    #[test]
+    fn large_unique_input_uses_sort_and_linear_grouping() {
+        let item_count = 50_000usize;
+        let items: Vec<Vec<u8>> = (0..item_count)
+            .rev()
+            .map(|value| (value as u64).to_le_bytes().to_vec())
+            .collect();
+
+        let (indices, inverse, counts) = unique_groups(&items, DataType::Uint64, item_count, true);
+        assert_eq!(indices.len(), item_count);
+        assert_eq!(inverse.len(), item_count);
+        assert!(counts.iter().all(|&count| count == 1));
+        assert_eq!(indices[0], item_count - 1);
+        assert_eq!(indices[item_count - 1], 0);
     }
 }
