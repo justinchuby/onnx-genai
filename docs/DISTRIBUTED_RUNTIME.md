@@ -1166,20 +1166,45 @@ coordination:
 - KV cache expansion in one session can OOM another.
 - Shared weights (attention, router, embeddings) are duplicated 8×.
 
-### 12.2 Relationship to WEIGHT_OFFLOAD.md
+### 12.2 Relationship to Existing Memory Designs
 
-[WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md) designs a three-tier weight residency system
-(cold mmap → warm host → hot device) with a `WeightResidencyManager` and
-`ResourceGovernor` that owns sub-budgets. That design is **single-session scoped**:
+Three existing documents already cover memory management. This section
+shows how they compose into the multi-session story.
 
-| Concept | WEIGHT_OFFLOAD.md (single session) | Distributed (multi-session) |
-|---|---|---|
-| Scope | One session, one device | Multiple sessions, one or more devices |
-| Governor | Per-session `ResourceGovernor` | Global `MemoryCoordinator` above governors |
-| Expert policy | Heat-based LRU within session budget | Heat-based + cross-session migration |
-| KV cache | Session-owned page pool | Shared pool with prefix dedup |
-| Shared weights | Loaded once per session | Loaded once per machine, mmap'd by all |
-| Conflict resolution | Sub-budget hysteresis within session | Cross-session arbitration |
+**A. [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md)** — three-tier weight residency
+(cold mmap → warm host → hot device) with `WeightResidencyManager`,
+`ExpertStore`, and heat-based LRU admission. Single-session scoped.
+
+**B. [DESIGN.md §26.11](./DESIGN.md) — Resource Governor** — the engine-level
+byte-budget authority. One per device, shared across all sessions. Already
+designs:
+- Per-tier ceilings (`vram_limit`, `host_ram_limit`, `disk_spill_limit`)
+  with `Bytes / Fraction / Auto` resolution.
+- **Live reconfigurability** via `governor.reconfigure()` / `set_vram_limit()`
+  — limits can change mid-session without restart.
+- Cross-session invariant: `sum(session.usage) ≤ budget.total_pages` (§26.11.3).
+- Lowering a limit triggers tiered eviction (background → paused → running →
+  interactive) until under ceiling, or rejects atomically.
+- Per-session sub-limits nest under the global ceiling.
+- `ArcSwap<ResolvedLimits>` for lock-free hot-path reads.
+
+**C. [DESIGN.md §43.2](./DESIGN.md) — MoE Expert Weights** — declares that
+expert weights are "not KV cache" and should reuse page-table/tiering/LRU/lease
+concepts from `onnx-genai-kv` with a separate weight API. The governor
+allocates coordinated KV + expert sub-budgets so independent LRUs cannot fight.
+
+The multi-session `MemoryCoordinator` sits above all three:
+
+| Concept | WEIGHT_OFFLOAD (single session) | DESIGN §26.11 (per-device governor) | Distributed (this section) |
+|---|---|---|---|
+| Scope | One session, one device | All sessions on one device | All sessions, all devices |
+| Budget authority | Per-session `ResourceGovernor` | Engine-level governor (1 per device) | Global `MemoryCoordinator` above governors |
+| Tier model | Cold mmap → warm host → hot device | VRAM / host RAM / disk spill | Same + cross-session shared tier |
+| Expert policy | Heat-based LRU within session budget | Governor sub-budgets (KV vs expert) | Heat-based + cross-session migration |
+| KV cache | Session-owned page pool | `ByteBudget` gates cross-session admission | Shared pool with prefix dedup |
+| Shared weights | Loaded once per session | N/A | Loaded once per machine, IPC/mmap'd |
+| Live reconfigure | N/A | `reconfigure()` / `set_vram_limit()` | Global rebalance → per-governor reconfigure |
+| Conflict resolution | Sub-budget hysteresis | Tiered eviction (bg→paused→running→interactive) | Cross-session arbitration + tiered eviction |
 
 **Key insight: the single-session design composes into the multi-session design.**
 Each session keeps its `WeightResidencyManager` and `ResourceGovernor`. The new
@@ -1281,14 +1306,25 @@ trait MemoryCoordinator: Send + Sync {
         activations: &[(ExpertId, u32)],
     );
 
-    // ── Budget Arbitration ──
+    // ── Budget Arbitration (drives DESIGN.md §26.11 governors) ──
 
     /// Query global memory pressure across all sessions.
     fn memory_pressure(&self) -> MemoryPressure;
 
     /// Rebalance sub-budgets across sessions.
+    /// Pushes adjustments down to each session's ResourceGovernor
+    /// via `governor.reconfigure()` (§26.11.2).
     /// Called periodically or when pressure changes.
     fn rebalance(&self) -> Vec<BudgetAdjustment>;
+
+    /// Dynamically adjust a single session's resource ceiling.
+    /// Delegates to the session's ResourceGovernor.set_vram_limit()
+    /// after checking global invariants (§26.11.3: sum ≤ ceiling).
+    fn set_session_limit(
+        &self,
+        session: SessionId,
+        limit: ResourceLimit,
+    ) -> Result<ReconfigureOutcome>;
 }
 
 /// Result of rebalancing — tells a session to adjust its Governor.
@@ -1309,7 +1345,41 @@ enum AdjustmentReason {
 }
 ```
 
-### 12.5 Three Strategies (Progressive)
+### 12.5 Integration: How MemoryCoordinator Drives Existing Governors
+
+The `MemoryCoordinator` does NOT replace the per-device `ResourceGovernor` from
+DESIGN.md §26.11. It is a **coordination layer** that calls INTO the governors:
+
+```text
+MemoryCoordinator.rebalance()
+  │
+  ├── reads: governor[0].snapshot() → {used: 120GB, limit: 141GB, headroom: 21GB}
+  ├── reads: governor[1].snapshot() → {used: 139GB, limit: 141GB, headroom: 2GB}
+  │   └── GPU 1 under pressure!
+  │
+  ├── decides: GPU 1 needs 15GB for KV. GPU 0 has 21GB headroom.
+  │   Migrate cold expert 742 (3GB) from GPU 1 → GPU 0.
+  │   Lower GPU 1’s expert sub-budget by 3GB, raise KV sub-budget.
+  │
+  ├── calls: governor[1].reconfigure({vram_kv: +3GB, vram_expert: -3GB})
+  │   └── Governor triggers §26.4 eviction tiers on expert cache
+  │       (already implemented: evict unleased weight pages)
+  │
+  └── calls: governor[0].reconfigure({vram_expert: +3GB})
+      └── Governor admits the migrated expert
+```
+
+**The key invariant from §26.11.3 is preserved:** `sum(session.usage) ≤ total_pages`.
+The coordinator never sets a per-session limit that would violate the global ceiling.
+If it tries, the governor rejects with `ResourceError::CannotSatisfyLoweredLimit`
+and the coordinator rolls back.
+
+**Live reconfigurability (§26.11.2) composes naturally.** When a user calls
+`engine.set_vram_limit("6GiB")`, the governor already handles tiered eviction.
+The coordinator observes the lowered limit via `snapshot()` on next `rebalance()`
+cycle and redistributes expert budgets accordingly. No new eviction logic needed.
+
+### 12.6 Three Strategies (Progressive)
 
 #### Strategy 1: Static Isolation (Phase 1)
 
@@ -1374,7 +1444,7 @@ the per-session residency manager reports activation counts up to the
 coordinator, which makes global migration/replication decisions and pushes
 budget adjustments back down to per-session governors.
 
-### 12.6 Cross-Node Memory Coordination
+### 12.7 Cross-Node Memory Coordination
 
 For a Mac Studio cluster (4 nodes), the coordinator splits into:
 
@@ -1402,17 +1472,18 @@ Within a node, shared weights use zero-copy IPC. The two tiers compose
 naturally: the `GlobalCoordinator` delegates intra-node sharing to the
 `LocalCoordinator` and handles only inter-node transfers itself.
 
-### 12.7 Comparison: Single-Session (WEIGHT_OFFLOAD) vs Multi-Session (This Doc)
+### 12.8 Comparison: All Three Memory Designs
 
-| Concern | WEIGHT_OFFLOAD.md | This section |
-|---|---|---|
-| Weight dedup | N/A (one session) | CUDA IPC / mmap across sessions |
-| Expert heat tracking | `observe_routes()` per session | Same, plus cross-session aggregation |
-| KV cache pool | Per-session page pool | Global pool with per-session quotas |
-| Budget authority | Per-session `ResourceGovernor` | Global `MemoryCoordinator` → per-session Governors |
-| Eviction policy | Session-local LRU | Session-local LRU + global pressure signals |
-| Prefetch | Session-local route prediction | Same, plus cross-session prefix reuse |
-| Implementation order | Phase 1 (standalone) | Phase 2-3 (after single-session works) |
+| Concern | WEIGHT_OFFLOAD.md | DESIGN.md §26.11 | This section (§12) |
+|---|---|---|---|
+| Weight dedup | N/A (one session) | N/A | CUDA IPC / mmap across sessions |
+| Expert heat tracking | `observe_routes()` per session | N/A | Same, plus cross-session aggregation |
+| KV cache pool | Per-session page pool | `ByteBudget` gates cross-session | Global pool with prefix dedup |
+| Budget authority | Per-session `WeightResidencyManager` | Per-device `ResourceGovernor` | Global `MemoryCoordinator` above governors |
+| Live adjustment | N/A | `reconfigure()` / `set_vram_limit()` | `rebalance()` → `governor.reconfigure()` |
+| Eviction | Session-local LRU by heat | Tiered: bg→paused→running→interactive | Session-local LRU + global pressure signals |
+| Prefetch | Session-local route prediction | N/A | Same, plus cross-session prefix reuse |
+| Implementation order | Phase 1 (standalone) | ✅ Engine wiring landed | Phase 2-3 (after single-session works) |
 
 **The single-session design is the foundation.** Every mechanism in
 WEIGHT_OFFLOAD.md — three-tier residency, `ExpertStore`, `ResourceGovernor`,
