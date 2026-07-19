@@ -1,32 +1,33 @@
 --------------------------- MODULE BufferOwnership ---------------------------
-\* Model of transport-held buffer leases and CommHandle lifetime.
+\* Refinement target for transport-held allocation leases.
 \*
-\* A submitted operation is retained by the backend registry until transport
-\* completion or abort quiescence. Dropping/detaching the user-visible handle
-\* does not release its lease. Ready operations may legally wait for a shared
-\* buffer; they are not evidence of premature reuse.
-\*
-\* The model uses one exclusive workspace buffer per operation. Production
-\* read-only aliasing can be added as shared leases, but must preserve the same
-\* no-free/no-write rule while any registry lease is active.
+\* Each operation acquires a read buffer and a write buffer. Multiple readers
+\* may alias, while any writer excludes all other readers and writers of that
+\* buffer. The backend registry retains both leases until successful terminal
+\* completion or abort quiescence. Detaching the user-visible handle does not
+\* release either lease.
 
-EXTENDS Naturals, Sequences, FiniteSets, TLC
+EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     NumBuffers,
     NumOperations
 
-ASSUME /\ NumBuffers > 0
-       /\ NumOperations > 0
+ASSUME /\ NumBuffers > 1
+       /\ NumOperations > 1
 
 Buffers == 1..NumBuffers
 Operations == 1..NumOperations
 OperationStates == {"ready", "submitted", "aborting", "terminal"}
 Outcomes == {"none", "ok", "error"}
 
-\* A deterministic assignment keeps the model self-contained and guarantees
-\* sharing whenever NumOperations > NumBuffers.
-BufferOf(op) == ((op - 1) % NumBuffers) + 1
+\* This assignment creates both read sharing and read/write conflicts in the
+\* checked configuration.
+ReadBuffer(op) ==
+    (((op - 1) \div 2) % NumBuffers) + 1
+
+WriteBuffer(op) ==
+    (op % NumBuffers) + 1
 
 VARIABLES
     operationState,
@@ -34,12 +35,13 @@ VARIABLES
     registryOwned,
     outcome,
     freed,
-    leaseGeneration,
-    operationGeneration
+    bufferGeneration,
+    observedReadGeneration,
+    observedWriteGeneration
 
 vars ==
     <<operationState, handleAttached, registryOwned, outcome, freed,
-      leaseGeneration, operationGeneration>>
+      bufferGeneration, observedReadGeneration, observedWriteGeneration>>
 
 TypeOK ==
     /\ operationState \in [Operations -> OperationStates]
@@ -47,42 +49,58 @@ TypeOK ==
     /\ registryOwned \in [Operations -> BOOLEAN]
     /\ outcome \in [Operations -> Outcomes]
     /\ freed \subseteq Buffers
-    /\ leaseGeneration \in [Buffers -> Nat]
-    /\ operationGeneration \in [Operations -> Nat]
+    /\ bufferGeneration \in [Buffers -> Nat]
+    /\ observedReadGeneration \in [Operations -> Nat]
+    /\ observedWriteGeneration \in [Operations -> Nat]
 
 Init ==
-    /\ operationState = [op \in Operations |-> "ready"]
-    /\ handleAttached = [op \in Operations |-> FALSE]
-    /\ registryOwned = [op \in Operations |-> FALSE]
-    /\ outcome = [op \in Operations |-> "none"]
+    /\ operationState =
+        [op \in Operations |-> "ready"]
+    /\ handleAttached =
+        [op \in Operations |-> FALSE]
+    /\ registryOwned =
+        [op \in Operations |-> FALSE]
+    /\ outcome =
+        [op \in Operations |-> "none"]
     /\ freed = {}
-    /\ leaseGeneration = [b \in Buffers |-> 0]
-    /\ operationGeneration = [op \in Operations |-> 0]
+    /\ bufferGeneration =
+        [buffer \in Buffers |-> 0]
+    /\ observedReadGeneration =
+        [op \in Operations |-> 0]
+    /\ observedWriteGeneration =
+        [op \in Operations |-> 0]
 
 Active(op) ==
     operationState[op] \in {"submitted", "aborting"}
 
-BufferAvailable(op) ==
-    /\ BufferOf(op) \notin freed
+Conflicts(op, other) ==
+    \/ WriteBuffer(op) = WriteBuffer(other)
+    \/ WriteBuffer(op) = ReadBuffer(other)
+    \/ ReadBuffer(op) = WriteBuffer(other)
+
+BuffersAvailable(op) ==
+    /\ ReadBuffer(op) \notin freed
+    /\ WriteBuffer(op) \notin freed
     /\ \A other \in Operations:
-        BufferOf(other) = BufferOf(op) => ~Active(other)
+        Active(other) => ~Conflicts(op, other)
 
 Submit(op) ==
     /\ operationState[op] = "ready"
-    /\ BufferAvailable(op)
+    /\ BuffersAvailable(op)
     /\ operationState' =
         [operationState EXCEPT ![op] = "submitted"]
     /\ handleAttached' =
         [handleAttached EXCEPT ![op] = TRUE]
     /\ registryOwned' =
         [registryOwned EXCEPT ![op] = TRUE]
-    /\ operationGeneration' =
-        [operationGeneration EXCEPT
-            ![op] = leaseGeneration[BufferOf(op)]]
-    /\ UNCHANGED <<outcome, freed, leaseGeneration>>
+    /\ observedReadGeneration' =
+        [observedReadGeneration EXCEPT
+            ![op] = bufferGeneration[ReadBuffer(op)]]
+    /\ observedWriteGeneration' =
+        [observedWriteGeneration EXCEPT
+            ![op] = bufferGeneration[WriteBuffer(op)]]
+    /\ UNCHANGED <<outcome, freed, bufferGeneration>>
 
-\* Dropping the handle detaches observation only. Backend ownership and the
-\* buffer lease remain live.
 Detach(op) ==
     /\ Active(op)
     /\ handleAttached[op]
@@ -90,7 +108,8 @@ Detach(op) ==
         [handleAttached EXCEPT ![op] = FALSE]
     /\ UNCHANGED
         <<operationState, registryOwned, outcome, freed,
-          leaseGeneration, operationGeneration>>
+          bufferGeneration, observedReadGeneration,
+          observedWriteGeneration>>
 
 CompleteSuccess(op) ==
     /\ operationState[op] = "submitted"
@@ -101,12 +120,14 @@ CompleteSuccess(op) ==
         [registryOwned EXCEPT ![op] = FALSE]
     /\ outcome' =
         [outcome EXCEPT ![op] = "ok"]
-    /\ leaseGeneration' =
-        [leaseGeneration EXCEPT ![BufferOf(op)] = @ + 1]
-    /\ UNCHANGED <<handleAttached, freed, operationGeneration>>
+    /\ bufferGeneration' =
+        [bufferGeneration EXCEPT
+            ![WriteBuffer(op)] = @ + 1]
+    /\ UNCHANGED
+        <<handleAttached, freed, observedReadGeneration,
+          observedWriteGeneration>>
 
-\* Abort request is not terminal completion. The lease remains owned until the
-\* transport reports quiescence.
+\* Abort request is not terminal completion. Both leases remain active.
 BeginAbort(op) ==
     /\ operationState[op] = "submitted"
     /\ registryOwned[op]
@@ -114,7 +135,8 @@ BeginAbort(op) ==
         [operationState EXCEPT ![op] = "aborting"]
     /\ UNCHANGED
         <<handleAttached, registryOwned, outcome, freed,
-          leaseGeneration, operationGeneration>>
+          bufferGeneration, observedReadGeneration,
+          observedWriteGeneration>>
 
 QuiesceAbort(op) ==
     /\ operationState[op] = "aborting"
@@ -125,18 +147,24 @@ QuiesceAbort(op) ==
         [registryOwned EXCEPT ![op] = FALSE]
     /\ outcome' =
         [outcome EXCEPT ![op] = "error"]
-    /\ leaseGeneration' =
-        [leaseGeneration EXCEPT ![BufferOf(op)] = @ + 1]
-    /\ UNCHANGED <<handleAttached, freed, operationGeneration>>
+    /\ bufferGeneration' =
+        [bufferGeneration EXCEPT
+            ![WriteBuffer(op)] = @ + 1]
+    /\ UNCHANGED
+        <<handleAttached, freed, observedReadGeneration,
+          observedWriteGeneration>>
 
-FreeBuffer(b) ==
-    /\ b \notin freed
+FreeBuffer(buffer) ==
+    /\ buffer \notin freed
     /\ \A op \in Operations:
-        BufferOf(op) = b => ~registryOwned[op]
-    /\ freed' = freed \union {b}
+        /\ Active(op)
+        => /\ ReadBuffer(op) # buffer
+           /\ WriteBuffer(op) # buffer
+    /\ freed' = freed \union {buffer}
     /\ UNCHANGED
         <<operationState, handleAttached, registryOwned, outcome,
-          leaseGeneration, operationGeneration>>
+          bufferGeneration, observedReadGeneration,
+          observedWriteGeneration>>
 
 Next ==
     \/ \E op \in Operations: Submit(op)
@@ -144,15 +172,14 @@ Next ==
     \/ \E op \in Operations: CompleteSuccess(op)
     \/ \E op \in Operations: BeginAbort(op)
     \/ \E op \in Operations: QuiesceAbort(op)
-    \/ \E b \in Buffers: FreeBuffer(b)
+    \/ \E buffer \in Buffers: FreeBuffer(buffer)
 
-ExclusiveActiveLease ==
-    \A b \in Buffers:
-        Cardinality(
-            {op \in Operations:
-                /\ BufferOf(op) = b
-                /\ Active(op)}
-        ) <= 1
+NoConflictingActiveLeases ==
+    \A op, other \in Operations:
+        /\ op # other
+        /\ Active(op)
+        /\ Active(other)
+        => ~Conflicts(op, other)
 
 ActiveIsRegistryOwned ==
     \A op \in Operations:
@@ -164,10 +191,12 @@ DetachedActiveIsStillOwned ==
         /\ ~handleAttached[op]
         => registryOwned[op]
 
-FreedHasNoOwner ==
-    \A b \in freed:
+FreedHasNoLease ==
+    \A buffer \in freed:
         \A op \in Operations:
-            BufferOf(op) = b => ~registryOwned[op]
+            Active(op) =>
+                /\ ReadBuffer(op) # buffer
+                /\ WriteBuffer(op) # buffer
 
 TerminalReleased ==
     \A op \in Operations:
@@ -175,16 +204,27 @@ TerminalReleased ==
             => /\ ~registryOwned[op]
                /\ outcome[op] \in {"ok", "error"}
 
-ActiveGenerationMatches ==
+\* Neither a reader nor a writer may observe its buffer generation change
+\* while its transport operation remains active.
+ActiveGenerationsMatch ==
     \A op \in Operations:
         Active(op) =>
-            operationGeneration[op] = leaseGeneration[BufferOf(op)]
+            /\ observedReadGeneration[op]
+                = bufferGeneration[ReadBuffer(op)]
+            /\ observedWriteGeneration[op]
+                = bufferGeneration[WriteBuffer(op)]
+
+BufferAssignmentValid ==
+    \A op \in Operations:
+        /\ ReadBuffer(op) \in Buffers
+        /\ WriteBuffer(op) \in Buffers
 
 Spec ==
     /\ Init
     /\ [][Next]_vars
     /\ \A op \in Operations:
         WF_vars(CompleteSuccess(op) \/ BeginAbort(op))
-    /\ \A op \in Operations: WF_vars(QuiesceAbort(op))
+    /\ \A op \in Operations:
+        WF_vars(QuiesceAbort(op))
 
 =============================================================================

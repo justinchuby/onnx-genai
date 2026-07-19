@@ -1,31 +1,42 @@
 -------------------------- MODULE CollectiveOrdering --------------------------
-\* Model of one communicator's plan-time collective sequence and runtime
-\* per-group submit sequencer.
+\* Refinement target for coordinator admission and per-communicator submit
+\* sequencers.
 \*
-\* Each slot is a (ExecutionId, CommSequenceId) instance. Multiple executions
-\* may overlap, but every rank traverses the same lexicographic slot order.
-\* The coordinator admits or skips an execution before any rank can submit its
-\* slots. Once an admitted execution has been submitted, failure transitions
-\* the group to abort; it cannot be retroactively skipped.
+\* Multiple communicator groups overlap in membership. Each group independently
+\* traverses a lexicographic sequence of (ExecutionId, CommSequenceId) slots.
+\* Cross-group enqueue order is intentionally unconstrained; within a group,
+\* ranks may advance at different speeds but cannot diverge in transport order.
 \*
-\* Transport completion is intentionally rank-local. One rank may observe its
-\* own completion while peers remain in flight.
+\* Completion is rank-local. Abort freezes new submissions in every group while
+\* already submitted operations remain eligible to quiesce locally.
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
     NumRanks,
+    NumGroups,
     NumExecutions,
     SequenceLength
 
 ASSUME /\ NumRanks > 1
+       /\ NumGroups > 1
        /\ NumExecutions > 0
        /\ SequenceLength > 0
 
 Ranks == 1..NumRanks
+Groups == 1..NumGroups
 Executions == 1..NumExecutions
 TotalSlots == NumExecutions * SequenceLength
 Slots == 1..TotalSlots
+
+\* Group 1 is the world. Other groups overlap at rank 1 and select alternating
+\* peers, which exercises membership overlap without a separate model value.
+GroupMembers(group) ==
+    IF group = 1
+    THEN Ranks
+    ELSE {rank \in Ranks:
+            \/ rank = 1
+            \/ ((rank + group) % 2) = 0}
 
 ExecutionOf(slot) == ((slot - 1) \div SequenceLength) + 1
 SequenceOf(slot) == ((slot - 1) % SequenceLength) + 1
@@ -48,27 +59,36 @@ vars ==
 TypeOK ==
     /\ decision \in [Executions -> DecisionStates]
     /\ decidedPrefix \in 0..NumExecutions
-    /\ cursor \in [Ranks -> 0..TotalSlots]
-    /\ transportLog \in [Ranks -> Seq(Slots)]
-    /\ localCompleted \in [Ranks -> 0..TotalSlots]
+    /\ cursor \in [Ranks -> [Groups -> 0..TotalSlots]]
+    /\ transportLog \in [Ranks -> [Groups -> Seq(Slots)]]
+    /\ localCompleted \in
+        [Ranks -> [Groups -> 0..TotalSlots]]
     /\ aborted \in BOOLEAN
-    /\ logAtAbort \in [Ranks -> Seq(Slots)]
+    /\ logAtAbort \in [Ranks -> [Groups -> Seq(Slots)]]
 
 Init ==
-    /\ decision = [e \in Executions |-> "undecided"]
+    /\ decision = [execution \in Executions |-> "undecided"]
     /\ decidedPrefix = 0
-    /\ cursor = [r \in Ranks |-> 0]
-    /\ transportLog = [r \in Ranks |-> <<>>]
-    /\ localCompleted = [r \in Ranks |-> 0]
+    /\ cursor =
+        [rank \in Ranks |->
+            [group \in Groups |-> 0]]
+    /\ transportLog =
+        [rank \in Ranks |->
+            [group \in Groups |-> <<>>]]
+    /\ localCompleted =
+        [rank \in Ranks |->
+            [group \in Groups |-> 0]]
     /\ aborted = FALSE
-    /\ logAtAbort = [r \in Ranks |-> <<>>]
+    /\ logAtAbort =
+        [rank \in Ranks |->
+            [group \in Groups |-> <<>>]]
 
-\* Coordinator decisions are monotonic and made in ExecutionId order.
 AdmitNext ==
     /\ ~aborted
     /\ decidedPrefix < NumExecutions
     /\ LET execution == decidedPrefix + 1
-       IN decision' = [decision EXCEPT ![execution] = "admitted"]
+       IN decision' =
+            [decision EXCEPT ![execution] = "admitted"]
     /\ decidedPrefix' = decidedPrefix + 1
     /\ UNCHANGED
         <<cursor, transportLog, localCompleted, aborted, logAtAbort>>
@@ -77,42 +97,49 @@ SkipNext ==
     /\ ~aborted
     /\ decidedPrefix < NumExecutions
     /\ LET execution == decidedPrefix + 1
-       IN decision' = [decision EXCEPT ![execution] = "skipped"]
+       IN decision' =
+            [decision EXCEPT ![execution] = "skipped"]
     /\ decidedPrefix' = decidedPrefix + 1
     /\ UNCHANGED
         <<cursor, transportLog, localCompleted, aborted, logAtAbort>>
 
-\* A rank can submit only its next slot. This is the no-tag backend sequencer:
-\* rank skew is allowed, order divergence is not.
-Submit(r) ==
+Submit(rank, group) ==
     /\ ~aborted
-    /\ cursor[r] < TotalSlots
-    /\ LET slot == cursor[r] + 1
+    /\ rank \in GroupMembers(group)
+    /\ cursor[rank][group] < TotalSlots
+    /\ LET slot == cursor[rank][group] + 1
        IN /\ decision[ExecutionOf(slot)] = "admitted"
-          /\ cursor' = [cursor EXCEPT ![r] = slot]
+          /\ cursor' =
+              [cursor EXCEPT ![rank][group] = slot]
           /\ transportLog' =
-              [transportLog EXCEPT ![r] = Append(@, slot)]
+              [transportLog EXCEPT
+                  ![rank][group] = Append(@, slot)]
     /\ UNCHANGED
         <<decision, decidedPrefix, localCompleted, aborted, logAtAbort>>
 
-\* A coordinated skip consumes the same sequence slots on every rank without
-\* submitting anything to the transport.
-ObserveSkip(r) ==
+\* A coordinator skip consumes the corresponding slots on every member without
+\* calling the transport.
+ObserveSkip(rank, group) ==
     /\ ~aborted
-    /\ cursor[r] < TotalSlots
-    /\ LET slot == cursor[r] + 1
+    /\ rank \in GroupMembers(group)
+    /\ cursor[rank][group] < TotalSlots
+    /\ LET slot == cursor[rank][group] + 1
        IN /\ decision[ExecutionOf(slot)] = "skipped"
-          /\ cursor' = [cursor EXCEPT ![r] = slot]
+          /\ cursor' =
+              [cursor EXCEPT ![rank][group] = slot]
     /\ UNCHANGED
         <<decision, decidedPrefix, transportLog,
           localCompleted, aborted, logAtAbort>>
 
-\* Completion is local: polling one CommHandle advances only that rank.
-CompleteLocal(r) ==
-    /\ localCompleted[r] < Len(transportLog[r])
-    /\ localCompleted' = [localCompleted EXCEPT ![r] = @ + 1]
+CompleteLocal(rank, group) ==
+    /\ rank \in GroupMembers(group)
+    /\ localCompleted[rank][group]
+        < Len(transportLog[rank][group])
+    /\ localCompleted' =
+        [localCompleted EXCEPT ![rank][group] = @ + 1]
     /\ UNCHANGED
-        <<decision, decidedPrefix, cursor, transportLog, aborted, logAtAbort>>
+        <<decision, decidedPrefix, cursor, transportLog,
+          aborted, logAtAbort>>
 
 Abort ==
     /\ ~aborted
@@ -124,9 +151,12 @@ Abort ==
 Next ==
     \/ AdmitNext
     \/ SkipNext
-    \/ \E r \in Ranks: Submit(r)
-    \/ \E r \in Ranks: ObserveSkip(r)
-    \/ \E r \in Ranks: CompleteLocal(r)
+    \/ \E rank \in Ranks, group \in Groups:
+        Submit(rank, group)
+    \/ \E rank \in Ranks, group \in Groups:
+        ObserveSkip(rank, group)
+    \/ \E rank \in Ranks, group \in Groups:
+        CompleteLocal(rank, group)
     \/ Abort
 
 IsPrefix(a, b) ==
@@ -134,46 +164,70 @@ IsPrefix(a, b) ==
     /\ SubSeq(b, 1, Len(a)) = a
 
 StrictlyIncreasing(s) ==
-    \A i, j \in 1..Len(s): i < j => s[i] < s[j]
+    \A i, j \in 1..Len(s):
+        i < j => s[i] < s[j]
+
+GroupMembershipValid ==
+    \A group \in Groups:
+        /\ GroupMembers(group) \subseteq Ranks
+        /\ Cardinality(GroupMembers(group)) > 0
 
 DecisionPrefixIsFrozen ==
-    /\ \A e \in 1..decidedPrefix: decision[e] # "undecided"
-    /\ \A e \in (decidedPrefix + 1)..NumExecutions:
-        decision[e] = "undecided"
+    /\ \A execution \in 1..decidedPrefix:
+        decision[execution] # "undecided"
+    /\ \A execution \in (decidedPrefix + 1)..NumExecutions:
+        decision[execution] = "undecided"
 
 SubmittedOnlyAdmitted ==
-    \A r \in Ranks:
-        \A i \in 1..Len(transportLog[r]):
-            decision[ExecutionOf(transportLog[r][i])] = "admitted"
+    \A rank \in Ranks, group \in Groups:
+        \A i \in 1..Len(transportLog[rank][group]):
+            decision[
+                ExecutionOf(transportLog[rank][group][i])
+            ] = "admitted"
 
 NoDuplicateOrReorder ==
-    \A r \in Ranks: StrictlyIncreasing(transportLog[r])
+    \A rank \in Ranks, group \in Groups:
+        StrictlyIncreasing(transportLog[rank][group])
 
-\* Logs need not have equal length. Any two are compatible prefixes of the
-\* same canonical admitted-slot stream.
-RankLogsCompatible ==
-    \A r1, r2 \in Ranks:
-        \/ IsPrefix(transportLog[r1], transportLog[r2])
-        \/ IsPrefix(transportLog[r2], transportLog[r1])
+\* Compatibility is required only within one communicator. Different groups
+\* may legally enqueue in unrelated orders.
+GroupRankLogsCompatible ==
+    \A group \in Groups:
+        \A rank1, rank2 \in GroupMembers(group):
+            \/ IsPrefix(
+                transportLog[rank1][group],
+                transportLog[rank2][group])
+            \/ IsPrefix(
+                transportLog[rank2][group],
+                transportLog[rank1][group])
 
 LocalCompletionBounded ==
-    \A r \in Ranks:
-        localCompleted[r] <= Len(transportLog[r])
+    \A rank \in Ranks, group \in Groups:
+        localCompleted[rank][group]
+            <= Len(transportLog[rank][group])
+
+NonMembersRemainUntouched ==
+    \A rank \in Ranks, group \in Groups:
+        rank \notin GroupMembers(group) =>
+            /\ cursor[rank][group] = 0
+            /\ transportLog[rank][group] = <<>>
+            /\ localCompleted[rank][group] = 0
 
 CursorCoversSubmitted ==
-    \A r \in Ranks:
-        /\ Len(transportLog[r]) <= cursor[r]
-        /\ \A i \in 1..Len(transportLog[r]):
-            transportLog[r][i] <= cursor[r]
+    \A rank \in Ranks, group \in Groups:
+        /\ Len(transportLog[rank][group])
+            <= cursor[rank][group]
+        /\ \A i \in 1..Len(transportLog[rank][group]):
+            transportLog[rank][group][i]
+                <= cursor[rank][group]
 
-\* After abort, no further transport submission may occur. Local completion
-\* remains enabled so the scheduler can quiesce already submitted work.
 AbortFreezesSubmission ==
     aborted => transportLog = logAtAbort
 
 Spec ==
     /\ Init
     /\ [][Next]_vars
-    /\ \A r \in Ranks: WF_vars(CompleteLocal(r))
+    /\ \A rank \in Ranks, group \in Groups:
+        WF_vars(CompleteLocal(rank, group))
 
 =============================================================================

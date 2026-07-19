@@ -742,6 +742,48 @@ are modeled in
 5. A timeout racing either grant has one ledger-ordered winner; no allocation
    is leaked and no waiter proceeds without ownership.
 
+### 5.3.2 Implementation Refinement and Ledger Audit
+
+The implementation must conform to the action mapping and trace contract in
+[`specs/tla/REFINEMENT.md`](../specs/tla/REFINEMENT.md). In particular, the
+following are one ledger-locked transition each, not a sequence of observable
+partial updates:
+
+- charge exact bytes and publish `Granted` before wakeup;
+- claim the granted `PhysicalAllocationId` and disarm cancellation;
+- cancel or time out a grant and return that exact allocation;
+- increment configuration generation and resolve every prior-generation
+  pending request; and
+- credit reclaimed bytes before reconsidering queued tickets.
+
+Test traces identify tickets by `PressureRequestId` and allocations by
+`PhysicalAllocationId`; queue indices and addresses are not stable identities.
+The trace records checked byte extents, owner `LocalDeviceId`, configuration
+generation, previous/new ticket state, and the ledger counters after the
+transition.
+
+Debug and conformance builds independently recompute:
+
+```text
+host_ram_used
+  = reclaimable allocations
+  + granted-but-unclaimed allocations
+  + claimed live allocations
+  + other explicitly classified host allocations
+```
+
+The recomputed total must equal the sum of authoritative
+`PhysicalAllocationId` entries and remain within the configured limit. A
+counter matching its own previous value is not sufficient evidence. Overflow,
+duplicate physical identity, negative headroom, wakeup without a charge, and a
+terminal ticket retaining an allocation are immediate failures.
+
+The deterministic test campaign covers multiple variable-sized tickets per
+device, exact-capacity admission, cancellation-mailbox saturation,
+grant/claim/cancel/timeout/reconfigure races, priority aging, and reclaim by the
+requesting device itself. Each failing schedule records a replayable scheduler
+decision trace.
+
 ### 5.4 Config Surface
 
 **YAML** (machine-wide shared limits in the `memory:` block):
@@ -1040,14 +1082,19 @@ Backend inventory, capability, and performance claims live only in
 [DISTRIBUTED_RUNTIME.md §4](./DISTRIBUTED_RUNTIME.md#4-communicator-backends).
 From the memory architecture's perspective:
 
-- Direct-device transports retain the source and destination
-  `PhysicalAllocationId` leases until the local `CommHandle` is terminal.
+- Direct-device transports register complete read and write
+  `PhysicalAllocationId` lease sets before enqueue and retain them until the
+  local `CommHandle` is terminal. Read/read aliasing is legal; a write lease
+  excludes all other access to that allocation.
 - Host-staged transports obtain staging capacity through `PressureTicket`; an
   enqueue cannot begin with uncharged staging memory.
 - Unified-memory transports alias one ledger entry and do not create a second
   host charge.
 - Communicator abort transitions outstanding handles to terminal errors before
   their retained allocation leases are released.
+- Test builds emit the lossless lease lifecycle required by
+  [`specs/tla/REFINEMENT.md`](../specs/tla/REFINEMENT.md); allocator reuse before
+  terminal release is rejected even when a new view has a different address.
 
 ### 7.3 Communicator Supersedes DispatchTransport
 
@@ -1769,9 +1816,13 @@ Unified across all design documents:
 - **HostGovernor wiring:** host RAM quota management, per-device usage tracking,
   cross-device arbitration for offload pages.
 - DeviceGovernor → HostGovernor integration for VRAM eviction → host RAM offload flow.
-- Model-check or stress-test grant/cancel/timeout/reconfigure races: every
-  successful ticket owns charged bytes, every abandoned grant is released, and
-  physical usage never exceeds the limit.
+- Exhaustively check `PressureProtocol.cfg`, then run deterministic
+  grant/cancel/timeout/reconfigure/reclaim schedules through the independent
+  refinement checker. Every successful ticket owns its exact charged bytes,
+  every abandoned grant is released, and physical usage never exceeds the
+  limit.
+- Include multiple variable-sized tickets per device, fixed non-reclaimable
+  charges, exact-capacity requests, and cancellation-mailbox saturation.
 - Test simultaneous reclaim and allocation to prove no governor lock is held
   across await and priority/FIFO arbitration cannot starve an older request.
 - Test discrete offload creates a new physical ID only after reservation, while

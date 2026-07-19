@@ -1,99 +1,101 @@
 # TLA+ Formal Specifications
 
 Executable, bounded models for the concurrency contracts in the memory and
-distributed-runtime designs. They are safety models first: each README claim
-below corresponds to an invariant checked by TLC. Liveness is asserted only
-where the specification includes action-specific fairness and the modeled
-environment can actually make progress.
+distributed-runtime designs. They are safety models first: each claim below
+corresponds to an invariant checked by TLC.
 
-These models do not prove the implementation correct. The implementation must
-preserve the modeled state transitions, linearization points, and ownership
-boundaries.
+TLC proves the model, not the implementation. Implementations must also satisfy
+the normative [refinement contract](./REFINEMENT.md), emit lossless protocol
+traces in conformance tests, and pass an independent replay checker.
 
 ## Specifications
 
 ### `PressureProtocol.tla`
 
-Models the `PressureTicket` lifecycle, atomic grant charging, cancellation and
-timeout races, configuration-generation invalidation, reclaim, and claim.
+Models multiple variable-sized `PressureTicket`s per device, atomic grant
+charging, claim, cancellation and timeout races, configuration-generation
+invalidation, reclaim, and capacity already consumed by fixed non-reclaimable
+allocations.
 
 Checked invariants:
 
-- `CapacityConserved`: free, reclaimable, reserved, and claimed pages sum to
-  the configured capacity.
-- `GrantedIsCharged`: a published grant always has an existing ledger charge.
-- `ClaimedExactlyOnce`: a grant can be claimed at most once.
-- `TerminalHasNoReservation`: cancellation, timeout, and completion cannot
-  leak a reservation.
+- `CapacityConserved`: free, reclaimable, reserved, and claimed byte extents sum
+  with fixed charges to the configured capacity.
+- `GrantedIsChargedExactly`: every grant owns its exact requested extent.
+- `ClaimedIsOwnedExactly` and `ClaimedAtMostOnce`: claim transfers the exact
+  reservation once.
+- `TerminalHasNoAllocation`: cancellation, timeout, and completion cannot leak
+  an allocation.
 - `PendingUsesCurrentGeneration`: reconfiguration leaves no stale pending
   request.
 
-The model intentionally does not assert unconditional deadlock freedom or
-eventual satisfaction. A request cannot progress if the environment retains
-all capacity and exposes no reclaim or release action.
+The model does not assert unconditional eventual satisfaction. Priority/FIFO
+arbitration and bounded aging are implementation scheduler obligations tested
+by deterministic conformance campaigns.
 
 ### `CollectiveOrdering.tla`
 
-Models one communicator group. Runtime slots are the lexicographic sequence of
-`(ExecutionId, CommSequenceId)` pairs across overlapping executions. Ranks may
-advance and complete independently, while coordinator admission/skip decisions
-and the submit sequencer prevent transport-order divergence.
+Models overlapping executions across overlapping communicator groups. Runtime
+slots are lexicographic `(ExecutionId, CommSequenceId)` pairs. Ranks and groups
+advance independently while coordinator admission/skip decisions and each
+group's submit sequencer prevent transport-order divergence.
 
 Checked invariants:
 
-- `DecisionPrefixIsFrozen`: execution admission decisions are monotonic and
-  coordinator ordered.
+- `GroupMembershipValid`: every frozen group is a non-empty world-rank subset.
+- `DecisionPrefixIsFrozen`: coordinator decisions are monotonic.
 - `SubmittedOnlyAdmitted`: skipped or undecided executions never reach the
   transport.
-- `NoDuplicateOrReorder`: each rank submits a strictly increasing slot stream.
-- `RankLogsCompatible`: rank logs may differ in length but remain compatible
-  prefixes of one canonical order.
-- `LocalCompletionBounded`: completion is rank-local and cannot pass local
-  submission.
-- `AbortFreezesSubmission`: abort stops new transport work while already
-  submitted operations may still quiesce.
+- `NoDuplicateOrReorder`: every rank-group log is strictly increasing.
+- `GroupRankLogsCompatible`: members of one group remain compatible prefixes;
+  different groups have no artificial global enqueue order.
+- `LocalCompletionBounded`: rank-local completion cannot pass local submission.
+- `NonMembersRemainUntouched`: non-members never consume a group slot.
+- `AbortFreezesSubmission`: abort stops new transport work while submitted
+  operations may still quiesce.
 
-Instantiate the model independently for each frozen communicator group. The
-production plan validator is responsible for constructing identical group
-membership and sequence metadata on every rank.
+The production plan validator must supply identical ordered membership and
+sequence metadata on every rank; the refinement checker verifies its hash.
 
 ### `BufferOwnership.tla`
 
-Models the backend registry lease retained for a submitted operation, including
-detached user handles, successful completion, abort request, abort quiescence,
-and physical buffer free.
+Models read and write allocation leases retained by the backend registry across
+handle detach, successful completion, abort request, abort quiescence, and
+physical free.
 
 Checked invariants:
 
-- `ExclusiveActiveLease`: an exclusive workspace has at most one active user.
+- `NoConflictingActiveLeases`: readers may alias, but a writer excludes every
+  other reader and writer of its allocation.
 - `ActiveIsRegistryOwned`: every submitted or aborting operation remains rooted
   in the backend registry.
-- `DetachedActiveIsStillOwned`: dropping a handle cannot release the lease.
-- `FreedHasNoOwner`: physical free requires all transport leases to be gone.
-- `TerminalReleased`: registry release occurs only at a terminal transport
+- `DetachedActiveIsStillOwned`: dropping a handle cannot release leases.
+- `FreedHasNoLease`: physical free requires all read and write leases to end.
+- `TerminalReleased`: registry release occurs only at terminal transport
   outcome.
-- `ActiveGenerationMatches`: a buffer generation cannot advance under an
-  active operation.
-
-Ready operations are allowed to wait for a shared buffer. The previous
-`NoPendingReuse` property incorrectly treated such legal waiters as reuse.
+- `ActiveGenerationsMatch`: allocator reuse cannot occur under an active read or
+  write lease.
 
 ## Running
 
 Install [TLA+ tools](https://github.com/tlaplus/tlaplus/releases), then run from
-this directory:
+this directory. CI must pin the jar artifact and verify its checksum rather than
+downloading an unversioned latest release.
 
 ```bash
-java -jar /path/to/tla2tools.jar -config PressureProtocol.cfg PressureProtocol.tla
-java -jar /path/to/tla2tools.jar -config CollectiveOrdering.cfg CollectiveOrdering.tla
-java -jar /path/to/tla2tools.jar -config BufferOwnership.cfg BufferOwnership.tla
+TLA2TOOLS_JAR=/path/to/tla2tools.jar ./check.sh
 ```
 
-The checked configurations are deliberately small enough for exhaustive local
-runs. Increase the constants for deeper validation when changing a protocol.
+`JAVA_BIN` and `TLC_WORKERS` may override the Java executable and worker count.
+The script gives every model a distinct temporary metadata directory and fails
+on the first parse, invariant, or model-checking error.
+
+The checked configurations are deliberately finite and exhaustive. Increasing
+constants is useful, but does not replace implementation trace conformance.
 
 ## Design Context
 
 - `docs/MEMORY_ARCHITECTURE.md` section 5.3.1 (pressure protocol)
 - `docs/DISTRIBUTED_RUNTIME.md` sections 3.1 and 3.2.1 (completion and ordering)
 - `docs/DISTRIBUTED_RUNTIME.md` section 8.1 (rank-local DAG scheduling)
+- `REFINEMENT.md` (implementation linearization and verification gates)

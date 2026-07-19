@@ -1,28 +1,36 @@
 --------------------------- MODULE PressureProtocol ---------------------------
-\* Model of the HostGovernor pressure-ticket lifecycle and its allocation
-\* ledger. Ledger-changing actions are atomic critical sections; no lock state
-\* survives an action, so a pending ticket never waits while holding the
-\* governor lock.
+\* Refinement target for HostGovernor pressure tickets.
 \*
-\* The model distinguishes:
-\*   - reclaimable pages already resident on a device's behalf,
-\*   - pages reserved for a granted but not yet claimed ticket, and
-\*   - pages held by a caller that successfully claimed its ticket.
+\* The bounded model includes multiple outstanding tickets per device and
+\* variable request sizes. Ledger-changing actions are atomic critical
+\* sections; no lock state survives an action, so no ticket waits while holding
+\* the governor lock.
 \*
-\* This is a safety model. Progress depends on explicit fairness and on there
-\* being reclaimable/releasable capacity; it does not claim unconditional
-\* deadlock freedom when the environment permanently retains all capacity.
+\* This is primarily a safety model. Arbitration priority, bounded aging, and
+\* environment-driven release liveness require separate scheduler tests.
 
-EXTENDS Naturals, Sequences, FiniteSets, TLC
+EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     NumDevices,
-    Capacity
+    NumTickets,
+    Capacity,
+    FixedCharge,
+    MaxRequest
 
 ASSUME /\ NumDevices > 0
+       /\ NumTickets > 1
        /\ Capacity > 0
+       /\ FixedCharge \in 0..(Capacity - 1)
+       /\ MaxRequest > 0
+       /\ MaxRequest <= Capacity - FixedCharge
 
 Devices == 1..NumDevices
+Tickets == 1..NumTickets
+
+\* The finite model deliberately creates shared owners and different extents.
+OwnerOf(ticket) == ((ticket - 1) % NumDevices) + 1
+RequestBytes(ticket) == ((ticket - 1) % MaxRequest) + 1
 
 TicketStates ==
     {"idle", "pending", "granted", "claimed",
@@ -49,189 +57,231 @@ SumFunction(f, n) ==
     THEN 0
     ELSE f[n] + SumFunction(f, n - 1)
 
-Total(f) == SumFunction(f, NumDevices)
+DeviceTotal(f) == SumFunction(f, NumDevices)
+TicketTotal(f) == SumFunction(f, NumTickets)
 
 TypeOK ==
     /\ free \in 0..Capacity
     /\ reclaimable \in [Devices -> 0..Capacity]
-    /\ reserved \in [Devices -> 0..1]
-    /\ claimedHeld \in [Devices -> 0..1]
-    /\ ticketState \in [Devices -> TicketStates]
-    /\ ticketGeneration \in [Devices -> Nat]
+    /\ reserved \in [Tickets -> 0..Capacity]
+    /\ claimedHeld \in [Tickets -> 0..Capacity]
+    /\ ticketState \in [Tickets -> TicketStates]
+    /\ ticketGeneration \in [Tickets -> Nat]
     /\ configurationGeneration \in Nat
     /\ reclaimNotices \in [Devices -> 0..1]
-    /\ claimCount \in [Devices -> 0..1]
+    /\ claimCount \in [Tickets -> 0..1]
 
 Init ==
     /\ \E initial \in [Devices -> 0..Capacity]:
-        /\ Total(initial) <= Capacity
+        /\ DeviceTotal(initial) <= Capacity - FixedCharge
         /\ reclaimable = initial
-        /\ free = Capacity - Total(initial)
-    /\ reserved = [d \in Devices |-> 0]
-    /\ claimedHeld = [d \in Devices |-> 0]
-    /\ ticketState = [d \in Devices |-> "idle"]
-    /\ ticketGeneration = [d \in Devices |-> 0]
+        /\ free =
+            Capacity - FixedCharge - DeviceTotal(initial)
+    /\ reserved = [ticket \in Tickets |-> 0]
+    /\ claimedHeld = [ticket \in Tickets |-> 0]
+    /\ ticketState = [ticket \in Tickets |-> "idle"]
+    /\ ticketGeneration = [ticket \in Tickets |-> 0]
     /\ configurationGeneration = 0
-    /\ reclaimNotices = [d \in Devices |-> 0]
-    /\ claimCount = [d \in Devices |-> 0]
+    /\ reclaimNotices = [device \in Devices |-> 0]
+    /\ claimCount = [ticket \in Tickets |-> 0]
 
-\* Submit one unit request. The production protocol generalizes the same
-\* transitions to byte extents checked before ledger mutation.
-Submit(d) ==
-    /\ ticketState[d] = "idle"
-    /\ ticketState' = [ticketState EXCEPT ![d] = "pending"]
+Submit(ticket) ==
+    /\ ticketState[ticket] = "idle"
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "pending"]
     /\ ticketGeneration' =
-        [ticketGeneration EXCEPT ![d] = configurationGeneration]
+        [ticketGeneration EXCEPT
+            ![ticket] = configurationGeneration]
     /\ UNCHANGED
         <<free, reclaimable, reserved, claimedHeld,
           configurationGeneration, reclaimNotices, claimCount>>
 
-\* The charge is made in the same atomic action that publishes the grant.
-Grant(d) ==
-    /\ ticketState[d] = "pending"
-    /\ ticketGeneration[d] = configurationGeneration
-    /\ free >= 1
-    /\ free' = free - 1
-    /\ reserved' = [reserved EXCEPT ![d] = 1]
-    /\ ticketState' = [ticketState EXCEPT ![d] = "granted"]
+\* Charge the exact extent before publishing the grant.
+Grant(ticket) ==
+    /\ ticketState[ticket] = "pending"
+    /\ ticketGeneration[ticket] = configurationGeneration
+    /\ free >= RequestBytes(ticket)
+    /\ free' = free - RequestBytes(ticket)
+    /\ reserved' =
+        [reserved EXCEPT
+            ![ticket] = RequestBytes(ticket)]
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "granted"]
     /\ UNCHANGED
         <<reclaimable, claimedHeld, ticketGeneration,
           configurationGeneration, reclaimNotices, claimCount>>
 
-\* Polling a ready ticket transfers the already charged reservation exactly
-\* once. It does not perform a second capacity check.
-Claim(d) ==
-    /\ ticketState[d] = "granted"
-    /\ reserved[d] = 1
-    /\ claimCount[d] = 0
-    /\ reserved' = [reserved EXCEPT ![d] = 0]
-    /\ claimedHeld' = [claimedHeld EXCEPT ![d] = 1]
-    /\ claimCount' = [claimCount EXCEPT ![d] = 1]
-    /\ ticketState' = [ticketState EXCEPT ![d] = "claimed"]
+\* Polling a ready ticket transfers the already charged reservation once.
+Claim(ticket) ==
+    /\ ticketState[ticket] = "granted"
+    /\ reserved[ticket] = RequestBytes(ticket)
+    /\ claimCount[ticket] = 0
+    /\ reserved' = [reserved EXCEPT ![ticket] = 0]
+    /\ claimedHeld' =
+        [claimedHeld EXCEPT
+            ![ticket] = RequestBytes(ticket)]
+    /\ claimCount' =
+        [claimCount EXCEPT ![ticket] = 1]
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "claimed"]
     /\ UNCHANGED
         <<free, reclaimable, ticketGeneration,
           configurationGeneration, reclaimNotices>>
 
-Complete(d) ==
-    /\ ticketState[d] = "claimed"
-    /\ claimedHeld[d] = 1
-    /\ claimedHeld' = [claimedHeld EXCEPT ![d] = 0]
-    /\ free' = free + 1
-    /\ ticketState' = [ticketState EXCEPT ![d] = "completed"]
+Complete(ticket) ==
+    /\ ticketState[ticket] = "claimed"
+    /\ claimedHeld[ticket] = RequestBytes(ticket)
+    /\ claimedHeld' = [claimedHeld EXCEPT ![ticket] = 0]
+    /\ free' = free + RequestBytes(ticket)
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "completed"]
     /\ UNCHANGED
         <<reclaimable, reserved, ticketGeneration,
           configurationGeneration, reclaimNotices, claimCount>>
 
-CancelPending(d) ==
-    /\ ticketState[d] = "pending"
-    /\ ticketState' = [ticketState EXCEPT ![d] = "cancelled"]
+CancelPending(ticket) ==
+    /\ ticketState[ticket] = "pending"
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "cancelled"]
     /\ UNCHANGED
         <<free, reclaimable, reserved, claimedHeld, ticketGeneration,
           configurationGeneration, reclaimNotices, claimCount>>
 
-\* Cancellation racing with grant returns the reserved charge before the
-\* ticket becomes terminal.
-CancelGranted(d) ==
-    /\ ticketState[d] = "granted"
-    /\ reserved[d] = 1
-    /\ free' = free + 1
-    /\ reserved' = [reserved EXCEPT ![d] = 0]
-    /\ ticketState' = [ticketState EXCEPT ![d] = "cancelled"]
+CancelGranted(ticket) ==
+    /\ ticketState[ticket] = "granted"
+    /\ reserved[ticket] = RequestBytes(ticket)
+    /\ free' = free + RequestBytes(ticket)
+    /\ reserved' = [reserved EXCEPT ![ticket] = 0]
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "cancelled"]
     /\ UNCHANGED
         <<reclaimable, claimedHeld, ticketGeneration,
           configurationGeneration, reclaimNotices, claimCount>>
 
-Timeout(d) ==
-    /\ ticketState[d] = "pending"
-    /\ ticketState' = [ticketState EXCEPT ![d] = "failed"]
+TimeoutPending(ticket) ==
+    /\ ticketState[ticket] = "pending"
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "failed"]
     /\ UNCHANGED
         <<free, reclaimable, reserved, claimedHeld, ticketGeneration,
           configurationGeneration, reclaimNotices, claimCount>>
 
-\* Reconfiguration invalidates all requests admitted under the previous
+\* Timeout may race a published grant before the caller claims it. The timeout
+\* winner returns the exact reservation and reports failure.
+TimeoutGranted(ticket) ==
+    /\ ticketState[ticket] = "granted"
+    /\ reserved[ticket] = RequestBytes(ticket)
+    /\ free' = free + RequestBytes(ticket)
+    /\ reserved' = [reserved EXCEPT ![ticket] = 0]
+    /\ ticketState' =
+        [ticketState EXCEPT ![ticket] = "failed"]
+    /\ UNCHANGED
+        <<reclaimable, claimedHeld, ticketGeneration,
+          configurationGeneration, reclaimNotices, claimCount>>
+
+\* Reconfiguration invalidates requests admitted under the previous
 \* generation. Already published grants remain charged and claimable.
 Reconfigure ==
-    /\ \E d \in Devices: ticketState[d] = "pending"
+    /\ \E ticket \in Tickets:
+        ticketState[ticket] = "pending"
     /\ configurationGeneration' = configurationGeneration + 1
     /\ ticketState' =
-        [d \in Devices |->
-            IF ticketState[d] = "pending"
+        [ticket \in Tickets |->
+            IF ticketState[ticket] = "pending"
             THEN "failed"
-            ELSE ticketState[d]]
+            ELSE ticketState[ticket]]
     /\ UNCHANGED
         <<free, reclaimable, reserved, claimedHeld, ticketGeneration,
           reclaimNotices, claimCount>>
 
-\* The requester is intentionally not excluded as a victim. Excluding it can
-\* deadlock when it owns the only reclaimable allocation.
-SendReclaim(d) ==
-    /\ reclaimable[d] > 0
-    /\ reclaimNotices[d] = 0
-    /\ \E requester \in Devices:
-        /\ ticketState[requester] = "pending"
-        /\ free = 0
-    /\ reclaimNotices' = [reclaimNotices EXCEPT ![d] = 1]
+\* The requester is not excluded as a reclaim victim. It may own the only
+\* reclaimable allocation.
+SendReclaim(device) ==
+    /\ reclaimable[device] > 0
+    /\ reclaimNotices[device] = 0
+    /\ \E ticket \in Tickets:
+        /\ ticketState[ticket] = "pending"
+        /\ free < RequestBytes(ticket)
+    /\ reclaimNotices' =
+        [reclaimNotices EXCEPT ![device] = 1]
     /\ UNCHANGED
         <<free, reclaimable, reserved, claimedHeld, ticketState,
           ticketGeneration, configurationGeneration, claimCount>>
 
-Reclaim(d) ==
-    /\ reclaimNotices[d] > 0
-    /\ reclaimable[d] > 0
-    /\ reclaimable' = [reclaimable EXCEPT ![d] = @ - 1]
-    /\ reclaimNotices' = [reclaimNotices EXCEPT ![d] = 0]
+Reclaim(device) ==
+    /\ reclaimNotices[device] = 1
+    /\ reclaimable[device] > 0
+    /\ reclaimable' =
+        [reclaimable EXCEPT ![device] = @ - 1]
+    /\ reclaimNotices' =
+        [reclaimNotices EXCEPT ![device] = 0]
     /\ free' = free + 1
     /\ UNCHANGED
         <<reserved, claimedHeld, ticketState, ticketGeneration,
           configurationGeneration, claimCount>>
 
 Next ==
-    \/ \E d \in Devices: Submit(d)
-    \/ \E d \in Devices: Grant(d)
-    \/ \E d \in Devices: Claim(d)
-    \/ \E d \in Devices: Complete(d)
-    \/ \E d \in Devices: CancelPending(d)
-    \/ \E d \in Devices: CancelGranted(d)
-    \/ \E d \in Devices: Timeout(d)
+    \/ \E ticket \in Tickets: Submit(ticket)
+    \/ \E ticket \in Tickets: Grant(ticket)
+    \/ \E ticket \in Tickets: Claim(ticket)
+    \/ \E ticket \in Tickets: Complete(ticket)
+    \/ \E ticket \in Tickets: CancelPending(ticket)
+    \/ \E ticket \in Tickets: CancelGranted(ticket)
+    \/ \E ticket \in Tickets: TimeoutPending(ticket)
+    \/ \E ticket \in Tickets: TimeoutGranted(ticket)
     \/ Reconfigure
-    \/ \E d \in Devices: SendReclaim(d)
-    \/ \E d \in Devices: Reclaim(d)
+    \/ \E device \in Devices: SendReclaim(device)
+    \/ \E device \in Devices: Reclaim(device)
 
 CapacityConserved ==
-    free + Total(reclaimable) + Total(reserved) + Total(claimedHeld)
+    FixedCharge + free + DeviceTotal(reclaimable)
+        + TicketTotal(reserved) + TicketTotal(claimedHeld)
         = Capacity
 
-GrantedIsCharged ==
-    \A d \in Devices:
-        /\ (ticketState[d] = "granted") => (reserved[d] = 1)
-        /\ (ticketState[d] # "granted") => (reserved[d] = 0)
+GrantedIsChargedExactly ==
+    \A ticket \in Tickets:
+        /\ (ticketState[ticket] = "granted") =>
+            reserved[ticket] = RequestBytes(ticket)
+        /\ (ticketState[ticket] # "granted") =>
+            reserved[ticket] = 0
 
-ClaimedExactlyOnce ==
-    \A d \in Devices:
-        /\ (ticketState[d] = "claimed") =>
-            /\ claimedHeld[d] = 1
-            /\ claimCount[d] = 1
-        /\ claimCount[d] <= 1
+ClaimedIsOwnedExactly ==
+    \A ticket \in Tickets:
+        /\ (ticketState[ticket] = "claimed") =>
+            claimedHeld[ticket] = RequestBytes(ticket)
+        /\ (ticketState[ticket] # "claimed") =>
+            claimedHeld[ticket] = 0
 
-TerminalHasNoReservation ==
-    \A d \in Devices:
-        ticketState[d] \in {"cancelled", "failed", "completed"}
-            => reserved[d] = 0
+ClaimedAtMostOnce ==
+    \A ticket \in Tickets:
+        /\ claimCount[ticket] <= 1
+        /\ ticketState[ticket] = "claimed" =>
+            claimCount[ticket] = 1
+
+TerminalHasNoAllocation ==
+    \A ticket \in Tickets:
+        ticketState[ticket] \in {"cancelled", "failed", "completed"}
+            => /\ reserved[ticket] = 0
+               /\ claimedHeld[ticket] = 0
 
 PendingUsesCurrentGeneration ==
-    \A d \in Devices:
-        ticketState[d] = "pending"
-            => ticketGeneration[d] = configurationGeneration
+    \A ticket \in Tickets:
+        ticketState[ticket] = "pending"
+            => ticketGeneration[ticket] = configurationGeneration
 
-\* These fairness assumptions are deliberately action-specific. They support
-\* conditional progress checks without claiming that an unsatisfiable request
-\* can complete.
+RequestExtentValid ==
+    \A ticket \in Tickets:
+        /\ RequestBytes(ticket) > 0
+        /\ RequestBytes(ticket) <= MaxRequest
+        /\ RequestBytes(ticket) <= Capacity - FixedCharge
+        /\ OwnerOf(ticket) \in Devices
+
 Spec ==
     /\ Init
     /\ [][Next]_vars
-    /\ \A d \in Devices: SF_vars(Grant(d))
-    /\ \A d \in Devices: WF_vars(Claim(d))
-    /\ \A d \in Devices: WF_vars(Complete(d))
-    /\ \A d \in Devices: WF_vars(Reclaim(d))
+    /\ \A ticket \in Tickets: SF_vars(Grant(ticket))
+    /\ \A ticket \in Tickets: WF_vars(Claim(ticket))
+    /\ \A ticket \in Tickets: WF_vars(Complete(ticket))
+    /\ \A device \in Devices: WF_vars(Reclaim(device))
 
 =============================================================================

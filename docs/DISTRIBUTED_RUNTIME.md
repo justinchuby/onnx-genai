@@ -393,6 +393,26 @@ exceeds that reservation; only then may the data phase consume the ticket.
 Count exchange plus data transfer form one composite `CommInstanceId` for
 ordering and failure purposes.
 
+Before enqueue, the backend normalizes every buffer argument into one operation
+lease set:
+
+```rust
+pub struct CommLeaseSet {
+    /// Allocations that the backend may read until local terminal completion.
+    pub reads: Vec<PhysicalAllocationId>,
+    /// Allocations that the backend may write until local terminal completion.
+    pub writes: Vec<PhysicalAllocationId>,
+}
+```
+
+Read/read aliasing is legal. A write lease conflicts with every other read or
+write lease on the same physical allocation; an in-place collective lists its
+allocation in both sets and therefore acquires it exclusively. The outstanding
+operation registry owns the complete set before transport enqueue and releases
+it only at success or abort quiescence. `DeviceBuffer` views with different
+addresses or ranges do not bypass conflict detection when they share a
+`PhysicalAllocationId`.
+
 The transport-held lease and detach/abort lifetime are modeled in
 [`BufferOwnership.tla`](../specs/tla/BufferOwnership.tla). Any implementation
 optimization must preserve its registry-ownership and terminal-release
@@ -1399,6 +1419,73 @@ Aborting ─► Quiescing ─► Failed ─► Restarting(new topology epoch)
 Partial rank replacement and degraded execution are Phase 4+ work. Until then,
 no backend may continue a surviving subset after collective failure.
 
+### 8.6 Implementation Refinement and Conformance
+
+The TLA+ modules are normative protocol specifications, but TLC proves only the
+abstract models. An implementation is accepted only when it satisfies the
+action-to-linearization-point and trace-replay contract in
+[`specs/tla/REFINEMENT.md`](../specs/tla/REFINEMENT.md).
+
+Every protocol-changing implementation provides a lossless test trace with:
+
+- contract revision and topology epoch;
+- stable group, execution, sequence, rank, operation, request, and physical
+  allocation identities;
+- an ordered-membership hash for every communicator event;
+- complete read and write allocation lease sets; and
+- a monotonic per-source sequence assigned at the authoritative state mutation.
+
+Wall-clock timestamps never establish correctness order. The replay checker
+merges events using coordinator decision order, per-group submit order, and
+per-source sequence. Events from different communicator groups remain
+independently ordered.
+
+Trace insertion is part of the test-visible atomic transition. Test builds use
+preallocated, lossless owner-local journals: a journal append cannot allocate,
+block while holding a protocol lock, or be dropped under backpressure. Export
+and serialization happen after the critical section. Sampled production
+telemetry is diagnostic and cannot satisfy conformance.
+
+The replay checker is independent:
+
+```rust
+pub trait ProtocolConformanceChecker {
+    /// Applies exactly one enabled abstract action or returns the shortest
+    /// offending trace prefix.
+    fn apply(&mut self, event: &ProtocolTraceEvent) -> Result<()>;
+
+    /// Recomputes invariants and rejects unmodeled live ownership at test end.
+    fn finish(self, boundary: TestBoundary) -> Result<ConformanceReport>;
+}
+```
+
+It may share event and identity types with the runtime, but it must not call the
+runtime's state-transition functions. Otherwise implementation and oracle can
+repeat the same bug.
+
+**Required verification gates for each protocol implementation PR:**
+
+1. The affected bounded TLC configurations complete exhaustive checking.
+2. The PR names the concrete source location of every affected linearization
+   point.
+3. Deterministic race and fault-injection campaigns produce traces accepted by
+   the independent checker.
+4. Debug/test snapshots recompute ordering and lease invariants from
+   authoritative registry entries rather than trusting incremental counters.
+5. Every backend validates its stated completion, stream-order, abort, and
+   buffer-lifetime assumptions.
+6. The scheduler records its seed and decision trace; a failing interleaving is
+   replayable without random retry.
+
+Small models and deterministic campaigns run on every protocol-changing PR.
+Larger model bounds, extended schedule campaigns, and hardware backend tests run
+nightly. A flaky protocol test is a correctness failure, not a candidate for
+retry-to-green.
+
+Passing these gates means "conforms under checked traces and stated backend
+assumptions." It must not be described as a proof of arbitrary Rust, CUDA, or
+transport execution.
+
 ---
 
 ## 9. Integration with MoE Expert Parallelism
@@ -1569,6 +1656,8 @@ workloads are deferred to [§14](#14-deferred-workload-validation).
 **Goal:** Validate the abstraction without real hardware.
 
 - Implement `Communicator` trait and `InProcessCommunicator`
+- Implement contract-revisioned, lossless protocol traces and the independent
+  replay checker before adding a hardware transport.
 - Implement `TensorParallel` and `ExpertParallel` strategy structs
 - Compile compute and communication into one validated `FrozenPlan`
 - Test with multiple CPU EPs in one process simulating multi-device
@@ -1581,6 +1670,10 @@ workloads are deferred to [§14](#14-deferred-workload-validation).
   local-step quiescence, lease release, and no subsequent collective submission.
 - Run overlapping executions of the same frozen plan and assert
   `CommInstanceId` prevents cross-request send/recv or collective matching.
+- Replay deterministic schedules across overlapping communicator groups and
+  require every trace to satisfy `CollectiveOrdering` and `BufferOwnership`.
+- Run `specs/tla/check.sh`; record the concrete source location for each
+  linearization point listed in `specs/tla/REFINEMENT.md`.
 - Property-test `all_to_all_v` checked extents, offset overflow, overlapping
   receive ranges, mismatched peer counts, ticket reuse, and token permutation
   round-trips.
