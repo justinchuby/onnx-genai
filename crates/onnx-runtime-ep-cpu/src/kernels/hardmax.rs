@@ -28,8 +28,10 @@ impl Kernel for HardmaxKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Hardmax", inputs, outputs, 1, 1, 1)?;
         match inputs[0].dtype {
+            DataType::Float16 => hardmax_typed::<half::f16>(self.axis, inputs, outputs),
             DataType::Float32 => hardmax_typed::<f32>(self.axis, inputs, outputs),
             DataType::Float64 => hardmax_typed::<f64>(self.axis, inputs, outputs),
+            DataType::BFloat16 => hardmax_typed::<half::bf16>(self.axis, inputs, outputs),
             other => Err(unsupported_dtype("Hardmax", other)),
         }
     }
@@ -134,5 +136,36 @@ mod tests {
             .execute(&[input.view()], &mut [output.view_mut()])
             .unwrap();
         assert_eq!(output.to_f64(), vec![0., 1., 0., 1., 0., 0.]);
+    }
+
+    #[test]
+    fn hardmax_supports_float16() {
+        let input = Owned::f16(&[2, 3], &[1., 3., 3., 4., 2., 4.]);
+        let mut output = Owned::zeros(DataType::Float16, &[2, 3]);
+        HardmaxKernel { axis: 1 }
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_f16_as_f32(), vec![0., 1., 0., 1., 0., 0.]);
+    }
+
+    #[test]
+    fn hardmax_supports_bfloat16() {
+        let input = Owned::bf16(&[2, 3], &[1., 3., 3., 4., 2., 4.]);
+        let mut output = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        HardmaxKernel { axis: 1 }
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_bf16_as_f32(), vec![0., 1., 0., 1., 0., 0.]);
+    }
+
+    #[test]
+    fn hardmax_rejects_out_of_range_axis() {
+        let input = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let mut output = Owned::zeros_f32(&[2, 3]);
+        assert!(
+            HardmaxKernel { axis: 2 }
+                .execute(&[input.view()], &mut [output.view_mut()])
+                .is_err()
+        );
     }
 }

@@ -208,22 +208,55 @@ mod tests {
         }
     }
 
+    fn patterned_bytes(dtype: DataType, shape: &[usize], patterns: &[u8]) -> Owned {
+        assert_eq!(patterns.len(), shape.iter().product::<usize>());
+        let mut values = Vec::with_capacity(patterns.len() * dtype.byte_size());
+        for &pattern in patterns {
+            values.extend(std::iter::repeat_n(pattern, dtype.byte_size()));
+        }
+        Owned {
+            bytes: values,
+            shape: shape.to_vec(),
+            strides: compute_contiguous_strides(shape),
+            dtype,
+        }
+    }
+
     #[test]
-    fn binary_ops_support_every_integer_dtype() {
+    fn binary_ops_broadcast_non_uniform_values_for_every_integer_dtype() {
         let cases = [
-            (BitwiseOp::And, 0xf0, 0x0f, 0x00),
-            (BitwiseOp::Or, 0xf0, 0x0f, 0xff),
-            (BitwiseOp::Xor, 0xf0, 0x0f, 0xff),
+            (
+                BitwiseOp::And,
+                &[
+                    0x00, 0x30, 0xa0, 0x80, 0x0c, 0x30, 0x28, 0x00, 0x05, 0x11, 0x00, 0x01,
+                ][..],
+            ),
+            (
+                BitwiseOp::Or,
+                &[
+                    0xff, 0xf3, 0xfa, 0xf1, 0x3f, 0x3f, 0xbe, 0xbd, 0x5f, 0x77, 0xff, 0xd5,
+                ][..],
+            ),
+            (
+                BitwiseOp::Xor,
+                &[
+                    0xff, 0xc3, 0x5a, 0x71, 0x33, 0x0f, 0x96, 0xbd, 0x5a, 0x66, 0xff, 0xd4,
+                ][..],
+            ),
         ];
         for dtype in INTEGER_DTYPES {
-            for (op, lhs_byte, rhs_byte, expected_byte) in cases {
-                let lhs = bytes(dtype, &[2, 1], lhs_byte);
-                let rhs = bytes(dtype, &[1, 3], rhs_byte);
-                let mut out = bytes(dtype, &[2, 3], 0);
+            for (op, expected) in cases {
+                let lhs = patterned_bytes(dtype, &[3, 1], &[0xf0, 0x3c, 0x55]);
+                let rhs = patterned_bytes(dtype, &[1, 4], &[0x0f, 0x33, 0xaa, 0x81]);
+                let mut out = bytes(dtype, &[3, 4], 0);
                 BitwiseKernel { op }
                     .execute(&[lhs.view(), rhs.view()], &mut [out.view_mut()])
                     .unwrap();
-                assert_eq!(out.bytes, vec![expected_byte; out.bytes.len()], "{dtype:?}");
+                assert_eq!(
+                    out.bytes,
+                    patterned_bytes(dtype, &[3, 4], expected).bytes,
+                    "{dtype:?}"
+                );
             }
         }
     }
@@ -249,5 +282,42 @@ mod tests {
                 .unwrap();
             assert_eq!(out.bytes, vec![0xff; out.bytes.len()], "{dtype:?}");
         }
+    }
+
+    #[test]
+    fn bitwise_rejects_float_inputs() {
+        let lhs = Owned::f32(&[2], &[1., 2.]);
+        let rhs = Owned::f32(&[2], &[3., 4.]);
+        let mut out = Owned::zeros_f32(&[2]);
+        assert!(
+            BitwiseKernel { op: BitwiseOp::And }
+                .execute(&[lhs.view(), rhs.view()], &mut [out.view_mut()])
+                .is_err()
+        );
+        assert!(
+            BitwiseNotKernel
+                .execute(&[lhs.view()], &mut [out.view_mut()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bitwise_rejects_mixed_and_mismatched_output_dtypes() {
+        let lhs = bytes(DataType::Uint8, &[2], 0xf0);
+        let rhs = bytes(DataType::Int8, &[2], 0x0f);
+        let mut uint_out = bytes(DataType::Uint8, &[2], 0);
+        assert!(
+            BitwiseKernel { op: BitwiseOp::Or }
+                .execute(&[lhs.view(), rhs.view()], &mut [uint_out.view_mut()])
+                .is_err()
+        );
+
+        let rhs = bytes(DataType::Uint8, &[2], 0x0f);
+        let mut int_out = bytes(DataType::Int8, &[2], 0);
+        assert!(
+            BitwiseKernel { op: BitwiseOp::Or }
+                .execute(&[lhs.view(), rhs.view()], &mut [int_out.view_mut()])
+                .is_err()
+        );
     }
 }
