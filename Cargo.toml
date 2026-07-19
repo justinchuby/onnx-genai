@@ -37,6 +37,49 @@ members = [
     # ── onnx-rs standard library (new — see docs/ONNX_RS.md) ──
     "crates/onnx-rs",
     "crates/onnx-rs-python",
+
+    # ── FEASIBILITY SPIKE (see docs/MLAS_SYS_SPIKE.md) ──
+    # Registered as a member so `cargo build -p mlas-sys` resolves, but kept
+    # out of `default-members` below so bare `cargo build`/`cargo test` (and
+    # CI) do NOT compile the vendored MLAS C++. Remove after the spike review.
+    "crates/mlas-sys",
+]
+
+# Bare `cargo build`/`cargo test` operate on this set only, which excludes the
+# mlas-sys spike. Build the spike explicitly with `-p mlas-sys`.
+default-members = [
+    "crates/onnx-genai",
+    "crates/onnx-genai-preprocess",
+    "crates/onnx-genai-metadata",
+    "crates/onnx-genai-genai-config",
+    "crates/onnx-genai-runtime-config",
+    "crates/onnx-genai-kv",
+    "crates/onnx-genai-scheduler",
+    "crates/onnx-genai-engine",
+    "crates/onnx-genai-ort",
+    "crates/onnx-genai-server",
+    "crates/onnx-genai-router",
+    "crates/onnx-genai-bench",
+    "crates/onnx-genai-capi",
+    "crates/onnx-genai-ort/ort-sys",
+    "crates/onnx-runtime-ir",
+    "crates/onnx-runtime-memory",
+    "crates/onnx-runtime-cpuinfo",
+    "crates/onnx-runtime-loader",
+    "crates/onnx-runtime-shape-inference",
+    "crates/onnx-runtime-optimizer",
+    "crates/onnx-runtime-quantization",
+    "crates/onnx-runtime-ep-api",
+    "crates/onnx-runtime-ep-cpu",
+    "crates/onnx-runtime-ep-cuda",
+    "crates/onnx-runtime-eager",
+    "crates/onnx-runtime-session",
+    "crates/onnx-runtime-capi",
+    "crates/onnx-runtime-tracer",
+    "crates/onnx-runtime-python",
+    "crates/onnx-runtime-dlpack",
+    "crates/onnx-rs",
+    "crates/onnx-rs-python",
 ]
 
 [workspace.package]

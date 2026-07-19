@@ -1516,6 +1516,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlas-sys"
+version = "0.0.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
