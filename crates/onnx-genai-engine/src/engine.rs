@@ -2372,69 +2372,224 @@ fn maybe_enable_cuda_graph(options: &mut SessionOptions, model_directory: &Model
     }
 }
 
-/// Models larger than this likely embed initializer data inline. Decoding them
-/// solely to inspect their graph would be needlessly expensive.
-const MAX_CONTROL_FLOW_SCAN_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Minimal protobuf views used to scan an ONNX graph's node `op_type`s without
-/// pulling in the full model proto (which lives behind the `native-backend`
-/// feature). prost silently ignores unknown fields, so only the traversed tags
-/// need declaring: `ModelProto.graph = 7`, `GraphProto.node = 1`,
-/// `NodeProto.op_type = 4`, and `NodeProto.domain = 7`.
-#[derive(Clone, PartialEq, prost::Message)]
-struct ScanModel {
-    #[prost(message, optional, tag = "7")]
-    graph: Option<ScanGraph>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ScanGraph {
-    #[prost(message, repeated, tag = "1")]
-    node: Vec<ScanNode>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ScanNode {
-    #[prost(string, tag = "4")]
-    op_type: String,
-    #[prost(string, tag = "7")]
-    domain: String,
-}
-
 /// Whether the ONNX model at `model_path` contains top-level control-flow nodes
 /// (`If`/`Loop`/`Scan`). ORT cannot capture a CUDA graph for such models, and
 /// requesting capture anyway (via the `enable_cuda_graph` provider option)
 /// forces a pathological ~6× slower per-Run path, so the caller must leave graph
 /// capture disabled when this returns `true`.
 ///
+/// The scan streams the ONNX protobuf and `seek`s past initializer tensors
+/// rather than loading them, so it stays cheap even when a model embeds
+/// multi-gigabyte weights inline (e.g. the qwen3 exports, whose `model.onnx` is
+/// over 1 GB). Only the small node region is actually read. An earlier version
+/// gave up on any file over 512 MB and conservatively reported "has control
+/// flow", which wrongly disabled CUDA graph capture for large inline-weight
+/// models — a ~20% decode-throughput loss on otherwise capture-eligible models.
+///
 /// Returns `true` whenever the model cannot be inspected. CUDA graph capture is
 /// an optional optimization, so uncertain models conservatively skip it rather
 /// than risking ORT's pathological uncaptured per-Run path.
 fn model_has_control_flow_nodes(model_path: &Path) -> bool {
-    const CONTROL_FLOW_OPS: [&str; 3] = ["If", "Loop", "Scan"];
+    // A model that cannot be inspected is conservatively treated as if it had
+    // control flow, so capture stays off rather than risking the pathological
+    // uncaptured per-Run path.
+    scan_top_level_control_flow(model_path).unwrap_or(true)
+}
 
-    match std::fs::metadata(model_path) {
-        // onnxruntime-genai / Foundry models keep weights in an external
-        // `model.onnx.data`, so the graph proto itself is small (a few MB).
-        // Avoid decoding an inline-weight model, but conservatively leave graph
-        // capture off because it may still contain control flow.
-        Ok(meta) if meta.len() > MAX_CONTROL_FLOW_SCAN_BYTES => return true,
-        Ok(_) => {}
-        Err(_) => return true,
+/// Streaming scan for top-level control-flow ops in an ONNX `ModelProto`.
+///
+/// Returns `Some(true)`/`Some(false)` when the graph could be walked, or `None`
+/// if the file could not be opened/parsed (the caller treats that
+/// conservatively). The ONNX wire layout traversed here is
+/// `ModelProto.graph = 7`, `GraphProto.node = 1`, `NodeProto.op_type = 4`, and
+/// `NodeProto.domain = 7`. Every other field — including the
+/// `GraphProto.initializer` weight tensors that dominate an inline-weight file —
+/// is skipped with `seek`, so the number of bytes actually read is proportional
+/// to the graph's node list, not the weight payload.
+fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+
+    const CONTROL_FLOW_OPS: [&str; 3] = ["If", "Loop", "Scan"];
+    // Real `op_type`/`domain` strings are short; a longer length is a misparse,
+    // so we refuse to allocate for it (and treat the model conservatively).
+    const MAX_NAME_LEN: u64 = 256;
+    // protobuf field numbers are 1..=2^29-1 (0 is reserved/invalid).
+    const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
+
+    /// Read a base-128 protobuf varint, rejecting EOF and over-long (>10 byte)
+    /// or overflowing encodings (the 10th byte may only carry the top bit).
+    fn read_varint<R: Read>(reader: &mut R) -> Option<u64> {
+        let mut value: u64 = 0;
+        for index in 0..10u32 {
+            let mut byte = [0u8; 1];
+            reader.read_exact(&mut byte).ok()?;
+            let bits = byte[0];
+            if index == 9 && bits > 1 {
+                return None; // 10th byte would overflow u64
+            }
+            value |= u64::from(bits & 0x7f) << (index * 7);
+            if bits & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None // 10 continuation bytes without a terminator
     }
-    let Ok(bytes) = std::fs::read(model_path) else {
-        return true;
-    };
-    use prost::Message;
-    let Ok(model) = ScanModel::decode(bytes.as_slice()) else {
-        return true;
-    };
-    model.graph.is_some_and(|graph| {
-        graph.node.iter().any(|node| {
-            matches!(node.domain.as_str(), "" | "ai.onnx")
-                && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
-        })
-    })
+
+    /// Read and validate a field key (tag), returning `(field_number, wire_type)`.
+    /// Rejects the reserved field number 0 and out-of-range field numbers.
+    fn read_key<R: Read>(reader: &mut R) -> Option<(u64, u64)> {
+        let tag = read_varint(reader)?;
+        let field = tag >> 3;
+        let wire = tag & 0x7;
+        if field == 0 || field > MAX_FIELD_NUMBER {
+            return None;
+        }
+        Some((field, wire))
+    }
+
+    /// Seek `advance` bytes forward, refusing to cross the container's `end`.
+    fn seek_within<R: Seek>(reader: &mut R, advance: u64, end: u64) -> Option<()> {
+        let position = reader.stream_position().ok()?;
+        let target = position.checked_add(advance)?;
+        if target > end {
+            return None;
+        }
+        reader.seek(SeekFrom::Start(target)).ok()?;
+        Some(())
+    }
+
+    /// Advance past one field whose value is not needed, staying within `end`.
+    /// Length-delimited payloads (initializers, value infos) are skipped with
+    /// `seek` and never read into memory.
+    fn skip_field<R: Read + Seek>(reader: &mut R, wire: u64, end: u64) -> Option<()> {
+        match wire {
+            0 => {
+                read_varint(reader)?;
+                if reader.stream_position().ok()? > end {
+                    return None;
+                }
+            }
+            1 => seek_within(reader, 8, end)?,
+            2 => {
+                let len = read_varint(reader)?;
+                seek_within(reader, len, end)?;
+            }
+            5 => seek_within(reader, 4, end)?,
+            _ => return None, // group (3/4) or invalid wire types
+        }
+        Some(())
+    }
+
+    /// Read a length-delimited header and return the exclusive end offset of its
+    /// payload, verifying it stays within the enclosing container's `end`.
+    fn length_delimited_end<R: Read + Seek>(reader: &mut R, end: u64) -> Option<u64> {
+        let len = read_varint(reader)?;
+        let start = reader.stream_position().ok()?;
+        let payload_end = start.checked_add(len)?;
+        if payload_end > end {
+            return None;
+        }
+        Some(payload_end)
+    }
+
+    /// Read a short length-delimited string (`op_type`/`domain`), bounded by
+    /// `end` and `MAX_NAME_LEN`. A longer or out-of-bounds length yields `None`.
+    fn read_name<R: Read + Seek>(reader: &mut R, end: u64) -> Option<String> {
+        let len = read_varint(reader)?;
+        if len > MAX_NAME_LEN {
+            return None;
+        }
+        let start = reader.stream_position().ok()?;
+        if start.checked_add(len)? > end {
+            return None;
+        }
+        let mut buffer = vec![0u8; len as usize];
+        reader.read_exact(&mut buffer).ok()?;
+        String::from_utf8(buffer).ok()
+    }
+
+    /// Whether a `NodeProto` spanning `[.., node_end)` is a control-flow op in
+    /// the default (`""`/`ai.onnx`) domain. Consumes exactly up to `node_end`.
+    fn node_is_control_flow<R: Read + Seek>(reader: &mut R, node_end: u64) -> Option<bool> {
+        let mut op_type: Option<String> = None;
+        let mut domain: Option<String> = None;
+        loop {
+            let position = reader.stream_position().ok()?;
+            if position == node_end {
+                break;
+            }
+            if position > node_end {
+                return None;
+            }
+            match read_key(reader)? {
+                (4, 2) => op_type = Some(read_name(reader, node_end)?),
+                (7, 2) => domain = Some(read_name(reader, node_end)?),
+                (_, wire) => skip_field(reader, wire, node_end)?,
+            }
+        }
+        Some(
+            matches!(domain.unwrap_or_default().as_str(), "" | "ai.onnx")
+                && CONTROL_FLOW_OPS.contains(&op_type.unwrap_or_default().as_str()),
+        )
+    }
+
+    /// Scan a `GraphProto` spanning `[.., graph_end)` for a top-level
+    /// control-flow node. Consumes exactly up to `graph_end`.
+    fn graph_has_control_flow<R: Read + Seek>(reader: &mut R, graph_end: u64) -> Option<bool> {
+        loop {
+            let position = reader.stream_position().ok()?;
+            if position == graph_end {
+                return Some(false);
+            }
+            if position > graph_end {
+                return None;
+            }
+            match read_key(reader)? {
+                (1, 2) => {
+                    let node_end = length_delimited_end(reader, graph_end)?;
+                    if node_is_control_flow(reader, node_end)? {
+                        // Leave the reader anywhere; the caller stops on `true`.
+                        return Some(true);
+                    }
+                }
+                (_, wire) => skip_field(reader, wire, graph_end)?,
+            }
+        }
+    }
+
+    let file = std::fs::File::open(model_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut reader = BufReader::new(file);
+
+    // Top level: walk every `ModelProto` field, scanning each `graph` (field 7)
+    // occurrence. Duplicate graph fields (protobuf merge semantics) are all
+    // inspected so a control-flow node in a later one is never missed. If we
+    // reach EOF without ever seeing a graph the model is not a `ModelProto` we
+    // understand, so we report `None` (conservative `true`) rather than a
+    // definitive "no control flow".
+    let mut saw_graph = false;
+    loop {
+        let position = reader.stream_position().ok()?;
+        if position == file_len {
+            return if saw_graph { Some(false) } else { None };
+        }
+        if position > file_len {
+            return None;
+        }
+        match read_key(&mut reader)? {
+            (7, 2) => {
+                saw_graph = true;
+                let graph_end = length_delimited_end(&mut reader, file_len)?;
+                if graph_has_control_flow(&mut reader, graph_end)? {
+                    return Some(true);
+                }
+                // `graph_has_control_flow` returned `false`, so it consumed the
+                // whole graph; realign in case a node scan stopped early.
+                reader.seek(SeekFrom::Start(graph_end)).ok()?;
+            }
+            (_, wire) => skip_field(&mut reader, wire, file_len)?,
+        }
+    }
 }
 
 /// Whether the model at `model_directory` declares the shared-KV (SharedBuffer)
@@ -2641,7 +2796,18 @@ mod tests {
     }
 
     fn write_scan_model(nodes: &[(&str, &str)]) -> std::path::PathBuf {
-        use onnx::ir::{DataType, Graph, Node, NodeId, static_shape};
+        write_scan_model_with_weights(nodes, 0)
+    }
+
+    /// Build a valid ONNX model whose graph has the given `(domain, op_type)`
+    /// nodes, plus `weight_floats` f32 elements of inline initializer data to
+    /// simulate an inline-weight export (the qwen3 case). The streaming scan
+    /// must `seek` past this initializer rather than reading it.
+    fn write_scan_model_with_weights(
+        nodes: &[(&str, &str)],
+        weight_floats: usize,
+    ) -> std::path::PathBuf {
+        use onnx::ir::{DataType, Dim, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
         use onnx_rs as onnx;
         use prost::Message;
 
@@ -2657,6 +2823,23 @@ mod tests {
             node.domain = domain.to_string();
             graph.insert_node(node);
             graph.add_output(output);
+        }
+
+        if weight_floats > 0 {
+            let weight = graph.create_named_value(
+                "inline_weight",
+                DataType::Float32,
+                vec![Dim::from(weight_floats)],
+            );
+            let bytes = vec![0u8; weight_floats * std::mem::size_of::<f32>()];
+            graph.set_initializer(
+                weight,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![weight_floats],
+                    bytes,
+                )),
+            );
         }
 
         let path = test_model_path("control-flow");
@@ -2716,14 +2899,53 @@ mod tests {
     }
 
     #[test]
-    fn control_flow_scan_conservatively_skips_large_models() {
-        let path = test_model_path("large-control-flow");
-        std::fs::File::create(&path)
-            .expect("create large test model")
-            .set_len(MAX_CONTROL_FLOW_SCAN_BYTES + 1)
-            .expect("make sparse large test model");
-        assert!(model_has_control_flow_nodes(&path));
-        std::fs::remove_file(&path).ok();
+    fn control_flow_scan_reads_nodes_past_large_inline_weights() {
+        // Simulate an inline-weight export (like the qwen3 models, whose
+        // `model.onnx` embeds >1 GB of weights): the graph carries a large
+        // initializer alongside its nodes. The streaming scan must still find
+        // the control-flow op — and, for a plain graph, must NOT be fooled into
+        // conservatively reporting control flow just because the file is large.
+        // 4 Mi f32 elements = 16 MiB of inline initializer data.
+        let weight_floats = 4 * 1024 * 1024;
+
+        let with_control_flow =
+            write_scan_model_with_weights(&[("", "MatMul"), ("", "If")], weight_floats);
+        assert!(
+            model_has_control_flow_nodes(&with_control_flow),
+            "control-flow op must be detected even behind a large inline initializer"
+        );
+        std::fs::remove_file(&with_control_flow).ok();
+
+        let plain =
+            write_scan_model_with_weights(&[("", "MatMul"), ("", "GroupQueryAttention")], weight_floats);
+        assert!(
+            !model_has_control_flow_nodes(&plain),
+            "a large inline-weight model without control flow must remain capture-eligible"
+        );
+        std::fs::remove_file(&plain).ok();
+    }
+
+    #[test]
+    fn control_flow_scan_conservatively_handles_truncated_control_flow_model() {
+        // A control-flow model whose bytes are truncated anywhere must never
+        // parse cleanly into a "no control flow" verdict (which would wrongly
+        // enable CUDA graph capture and trigger ORT's ~6x slower per-Run path).
+        // Truncation either cuts the graph payload (its length header points past
+        // EOF -> None) or stops before the graph is ever seen (no-graph -> None),
+        // so every non-empty prefix must fall back to conservative `true`.
+        let full = write_scan_model(&[("", "MatMul"), ("", "If")]);
+        let bytes = std::fs::read(&full).expect("read full model");
+        std::fs::remove_file(&full).ok();
+
+        for truncated_len in 1..bytes.len() {
+            let truncated = test_model_path(&format!("truncated-{truncated_len}"));
+            std::fs::write(&truncated, &bytes[..truncated_len]).expect("write truncated model");
+            assert!(
+                model_has_control_flow_nodes(&truncated),
+                "a truncated control-flow model (len {truncated_len}) must stay conservative"
+            );
+            std::fs::remove_file(&truncated).ok();
+        }
     }
 
     #[cfg(feature = "native-backend")]
