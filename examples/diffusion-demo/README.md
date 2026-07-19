@@ -102,6 +102,16 @@ another real model) to see the GPU win in the it/s card.
   controls; each run tokenizes the prompt with the packaged CLIP tokenizer, runs
   the iterative denoise loop (DPM-Solver++, classifier-free guidance), and
   VAE-decodes the final latent to an RGB PNG.
+
+  Tip: move the package somewhere persistent (the repo's gitignored `models/`
+  dir works — the 2.7 GB package won't survive a reboot in `/tmp`) and combine
+  with the MLX EP for a fast render (~4× vs CPU on Apple Silicon):
+  ```bash
+  ONNX_GENAI_SD_PACKAGE="$PWD/../../models/sd-small-fromscratch" \
+    ONNX_GENAI_EP=metal \
+    ONNX_GENAI_METAL_EP_LIB=/abs/path/onnxruntime-mlx/rust/target/release/libonnxruntime_mlx_ep.dylib \
+    npm run dev
+  ```
 - **Real language diffusion** (beyond the bundled fixture): export a masked
   masked-diffusion LM (e.g. `kuleshov-group/mdlm-owt`) to a package and point the
   demo at it with `ONNX_GENAI_LM_PACKAGE=/path/to/pkg` and
