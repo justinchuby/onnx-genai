@@ -670,6 +670,15 @@ pub struct PipelineStrategy {
     #[serde(default)]
     pub timesteps: Option<Vec<f32>>,
 
+    /// First step index for a partial (img2img) denoise loop.
+    ///
+    /// When set, the iterative loop runs `start_step..num_steps` instead of the
+    /// full `0..num_steps`, and the seed (`denoiser` sample input) is expected to
+    /// already be the encoded image noised to `timesteps[start_step]`. Matches
+    /// diffusers' img2img `get_timesteps(num_steps, strength)` skip. Default 0.
+    #[serde(default)]
+    pub start_step: Option<usize>,
+
     /// Optional diffusion scheduler applied to the denoiser's loop-carried
     /// output (treating it as a noise prediction) each step.
     #[serde(default)]

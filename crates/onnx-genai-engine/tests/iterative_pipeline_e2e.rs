@@ -383,6 +383,45 @@ pipeline:
 }
 
 #[test]
+fn iterative_start_step_runs_partial_loop() -> anyhow::Result<()> {
+    // img2img: start_step skips the earliest (noisiest) steps. denoiser_step
+    // outputs `denoised = sample + t` with identity feedback (no scheduler).
+    // timesteps=[10,20,30,40], start_step=2 runs only steps 2,3:
+    //   seed 0 -> 0+30=30 -> 30+40=70   (vs the full loop's 100).
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 4
+    start_step: 2
+    timestep_input: t
+    timesteps:
+      - 10.0
+      - 20.0
+      - 30.0
+      - 40.0
+";
+    let dir = fixture_with_metadata("diffusion-img2img", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request =
+        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
+    for got in &denoised {
+        assert!((got - 70.0).abs() < 1e-4, "{got} != 70 (partial loop from start_step=2)");
+    }
+    Ok(())
+}
+
+#[test]
 fn iterative_dpmpp_2m_karras_runs() -> anyhow::Result<()> {
     // use_karras_sigmas swaps in the Karras (rho=7) sigma schedule; verify it
     // threads through the schema and runs. Numerical parity is covered by

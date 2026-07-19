@@ -352,7 +352,15 @@ impl PipelineEngine {
         // name collides with a conditioning input from clobbering it.
         let mut carried: HashMap<String, Value> = HashMap::new();
         let mut last_outputs: HashMap<String, Value> = HashMap::new();
-        for step in 0..plan.num_steps {
+        // Reset any multistep scheduler state before the loop (img2img reuses a
+        // plan whose scheduler may hold state from a previous run).
+        if let Some(scheduler) = &plan.scheduler {
+            scheduler.reset();
+        }
+        // Partial (img2img) loops start at `start_step`; the seed is then the
+        // encoded image already noised to `timesteps[start_step]`.
+        for step in plan.start_step..plan.num_steps {
+            let is_first = step == plan.start_step;
             // Timestep/sigma for this step: explicit schedule when provided,
             // otherwise the 0-based step index.
             let timestep = plan
@@ -362,14 +370,14 @@ impl PipelineEngine {
                 .unwrap_or(step as f32);
 
             // Raw (unscaled) loop-carried sample feeding each loop input this
-            // step: the seed at step 0, otherwise the value carried from the
-            // previous step. The scheduler's `step` consumes these raw samples.
+            // step: the seed on the first step, otherwise the value carried from
+            // the previous step. The scheduler's `step` consumes these raw samples.
             let mut raw_samples: HashMap<String, Value> = HashMap::new();
             for (_, in_port) in &plan.loop_edges {
-                let raw = if step == 0 {
+                let raw = if is_first {
                     let endpoint = format!("{}.{}", plan.denoiser, in_port);
                     constants.get(&endpoint).with_context(|| {
-                        format!("missing iterative pipeline seed '{endpoint}' at step 0")
+                        format!("missing iterative pipeline seed '{endpoint}' at start step")
                     })?
                 } else {
                     carried.get(in_port).with_context(|| {
@@ -519,9 +527,9 @@ impl PipelineEngine {
             }
             let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
             let value = if is_loop {
-                if step == 0 {
+                if step == plan.start_step {
                     constants.get(&endpoint).with_context(|| {
-                        format!("missing iterative pipeline seed '{endpoint}' at step 0")
+                        format!("missing iterative pipeline seed '{endpoint}' at start step")
                     })?
                 } else {
                     carried
@@ -883,6 +891,8 @@ struct IterativePlan {
     loop_edges: Vec<(String, String)>,
     /// Denoiser input port that receives the per-step timestep scalar, if any.
     timestep_input: Option<String>,
+    /// First step index (0 for txt2img; >0 for a partial img2img denoise loop).
+    start_step: usize,
     /// Explicit per-step timestep schedule (length == `num_steps`); when absent
     /// the 0-based step index is fed instead.
     timesteps: Option<Vec<f32>>,
@@ -910,6 +920,10 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
         sample: &Value,
         model_output: &Value,
     ) -> anyhow::Result<Value>;
+
+    /// Reset any per-loop internal state (e.g. a multistep scheduler's previous
+    /// prediction). Called once before each denoise loop. Default no-op.
+    fn reset(&self) {}
 
     /// Per-step transform applied to the loop-carried input BEFORE the denoiser
     /// (e.g. Euler's `sample / sqrt(sigma^2 + 1)`). `Ok(None)` = identity (the
@@ -1513,11 +1527,10 @@ impl Scheduler for Dpmpp2m {
             .prev_x0
             .lock()
             .map_err(|_| anyhow::anyhow!("dpm++ scheduler state poisoned"))?;
-        if step == 0 {
-            *prev = None; // reset at the start of each denoise loop
-        }
         let lower_order_final = step + 1 == num_steps && num_steps < 15;
-        let first_order = step == 0 || lower_order_final || prev.is_none();
+        // First step of the loop (prev cleared by reset) or the low-order final
+        // step both use the first-order update.
+        let first_order = lower_order_final || prev.is_none();
 
         let out: Vec<f32> = if first_order {
             x.iter()
@@ -1543,6 +1556,12 @@ impl Scheduler for Dpmpp2m {
         *prev = Some(x0);
         drop(prev);
         Value::from_slice_f32(&out, &shape).map_err(Into::into)
+    }
+
+    fn reset(&self) {
+        if let Ok(mut prev) = self.prev_x0.lock() {
+            *prev = None;
+        }
     }
 }
 
@@ -1633,6 +1652,12 @@ impl PipelinePlan {
         if num_steps == 0 {
             anyhow::bail!("iterative strategy 'num_steps' must be greater than zero");
         }
+        let start_step = spec.strategy.start_step.unwrap_or(0);
+        if start_step >= num_steps {
+            anyhow::bail!(
+                "iterative strategy 'start_step' ({start_step}) must be less than 'num_steps' ({num_steps})"
+            );
+        }
 
         // Classifier-free guidance requires a declared conditioning input to
         // zero on the unconditional pass.
@@ -1699,6 +1724,7 @@ impl PipelinePlan {
             final_components,
             loop_edges,
             timestep_input: spec.strategy.timestep_input.clone(),
+            start_step,
             timesteps: spec.strategy.timesteps.clone(),
             scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps, schedulers)?,
             cfg_conditioning_input: spec.strategy.cfg_conditioning_input.clone(),

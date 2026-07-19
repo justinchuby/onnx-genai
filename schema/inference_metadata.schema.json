@@ -1135,6 +1135,16 @@
             "$ref": "#/$defs/PipelineStrategyStage"
           }
         },
+        "start_step": {
+          "description": "First step index for a partial (img2img) denoise loop.\n\nWhen set, the iterative loop runs `start_step..num_steps` instead of the\nfull `0..num_steps`, and the seed (`denoiser` sample input) is expected to\nalready be the encoded image noised to `timesteps[start_step]`. Matches\ndiffusers' img2img `get_timesteps(num_steps, strength)` skip. Default 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
         "state": {
           "description": "Runtime-specific iterative state declaration."
         },
