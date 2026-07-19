@@ -6,9 +6,14 @@
 //! The 2-D tile GEMM ([`gemm`]) dispatches on [`CpuBackend::auto_detect`]
 //! (`docs/ORT2.md` §25.2):
 //!
-//! * **Generic** (default, always compiled, offline): a blocked, register-tiled,
-//!   rayon-parallelized pure-Rust f32 GEMM ([`gemm_generic`]). It is the
-//!   correctness baseline and contains no `unsafe`.
+//! * **Generic** (default fallback, always compiled, offline): a blocked,
+//!   register-tiled, rayon-parallelized pure-Rust f32 GEMM ([`gemm_generic`]).
+//!   It is the correctness baseline and contains no `unsafe`.
+//! * **`SimdX86`** (default on AVX2/FMA x86-64, runtime-detected): an
+//!   MLAS-style packed SIMD f32 SGEMM ([`simd_gemm`]) — panel packing + a
+//!   `6×16` AVX2/FMA register microkernel + K/N cache blocking, parallelized
+//!   over column strips. Selected automatically with no cargo feature; falls
+//!   back to Generic when AVX2/FMA is absent.
 //! * **oneDNN** (non-default `onednn` feature): `dnnl_sgemm` via
 //!   [`crate::kernels::onednn`], statically linked.
 //!
@@ -27,6 +32,12 @@ use super::check_arity;
 use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
+
+// MLAS-style packed SIMD f32 GEMM (the `SimdX86` backend). Kept in a sibling
+// file but included here so `kernels/mod.rs` needs no edit; it is an internal
+// perf detail of the MatMul hot path, not a new op.
+#[path = "simd_gemm.rs"]
+mod simd_gemm;
 
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
@@ -100,6 +111,12 @@ pub(crate) fn gemm(
     match CpuBackend::auto_detect() {
         #[cfg(feature = "onednn")]
         CpuBackend::OneDnn => crate::kernels::onednn::sgemm(a, b, c, m, k, n),
+        // Built-in MLAS-style packed SIMD backend for AVX2/FMA x86-64 hosts.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        CpuBackend::SimdX86 => {
+            simd_gemm::sgemm_simd(a, b, c, m, k, n);
+            Ok(())
+        }
         // Xnnpack / Accelerate placeholders (and Generic) share the pure-Rust
         // kernel until their native backends are wired.
         _ => {

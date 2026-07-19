@@ -6,6 +6,9 @@
 //!
 //! * On x86 / ARM-server targets we prefer **oneDNN** when it is compiled in
 //!   (the non-default `onednn` cargo feature, statically linked in this crate).
+//! * On x86-64 hosts with AVX2 + FMA (detected at runtime) we use the built-in
+//!   **`SimdX86`** MLAS-style packed SIMD f32 GEMM — the default fast path with
+//!   no extra dependency and no cargo feature required.
 //! * Everything else — and any build without the `onednn` feature — falls back
 //!   to the **Generic** pure-Rust blocked GEMM, which compiles anywhere and is
 //!   the correctness baseline.
@@ -24,6 +27,12 @@ pub enum CpuBackend {
     /// oneDNN (x86 + ARM server). Requires the `onednn` cargo feature; when that
     /// feature is off this variant is never selected.
     OneDnn,
+    /// Built-in MLAS-style packed SIMD f32 GEMM for x86-64 with AVX2 + FMA.
+    /// Selected at runtime via `is_x86_feature_detected!` — no cargo feature and
+    /// no external dependency. Falls back to [`CpuBackend::Generic`] arithmetic
+    /// on hosts without AVX2/FMA.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    SimdX86,
     /// XNNPACK (Android mobile). Design placeholder — currently routes to
     /// [`CpuBackend::Generic`] arithmetic.
     #[cfg(target_os = "android")]
@@ -43,7 +52,8 @@ impl CpuBackend {
     ///
     /// * Android → `Xnnpack` (placeholder; Generic arithmetic today).
     /// * macOS / iOS → `Accelerate` (placeholder; Generic arithmetic today).
-    /// * Otherwise → `OneDnn` when [`has_onednn`] is true, else `Generic`.
+    /// * Otherwise → `OneDnn` when [`has_onednn`] is true; else `SimdX86` when
+    ///   the host is x86-64 with AVX2 + FMA; else `Generic`.
     pub fn auto_detect() -> Self {
         #[cfg(target_os = "android")]
         {
@@ -62,10 +72,25 @@ impl CpuBackend {
             if has_onednn() {
                 Self::OneDnn
             } else {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    if has_simd_x86() {
+                        return Self::SimdX86;
+                    }
+                }
                 Self::Generic
             }
         }
     }
+}
+
+/// Whether the host CPU supports the AVX2 + FMA instructions the built-in
+/// [`CpuBackend::SimdX86`] microkernel requires. Runtime-detected so the same
+/// binary stays correct on older x86 CPUs (falling back to `Generic`).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub fn has_simd_x86() -> bool {
+    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 }
 
 /// Whether the statically-linked oneDNN backend is compiled into this build.
@@ -102,7 +127,18 @@ mod tests {
         let expected = if cfg!(feature = "onednn") {
             CpuBackend::OneDnn
         } else {
-            CpuBackend::Generic
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                if has_simd_x86() {
+                    CpuBackend::SimdX86
+                } else {
+                    CpuBackend::Generic
+                }
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                CpuBackend::Generic
+            }
         };
         assert_eq!(CpuBackend::auto_detect(), expected);
     }
