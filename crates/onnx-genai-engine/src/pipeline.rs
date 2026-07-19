@@ -1416,6 +1416,20 @@ impl PipelinePlan {
             }
         }
 
+        // The CFG conditioning port and the loop-carried sample port must be
+        // distinct: on the unconditional pass the conditioning is replaced, and
+        // a scheduler (e.g. Euler) may also override the loop input, so a shared
+        // port would make the two overrides clobber each other.
+        if let Some(cfg_port) = &spec.strategy.cfg_conditioning_input
+            && guidance_active
+            && loop_edges.iter().any(|(_, in_port)| in_port == cfg_port)
+        {
+            anyhow::bail!(
+                "cfg_conditioning_input '{cfg_port}' must not also be a loop-carried input \
+                 port: the unconditional conditioning override would clobber the loop sample"
+            );
+        }
+
         // Non-decoder components: prompt-phase (run once before the loop) and
         // final-phase (run once after the loop).
         let mut prompt_components = Vec::new();

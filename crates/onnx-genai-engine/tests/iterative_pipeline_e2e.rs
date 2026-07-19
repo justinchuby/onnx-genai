@@ -391,6 +391,38 @@ pipeline:
 }
 
 #[test]
+fn cfg_conditioning_port_that_is_also_a_loop_input_is_rejected() -> anyhow::Result<()> {
+    // If cfg_conditioning_input names a loop-carried input port, the
+    // unconditional override would clobber the scheduler's loop sample. Reject
+    // at load time.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 2
+    guidance_scale: 7.5
+    cfg_conditioning_input: sample
+";
+    let dir = fixture_with_metadata("diffusion-cfg-collision", &["denoiser_step.onnx"], metadata)?;
+    let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
+        .err()
+        .expect("cfg conditioning port colliding with a loop input must be rejected");
+    assert!(
+        err.to_string().contains("loop-carried input"),
+        "unexpected: {err}"
+    );
+    Ok(())
+}
+
+#[test]
 fn iterative_ddim_scheduler_transforms_loop_carried_sample() -> anyhow::Result<()> {
     // denoiser_step outputs `denoised = sample + t`. With timestep_input=t and
     // no explicit schedule, step 0 injects t=0, so the model output (treated as
