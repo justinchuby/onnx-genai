@@ -69,6 +69,9 @@ def main() -> int:
     ap.add_argument("--checkpoint", required=True, help=".safetensors/.ckpt, diffusers dir, or HF id.")
     ap.add_argument("--output", "-o", default="comfyui_out.png", help="Output PNG path.")
     ap.add_argument("--workdir", default=str(REPO / "target" / "run-comfyui"))
+    ap.add_argument("--control-image", help="Control image for a ControlNet workflow (resized to WxH).")
+    ap.add_argument("--lora", action="append", metavar="NAME=PATH", help="Resolve a ComfyUI LoRA name to a path (fused).")
+    ap.add_argument("--controlnet", action="append", metavar="NAME=PATH", help="Resolve a ComfyUI ControlNet name to a diffusers dir/file (fused).")
     ap.add_argument("--compare", action="store_true", help="Also diff against a diffusers reference.")
     args = ap.parse_args()
 
@@ -86,7 +89,19 @@ def main() -> int:
 
     pdir = Path(args.workdir) / "pipeline"
     print("converting ComfyUI workflow -> onnx-genai pipeline ...", flush=True)
-    result = convert_comfyui_workflow(workflow, args.checkpoint, str(pdir))
+    def _pairs(entries):
+        out = {}
+        for e in entries or []:
+            n, _, p = e.partition("=")
+            if p:
+                out[n] = p
+        return out or None
+
+    result = convert_comfyui_workflow(
+        workflow, args.checkpoint, str(pdir),
+        lora_paths=_pairs(getattr(args, "lora", None)),
+        controlnet_paths=_pairs(getattr(args, "controlnet", None)),
+    )
     wf = result.workflow
     meta = json.loads(json.dumps(__import__("yaml").safe_load(open(result.metadata_path))))
     sc = meta["pipeline"]["strategy"]["scheduler_config"]
@@ -151,9 +166,28 @@ def main() -> int:
             f"denoiser.encoder_hidden_states.uncond:1,{emb_neg.shape[1]},{emb_neg.shape[2]}:{pdir / 'uncond.f32'}",
         ]
 
+    controlnet = bool(run_params.get("controlnet", False))
+    if controlnet:
+        cond_ch = int(run_params.get("conditioning_channels", 3))
+        from PIL import Image
+
+        if getattr(args, "control_image", None):
+            ci = Image.open(args.control_image).convert("RGB").resize((wf.width, wf.height))
+            arr = (np.asarray(ci, dtype=np.float32) / 255.0).transpose(2, 0, 1)[None]
+        else:
+            print("  (no --control-image; using a zero control map)")
+            arr = np.zeros((1, cond_ch, wf.height, wf.width), dtype=np.float32)
+        arr.astype("<f4").tofile(pdir / "control.f32")
+        inputs.append(
+            f"denoiser.controlnet_cond:1,{cond_ch},{wf.height},{wf.width}:{pdir / 'control.f32'}"
+        )
+
     env = dict(os.environ)
     env["DYLD_LIBRARY_PATH"] = ort_lib_dir() + ":" + env.get("DYLD_LIBRARY_PATH", "")
-    print(f"rendering through onnx-genai ({'SDXL' if sdxl else 'SD'}) ...", flush=True)
+    tag = "SDXL" if sdxl else "SD"
+    if controlnet:
+        tag += "+ControlNet"
+    print(f"rendering through onnx-genai ({tag}) ...", flush=True)
     subprocess.run(inputs, env=env, check=True)
     flat = np.fromfile(pdir / "image.f32", dtype="<f4")
     hw = int(round((flat.size / 3) ** 0.5))
