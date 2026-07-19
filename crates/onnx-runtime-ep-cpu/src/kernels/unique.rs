@@ -6,7 +6,8 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{elem_size, to_dense_bytes, write_dense_bytes};
-use crate::strided::{elem_offset, next_index, numel};
+use crate::dtype::unsupported_dtype;
+use crate::strided::numel;
 
 pub struct UniqueKernel {
     axis: Option<i64>,
@@ -43,9 +44,6 @@ impl Kernel for UniqueKernel {
 
         let input = &inputs[0];
         ensure_supported_dtype(input.dtype)?;
-        if input.dtype == DataType::String {
-            return execute_strings(input, outputs, self.axis, self.sorted);
-        }
 
         let element_size = elem_size(input.dtype)?;
         let dense = to_dense_bytes(input)?;
@@ -101,55 +99,6 @@ impl Kernel for UniqueKernel {
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         input_idx == 0
     }
-}
-
-fn execute_strings(
-    input: &TensorView,
-    outputs: &mut [TensorMut],
-    axis: Option<i64>,
-    sorted: bool,
-) -> Result<()> {
-    let dense = to_dense_strings(input)?;
-    let axis = axis
-        .map(|axis| normalize_axis(axis, input.shape.len()))
-        .transpose()?;
-    let items = make_string_items(&dense, input.shape, axis);
-    let item_count = items.len();
-    let (first_indices, inverse_indices, counts) =
-        unique_groups_by(item_count, sorted, |a, b| items[a].cmp(&items[b]));
-
-    let expected_y_shape = match axis {
-        Some(axis) => {
-            let mut shape = input.shape.to_vec();
-            shape[axis] = first_indices.len();
-            shape
-        }
-        None => vec![first_indices.len()],
-    };
-    validate_output(&outputs[0], DataType::String, &expected_y_shape, "Y")?;
-    let y = gather_string_y(&dense, input.shape, axis, &first_indices);
-    write_dense_strings(&mut outputs[0], &y)?;
-
-    let unique_shape = [first_indices.len()];
-    if outputs.len() >= 2 {
-        validate_output(&outputs[1], DataType::Int64, &unique_shape, "indices")?;
-        write_i64(&mut outputs[1], &first_indices)?;
-    }
-    if outputs.len() >= 3 {
-        let inverse_shape = [inverse_indices.len()];
-        validate_output(
-            &outputs[2],
-            DataType::Int64,
-            &inverse_shape,
-            "inverse_indices",
-        )?;
-        write_i64(&mut outputs[2], &inverse_indices)?;
-    }
-    if outputs.len() == 4 {
-        validate_output(&outputs[3], DataType::Int64, &unique_shape, "counts")?;
-        write_i64(&mut outputs[3], &counts)?;
-    }
-    Ok(())
 }
 
 struct UniquePlan {
@@ -241,129 +190,6 @@ fn unique_groups_by(
     (first_indices, inverse_indices, counts)
 }
 
-fn to_dense_strings(view: &TensorView) -> Result<Vec<String>> {
-    validate_string_view(
-        view.data.is_null(),
-        view.dtype,
-        view.shape,
-        view.strides,
-        view.byte_offset,
-        view.device.is_host_accessible(),
-    )?;
-    let count = numel(view.shape);
-    let origin = view.data_ptr::<String>();
-    let mut output = Vec::with_capacity(count);
-    if count == 0 {
-        return Ok(output);
-    }
-    let mut index = vec![0usize; view.shape.len()];
-    loop {
-        let offset = elem_offset(view.strides, &index);
-        // SAFETY: string tensor views point at an out-of-band array of initialized
-        // `String` values; the validated shape/strides describe live elements.
-        output.push(unsafe { (*origin.offset(offset)).clone() });
-        if !next_index(view.shape, &mut index) {
-            break;
-        }
-    }
-    Ok(output)
-}
-
-fn write_dense_strings(output: &mut TensorMut, values: &[String]) -> Result<()> {
-    validate_string_view(
-        output.data.is_null(),
-        output.dtype,
-        output.shape,
-        output.strides,
-        output.byte_offset,
-        output.device.is_host_accessible(),
-    )?;
-    if !output.is_contiguous() {
-        return Err(EpError::InvalidTensorView {
-            reason: "Unique: String output must be contiguous".into(),
-        });
-    }
-    if values.len() != numel(output.shape) {
-        return Err(EpError::KernelFailed(format!(
-            "Unique: String output element count {} does not match produced {}",
-            numel(output.shape),
-            values.len()
-        )));
-    }
-    let destination = output.data_ptr_mut::<String>();
-    for (index, value) in values.iter().enumerate() {
-        // SAFETY: string output storage is an out-of-band array of initialized
-        // `String` slots with one slot per logical output element.
-        unsafe {
-            (*destination.add(index)).clone_from(value);
-        }
-    }
-    Ok(())
-}
-
-fn validate_string_view(
-    data_is_null: bool,
-    dtype: DataType,
-    shape: &[usize],
-    strides: &[i64],
-    byte_offset: usize,
-    host_accessible: bool,
-) -> Result<()> {
-    if dtype != DataType::String
-        || data_is_null
-        || shape.len() != strides.len()
-        || !byte_offset.is_multiple_of(std::mem::align_of::<String>())
-        || !host_accessible
-    {
-        return Err(EpError::InvalidTensorView {
-            reason: "Unique: invalid out-of-band String tensor view".into(),
-        });
-    }
-    Ok(())
-}
-
-fn make_string_items(dense: &[String], shape: &[usize], axis: Option<usize>) -> Vec<Vec<String>> {
-    let Some(axis) = axis else {
-        return dense.iter().cloned().map(|value| vec![value]).collect();
-    };
-    let axis_len = shape[axis];
-    let inner: usize = shape[axis + 1..].iter().product();
-    let outer: usize = shape[..axis].iter().product();
-    let mut items = vec![Vec::with_capacity(outer * inner); axis_len];
-    for outer_index in 0..outer {
-        for (axis_index, item) in items.iter_mut().enumerate() {
-            let start = (outer_index * axis_len + axis_index) * inner;
-            item.extend_from_slice(&dense[start..start + inner]);
-        }
-    }
-    items
-}
-
-fn gather_string_y(
-    dense: &[String],
-    shape: &[usize],
-    axis: Option<usize>,
-    first_indices: &[usize],
-) -> Vec<String> {
-    let Some(axis) = axis else {
-        return first_indices
-            .iter()
-            .map(|&index| dense[index].clone())
-            .collect();
-    };
-    let axis_len = shape[axis];
-    let inner: usize = shape[axis + 1..].iter().product();
-    let outer: usize = shape[..axis].iter().product();
-    let mut output = Vec::with_capacity(outer * first_indices.len() * inner);
-    for outer_index in 0..outer {
-        for &axis_index in first_indices {
-            let start = (outer_index * axis_len + axis_index) * inner;
-            output.extend_from_slice(&dense[start..start + inner]);
-        }
-    }
-    output
-}
-
 fn make_items(
     dense: &[u8],
     shape: &[usize],
@@ -420,9 +246,6 @@ fn gather_y(
 }
 
 fn compare_items(dtype: DataType, a: &[u8], b: &[u8]) -> Ordering {
-    if dtype == DataType::String {
-        return a.cmp(b);
-    }
     let size = dtype.byte_size();
     for (a, b) in a.chunks_exact(size).zip(b.chunks_exact(size)) {
         let ordering = compare_element(dtype, a, b);
@@ -514,11 +337,8 @@ fn ensure_supported_dtype(dtype: DataType) -> Result<()> {
         | DataType::Float16
         | DataType::BFloat16
         | DataType::Float32
-        | DataType::Float64
-        | DataType::String => Ok(()),
-        _ => Err(EpError::KernelFailed(format!(
-            "Unique: dtype {dtype:?} is unsupported"
-        ))),
+        | DataType::Float64 => Ok(()),
+        _ => Err(unsupported_dtype("Unique", dtype)),
     }
 }
 
@@ -556,52 +376,6 @@ fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
-    use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
-
-    struct StringOwned {
-        values: Vec<String>,
-        shape: Vec<usize>,
-        strides: Vec<i64>,
-    }
-
-    impl StringOwned {
-        fn new(shape: &[usize], values: &[&str]) -> Self {
-            Self {
-                values: values.iter().map(|value| (*value).to_owned()).collect(),
-                shape: shape.to_vec(),
-                strides: compute_contiguous_strides(shape),
-            }
-        }
-
-        fn zeros(shape: &[usize]) -> Self {
-            Self {
-                values: vec![String::new(); numel(shape)],
-                shape: shape.to_vec(),
-                strides: compute_contiguous_strides(shape),
-            }
-        }
-
-        fn view(&self) -> TensorView<'_> {
-            TensorView::new(
-                DevicePtr(self.values.as_ptr().cast()),
-                DataType::String,
-                &self.shape,
-                &self.strides,
-                DeviceId::cpu(),
-            )
-        }
-
-        fn view_mut(&mut self) -> TensorMut<'_> {
-            TensorMut::new(
-                DevicePtrMut(self.values.as_mut_ptr().cast()),
-                DataType::String,
-                &self.shape,
-                &self.strides,
-                DeviceId::cpu(),
-            )
-        }
-    }
 
     #[test]
     fn sorts_axis_slices_lexicographically() {
@@ -700,55 +474,6 @@ mod tests {
         assert_eq!(indices.to_i64(), vec![2, 0]);
         assert_eq!(inverse.to_i64(), vec![1, 1, 0, 0]);
         assert_eq!(counts.to_i64(), vec![2, 2]);
-    }
-
-    #[test]
-    fn string_tensor_runs_through_kernel_sorted_and_unsorted() {
-        let input = StringOwned::new(
-            &[9],
-            &[
-                "pear", "apple", "pear", "banana", "apple", "pear", "pear", "apple", "pear",
-            ],
-        );
-
-        for (sorted, expected_y, expected_indices, expected_inverse, expected_counts) in [
-            (
-                true,
-                vec!["apple", "banana", "pear"],
-                vec![1, 3, 0],
-                vec![2, 0, 2, 1, 0, 2, 2, 0, 2],
-                vec![3, 1, 5],
-            ),
-            (
-                false,
-                vec!["pear", "apple", "banana"],
-                vec![0, 1, 3],
-                vec![0, 1, 0, 2, 1, 0, 0, 1, 0],
-                vec![5, 3, 1],
-            ),
-        ] {
-            let mut y = StringOwned::zeros(&[3]);
-            let mut indices = Owned::zeros(DataType::Int64, &[3]);
-            let mut inverse = Owned::zeros(DataType::Int64, &[9]);
-            let mut counts = Owned::zeros(DataType::Int64, &[3]);
-
-            UniqueKernel { axis: None, sorted }
-                .execute(
-                    &[input.view()],
-                    &mut [
-                        y.view_mut(),
-                        indices.view_mut(),
-                        inverse.view_mut(),
-                        counts.view_mut(),
-                    ],
-                )
-                .unwrap();
-
-            assert_eq!(y.values, expected_y);
-            assert_eq!(indices.to_i64(), expected_indices);
-            assert_eq!(inverse.to_i64(), expected_inverse);
-            assert_eq!(counts.to_i64(), expected_counts);
-        }
     }
 
     #[test]
