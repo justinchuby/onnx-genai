@@ -1952,6 +1952,7 @@ dependencies = [
  "criterion",
  "half",
  "libm",
+ "mlas-sys",
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "onnx-runtime-loader",

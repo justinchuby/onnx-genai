@@ -8,6 +8,10 @@ _Last updated: 2026-07-19T22:20Z — ConvTranspose/Unique CPU kernels, fused QMo
 
 **Current `origin/main` implementation HEAD:** `6a7755c`.
 
+## 2026-07-19 — MLAS CPU-EP opt-in integration
+
+- **Vendored MLAS f32 GEMM ✅ wired:** `onnx-runtime-ep-cpu` now exposes the opt-in `mlas` feature plus `NXRT_CPU_GEMM_BACKEND=mlas` on x86-64. It remains single-threaded and `SimdX86` remains the default pending MLAS threadpool bridging.
+
 ## 2026-07-19 — CPU GEMM parity and backend controls
 
 - **MLAS-style AVX2/FMA SIMD GEMM ✅ landed (`15e2f2e`):** new default `CpuBackend::SimdX86` (6×16 microkernel, panel packing, KC=256, rayon over disjoint C strips). Closed the medium-f32 MatMul-vs-ORT gap from ~21×/16× (1-/8-thread) down to **2.4×/5.1×**. (Gaff 🟢)

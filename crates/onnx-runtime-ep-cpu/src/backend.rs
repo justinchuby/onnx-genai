@@ -7,6 +7,9 @@
 //! * On x86-64 hosts with AVX2 + FMA (detected at runtime) we use the built-in
 //!   **`SimdX86`** MLAS-style packed SIMD f32 GEMM — the default fast path with
 //!   no extra dependency and no cargo feature required.
+//! * With the `mlas` Cargo feature, `NXRT_CPU_GEMM_BACKEND=mlas` explicitly
+//!   selects the vendored, single-threaded MLAS f32 GEMM on x86-64. It is never
+//!   auto-selected while Rayon-to-MLAS threadpool bridging is pending.
 //! * Everything else falls back to the **Generic** pure-Rust blocked GEMM,
 //!   which compiles anywhere and is the correctness baseline.
 //!
@@ -27,6 +30,11 @@ pub enum CpuBackend {
     /// on hosts without AVX2/FMA.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     SimdX86,
+    /// Vendored MLAS f32 SGEMM for x86-64. Available only with the `mlas`
+    /// Cargo feature and selected explicitly with `NXRT_CPU_GEMM_BACKEND=mlas`;
+    /// it is single-threaded until MLAS threadpool bridging is implemented.
+    #[cfg(feature = "mlas")]
+    Mlas,
     /// XNNPACK (Android mobile). Design placeholder — currently routes to
     /// [`CpuBackend::Generic`] arithmetic.
     #[cfg(target_os = "android")]
@@ -49,6 +57,11 @@ impl CpuBackend {
     /// * Otherwise → `SimdX86` when the host is x86-64 with AVX2 + FMA; else
     ///   `Generic`.
     pub fn auto_detect() -> Self {
+        if let Some(backend) = Self::from_env_override(std::env::var("NXRT_CPU_GEMM_BACKEND").ok())
+        {
+            return backend;
+        }
+
         #[cfg(target_os = "android")]
         {
             Self::Xnnpack
@@ -71,6 +84,24 @@ impl CpuBackend {
             }
             Self::Generic
         }
+    }
+
+    /// Resolve the optional `NXRT_CPU_GEMM_BACKEND` value. Unsupported choices
+    /// intentionally fall through to ordinary host auto-detection.
+    fn from_env_override(value: Option<String>) -> Option<Self> {
+        let value = value?;
+        if value.eq_ignore_ascii_case("generic") {
+            return Some(Self::Generic);
+        }
+        if value.eq_ignore_ascii_case("simd") {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            return Some(Self::SimdX86);
+        }
+        if value.eq_ignore_ascii_case("mlas") {
+            #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+            return Some(Self::Mlas);
+        }
+        None
     }
 }
 
@@ -115,5 +146,24 @@ mod tests {
             }
         };
         assert_eq!(CpuBackend::auto_detect(), expected);
+    }
+
+    #[test]
+    fn backend_env_override_is_case_insensitive() {
+        assert_eq!(
+            CpuBackend::from_env_override(Some("GeNeRiC".into())),
+            Some(CpuBackend::Generic)
+        );
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert_eq!(
+            CpuBackend::from_env_override(Some("SIMD".into())),
+            Some(CpuBackend::SimdX86)
+        );
+        #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+        assert_eq!(
+            CpuBackend::from_env_override(Some("mLaS".into())),
+            Some(CpuBackend::Mlas)
+        );
+        assert_eq!(CpuBackend::from_env_override(Some("unknown".into())), None);
     }
 }

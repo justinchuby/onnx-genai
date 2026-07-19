@@ -8,11 +8,16 @@ repository.workspace = true
 keywords = ["onnx", "cpu", "execution-provider", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
+[features]
+# Opt-in vendored MLAS f32 SGEMM. Kept off by default because it builds C++/asm.
+mlas = ["dep:mlas-sys"]
+
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
+mlas-sys = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
 thiserror = { workspace = true }
 half = "2"

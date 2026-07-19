@@ -129,43 +129,76 @@ fn bench_gather(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark one explicitly requested GEMM backend without leaving global
+/// process environment state behind. Criterion invokes these iterations serially.
+fn with_gemm_backend<T>(backend: &str, f: impl FnOnce() -> T) -> T {
+    struct EnvGuard(Option<std::ffi::OsString>);
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                    None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+                }
+            }
+        }
+    }
+
+    let guard = EnvGuard(std::env::var_os("NXRT_CPU_GEMM_BACKEND"));
+    unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", backend) };
+    let result = f();
+    drop(guard);
+    result
+}
+
 fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul");
+    let mut backends = vec!["generic"];
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    backends.push("simd");
+    #[cfg(feature = "mlas")]
+    backends.push("mlas");
+
     for (size, m, k, n) in [
         ("small", 1, 256, 256),
         ("medium", 32, 512, 512),
         ("large", 32, 1_024, 1_024),
     ] {
         group.throughput(Throughput::Elements((m * n) as u64));
-        for dtype in FLOAT_DTYPES {
-            for threads in MATCHED_THREAD_COUNTS {
-                let pool = thread_pool(threads);
-                let a = Tensor::floats(dtype, &[m, k], &float_values(m * k));
-                let b = Tensor::floats(dtype, &[k, n], &float_values(k * n));
-                let mut output = Tensor::zeros(dtype, &[m, n]);
-                let mut kernel = make_kernel("MatMul", [], &[vec![m, k], vec![k, n]], 13);
-                group.bench_function(
-                    BenchmarkId::new(
-                        format!("{size}/{}/threads={threads}", dtype.name()),
-                        format!("{m}x{k}x{n}"),
-                    ),
-                    |bencher| {
-                        bencher.iter(|| {
-                            let a = &a;
-                            let b = &b;
-                            let output = &mut output;
-                            let kernel = &mut kernel;
-                            pool.install(move || {
-                                kernel
-                                    .execute(
-                                        black_box(&[a.view(), b.view()]),
-                                        black_box(&mut [output.view_mut()]),
-                                    )
-                                    .unwrap()
-                            })
-                        });
-                    },
-                );
+        for backend in &backends {
+            for dtype in FLOAT_DTYPES {
+                for threads in MATCHED_THREAD_COUNTS {
+                    let pool = thread_pool(threads);
+                    let a = Tensor::floats(dtype, &[m, k], &float_values(m * k));
+                    let b = Tensor::floats(dtype, &[k, n], &float_values(k * n));
+                    let mut output = Tensor::zeros(dtype, &[m, n]);
+                    let mut kernel = make_kernel("MatMul", [], &[vec![m, k], vec![k, n]], 13);
+                    group.bench_function(
+                        BenchmarkId::new(
+                            format!("{size}/{backend}/{}/threads={threads}", dtype.name()),
+                            format!("{m}x{k}x{n}"),
+                        ),
+                        |bencher| {
+                            bencher.iter(|| {
+                                let a = &a;
+                                let b = &b;
+                                let output = &mut output;
+                                let kernel = &mut kernel;
+                                pool.install(move || {
+                                    with_gemm_backend(backend, || {
+                                        kernel
+                                            .execute(
+                                                black_box(&[a.view(), b.view()]),
+                                                black_box(&mut [output.view_mut()]),
+                                            )
+                                            .unwrap()
+                                    })
+                                })
+                            });
+                        },
+                    );
+                }
             }
         }
     }

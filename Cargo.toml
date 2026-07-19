@@ -112,6 +112,7 @@ onnx-runtime-optimizer = { path = "crates/onnx-runtime-optimizer", version = "=0
 onnx-runtime-quantization = { path = "crates/onnx-runtime-quantization", version = "=0.1.0-dev.2" }
 onnx-runtime-ep-api = { path = "crates/onnx-runtime-ep-api", version = "=0.1.0-dev.2" }
 onnx-runtime-ep-cpu = { path = "crates/onnx-runtime-ep-cpu", version = "=0.1.0-dev.2" }
+mlas-sys = { path = "crates/mlas-sys" }
 onnx-runtime-ep-cuda = { path = "crates/onnx-runtime-ep-cuda", version = "=0.1.0-dev.2" }
 onnx-runtime-eager = { path = "crates/onnx-runtime-eager", version = "=0.1.0-dev.2" }
 onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0-dev.2" }

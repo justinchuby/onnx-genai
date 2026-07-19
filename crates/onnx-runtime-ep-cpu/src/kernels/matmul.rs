@@ -14,6 +14,9 @@
 //!   `6×16` AVX2/FMA register microkernel + K/N cache blocking, parallelized
 //!   over column strips. Selected automatically with no cargo feature; falls
 //!   back to Generic when AVX2/FMA is absent.
+//! * **`Mlas`** (opt-in `mlas` feature on x86-64): vendored MLAS f32 SGEMM,
+//!   selected only with `NXRT_CPU_GEMM_BACKEND=mlas`. It is single-threaded
+//!   until its threadpool is bridged, so it is not an automatic default.
 //!
 //! The batched / broadcast / 1-D-vector handling in [`matmul_dense`] is
 //! backend-agnostic; only the inner 2-D tile GEMM changes. The session also
@@ -105,7 +108,25 @@ pub(crate) fn gemm(
     k: usize,
     n: usize,
 ) -> Result<()> {
-    match CpuBackend::auto_detect() {
+    gemm_with_backend(CpuBackend::auto_detect(), a, b, c, m, k, n)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_with_backend(
+    backend: CpuBackend,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<()> {
+    match backend {
+        #[cfg(feature = "mlas")]
+        CpuBackend::Mlas => {
+            mlas_sys::sgemm_nn(m, n, k, a, b, c);
+            Ok(())
+        }
         // Built-in MLAS-style packed SIMD backend for AVX2/FMA x86-64 hosts.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         CpuBackend::SimdX86 => {
@@ -265,6 +286,7 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     )
 }
 
+// TODO(mlas prepack): cache `mlas_sys::PackedB` for immutable f32 B weights.
 pub(crate) fn matmul_dense_prepacked(
     a: &TensorView,
     b: &TensorView,
@@ -551,6 +573,49 @@ mod tests {
         }
 
         println!("generic MatMul max abs error: {overall_max_abs_error}");
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_gemm_matches_generic_for_matrix_and_batched_vector_tiles() {
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 1, 1),
+            (7, 13, 5),
+            (32, 512, 512),
+            (97, 11, 3),
+            // Each tile below is how batched and vector MatMul route through gemm.
+            (1, 13, 5),
+            (3, 13, 1),
+        ];
+        let mut state = 0x5eed_1234_u32;
+        let mut next_f32 = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.25
+        };
+
+        for &(m, k, n) in SHAPES {
+            let a: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| next_f32()).collect();
+            let mut expected = vec![0.0; m * n];
+            let mut actual = vec![0.0; m * n];
+            gemm_generic(&a, &b, &mut expected, m, k, n);
+            gemm_with_backend(CpuBackend::Mlas, &a, &b, &mut actual, m, k, n).unwrap();
+            let max_error = actual
+                .iter()
+                .zip(&expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 1e-3,
+                "{m}x{k} @ {k}x{n}: MLAS max error {max_error} exceeds tolerance"
+            );
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_selects_a_float_kernel_on_x86_64() {
+        assert_ne!(mlas_sys::selected_float_kernel(), 0);
     }
 
     #[test]
