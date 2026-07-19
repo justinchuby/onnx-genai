@@ -61,7 +61,7 @@ impl Kernel for SpaceToDepthKernel {
             for channel in 0..c {
                 for block_h in 0..block {
                     for block_w in 0..block {
-                        let output_channel = channel * block * block + block_h * block + block_w;
+                        let output_channel = (block_h * block + block_w) * c + channel;
                         for output_y in 0..output_h {
                             for output_x in 0..output_w {
                                 let input_y = output_y * block + block_h;
@@ -117,12 +117,12 @@ mod tests {
     }
 
     #[test]
-    fn preserves_channel_major_block_order() {
+    fn interleaves_channels_within_each_spatial_offset() {
         let input = Owned::i64(&[1, 2, 2, 2], &[1, 2, 3, 4, 11, 12, 13, 14]);
         let mut output = Owned::zeros(onnx_runtime_ir::DataType::Int64, &[1, 8, 1, 1]);
         SpaceToDepthKernel { blocksize: 2 }
             .execute(&[input.view()], &mut [output.view_mut()])
             .unwrap();
-        assert_eq!(output.to_i64(), vec![1, 2, 3, 4, 11, 12, 13, 14]);
+        assert_eq!(output.to_i64(), vec![1, 11, 2, 12, 3, 13, 4, 14]);
     }
 }

@@ -1423,7 +1423,7 @@ mod tests {
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 74);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 77);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

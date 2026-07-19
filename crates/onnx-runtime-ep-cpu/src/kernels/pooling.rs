@@ -57,13 +57,19 @@ impl PoolParams {
                     let numerator =
                         spatial[axis] as i64 + pads[axis] as i64 + pads[axis + dims] as i64
                             - effective as i64;
-                    let out = if ceil_mode {
+                    let mut out = if ceil_mode {
                         ((numerator + self.strides[axis] as i64 - 1) / self.strides[axis] as i64
                             + 1)
                         .max(0) as usize
                     } else {
                         (numerator / self.strides[axis] as i64 + 1).max(0) as usize
                     };
+                    if ceil_mode
+                        && out > 0
+                        && (out - 1) * self.strides[axis] >= spatial[axis] + pads[axis]
+                    {
+                        out -= 1;
+                    }
                     (pads[axis], pads[axis + dims], out)
                 }
             };
@@ -680,6 +686,22 @@ mod tests {
             .execute(&[x.view()], &mut [output.view_mut()])
             .unwrap();
         assert_close(&output.to_f32(), &[5.0_f32.sqrt(), 13.0_f32.sqrt()]);
+    }
+
+    #[test]
+    fn lp_pool_ceil_mode_drops_trailing_padding_window() {
+        let x = Owned::f32(&[1, 1, 4], &[1., 2., 3., 4.]);
+        let values = lp(
+            PoolKernel {
+                params: params(&[2], &[3], &[0, 2], &[1]),
+                auto_pad: AutoPad::NotSet,
+                ceil_mode: true,
+                kind: PoolKind::Lp { p: 2 },
+            },
+            &x,
+            &[1, 1, 2],
+        );
+        assert_close(&values, &[5.0_f32.sqrt(), 4.]);
     }
 
     #[test]
