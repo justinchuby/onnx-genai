@@ -28,3 +28,8 @@ Fixed the cudarc CUDA-version-feature conflict blocking `onnx-genai-engine --fea
 
 
 - **2026-07-19T16:15:00Z — CPU-EP fixes:** Corrected omitted-vs-present-empty reduction axes semantics (`6e97ee6`) after Chew’s rejection; also widened Selu/ThresholdedRelu dtype paths, with Sapper subsequently correcting f64 precision (`39edb76`).
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Corrected SpaceToDepth DCR ordering and pooling ceil-mode sizing (`014cf02`); also authored AffineGrid/Col2Im/CenterCropPad (`8e49948`).

@@ -4,9 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T14:10Z — CPU-EP op-coverage wave advanced backend node conformance to 921 passing._
+_Last updated: 2026-07-19T18:20Z — CPU-EP op-coverage wave advanced backend node conformance to 975 passing._
 
-**Current `origin/main` implementation HEAD:** `4c05ede`.
+**Current `origin/main` implementation HEAD:** `eef2c81`.
+
+
+## 2026-07-19 — CPU-EP op coverage 936→975
+
+- **CPU-EP coverage ✅ landed (`eef2c81`):** added BitShift, OneHot, Compress, LpPool, GlobalLpPool, SpaceToDepth, AffineGrid, Col2Im, and CenterCropPad. Backend node conformance advanced **936→975 passing (+39 backend tests)**, with 790 failing and 1,765 skipped. Two 🔴 reject→fix→approve review cycles completed.
 
 
 ## 2026-07-19 — CPU-EP op coverage 921→936

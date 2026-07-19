@@ -2229,3 +2229,148 @@ The fix commit does not modify LpNormalization or the registry/count assertion. 
 **By:** Sapper
 **What:** Added a dedicated f64 activation execution path and precision-sensitive Selu and ThresholdedRelu f64 tests.
 **Why:** Float64 inputs must not be narrowed through f32 computation, which loses precision before results are written.
+
+
+## 2026-07-19T18:20:00Z — Scribe inbox merge (CPU-EP op coverage 936→975)
+
+<!-- merged from bryant-conformance-975.md -->
+
+### 2026-07-19: Refresh backend conformance baseline to 975 passes
+**By:** Bryant
+**What:** Updated the ONNX backend node-test baseline at `c69d047` to 975 passed, 790 failed, and 1,765 skipped, preserving all prior dated measurements.
+**Why:** Batch 3 added 39 passing cases across BitShift, OneHot, Compress, LpPool, GlobalLpPool, SpaceToDepth, AffineGrid, Col2Im, and CenterCropPad.
+
+<!-- merged from bryant-lppool-spacetodepth.md -->
+
+### 2026-07-19: Reuse pooling infrastructure for LpPool
+**By:** Bryant
+**What:** Implement LpPool and GlobalLpPool in the existing N-D pooling module, and implement dtype-agnostic SpaceToDepth as a separate movement kernel. Register LpPool at opset 18, GlobalLpPool at opset 2, and SpaceToDepth at opset 13.
+**Why:** LpPool shares AveragePool's window, padding, stride, dilation, auto-pad, and ceil-mode semantics, while SpaceToDepth is a pure byte-preserving layout transformation. Reusing those paths minimizes duplicated indexing logic and preserves strided-input support.
+
+<!-- merged from chew-rereview-lppool-spacetodepth.md -->
+
+### 2026-07-19: LpPool/SpaceToDepth fix re-review
+**By:** Chew
+**What:** 🟢 APPROVE commit `014cf02` on `bryant/lppool-spacetodepth`.
+**Why:** Both prior blockers are resolved. SpaceToDepth now maps output channels as `(block_h * block + block_w) * C + channel`, and its corrected C>1 oracle is exactly `[1, 11, 2, 12, 3, 13, 4, 14]`. Shared pooling shape inference now applies the ONNX ceil-mode final adjustment, removing the all-padding trailing window. The new LpPool regression uses input shape `[1,1,4]`, kernel `[2]`, stride `[3]`, pads `[0,2]`, output shape `[1,1,2]`, and expected values `[sqrt(5), 4]`.
+
+Validation:
+- Both focused regression tests passed.
+- All 10 pooling tests passed, including AveragePool, MaxPool, GlobalAveragePool/GlobalMaxPool, and LpPool coverage.
+- `cargo test -p onnx-runtime-ep-cpu` passed: 566 passed, 0 failed, 1 ignored; doctest target also passed with its single test ignored.
+
+<!-- merged from chew-review-lppool-spacetodepth.md -->
+
+### 2026-07-19: LpPool / GlobalLpPool / SpaceToDepth CPU review
+**By:** Chew
+**What:** 🔴 REJECT commit `62fcb62`. Revision owner: **Deckard** (different from Bryant).
+**Why:** Two operator-contract defects are blocking.
+
+1. **SpaceToDepth uses the wrong channel ordering for `C > 1`.** At `crates/onnx-runtime-ep-cpu/src/kernels/space_to_depth.rs:64`, `channel * block * block + block_h * block + block_w` flattens `[C, block_h, block_w]`. ONNX SpaceToDepth is the inverse of DepthToSpace DCR and flattens `[block_h, block_w, C]`; the channel index must be `(block_h * block + block_w) * c + channel`. For input `[1,2,2,2]` containing channel planes `[1,2,3,4]` and `[11,12,13,14]`, ONNX ReferenceEvaluator 1.22.0 returns `[1,11,2,12,3,13,4,14]`, while the test at `space_to_depth.rs:120-126` incorrectly blesses `[1,2,3,4,11,12,13,14]`. Replace that oracle and add/retain the single-channel hand-worked case.
+
+2. **`ceil_mode` can emit a window starting entirely in right padding.** `crates/onnx-runtime-ep-cpu/src/kernels/pooling.rs:56-68` computes the ceiling output size but omits ONNX's required final adjustment when `(out - 1) * stride >= input_size + pad_begin`. Example: input `[1,1,4]`, kernel `[2]`, stride `[3]`, pads `[0,2]`, `ceil_mode=1`. ONNX ReferenceEvaluator returns shape `[1,1,2]` with `[sqrt(5), 4]`; this kernel expects shape `[1,1,3]` and appends a spurious all-padding zero. This directly affects the newly registered LpPool. Add a dedicated LpPool ceil-mode regression.
+
+The core Lp computations are otherwise correct: `sum(abs(x)^p)^(1/p)`, default `p=2`, zero-equivalent padding, GlobalLpPool over all spatial axes, and the tested 1D/2D/3D, strides, explicit pads, dilations, SAME_UPPER, and SAME_LOWER references are hand-computed rather than tautological. However, the Lp tests omit `ceil_mode`, and the multi-channel SpaceToDepth reference is meaningfully wrong.
+
+Registry accounting is correct: the parent asserted `PHASE1_OPS.len() + 71`; three registrations produce `+74` at `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:1411`, with lookup checks at lines 1427-1429.
+
+**Verification:** `cargo test -p onnx-runtime-ep-cpu` passed: 565 passed, 0 failed, 1 ignored; doctest: 0 passed, 1 ignored. Passing tests do not cover the two failing contract cases above.
+
+<!-- merged from deckard-affinegrid-col2im-crop.md -->
+
+### 2026-07-19: Add CPU spatial rearrangement and grid kernels
+**By:** Deckard
+**What:** Added pure-Rust CPU EP kernels for AffineGrid (opset 20), Col2Im (opset 18), and CenterCropPad (opset 18), including registry entries and unit coverage.
+**Why:** ONNX backend node coverage requires these standard spatial/movement operators; implementations preserve centered crop/pad placement, Col2Im overlap accumulation, and AffineGrid corner alignment semantics.
+
+Ops: AffineGrid, Col2Im, CenterCropPad; opsets: 20, 18, 18; new registry count: PHASE1_OPS.len() + 74 (173); test result: `cargo test -p onnx-runtime-ep-cpu` passed.
+
+<!-- merged from deckard-lppool-spacetodepth-fix.md -->
+
+### 2026-07-19: Correct SpaceToDepth and ceil-mode pooling conformance
+**By:** Deckard
+**What:** Changed SpaceToDepth channel flattening to DCR order and added ONNX's ceil-mode trailing-padding window adjustment to shared pooling output sizing, with regressions for both.
+**Why:** The rejected implementation produced incorrect multi-channel SpaceToDepth ordering and an invalid all-padding LpPool output window.
+
+<!-- merged from gaff-rereview-onehot-bitshift.md -->
+
+### 2026-07-19: OneHot/BitShift/Compress fix re-review
+**By:** Gaff
+**What:** 🟢 APPROVE commit `49d8827` on `pris/bitshift-onehot-compress`.
+**Why:** Both prior blockers are resolved. OneHot now accepts only indices in `[-depth, depth - 1]`, adds `depth` once for valid negatives, and leaves out-of-range rows off. Its corrected test proves depth-3 inputs `-1`, `3`, and `-4` produce the last category, all-off, and all-off respectively. BitShift now errors when `direction` is absent, retains explicit `LEFT`/`RIGHT` handling, and still rejects every other value through the `Some(_)` error arm; the new missing-direction test exercises the required-attribute failure. Compress has no diff from `49d8827^` and remains unchanged. `cargo test -p onnx-runtime-ep-cpu` passed: 566 passed, 0 failed, 1 ignored; doctests 0 passed, 0 failed, 1 ignored.
+
+<!-- merged from gaff-review-bitshift-onehot-compress.md -->
+
+### 2026-07-19: Reject BitShift, OneHot, and Compress CPU EP commit
+**By:** Gaff
+**What:** 🔴 REJECT commit `9ca9375`. Deckard should revise it; Pris is locked out from revising the rejected artifact.
+**Why:**
+
+1. **Blocking — OneHot maps out-of-range indices to valid categories.** `onehot.rs:79-80` applies `rem_euclid(depth)` to every index. ONNX requires indices outside `[-depth, depth-1]` to produce an all-off vector. With depth 3, both `3` and `-4` are out of range, but this code maps them to categories 0 and 2. The test at `onehot.rs:130-142` encodes the incorrect `-4` behavior. Deckard should range-check first, skip out-of-range indices, and only add `depth` once for valid negative indices.
+
+2. **Blocking — BitShift silently defaults a required attribute.** The ONNX BitShift schema requires `direction`; `bitshift.rs:25-27` treats a missing attribute as `RIGHT`. Deckard should reject missing values and retain rejection of values other than `LEFT`/`RIGHT`.
+
+The large-shift panic risk is guarded by `checked_shl`/`checked_shr` at `bitshift.rs:48,52`, so the tested width-sized shift does not panic. The `u64` cast to `u32` can truncate very large amounts, but ONNX leaves over-width behavior platform-defined.
+
+Compress selection is correct for an explicit/negative axis, omitted-axis flattening, and short/long conditions; the implementation ignores condition entries beyond the selected dimension. Its tests are meaningful, though a longer-than-dimension case would improve coverage.
+
+Registry accounting is consistent: `PHASE1_OPS` has 101 names, `mod.rs:1415` asserts `+72`, totaling 173. `kernels::tests::registry_has_all_phase1_ops` passed. Full `cargo test -p onnx-runtime-ep-cpu` passed (566 tests; one pre-existing dead-code warning).
+
+<!-- merged from gaff-review-conformance-975.md -->
+
+### 2026-07-19: Review conformance refresh to 975 passes
+**By:** Gaff
+**Verdict:** 🟢 APPROVE
+
+**What:** Reviewed commit `eef2c81` in `/home/justinchu/wt-conf2`.
+
+**Why:** The documentation and generated result data consistently report 975
+passed, 790 failed, and 1,765 skipped tests (3,530 total). The
+`ONNX backend test` section preserves the dated 360, 875, 921, and 936 history
+entries, adds the 975 entry dated 2026-07-19, and retains the reproduction
+command `maturin develop --release --no-default-features`.
+
+The result file contains 3,530 well-formed tab-separated rows: 1,765 CPU rows
+(975 passed, 790 failed) and 1,765 skipped CUDA rows. Relative to the prior
+version, row count, device/test names, ordering, and table format are unchanged;
+exactly 39 CPU rows changed from `failed` to `passed`. The file is neither
+truncated nor reformatted, and its header agrees with both the table contents
+and `docs/EP_CONFORMANCE.md`.
+
+<!-- merged from luv-review-affinegrid-col2im-crop.md -->
+
+### 2026-07-19: Review commit 8e49948 — AffineGrid, Col2Im, CenterCropPad
+**By:** Luv
+**Verdict:** 🟡 APPROVE-WITH-NITS (landable)
+
+**What:** Reviewed the full commit diff and validated all three CPU kernels.
+
+**Correctness:**
+- `affine_grid.rs:26-35,83-113` implements the ONNX/PyTorch normalized base grid correctly: `align_corners=1` uses `2*i/(size-1)-1` with singleton dimensions at zero; `align_corners=0` uses `(2*i+1)/size-1`. Coordinate order, homogeneous affine multiplication, and `[N,H,W,2]` / `[N,D,H,W,3]` output traversal are correct.
+- `col2im.rs:110-170` computes block counts with dilation, begin/end padding, and stride; indexes kernel and block positions lexicographically; and sums overlapping contributions into the reconstructed image.
+- `center_crop_pad.rs:42-101` resolves negative axes, preserves unlisted axes, uses the required floor split on the leading side for odd crop/pad differences, and zero-fills padding.
+- Registrations use the correct minimum opsets at `kernels/mod.rs:480-491`.
+
+**Tests:** The references are explicit and non-tautological. AffineGrid covers both `align_corners` modes and 3-D translation; Col2Im covers overlapping sums, padding/stride, and 3-D folding; CenterCropPad covers crop, pad, mixed operation, negative axes, and preservation of unlisted dimensions.
+
+**Nit:** `col2im.rs:219-235` is named as a dilation test but passes `dilations=[1,1]`. Add a genuinely non-unit dilation case in follow-up coverage; the implementation itself at `col2im.rs:112,147-149` is correct.
+
+**Validation:**
+- `cargo test -p onnx-runtime-ep-cpu registry_has_all_phase1_ops`: 1 passed; registry count `PHASE1_OPS + 74` confirmed.
+- `cargo test -p onnx-runtime-ep-cpu`: 567 passed, 0 failed, 1 ignored; doctest ignored.
+
+<!-- merged from pris-bitshift-onehot-compress.md -->
+
+### 2026-07-19: CPU BitShift, OneHot, and Compress kernels
+**By:** Pris
+**What:** Added opset-11 CPU kernels and registrations for BitShift, OneHot, and Compress.
+**Why:** Complete the missing ONNX backend node coverage with broadcast-aware shifts, OneHot negative-index wrapping, and axis-aware compression.
+
+Summary: Implemented BitShift, OneHot, and Compress at opset 11; registry count is 173 (PHASE1_OPS + 72); cargo test -p onnx-runtime-ep-cpu passed (565 passed, 1 ignored).
+
+<!-- merged from sapper-onehot-bitshift-fix.md -->
+
+### 2026-07-19: Correct OneHot index bounds and require BitShift direction
+**By:** Sapper
+**What:** Updated CPU EP OneHot to emit all-off vectors for indices outside `[-depth, depth - 1]`, and made BitShift reject nodes without the required `direction` attribute.
+**Why:** These changes restore ONNX operator conformance identified by review, preventing invalid OneHot category selection and silent BitShift semantic defaults.

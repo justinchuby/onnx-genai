@@ -83,3 +83,8 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 
 
 - **2026-07-19T16:15:00Z — CPU-EP review:** Rejected the initial reduction axes semantics, then approved Deckard’s omitted-axes fix (`6e97ee6`).
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Rejected Bryant’s initial pooling/layout implementation, then approved Deckard’s SpaceToDepth and ceil-mode fixes (`014cf02`).

@@ -44,3 +44,8 @@
 
 
 - **2026-07-19T16:15:00Z — CPU-EP coverage:** Added Selu, ThresholdedRelu, and LpNormalization; after dtype/f64 review fixes, refreshed backend conformance artifacts to 936/829/1765 in `4c05ede`.
+
+
+## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
+
+- Added LpPool/GlobalLpPool/SpaceToDepth (`62fcb62`) and refreshed backend conformance artifacts to 975/790/1765 (`eef2c81`).
