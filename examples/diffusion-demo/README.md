@@ -18,7 +18,7 @@ Diffusion). It:
    wall-clock time.
 
 The backend drives the **real** onnx-genai runtime (the `run_diffusion`,
-`run_comfyui`, and `comfyui_to_metadata` binaries) — nothing is simulated.
+`render_sd`, and `comfyui_to_metadata` binaries) — nothing is simulated.
 
 ```
 ┌─────────────┐   config (ComfyUI / native)   ┌──────────────┐   spawn    ┌────────────────────┐
@@ -33,14 +33,14 @@ The backend drives the **real** onnx-genai runtime (the `run_diffusion`,
 - Built onnx-genai binaries (from the repo root):
   ```bash
   cargo build --release -p onnx-genai --bin run_diffusion
-  cargo build --release -p onnx-genai --bin run_comfyui       # renders the image PNG
+  cargo build --release -p onnx-genai --bin render_sd          # renders the image PNG
   cargo build --release -p onnx-genai-comfyui-config --bin comfyui_to_metadata
   ```
   To build with the **CUDA** execution provider (image rendering on an NVIDIA
   GPU), point `ORT_ROOT` at a GPU ONNX Runtime and add `--features cuda`:
   ```powershell
   $env:ORT_ROOT="C:\path\to\onnxruntime-win-x64-gpu_cuda12-1.27.0"
-  cargo build --release -p onnx-genai --bin run_comfyui --bin run_diffusion --features cuda
+  cargo build --release -p onnx-genai --bin render_sd --bin run_diffusion --features cuda
   ```
 - The prebuilt ONNX Runtime dylib is found automatically under `target/`.
 
@@ -79,18 +79,25 @@ use a real SD package to see the GPU win in the it/s card.
   un-masking dynamics (toy vocabulary, real algorithm).
 - **Config load + visualization** works for any ComfyUI or native config with no
   model present.
-- **Image diffusion** needs a real Stable Diffusion package. Build one from a
-  Hugging Face checkpoint with the bundled exporter (no Mobius required):
+- **Image diffusion** needs a real Stable Diffusion package built **from scratch**
+  by [Mobius](https://github.com/justinchuby/mobius) (no `torch.onnx.export`, no
+  `optimum` — every ONNX graph is authored directly with `onnx_ir`/`onnxscript`).
+  Build a classic Stable Diffusion 1.x package (fp16) from a cached Hugging Face
+  checkpoint:
   ```bash
-  python scripts/export_sd_package.py --output /tmp/sd-pkg --model runwayml/stable-diffusion-v1-5 --size 384
+  python -m mobius build --model OFA-Sys/small-stable-diffusion-v0 \
+    --runtime onnx-genai --dtype f16 /tmp/sd-pkg
   ```
-  Then point the demo at it (the image tab will render a real PNG):
+  The package contains `text_encoder/`, `unet/`, `vae_decoder/`,
+  `inference_metadata.yaml`, and the CLIP `tokenizer.json`. Point the demo at it
+  (the image tab then renders a real PNG from your prompt):
   ```bash
   ONNX_GENAI_SD_PACKAGE=/tmp/sd-pkg npm run dev
   ```
-  The default `--size 384` (latent 48×48) keeps fp32 SD 1.5 within ~8 GB of
-  VRAM; larger sizes need more memory. Spatial axes are dynamic, so you can also
-  change `width`/`height` in the package's `workflow.json` without re-exporting.
+  The image tab exposes a **prompt** box plus **steps / guidance / seed**
+  controls; each run tokenizes the prompt with the packaged CLIP tokenizer, runs
+  the iterative denoise loop (DPM-Solver++, classifier-free guidance), and
+  VAE-decodes the final latent to an RGB PNG.
 - **Real language diffusion** (beyond the bundled fixture): export a masked
   masked-diffusion LM (e.g. `kuleshov-group/mdlm-owt`) to a package and point the
   demo at it with `ONNX_GENAI_LM_PACKAGE=/path/to/pkg` and
@@ -164,9 +171,8 @@ For the language tab, **Use bundled fixture** both loads the config and runs it.
 
 - `server/index.mjs` — Node API: translate ComfyUI→native, parse native config,
   run a language pipeline with per-step dumps, and render an image PNG via
-  `run_comfyui`; returns frames / the rendered image.
-- `scripts/export_sd_package.py` — reproducible Stable-Diffusion → onnx-genai
-  package exporter (dynamic spatial axes, DDIM, writes the package + workflow).
+  `render_sd` (the from-scratch Mobius SD 1.x driver); returns frames / the
+  rendered image.
 - `src/` — Vite + TypeScript UI: config loader, DAG/strategy view, run animation
   (`main.ts`, `style.css`).
 - `samples/` — example ComfyUI and native configs to load.

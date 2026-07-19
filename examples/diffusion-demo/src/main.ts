@@ -337,9 +337,11 @@ function renderImageRun(
   container: HTMLElement,
   frames: ImageFrame[],
   finalImage: string | null,
-  info: { wallMs?: number; render?: { finite?: boolean }; package?: string }
+  info: { wallMs?: number; render?: { finite?: boolean }; package?: string; prompt?: string; perf?: Perf | null }
 ) {
   container.innerHTML = "";
+  const perfCard = renderPerf(info.perf);
+  if (perfCard) container.appendChild(perfCard);
   const figure = el("div", "image-result");
   container.appendChild(figure);
 
@@ -440,6 +442,7 @@ function renderImageRun(
   figure.appendChild(
     el("div", "note", `text-encode → denoise → VAE decode${meta.length ? " · " + meta.join(" · ") : ""}`)
   );
+  if (info.prompt) figure.appendChild(el("div", "note", `prompt: “${info.prompt}”`));
   container.appendChild(el("div", "note", `package: ${info.package ?? "(set ONNX_GENAI_SD_PACKAGE)"}`));
 
   if (frames.length) play(); // auto-play the denoising on render
@@ -495,10 +498,55 @@ function render() {
 
   const vizMount = el("div");
   app.appendChild(vizMount);
-
   const runPanel = el("div", "panel");
   runPanel.style.display = "none";
   runPanel.appendChild(el("h2", undefined, "3 · Run"));
+
+  // Image tab: prompt + generation controls that drive the real SD pipeline.
+  let promptInput: HTMLTextAreaElement | null = null;
+  let negativeInput: HTMLInputElement | null = null;
+  let stepsInput: HTMLInputElement | null = null;
+  let guidanceInput: HTMLInputElement | null = null;
+  let seedInput: HTMLInputElement | null = null;
+  if (currentTab === "image") {
+    const promptField = el("div", "field");
+    promptField.appendChild(el("label", "field-label", "Prompt"));
+    promptInput = el("textarea") as HTMLTextAreaElement;
+    promptInput.className = "prompt-input";
+    promptInput.placeholder = "a photograph of an astronaut riding a horse";
+    promptInput.value = "a photograph of an astronaut riding a horse";
+    promptField.appendChild(promptInput);
+    runPanel.appendChild(promptField);
+
+    const negField = el("div", "field");
+    negField.appendChild(el("label", "field-label", "Negative prompt"));
+    negativeInput = el("input") as HTMLInputElement;
+    negativeInput.type = "text";
+    negativeInput.className = "prompt-input";
+    negativeInput.placeholder = "(optional) blurry, low quality";
+    negField.appendChild(negativeInput);
+    runPanel.appendChild(negField);
+
+    const numRow = el("div", "row controls-row");
+    const mkNumber = (label: string, value: string, min: string, max: string, step: string) => {
+      const field = el("div", "field field-inline");
+      field.appendChild(el("label", "field-label", label));
+      const input = el("input") as HTMLInputElement;
+      input.type = "number";
+      input.min = min;
+      input.max = max;
+      input.step = step;
+      input.value = value;
+      field.appendChild(input);
+      numRow.appendChild(field);
+      return input;
+    };
+    stepsInput = mkNumber("Steps", "25", "1", "100", "1");
+    guidanceInput = mkNumber("Guidance", "7.5", "0", "30", "0.5");
+    seedInput = mkNumber("Seed", "0", "0", "999999", "1");
+    runPanel.appendChild(numRow);
+  }
+
   const runRow = el("div", "row");
   const runBtn = el("button", undefined, currentTab === "language" ? "Run language diffusion" : "Run image diffusion") as HTMLButtonElement;
   runRow.appendChild(runBtn);
@@ -509,6 +557,10 @@ function render() {
   runErr.style.display = "none";
   runPanel.appendChild(runErr);
   app.appendChild(runPanel);
+
+  // The image tab renders straight from the configured SD package, so expose
+  // the run controls immediately without requiring a pasted config first.
+  if (currentTab === "image") runPanel.style.display = "";
 
   const showViz = (meta: Metadata) => {
     loadedMeta = meta;
@@ -583,13 +635,22 @@ function render() {
         if (res.metadata && !loadedMeta) showViz(res.metadata as Metadata);
         renderLanguageRun(runOut, res.frames as Frame[], res.maskId, res.perf as Perf);
       } else {
-        const res = await postText("/api/run/image", "{}");
+        const payload = {
+          prompt: promptInput?.value ?? "",
+          negative: negativeInput?.value ?? "",
+          steps: stepsInput ? Number(stepsInput.value) : undefined,
+          guidance: guidanceInput ? Number(guidanceInput.value) : undefined,
+          seed: seedInput ? Number(seedInput.value) : undefined,
+        };
+        const res = await postText("/api/run/image", JSON.stringify(payload));
         runOut.innerHTML = "";
         if (res.metadata) showViz(res.metadata as Metadata);
         renderImageRun(runOut, (res.frames as ImageFrame[]) ?? [], (res.image as string) ?? null, {
           wallMs: res.wallMs,
           render: res.render,
           package: res.package,
+          prompt: res.prompt,
+          perf: res.perf as Perf,
         });
       }
     } catch (e) {

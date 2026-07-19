@@ -264,24 +264,35 @@ function runLanguage() {
 }
 
 // Render a full image (text-encode + denoise + VAE decode -> PNG) with
-// run_comfyui, returning the PNG as a data URL plus wall-clock + render stats.
-// Honors the execution provider from the environment (set ONNX_GENAI_EP=cuda in
-// the shell that launches the demo for GPU rendering; see README).
-function runImage() {
-  const bin = findBinary("run_comfyui");
-  const workflow = join(SD_PACKAGE, "workflow.json");
-  if (!existsSync(workflow)) {
-    throw new Error(
-      `no workflow.json in ${SD_PACKAGE}; the exported package must include one ` +
-        `(see README), or point ONNX_GENAI_SD_PACKAGE at a package that has it`
-    );
-  }
+// `render_sd`, the driver for the from-scratch Mobius Stable Diffusion 1.x
+// package. Accepts a user prompt plus step-count/guidance/seed controls, runs
+// the real iterative pipeline, and returns the PNG as a data URL plus per-step
+// latent previews and timing. Honors the execution provider from the
+// environment (set ONNX_GENAI_EP=metal / cuda in the launching shell; see
+// README).
+function runImage(options) {
+  const prompt = typeof options.prompt === "string" ? options.prompt.trim() : "";
+  if (!prompt) throw new Error("prompt is required");
+  const negative = typeof options.negative === "string" ? options.negative : "";
+  const steps = clampInt(options.steps, 1, 100, 25);
+  const guidance = clampFloat(options.guidance, 0, 30, 7.5);
+  const seed = clampInt(options.seed, 0, Number.MAX_SAFE_INTEGER, 0);
+
+  const bin = findBinary("render_sd");
   const outPng = join(mkdtempSync(join(tmpdir(), "ogimg-")), "out.png");
   const dump = mkdtempSync(join(tmpdir(), "ogimgsteps-"));
   const started = Date.now();
   const r = spawnSync(
     bin,
-    ["--workflow", workflow, "--pipeline-dir", SD_PACKAGE, "--output", outPng],
+    [
+      "--pipeline-dir", SD_PACKAGE,
+      "--prompt", prompt,
+      "--negative", negative,
+      "--steps", String(steps),
+      "--guidance", String(guidance),
+      "--seed", String(seed),
+      "--output", outPng,
+    ],
     {
       encoding: "utf8",
       maxBuffer: 64 << 20,
@@ -292,41 +303,92 @@ function runImage() {
       },
     }
   );
-  if (r.status !== 0) throw new Error(r.stderr || "run_comfyui failed");
+  if (r.status !== 0) throw new Error(r.stderr || "render_sd failed");
   const wallMs = Date.now() - started;
-  if (!existsSync(outPng)) throw new Error(`run_comfyui reported success but ${outPng} is missing`);
+  if (!existsSync(outPng)) throw new Error(`render_sd reported success but ${outPng} is missing`);
   const image = `data:image/png;base64,${readFileSync(outPng).toString("base64")}`;
-  // Per-step latent previews (noise -> image) for the denoising animation.
-  const frames = readdirSync(dump)
+
+  // render_sd prints a machine-readable timing summary on stdout.
+  let summary = null;
+  try {
+    summary = JSON.parse((r.stdout || "").trim().split("\n").at(-1) ?? "");
+  } catch {
+    summary = null;
+  }
+
+  // Per-step latent previews (noise -> image) for the denoising animation, plus
+  // the per-step wall-clock the engine records in each dump.
+  const stepFiles = readdirSync(dump)
     .filter((f) => f.startsWith("step_") && f.endsWith(".json"))
-    .sort()
-    .map((f) => {
-      const j = JSON.parse(readFileSync(join(dump, f), "utf8"));
-      return latentToRgbPreview(j.data, j.shape);
-    });
+    .sort();
+  const frames = [];
+  const stepMs = [];
+  for (const f of stepFiles) {
+    const j = JSON.parse(readFileSync(join(dump, f), "utf8"));
+    frames.push(latentToRgbPreview(j.data, j.shape));
+    stepMs.push(typeof j.step_ms === "number" ? j.step_ms : null);
+  }
+  const stagesPath = join(dump, "stages.json");
+  const stages = existsSync(stagesPath)
+    ? JSON.parse(readFileSync(stagesPath, "utf8")).stages ?? []
+    : [];
+
   const renderMatch =
-    /\[render\]\s*finite=(\w+)\s*min=([-\d.]+)\s*max=([-\d.]+)\s*mean=([-\d.]+)\s*var=([-\d.]+)/.exec(
-      r.stderr || ""
-    );
+    /\[render\]\s*finite=(\w+)\s*min=([-\d.]+)\s*max=([-\d.]+)\s*mean=([-\d.]+)/.exec(r.stderr || "");
   const render = renderMatch
     ? {
         finite: renderMatch[1] === "true",
         min: Number(renderMatch[2]),
         max: Number(renderMatch[3]),
         mean: Number(renderMatch[4]),
-        var: Number(renderMatch[5]),
       }
     : null;
+
+  const denoiseMs = summary?.denoise_ms ?? null;
+  const perf = {
+    numSteps: steps,
+    runMs: denoiseMs,
+    // it/s = reverse-process steps per second (same metric ComfyUI reports).
+    stepsPerSecond:
+      summary?.steps_per_second ??
+      (denoiseMs && denoiseMs > 0 ? (steps / denoiseMs) * 1000 : null),
+    msPerStep: denoiseMs && steps > 0 ? denoiseMs / steps : null,
+    stages,
+    stepMs,
+  };
+
   const metaPath = join(SD_PACKAGE, "inference_metadata.yaml");
   return {
     kind: "image",
     package: SD_PACKAGE,
+    prompt,
+    negative,
+    steps,
+    guidance,
+    seed,
     metadata: existsSync(metaPath) ? YAML.parse(readFileSync(metaPath, "utf8")) : null,
     image,
     frames,
     wallMs,
     render,
+    perf,
   };
+}
+
+// Parse and clamp an integer request field, falling back to `fallback` when the
+// value is absent or not a finite number.
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+// Parse and clamp a floating-point request field, falling back to `fallback`
+// when the value is absent or not a finite number.
+function clampFloat(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 const server = createServer(async (req, res) => {
@@ -346,7 +408,16 @@ const server = createServer(async (req, res) => {
       if (!SD_PACKAGE) {
         return json(res, 400, { error: "no Stable Diffusion package configured; set ONNX_GENAI_SD_PACKAGE (see README)" });
       }
-      return json(res, 200, runImage());
+      const body = await readBody(req);
+      let options = {};
+      if (body.trim()) {
+        try {
+          options = JSON.parse(body);
+        } catch {
+          return json(res, 400, { error: "request body must be JSON" });
+        }
+      }
+      return json(res, 200, runImage(options));
     }
     if (req.url === "/api/health") return json(res, 200, { ok: true, lmPackage: LM_PACKAGE, sdPackage: SD_PACKAGE || null });
     return json(res, 404, { error: "not found" });

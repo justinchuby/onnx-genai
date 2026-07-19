@@ -131,3 +131,23 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 1
   border: 1px solid var(--border); border-radius: 8px; background: var(--mask);
   image-rendering: auto; display: block;
 }
+
+/* Image tab prompt + generation controls */
+.field { margin-top: 12px; }
+.field-label {
+  display: block; font-size: 12px; color: var(--muted, #9aa);
+  margin-bottom: 4px; font-weight: 600;
+}
+.prompt-input {
+  width: 100%; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+  font-size: 13px;
+}
+textarea.prompt-input { min-height: 60px; resize: vertical; }
+.controls-row { align-items: flex-end; }
+.field-inline { margin-top: 0; }
+.field-inline input[type=number] {
+  width: 96px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+  font-size: 13px;
+}
