@@ -79,6 +79,20 @@ fn device_argmax_enabled() -> bool {
     })
 }
 
+/// Whether shared-KV models that cannot capture a CUDA graph (control-flow
+/// models like Phi-4-mini) still use the persistent fixed-address I/O buffers
+/// for decode. On by default; `ONNX_GENAI_PERSISTENT_DECODE=0` forces the
+/// per-step reallocating standard path (for A/B testing).
+#[cfg(feature = "cuda")]
+fn persistent_uncaptured_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_PERSISTENT_DECODE")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn next_capture_graph_id() -> i32 {
     // Ids must be unique across concurrently-live sessions and strictly positive
     // so they never collide with the `-1` no-capture sentinel. Masking off the
@@ -400,11 +414,11 @@ pub struct DecodeSession<'a> {
     /// Process-unique CUDA-graph annotation id claimed lazily when this session
     /// first captures its decode graph. `None` until the first captured step.
     capture_graph_id: Option<i32>,
-    /// Set when a captured decode step fails and we fall back to the standard
-    /// decode path for the rest of this generation. Once set, the captured fast
-    /// path is skipped even though the underlying session still reports
-    /// `graph_capture() == true`, so graceful degradation persists per decode
-    /// loop without mutating the shared session.
+    /// Set when a persistent-buffer decode step (captured *or* uncaptured) fails
+    /// during setup and we fall back to the standard decode path for the rest of
+    /// this generation. Once set, both fast paths are skipped — even when the
+    /// session still reports `graph_capture() == true` — so graceful degradation
+    /// persists per decode loop without mutating the shared session.
     graph_capture_disabled: bool,
     /// Backend-provided device-side token selection for the captured path.
     /// `Some` only when the captured `logits` buffer is device-resident (see
@@ -658,6 +672,16 @@ impl<'a> DecodeSession<'a> {
     /// invoke the sampled path in that case: the standard step's side effects
     /// would be replayed by the host fallback, double-advancing the KV cache.
     /// This predicate lets the caller route straight to host sampling instead.
+    ///
+    /// NOTE: the uncaptured persistent path ([`Self::step_persistent`] with
+    /// `use_graph == false`) is deliberately *excluded* here, so control-flow
+    /// models fall back to host sampling for non-greedy draws. Greedy decoding is
+    /// unaffected — it routes through [`Self::step_argmax`], gated on
+    /// `supports_argmax` rather than this predicate, and already reduces on the
+    /// device. Extending device *sampling* to the uncaptured path is a deferred
+    /// optimization: it would need the same double-advance care as the captured
+    /// path for the prompt-prefill step, for a payoff the on-device reduction's
+    /// synchronization cost largely cancels on these compute-bound models.
     pub fn will_sample_on_device(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
@@ -719,7 +743,7 @@ impl<'a> DecodeSession<'a> {
             && self.current_len > 0
         {
             let captured =
-                self.step_captured(new_input_ids[0], attention_mask, position_ids[0], params);
+                self.step_persistent(new_input_ids[0], attention_mask, position_ids[0], params, true);
             return retry_pre_run_captured_failure(captured, |err| {
                 // Failures before ORT starts the graph run cannot have advanced
                 // KV state, so disable capture and retry this step through the
@@ -734,6 +758,50 @@ impl<'a> DecodeSession<'a> {
                     self.graph_capture_disabled = true;
                     self.capture = None;
                 }
+                self.step_standard(new_input_ids, attention_mask, position_ids)
+                    .map(StepLogits::Value)
+            });
+        }
+
+        // Persistent-buffer decode for shared-KV models that CANNOT capture a
+        // CUDA graph (top-level control-flow ops, e.g. Phi-4-mini's long-context
+        // RoPE `If`). Such models are left uncaptured (`graph_capture() == false`)
+        // yet still run the shared-buffer KV path, so `step_standard` pays a
+        // per-token tax the captured path avoids: it reallocates the input
+        // `Value`s, clears *all* bindings, rebinds ~30 outputs, and copies the
+        // full logits vocabulary host-side every step. Reuse the captured path's
+        // fixed-address I/O buffers, in-place input writes, `clear_inputs`-only
+        // rebinding, and on-device argmax — but run without a graph. Gated to
+        // CUDA sessions (where the device-logits/argmax win applies) and
+        // disableable with `ONNX_GENAI_PERSISTENT_DECODE=0`.
+        #[cfg(feature = "cuda")]
+        if self.mode == DecodeKvMode::SharedBuffer
+            && !self.session.graph_capture()
+            && !self.graph_capture_disabled
+            && new_input_ids.len() == 1
+            && self.current_len > 0
+            && self.session.cuda_device_id().is_some()
+            && persistent_uncaptured_enabled()
+        {
+            let stepped = self.step_persistent(
+                new_input_ids[0],
+                attention_mask,
+                position_ids[0],
+                params,
+                false,
+            );
+            return retry_pre_run_captured_failure(stepped, |err| {
+                // Only pre-run (setup/bind) failures reach here; they cannot have
+                // advanced KV, so drop the persistent state, latch the fast path
+                // off (reusing `graph_capture_disabled`, otherwise unused for
+                // uncaptured models), and replay this and every later step through
+                // the standard path.
+                tracing::warn!(
+                    error = %err,
+                    "persistent uncaptured decode setup failed; falling back to the standard decode path for the rest of this session"
+                );
+                self.graph_capture_disabled = true;
+                self.capture = None;
                 self.step_standard(new_input_ids, attention_mask, position_ids)
                     .map(StepLogits::Value)
             });
@@ -818,25 +886,42 @@ impl<'a> DecodeSession<'a> {
         logits.ok_or_else(|| OrtError::InvalidArgument("model did not produce logits".into()))
     }
 
-    /// Single-token decode step replayed through a captured CUDA graph.
+    /// Single-token decode step against persistent, fixed-address I/O buffers.
     ///
-    /// All inputs are bound to persistent, fixed-address buffers whose shapes
-    /// never change across steps: `input_ids [1,1]`, `position_ids [1,1]`, and a
-    /// full-capacity `attention_mask [1, max_len]` whose leading `valid_len`
-    /// entries are 1 (the model derives GQA sequence lengths from the mask, so
-    /// the trailing zeros mask the unused KV-buffer tail). KV buffers are the
-    /// same fixed shared buffers bound in place as both past inputs and present
-    /// outputs. Logits are written into a persistent output buffer. The first
-    /// such step captures the graph; subsequent steps replay it.
-    fn step_captured(
+    /// All inputs are bound to buffers whose shapes never change across steps:
+    /// `input_ids [1,1]`, `position_ids [1,1]`, and a full-capacity
+    /// `attention_mask [1, max_len]` whose leading `valid_len` entries are 1 (the
+    /// model derives GQA sequence lengths from the mask, so the trailing zeros
+    /// mask the unused KV-buffer tail). KV buffers are the same fixed shared
+    /// buffers bound in place as both past inputs and present outputs. Logits are
+    /// written into a persistent output buffer.
+    ///
+    /// When `use_graph` is set the step is captured/replayed through a CUDA graph
+    /// (`run_with_binding_graph`) — the first such step captures, later steps
+    /// replay. When `use_graph` is clear the same persistent buffers are used but
+    /// the step runs via a plain `run_with_binding`, which lets shared-KV models
+    /// that cannot capture a graph (control-flow ops like Phi-4-mini's RoPE `If`)
+    /// still avoid `step_standard`'s per-token `Value` reallocation, full binding
+    /// clear, ~30 output rebinds, and host logits copy. The uncaptured path never
+    /// claims a CUDA-graph annotation id.
+    fn step_persistent(
         &mut self,
         token: i64,
         attention_mask: &[i64],
         position: i64,
         params: Option<&DeviceSampleParams>,
+        use_graph: bool,
     ) -> std::result::Result<StepLogits, CapturedStepError> {
         self.ensure_capture_state()
             .map_err(CapturedStepError::PreRun)?;
+        // Claim a process-unique CUDA-graph annotation id lazily, only on the
+        // captured path and only once per generation. The uncaptured path runs
+        // without a graph, so it never claims an id (keeping `capture_graph_id`
+        // `None` means `Drop`/`invalidate_captured_graph` never try to release a
+        // graph that was never captured).
+        if use_graph && self.capture_graph_id.is_none() {
+            self.capture_graph_id = Some(next_capture_graph_id());
+        }
         // Move the capture buffers out of `self` for the duration of the step so
         // the `&mut self` bind helpers don't alias the borrow; restore on the
         // success path (an error aborts generation and drops the state).
@@ -873,14 +958,14 @@ impl<'a> DecodeSession<'a> {
         }
         cap.mask_valid_len = valid_len;
 
-        // On the first step under this capture id (and after any reset/rewind/KV
-        // grow that calls `invalidate_captured_graph`), bind every input and
-        // output so the graph is captured against these exact buffers. On later
-        // steps that merely replay the captured graph, the output tensors (KV
-        // shared buffers and logits) are device-resident and unchanged, so their
+        // On the first bound step (and after any reset/rewind/KV grow that clears
+        // `capture_bound`), bind every input and output against these exact
+        // persistent buffers — on the captured path this is what the CUDA graph
+        // is captured against. On later steps the output tensors (KV shared
+        // buffers and logits) are device-resident and unchanged, so their
         // bindings persist untouched. Inputs must be cleared and re-bound so ORT
         // re-copies the mutated CPU inputs (new token id, position, mask tail)
-        // host->device before the replay; clearing inputs also drops the KV
+        // host->device before each run/replay; clearing inputs also drops the KV
         // input bindings, so those are re-bound too (cheap: device-resident, no
         // copy). Skipping the ~30 output binds per token (each a CString alloc +
         // FFI call) removes about half the per-token bind cost.
@@ -926,15 +1011,26 @@ impl<'a> DecodeSession<'a> {
 
         {
             let _run_span = crate::prof_span!("ort.session_run");
-            let graph_id = self
-                .capture_graph_id
-                .expect("capture graph id assigned in ensure_capture_state");
-            self.session
-                .run_with_binding_graph_phased(&self.binding, graph_id)
-                .map_err(classify_run_phase)?;
+            if use_graph {
+                let graph_id = self
+                    .capture_graph_id
+                    .expect("capture graph id assigned before captured run");
+                self.session
+                    .run_with_binding_graph_phased(&self.binding, graph_id)
+                    .map_err(classify_run_phase)?;
+            } else {
+                // Uncaptured persistent path: a plain bound run with no CUDA
+                // graph. A failure here occurs at/after model invocation, which
+                // may already have advanced KV state, so classify it as
+                // `RunInvoked` (propagate without a standard-path replay).
+                self.session
+                    .run_with_binding(&self.binding)
+                    .map_err(CapturedStepError::RunInvoked)?;
+            }
         }
-        // A graph is now captured under `capture_graph_id`; mark it so reset /
-        // rewind / drop release it before this session's buffers are freed.
+        // The persistent I/O is now bound (and, on the captured path, a graph is
+        // captured under `capture_graph_id`); mark it so reset / rewind / drop
+        // clear it before this session's buffers are freed.
         self.capture_bound = true;
         self.current_len = self.current_len.checked_add(1).ok_or_else(|| {
             CapturedStepError::RunInvoked(OrtError::InvalidArgument(
@@ -1061,11 +1157,6 @@ impl<'a> DecodeSession<'a> {
         {
             logits = Value::empty(&[1, 1, vocab], logits_dtype)?;
         }
-
-        // Claim a process-unique annotation id so this session captures its own
-        // graph rather than re-capturing under an id ORT may still hold from a
-        // prior generation on the same underlying ORT session.
-        self.capture_graph_id = Some(next_capture_graph_id());
 
         self.capture = Some(CaptureState {
             input_ids,
@@ -1212,9 +1303,12 @@ impl<'a> DecodeSession<'a> {
         if self.capture_bound {
             if let Some(graph_id) = self.capture_graph_id {
                 let _ = self.session.release_captured_graph(graph_id);
+                // Re-capture under a new id if this session keeps decoding. Only
+                // the captured path holds an id; the uncaptured persistent path
+                // leaves `capture_graph_id` `None`, so it must not acquire one
+                // here (there is no graph to release or re-capture).
+                self.capture_graph_id = Some(next_capture_graph_id());
             }
-            // Re-capture under a new id if this session keeps decoding.
-            self.capture_graph_id = Some(next_capture_graph_id());
             self.capture_bound = false;
         }
     }
