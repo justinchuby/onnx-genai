@@ -209,5 +209,10 @@ End-to-end image (full pipeline through onnx-genai vs diffusers): `diffusion_ima
   done** — `checkpoint_export` auto-detects SDXL and emits the dual-encoder + 5-input-UNet pipeline,
   `mobius convert-comfyui` routes both conditioning edges automatically, and **`run_comfyui.py`
   renders SDXL end-to-end** (dual tokenizers, `time_ids`, dual-conditioning negative-prompt uncond).
-- LoRA weight merging and ControlNet are not yet wired.
+- **LoRA** ✅ handled by **fusing into the base model before export** (no runtime LoRA support
+  needed): the ComfyUI translator collects stacked `LoraLoader` nodes (name + `strength_model`),
+  `checkpoint_export(loras=[(path, strength)])` runs diffusers `load_lora_weights` + `fuse_lora`,
+  and `mobius convert-comfyui --lora NAME=PATH` resolves the filenames. Validated
+  (`scripts/lora_e2e.py`): a fused export matches diffusers `load+fuse` to 7.9e-6 and differs from
+  the base by 0.63 (the LoRA takes effect). **ControlNet** is not yet wired.
 - **img2img** is supported; inpainting (mask) is not.
