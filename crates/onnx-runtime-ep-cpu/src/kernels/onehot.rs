@@ -1,4 +1,4 @@
-//! Opset-11 `OneHot`, including negative index wrapping.
+//! Opset-11 `OneHot`, including valid negative index wrapping.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node};
@@ -77,7 +77,11 @@ impl Kernel for OneHotKernel {
         let output_strides = contiguous(&expected_shape);
         let index_strides = contiguous(inputs[0].shape);
         for (index_linear, index) in to_dense_i64(&inputs[0])?.into_iter().enumerate() {
-            let index = index.rem_euclid(depth as i64) as usize;
+            let index = match index {
+                index if index >= 0 && index < depth as i64 => index as usize,
+                index if index < 0 && index >= -(depth as i64) => (index + depth as i64) as usize,
+                _ => continue,
+            };
             let mut rem = index_linear;
             let mut output_linear = index * output_strides[axis];
             for d in 0..output_rank {
@@ -128,17 +132,17 @@ mod tests {
     }
 
     #[test]
-    fn negative_axis_and_indices_wrap_by_depth() {
-        let indices = Owned::i64(&[2], &[-1, -4]);
+    fn valid_negative_indices_wrap_and_out_of_range_indices_are_off() {
+        let indices = Owned::i64(&[3], &[-1, 3, -4]);
         let depth = Owned::i64(&[], &[3]);
         let values = Owned::f32(&[2], &[0., 1.]);
-        let mut out = Owned::zeros_f32(&[2, 3]);
+        let mut out = Owned::zeros_f32(&[3, 3]);
         OneHotKernel { axis: -1 }
             .execute(
                 &[indices.view(), depth.view(), values.view()],
                 &mut [out.view_mut()],
             )
             .unwrap();
-        assert_eq!(out.to_f32(), vec![0., 0., 1., 0., 0., 1.]);
+        assert_eq!(out.to_f32(), vec![0., 0., 1., 0., 0., 0., 0., 0., 0.]);
     }
 }

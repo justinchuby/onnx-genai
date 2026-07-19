@@ -24,10 +24,15 @@ impl KernelFactory for BitShiftFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let direction = match node.attr("direction").and_then(Attribute::as_str) {
             Some("LEFT") => Direction::Left,
-            Some("RIGHT") | None => Direction::Right,
+            Some("RIGHT") => Direction::Right,
             Some(_) => {
                 return Err(EpError::KernelFailed(
                     "BitShift: direction attribute must be LEFT or RIGHT".into(),
+                ));
+            }
+            None => {
+                return Err(EpError::KernelFailed(
+                    "BitShift: direction attribute is required".into(),
                 ));
             }
         };
@@ -112,7 +117,7 @@ fn bitshift_typed<T: Shiftable + Default>(
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::compute_contiguous_strides;
+    use onnx_runtime_ir::{NodeId, compute_contiguous_strides};
 
     fn unsigned(shape: &[usize], dtype: DataType, values: &[u64]) -> Owned {
         let mut bytes = Vec::with_capacity(values.len() * dtype.byte_size());
@@ -178,5 +183,11 @@ mod tests {
         .execute(&[input.view(), shifts.view()], &mut [out.view_mut()])
         .unwrap();
         assert_eq!(out.bytes, vec![0]);
+    }
+
+    #[test]
+    fn missing_direction_attribute_errors() {
+        let node = Node::new(NodeId(0), "BitShift", vec![], vec![]);
+        assert!(BitShiftFactory.create(&node, &[]).is_err());
     }
 }

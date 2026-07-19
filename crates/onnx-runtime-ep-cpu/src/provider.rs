@@ -483,7 +483,11 @@ mod tests {
     fn get_kernel_dispatches_phase1_ops() {
         let ep = CpuExecutionProvider::new();
         for (i, op) in crate::kernels::PHASE1_OPS.iter().enumerate() {
-            let node = Node::new(onnx_runtime_ir::NodeId(i as u32), *op, vec![], vec![]);
+            let mut node = Node::new(onnx_runtime_ir::NodeId(i as u32), *op, vec![], vec![]);
+            if *op == "BitShift" {
+                node.attributes
+                    .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
+            }
             assert!(ep.get_kernel(&node, &[], 17).is_ok(), "no kernel for {op}");
         }
         let bad = Node::new(onnx_runtime_ir::NodeId(99), "Conv", vec![], vec![]);
