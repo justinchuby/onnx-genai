@@ -64,9 +64,7 @@ fn resolve_native_decode_device(
     }
 
     for provider in &session_options.execution_providers {
-        if !provider.caps.is_host()
-            && !(provider.caps.is_gpu() && provider.caps.is_nvidia())
-        {
+        if !provider.caps.is_host() && !(provider.caps.is_gpu() && provider.caps.is_nvidia()) {
             anyhow::bail!(
                 "native decoder backend does not support execution provider {provider:?}; supported devices are CPU and CUDA"
             );
@@ -1094,9 +1092,7 @@ impl Engine {
         sampler: Box<dyn Sampler>,
     ) -> anyhow::Result<GenerateResult> {
         if self.decode_backend == EngineDecodeBackend::Native {
-            anyhow::bail!(
-                "custom samplers are not supported on the native single-session backend"
-            );
+            anyhow::bail!("custom samplers are not supported on the native single-session backend");
         }
         let session_id = self.create_session()?;
         let result = self.generate_in_session_with_sampler(session_id, request, sampler);
@@ -1203,7 +1199,9 @@ impl Engine {
         request: GenerateRequest,
         priority: Priority,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_in_session_with_priority_and_callback(session_id, request, priority, None, None)
+        self.generate_in_session_with_priority_and_callback(
+            session_id, request, priority, None, None,
+        )
     }
 
     /// Generate text in a persistent session and optionally stream generated tokens.

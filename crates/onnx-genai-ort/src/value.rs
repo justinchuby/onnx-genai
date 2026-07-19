@@ -360,7 +360,8 @@ impl Value {
         // `[offset, offset + vocab)`, which is in bounds by construction.
         let index = match self.dtype {
             DataType::Float32 => {
-                let row = unsafe { std::slice::from_raw_parts(data.cast::<f32>().add(offset), vocab) };
+                let row =
+                    unsafe { std::slice::from_raw_parts(data.cast::<f32>().add(offset), vocab) };
                 argmax_row_f32(row)
             }
             DataType::Float16 => {
@@ -888,11 +889,7 @@ where
             found = true;
         }
     }
-    if found {
-        best_index
-    } else {
-        0
-    }
+    if found { best_index } else { 0 }
 }
 
 /// Argmax over raw binary16 bits, ignoring NaNs, matching [`argmax_row_f32`].
@@ -1013,8 +1010,16 @@ mod argmax_tests {
                 .iter()
                 .map(|&v| half::bf16::from_f32(v).to_bits())
                 .collect();
-            assert_eq!(argmax_f16_bits(&f16_bits), reference(&f32_row), "f16 peak {peak}");
-            assert_eq!(argmax_bf16_bits(&bf16_bits), reference(&f32_row), "bf16 peak {peak}");
+            assert_eq!(
+                argmax_f16_bits(&f16_bits),
+                reference(&f32_row),
+                "f16 peak {peak}"
+            );
+            assert_eq!(
+                argmax_bf16_bits(&bf16_bits),
+                reference(&f32_row),
+                "bf16 peak {peak}"
+            );
         }
 
         // NaNs are ignored; a single finite value in a later chunk wins.
