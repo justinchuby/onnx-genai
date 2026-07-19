@@ -1,99 +1,190 @@
 --------------------------- MODULE BufferOwnership ---------------------------
-\* TLA+ specification for CommHandle buffer ownership state machine.
-\* Proves no buffer is reused/freed before its communication completes,
-\* under all possible DAG scheduling interleavings.
+\* Model of transport-held buffer leases and CommHandle lifetime.
 \*
-\* Model: A set of buffers, each used by communication operations.
-\* The DagScheduler may launch multiple operations concurrently.
-\* A buffer transitions: Free → InUse → PendingComm → Free
+\* A submitted operation is retained by the backend registry until transport
+\* completion or abort quiescence. Dropping/detaching the user-visible handle
+\* does not release its lease. Ready operations may legally wait for a shared
+\* buffer; they are not evidence of premature reuse.
 \*
-\* Verifies:
-\*   1. No buffer is in two concurrent operations
-\*   2. No buffer is freed/reused while PendingComm
-\*   3. Every buffer eventually returns to Free (liveness)
+\* The model uses one exclusive workspace buffer per operation. Production
+\* read-only aliasing can be added as shared leases, but must preserve the same
+\* no-free/no-write rule while any registry lease is active.
 
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
-    Buffers,        \* Set of buffer IDs
-    Operations      \* Set of operation IDs (communication steps)
+    NumBuffers,
+    NumOperations
+
+ASSUME /\ NumBuffers > 0
+       /\ NumOperations > 0
+
+Buffers == 1..NumBuffers
+Operations == 1..NumOperations
+OperationStates == {"ready", "submitted", "aborting", "terminal"}
+Outcomes == {"none", "ok", "error"}
+
+\* A deterministic assignment keeps the model self-contained and guarantees
+\* sharing whenever NumOperations > NumBuffers.
+BufferOf(op) == ((op - 1) % NumBuffers) + 1
 
 VARIABLES
-    bufState,       \* bufState[b] \in {"free", "in_use", "pending_comm"}
-    opState,        \* opState[op] \in {"ready", "launched", "complete"}
-    opBuffer,       \* opBuffer[op] = buffer used by this operation (static assignment)
-    handleState     \* handleState[op] \in {"none", "active", "signaled"}
+    operationState,
+    handleAttached,
+    registryOwned,
+    outcome,
+    freed,
+    leaseGeneration,
+    operationGeneration
 
-vars == <<bufState, opState, opBuffer, handleState>>
+vars ==
+    <<operationState, handleAttached, registryOwned, outcome, freed,
+      leaseGeneration, operationGeneration>>
 
 TypeOK ==
-    /\ \A b \in Buffers: bufState[b] \in {"free", "in_use", "pending_comm"}
-    /\ \A op \in Operations: opState[op] \in {"ready", "launched", "complete"}
-    /\ \A op \in Operations: handleState[op] \in {"none", "active", "signaled"}
+    /\ operationState \in [Operations -> OperationStates]
+    /\ handleAttached \in [Operations -> BOOLEAN]
+    /\ registryOwned \in [Operations -> BOOLEAN]
+    /\ outcome \in [Operations -> Outcomes]
+    /\ freed \subseteq Buffers
+    /\ leaseGeneration \in [Buffers -> Nat]
+    /\ operationGeneration \in [Operations -> Nat]
 
 Init ==
-    /\ bufState = [b \in Buffers |-> "free"]
-    /\ opState = [op \in Operations |-> "ready"]
-    /\ opBuffer = [op \in Operations |-> CHOOSE b \in Buffers : TRUE]  \* model config
-    /\ handleState = [op \in Operations |-> "none"]
+    /\ operationState = [op \in Operations |-> "ready"]
+    /\ handleAttached = [op \in Operations |-> FALSE]
+    /\ registryOwned = [op \in Operations |-> FALSE]
+    /\ outcome = [op \in Operations |-> "none"]
+    /\ freed = {}
+    /\ leaseGeneration = [b \in Buffers |-> 0]
+    /\ operationGeneration = [op \in Operations |-> 0]
 
----------------------------------------------------------------------------
-\* ACTION: Scheduler writes data into buffer (preparing for comm)
-PrepareBuffer(op) ==
-    /\ opState[op] = "ready"
-    /\ bufState[opBuffer[op]] = "free"
-    /\ bufState' = [bufState EXCEPT ![opBuffer[op]] = "in_use"]
-    /\ opState' = [opState EXCEPT ![op] = "launched"]
-    /\ handleState' = [handleState EXCEPT ![op] = "active"]
-    /\ UNCHANGED opBuffer
+Active(op) ==
+    operationState[op] \in {"submitted", "aborting"}
 
-\* ACTION: Communication is enqueued (buffer transitions to pending_comm)
-\* Buffer is now owned by the transport — cannot be touched.
-EnqueueComm(op) ==
-    /\ opState[op] = "launched"
-    /\ bufState[opBuffer[op]] = "in_use"
-    /\ bufState' = [bufState EXCEPT ![opBuffer[op]] = "pending_comm"]
-    /\ UNCHANGED <<opState, opBuffer, handleState>>
+BufferAvailable(op) ==
+    /\ BufferOf(op) \notin freed
+    /\ \A other \in Operations:
+        BufferOf(other) = BufferOf(op) => ~Active(other)
 
-\* ACTION: Communication completes (CommHandle signals)
-\* Buffer returns to free. Only happens when transport is done.
-CommComplete(op) ==
-    /\ handleState[op] = "active"
-    /\ bufState[opBuffer[op]] = "pending_comm"
-    /\ handleState' = [handleState EXCEPT ![op] = "signaled"]
-    /\ bufState' = [bufState EXCEPT ![opBuffer[op]] = "free"]
-    /\ opState' = [opState EXCEPT ![op] = "complete"]
-    /\ UNCHANGED opBuffer
+Submit(op) ==
+    /\ operationState[op] = "ready"
+    /\ BufferAvailable(op)
+    /\ operationState' =
+        [operationState EXCEPT ![op] = "submitted"]
+    /\ handleAttached' =
+        [handleAttached EXCEPT ![op] = TRUE]
+    /\ registryOwned' =
+        [registryOwned EXCEPT ![op] = TRUE]
+    /\ operationGeneration' =
+        [operationGeneration EXCEPT
+            ![op] = leaseGeneration[BufferOf(op)]]
+    /\ UNCHANGED <<outcome, freed, leaseGeneration>>
 
----------------------------------------------------------------------------
+\* Dropping the handle detaches observation only. Backend ownership and the
+\* buffer lease remain live.
+Detach(op) ==
+    /\ Active(op)
+    /\ handleAttached[op]
+    /\ handleAttached' =
+        [handleAttached EXCEPT ![op] = FALSE]
+    /\ UNCHANGED
+        <<operationState, registryOwned, outcome, freed,
+          leaseGeneration, operationGeneration>>
+
+CompleteSuccess(op) ==
+    /\ operationState[op] = "submitted"
+    /\ registryOwned[op]
+    /\ operationState' =
+        [operationState EXCEPT ![op] = "terminal"]
+    /\ registryOwned' =
+        [registryOwned EXCEPT ![op] = FALSE]
+    /\ outcome' =
+        [outcome EXCEPT ![op] = "ok"]
+    /\ leaseGeneration' =
+        [leaseGeneration EXCEPT ![BufferOf(op)] = @ + 1]
+    /\ UNCHANGED <<handleAttached, freed, operationGeneration>>
+
+\* Abort request is not terminal completion. The lease remains owned until the
+\* transport reports quiescence.
+BeginAbort(op) ==
+    /\ operationState[op] = "submitted"
+    /\ registryOwned[op]
+    /\ operationState' =
+        [operationState EXCEPT ![op] = "aborting"]
+    /\ UNCHANGED
+        <<handleAttached, registryOwned, outcome, freed,
+          leaseGeneration, operationGeneration>>
+
+QuiesceAbort(op) ==
+    /\ operationState[op] = "aborting"
+    /\ registryOwned[op]
+    /\ operationState' =
+        [operationState EXCEPT ![op] = "terminal"]
+    /\ registryOwned' =
+        [registryOwned EXCEPT ![op] = FALSE]
+    /\ outcome' =
+        [outcome EXCEPT ![op] = "error"]
+    /\ leaseGeneration' =
+        [leaseGeneration EXCEPT ![BufferOf(op)] = @ + 1]
+    /\ UNCHANGED <<handleAttached, freed, operationGeneration>>
+
+FreeBuffer(b) ==
+    /\ b \notin freed
+    /\ \A op \in Operations:
+        BufferOf(op) = b => ~registryOwned[op]
+    /\ freed' = freed \union {b}
+    /\ UNCHANGED
+        <<operationState, handleAttached, registryOwned, outcome,
+          leaseGeneration, operationGeneration>>
+
 Next ==
-    \/ \E op \in Operations: PrepareBuffer(op)
-    \/ \E op \in Operations: EnqueueComm(op)
-    \/ \E op \in Operations: CommComplete(op)
+    \/ \E op \in Operations: Submit(op)
+    \/ \E op \in Operations: Detach(op)
+    \/ \E op \in Operations: CompleteSuccess(op)
+    \/ \E op \in Operations: BeginAbort(op)
+    \/ \E op \in Operations: QuiesceAbort(op)
+    \/ \E b \in Buffers: FreeBuffer(b)
 
----------------------------------------------------------------------------
-\* PROPERTIES
+ExclusiveActiveLease ==
+    \A b \in Buffers:
+        Cardinality(
+            {op \in Operations:
+                /\ BufferOf(op) = b
+                /\ Active(op)}
+        ) <= 1
 
-\* Safety: A buffer in "pending_comm" is never accessed by another operation.
-\* (No other op can PrepareBuffer on the same buffer while it's pending.)
-NoPendingReuse == \A b \in Buffers:
-    bufState[b] = "pending_comm" =>
-        ~(\E op \in Operations:
-            /\ opBuffer[op] = b
-            /\ opState[op] = "ready")
+ActiveIsRegistryOwned ==
+    \A op \in Operations:
+        Active(op) => registryOwned[op]
 
-\* Safety: A buffer cannot be in_use by two operations simultaneously.
-NoDoubleUse == \A b \in Buffers:
-    Cardinality({op \in Operations:
-        opBuffer[op] = b /\ opState[op] = "launched"}) <= 1
+DetachedActiveIsStillOwned ==
+    \A op \in Operations:
+        /\ Active(op)
+        /\ ~handleAttached[op]
+        => registryOwned[op]
 
-\* Safety: Buffer is only freed AFTER CommHandle signals.
-FreeOnlyAfterSignal == \A op \in Operations:
-    (opState[op] = "complete") => (handleState[op] = "signaled")
+FreedHasNoOwner ==
+    \A b \in freed:
+        \A op \in Operations:
+            BufferOf(op) = b => ~registryOwned[op]
 
-\* Liveness: All operations eventually complete.
-AllOpsComplete == <>(\A op \in Operations: opState[op] = "complete")
+TerminalReleased ==
+    \A op \in Operations:
+        operationState[op] = "terminal"
+            => /\ ~registryOwned[op]
+               /\ outcome[op] \in {"ok", "error"}
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+ActiveGenerationMatches ==
+    \A op \in Operations:
+        Active(op) =>
+            operationGeneration[op] = leaseGeneration[BufferOf(op)]
+
+Spec ==
+    /\ Init
+    /\ [][Next]_vars
+    /\ \A op \in Operations:
+        WF_vars(CompleteSuccess(op) \/ BeginAbort(op))
+    /\ \A op \in Operations: WF_vars(QuiesceAbort(op))
 
 =============================================================================

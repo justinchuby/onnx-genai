@@ -1,162 +1,237 @@
 --------------------------- MODULE PressureProtocol ---------------------------
-\* TLA+ specification for the epoch-based pressure protocol between
-\* DeviceGovernors and HostGovernor. Proves deadlock freedom under the
-\* invariant: "no lock is held across an await/wait point."
+\* Model of the HostGovernor pressure-ticket lifecycle and its allocation
+\* ledger. Ledger-changing actions are atomic critical sections; no lock state
+\* survives an action, so a pending ticket never waits while holding the
+\* governor lock.
 \*
-\* Model: N devices share one HostGovernor. Any device may need host pages
-\* (offload) while the host may be full and need devices to reclaim.
+\* The model distinguishes:
+\*   - reclaimable pages already resident on a device's behalf,
+\*   - pages reserved for a granted but not yet claimed ticket, and
+\*   - pages held by a caller that successfully claimed its ticket.
 \*
-\* This spec verifies:
-\*   1. No deadlock (always at least one enabled action)
-\*   2. No lock held during wait (structural — waits are outside critical sections)
-\*   3. Eventually all pressure requests are satisfied (liveness under fairness)
+\* This is a safety model. Progress depends on explicit fairness and on there
+\* being reclaimable/releasable capacity; it does not claim unconditional
+\* deadlock freedom when the environment permanently retains all capacity.
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS
-    Devices,            \* Set of device IDs, e.g., {d0, d1, d2}
-    HostCapacity,       \* Total host pages available
-    MaxRequest          \* Max pages a device can request at once
+    NumDevices,
+    Capacity
+
+ASSUME /\ NumDevices > 0
+       /\ Capacity > 0
+
+Devices == 1..NumDevices
+
+TicketStates ==
+    {"idle", "pending", "granted", "claimed",
+     "cancelled", "failed", "completed"}
 
 VARIABLES
-    hostFree,           \* Host pages currently free
-    hostLocked,         \* Whether host lock is held (by whom, or "none")
-    deviceHeld,         \* deviceHeld[d] = pages device d holds on host
-    pressureQueue,      \* Queue of {device, bytes, epoch, satisfied}
-    epoch,              \* Global epoch counter
-    reclaimNotices,     \* Per-device channel of reclaim requests
-    deviceState         \* Per-device state: "idle" | "requesting" | "waiting" | "reclaiming"
+    free,
+    reclaimable,
+    reserved,
+    claimedHeld,
+    ticketState,
+    ticketGeneration,
+    configurationGeneration,
+    reclaimNotices,
+    claimCount
 
-vars == <<hostFree, hostLocked, deviceHeld, pressureQueue, epoch, reclaimNotices, deviceState>>
+vars ==
+    <<free, reclaimable, reserved, claimedHeld, ticketState,
+      ticketGeneration, configurationGeneration, reclaimNotices, claimCount>>
+
+RECURSIVE SumFunction(_, _)
+SumFunction(f, n) ==
+    IF n = 0
+    THEN 0
+    ELSE f[n] + SumFunction(f, n - 1)
+
+Total(f) == SumFunction(f, NumDevices)
 
 TypeOK ==
-    /\ hostFree \in 0..HostCapacity
-    /\ hostLocked \in Devices \union {"none"}
-    /\ \A d \in Devices: deviceHeld[d] \in 0..HostCapacity
-    /\ epoch \in Nat
-    /\ \A d \in Devices: deviceState[d] \in {"idle", "requesting", "waiting", "reclaiming"}
+    /\ free \in 0..Capacity
+    /\ reclaimable \in [Devices -> 0..Capacity]
+    /\ reserved \in [Devices -> 0..1]
+    /\ claimedHeld \in [Devices -> 0..1]
+    /\ ticketState \in [Devices -> TicketStates]
+    /\ ticketGeneration \in [Devices -> Nat]
+    /\ configurationGeneration \in Nat
+    /\ reclaimNotices \in [Devices -> 0..1]
+    /\ claimCount \in [Devices -> 0..1]
 
 Init ==
-    /\ hostFree = HostCapacity
-    /\ hostLocked = "none"
-    /\ deviceHeld = [d \in Devices |-> 0]
-    /\ pressureQueue = <<>>
-    /\ epoch = 0
+    /\ \E initial \in [Devices -> 0..Capacity]:
+        /\ Total(initial) <= Capacity
+        /\ reclaimable = initial
+        /\ free = Capacity - Total(initial)
+    /\ reserved = [d \in Devices |-> 0]
+    /\ claimedHeld = [d \in Devices |-> 0]
+    /\ ticketState = [d \in Devices |-> "idle"]
+    /\ ticketGeneration = [d \in Devices |-> 0]
+    /\ configurationGeneration = 0
     /\ reclaimNotices = [d \in Devices |-> 0]
-    /\ deviceState = [d \in Devices |-> "idle"]
+    /\ claimCount = [d \in Devices |-> 0]
 
----------------------------------------------------------------------------
-\* ACTION: Device d requests host pages (Phase 1 of protocol)
-\* Briefly acquires host lock, enqueues request, releases lock, then waits.
+\* Submit one unit request. The production protocol generalizes the same
+\* transitions to byte extents checked before ledger mutation.
+Submit(d) ==
+    /\ ticketState[d] = "idle"
+    /\ ticketState' = [ticketState EXCEPT ![d] = "pending"]
+    /\ ticketGeneration' =
+        [ticketGeneration EXCEPT ![d] = configurationGeneration]
+    /\ UNCHANGED
+        <<free, reclaimable, reserved, claimedHeld,
+          configurationGeneration, reclaimNotices, claimCount>>
 
-RequestHostPages(d) ==
-    /\ deviceState[d] = "idle"
-    /\ hostLocked = "none"
-    \* Acquire lock briefly
-    /\ hostLocked' = d
-    /\ LET req == [device |-> d, bytes |-> 1, epoch |-> epoch]
-       IN pressureQueue' = Append(pressureQueue, req)
-    /\ epoch' = epoch + 1
-    /\ deviceState' = [deviceState EXCEPT ![d] = "requesting"]
-    /\ UNCHANGED <<hostFree, deviceHeld, reclaimNotices>>
+\* The charge is made in the same atomic action that publishes the grant.
+Grant(d) ==
+    /\ ticketState[d] = "pending"
+    /\ ticketGeneration[d] = configurationGeneration
+    /\ free >= 1
+    /\ free' = free - 1
+    /\ reserved' = [reserved EXCEPT ![d] = 1]
+    /\ ticketState' = [ticketState EXCEPT ![d] = "granted"]
+    /\ UNCHANGED
+        <<reclaimable, claimedHeld, ticketGeneration,
+          configurationGeneration, reclaimNotices, claimCount>>
 
-\* Release lock and transition to waiting (separate step — lock not held during wait)
-ReleaseAndWait(d) ==
-    /\ deviceState[d] = "requesting"
-    /\ hostLocked = d
-    /\ hostLocked' = "none"
-    /\ deviceState' = [deviceState EXCEPT ![d] = "waiting"]
-    /\ UNCHANGED <<hostFree, deviceHeld, pressureQueue, epoch, reclaimNotices>>
+\* Polling a ready ticket transfers the already charged reservation exactly
+\* once. It does not perform a second capacity check.
+Claim(d) ==
+    /\ ticketState[d] = "granted"
+    /\ reserved[d] = 1
+    /\ claimCount[d] = 0
+    /\ reserved' = [reserved EXCEPT ![d] = 0]
+    /\ claimedHeld' = [claimedHeld EXCEPT ![d] = 1]
+    /\ claimCount' = [claimCount EXCEPT ![d] = 1]
+    /\ ticketState' = [ticketState EXCEPT ![d] = "claimed"]
+    /\ UNCHANGED
+        <<free, reclaimable, ticketGeneration,
+          configurationGeneration, reclaimNotices>>
 
----------------------------------------------------------------------------
-\* ACTION: HostGovernor processes pressure queue (background task)
-\* If free pages available, satisfy request directly.
-\* If not, send reclaim notices to devices that hold pages.
+Complete(d) ==
+    /\ ticketState[d] = "claimed"
+    /\ claimedHeld[d] = 1
+    /\ claimedHeld' = [claimedHeld EXCEPT ![d] = 0]
+    /\ free' = free + 1
+    /\ ticketState' = [ticketState EXCEPT ![d] = "completed"]
+    /\ UNCHANGED
+        <<reclaimable, reserved, ticketGeneration,
+          configurationGeneration, reclaimNotices, claimCount>>
 
-SatisfyFromFree ==
-    /\ Len(pressureQueue) > 0
-    /\ hostLocked = "none"
-    /\ LET req == Head(pressureQueue)
-       IN /\ hostFree >= req.bytes
-          /\ hostFree' = hostFree - req.bytes
-          /\ deviceHeld' = [deviceHeld EXCEPT ![req.device] = @ + req.bytes]
-          /\ pressureQueue' = Tail(pressureQueue)
-          /\ deviceState' = [deviceState EXCEPT ![req.device] = "idle"]
-          /\ UNCHANGED <<hostLocked, epoch, reclaimNotices>>
+CancelPending(d) ==
+    /\ ticketState[d] = "pending"
+    /\ ticketState' = [ticketState EXCEPT ![d] = "cancelled"]
+    /\ UNCHANGED
+        <<free, reclaimable, reserved, claimedHeld, ticketGeneration,
+          configurationGeneration, reclaimNotices, claimCount>>
 
-SendReclaimNotice ==
-    /\ Len(pressureQueue) > 0
-    /\ hostFree < Head(pressureQueue).bytes
-    /\ hostLocked = "none"
-    \* Send reclaim to a device that holds pages (not the requester)
-    /\ \E victim \in Devices:
-        /\ victim # Head(pressureQueue).device
-        /\ deviceHeld[victim] > 0
-        /\ reclaimNotices' = [reclaimNotices EXCEPT ![victim] = @ + 1]
-        /\ UNCHANGED <<hostFree, hostLocked, deviceHeld, pressureQueue, epoch, deviceState>>
+\* Cancellation racing with grant returns the reserved charge before the
+\* ticket becomes terminal.
+CancelGranted(d) ==
+    /\ ticketState[d] = "granted"
+    /\ reserved[d] = 1
+    /\ free' = free + 1
+    /\ reserved' = [reserved EXCEPT ![d] = 0]
+    /\ ticketState' = [ticketState EXCEPT ![d] = "cancelled"]
+    /\ UNCHANGED
+        <<reclaimable, claimedHeld, ticketGeneration,
+          configurationGeneration, reclaimNotices, claimCount>>
 
----------------------------------------------------------------------------
-\* ACTION: Device receives reclaim notice and releases pages
-\* Does NOT need to acquire HostGovernor lock to release — just updates.
+Timeout(d) ==
+    /\ ticketState[d] = "pending"
+    /\ ticketState' = [ticketState EXCEPT ![d] = "failed"]
+    /\ UNCHANGED
+        <<free, reclaimable, reserved, claimedHeld, ticketGeneration,
+          configurationGeneration, reclaimNotices, claimCount>>
+
+\* Reconfiguration invalidates all requests admitted under the previous
+\* generation. Already published grants remain charged and claimable.
+Reconfigure ==
+    /\ \E d \in Devices: ticketState[d] = "pending"
+    /\ configurationGeneration' = configurationGeneration + 1
+    /\ ticketState' =
+        [d \in Devices |->
+            IF ticketState[d] = "pending"
+            THEN "failed"
+            ELSE ticketState[d]]
+    /\ UNCHANGED
+        <<free, reclaimable, reserved, claimedHeld, ticketGeneration,
+          reclaimNotices, claimCount>>
+
+\* The requester is intentionally not excluded as a victim. Excluding it can
+\* deadlock when it owns the only reclaimable allocation.
+SendReclaim(d) ==
+    /\ reclaimable[d] > 0
+    /\ reclaimNotices[d] = 0
+    /\ \E requester \in Devices:
+        /\ ticketState[requester] = "pending"
+        /\ free = 0
+    /\ reclaimNotices' = [reclaimNotices EXCEPT ![d] = 1]
+    /\ UNCHANGED
+        <<free, reclaimable, reserved, claimedHeld, ticketState,
+          ticketGeneration, configurationGeneration, claimCount>>
 
 Reclaim(d) ==
     /\ reclaimNotices[d] > 0
-    /\ deviceHeld[d] > 0
-    /\ deviceState[d] \in {"idle", "waiting"}  \* Can reclaim even while waiting for own request
-    \* Release one page back to host (briefly lock host to update ledger)
-    /\ hostLocked = "none"
-    /\ hostLocked' = d
-    /\ deviceState' = [deviceState EXCEPT ![d] = "reclaiming"]
-    /\ UNCHANGED <<hostFree, deviceHeld, pressureQueue, epoch, reclaimNotices>>
-
-CompleteReclaim(d) ==
-    /\ deviceState[d] = "reclaiming"
-    /\ hostLocked = d
-    /\ hostFree' = hostFree + 1
-    /\ deviceHeld' = [deviceHeld EXCEPT ![d] = @ - 1]
-    /\ reclaimNotices' = [reclaimNotices EXCEPT ![d] = @ - 1]
-    /\ hostLocked' = "none"
-    /\ deviceState' = [deviceState EXCEPT ![d] =
-        IF reclaimNotices[d] - 1 > 0 THEN "idle" ELSE "idle"]
-    /\ UNCHANGED <<pressureQueue, epoch>>
-
----------------------------------------------------------------------------
-\* Next-state relation
+    /\ reclaimable[d] > 0
+    /\ reclaimable' = [reclaimable EXCEPT ![d] = @ - 1]
+    /\ reclaimNotices' = [reclaimNotices EXCEPT ![d] = 0]
+    /\ free' = free + 1
+    /\ UNCHANGED
+        <<reserved, claimedHeld, ticketState, ticketGeneration,
+          configurationGeneration, claimCount>>
 
 Next ==
-    \/ \E d \in Devices: RequestHostPages(d)
-    \/ \E d \in Devices: ReleaseAndWait(d)
-    \/ SatisfyFromFree
-    \/ SendReclaimNotice
+    \/ \E d \in Devices: Submit(d)
+    \/ \E d \in Devices: Grant(d)
+    \/ \E d \in Devices: Claim(d)
+    \/ \E d \in Devices: Complete(d)
+    \/ \E d \in Devices: CancelPending(d)
+    \/ \E d \in Devices: CancelGranted(d)
+    \/ \E d \in Devices: Timeout(d)
+    \/ Reconfigure
+    \/ \E d \in Devices: SendReclaim(d)
     \/ \E d \in Devices: Reclaim(d)
-    \/ \E d \in Devices: CompleteReclaim(d)
 
----------------------------------------------------------------------------
-\* PROPERTIES
+CapacityConserved ==
+    free + Total(reclaimable) + Total(reserved) + Total(claimedHeld)
+        = Capacity
 
-\* Safety: No deadlock — some action is always enabled
-NoDeadlock == \/ \E d \in Devices: ENABLED RequestHostPages(d)
-              \/ \E d \in Devices: ENABLED ReleaseAndWait(d)
-              \/ ENABLED SatisfyFromFree
-              \/ ENABLED SendReclaimNotice
-              \/ \E d \in Devices: ENABLED Reclaim(d)
-              \/ \E d \in Devices: ENABLED CompleteReclaim(d)
+GrantedIsCharged ==
+    \A d \in Devices:
+        /\ (ticketState[d] = "granted") => (reserved[d] = 1)
+        /\ (ticketState[d] # "granted") => (reserved[d] = 0)
 
-\* Safety: Lock never held while in "waiting" state
-NoLockDuringWait == \A d \in Devices:
-    deviceState[d] = "waiting" => hostLocked # d
+ClaimedExactlyOnce ==
+    \A d \in Devices:
+        /\ (ticketState[d] = "claimed") =>
+            /\ claimedHeld[d] = 1
+            /\ claimCount[d] = 1
+        /\ claimCount[d] <= 1
 
-\* Safety: Total pages invariant
-PagesConserved ==
-    hostFree + SumDeviceHeld = HostCapacity
-    WHERE SumDeviceHeld == 
-        LET S == {deviceHeld[d] : d \in Devices}
-        IN hostFree + ReduceSet(S, 0, LAMBDA x, y: x + y) = HostCapacity
+TerminalHasNoReservation ==
+    \A d \in Devices:
+        ticketState[d] \in {"cancelled", "failed", "completed"}
+            => reserved[d] = 0
 
-\* Liveness: Every waiting device eventually becomes idle (under weak fairness)
-EventualSatisfaction == \A d \in Devices:
-    deviceState[d] = "waiting" ~> deviceState[d] = "idle"
+PendingUsesCurrentGeneration ==
+    \A d \in Devices:
+        ticketState[d] = "pending"
+            => ticketGeneration[d] = configurationGeneration
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+\* These fairness assumptions are deliberately action-specific. They support
+\* conditional progress checks without claiming that an unsatisfiable request
+\* can complete.
+Spec ==
+    /\ Init
+    /\ [][Next]_vars
+    /\ \A d \in Devices: SF_vars(Grant(d))
+    /\ \A d \in Devices: WF_vars(Claim(d))
+    /\ \A d \in Devices: WF_vars(Complete(d))
+    /\ \A d \in Devices: WF_vars(Reclaim(d))
 
 =============================================================================

@@ -1,70 +1,99 @@
 # TLA+ Formal Specifications
 
-Formal models for critical distributed protocols in onnx-genai. These specs
-verify safety and liveness properties that are difficult to test through
-conventional unit/integration testing due to combinatorial interleavings.
+Executable, bounded models for the concurrency contracts in the memory and
+distributed-runtime designs. They are safety models first: each README claim
+below corresponds to an invariant checked by TLC. Liveness is asserted only
+where the specification includes action-specific fairness and the modeled
+environment can actually make progress.
+
+These models do not prove the implementation correct. The implementation must
+preserve the modeled state transitions, linearization points, and ownership
+boundaries.
 
 ## Specifications
 
-### PressureProtocol.tla
+### `PressureProtocol.tla`
 
-**Verifies:** The epoch-based pressure protocol between DeviceGovernors and
-HostGovernor is deadlock-free.
+Models the `PressureTicket` lifecycle, atomic grant charging, cancellation and
+timeout races, configuration-generation invalidation, reclaim, and claim.
 
-**Key properties:**
-- `NoDeadlock` — some action is always enabled (no global stuck state)
-- `NoLockDuringWait` — no lock is held while a device is in "waiting" state
-- `PagesConserved` — total pages invariant (no leaks)
-- `EventualSatisfaction` — every waiting device eventually gets its pages (liveness)
+Checked invariants:
 
-**Model parameters:**
-- `Devices = {d0, d1, d2}` (3 devices)
-- `HostCapacity = 4` (small for exhaustive search)
-- `MaxRequest = 1`
+- `CapacityConserved`: free, reclaimable, reserved, and claimed pages sum to
+  the configured capacity.
+- `GrantedIsCharged`: a published grant always has an existing ledger charge.
+- `ClaimedExactlyOnce`: a grant can be claimed at most once.
+- `TerminalHasNoReservation`: cancellation, timeout, and completion cannot
+  leak a reservation.
+- `PendingUsesCurrentGeneration`: reconfiguration leaves no stale pending
+  request.
 
-### CollectiveOrdering.tla
+The model intentionally does not assert unconditional deadlock freedom or
+eventual satisfaction. A request cannot progress if the environment retains
+all capacity and exposes no reclaim or release action.
 
-**Verifies:** The GroupRegistry compile + DagScheduler guarantees all ranks in
-a communication group submit collectives in identical order.
+### `CollectiveOrdering.tla`
 
-**Key properties:**
-- `OrderConsistency` — ranks in a group never diverge by more than 1 step
-- `NoSkip` — no rank submits step N+1 before completing step N-1
-- `AllComplete` — all collectives eventually complete (liveness)
+Models one communicator group. Runtime slots are the lexicographic sequence of
+`(ExecutionId, CommSequenceId)` pairs across overlapping executions. Ranks may
+advance and complete independently, while coordinator admission/skip decisions
+and the submit sequencer prevent transport-order divergence.
 
-**Model parameters:**
-- `Ranks = {r0, r1, r2, r3}` (4 ranks)
-- `Groups = {g0, g1}` (2 groups with overlapping membership)
-- `CollectiveSeq[g0] = <<s1, s2, s3>>`, `CollectiveSeq[g1] = <<s4, s5>>`
+Checked invariants:
 
-### BufferOwnership.tla
+- `DecisionPrefixIsFrozen`: execution admission decisions are monotonic and
+  coordinator ordered.
+- `SubmittedOnlyAdmitted`: skipped or undecided executions never reach the
+  transport.
+- `NoDuplicateOrReorder`: each rank submits a strictly increasing slot stream.
+- `RankLogsCompatible`: rank logs may differ in length but remain compatible
+  prefixes of one canonical order.
+- `LocalCompletionBounded`: completion is rank-local and cannot pass local
+  submission.
+- `AbortFreezesSubmission`: abort stops new transport work while already
+  submitted operations may still quiesce.
 
-**Verifies:** CommHandle lifecycle ensures no buffer is reused/freed while
-communication is in-flight, under arbitrary DAG scheduling orders.
+Instantiate the model independently for each frozen communicator group. The
+production plan validator is responsible for constructing identical group
+membership and sequence metadata on every rank.
 
-**Key properties:**
-- `NoPendingReuse` — buffer in "pending_comm" cannot be acquired by another op
-- `NoDoubleUse` — buffer cannot be in_use by two operations simultaneously
-- `FreeOnlyAfterSignal` — buffer freed only after CommHandle signals completion
-- `AllOpsComplete` — all operations eventually complete (liveness)
+### `BufferOwnership.tla`
 
-**Model parameters:**
-- `Buffers = {b0, b1, b2}` (3 buffers)
-- `Operations = {op0, op1, op2, op3}` (4 operations, some sharing buffers)
+Models the backend registry lease retained for a submitted operation, including
+detached user handles, successful completion, abort request, abort quiescence,
+and physical buffer free.
+
+Checked invariants:
+
+- `ExclusiveActiveLease`: an exclusive workspace has at most one active user.
+- `ActiveIsRegistryOwned`: every submitted or aborting operation remains rooted
+  in the backend registry.
+- `DetachedActiveIsStillOwned`: dropping a handle cannot release the lease.
+- `FreedHasNoOwner`: physical free requires all transport leases to be gone.
+- `TerminalReleased`: registry release occurs only at a terminal transport
+  outcome.
+- `ActiveGenerationMatches`: a buffer generation cannot advance under an
+  active operation.
+
+Ready operations are allowed to wait for a shared buffer. The previous
+`NoPendingReuse` property incorrectly treated such legal waiters as reuse.
 
 ## Running
 
-Install [TLA+ tools](https://github.com/tlaplus/tlaplus/releases) or use
-the VS Code TLA+ extension.
+Install [TLA+ tools](https://github.com/tlaplus/tlaplus/releases), then run from
+this directory:
 
 ```bash
-# Check with TLC model checker
-java -jar tla2tools.jar -config PressureProtocol.cfg PressureProtocol.tla
+java -jar /path/to/tla2tools.jar -config PressureProtocol.cfg PressureProtocol.tla
+java -jar /path/to/tla2tools.jar -config CollectiveOrdering.cfg CollectiveOrdering.tla
+java -jar /path/to/tla2tools.jar -config BufferOwnership.cfg BufferOwnership.tla
 ```
+
+The checked configurations are deliberately small enough for exhaustive local
+runs. Increase the constants for deeper validation when changing a protocol.
 
 ## Design Context
 
-These specs correspond to:
-- `docs/MEMORY_ARCHITECTURE.md` §5.5 (Pressure Protocol)
-- `docs/DISTRIBUTED_RUNTIME.md` §3.2 (GroupRegistry), §8.1 (ExecutionPlan DAG)
-- `docs/DISTRIBUTED_RUNTIME.md` §3.1 (CommHandle buffer ownership)
+- `docs/MEMORY_ARCHITECTURE.md` section 5.3.1 (pressure protocol)
+- `docs/DISTRIBUTED_RUNTIME.md` sections 3.1 and 3.2.1 (completion and ordering)
+- `docs/DISTRIBUTED_RUNTIME.md` section 8.1 (rank-local DAG scheduling)
