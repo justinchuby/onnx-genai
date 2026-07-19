@@ -4,7 +4,7 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T07:55:00Z — PR #32, IndexShare v1, and CSA Phase B B0 landed._
+_Last updated: 2026-07-19T07:42:20Z — CSA Phase B B2 + nits landed; B3 is in progress._
 
 **Current `origin/main` HEAD:** `9c56d9c`.
 
@@ -519,10 +519,13 @@ Reserved `onnx-genai` 0.0.0 on PyPI with a pure-Python placeholder at `python/on
 - **PR #32 ✅ MERGED (`9683a08`, 2026-07-19):** EP-agnostic runtime selection now uses provider capabilities; the rebase retained current CUDA/runtime integrations and fixed half-precision argmax edge cases, EP-name normalization, and `ONNX_GENAI_EP_OPTIONS` forwarding.
 - **IndexShare v1 ✅ DONE / merged (`744a9a7`, 2026-07-19; Batty; Chew 🟡→addressed):** frozen `pkg.nxrt::IndexShare` selected-token-attention ABI and exact f32 CPU dense-additive-mask oracle landed with strict increasing/unique dense-cache-order indices, trailing-`-1` sentinels only, GQA/shared-index support, and explicit KV/bias/index I/O.
 - **CSA Phase B B0 ✅ DONE / merged (`9c56d9c`, 2026-07-19; Sapper/Deckard; Chew 🔴→🟢):** fixed-capacity CUDA device-state buffers, per-stage Host/Device dispatch defaulting to byte-identical all-Host execution, and shared NVRTC FP8 E4M3 + FP4 E2M1 quant/dequant scaffolding landed. CUDA graph capture remains disabled.
+- **CSA Phase B B1 ✅ DONE / merged:** device ratio-128 sink-softmax attention landed with bit-exact CPU-f32 parity.
+- **CSA Phase B B2 ✅ DONE / merged (`2067504`, 2026-07-19; Deckard/Batty; Chew 🟡→🟢):** device ratio-128 compression and device-resident FP8 cache/carry landed in `2f5f5e9`; Batty’s RMSNorm rounding and carry-reset nits landed in `2067504`. **14/14 GPU parity tests remain bit-exact on H200.**
+- **CSA Phase B B3 🔄 IN PROGRESS:** device ratio-4 index-key FP4 compression is next.
 
 ### Tiered implementation worklist
 
 - **Tier 0 ✅ DONE:** BQMoE v1 ✅ and CSA Phase B B0 ✅.
-- **Tier 1 🔄 ACTIVE:** IndexShare v1 ✅; CSA B1 is next/in progress; CSA B2 pending; E2E manifest + pinned-Mobius harness pending.
+- **Tier 1 🔄 ACTIVE:** IndexShare v1 ✅; CSA ladder B0✅ B1✅ B2✅; B3 device ratio-4 index-key FP4 compression is in progress; E2E manifest + pinned-Mobius harness pending.
 - **Tier 2 ⏳ PENDING:** device-resident paging/sparse-cache integration after Tier-1 correctness gates.
 - **Tier 3 ⏳ PENDING:** broader performance optimization and production hardening after paging integration.
