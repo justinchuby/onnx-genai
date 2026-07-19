@@ -53,13 +53,14 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseAttentionFactory as CpuCsaFactory;
 use onnx_runtime_ir::{DataType, DeviceId, Dim, Node, Shape, as_static_shape};
 
 use crate::error::not_implemented;
+use crate::kernels::csa_device_state::{CsaBufferLayout, CsaDeviceBufferManager};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "CompressedSparseAttention";
@@ -78,9 +79,22 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // required input names) and produces the stateful oracle kernel whose
         // compute we reuse verbatim.
         let inner = CpuCsaFactory.create(node, input_shapes)?;
+        let ratio = usize::try_from(
+            node.attr("compression_ratio")
+                .and_then(|attribute| attribute.as_int())
+                .expect("CPU factory accepted compression_ratio"),
+        )
+        .expect("CPU factory accepted positive compression_ratio");
+        // This is runner initialization, never capability claiming: reserve every
+        // fixed-address stream now so an OOM fails before any execution.
+        let layout = CsaBufferLayout::from_runner(node, input_shapes, ratio)?;
+        let device_state = CsaDeviceBufferManager::reserve(self.runtime.clone(), layout)?;
         Ok(Box::new(CompressedSparseAttentionKernel {
             runtime: self.runtime.clone(),
             inner,
+            device_state,
+            dispatch: CsaStageDispatch::default(),
+            golden_capture: CsaGoldenCapture::from_environment(),
         }))
     }
 }
@@ -90,11 +104,128 @@ impl KernelFactory for CompressedSparseAttentionFactory {
 struct CompressedSparseAttentionKernel {
     runtime: Arc<CudaRuntime>,
     inner: Box<dyn Kernel>,
+    // Kept alive for stable device addresses; B0 still uses graph-threaded state.
+    device_state: CsaDeviceBufferManager,
+    dispatch: CsaStageDispatch,
+    golden_capture: CsaGoldenCapture,
 }
 
 impl std::fmt::Debug for CompressedSparseAttentionKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompressedSparseAttentionKernel").finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CsaStageMode {
+    Host,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CsaPipelineStage {
+    CompressionUpdate,
+    IndexKeyUpdate,
+    IndexQueryFinalize,
+    IndexScoring,
+    Selection,
+    CandidateAssembly,
+    SparseSinkSoftmaxAttention,
+    Writeback,
+}
+
+impl CsaPipelineStage {
+    const ALL: [Self; 8] = [
+        Self::CompressionUpdate,
+        Self::IndexKeyUpdate,
+        Self::IndexQueryFinalize,
+        Self::IndexScoring,
+        Self::Selection,
+        Self::CandidateAssembly,
+        Self::SparseSinkSoftmaxAttention,
+        Self::Writeback,
+    ];
+}
+
+#[derive(Clone, Debug)]
+pub struct CsaStageDispatch {
+    modes: [CsaStageMode; 8],
+}
+impl Default for CsaStageDispatch {
+    fn default() -> Self {
+        Self {
+            modes: [CsaStageMode::Host; 8],
+        }
+    }
+}
+impl CsaStageDispatch {
+    pub fn mode(&self, stage: CsaPipelineStage) -> CsaStageMode {
+        self.modes[stage as usize]
+    }
+
+    /// B0 still delegates Device modes to the oracle; later phases replace only
+    /// the selected stage's branch.
+    pub fn set(&mut self, stage: CsaPipelineStage, mode: CsaStageMode) {
+        self.modes[stage as usize] = mode;
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct CsaGoldenBoundary {
+    stage: CsaPipelineStage,
+    mode: CsaStageMode,
+    payload: Vec<u8>,
+}
+#[derive(Debug)]
+struct CsaGoldenCapture {
+    enabled: bool,
+    boundaries: Mutex<Vec<CsaGoldenBoundary>>,
+}
+impl CsaGoldenCapture {
+    fn from_environment() -> Self {
+        Self {
+            enabled: std::env::var_os("NXRT_CSA_GOLDEN_CAPTURE").is_some(),
+            boundaries: Mutex::new(Vec::new()),
+        }
+    }
+    fn record(&self, stage: CsaPipelineStage, mode: CsaStageMode, inputs: &[TensorView]) {
+        if self.enabled {
+            let mut payload = Vec::new();
+            for input in inputs.iter().filter(|input| !input.is_absent()) {
+                // SAFETY: B0 calls this only for the live host-staged views, and
+                // copies exactly their contiguous byte extent for a future diff.
+                unsafe {
+                    payload.extend_from_slice(std::slice::from_raw_parts(
+                        input.data_ptr::<u8>(),
+                        input.byte_size(),
+                    ));
+                }
+            }
+            self.boundaries
+                .lock()
+                .expect("CSA golden capture mutex poisoned")
+                .push(CsaGoldenBoundary {
+                    stage,
+                    mode,
+                    payload,
+                });
+        }
+    }
+}
+
+impl CompressedSparseAttentionKernel {
+    fn run_host_staged_pipeline(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        let _stable_capacity = self.device_state.layout.max_seq_len;
+        for stage in CsaPipelineStage::ALL {
+            self.golden_capture
+                .record(stage, self.dispatch.mode(stage), inputs);
+        }
+        self.inner.execute(inputs, outputs)
     }
 }
 
@@ -177,9 +308,10 @@ impl Kernel for CompressedSparseAttentionKernel {
             })
             .collect();
 
-        // Run the CPU oracle over the host-staged tensors: guarantees bit-parity
-        // and reproduces the full stateful cache/carry/index lifecycle.
-        self.inner.execute(&host_inputs, &mut host_outputs)?;
+        // The B0 dispatch seam deliberately routes every stage through this one
+        // host oracle invocation. Later phases replace individual `Host` arms;
+        // changing a mode today cannot alter numerical behavior.
+        self.run_host_staged_pipeline(&host_inputs, &mut host_outputs)?;
 
         // Release the borrow of `out_bufs` before uploading the results.
         drop(host_outputs);
@@ -253,6 +385,12 @@ pub(crate) fn unsupported_reason(
         .attr("cache_format")
         .and_then(|attribute| attribute.as_str())
         .unwrap_or("f32");
+
+    // Claim-time sizing is metadata-only: it validates fixed static bounds but
+    // does not query free memory or reserve device storage.
+    if let Err(error) = CsaBufferLayout::from_claim(node, shapes, ratio) {
+        return Some(Cow::Owned(format!("{OP}: {error}")));
+    }
 
     let result = match ratio {
         4 => validate_ratio4_claim(node, shapes, input_dtypes, cache_format),
@@ -463,7 +601,9 @@ fn validate_attention_bias_claim(
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> std::result::Result<(), String> {
-    if !node.inputs.get(19).is_some_and(Option::is_some) {
+    if !node.inputs.get(19).is_some_and(Option::is_some)
+        || input_dtypes.get(19) == Some(&DataType::Undefined)
+    {
         return Ok(());
     }
 

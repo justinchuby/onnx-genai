@@ -23,11 +23,13 @@ use crate::runtime::CudaRuntime;
 
 pub mod activations;
 pub mod attention;
+pub mod block_quant;
 pub mod block_quantized_matmul;
 pub mod cast;
 pub mod compressed_sparse_attention;
 pub mod constant;
 pub mod conv;
+pub mod csa_device_state;
 pub mod cumsum;
 pub mod elementwise;
 pub mod fused_gemm;

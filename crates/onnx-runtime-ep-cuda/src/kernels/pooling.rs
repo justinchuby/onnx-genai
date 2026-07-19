@@ -8,7 +8,7 @@ use onnx_runtime_ir::{DataType, Node};
 
 use crate::cudnn::{CudnnBufferPair, CudnnPoolingMode, CudnnPoolingSpec, CudnnTensorType};
 use crate::error::not_implemented;
-use crate::runtime::{cuptr, CudaRuntime};
+use crate::runtime::{CudaRuntime, cuptr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolKind {

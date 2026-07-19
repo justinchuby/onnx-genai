@@ -30,7 +30,7 @@ use crate::strided::{elem_offset, next_index, numel};
 pub mod activations;
 pub mod add;
 pub mod attention;
-pub(crate) mod block_dequant;
+pub mod block_dequant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
 pub mod cast;

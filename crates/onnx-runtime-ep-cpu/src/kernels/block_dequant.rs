@@ -11,7 +11,7 @@ const E2M1: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
-pub(crate) fn decode_e8m0_scale(exponent: u8) -> f32 {
+pub fn decode_e8m0_scale(exponent: u8) -> f32 {
     match exponent {
         0xff => f32::NAN,
         0 => f32::from_bits(0x0040_0000),
@@ -19,11 +19,11 @@ pub(crate) fn decode_e8m0_scale(exponent: u8) -> f32 {
     }
 }
 
-pub(crate) fn decode_e2m1(code: u8) -> f32 {
+pub fn decode_e2m1(code: u8) -> f32 {
     E2M1[usize::from(code & 0x0f)]
 }
 
-pub(crate) fn decode_e4m3fn(code: u8) -> f32 {
+pub fn decode_e4m3fn(code: u8) -> f32 {
     let sign = if code & 0x80 == 0 { 1.0 } else { -1.0 };
     let exponent = (code >> 3) & 0x0f;
     let mantissa = code & 0x07;
@@ -78,7 +78,7 @@ pub(crate) fn quantize_fp8_e4m3_block(
     dequantize_fp8_e4m3_block(*scale_exponent, packed, output)
 }
 
-pub(crate) fn dequantize_fp4_e2m1_block(
+pub fn dequantize_fp4_e2m1_block(
     scale_exponent: u8,
     packed: &[u8],
     output: &mut [f32],
@@ -191,7 +191,7 @@ fn encode_e4m3fn(value: f32) -> u8 {
     sign | encoded.min(0x7e) as u8
 }
 
-pub(crate) fn dequantize_fp8_e4m3_block(
+pub fn dequantize_fp8_e4m3_block(
     scale_exponent: u8,
     packed: &[u8],
     output: &mut [f32],
