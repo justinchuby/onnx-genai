@@ -1135,6 +1135,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_index_after_interior_padding_at_execution() {
+        let case = Case {
+            batch: 1,
+            q_heads: 1,
+            kv_heads: 1,
+            q_seq: 1,
+            current_seq: 6,
+            past_seq: 0,
+            head_size: 1,
+            index_heads: 1,
+            width: 3,
+            scale: 1.0,
+        };
+        let error = run(
+            case,
+            &[1.0],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            None,
+            None,
+            &[2, -1, 5],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("index 5 follows trailing -1 padding"), "{error}");
+    }
+
+    #[test]
     fn claim_gate_accepts_omitted_optionals_and_rejects_present_wrong_dtype() {
         let case = Case {
             batch: 1,

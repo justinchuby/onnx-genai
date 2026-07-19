@@ -1,6 +1,6 @@
 # IndexShare selected-token attention — frozen v1
 
-**Status:** frozen v1  
+**Status:** frozen v1
 **Operator:** `pkg.nxrt::IndexShare`, version 1
 
 ## Boundary and schema
