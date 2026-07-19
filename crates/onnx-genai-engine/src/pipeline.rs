@@ -293,6 +293,35 @@ impl PipelineEngine {
             .session(&plan.denoiser)
             .with_context(|| format!("pipeline denoiser '{}' was not loaded", plan.denoiser))?;
 
+        // Precompute the CFG unconditional conditioning once: the caller may
+        // supply `{denoiser}.{port}.uncond` (the empty-prompt embedding, to match
+        // real SD CFG); otherwise the conditioning is zeroed as a fallback.
+        let cfg_uncond: Option<(String, Value)> = if guidance.is_some() {
+            let port = plan
+                .cfg_conditioning_input
+                .clone()
+                .context("classifier-free guidance requires cfg_conditioning_input")?;
+            let cond_endpoint = format!("{}.{}", plan.denoiser, port);
+            let uncond_endpoint = format!("{}.{}.uncond", plan.denoiser, port);
+            let value = if let Some(u) = constants.get(&uncond_endpoint) {
+                clone_value(u)?
+            } else {
+                let cond = constants
+                    .get(&cond_endpoint)
+                    .or_else(|| {
+                        plan.dataflow
+                            .iter()
+                            .find(|e| e.to == cond_endpoint)
+                            .and_then(|e| constants.get(&e.from))
+                    })
+                    .with_context(|| format!("cfg conditioning '{cond_endpoint}' not found"))?;
+                Value::from_slice_f32(&vec![0.0f32; cond.numel()], cond.shape())?
+            };
+            Some((port, value))
+        } else {
+            None
+        };
+
         // `carried` holds the value to feed each loop-carried INPUT port next
         // step (keyed by input port); `last_outputs` holds the denoiser's raw
         // outputs from the final step (keyed by output port). Keeping them
@@ -314,13 +343,14 @@ impl PipelineEngine {
                 self.run_denoiser_pass(denoiser, plan, &constants, &carried, step, timestep, None)?;
 
             // Classifier-free guidance: run an unconditional pass with the
-            // conditioning input zeroed, then combine per output port:
-            //   pred = uncond + scale * (cond - uncond).
+            // conditioning replaced by the unconditional embedding, then combine
+            // per output port:  pred = uncond + scale * (cond - uncond).
             let out_map = if let Some(scale) = guidance {
-                let zero_port = plan.cfg_conditioning_input.as_deref();
-                let (uncond_out, _) = self.run_denoiser_pass(
-                    denoiser, plan, &constants, &carried, step, timestep, zero_port,
-                )?;
+                let cfg = cfg_uncond
+                    .as_ref()
+                    .map(|(port, value)| (port.as_str(), value));
+                let (uncond_out, _) =
+                    self.run_denoiser_pass(denoiser, plan, &constants, &carried, step, timestep, cfg)?;
                 let mut combined: HashMap<String, Value> = HashMap::new();
                 for (port, cond_value) in &cond_out {
                     let uncond_value = uncond_out.get(port).with_context(|| {
@@ -379,8 +409,9 @@ impl PipelineEngine {
     }
 
     /// Run one denoiser invocation for `step`. Returns `(outputs, sample_in)`
-    /// keyed by port. `zero_port`, when set, zeros that conditioning input (the
-    /// unconditional pass of classifier-free guidance).
+    /// keyed by port. `override_input`, when set as `(port, value)`, substitutes
+    /// that input's value — used to supply the unconditional conditioning on the
+    /// CFG unconditional pass.
     #[allow(clippy::too_many_arguments)]
     fn run_denoiser_pass(
         &self,
@@ -390,13 +421,20 @@ impl PipelineEngine {
         carried: &HashMap<String, Value>,
         step: usize,
         timestep: f32,
-        zero_port: Option<&str>,
+        override_input: Option<(&str, &Value)>,
     ) -> anyhow::Result<(HashMap<String, Value>, HashMap<String, Value>)> {
         let mut sample_in: HashMap<String, Value> = HashMap::new();
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for info in denoiser.inputs() {
             let port = info.name.as_str();
             let endpoint = format!("{}.{}", plan.denoiser, port);
+            // An override (CFG unconditional conditioning) wins for its port.
+            if let Some((over_port, over_value)) = override_input
+                && over_port == port
+            {
+                inputs.push((port.to_string(), clone_value(over_value)?));
+                continue;
+            }
             // Per-step timestep injection takes precedence for its port. Honor
             // the port dtype: real diffusion denoisers (DiT/UNet) declare an
             // INT64 timestep, while others take a float sigma.
@@ -433,14 +471,7 @@ impl PipelineEngine {
             if is_loop {
                 sample_in.insert(port.to_string(), clone_value(value)?);
             }
-            // Unconditional pass zeros the declared conditioning input.
-            let cloned = if zero_port == Some(port) {
-                let zeros = vec![0.0f32; value.numel()];
-                Value::from_slice_f32(&zeros, value.shape())?
-            } else {
-                clone_value(value)?
-            };
-            inputs.push((port.to_string(), cloned));
+            inputs.push((port.to_string(), clone_value(value)?));
         }
         let refs = inputs
             .iter()

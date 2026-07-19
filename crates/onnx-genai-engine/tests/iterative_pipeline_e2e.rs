@@ -452,3 +452,40 @@ fn real_dit_denoiser_runs_through_ddim_iterative_pipeline() -> anyhow::Result<()
     assert_eq!(noise.len(), 4 * 8 * 8);
     Ok(())
 }
+
+#[test]
+fn cfg_uses_caller_supplied_unconditional_conditioning() -> anyhow::Result<()> {
+    // denoiser: denoised = (sample + cond) * 0.5.
+    //   cond pass (cond=c):        (sample + c) * 0.5
+    //   uncond pass (cond=u):      (sample + u) * 0.5   [supplied, NOT zeroed]
+    //   guided = uncond + s*(cond-uncond) = 0.5*sample + 0.5*u + s*0.5*(c-u)
+    // seed sample=0, c=2, u=1, s=2 -> 0.5 + 2*0.5 = 1.5  (zeros-fallback would give 2.0).
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 1
+    guidance_scale: 2.0
+    cfg_conditioning_input: cond
+";
+    let dir = fixture_with_metadata("diffusion-cfg-uncond", &["denoiser.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond", Value::from_slice_f32(&[2.0; 4], &[1, 4])?)
+        .with_input("denoiser.cond.uncond", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
+    for got in &denoised {
+        assert!((got - 1.5).abs() < 1e-5, "{got} != 1.5 (uncond input not honored?)");
+    }
+    Ok(())
+}
