@@ -815,6 +815,77 @@ optimizations (shared weight dedup, KV prefix sharing) or multi-node coordinatio
 the invariant. The coordinator is an optimization layer, not a correctness requirement
 for single-machine deployments.
 
+### D6: ONNX multi-device annotations are hints, not execution constraints
+
+**Decision:** The ONNX IR v11+ multi-device spec (`DeviceConfigurationProto`,
+`ShardingSpecProto`, `NodeDeviceConfigurationProto`) is preserved in the IR as
+optional annotations. The runtime reads them as **placement hints** for the graph
+partitioner, but the `ParallelStrategy` makes the actual placement decision.
+
+**What the ONNX spec provides:**
+- `DeviceConfigurationProto` — model-level declaration of available device groups
+  and their sizes.
+- `NodeDeviceConfigurationProto` — per-node annotation of which device config it
+  belongs to.
+- `ShardingSpecProto` — per-tensor description of how axes are sharded across
+  devices (shard vs replicate per dimension).
+
+**How it interacts with our layers:**
+
+```text
+ONNX model (with optional sharding annotations)
+    │
+    ▼
+Loader: parse DeviceConfigurationProto → NodeDeviceHints
+    │
+    ▼
+IR: Node.device_hints (optional, informational)
+    │
+    ▼
+ParallelStrategy: reads hints as ILP seed placement
+    │  Hint says "TP on dim=0, 8 devices"
+    │  → generate TensorParallel strategy, skip analysis
+    │  No hint → fall back to automatic graph analysis
+    │
+    ▼
+Communicator: executes communication (hint-agnostic)
+    │
+    ▼
+EP: execute() (unaware of sharding)
+```
+
+**What we store in IR:**
+
+```rust
+struct NodeDeviceHints {
+    /// Which device configuration this node prefers.
+    pub config_name: Option<String>,
+    /// Sharding specs for inputs/outputs.
+    pub input_sharding: Vec<Option<ShardingSpec>>,
+    pub output_sharding: Vec<Option<ShardingSpec>>,
+}
+
+struct ShardingSpec {
+    /// Device IDs across which this tensor is sharded/replicated.
+    pub devices: Vec<String>,
+    /// Per-axis sharding description.
+    pub sharded_dims: Vec<ShardedDim>,
+}
+```
+
+**Rationale:**
+- ONNX annotations are declarative ("SHOULD be sharded this way"), not imperative.
+  They don't specify communication — that's the `Communicator`'s job.
+- If Mobius or other exporters annotate models with sharding specs, the partitioner
+  can skip expensive graph analysis and use the hints directly.
+- The `onnx-rs` crate already validates these annotations (`MultiDeviceConfigurationRule`)
+  but the runtime IR (`onnx-runtime-ir`) currently drops them after parsing. The
+  loader should preserve them into `NodeDeviceHints` when present.
+- Without annotations, the runtime falls back to automatic placement — no regression.
+
+**Current status:** `onnx-rs` validates; IR/loader do not yet propagate. Low priority
+until real models with sharding annotations exist.
+
 ---
 
 ## 9. Phased Implementation
