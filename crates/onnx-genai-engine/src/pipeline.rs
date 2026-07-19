@@ -465,7 +465,18 @@ impl PipelineEngine {
                     let sample = raw_samples.get(in_port).with_context(|| {
                         format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
                     })?;
-                    scheduler.step(step, plan.num_steps, sample, model_output)?
+                    if scheduler.needs_noise() {
+                        let noise = self.step_noise(plan, &constants, in_port, step, sample)?;
+                        scheduler.step_with_noise(
+                            step,
+                            plan.num_steps,
+                            sample,
+                            model_output,
+                            Some(&noise),
+                        )?
+                    } else {
+                        scheduler.step(step, plan.num_steps, sample, model_output)?
+                    }
                 } else {
                     clone_value(model_output)?
                 };
@@ -561,6 +572,41 @@ impl PipelineEngine {
             out_map.insert(name.clone(), value);
         }
         Ok(out_map)
+    }
+
+    /// Fetch the per-step Gaussian noise an ancestral scheduler needs at `step`.
+    ///
+    /// The caller supplies an external tensor `{denoiser}.{in_port}.noise` shaped
+    /// `[num_steps, *sample_shape]` (so the noise sequence is reproducible and can
+    /// match a reference generator); this slices out the `step`-th sample.
+    fn step_noise(
+        &self,
+        plan: &IterativePlan,
+        constants: &PipelineTensors,
+        in_port: &str,
+        step: usize,
+        sample: &Value,
+    ) -> anyhow::Result<Value> {
+        let endpoint = format!("{}.{}.noise", plan.denoiser, in_port);
+        let all = constants.get(&endpoint).with_context(|| {
+            format!(
+                "ancestral scheduler requires per-step noise tensor '{endpoint}' \
+                 shaped [num_steps, ...]"
+            )
+        })?;
+        let elem: usize = sample.shape().iter().map(|&d| d as usize).product();
+        let data = all.to_vec_f32()?;
+        let want = plan.num_steps * elem;
+        if data.len() != want {
+            anyhow::bail!(
+                "noise tensor '{endpoint}' has {} elements but expected {want} \
+                 ({} steps x {elem})",
+                data.len(),
+                plan.num_steps
+            );
+        }
+        let slice = &data[step * elem..(step + 1) * elem];
+        Value::from_slice_f32(slice, sample.shape()).map_err(Into::into)
     }
 
     /// Run a single-pass pipeline: prompt-phase components once, then one
@@ -925,6 +971,27 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
     /// prediction). Called once before each denoise loop. Default no-op.
     fn reset(&self) {}
 
+    /// Whether this scheduler consumes fresh Gaussian noise each step (ancestral /
+    /// stochastic samplers). When `true`, the loop supplies per-step noise via
+    /// [`Scheduler::step_with_noise`]. Default `false` (deterministic).
+    fn needs_noise(&self) -> bool {
+        false
+    }
+
+    /// Like [`Scheduler::step`] but with the per-step noise an ancestral sampler
+    /// needs. The default ignores `noise` and delegates to `step`, so existing
+    /// deterministic schedulers are unaffected.
+    fn step_with_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+        _noise: Option<&Value>,
+    ) -> anyhow::Result<Value> {
+        self.step(step, num_steps, sample, model_output)
+    }
+
     /// Per-step transform applied to the loop-carried input BEFORE the denoiser
     /// (e.g. Euler's `sample / sqrt(sigma^2 + 1)`). `Ok(None)` = identity (the
     /// denoiser sees the raw loop-carried value, as DDIM requires).
@@ -993,6 +1060,27 @@ impl SchedulerRegistry {
                     );
                 }
                 let sched = EulerSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
+                    num_steps,
+                    cfg.use_karras_sigmas.unwrap_or(false),
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "euler_ancestral".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported euler_ancestral prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = EulerAncestral::with_schedule(
                     cfg.num_train_timesteps.unwrap_or(1000),
                     cfg.beta_start.unwrap_or(0.00085),
                     cfg.beta_end.unwrap_or(0.012),
@@ -1346,6 +1434,97 @@ impl Scheduler for EulerSchedule {
         let shape = sample.shape().to_vec();
         let scaled = self.scale(step, &sample.to_vec_f32()?);
         Ok(Some(Value::from_slice_f32(&scaled, &shape)?))
+    }
+}
+
+/// Euler Ancestral (`EulerAncestralDiscreteScheduler`, epsilon) — a *stochastic*
+/// sampler (one of the most-used in ComfyUI). Like Euler it scales the model
+/// input and seeds at `sigmas[0]`, but each step advances to an intermediate
+/// `sigma_down` and injects fresh noise scaled by `sigma_up`:
+///   `sigma_up   = sqrt(sigma_to^2 (sigma_from^2 - sigma_to^2) / sigma_from^2)`
+///   `sigma_down = sqrt(sigma_to^2 - sigma_up^2)`
+///   `x_next = x + eps*(sigma_down - sigma) + noise*sigma_up`.
+/// Matches diffusers when fed the same per-step noise sequence.
+#[derive(Debug, Clone)]
+struct EulerAncestral {
+    sigmas: Vec<f32>,
+}
+
+impl EulerAncestral {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+        use_karras: bool,
+    ) -> anyhow::Result<Self> {
+        // Same sigma schedule as Euler (linspace interp or Karras).
+        let euler = EulerSchedule::with_schedule(
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule,
+            num_steps,
+            use_karras,
+        )?;
+        Ok(Self { sigmas: euler.sigmas })
+    }
+}
+
+impl Scheduler for EulerAncestral {
+    fn step(
+        &self,
+        _step: usize,
+        _num_steps: usize,
+        _sample: &Value,
+        _model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        anyhow::bail!("euler_ancestral is stochastic; the loop must call step_with_noise")
+    }
+
+    fn needs_noise(&self) -> bool {
+        true
+    }
+
+    fn step_with_noise(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+        noise: Option<&Value>,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let x = sample.to_vec_f32()?;
+        let eps = model_output.to_vec_f32()?;
+        let sigma_from = self.sigmas[step];
+        let sigma_to = self.sigmas[step + 1];
+        let sigma_up = (sigma_to * sigma_to * (sigma_from * sigma_from - sigma_to * sigma_to)
+            / (sigma_from * sigma_from))
+            .max(0.0)
+            .sqrt();
+        let sigma_down = (sigma_to * sigma_to - sigma_up * sigma_up).max(0.0).sqrt();
+        let dt = sigma_down - sigma_from;
+        let noise = noise.context("euler_ancestral requires per-step noise")?.to_vec_f32()?;
+        if noise.len() != x.len() {
+            anyhow::bail!("euler_ancestral noise length {} != sample {}", noise.len(), x.len());
+        }
+        let out: Vec<f32> = (0..x.len())
+            .map(|i| x[i] + eps[i] * dt + noise[i] * sigma_up)
+            .collect();
+        Value::from_slice_f32(&out, &shape).map_err(Into::into)
+    }
+
+    fn scale_input(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+    ) -> anyhow::Result<Option<Value>> {
+        let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
+        let scaled: Vec<f32> = sample.to_vec_f32()?.iter().map(|&x| x / factor).collect();
+        Ok(Some(Value::from_slice_f32(&scaled, sample.shape())?))
     }
 }
 

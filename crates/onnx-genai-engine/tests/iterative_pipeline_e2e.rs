@@ -422,6 +422,46 @@ pipeline:
 }
 
 #[test]
+fn iterative_euler_ancestral_consumes_per_step_noise() -> anyhow::Result<()> {
+    // Euler Ancestral is stochastic: the loop must supply a per-step noise tensor
+    // `denoiser.sample.noise` shaped [num_steps, *sample_shape]. Zero noise makes
+    // the step deterministic; verify it threads through and runs. Numerical parity
+    // (with matched noise) is covered by scripts/euler_a_e2e.py.
+    let metadata = "\
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser_step.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.denoised
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    timestep_input: t
+    scheduler_config:
+      kind: euler_ancestral
+      num_train_timesteps: 1000
+      beta_start: 0.00085
+      beta_end: 0.012
+      beta_schedule: scaled_linear
+";
+    let dir = fixture_with_metadata("diffusion-euler-a", &["denoiser_step.onnx"], metadata)?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let request = empty_request()
+        .with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?)
+        .with_input("denoiser.sample.noise", Value::from_slice_f32(&[0.0; 12], &[3, 1, 4])?);
+    let out = engine.run_pipeline(request)?;
+    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    for got in &sample {
+        assert!(got.is_finite(), "euler_ancestral produced non-finite value {got}");
+    }
+    Ok(())
+}
+
+#[test]
 fn iterative_dpmpp_2m_karras_runs() -> anyhow::Result<()> {
     // use_karras_sigmas swaps in the Karras (rho=7) sigma schedule; verify it
     // threads through the schema and runs. Numerical parity is covered by
