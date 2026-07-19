@@ -250,11 +250,13 @@ runtime gate (no torch export, no ONNX surgery):
 and `start_step`, re-driving the *same loaded models*. Seed / prompt / negative are already live as
 per-request inputs. Together these give ComfyUI-like interactive editing without touching the models.
 
-> Status: the runtime-LoRA **graph mechanism is wired end-to-end and validated** (Mobius
-> `models/unet_lora_test.py` — full-UNet gate inputs + adapter params), and onnx-genai feeds the
-> gate via the existing per-request input path (no engine change). **Remaining:** load LoRA
-> `.safetensors` into the baked `lora_A/lora_B` params (key remapping across diffusers/PEFT/kohya
-> formats) and `gate=0 == base` / `gate=1 == diffusers-fused` parity on a real SD build.
+> Status: runtime LoRA is **code-complete and unit/graph-validated end-to-end** — the gated-LoRA
+> graph through the whole UNet (`models/unet_lora_test.py`), diffusers→baked LoRA weight
+> remap + safetensors load, and `build_diffusers_pipeline(unet_loras={name: path})` (rank inferred,
+> `UNet2DConfig.lora_adapters` injected, weights merged). onnx-genai feeds the gate via the existing
+> per-request input path (no engine change). **Remaining:** `gate=0 == base` / `gate=1 ==
+> diffusers-fused` **numerical** parity on a real SD build — which depends on the from-scratch UNet's
+> base diffusers-parity and is disk-heavy (each SD build is multi-GB).
 
 ---
 
