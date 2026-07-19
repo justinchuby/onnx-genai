@@ -8,8 +8,10 @@
 //!   **`SimdX86`** MLAS-style packed SIMD f32 GEMM — the default fast path with
 //!   no extra dependency and no cargo feature required.
 //! * With the `mlas` Cargo feature, `NXRT_CPU_GEMM_BACKEND=mlas` explicitly
-//!   selects the vendored, single-threaded MLAS f32 GEMM on x86-64. It is never
-//!   auto-selected while Rayon-to-MLAS threadpool bridging is pending.
+//!   selects the vendored, **multi-threaded** MLAS f32 GEMM on x86-64. MLAS
+//!   does its own cache-aware tile partitioning and dispatches the tiles across
+//!   the process Rayon pool (see `mlas-sys`), so it honours the same thread
+//!   budget as `SimdX86`/`Generic` without oversubscribing.
 //! * Everything else falls back to the **Generic** pure-Rust blocked GEMM,
 //!   which compiles anywhere and is the correctness baseline.
 //!
@@ -31,8 +33,11 @@ pub enum CpuBackend {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     SimdX86,
     /// Vendored MLAS f32 SGEMM for x86-64. Available only with the `mlas`
-    /// Cargo feature and selected explicitly with `NXRT_CPU_GEMM_BACKEND=mlas`;
-    /// it is single-threaded until MLAS threadpool bridging is implemented.
+    /// Cargo feature and selected explicitly with `NXRT_CPU_GEMM_BACKEND=mlas`.
+    /// Multi-threaded: MLAS partitions the GEMM and runs the tiles on the
+    /// process Rayon pool. Kept opt-in (not auto-selected) until a later slice
+    /// decides whether to flip the default; doing so is a one-line change in
+    /// [`CpuBackend::auto_detect`].
     #[cfg(feature = "mlas")]
     Mlas,
     /// XNNPACK (Android mobile). Design placeholder — currently routes to

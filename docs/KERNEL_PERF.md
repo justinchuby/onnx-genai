@@ -51,3 +51,63 @@ intra-op count and uses one inter-op thread for its one-node model. Thus the
 honest current gap is approximately 2–5×, not an unqualified default-thread
 comparison. Add, ReduceMean, and Gather are single-threaded internally and are
 reported as such. The next port target remains quantized MatMul.
+
+## Multi-threaded vendored MLAS (`NXRT_CPU_GEMM_BACKEND=mlas`)
+
+The opt-in `mlas` feature (`CpuBackend::Mlas`, x86-64) now runs **multi-threaded**.
+MLAS's high-level `MlasGemmBatch` does its own cache-aware M/N tile partitioning
+and dispatches the tiles through `MlasTrySimpleParallel` /
+`MlasGetMaximumThreadCount`. In the standalone `BUILD_MLAS_NO_ONNXRUNTIME` build
+those two primitives were serial with a hard thread cap of 1; `mlas-sys` now
+installs a **Rayon-backed parallel-for backend** (`vendor/shim.cpp` hooks +
+`mlas_set_threading` from `src/lib.rs`) so MLAS keeps its native partitioning
+while executing the tiles across the current Rayon pool — the same pool
+`SimdX86`/`Generic` use, so there is no oversubscription. For `32×512×512` at 8
+threads MLAS chooses `ThreadCountN=8, ThreadCountM=1` (its native N-partition).
+
+### Isolated GEMM parity (warm, buffers reused — the `mlas-sys` perf probe)
+
+This is the apples-to-apples comparison to the recorded ORT baseline (ORT also
+reuses/prepacks buffers). `32×512×512`, repack-B-per-call:
+
+| Workers | ORT 1.27 CPU EP | vendored MLAS (this slice) | MLAS / ORT |
+|---:|---:|---:|---:|
+| 1 | 131 µs | ~123 µs | 0.94× |
+| 8 | 30.6 µs | ~32 µs | 1.05× |
+
+**Parity reached**: the vendored MLAS SGEMM kernel is at/below ORT single-thread
+and within noise of ORT at 8 threads (~500 GFLOP/s, ~3.8× scaling from 1→8).
+Reproduce with `cargo test -p mlas-sys --release -- --ignored --nocapture
+perf_sgemm_multithread`.
+
+### End-to-end `MatMul` kernel (Criterion harness, f32, thread-matched)
+
+Through the full `MatMul` kernel (each call allocates and zeroes a fresh output
+buffer — a cost shared by *every* backend and not yet optimized), warm-cache
+Criterion medians on this Sapphire Rapids host:
+
+| Shape | Backend | 1 thread | 8 threads |
+|---|---|---:|---:|
+| 1×256×256 | Generic | 48.9 µs | 55.5 µs |
+| 1×256×256 | SimdX86 | 31.2 µs | 48.7 µs |
+| 1×256×256 | **MLAS** | **22.0 µs** | **38.6 µs** |
+| 32×512×512 | Generic | 2.797 ms | 492 µs |
+| 32×512×512 | SimdX86 | 300 µs | 162 µs |
+| 32×512×512 | **MLAS** | **178 µs** | **147 µs** |
+| 32×1024×1024 | Generic | 11.93 ms | 1.922 ms |
+| 32×1024×1024 | SimdX86 | 1.239 ms | 363 µs |
+| 32×1024×1024 | **MLAS** | **808 µs** | **306 µs** |
+
+MLAS is the fastest backend at every shape and thread count. The absolute 8-thread
+end-to-end numbers do **not** reach the isolated ~32 µs because the per-call
+output allocation dominates once the GEMM itself is this fast (measured: for
+`32×512×512` at 8 threads the fresh-`Vec` allocation alone costs ~50–90 µs). That
+allocation overhead is backend-agnostic and is the next lever (see
+`TODO(mlas prepack)` in `matmul.rs` — cache `PackedB` and reuse output buffers);
+it is out of scope for this GEMM-threading slice. The tiny `1×256×256` shape does
+not benefit from 8 threads (compute < scheduling overhead) for any backend.
+
+`CpuBackend::Mlas` stays opt-in (`NXRT_CPU_GEMM_BACKEND=mlas`) and off the default
+build; auto-detect still selects `SimdX86`. Flipping the default once buffer reuse
+lands is a one-line change in `CpuBackend::auto_detect`.
+

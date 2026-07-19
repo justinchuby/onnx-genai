@@ -4,13 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-19T22:20Z — ConvTranspose/Unique CPU kernels, fused QMoE export, and kernel benchmarks landed._
+_Last updated: 2026-07-19T23:00Z — multi-threaded vendored MLAS f32 GEMM reaches ORT 8-thread parity (isolated GEMM); ConvTranspose/Unique CPU kernels, fused QMoE export, and kernel benchmarks landed._
 
 **Current `origin/main` implementation HEAD:** `6a7755c`.
 
 ## 2026-07-19 — MLAS CPU-EP opt-in integration
 
-- **Vendored MLAS f32 GEMM ✅ wired:** `onnx-runtime-ep-cpu` now exposes the opt-in `mlas` feature plus `NXRT_CPU_GEMM_BACKEND=mlas` on x86-64. It remains single-threaded and `SimdX86` remains the default pending MLAS threadpool bridging.
+- **Vendored MLAS f32 GEMM ✅ multi-threaded (parity):** the opt-in `mlas` feature / `NXRT_CPU_GEMM_BACKEND=mlas` (`CpuBackend::Mlas`, x86-64) now runs **multi-threaded**. `mlas-sys` installs a Rayon-backed parallel-for backend into MLAS's standalone (`BUILD_MLAS_NO_ONNXRUNTIME`) threading hooks (`vendor/shim.cpp` + `mlas_set_threading`), so MLAS keeps its own cache-aware M/N tile partitioning while running the tiles on the process Rayon pool (no oversubscription). **Isolated-GEMM parity reached** on Sapphire Rapids for `32×512×512`: ~123 µs @1t and ~32 µs @8t vs ORT 131 µs / 30.6 µs (0.94× / 1.05×, ~500 GFLOP/s). End-to-end through the `MatMul` kernel MLAS is the fastest backend at every shape (medium 8t: MLAS 147 µs < SimdX86 162 µs < Generic 492 µs); absolute end-to-end 8t is bounded by per-call output allocation (backend-agnostic, ~50–90 µs) — the next lever is the `PackedB`/buffer-reuse TODO. `SimdX86` stays the default; flipping to MLAS is a one-line change in `auto_detect`. See `docs/KERNEL_PERF.md`. (Deckard 🟢)
+- **Vendored MLAS f32 GEMM ✅ wired (slice 1, `85087ac`):** `onnx-runtime-ep-cpu` exposes the opt-in `mlas` feature plus `NXRT_CPU_GEMM_BACKEND=mlas` on x86-64 (was single-threaded; now superseded by the multi-thread slice above).
 
 ## 2026-07-19 — CPU GEMM parity and backend controls
 

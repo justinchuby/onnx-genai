@@ -1897,6 +1897,12 @@ MlasTryBatchParallel(
     );
 
 
+#if defined(BUILD_MLAS_NO_ONNXRUNTIME)
+// nxrt-mlas-mt: implemented in vendor/shim.cpp — reports the Rayon-backed
+// degree of parallelism (or 1 when no backend is registered).
+extern "C" int MlasStandaloneMaxThreads();
+#endif
+
 inline
 ptrdiff_t
 MlasGetMaximumThreadCount(
@@ -1905,7 +1911,10 @@ MlasGetMaximumThreadCount(
 {
 #if defined(BUILD_MLAS_NO_ONNXRUNTIME)
     MLAS_UNREFERENCED_PARAMETER(ThreadPool);
-    return 1;
+    // nxrt-mlas-mt: report the degree of parallelism from the registered
+    // parallel-for backend (Rayon's current pool size) so MLAS partitions its
+    // GEMM across that many tiles. Defaults to 1 when no backend is registered.
+    return MlasStandaloneMaxThreads();
 #else
     return onnxruntime::concurrency::ThreadPool::DegreeOfParallelism(ThreadPool);
 #endif

@@ -1,13 +1,19 @@
-//! FEASIBILITY SPIKE: thin FFI wrapper around a vendored subset of ONNX
-//! Runtime's MLAS single-precision GEMM (`MlasGemmBatch`).
+//! Thin FFI wrapper around a vendored subset of ONNX Runtime's MLAS
+//! single-precision GEMM (`MlasGemmBatch`).
 //!
-//! This crate exists only to answer one question: can MLAS's real f32 SGEMM
-//! be built standalone from `build.rs` and called via FFI with correct
-//! results and AVX-512-class performance on this host? See
-//! `docs/MLAS_SYS_SPIKE.md`. It is deliberately not integrated into
-//! `onnx-runtime-ep-cpu`.
+//! The vendored MLAS is compiled in its standalone `BUILD_MLAS_NO_ONNXRUNTIME`
+//! mode, whose threading primitives normally serialize. This crate installs a
+//! Rayon-backed parallel-for backend (see [`ensure_threading`] and
+//! `vendor/shim.cpp`) so MLAS keeps its own cache-aware GEMM tile partitioning
+//! while executing the tiles across the current Rayon pool — the same pool the
+//! rest of `onnx-runtime-ep-cpu` uses, so there is no oversubscription. See
+//! `docs/MLAS_SYS_SPIKE.md` for the original single-thread feasibility spike.
 
 use std::os::raw::c_int;
+use std::os::raw::c_void;
+use std::sync::Once;
+
+use rayon::prelude::*;
 
 unsafe extern "C" {
     /// Vendored-MLAS SGEMM shim (single-threaded). Computes
@@ -54,6 +60,69 @@ unsafe extern "C" {
     );
 
     fn mlas_float_kernel_id() -> c_int;
+
+    /// Register the Rust-backed threading backend with the vendored MLAS
+    /// standalone build (see `vendor/shim.cpp`). Passing the callbacks below
+    /// lets MLAS's own GEMM tile partitioning run across a real thread pool.
+    fn mlas_set_threading(
+        parallel_for: MlasParallelForFn,
+        max_threads: MlasMaxThreadsFn,
+        rust_ctx: *mut c_void,
+    );
+}
+
+/// One MLAS work unit: run partition `tid`. `task_ctx` is opaque C++ state.
+type MlasTaskFn = unsafe extern "C" fn(task_ctx: *mut c_void, tid: isize);
+/// Backend that runs `task(task_ctx, tid)` for every `tid` in `[0, iterations)`.
+type MlasParallelForFn = unsafe extern "C" fn(
+    rust_ctx: *mut c_void,
+    iterations: isize,
+    task: MlasTaskFn,
+    task_ctx: *mut c_void,
+);
+/// Backend that reports the degree of parallelism MLAS may use.
+type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
+
+/// Rayon-backed parallel-for. Runs on whatever pool is current at call time
+/// (i.e. the ep-cpu global pool, or a `ThreadPool::install` scope), so MLAS
+/// never spawns a second pool that would oversubscribe the machine.
+unsafe extern "C" fn rayon_parallel_for(
+    _rust_ctx: *mut c_void,
+    iterations: isize,
+    task: MlasTaskFn,
+    task_ctx: *mut c_void,
+) {
+    if iterations <= 0 {
+        return;
+    }
+    // Carry the opaque C++ closure pointer across Rayon worker threads as an
+    // address (usize is Send + Sync). MLAS only *reads* the closure
+    // (`std::function::operator() const`) and each `tid` writes a disjoint
+    // output partition, so concurrent invocation is race-free.
+    let task_ctx = task_ctx as usize;
+    (0..iterations).into_par_iter().for_each(|tid| {
+        // SAFETY: `task_ctx` is valid for the whole `MlasGemmBatch` call that
+        // drives this parallel-for; each `tid` touches a disjoint output range.
+        unsafe { task(task_ctx as *mut c_void, tid) };
+    });
+}
+
+/// Report Rayon's current degree of parallelism to MLAS's partitioner, so the
+/// GEMM is split into as many tiles as there are worker threads available.
+unsafe extern "C" fn rayon_max_threads(_rust_ctx: *mut c_void) -> c_int {
+    rayon::current_num_threads().max(1) as c_int
+}
+
+static THREADING_INIT: Once = Once::new();
+
+/// Install the Rayon-backed threading backend into the vendored MLAS build.
+/// Idempotent; called before every GEMM entry point. Until this runs (e.g. in
+/// the mlas-sys unit tests that call the FFI directly) MLAS stays single
+/// threaded, matching the original spike behaviour.
+fn ensure_threading() {
+    THREADING_INIT.call_once(|| unsafe {
+        mlas_set_threading(rayon_parallel_for, rayon_max_threads, std::ptr::null_mut());
+    });
 }
 
 /// Runtime-selected f32 GEMM microkernel: 512 = AVX-512F, 3 = FMA3/AVX2,
@@ -98,6 +167,7 @@ pub fn sgemm_nn_packed(m: usize, a: &[f32], packed: &PackedB, c: &mut [f32]) {
     let (n, k) = (packed.n, packed.k);
     assert_eq!(a.len(), m * k);
     assert_eq!(c.len(), m * n);
+    ensure_threading();
     unsafe {
         mlas_sgemm_packed(
             0,
@@ -124,6 +194,7 @@ pub fn sgemm_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32
     assert_eq!(a.len(), m * k, "A must be m*k");
     assert_eq!(b.len(), k * n, "B must be k*n");
     assert_eq!(c.len(), m * n, "C must be m*n");
+    ensure_threading();
     unsafe {
         mlas_sgemm(
             0,
@@ -161,6 +232,7 @@ pub fn sgemm(
     c: &mut [f32],
     ldc: usize,
 ) {
+    ensure_threading();
     unsafe {
         mlas_sgemm(
             trans_a as c_int,
@@ -377,5 +449,46 @@ mod tests {
              ({gflops_p:.1} GFLOP/s), checksum={checksum_p:.3}"
         );
         eprintln!("recorded baselines (docs/KERNEL_PERF.md): ORT 1-thread ~131 us, SimdX86 ~285 us");
+    }
+
+    /// Multi-thread scaling probe: measures the same 32x512x512 shape at 1 and
+    /// 8 Rayon threads to confirm MLAS's own tile partitioning now runs across
+    /// the pool. Ignored by default; run with:
+    ///   cargo test -p mlas-sys --release -- --ignored --nocapture perf_sgemm_multithread
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn perf_sgemm_multithread() {
+        use std::time::Instant;
+
+        let (m, n, k) = (32usize, 512usize, 512usize);
+        let a = seq(m * k, 0.5);
+        let b = seq(k * n, 1.5);
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+
+        for threads in [1usize, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let (per_us, checksum) = pool.install(|| {
+                let mut c = vec![0.0f32; m * n];
+                for _ in 0..100 {
+                    sgemm_nn(m, n, k, &a, &b, &mut c);
+                }
+                let iters = 5000u32;
+                let start = Instant::now();
+                for _ in 0..iters {
+                    sgemm_nn(m, n, k, &a, &b, &mut c);
+                }
+                let per_us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                (per_us, c.iter().copied().sum::<f32>())
+            });
+            let gflops = flops / (per_us * 1e3);
+            eprintln!(
+                "vendored-MLAS SGEMM 32x512x512 repack-B, {threads} thread(s): {per_us:.1} us/iter \
+                 ({gflops:.1} GFLOP/s), checksum={checksum:.3}"
+            );
+        }
+        eprintln!("recorded ORT baselines (docs/KERNEL_PERF.md): 1-thread ~131 us, 8-thread ~28-30 us");
     }
 }

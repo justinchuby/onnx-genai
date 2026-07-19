@@ -16,6 +16,14 @@ Abstract:
 
 #include "mlasi.h"
 
+#if defined(BUILD_MLAS_NO_ONNXRUNTIME)
+// nxrt-mlas-mt: pluggable parallel-for backend implemented in vendor/shim.cpp.
+// When a backend is registered (via mlas_set_threading from Rust) these route
+// MLAS's own tile partitioning onto a real thread pool (Rayon); otherwise they
+// run serially. `work` points to the std::function<void(ptrdiff_t)> closure.
+extern "C" void MlasStandaloneParallelFor(std::ptrdiff_t Iterations, void* work);
+#endif
+
 void
 MlasExecuteThreaded(
     MLAS_THREADED_ROUTINE* ThreadedRoutine,
@@ -76,15 +84,11 @@ MlasTrySimpleParallel(
     MLAS_UNREFERENCED_PARAMETER(ThreadPool);
 
     //
-    // Fallback to OpenMP or a serialized implementation.
+    // nxrt-mlas-mt: route MLAS's own partitioned iterations onto the registered
+    // parallel-for backend (Rayon), falling back to a serial loop if none is
+    // registered.
     //
-
-    //
-    // Execute the routine for the specified number of iterations.
-    //
-    for (ptrdiff_t tid = 0; tid < Iterations; tid++) {
-        Work(tid);
-    }
+    MlasStandaloneParallelFor(Iterations, const_cast<void*>(static_cast<const void*>(&Work)));
 #else
     //
     // Schedule the threaded iterations using the thread pool object.

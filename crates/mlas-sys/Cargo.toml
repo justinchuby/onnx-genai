@@ -11,6 +11,7 @@ description = "FEASIBILITY SPIKE: FFI bindings to a vendored subset of ONNX Runt
 [lints]
 
 [dependencies]
+rayon = "1"
 
 [build-dependencies]
 cc = "1"

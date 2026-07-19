@@ -15,8 +15,9 @@
 //!   over column strips. Selected automatically with no cargo feature; falls
 //!   back to Generic when AVX2/FMA is absent.
 //! * **`Mlas`** (opt-in `mlas` feature on x86-64): vendored MLAS f32 SGEMM,
-//!   selected only with `NXRT_CPU_GEMM_BACKEND=mlas`. It is single-threaded
-//!   until its threadpool is bridged, so it is not an automatic default.
+//!   selected only with `NXRT_CPU_GEMM_BACKEND=mlas`. Multi-threaded — MLAS
+//!   partitions the GEMM and runs the tiles across the process Rayon pool — but
+//!   kept opt-in (not an automatic default) pending a later slice.
 //!
 //! The batched / broadcast / 1-D-vector handling in [`matmul_dense`] is
 //! backend-agnostic; only the inner 2-D tile GEMM changes. The session also
