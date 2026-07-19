@@ -87,3 +87,14 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 - Deckard's `b5ccd3c` correction made `SimpleShardedDimProto.dim` optional; Bryant 🟢 approved. Remaining parity gaps are in flight.
 - 2026-07-19: Landed BQMoE v1 CPU parity oracle and frozen ABI (`7f31162`).
 - 2026-07-19T07:55:00Z: CSA Phase B B0 device-state/stage-dispatch scaffolding merged at `9c56d9c` after numerical correction.
+
+## 2026-07-19T07:42:20Z — CSA Phase B B3 landed
+
+- Landed device ratio-4 FP4 index-key compression with device-resident index cache/carry in `3ae3244`. Chew approved; 15/15 H200 GPU parity tests are bit-exact.
+
+## 2026-07-19T07:42:20Z — CSA B7 nit follow-up
+
+- Assigned Chew's non-blocking B7 nits: completed-block rollback boundary coverage and the five-output ratio-4 host metrics mode label. Sapper is closing both as a follow-up.
+
+
+- **2026-07-19T16:15:00Z — Activation precision fix:** Added true f64 Selu/ThresholdedRelu computation and precision-sensitive tests; activations landed as `39edb76` after Luv approval.

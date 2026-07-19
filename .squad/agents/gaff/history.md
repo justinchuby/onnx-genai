@@ -87,3 +87,13 @@ Non-author review of Leon's `ort2_*` → `nxrt_*` C-ABI rename. Verified both fi
 - 2026-07-15 — Reviewed Mariette’s cpuinfo publish fix; approved (`65cc851`).
 - 2026-07-19: Reviewed PR #30 through four cycles and verified the rebased integration before merge.
 - 2026-07-19T07:55:00Z: PR #30's reviewed sampler and retry-safety integration remained intact through the subsequent EP-capabilities landing.
+
+## 2026-07-19T07:42:20Z — Mobius-head E2E harness review
+
+- Approved Leon's pinned GLM/DeepSeek harness; immutable manifest pins, clean missing-artifact skips, and real `Engine::from_dir` execution for present artifacts were verified. Landed as `3d47ea9`.
+
+## 2026-07-19T13:10Z — cudarc CUDA-version unification review
+Reviewed Deckard's fix for the cudarc CUDA-version-feature conflict. Verified all three builds plus `onnx-runtime-ep-cuda` tests, confirmed Cargo 1.97 rejects `{ workspace = true, default-features = false }`, and approved the inline path+version dependency choice.
+
+
+- **2026-07-19T16:15:00Z — Conformance review:** Approved the 936/829/1765 conformance refresh with non-blocking attribution nits; artifacts landed as `4c05ede`.

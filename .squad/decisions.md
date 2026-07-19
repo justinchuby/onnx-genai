@@ -1259,3 +1259,973 @@ Detection now records each ONNX node domain and treats `If`, `Loop`, and `Scan` 
 **By:** Chew
 **What:** 🟢 APPROVE commit `5c308f7`. FP8 E4M3 and FP4 E2M1 quantization use the required scales, round-to-nearest-even behavior, saturation, and subnormal handling; independent hand-computed tests cover scale selection, ties, saturation, packed codes, and reconstructed values.
 **Why:** CUDA build and full EP tests passed, including 8 block-quant tests and all 11 unchanged CSA GPU tests. CSA remains graph-incompatible, and the coordinator may merge B0.
+
+
+## 2026-07-19 — Scribe inbox merge (CSA Phase B B1/B2 landing)
+
+<!-- merged from chew-csa-b1-review.md -->
+
+# Chew review — CSA Phase B1
+
+- **Commit reviewed:** `92e7104` (`feat-csa-phase-b1`)
+- **Verdict:** 🟢 APPROVE
+
+The ratio-128 f32 device kernel preserves the CPU oracle's ordered dense-window
+then compressed-record candidate traversal. Score, denominator, and per-output
+value reductions are serial f32 accumulations; the CUDA source uses
+`__fmul_rn` followed by `__fadd_rn` for every parity-path dot/value
+multiply-add, while the CPU oracle uses separate Rust `sum + a * b`
+operations.
+
+The kernel uses two-pass max/denominator/value softmax, double-domain `exp`,
+post-max sink denominator mass only, and excludes `-inf` sentinels from both
+denominator and value reductions. Dispatch is conservatively limited to
+ratio-128, `cache_format="f32"`, and absent attention bias; ratio-4 and
+non-f32 paths retain host staging. `cuda_graph_compatible()` remains false.
+
+`compressed_sparse_attention_gpu` passed all 13 tests on CUDA. The new tests
+compare independently run CPU and CUDA providers with `Y max_ulp == 0`, cover
+the 128 boundary, compressed-record candidate, invalid dense slots, and
+material sink behavior. Full `cargo test -p onnx-runtime-ep-cuda` also passed.
+
+Coordinator may rebase and FF-merge `feat-csa-phase-b1` to `main`.
+
+
+<!-- merged from chew-csa-b2-nits-review.md -->
+
+# Decision: CSA B2 nits review — 🟢 APPROVE
+
+- **Reviewer:** Chew (Numerics Code Reviewer)
+- **Date:** 2026-07-19T07:42:20+0000
+- **Target:** worktree `/home/justinchu/wt-csa-b2-nits`, branch `fix-csa-b2-nits`
+- **Fix commit:** `2067504` (parent `2f5f5e9` = B2, on main)
+- **Author of fix:** Batty (distinct from B2 author Deckard)
+- **Requested by:** Justin Chu
+
+## Verdict: 🟢 APPROVE
+
+Both previously-flagged nits are correctly fixed, no new numeric divergence, 14/14
+CSA GPU parity tests bit-exact.
+
+## N1 — RMSNorm rsqrt now matches CPU oracle bit-for-bit ✅
+- **Device** (`crates/onnx-runtime-ep-cuda/src/kernels/compressed_sparse_attention.rs:163`):
+  ```c
+  float inverse_rms = __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(square_sum, (float)dim), 1.0e-6f)));
+  ```
+  Two-step: correctly-rounded (RN) sqrt followed by correctly-rounded (RN) reciprocal.
+  The prior fused `__frsqrt_rn` (single approximate/differently-rounded op, latent 1-ULP)
+  is gone.
+- **CPU oracle** (`crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs:2378`):
+  ```rust
+  let inverse_rms = (square_sum / dim as f32 + 1.0e-6).sqrt().recip();
+  ```
+  Confirmed genuinely two-step: IEEE-correctly-rounded `f32::sqrt()` then `.recip()`
+  (= correctly-rounded `1.0/x`). Operand order (`square_sum/dim + eps`, then sqrt, then
+  recip) and the `1.0e-6` epsilon match the device form exactly. The same two-step oracle
+  form recurs at lines 2378, 1849, 4326, 4733-4735 — device now agrees with all.
+- No other numeric path was touched; `square_sum` accumulation remains the sequential
+  `__fadd_rn(__fmul_rn(...))` reduction matching the CPU fold.
+
+## N2 — Redundant carry-reset loop removed ✅
+- The dead outer `for (int slot = 0; slot < 128; ++slot)` wrapper (whose `slot` index was
+  never used, causing the inner full reset to run 128× redundantly) is removed.
+- The single correct reset — inner `for reset_slot in 0..128` × `for d in 0..dim`, writing
+  `0.0f` to the value lane and `__int_as_float(0xff800000)` (−inf) to the running-max lane —
+  is preserved unchanged, still guarded by `if (start == 0)`. Pure dead-work elimination,
+  no behavior change.
+
+## N3 — Regression / new divergence: none ✅
+Command run (without `--features cuda`, per Batty's note; passed cleanly):
+
+```
+running 14 tests
+test supports_op_rejects_ratio4_wrong_output_count ... ok
+test supports_op_rejects_ratio4_non_128_index_head_dim ... ok
+test supports_op_rejects_ratio4_missing_index_inputs ... ok
+test supports_op_rejects_non_query_fixed_input_dtype ... ok
+test supports_op_claims_omitted_ratio128_attention_bias ... ok
+test supports_op_rejects_ratio128_ratio4_only_input ... ok
+test supports_op_rejects_ratio128_fp4_cache_format ... ok
+test supports_op_validates_ratio128_attention_bias_at_input_19 ... ok
+test ratio4_prefill_claim_and_execute_matches_cpu ... ok
+test supports_op_rejects_unsupported_configs ... ok
+test ratio128_f32_device_attention_sink_material_matches_cpu ... ok
+test ratio128_prefill_then_two_decodes_matches_cpu ... ok
+test ratio128_f32_device_attention_matches_cpu ... ok
+test ratio128_device_compression_crosses_two_blocks_matches_cpu ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+```
+
+14/14 pass, including all `*_matches_cpu` bit-exact parity cases.
+
+## Notes
+- Diff is a clean −9/+8, single file, tightly scoped to the two nits. No collateral changes.
+
+
+<!-- merged from chew-csa-b2-review.md -->
+
+# CSA Phase B — Slice B2 Review
+
+**Reviewer:** Chew (Numerics Code Reviewer)
+**Author:** Deckard (locked out of any resulting fix)
+**Date:** 2026-07-19T07:42Z
+**Commit:** `2f5f5e9` (parent `ec6292b` = B1 on main)
+**Worktree/branch:** `/home/justinchu/wt-csa-b2` / `feat-csa-phase-b2`
+**Scope:** device ratio-128 compression (stage-1) + device-resident cache/carry.
+
+## Verdict: 🟡 APPROVE-WITH-NITS
+
+The B2 device compressor produces `present_compressed_kv` (FP8 E4M3 block-64 + BF16
+RoPE tail) and `present_compression_carry` on-device and matches the CPU-f32 oracle
+**bit-exact on the real H200** — all 14 GPU parity tests pass, including the new
+two-block-boundary test and the existing decode-boundary test. Two non-blocking nits
+below. No cuDNN/`conv_gpu` failures were involved.
+
+## Evidence (real H200, ep-cuda)
+
+```
+running 14 tests
+test ratio4_prefill_claim_and_execute_matches_cpu ... ok
+test ratio128_f32_device_attention_sink_material_matches_cpu ... ok
+test ratio128_prefill_then_two_decodes_matches_cpu ... ok
+test ratio128_f32_device_attention_matches_cpu ... ok
+test ratio128_device_compression_crosses_two_blocks_matches_cpu ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; ... finished in 2.79s
+```
+(Note: crate has no `cuda` feature — ran `cargo test -p onnx-runtime-ep-cuda --test
+compressed_sparse_attention_gpu`; NVRTC compiled against CUDA 13.3, GPU = NVIDIA H200.)
+
+## Contract verification
+
+1. **FP8 E4M3 compression parity** — ✅ Device calls the B0-verified
+   `quantize_fp8_e4m3_block` (E8M0 `2^ceil(log2(amax/448))`, saturate ±448 via
+   `fminf/fmaxf`, amax clamp `1e-4`, RNE). FP8 block layout `[scale, 64 codes]×7`
+   at stride 65 + BF16 RoPE tail at byte 455 exactly matches oracle
+   `finalize_attention_record` packing. `assert_eq!(gpu[1], cpu[1])` byte-exact — PASS.
+2. **Carry lifecycle / off-by-one** — ✅ `slot = pos & 127`, boundary emit iff
+   `(pos+1)&127==0`, RoPE position `pos-127` == oracle `block_start = position+1-ratio`.
+   `start==0` resets carry (kv=0, score=`0xff800000`=-inf); each completed block resets
+   all 128 slots after finalize; decode threads `past_carry`. The new test exercises a
+   GENUINE boundary: prefill S=255 emits block [0,128) then carries [128,254]; decode at
+   pos 255 emits [128,256) (256%128==0), yielding 2 records across 2 steps. Not
+   tautological — parity is asserted inside `run_step` (independent CPU oracle vs device),
+   not against the device output itself.
+3. **Full output set bit-exact** — ✅ `Y` (host-staged in FP8 path, byte-identical),
+   `present_compressed_kv` (byte-exact), `present_compression_carry` (device-written,
+   parity-checked). PASS on hardware.
+4. **Non-FMA discipline** — ✅ All mul-add chains use `__fadd_rn(acc,__fmul_rn(a,b))` /
+   `__fsub_rn` intrinsics (uncontractable), softmax `exp` via `(float)exp((double)x)`
+   per the blessed convention. RoPE `re*cs - im*sn` uses explicit `_rn` ops.
+5. **EP claim contract** — ✅ `cuda_graph_compatible()` still returns **false**
+   unconditionally; claim/`unsupported_reason` unchanged (CPU-factory dry-run still
+   gates); `device_compression` is an execute-time overwrite only (post host-stage),
+   guarded by `outputs[1].dtype == Uint8`. supports_op tests green.
+6. **Tests not tautological; ratio-4/index/oracle unchanged** — ✅ Oracle
+   (`ep-cpu`) untouched by the diff; only `block_quant.rs` (1 line), the cuda CSA kernel,
+   and the test file changed. `ratio4_prefill_claim_and_execute_matches_cpu` unchanged and
+   passing. `block_quant.rs` change is `CUDART_INF_F` → `__int_as_float(0x7f800000)` in the
+   **e2m1/FP4** path (unused by ratio-128) — functionally identical.
+
+## Nits (non-blocking, recommend follow-up — NOT Deckard if actioned)
+
+- **N1 (numeric fidelity, MED):** RMSNorm uses `__frsqrt_rn(x)` (single correctly-rounded
+  rsqrt) where the frozen oracle computes `(...).sqrt().recip()` — i.e. `__frcp_rn(__fsqrt_rn(x))`
+  (two rounding steps). These can differ by 1 ULP in f32. It is currently masked by the
+  downstream BF16 + FP8 quantization (verified: real-GPU cache is byte-exact for the test
+  inputs), consistent with how device `sincosf/powf` divergences are absorbed in the RoPE
+  tail. But because `inverse_rms` feeds **all 448 non-RoPE FP8 dims**, prefer
+  `__frcp_rn(__fsqrt_rn(x))` to mirror the oracle exactly and guarantee the max_ulp=0 D1
+  gate for *all* inputs, not just tested ones. `compressed_sparse_attention.rs`
+  (COMPRESSION_SOURCE, `inverse_rms` line).
+- **N2 (perf/dead code, LOW):** The `start==0` carry reset wraps the 128-slot clear in a
+  redundant outer `for (int slot = 0; slot < 128; ++slot)` whose `slot` is unused, so the
+  full reset runs 128× (≈8.4M redundant writes/batch). Clearly a copy/paste artifact; the
+  post-block reset correctly uses a single loop. Drop the outer loop.
+
+## Fix routing (if nits are actioned)
+
+Deckard is **locked out** of any B2 fix. Eligible fixer: **Batty** (or Sapper/Leon/Roy).
+Both nits are optional polish; B2 meets the bit-exact gate and may land as-is with these
+tracked as follow-ups.
+
+
+<!-- merged from deckard-csa-b2.md -->
+
+### 2026-07-19: CSA Phase B B2 device ratio-128 compression
+**By:** Deckard
+**What:** Added a serial ratio-128 CUDA compression kernel that pools each dimension in oracle order, BF16-casts, RMS-normalizes, applies block-start compressed RoPE, and finalizes hybrid FP8 E4M3 records through the shared block quant primitive. Added two-block boundary parity coverage.
+**Why:** Keeping each batch row serial preserves the CPU f32 accumulation order. A completed ratio-128 block clears its consumed carry block after emission, matching the CPU oracle lifecycle; the FP8 path uses the 1e-4 amax floor and power-of-two/RNE block quantizer.
+
+
+<!-- merged from roy-csa-b1.md -->
+
+### 2026-07-19: CSA Phase B B1 device ratio-128 attention
+
+**By:** Roy
+
+**What:** Turned ON the DEVICE path for stage 7 (sparse sink-softmax attention)
+and the stage-6 candidate read for **ratio-128 with `cache_format="f32"`** in
+`crates/onnx-runtime-ep-cuda/src/kernels/compressed_sparse_attention.rs`. A new
+NVRTC kernel (`csa_ratio128_sink_attention`) computes `Y` on device — one CUDA
+block per `(batch, query, head)` output row — and overwrites the host oracle's
+`Y`. Compression (stage 1), candidate assembly of the compressed records,
+writeback, ratio-4, and FP8/hybrid ratio-128 records all STAY host-staged. The
+device attention reads the query and `current_kv` device inputs plus the freshly
+uploaded f32 `present_compressed_kv` (the dequantized candidate records the host
+compression already produced), so no device FP8 dequant was needed this slice.
+`CsaStageDispatch` flips only stages 6+7, and only when `ratio==128 &&
+cache_format=="f32" && no attention_bias`. `cuda_graph_compatible()` stays
+`false`. Extended `compressed_sparse_attention_gpu.rs` with two device tests
+(prefill→decode→decode across the 128-block boundary, and a sink-materiality
+decode) asserting **ULP=0** `Y` parity vs the CPU oracle; the existing all-Host
+fp8 tests stay green.
+
+**Why (reduction-order decision):** D1 parity targets the CPU-f32 oracle
+(`ratio128_attention`), which is a faithful **two-pass** softmax: pass 1 computes
+every candidate score and the running max, pass 2 sums `exp(score-max)` for the
+denominator, pass 3 accumulates `exp(score-max)/denom * value`. All f32 sums run
+in **ascending candidate index order** (dense window first, then compressed
+records) with non-FMA `sum + a*b`. To be bit-exact I reproduced exactly that
+order and rounding rather than an online-rescale softmax (a running rescale
+reorders the f32 sum and would diverge). Specifically:
+
+* Score dot-products and value accumulation use `__fadd_rn(acc, __fmul_rn(a,b))`
+  so each multiply-add stays **un-fused**, matching the CPU's separate mul/add
+  (Rust/LLVM does not contract `sum + a*b` into an FMA on x86 without fast-math;
+  nvcc/NVRTC would, so the explicit `_rn` intrinsics are required).
+* The whole reduction is single-threaded per row (thread 0 does pass 1+2), so the
+  accumulation order is provably identical to the oracle; the value pass then
+  parallelizes over the head dimension `d` only (each `d` still sums candidates
+  in ascending order), which does not change any per-element sum.
+* `exp` is evaluated as `(float)exp((double)x)` — the same double-precision
+  evaluation the GQA reference kernel uses to match glibc's correctly-rounded
+  `expf` bit-for-bit.
+* The learned `head_sink` is added to the denominator **after** the running max,
+  as `exp(sink[h]-max)` logit-only mass (no value contribution), matching the
+  oracle. Invalid/skipped candidates (the fused `-1`: dense positions past the
+  causal limit, before the `current_kv` window, or not-yet-completed compressed
+  records) are `-inf` scores excluded from both denominator and value reduction.
+
+Measured result: `Y max_ulp=0` on every prefill/decode step on a real GPU
+(bit-exact). FP8 ratio-128 attention and device compression are deferred to
+later slices (B2) because they need device/host FP8 dequant of candidate
+records; ratio-4 is unchanged.
+
+## 2026-07-19 — Scribe inbox merge (CSA Phase B B3/B4 landing and numerics reviews)
+
+<!-- merged from sapper-csa-b3.md -->
+
+# B3 ratio-4 index compressor
+
+B3 uses the CPU oracle's full sixteen-code E2M1 nearest-value scan on device rather than a sign/magnitude quantizer. This preserves the oracle's tie rule at signed zero (`+0` wins over `-0`), which is required for byte-exact FP4 index records.
+
+<!-- merged from chew-csa-b3-review.md -->
+
+# Review — CSA Phase B slice B3 (device ratio-4 FP4 index-key compression)
+
+- **Reviewer:** Chew (Numerics Code Reviewer)
+- **Author:** Sapper (locked out of any resulting fix)
+- **Date:** 2026-07-19
+- **Target:** worktree `/home/justinchu/wt-csa-b3`, branch `feat-csa-phase-b3`, commit `572d891` (parent `2067504`)
+- **Diff scope:** `git diff 2067504..572d891` — 3 files, all in `onnx-runtime-ep-cuda`:
+  - `src/kernels/block_quant.rs` (+device `quantize_fp4_e2m1_block`, signed-table `quantize_e2m1`)
+  - `src/kernels/compressed_sparse_attention.rs` (+`csa_ratio4_index_compress` kernel + host launch + dispatch wiring)
+  - `tests/compressed_sparse_attention_gpu.rs` (+boundary test, generalized `ratio4_node` shapes)
+
+## Verdict: 🟢 APPROVE
+
+D1 bit-exact gate (max_ulp=0 vs the independent CPU oracle) is satisfied on real H200. All numeric,
+lifecycle, scope, and EP-contract requirements verified. No fix required; no fixer assigned.
+
+## Evidence — test tail (H200, without `--features cuda`)
+
+```
+running 15 tests
+test supports_op_rejects_ratio4_missing_index_inputs ... ok
+test supports_op_rejects_ratio4_non_128_index_head_dim ... ok
+test supports_op_rejects_ratio4_wrong_output_count ... ok
+test supports_op_rejects_non_query_fixed_input_dtype ... ok
+test supports_op_validates_ratio128_attention_bias_at_input_19 ... ok
+test supports_op_claims_omitted_ratio128_attention_bias ... ok
+test supports_op_rejects_ratio128_ratio4_only_input ... ok
+test supports_op_rejects_ratio128_fp4_cache_format ... ok
+test supports_op_rejects_unsupported_configs ... ok
+test ratio4_prefill_claim_and_execute_matches_cpu ... ok
+test ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary ... ok
+test ratio128_f32_device_attention_sink_material_matches_cpu ... ok
+test ratio128_prefill_then_two_decodes_matches_cpu ... ok
+test ratio128_f32_device_attention_matches_cpu ... ok
+test ratio128_device_compression_crosses_two_blocks_matches_cpu ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+```
+
+No missing-cuDNN `conv_gpu` failures in this suite (nothing to ignore). All 15 CSA parity tests bit-exact.
+
+## Verification detail
+
+1. **FP4 E2M1 block-32 parity** — device `quantize_fp4_e2m1_block` (block_quant.rs) matches oracle
+   `quantize_fp4_e2m1_block`/`encode_e2m1` (block_dequant.rs) op-for-op:
+   - amax seed `6.0f * 0x1p-126f` == `6.0 * 2f32.powi(-126)`; `fmaxf(|x|)` == `.max(|x|)`.
+   - `scale_power = ceilf(log2f(amax/6))` == `(amax/6).log2().ceil()`; `exp2f(power)` == `2f32.powi(power)`
+     (both exact for integer power-of-two).
+   - E8M0 scale byte `power+127`; per-pair `clamp(-6,6)` via `fminf(6,fmaxf(-6,·))`; RNE nearest-code search
+     over the identical 16-entry signed E2M1 table with the same even-index tie-break
+     (`(i&1)==0 && (best&1)!=0`). Bit-identical.
+   - The `quantize_e2m1` signed-table rewrite is required to match the oracle and its **sole** caller is the
+     new FP4 path — no B2 caller affected.
+
+2. **`c=0` / `-inf` boundary + overlap shift** — device uses `NEG=0xff800000`; `score==NEG` skipped exactly
+   as oracle `score == f32::NEG_INFINITY`. Reset (state0→0, state1→NEG) and the 8-slot two-channel overlap
+   compressor (`candidate<4 → d`, else `dim+d`; slot=candidate) reproduce `pool_ratio4_record` exactly.
+   Post-emit shift `slots 4..7 → 0..3` with per-state reset matches oracle lines 1678-1692.
+
+3. **Carry lifecycle / non-tautological test** —
+   `ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary` runs a 3-token prefill (start=0,
+   emits 0 records) then a 1-token decode at position 3 (start=3) that crosses a genuine two-block boundary,
+   feeding prefill carry (slots 4-6) into decode and filling slot 7. It exercises overlap (dual channel) and
+   the c=0/-inf skip for the reset previous-block slots. Asserts `decode_gpu[3]==decode_cpu[3]` (FP4 key) and
+   `decode_gpu[4]==decode_cpu[4]` (carry) against the **independent** `run_cpu` oracle — never against itself.
+   No off-by-one at the decode boundary (`past_records + emitted` placement, past copied first).
+
+4. **Non-FMA discipline** — softmax `__fadd_rn(acc, __fmul_rn(w, kv))`; RMSNorm/Hadamard use
+   `__frcp_rn(__fsqrt_rn(x))` (never `__frsqrt_rn`); Hadamard butterfly uses plain `__fadd_rn/__fsub_rn` with
+   final `hadamard_scale = __frcp_rn(__fsqrt_rn((float)dim))` == oracle `1.0/(len).sqrt()` (`1/√ID`). `exp` via
+   `(float)exp((double)…)`, `powf(160000,…)`, `sincosf`, per-component `csa_index_bf16` — identical to the
+   already-approved B2 `csa_ratio128_compress` conventions.
+
+5. **Scope containment** — diff touches only the CUDA crate; `crates/onnx-runtime-ep-cpu/` diff is **0 lines**
+   (oracle unchanged). Ratio-128 `COMPRESSION_SOURCE`/attention paths untouched. B3 only moves ratio-4
+   stage-2 compression to device; ratio-4 scoring/attention remain host-staged (`device_index_compression`
+   sets only `IndexKeyUpdate = Device`).
+
+6. **EP claim contract** — metadata-only, zero-alloc claim; `supports_op` rejection tests all green;
+   `cuda_graph_compatible()` still returns **false** (unchanged, host round-trip + per-copy syncs).
+
+## Notes (non-blocking)
+- Device `quantize_fp4_e2m1_block` omits the oracle's E8M0-range validation (`1..=254`). Harmless for the
+  parity gate (out-of-range inputs error in the host oracle and never reach the bit-exact set); optional
+  hardening only.
+
+<!-- merged from roy-csa-b4.md -->
+
+# Decision note — CSA Phase B slice B4 (Roy, Lead)
+
+**Slice:** B4 — Device ratio-4 index scoring + deterministic top-k selection
+**Branch:** `feat-csa-phase-b4` (worktree `/home/justinchu/wt-csa-b4`, based on origin/main @ `3ae3244`)
+**Date:** 2026-07-19
+**Author:** Roy (Lead engineer)
+
+## What moved to device
+Stages 3–5 of the ratio-4 index pipeline now run on the GPU (NVRTC kernel
+`csa_ratio4_index_select`, one CUDA block per `(b, s)` row, correctness-first
+single-threaded like the B2/B3 compression kernels):
+
+- **Stage 3 — index-query finalize:** RoPE (compressed, last 64 of 128 dims,
+  keyed on the query `position`) → Hadamard with `1/√ID` scale → FP4 E2M1
+  roundtrip. Reuses the exact device primitives proven in B3
+  (`INDEX_COMPRESSION_SOURCE` / `block_quant.rs`), minus RMSNorm/pooling.
+- **Stage 4 — scoring:** `dot → relu → weighted-head-sum` with causal +
+  valid-length masking. Keys are dequantized on-the-fly from the device-written
+  FP4 packed `present_index_key` (output[3]).
+- **Stage 5 — deterministic top-k:** `topk(min(512, available), largest=True,
+  sorted=True)`, `-1` padding for unfilled slots, index-only host readback (D5).
+
+Ratio-4 **attention** (stages 6–7) remains host-staged this slice (that is B5).
+`cuda_graph_compatible()` stays **false** (D5: kernel is non-capturable because
+of the index-only host readback of the selected indices).
+
+## Tie-break approach (the critical part)
+The CPU oracle's `select_ratio4_topk` **rejects exact `==` score ties** with an
+`Err(unsupported)` before sorting, then orders the distinct scores with
+`sort_unstable_by(|l, r| r.1.total_cmp(&l.1))` — i.e. **descending
+`f32::total_cmp`**. Because the host oracle runs first inside `execute`, an exact
+tie would already have errored out before the device path is reached, so the
+device never has to reproduce the tie *error*; it only has to reproduce the
+*ordering* of distinct scores.
+
+Device replication:
+- A faithful port of Rust `f32::total_cmp` (`csa_total_cmp`) drives a strict
+  total order: **descending** `total_cmp` on the score, with **ascending record
+  index** as a secondary determinism guard (never triggers under the oracle's
+  no-exact-tie contract, but keeps the device reduction fully deterministic and
+  independent of thread/reduction order).
+- Selection is computed by rank (`csa_rank_before`): a record's output slot =
+  number of records that strictly outrank it — no non-deterministic device
+  reduction is used anywhere.
+
+## Why near-ties resolve identically (oracle-parity subtlety)
+Bit-identical *selection* requires bit-identical *scores*, so the whole point is
+computing scores in the **same order and rounding** as the oracle:
+- `dot` sums `d = 0..127` sequentially with non-FMA
+  `__fadd_rn(acc, __fmul_rn(q, k))`.
+- Head sum accrues ascending `h` with
+  `score = __fadd_rn(score, __fmul_rn(__fmul_rn(relu, weight), weight_scale))`,
+  `relu = fmaxf(acc, 0)`, and
+  `weight_scale = 1/√index_dim / √index_heads` built with `__fdiv_rn`/`__fsqrt_rn`.
+- Normalization uses two-step `__frcp_rn(__fsqrt_rn(x))` (not `__frsqrt_rn`);
+  Hadamard uses `1/√ID`; bf16 rounding is round-to-nearest-even.
+- FP4 key dequant iterates block → nibble-pair → (low nibble = even d, high
+  nibble = odd d), reproducing the oracle's `all_index_logical` ascending-`d`
+  layout bit-for-bit (`decode_e2m1 * e8m0_scale`), so equal-score ties are
+  actually equal bit-for-bit and near-ties order identically.
+
+## Device structures / D5 readback
+- Score buffer `f32[B, S, records]` — device-resident scratch (the plan's
+  `f32[B,S,C]`).
+- Selected-index scratch `int32[B, S, K]` on device; read back host-side
+  (indices only) and replicated across `index_heads` into
+  `int32[B, index_heads, S, K]` (matching the CPU `write_shared_selected_i32`
+  fan-out), then htod'd into output[5].
+- Transformed queries live in a device scratch buffer passed as a kernel arg.
+- Causal limit per query row: `min((position + 1) / 4, records)`.
+
+## EP claim contract
+Unchanged from B1–B3: metadata-only, zero-alloc at claim; claim iff executable;
+omitted optional inputs (`DataType::Undefined`) = "not provided" (still claim);
+reject present-wrong-dtype; no claim-then-fail on static dims.
+`cuda_graph_compatible()` stays **false**.
+
+## Tests (all vs the INDEPENDENT CPU oracle, never against device itself)
+- Extended `ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary`
+  to also assert `selected_indices` (output[5]) parity across the
+  prefill→decode boundary (empty top-k in prefill, real selection in decode).
+- Added `ratio4_device_topk_selection_multi_record_matches_cpu` (SEQ=16,
+  index_topk=4) — multi-record ordering; verified selections are genuine
+  score-based permutations, not trivial index order.
+- Added `ratio4_device_topk_tie_break_matches_cpu` (SEQ=12, index_topk=3) —
+  adversarial clustered tiny scores engineered to exercise near-tie ordering.
+
+## Result
+Full CSA GPU parity suite: **17 passed / 0 failed** (15 existing + 2 new),
+bit-exact (D1 max_ulp=0) on the H200. No missing-cuDNN failures in this binary.
+
+<!-- merged from chew-csa-b4-review.md -->
+
+# Decision Note — CSA Phase B slice B4 review (Chew, Numerics Code Reviewer)
+
+- **Date:** 2026-07-19
+- **Reviewer:** Chew (Numerics Code Reviewer)
+- **Author under review:** Roy (locked out of fixes)
+- **Target:** CSA Phase B **B4** — device ratio-4 index scoring + deterministic top-k
+- **Worktree/branch:** `/home/justinchu/wt-csa-b4` @ `feat-csa-phase-b4`
+- **Commit:** `77a44a4` (parent `3ae3244` = B3 on main)
+- **Diff reviewed:** `git diff 3ae3244..77a44a4` — 2 files, +564 lines (cuda kernel + gpu test only)
+
+## Verdict: 🟢 APPROVE (bit-exact; 17/17 CSA parity tests pass on H200)
+
+---
+
+## Tie-break comparator equivalence (the critical part)
+
+I read the oracle top-k (`select_ratio4_topk`, CPU crate lines 1874–1981) and the device
+comparator (`csa_total_cmp` / `csa_rank_before` / stage-5 selection sort) line by line and
+reason they are **provably equivalent for ALL accepted score distributions**, not just the
+fixtures:
+
+1. **`csa_total_cmp` is a bit-exact port of Rust `f32::total_cmp`.** Device:
+   `ia ^= (uint)(ia>>31)>>1` (arithmetic shift → 0 or 0x7FFFFFFF, XOR), identical to Rust's
+   `left ^= (((left>>31) as u32)>>1) as i32`. Byte-identical ordering key.
+2. **`csa_rank_before` = descending `total_cmp`, then ascending record index.** Matches the
+   oracle's `sort_unstable_by(|l,r| r.total_cmp(&l))` for the score key; the index tiebreak is
+   a strict-total-order determinism guard.
+3. **The oracle rejects any exact `==` score pair** (lines 1952–1961) before sorting. For finite
+   f32, `==` holds iff bit-identical, plus the `+0.0/−0.0` pair. `total_cmp==0` holds iff
+   bit-identical → a subset of the rejected set. Therefore on **every accepted input** all scores
+   are strictly `total_cmp`-ordered and the ascending-index tiebreak **never triggers** — exactly
+   as Roy's doc comment claims. Verified, not taken on faith.
+4. **Selection sort ≡ full sort** for a strict total order with distinct keys: the `prev`/`prev_score`
+   guard keeps only records ranking strictly after the last pick and takes the max, reproducing the
+   descending sequence; `-1` padding when `limit < topk_width` matches `.take(topk_width)` over a
+   pre-filled `-1` vector. `limit = min(records, (position+1)/4)` equals the oracle's
+   `valid_records.min(records)`; `topk_width` is read from `selected_indices` dim-3 (which the CPU
+   factory sized to `index_topk.min(next_records)`).
+   Conclusion: for inputs the oracle accepts, device selection is byte-identical. Inputs the oracle
+   rejects have no parity contract (test fails at `run_cpu().expect`), so there is no divergence.
+
+## Score bit-exactness (near-ties can only reorder if scores diverge)
+
+- **bf16 primitive** `csa_sel_bf16_bits` is character-identical to the B2/B3-proven `csa_bf16_bits`
+  / `csa_index_bf16_bits` (RNE `(bits+0x7fff+((bits>>16)&1))>>16`).
+- **Stage-3 finalize** (RoPE ramp/base/frequency, Hadamard, `1/√ID`, FP4 E2M1 round-trip) is
+  math-identical to the proven B3 `csa_ratio4_index_compress` path; `hadamard_scale =
+  __frcp_rn(__fsqrt_rn(dim))` correctly reproduces the oracle's `1.0/len.sqrt()` (round-to-nearest
+  reciprocal ≡ IEEE `1.0/x`), and it is **not** `__frsqrt_rn`. RoPE uses raw `position` matching
+  `finalize_index_query`.
+- **weight_scale** uses the oracle's two-step division form: `__fdiv_rn(1,√dim)` then
+  `__fdiv_rn(.,√heads)`.
+- **dot→relu→weighted-head-sum** is bit-for-bit: device `acc=__fadd_rn(acc,__fmul_rn(q[d],key))`
+  ascending in `d` equals the oracle `fold(0, |s,(a,b)| s + a*b)` (non-FMA, ascending); `fmaxf(acc,0)`
+  ≡ `.max(0.0)`; `score=__fadd_rn(score,__fmul_rn(__fmul_rn(relu,weight),weight_scale))` ascending in
+  head equals `score += dot.max(0)*weight*weight_scale`. No stray FMA contraction (every fused op is
+  an `__f*_rn` intrinsic barrier; the lone `decode*block_scale` product feeds a multiply, not an add).
+- **On-the-fly FP4 key dequant** (`decode_e2m1(byte)*e8m0_scale(key[17*block])`) reproduces the
+  oracle's `all_index_logical` (`dequantize_fp4_e2m1_block`) in identical ascending-dim order.
+
+## Tests — non-tautological
+
+Both new tests assert `gpu[5] == cpu[5]` where `cpu` is the **independent** `run_cpu` oracle, never
+device-vs-device. `ratio4_device_topk_selection_multi_record_matches_cpu` asserts both real
+selections **and** `-1` padding are present (exercises full ordering + causal clamp).
+`ratio4_device_topk_tie_break_matches_cpu` engineers near-constant queries so per-record scores
+cluster in the low mantissa bits; the oracle would `Err` on an exact `==` tie, so its passing proves
+the fixtures produce distinct-but-near-equal scores that genuinely exercise the comparator — a
+1-ULP divergence would flip the winner and fail the assert.
+
+## Scope containment
+
+- CPU crate diff = **0 lines** (oracle + ratio-128 B2 unchanged).
+- Ratio-4 attention stages 6–7 remain host-staged (`device_attention = ratio == 128 && …`); only
+  stages 3–5 flipped to Device.
+- `cuda_graph_compatible()` still returns **false**.
+- D5 honored: only an index-set readback (plus the `total_sequence_length` scalar) crosses to host;
+  `selected_indices` is recomputed device-resident and replicated per index-head exactly like the
+  oracle's shared-selection write.
+
+## Notes (non-blocking, no change required)
+
+- **Residual numerical risk (inherent, pre-existing):** scores depend on `sincosf` vs Rust
+  `f32::sin_cos` transcendental parity, which is only *empirically* validated. It is heavily masked
+  by the subsequent bf16 rounding + FP4 quantization of the RoPE output, and is the same risk already
+  accepted and shipped in B3. Not introduced by this slice.
+- **Perf:** the scoring/selection kernel runs one thread per `(batch,query)` block by design (to fix
+  the f32 reduction order to the oracle). Correctness-first is the stated goal; parallelization is a
+  future concern, not a defect.
+
+## Evidence — test tail (real H200, no `--features cuda`)
+
+```
+running 17 tests
+test ratio4_device_topk_tie_break_matches_cpu ... ok
+test ratio4_prefill_claim_and_execute_matches_cpu ... ok
+test ratio4_device_index_stream_matches_cpu_oracle_across_decode_boundary ... ok
+test ratio4_device_topk_selection_multi_record_matches_cpu ... ok
+test ratio128_f32_device_attention_sink_material_matches_cpu ... ok
+test ratio128_f32_device_attention_matches_cpu ... ok
+test ratio128_prefill_then_two_decodes_matches_cpu ... ok
+test ratio128_device_compression_crosses_two_blocks_matches_cpu ... ok
+(+ 9 supports_op claim-contract tests)
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.65s
+```
+
+No missing-cuDNN `conv_gpu` failures occurred (nothing to ignore).
+
+**Verdict: 🟢 APPROVE.** No required changes; no fixer needed. (Had a fix been required, eligible
+non-Roy fixers were Deckard, Batty, Sapper, Leon.)
+
+## 2026-07-19 — Scribe inbox merge (CSA Phase B B5 landing)
+
+<!-- merged from deckard-csa-b5.md -->
+
+# CSA B5 candidate assembly (Deckard)
+
+Ratio-4 fused attention uses candidates ordered as `[dense window, selected top-k slots]`, with dense slots mapped from the causal window and selected slots mapped through `selected_indices` to packed FP8/BF16 records. Replicated index-head selection is read from head zero, as guaranteed by B4. `-1` slots remain `-inf` and contribute neither denominator nor values; `head_sink` contributes denominator-only mass. Bias broadcasts over the candidate axis, matching the CPU oracle.
+
+<!-- merged from chew-csa-b5-review.md -->
+
+# CSA Phase B B5 review (Chew) — 🔴 REJECT
+
+Chew found blocking B5-1: a schema-valid ratio-4 node with five outputs (omitting optional `selected_indices`) was misrouted to the ratio-128 f32 attention kernel because dispatch conflated ratio and output count. That kernel interpreted the 583-byte FP8 record as `f32[512]`, causing out-of-bounds reads and clobbering the host-staged `Y`. Roy was assigned the fix. Non-blocking findings were to add a bit-exact no-bias ratio-4 assertion and align out-of-range selected-record handling; N1 was required by the fix, while N2 remained unreachable for valid selections.
+
+<!-- merged from roy-csa-b5-fix.md -->
+
+# CSA B5 fix (Roy) — 🟢 APPROVED and LANDED
+
+Roy split the overloaded dispatch flag: `device_attention` retains its pre-B5 meaning (`ratio == 128 && f32 && !bias`), while `device_ratio4_attention` is keyed to `ratio == 4` and requires six outputs before invoking fused device attention. Five-output ratio-4 nodes now leave the host-oracle `Y` untouched and can never reach the ratio-128 kernel. The no-bias ratio-4 parity assertion was tightened to `max_ulp == 0`, and `ratio4_five_output_fused_attention_falls_back_to_host_oracle_bit_exact` covers the regression. Chew’s re-review approved the fix; 19/19 H200 GPU parity tests passed bit-exact. Landed in `1ddf01b`.
+
+<!-- merged from chew-csa-b5-rereview.md -->
+
+# CSA Phase B B5 re-review (Chew) — 🟢 APPROVE
+
+The ratio-keyed guards are mutually exclusive and correct for all ratio/output/dtype/bias combinations: ratio-128 f32/no-bias uses the ratio-128 kernel, ratio-4 six-output nodes use fused attention, and ratio-4 five-output nodes fall back to the host oracle. B4’s index-scoring block remains six-output gated. The new five-output regression test is independent and bit-exact, and the full target suite passed 19/19 on H200. `cuda_graph_compatible()` remains false; B6 is the next capture-compatibility slice.
+
+## 2026-07-19 — Scribe inbox merge (CSA Phase B B6 landing)
+
+<!-- merged from roy-csa-b6.md -->
+
+# Decision Note — CSA Phase B slice B6: CUDA-graph capture compatibility
+
+**Author:** Roy (Lead engineer)
+**Date:** 2026-07-19
+**Scope:** `pkg.nxrt::CompressedSparseAttention`, ratio-4 fp8 6-output config.
+**Landing:** `2a7703a`
+
+B6 makes the ratio-4 fp8 6-output decode step fully device-resident and capture-clean. `cuda_graph_compatible()` now returns `true` exactly for that configuration; every other configuration remains host-staged and `false`. The B4 index host readback was replaced by device-side `csa_ratio4_index_replicate`, cursors are device-resident, pooled workspaces have stable addresses, and the EP uses a dedicated non-blocking compute stream. All 20 CSA GPU parity/capture tests and the full ep-cuda suite passed on H200.
+
+The ratio-4 five-output path remains a host-oracle fallback, and ratio-128 remains non-capturable. The captured graph is fixed-geometry per step; multi-step cursor advancement with changing geometry is deferred to B7.
+
+<!-- merged from chew-csa-b6-review.md -->
+
+# CSA Phase B B6 numerics and capture-safety review
+
+**Reviewer:** Chew (Numerics Code Reviewer)
+**Date:** 2026-07-19
+**Verdict:** 🟡 **APPROVE-WITH-NITS**; mergeable and landed in `2a7703a`.
+
+B6 is numerically bit-exact and capture-safe for ratio-4 fp8 6-output: 20/20 CSA tests and the full ep-cuda suite passed on H200, including capture/replay byte identity against eager execution and the independent CPU oracle. Review confirmed no host round trips, device-resident cursors, stable state/workspace addresses, single-stream ordering, and intact non-capturable fallbacks.
+
+Deferred follow-ups for B7 are: assert or gate `topk_width <= max_topk`, document the prior eager warmup requirement for capture, and support steady multi-step cursor/geometry advancement.
+
+## 2026-07-19 — Scribe inbox merge (CSA Phase B B7 + Mobius-head E2E harness)
+
+<!-- merged from roy-csa-b7.md -->
+
+# CSA Phase B B7 — stream-ordered checkpoint/restore, device default switchover, observability metrics
+
+- **Owner:** Roy (Lead); **Landing:** `d81b96a`; **Scope:** CUDA `onnx-runtime-ep-cuda` CSA ratio-4 fp8 6-output config.
+- **Status:** This slice completes CSA Phase B.
+- Added opaque `CsaCheckpoint` and backend-owned `CsaCheckpointJournal` with five bounded cursors, generation identity, stable device snapshot buffers, and stream-ordered device-to-device carry copies. Restore validates generation and `accepted <= checkpoint.seq_cursor`, resets device cursor state, and relies on length masking for stale tails.
+- The supported capturable ratio-4 path is now device-resident by default. Host staging remains available through `ONNX_GENAI_CSA_FORCE_HOST` (non-empty except `0`), while unsupported configurations retain host fallback.
+- Added instance-scoped `Arc<CsaMetrics>` covering attention mode, bytes avoided, cursor lengths, stage timings, sink mass, rollback counts, and host/device byte totals. Captured hot-path recording is gated off with `!runtime.is_capturing()`.
+- B6 nits were folded in: top-k workspace bound validation and eager-warmup documentation. CSA validation passed 24 tests plus 1 ignored MTP smoke; the full CUDA EP suite was green on H200, and forced-host output remained bit-exact.
+- MTP composite atomicity and broader device paging remain gated on external Mobius/MTP artifacts.
+
+<!-- merged from chew-csa-b7-review.md -->
+
+# CSA Phase B B7 review — 🟡 APPROVE-WITH-NITS
+
+- **Reviewer:** Chew; **Reviewed commit:** `2351899`; **Fixer:** Sapper.
+- The speculative rollback proof is non-tautological and bit-exact against both a fresh accepted-only run and the independent CPU oracle. Generation guards, accepted-prefix bounds, stable snapshot addresses, stream ordering, capture safety, instance metrics, and unchanged numeric routing were verified; 24 CSA tests and the full ep-cuda suite passed on H200.
+- Two non-blocking follow-ups remain: add a rollback test that rejects a draft completing a compression block (N1), and correct the host-staged five-output ratio-4 metrics mode label (N2). Sapper owns both.
+
+<!-- merged from leon-e2e-harness.md -->
+
+# Pinned Mobius-head E2E harness
+
+- **Owner:** Leon; **Landing:** `3d47ea9`; **Scope:** Tier 1 GLM/DeepSeek engine E2E scaffolding only.
+- `tests/e2e/mobius_heads.json` pins GLM-5.2 to Mobius PR #404 at `fb52e7279c8a77bb1862f52a880d3743ca8e081e` and DeepSeek-V4-Flash to PR #405 at `7e26e6eb4e3a8839b311d59160ca947254afff4b`, with artifact paths, required files, prompts, token budgets, and expected text.
+- The ignored `e2e_mobius_heads` test uses `ONNX_GENAI_E2E_MODEL_DIR`, never downloads, and skips cleanly when artifacts are absent; present artifacts exercise `Engine::from_dir` and deterministic greedy generation. Kimi K3, accepted-prefix reuse, BQMoE paging, and CUDA EP changes are explicitly out of scope.
+
+<!-- merged from gaff-e2e-harness-review.md -->
+
+# Pinned Mobius-head E2E harness review — 🟢 APPROVE
+
+- **Reviewer:** Gaff; **Reviewed commit:** `e095e16` (landed as `3d47ea9`).
+- Scope is contained to the manifest and engine E2E test, follows existing ignored environment-gated real-model patterns, and contains no download or hard-coded artifact path. Validation passed with absent artifacts (clean skip/explicit skip path); real artifacts will intentionally fail on load/generation errors to expose exporter/runtime drift.
+
+
+---
+
+<!-- merged from bryant-conformance-refresh.md -->
+
+# ONNX backend conformance refresh — 2026-07-19
+
+A fresh ONNX 1.22.0 unfiltered node-model run of the pure-Rust CPU `nxrt` wheel
+increased CPU coverage from 360/1,765 to 875/1,765 passing cases (890 failing;
+all 1,765 CUDA variants skipped). The gain follows the expanded CPU operator
+registrations: the full Reduce family; logical and comparison ops; shape/data
+movement ops including Concat, Flatten, Squeeze, Unsqueeze, Size, GatherND,
+ScatterElements, OneHot, Tile, Range, CumSum, and NonZero; Where/Not; Gemm;
+QuantizeLinear/DequantizeLinear; Clip, ArgMax/ArgMin, TopK; and unary math.
+
+The largest remaining failure families are CastLike (96),
+SoftmaxCrossEntropyLoss/SCE (68), Attention (66), Cast (52), and Resize (39).
+`Unique` (opset 11) and legacy `Upsample` (opset 9) remain direct CPU EP
+registration gaps, as confirmed by fresh backend-test failures; no registration
+changes were made in this measurement-only refresh.
+
+
+---
+
+<!-- merged from deckard-cuda-numeric-drift.md -->
+
+### 2026-07-19: Root-cause the CUDA token-index-10 numeric drift
+**By:** Deckard
+
+**What:** The native decode parity harness is
+`crates/onnx-genai-engine/src/native_decode.rs::native_cuda_qwen_decode_matches_cpu_tokens`.
+On H200, rerunning the pre-fix parent `1bf47a8` reproduced the exact streams:
+
+- CPU: `[11576,42740,11,358,614,264,3405,911,279,330,34,1027,11766,11635,1,323]`
+- CUDA: `[11576,42740,11,358,614,264,3405,911,279,330,9707,4337,1,2025,304,356]`
+
+The first causal tensor divergence is not RoPE, GQA softmax, or MatMulNBits.
+With bit-identical inputs, layer-0 `SkipSimplifiedLayerNormalization` node 14
+first diverges at generated token index 1: 885/896 outputs differ, with maximum
+absolute error `9.536743e-7`. Its sequential RMS square sum differs by one ULP
+(`0x422e4301` for separate multiply/add versus `0x422e4302` for fused FMA).
+NVRTC contracted `ss += sv * sv`; the CPU oracle separately rounds the multiply
+and add. Token-0 SiLU also had a smaller `1.192093e-7` incidental difference,
+but it was not the recurrent source of the index-10 split.
+
+At token index 10 the accumulated RMS error first exceeds the trace tolerance
+at layer-6 GQA node 84: maximum absolute error `1.270249e-4`, 214/896 elements.
+Layer-7 GQA amplifies it to `3.993874e-2`; final logits differ by `1.310799`.
+The CPU top-two margin is only `5.833e-3`, so token 34 flips to 9707. Replaying
+the first tolerance-failing MatMulNBits node 128 with identical CPU input was
+bit-exact, ruling it out as the origin.
+
+The clean CUDA-side fix already landed as `de3c556`: both RMS reductions use
+`__fadd_rn(ss, __fmul_rn(x, x))`, with exact GPU regressions
+`simplified_layer_norm_does_not_contract_square_accumulation` and
+`skip_simplified_layer_norm_does_not_contract_square_accumulation`. This is a
+genuine FMA-contraction bug, not a fundamental reduction-order tolerance.
+
+H200 per-op checks on tested base `080f0ba` (still an ancestor of current
+`ec5118c`) measured:
+
+- RoPE: `0` maximum ULP, `0` maximum absolute error.
+- GQA attention output (including softmax/value accumulation): `4` maximum ULP,
+  `1.4901161e-8` maximum absolute error over 64 tokens.
+- Accuracy-level-4 MatMulNBits, K=4864/N=896: `2.670288e-5` maximum absolute
+  error and `3096` global maximum ULP (the ULP maximum is dominated by values
+  near zero); it remains within the existing `3e-5` bound and is not the
+  first-diverging tensor.
+
+The full `onnx-runtime-ep-cuda` suite passes on H200. The post-fix 64-token
+real-model harness passes at `ccf994c` (including exact CPU/CUDA token equality);
+the token-index-10 flip is resolved. On current `ec5118c`, rebuilding that engine
+harness is independently blocked because `onnx-genai-engine --features
+cuda,native-backend` unifies cudarc `cuda-12060` from `onnx-genai-ort` with
+`cuda-13000` from `onnx-runtime-ep-cuda`, producing cudarc binding conflicts.
+This build-feature regression postdates the numeric fix and does not affect the
+current CUDA EP kernel tests.
+
+**Why:** The long-context failure was recurrent amplification of a one-ULP RMS
+reduction boundary caused by unintended FMA contraction. Explicit non-FMA CUDA
+arithmetic restores the CPU contract without changing the CPU oracle or forcing
+an expensive serial emulation in RoPE, attention, or MatMulNBits.
+
+<!-- Source: deckard-cudarc-version-unify.md -->
+### 2026-07-19: Select one cudarc CUDA API version per build graph
+**By:** Deckard
+**What:** Keep `onnx-genai-ort --features cuda` defaulting to CUDA 12.6 through a weak default version feature, while `onnx-genai-engine/cuda` disables that dependency default and explicitly selects CUDA 13.0 to match `onnx-runtime-ep-cuda`.
+**Why:** cudarc 0.19's build script chooses the highest enabled CUDA feature for its version environment, but its generated bindings still compile against every raw Cargo CUDA-version cfg. Enabling 12.6 and 13.0 together therefore creates duplicate and inconsistent binding definitions rather than a usable highest-version-wins build.
+
+<!-- Source: pris-test-staleness-guard.md -->
+### 2026-07-19: Use an unregistered synthetic operator in unsupported-op tests
+**By:** Pris
+**What:** Replaced the mutable real-op fixture with `NxrtNeverRegisteredSentinelOp` in the executor unsupported-op error tests.
+**Why:** A synthetic sentinel prevents future CPU EP registrations from invalidating tests meant to exercise the handler-miss diagnostic path.
+
+---
+
+## 2026-07-19 — Scribe inbox merge (CSA B7 nits and cudarc unify closeout)
+
+<!-- merged from sapper-csa-b7-nits.md and chew-csa-b7-nits-rereview.md -->
+
+### 2026-07-19: CSA B7 nits closed out
+**By:** Sapper; re-reviewed by Chew
+**What:** Sapper added a ratio-4 speculative rollback boundary regression that checkpoints at cursor 13, drafts through cursor 16 to complete a compressed/index record and reset both carries, then verifies rollback to the pre-block carry and bit-exact continuation parity with both a fresh accepted-only GPU run and the independent CPU oracle. The five-output ratio-4 path now reports `Host` metrics mode because its `Y` is produced by the host oracle; device attention is only executed for six-output ratio-4 nodes.
+**Why:** Chew approved the fix: the N1 coverage now genuinely crosses and discards a completed record boundary, N2 corrects only the diagnostic metrics label, and the diff makes no checkpoint/restore numeric or kernel/compute changes.
+**Validation:** On H200, `cargo test -p onnx-runtime-ep-cuda --test compressed_sparse_attention_gpu` passed: 25 passed, 1 ignored.
+
+<!-- merged from gaff-cudarc-version-unify.md -->
+
+### 2026-07-19: Approve cudarc CUDA-version unification
+**By:** Gaff
+**What:** Approved Deckard's landed `db3f733`: engine CUDA resolves cudarc only at CUDA 13.0, standalone ORT CUDA resolves at CUDA 12.6, and non-CUDA ORT does not activate cudarc.
+**Why:** All requested builds and CUDA EP tests passed on H200. Cargo 1.97 rejects `{ workspace = true, default-features = false }` because member manifests cannot override the workspace dependency's defaults, so the inline dependency is necessary without changing workspace-wide defaults; its pinned version matches `0.1.0-dev.2`.
+
+## 2026-07-19 — Scribe inbox merge (CPU-EP op coverage wave, 14:10Z)
+
+<!-- merged from bryant-scan-window-ops.md -->
+
+### 2026-07-19: Correct cumulative scans and add cumulative product/window kernels
+**By:** Bryant
+**What:** Updated CumSum to its current opset-14 registration and replaced its Float32/Int64-only path with dtype-generic ONNX scan logic covering Uint32/Uint64/Int32/Int64/Float16/Float32/Float64/BFloat16. Added CumProd at opset 26 and HannWindow, HammingWindow, and BlackmanWindow at opset 17, including periodic/symmetric and output-datatype handling.
+**Why:** CumSum's registration was stale and its kernel rejected Int32 backend cases; sharing a typed scan with explicit additive/product identities makes exclusive, reverse, negative-axis, and integer behavior consistent. Window formulas and Hamming's 25/46 alpha were matched against `onnx.reference.ops`. `cargo test -p onnx-runtime-ep-cpu` passes 534 tests (1 ignored), including 12 sequence tests and 3 window tests; clippy passes with 19 pre-existing warnings and none in the changed files.
+
+
+<!-- merged from chew-review-scan-window.md -->
+
+### 2026-07-19: Scan and window CPU kernel review
+**By:** Chew
+**What:** 🟡 APPROVE-WITH-NITS commit `5816d239b64f955a0f655afe0a97dda5c3546629`.
+**Why:** CumSum is registered at opset 14 and dispatches every schema dtype (`uint32`, `uint64`, `int32`, `int64`, `float16`, `float32`, `float64`, `bfloat16`). Its scan order correctly makes exclusive shift in the forward or reverse scan direction, including negative axes and 2-D axis 0/1 cases. CumProd shares the correct scan implementation, uses product identity 1, and is registered at opset 26. Window formulas match the ONNX reference exactly: Hann `0.5/0.5` via `sin²`, Hamming `25/46` and `21/46` (not `0.54/0.46`), Blackman `0.42/0.5/0.08`; periodic uses denominator `N`, symmetric uses `N-1`, and defaults are `periodic=1`, `output_datatype=float32`. Reference-computed size-5 tests cover both denominator modes and cumulative tests use explicit expected values. `cargo test -p onnx-runtime-ep-cpu` passes (534 passed, 0 failed, 1 ignored); `cargo clippy -p onnx-runtime-ep-cpu` exits successfully with 19 warnings. The commit changes only the three requested CPU EP files, and `mod.rs` contains only module/registration plus registry-test updates. Nits: cumulative axis validation accepts any one-element tensor rather than requiring ONNX's rank-0 scalar, and tests do not directly exercise factory defaults or non-f32 window output datatypes.
+
+
+<!-- merged from deckard-hardmax-bitwise-fix.md -->
+
+### 2026-07-19
+
+**By:** Deckard
+
+**What:** Added Hardmax Float16/BFloat16 dispatch and half-precision tests; strengthened Bitwise broadcast coverage with non-uniform operands across all integer dtypes, plus dtype rejection tests; added Hardmax invalid-axis rejection coverage.
+
+**Why:** Addressed Luv's rejected-review findings while preserving the existing kernel algorithms.
+
+
+<!-- merged from luv-rereview-bitwise-hardmax.md -->
+
+### 2026-07-19: Approve revised Bitwise and Hardmax CPU kernels
+**By:** Luv
+**What:** 🟢 APPROVE commit `7fe8961d2a77a02afa345041fecccd8d9f8d091e`.
+**Why:** All four rejection points are resolved. Hardmax dispatches Float16, Float32, Float64, and BFloat16, with hand-computed fp16/bf16 first-tied-maximum tests. It uses the existing typed `FloatElem` read/write plumbing directly, compares values in their native dtype, emits exact typed zero/one values, and retains strict `>` first-max behavior. Invalid axes return `EpError` and have regression coverage.
+
+Bitwise broadcast tests now use non-uniform `[3,1]` and `[1,4]` operands with hand-computed `[3,4]` expectations for And/Or/Xor across all eight integer dtypes, so incorrect broadcast indexing is observable. Explicit tests reject float inputs, mixed input dtypes, and mismatched output dtypes.
+
+Validation passed: `cargo test -p onnx-runtime-ep-cpu` reported 537 passed, 0 failed, 1 ignored; `cargo clippy -p onnx-runtime-ep-cpu` completed successfully with 19 existing warnings. Revision `43df6c0..7fe8961` changes only `bitwise.rs` and `hardmax.rs`; the full artifact changes only those files plus kernel registration/count updates in `mod.rs`, all under `crates/onnx-runtime-ep-cpu`.
+
+
+<!-- merged from luv-review-bitwise-hardmax.md -->
+
+### 2026-07-19: Reject Bitwise and Hardmax CPU kernels
+**By:** Luv
+**What:** 🔴 REJECT commit `43df6c02df608b3632c3989efd7b1fd31a2b9795`. Deckard must own the revision; Pris is locked out from revising this artifact.
+**Why:** `hardmax.rs:30-34` dispatches only Float32 and Float64, but ONNX Hardmax-13 requires Float16, Float32, Float64, and BFloat16, so valid models using Float16 or BFloat16 are rejected. Add both missing dispatches and hand-computed tests.
+
+The bitwise implementation correctly restricts dispatch to all eight integer dtypes, rejects mixed input/output dtypes, implements complement, and uses NumPy-style broadcasting. Hardmax axis normalization and strict `>` comparison correctly implement negative axes and first-max tie-breaking. Registrations use domain `""` and opsets 18/13 as required.
+
+The bitwise broadcasting tests at `bitwise.rs:211-240` are not genuine broadcasting regressions: both operands are uniform repeated bytes, so every output is identical and incorrect index mapping would still pass. Replace or supplement them with non-uniform typed operands and hand-computed expected tensors, while retaining coverage of all eight integer dtypes. Add explicit rejection tests for float bitwise inputs and unequal bitwise dtypes, plus Hardmax invalid-axis coverage.
+
+Validation passed: `cargo test -p onnx-runtime-ep-cpu` reported 532 passed, 0 failed, 1 ignored; `cargo clippy -p onnx-runtime-ep-cpu` exited successfully with 19 pre-existing warnings. The commit changes only the three requested files inside `onnx-runtime-ep-cpu`; `mod.rs` only adds module/registration lines and updates the registry-count test.
+
+
+<!-- merged from pris-bitwise-hardmax.md -->
+
+### 2026-07-19: Add CPU Bitwise and Hardmax kernels
+**By:** Pris
+**What:** Added opset-18 BitwiseAnd, BitwiseOr, BitwiseXor, and BitwiseNot for Int8/16/32/64 and Uint8/16/32/64 with NumPy broadcasting; added opset-13 Hardmax for Float32 and Float64 with first-maximum tie handling.
+**Why:** These operators were missing from the pure-Rust CPU EP and blocked ONNX backend node conformance tests. Added 6 deterministic kernel tests; the CPU EP suite now has 532 passing tests (1 ignored).
+
+<!-- merged from bryant-conformance-921.md -->
+
+### Date
+
+2026-07-19
+
+### By
+
+Bryant (Tester)
+
+### What
+
+Refreshed the ONNX 1.22.0 backend node-model report to 921/1,765 CPU passes,
+844 failures, and 1,765 skipped CUDA variants. The +46 cases cover the CumSum
+fix (int32, exclusive/reverse, negative axis), CumProd, BitwiseAnd/Or/Xor/Not,
+Hardmax including fp16/bf16, and Hann/Hamming/Blackman window kernels.
+
+### Why
+
+Built the CPU-only Python wheel with `maturin develop --release
+--no-default-features`, ran `tests/test_onnx_backend.py` with JUnit output, and
+derived each tab-separated result row and aggregate header count from that
+JUnit report. The window `*_expanded` cases remain failures because they test
+reference decomposition graphs rather than the base kernels.
+
+<!-- merged from bryant-activations-lpnorm.md -->
+
+### 2026-07-19: Add missing CPU activation and Lp normalization kernels
+**By:** Bryant
+**What:** Added and registered ai.onnx Selu (opset 6), ThresholdedRelu (opset 10), and LpNormalization (opset 1). Selu uses the ONNX defaults alpha=1.67326319 and gamma=1.05070102; ThresholdedRelu defaults alpha=1.0; LpNormalization defaults axis=-1 and p=2, accepts p=1 or p=2, and clamps the divisor to the compute dtype's smallest positive normal value. Selu and ThresholdedRelu match the existing activation path's Float32 coverage; LpNormalization supports Float16, BFloat16, Float32, and Float64. Four new unit tests cover activation defaults/custom attributes/boundaries and L1/L2 normalization across axes 0, 1, and -1. The full CPU EP suite passes 549 tests with 1 ignored.
+**Why:** These standard ONNX operators were absent from the live CPU registry, causing their ONNX backend node tests to fail despite being straightforward CPU kernels.
+
+
+<!-- merged from bryant-conformance-936.md -->
+
+### 2026-07-19: Refresh ONNX backend conformance baseline to 936 passes
+**By:** Bryant
+**What:** Updated the documented and per-test ONNX backend node-model results to 936 passed, 829 failed, and 1,765 skipped on main commit `39edb76`.
+**Why:** The current unfiltered ONNX 1.22.0 suite measurement includes the latest reduction-op fixes and Selu, ThresholdedRelu, and LpNormalization kernel coverage.
+
+
+<!-- merged from chew-rereview-reduce-fixes.md -->
+
+### 2026-07-19: Reduce axes-semantics fix re-review
+**By:** Chew
+**What:** 🟢 APPROVE commit `6e97ee6` on `dc229c1`.
+**Why:** The fix now distinguishes an omitted/absent axes input from a present empty axes tensor. Omitted axes reduce all regardless of `noop_with_empty_axes`; present-empty axes are identity when noop=1 and reduce all when noop=0. Tests cover all three cases and verify ReduceSum's additive identity when reducing an empty dimension. The change is confined to axes resolution and tests, preserving stable LogSumExp, boolean OR/AND ReduceMax/ReduceMin, keepdims behavior, and negative-axis normalization. `cargo test -p onnx-runtime-ep-cpu` passes: 552 passed, 0 failed, 1 ignored; doc tests also pass.
+
+
+<!-- merged from chew-review-reduce-fixes.md -->
+
+### 2026-07-19: Reject CPU reduce fixes pending omitted-axes correction
+**By:** Chew
+**What:** 🔴 REJECT commit `dc229c1`; Deckard should own the revision. In `crates/onnx-runtime-ep-cpu/src/kernels/reduce_ops.rs:270-273`, an omitted axes input with `noop_with_empty_axes=1` leaves every reduce-mask entry false, producing an identity instead of the ONNX-required reduce-all result. Distinguish omitted axes (`None` => reduce all) from an explicitly empty axes tensor (`Some([])` => identity only when noop is enabled), and add the missing regression test.
+**Why:** Opset-18 semantics apply `noop_with_empty_axes` only to an explicitly empty axes input; omission still reduces all axes. The existing tests cover attribute axes, axes input/negative axis/keepdims=false, omitted axes with default noop=false, explicit-empty noop=true, Bool Max/Min, and zero-sized retained ReduceSum output, but do not cover omitted axes with noop=true (which would expose this defect) or directly assert the non-empty zero identity result for reducing an empty dimension. LogSumExp max-subtraction, bool OR/AND identities, registry count `+68`, and the remaining tested behavior are correct. `cargo test -p onnx-runtime-ep-cpu` passed: 549 passed, 1 ignored; doctests passed with 1 ignored.
+
+
+<!-- merged from deckard-activations-dtypes.md -->
+
+### 2026-07-19: Activation float dtype coverage
+**By:** Deckard
+**What:** Updated the shared attribute-driven activation execution path to widen f16, bf16, and f64 inputs to f32 and narrow results back to the output dtype; added Selu and ThresholdedRelu coverage for those types.
+**Why:** ONNX permits these float dtypes for both operators, while their previous f32-only tensor helpers rejected them.
+
+
+<!-- merged from deckard-reduce-noop-fix.md -->
+
+### 2026-07-19: Reduce axes omission ignores noop flag
+**By:** Deckard
+**What:** Updated the CPU reduction axes resolver so an omitted axes input always reduces all dimensions; `noop_with_empty_axes=1` remains an identity only for an explicitly present, empty axes tensor. Added coverage for omitted axes, both empty-input modes, and Sum's additive identity over a reduced empty dimension.
+**Why:** ONNX opset-18 scopes `noop_with_empty_axes` exclusively to a present-but-empty axes input. Treating an omitted input as empty incorrectly produced an identity instead of reduce-all.
+
+
+<!-- merged from gaff-review-conformance-921.md -->
+
+### 2026-07-19: Approve conformance refresh to 921 CPU node cases
+**By:** Gaff
+**What:** 🟢 APPROVE commit `cbc049668f21d34c98ef05229e6c04618576bb1e`.
+**Why:** The commit changes only `docs/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`. The results header and all 3,530 rows agree (921 passed, 844 failed, 1,765 skipped; CPU 921/844 and CUDA 1,765 skipped), with no duplicate test names. All requested CumSum, non-expanded CumProd, Bitwise, Hardmax, and non-expanded window CPU cases pass; only the documented expanded window variants remain failed. The documentation reports 921/844, preserves the 360 and 875 historical records, adds the dated +46-case wave, and keeps newly supported operators out of the current representative-failure examples. `git diff --check` passes; the suite was not rerun because the recorded data is internally consistent.
+
+
+<!-- merged from gaff-review-conformance-936.md -->
+
+### 2026-07-19: Review conformance refresh to 936
+**By:** Gaff
+**Verdict:** 🟡 APPROVE-WITH-NITS (landable)
+
+Commit `4c05ede` is internally consistent and the data file is intact:
+
+- `docs/EP_CONFORMANCE.md` reports 936 passed, 829 failed, and 1,765 skipped (3,530 collected).
+- The 360, 875, and 921 historical measurements remain documented, with the new 936 measurement added.
+- The reproduction command still uses `maturin develop --release --no-default-features`.
+- `onnx_backend_node_results.txt` has 3,530 well-formed tab-separated rows: 936 passed + 829 failed + 1,765 skipped = 3,530. CPU and CUDA each have 1,765 entries.
+- The result file retains its prior 3,537-line length and unchanged table structure; the diff contains exactly 15 CPU status changes from failed to passed.
+- Both files agree on all totals.
+
+**Nit:** The prose says the +15 includes a ReduceLogSumExp opset-18 fix, but none of the 15 changed result rows is a ReduceLogSumExp test. The changed rows are six LpNormalization cases, two bool reductions, one ReduceSum empty-set case, three Selu cases, and three ThresholdedRelu cases. Consider removing or clarifying the ReduceLogSumExp attribution in a follow-up; this does not affect the recorded counts or landability.
+
+
+<!-- merged from luv-rereview-activations-dtypes.md -->
+
+### 2026-07-19: Re-review activations dtype fix
+**By:** Luv
+**What:** 🔴 REJECT commit `08cc025`; Sapper should own the next revision.
+**Why:** The fix accepts all four float storage dtypes, preserves Selu's defaults (`alpha = 1.6732632`, `gamma = 1.050701`) and ThresholdedRelu's strict `x > alpha` behavior/default `alpha = 1.0`, but it does not preserve the crate's compute-domain convention for `f64`.
+
+#### Blocking finding
+
+- **High — `f64` inputs are narrowed to `f32` before computation.** `crates/onnx-runtime-ep-cpu/src/kernels/activations.rs:189-193` routes every dtype through `to_dense_f32_widen` and `Activation::apply(f32)`. That helper explicitly converts `f64` storage to `f32` (`dtype.rs:474-500`), while the crate convention requires `f16`/`bf16`/`f32` computation in `f32` and `f64` computation in `f64` (`dtype.rs:12-15`, `dtype.rs:162-177`). This silently discards `f64` input precision and evaluates Selu's transcendental operation in the wrong domain.
+- The new Selu `f64` test does not detect this defect: `activations.rs:323-359` derives expected values by calling the same `Activation::apply(f32)` implementation and then casts those already-rounded values to `f64`. The ThresholdedRelu `f64` case uses exactly representable values (`activations.rs:372-391`), so it also cannot distinguish correct `f64` computation from the current `f32` round-trip.
+
+The non-`f32` tests do exercise `f16`, `bf16`, and `f64` storage paths and ThresholdedRelu's strict boundary, but the `f64` assertions must use independently computed, precision-sensitive expectations. `LpNormalization` and the registry-count assertion are unchanged by the fix; the registry still asserts `PHASE1_OPS.len() + 70` and retains the `LpNormalization` lookup. `cargo test -p onnx-runtime-ep-cpu` completed successfully.
+
+
+<!-- merged from luv-rereview-activations-f64.md -->
+
+### 2026-07-19: Activations f64 precision re-review
+**By:** Luv
+**What:** 🟢 APPROVE commit `1e6e29e` on `08cc025`.
+**Why:** The Float64 dispatch now reads, computes, and writes `f64` without routing tensor values through `f32`. Float32 remains on the existing `f32` path, while Float16/BFloat16 widen to `f32` and narrow on output. SELU retains the ONNX defaults (`alpha` ≈ 1.67326319, `gamma` ≈ 1.05070102), and ThresholdedRelu retains default `alpha = 1.0` with strict `x > alpha`.
+
+The new Float64 SELU and ThresholdedRelu cases use a `1e-12` tolerance and precision-sensitive inputs. Simulating the former Float32-narrowed path produces errors of approximately `6.3e-8`/`2.2e-7` for SELU and `9.5e-9` for ThresholdedRelu, so these tests would fail under the rejected implementation. Float16 (`1e-3`) and BFloat16 (`1e-2`) SELU tolerances remain appropriate; ThresholdedRelu half tests are exactly representable.
+
+The fix commit does not modify LpNormalization or the registry/count assertion. `cargo test -p onnx-runtime-ep-cpu` passes: 551 passed, 0 failed, 1 ignored; the doctest target also passes with its single test ignored.
+
+
+<!-- merged from luv-review-activations-lpnorm.md -->
+
+### 2026-07-19: Reject activations/LpNormalization CPU kernels
+**By:** Luv
+**What:** 🔴 REJECT commit `81b0a8d`. Deckard should own the revision; Bryant is locked out from revising this artifact. Add Float16/Float64 support for opset-6 `Selu` and opset-10 `ThresholdedRelu`, plus BFloat16 support when resolving the opset-22 schemas, and add dtype tests. Also add an explicit all-zero `LpNormalization` test for its divide-by-zero contract.
+**Why:** Both activation registrations resolve from their minimum opset onward, but `ActivationKernel::execute` routes every non-SiLU activation through the f32-only `to_dense_f32`/`write_dense_f32` path (`crates/onnx-runtime-ep-cpu/src/kernels/activations.rs:180-193`); those helpers explicitly require `Float32` (`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:787-790,911-914`). ONNX permits Float16/Float32/Float64 for these original schemas and adds BFloat16 at opset 22, so valid models fail at runtime. Existing activation tests use only f32 (`activations.rs:263-317`). The formulas/defaults and strict ThresholdedRelu boundary are correct. `LpNormalization` correctly implements L1/L2, negative axes, zero guarding, and generic float dispatch (`lp_normalization.rs:102-142`), with meaningful f32 axis/default tests, but no dtype or all-zero test (`lp_normalization.rs:161-209`). Registry count `+67 → +70` matches the three registrations. `cargo test -p onnx-runtime-ep-cpu` passed: 549 passed, 0 failed, 1 ignored; doc-test ignored.
+
+
+<!-- merged from pris-reduce-fixes.md -->
+
+### 2026-07-19: Reduce opset-18 axes and empty-output fixes
+**By:** Pris
+**What:** Added the opset-18 `ReduceLogSumExp` registration while retaining the legacy registration, routed all shared reductions through input-or-attribute axes resolution, added boolean ReduceMax/ReduceMin logical reductions, and emitted zero elements for reductions whose retained output axis has length zero.
+**Why:** Modern ReduceLogSumExp models pass axes as optional input 1 (or omit it to reduce all); the versioned registration makes this schema discoverable. The shared axes resolver also benefits ReduceSum, Max, Min, Prod, SumSquare, L1/L2, and LogSum. Bool extrema require OR/AND identities, and zero-sized outputs must not serialize the scalar scratch accumulator.
+
+
+<!-- merged from sapper-activations-f64-fix.md -->
+
+### 2026-07-19: Preserve f64 activation precision
+**By:** Sapper
+**What:** Added a dedicated f64 activation execution path and precision-sensitive Selu and ThresholdedRelu f64 tests.
+**Why:** Float64 inputs must not be narrowed through f32 computation, which loses precision before results are written.

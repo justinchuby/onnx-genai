@@ -6,8 +6,12 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 _Last updated: 2026-07-19T14:10Z — CPU-EP op-coverage wave advanced backend node conformance to 921 passing._
 
-**Current `origin/main` implementation HEAD:** `0b38d59`.
+**Current `origin/main` implementation HEAD:** `4c05ede`.
 
+
+## 2026-07-19 — CPU-EP op coverage 921→936
+
+- **CPU-EP coverage ✅ landed (`4c05ede`):** fixed ReduceLogSumExp opset-18 axes-input semantics, ReduceMax/Min Bool identities, and ReduceSum empty-set behavior; added Selu, ThresholdedRelu, and LpNormalization. Backend node conformance advanced **921→936 passing (+15)**, with 829 failing and 1,765 skipped.
 
 ## Current tiered-memory and interoperability milestones
 

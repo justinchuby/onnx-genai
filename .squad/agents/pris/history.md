@@ -82,3 +82,11 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 
 ## 2026-07-18T01:20:34Z — PR #25 lifecycle regression landed
 - Replaced simulated lifecycle coverage with an isolated child-process test using real `Environment` create/drop and plugin registration; Vasquez approved `dbff29c`, and PR #25 merged.
+
+## 2026-07-19T13:35Z — test-staleness guard
+- Hardened unsupported-op executor tests with `NxrtNeverRegisteredSentinelOp` so future real-op registrations cannot invalidate handler-miss diagnostics; landed as `6ba4d96` with 23/23 executor and full session suite passing.
+## 2026-07-19T14:10Z — Bitwise/Hardmax rejected
+- Added initial Bitwise* and Hardmax (`43df6c0`/integrated `43c0315`), but Luv 🔴 rejected missing fp16/bf16 Hardmax and weak broadcast/rejection tests. Pris is locked out; Deckard owned the revision.
+
+
+- **2026-07-19T16:15:00Z — CPU-EP reduction wave:** Authored ReduceLogSumExp opset-18 axes-input support, boolean ReduceMax/Min, and empty-set ReduceSum handling in `dc229c1`; Deckard corrected omitted-axes/noop semantics and the fix landed as `6e97ee6`.

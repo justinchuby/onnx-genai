@@ -34,3 +34,13 @@
 - The landing also includes the ONNX v1.20/IR13 spec-coverage audit; remaining gaps are tracked for Sapper.
 
 - 2026-07-18 Scribe: Reshape/Split review and approval recorded; final fixes landed in 4ff24cb.
+
+- 2026-07-19T12:40Z: Refreshed ONNX backend-test conformance artifacts; live CPU node coverage is 875/1,765 passing at ec5118c (890 failing; CUDA variants skipped).
+
+## 2026-07-19T13:35Z — test-staleness guard
+- 🟢 Approved Pris's unsupported-op sentinel guard after verifying `NxrtNeverRegisteredSentinelOp` remains unregistered and 23/23 executor tests pass; landed as `6ba4d96`.
+## 2026-07-19T14:10Z — CPU scan/window op coverage
+- Landed `5816d23`: CumSum opset-14 fix, CumProd opset-26, and Hann/Hamming/Blackman windows. Chew 🟡 approved with nits; backend node suite later reached 921 passing.
+
+
+- **2026-07-19T16:15:00Z — CPU-EP coverage:** Added Selu, ThresholdedRelu, and LpNormalization; after dtype/f64 review fixes, refreshed backend conformance artifacts to 936/829/1765 in `4c05ede`.
