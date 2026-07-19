@@ -599,6 +599,7 @@ impl PipelineEngine {
                 } else {
                     clone_value(model_output)?
                 };
+                dump_iterative_step(&plan.denoiser, in_port, step, &next);
                 carried.insert(in_port.clone(), next);
             }
             last_outputs = out_map;
@@ -1034,7 +1035,32 @@ struct SinglePassPlan {
     dataflow: Vec<DataflowEdge>,
 }
 
-/// Bounded iterative loop (diffusion denoise / other fixed-step refinement).
+/// Dump one iterative step's loop-carried tensor to `ONNX_GENAI_STEP_DUMP_DIR`
+/// (when set) as `step_{i}_{port}.json` — used by the diffusion demo to animate
+/// the reverse process. Best-effort; failures are ignored (never affects a run).
+fn dump_iterative_step(denoiser: &str, port: &str, step: usize, value: &Value) {
+    let Ok(dir) = std::env::var("ONNX_GENAI_STEP_DUMP_DIR") else {
+        return;
+    };
+    let shape: Vec<i64> = value.shape().to_vec();
+    // Emit int64 token sequences as integers (language diffusion) and everything
+    // else as f32 (image latents).
+    let payload = match value.dtype() {
+        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => value
+            .to_vec_i64()
+            .ok()
+            .map(|data| serde_json::json!({"dtype": "i64", "shape": shape, "data": data})),
+        _ => value
+            .to_vec_f32()
+            .ok()
+            .map(|data| serde_json::json!({"dtype": "f32", "shape": shape, "data": data})),
+    };
+    if let Some(payload) = payload {
+        let path = std::path::Path::new(&dir).join(format!("step_{step:04}_{denoiser}_{port}.json"));
+        let _ = std::fs::write(path, payload.to_string());
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IterativePlan {
     /// The component re-invoked once per step.

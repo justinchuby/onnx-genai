@@ -161,6 +161,10 @@ impl SchedulerConfig {
 pub struct ComfyUiWorkflow {
     /// Native pipeline metadata (topology + scheduler + guidance).
     pub metadata: InferenceMetadata,
+    /// The same native pipeline metadata as raw JSON (`{"pipeline": {...}}`),
+    /// convenient for display/serialization since [`InferenceMetadata`] is
+    /// deserialize-only.
+    pub metadata_json: serde_json::Value,
     /// Positive-conditioning prompt text, if recoverable.
     pub prompt: Option<String>,
     /// Negative-conditioning prompt text, if recoverable.
@@ -371,7 +375,7 @@ fn build_pipeline_metadata(
     start_step: Option<u32>,
     has_text_encoder: bool,
     has_vae: bool,
-) -> Result<InferenceMetadata, ComfyUiConfigError> {
+) -> Result<Value, ComfyUiConfigError> {
     if num_steps < 1 {
         return Err(ComfyUiConfigError::Unsupported(
             "num_steps must be >= 1".into(),
@@ -451,7 +455,7 @@ fn build_pipeline_metadata(
     }
 
     let root = json!({ "pipeline": Value::Object(pipeline) });
-    Ok(serde_json::from_value(root)?)
+    Ok(root)
 }
 
 /// Parse a ComfyUI API-format workflow (`serde_json::Value`) into a structured
@@ -523,7 +527,7 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
     // the flag off so behavior is well-defined (parity with the Python warning).
     let _ = known_spacing;
 
-    let metadata = build_pipeline_metadata(
+    let metadata_json = build_pipeline_metadata(
         steps,
         &scheduler,
         guidance,
@@ -531,9 +535,11 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
         has_text_encoder,
         has_vae,
     )?;
+    let metadata = serde_json::from_value(metadata_json.clone())?;
 
     Ok(ComfyUiWorkflow {
         metadata,
+        metadata_json,
         prompt,
         negative_prompt,
         width,
