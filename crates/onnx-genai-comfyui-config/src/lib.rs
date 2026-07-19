@@ -631,24 +631,24 @@ mod tests {
 
     #[test]
     fn parses_core_txt2img() {
-        let wf = parse_workflow(&txt2img_graph()).unwrap();
-        assert_eq!(wf.prompt.as_deref(), Some("a fox"));
-        assert_eq!(wf.negative_prompt.as_deref(), Some("blurry"));
-        assert_eq!((wf.width, wf.height, wf.batch_size), (768, 512, 2));
-        assert_eq!(wf.seed, 42);
-        assert_eq!(wf.steps, 20);
-        assert_eq!(wf.cfg, 7.5);
-        assert_eq!(wf.sampler_name, "euler");
-        assert_eq!(wf.scheduler_kind, "euler");
-        assert_eq!(wf.scheduler_spacing, "karras");
-        assert_eq!(wf.checkpoint.as_deref(), Some("sd15.safetensors"));
-        assert_eq!(wf.start_step, 0);
+        let workflow = parse_workflow(&txt2img_graph()).unwrap();
+        assert_eq!(workflow.prompt.as_deref(), Some("a fox"));
+        assert_eq!(workflow.negative_prompt.as_deref(), Some("blurry"));
+        assert_eq!((workflow.width, workflow.height, workflow.batch_size), (768, 512, 2));
+        assert_eq!(workflow.seed, 42);
+        assert_eq!(workflow.steps, 20);
+        assert_eq!(workflow.cfg, 7.5);
+        assert_eq!(workflow.sampler_name, "euler");
+        assert_eq!(workflow.scheduler_kind, "euler");
+        assert_eq!(workflow.scheduler_spacing, "karras");
+        assert_eq!(workflow.checkpoint.as_deref(), Some("sd15.safetensors"));
+        assert_eq!(workflow.start_step, 0);
     }
 
     #[test]
     fn builds_iterative_pipeline_metadata() {
-        let wf = parse_workflow(&txt2img_graph()).unwrap();
-        let pipeline = wf.metadata.pipeline.expect("pipeline present");
+        let workflow = parse_workflow(&txt2img_graph()).unwrap();
+        let pipeline = workflow.metadata.pipeline.expect("pipeline present");
         // Three components: denoiser, text_encoder, vae.
         assert!(pipeline.models.contains_key("denoiser"));
         assert!(pipeline.models.contains_key("text_encoder"));
@@ -664,9 +664,9 @@ mod tests {
             Some("encoder_hidden_states")
         );
         // Karras spacing propagated to the scheduler config.
-        let sched = strategy.scheduler_config.as_ref().unwrap();
-        assert_eq!(sched.kind, "euler");
-        assert_eq!(sched.use_karras_sigmas, Some(true));
+        let scheduler = strategy.scheduler_config.as_ref().unwrap();
+        assert_eq!(scheduler.kind, "euler");
+        assert_eq!(scheduler.use_karras_sigmas, Some(true));
         // Loop-carried self-edge is present.
         assert!(
             pipeline
@@ -680,8 +680,8 @@ mod tests {
     fn cfg_one_disables_guidance() {
         let mut graph = txt2img_graph();
         graph["3"]["inputs"]["cfg"] = json!(1.0);
-        let wf = parse_workflow(&graph).unwrap();
-        let strategy = wf.metadata.pipeline.unwrap().strategy;
+        let workflow = parse_workflow(&graph).unwrap();
+        let strategy = workflow.metadata.pipeline.unwrap().strategy;
         assert_eq!(strategy.guidance_scale, None);
         assert_eq!(strategy.cfg_conditioning_input, None);
     }
@@ -690,11 +690,11 @@ mod tests {
     fn denoise_below_one_sets_start_step() {
         let mut graph = txt2img_graph();
         graph["3"]["inputs"]["denoise"] = json!(0.6);
-        let wf = parse_workflow(&graph).unwrap();
+        let workflow = parse_workflow(&graph).unwrap();
         // 20 - round(20*0.6) = 20 - 12 = 8.
-        assert_eq!(wf.start_step, 8);
+        assert_eq!(workflow.start_step, 8);
         assert_eq!(
-            wf.metadata.pipeline.unwrap().strategy.start_step,
+            workflow.metadata.pipeline.unwrap().strategy.start_step,
             Some(8)
         );
     }
@@ -712,15 +712,15 @@ mod tests {
             "class_type": "LoraLoader",
             "inputs": {"lora_name": "a.safetensors", "strength_model": 0.8, "model": ["4", 0]}
         });
-        let wf = parse_workflow(&graph).unwrap();
+        let workflow = parse_workflow(&graph).unwrap();
         assert_eq!(
-            wf.loras,
+            workflow.loras,
             vec![
                 ("a.safetensors".to_owned(), 0.8),
                 ("b.safetensors".to_owned(), 0.5),
             ]
         );
-        assert_eq!(wf.checkpoint.as_deref(), Some("sd15.safetensors"));
+        assert_eq!(workflow.checkpoint.as_deref(), Some("sd15.safetensors"));
     }
 
     #[test]
@@ -734,15 +734,15 @@ mod tests {
             "class_type": "ControlNetLoader",
             "inputs": {"control_net_name": "canny.safetensors"}
         });
-        let wf = parse_workflow(&graph).unwrap();
-        assert_eq!(wf.controlnet, Some(("canny.safetensors".to_owned(), 0.9)));
+        let workflow = parse_workflow(&graph).unwrap();
+        assert_eq!(workflow.controlnet, Some(("canny.safetensors".to_owned(), 0.9)));
     }
 
     #[test]
     fn unwraps_prompt_wrapper() {
         let graph = json!({ "prompt": txt2img_graph() });
-        let wf = parse_workflow(&graph).unwrap();
-        assert_eq!(wf.prompt.as_deref(), Some("a fox"));
+        let workflow = parse_workflow(&graph).unwrap();
+        assert_eq!(workflow.prompt.as_deref(), Some("a fox"));
     }
 
     #[test]
@@ -766,8 +766,8 @@ mod tests {
         let mut graph = txt2img_graph();
         // Point latent_image at a non-latent node.
         graph["3"]["inputs"]["latent_image"] = json!(["4", 0]);
-        let wf = parse_workflow(&graph).unwrap();
-        assert_eq!((wf.width, wf.height, wf.batch_size), (512, 512, 1));
+        let workflow = parse_workflow(&graph).unwrap();
+        assert_eq!((workflow.width, workflow.height, workflow.batch_size), (512, 512, 1));
     }
 
     #[test]
@@ -783,19 +783,19 @@ mod tests {
             "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "unet.onnx"}},
             "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 64, "height": 64}}
         });
-        let wf = parse_workflow(&graph).unwrap();
-        let pipeline = wf.metadata.pipeline.unwrap();
+        let workflow = parse_workflow(&graph).unwrap();
+        let pipeline = workflow.metadata.pipeline.unwrap();
         assert!(pipeline.models.contains_key("denoiser"));
         assert!(!pipeline.models.contains_key("vae"));
         assert!(!pipeline.models.contains_key("text_encoder"));
-        assert_eq!(wf.checkpoint.as_deref(), Some("unet.onnx"));
+        assert_eq!(workflow.checkpoint.as_deref(), Some("unet.onnx"));
     }
 
     #[test]
     fn emitted_metadata_passes_runtime_validator() {
         use onnx_genai_metadata::validate_pipeline_spec;
-        let wf = parse_workflow(&txt2img_graph()).unwrap();
-        let pipeline = wf.metadata.pipeline.expect("pipeline present");
+        let workflow = parse_workflow(&txt2img_graph()).unwrap();
+        let pipeline = workflow.metadata.pipeline.expect("pipeline present");
         // The real "can we run it" gate: the runtime pipeline validator accepts
         // the emitted spec (loop-carried denoiser self-edge, single producers,
         // acyclic across components).
