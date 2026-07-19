@@ -66,10 +66,14 @@ npm run dev
 ```
 
 onnx-genai registers the plugin and runs the diffusion denoiser on MLX, producing
-bit-identical results to CPU. Real Stable-Diffusion UNet blocks run **5–16× faster**
-than ORT CPU on the MLX EP (the whole block fuses into one MLX closure); the tiny
-bundled language fixture is too small to show a speedup (it is dispatch-bound), so
-use a real SD package to see the GPU win in the it/s card.
+coherent results matching CPU. Measured end-to-end on the real from-scratch SD 1.x
+package (M-series Mac, 512×512, 12 steps): the **image render is ~4× faster on the
+MLX EP** — the denoise loop goes **0.27 → 1.08 it/s** (44 s → 11 s; total 54 s →
+16 s). Isolated fp16 UNet blocks run 5–16× faster (whole block fuses into one MLX
+closure); the full UNet sees ~4× because of per-dispatch boundaries plus the
+one-shot text-encoder/VAE and CFG's doubled batch. The tiny bundled language
+fixture is too small to show a speedup (dispatch-bound), so use the SD package (or
+another real model) to see the GPU win in the it/s card.
 
 ## What runs out of the box
 
