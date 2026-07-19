@@ -744,6 +744,32 @@ fn ratio128_prefill_then_two_decodes_matches_cpu() {
     assert_eq!(after_decode2.cache.shape, vec![1, 1, STORED_WIDTH]);
 }
 
+#[test]
+fn ratio128_device_compression_crosses_two_blocks_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(
+        &[DIM],
+        &(0..DIM)
+            .map(|d| 0.75 + (d % 17) as f32 * 0.03125)
+            .collect::<Vec<_>>(),
+    );
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+    let initial = CsaState {
+        cache: HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+
+    // The prefill emits block [0, 128), leaves [128, 255) in carry, then the
+    // final decode emits [128, 256).  This catches both FP8 record placement and
+    // the full carry reset between adjacent ratio-128 blocks.
+    let prefill = ratio128_inputs(255, 0, 0, 255, 255, &ape, &norm, &sink, &initial);
+    let after_prefill = run_step(&ep, &prefill, 1);
+    let decode = ratio128_inputs(1, 255, 0, 256, 256, &ape, &norm, &sink, &after_prefill);
+    let after_decode = run_step(&ep, &decode, 2);
+    assert_eq!(after_decode.cache.shape, vec![1, 2, STORED_WIDTH]);
+}
+
 // ---------------------------------------------------------------------------
 // B1: ratio-128 f32-cache DEVICE sink-softmax attention parity.
 //

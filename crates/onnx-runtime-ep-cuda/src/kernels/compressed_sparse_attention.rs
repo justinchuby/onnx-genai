@@ -61,6 +61,7 @@ use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseA
 use onnx_runtime_ir::{DataType, DeviceId, Dim, Node, Shape, as_static_shape};
 
 use crate::error::{driver_err, not_implemented};
+use crate::kernels::block_quant;
 use crate::kernels::csa_device_state::{CsaBufferLayout, CsaDeviceBufferManager};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -91,6 +92,111 @@ const OP: &str = "CompressedSparseAttention";
 const ATTENTION_MODULE: &str = "csa_ratio128_attention";
 const ATTENTION_ENTRY: &str = "csa_ratio128_sink_attention";
 const ATTENTION_BLOCK: u32 = 256;
+
+/// Stage-1 ratio-128 compressor.  Deliberately one thread owns a batch row: the
+/// oracle specifies an order-dependent f32 reduction for each dimension, so
+/// parallel reductions are not interchangeable here.  Decode uses S=1 and the
+/// short prefill is amortised by the later sparse-attention work.
+const COMPRESSION_MODULE: &str = "csa_ratio128_compression";
+const COMPRESSION_ENTRY: &str = "csa_ratio128_compress";
+const COMPRESSION_SOURCE: &str = r#"
+__device__ __forceinline__ unsigned short csa_bf16_bits(float x) {
+    unsigned int bits = __float_as_uint(x);
+    return (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+__device__ __forceinline__ float csa_bf16(float x) {
+    return __uint_as_float((unsigned int)csa_bf16_bits(x) << 16);
+}
+extern "C" __global__ void csa_ratio128_compress(
+    const float* kv, const float* gate, const float* ape, const float* norm,
+    const float* past_carry, const unsigned char* past_cache,
+    float* carry, unsigned char* cache,
+    int batch, int sequence, int dim, int past_records, int cache_records, int cache_fp8,
+    long long start)
+{
+    const int b = blockIdx.x;
+    if (b >= batch || threadIdx.x != 0) return;
+    const int carry_stride = 2 * 128 * dim;
+    const int cache_width = cache_fp8 ? 583 : dim * 4;
+    // The graph outputs are the next state.  Copy only the old records/carry;
+    // newly completed records are written below.
+    for (int i = 0; i < carry_stride; ++i) carry[b * carry_stride + i] = past_carry[b * carry_stride + i];
+    for (int i = 0; i < past_records * cache_width; ++i)
+        cache[b * cache_records * cache_width + i] = past_cache[b * past_records * cache_width + i];
+    if (start == 0) {
+        for (int slot = 0; slot < 128; ++slot)
+            // A completed ratio-128 block consumes every slot.  Clear the complete
+            // block after finalizing it (the next token writes only its own slot).
+            for (int reset_slot = 0; reset_slot < 128; ++reset_slot)
+                for (int d = 0; d < dim; ++d) {
+                    carry[b * carry_stride + (2 * reset_slot) * dim + d] = 0.0f;
+                    carry[b * carry_stride + (2 * reset_slot + 1) * dim + d] = __int_as_float(0xff800000);
+                }
+    }
+    int emitted = 0;
+    for (int s = 0; s < sequence; ++s) {
+        const long long pos = start + s;
+        const int slot = (int)(pos & 127);
+        for (int d = 0; d < dim; ++d) {
+            carry[b * carry_stride + (2 * slot) * dim + d] = kv[((b * sequence + s) * dim) + d];
+            carry[b * carry_stride + (2 * slot + 1) * dim + d] =
+                __fadd_rn(gate[((b * sequence + s) * dim) + d], ape[slot * dim + d]);
+        }
+        if (((pos + 1) & 127) != 0) continue;
+        float record[512];
+        for (int d = 0; d < dim; ++d) {
+            float maximum = __int_as_float(0xff800000);
+            for (int j = 0; j < 128; ++j)
+                maximum = fmaxf(maximum, carry[b * carry_stride + (2 * j + 1) * dim + d]);
+            float denominator = 0.0f, numerator = 0.0f;
+            for (int j = 0; j < 128; ++j) {
+                float score = carry[b * carry_stride + (2 * j + 1) * dim + d];
+                if (score == __int_as_float(0xff800000)) continue;
+                float weight = (float)exp((double)__fsub_rn(score, maximum));
+                denominator = __fadd_rn(denominator, weight);
+                numerator = __fadd_rn(numerator, __fmul_rn(weight, carry[b * carry_stride + (2 * j) * dim + d]));
+            }
+            record[d] = csa_bf16(__fdiv_rn(numerator, denominator));
+        }
+        float square_sum = 0.0f;
+        for (int d = 0; d < dim; ++d)
+            square_sum = __fadd_rn(square_sum, __fmul_rn(record[d], record[d]));
+        float inverse_rms = __frsqrt_rn(__fadd_rn(__fdiv_rn(square_sum, (float)dim), 1.0e-6f));
+        for (int d = 0; d < dim; ++d)
+            record[d] = csa_bf16(__fmul_rn(__fmul_rn(record[d], inverse_rms), norm[d]));
+        // The compressed RoPE tail is BF16-rounded after each component, just
+        // as the frozen CPU finalize path does.
+        for (int pair = 0; pair < 32; ++pair) {
+            float ramp = fminf(1.0f, fmaxf(0.0f, ((float)pair - 15.0f) / 10.0f));
+            float base = powf(160000.0f, -((float)(2 * pair)) / 64.0f);
+            float frequency = __fadd_rn(__fmul_rn(base, 1.0f - ramp), __fmul_rn(base / 16.0f, ramp));
+            float sn, cs; sincosf((float)(pos - 127) * frequency, &sn, &cs);
+            int d = 448 + 2 * pair; float re = record[d], im = record[d + 1];
+            record[d] = csa_bf16(__fsub_rn(__fmul_rn(re, cs), __fmul_rn(im, sn)));
+            record[d + 1] = csa_bf16(__fadd_rn(__fmul_rn(re, sn), __fmul_rn(im, cs)));
+        }
+        const int out = past_records + emitted++;
+        if (cache_fp8) {
+            unsigned char* dst = cache + (b * cache_records + out) * 583;
+            for (int block = 0; block < 7; ++block)
+                quantize_fp8_e4m3_block(record + block * 64, dst + block * 65, dst + block * 65 + 1);
+            for (int d = 0; d < 64; ++d) {
+                unsigned short bits = csa_bf16_bits(record[448 + d]);
+                dst[455 + 2 * d] = (unsigned char)bits;
+                dst[455 + 2 * d + 1] = (unsigned char)(bits >> 8);
+            }
+        } else {
+            float* dst = (float*)cache + (b * cache_records + out) * dim;
+            for (int d = 0; d < dim; ++d) dst[d] = record[d];
+        }
+        for (int reset_slot = 0; reset_slot < 128; ++reset_slot)
+            for (int d = 0; d < dim; ++d) {
+                carry[b * carry_stride + (2 * reset_slot) * dim + d] = 0.0f;
+                carry[b * carry_stride + (2 * reset_slot + 1) * dim + d] = __int_as_float(0xff800000);
+            }
+    }
+}
+"#;
 const ATTENTION_SOURCE: &str = r#"
 extern "C" __global__ void csa_ratio128_sink_attention(
     const float* query,        // [batch, sequence, heads, dim]
@@ -245,12 +351,16 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             .unwrap_or("f32")
             .to_string();
         let has_attention_bias = node.inputs.get(19).is_some_and(Option::is_some);
+        let device_compression = ratio == 128 && !has_attention_bias;
         let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
         let configured_scale = node
             .attr("scale")
             .and_then(|attribute| attribute.as_float())
             .unwrap_or(0.0);
         let mut dispatch = CsaStageDispatch::default();
+        if device_compression {
+            dispatch.set(CsaPipelineStage::CompressionUpdate, CsaStageMode::Device);
+        }
         if device_attention {
             dispatch.set(CsaPipelineStage::CandidateAssembly, CsaStageMode::Device);
             dispatch.set(
@@ -264,6 +374,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             inner,
             device_state,
             dispatch,
+            device_compression,
             device_attention,
             configured_scale,
             golden_capture: CsaGoldenCapture::from_environment(),
@@ -279,6 +390,9 @@ struct CompressedSparseAttentionKernel {
     // Kept alive for stable device addresses; B0 still uses graph-threaded state.
     device_state: CsaDeviceBufferManager,
     dispatch: CsaStageDispatch,
+    /// B2: ratio-128 stage-1 is a device kernel for both f32 and hybrid-FP8
+    /// caches.  Ratio-4 remains entirely host-staged.
+    device_compression: bool,
     /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
     device_attention: bool,
     /// Raw `scale` attribute (0.0 → `1/sqrt(dim)`), resolved at launch.
@@ -528,6 +642,84 @@ impl CompressedSparseAttentionKernel {
         let free = unsafe { self.runtime.free_raw(scratch) };
         result.and(free)
     }
+
+    /// B2 stage-1.  The cache/carry graph outputs are the authoritative
+    /// externally-visible state, so this kernel first copies exactly the past
+    /// prefix, then mutates only the new carry slots and records.  This avoids a
+    /// whole-cache rewrite and preserves the cache address chosen by the runner.
+    fn run_device_compression(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        staged: &[Vec<u8>],
+    ) -> Result<()> {
+        let shape = inputs[0].shape;
+        let (batch, sequence, dim) = (shape[0], shape[1], shape[3]);
+        let past_records = inputs[6].shape[1];
+        let cache_records = outputs[1].shape[1];
+        if batch == 0 || sequence == 0 {
+            return Ok(());
+        }
+        let start_total = staged[9].as_slice();
+        if start_total.len() != 8 {
+            return Err(not_implemented(format!(
+                "{OP}: device compression expects scalar total_sequence_length"
+            )));
+        }
+        let total = i64::from_ne_bytes(start_total.try_into().expect("8 bytes"));
+        let start = total.checked_sub(sequence as i64).ok_or_else(|| {
+            not_implemented(format!("{OP}: total < sequence in device compression"))
+        })?;
+        let cache_fp8 = i32::from(outputs[1].dtype == DataType::Uint8);
+        let source = format!("{}\n{}", block_quant::source(), COMPRESSION_SOURCE);
+        let func = self
+            .runtime
+            .nvrtc_function(COMPRESSION_MODULE, &source, COMPRESSION_ENTRY)?;
+        let kv = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
+        let gate = cuptr(inputs[3].data_ptr::<u8>() as *const c_void);
+        let ape = cuptr(inputs[4].data_ptr::<u8>() as *const c_void);
+        let norm = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
+        let past_carry = cuptr(inputs[7].data_ptr::<u8>() as *const c_void);
+        let past_cache = cuptr(inputs[6].data_ptr::<u8>() as *const c_void);
+        let carry = cuptr(outputs[2].data_ptr_mut::<u8>() as *const c_void);
+        let cache = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        let batch_i = i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
+        let sequence_i =
+            i32::try_from(sequence).map_err(|_| not_implemented("CSA sequence exceeds i32"))?;
+        let dim_i = i32::try_from(dim).map_err(|_| not_implemented("CSA dimension exceeds i32"))?;
+        let past_i =
+            i32::try_from(past_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        let records_i =
+            i32::try_from(cache_records).map_err(|_| not_implemented("CSA records exceed i32"))?;
+        builder
+            .arg(&kv)
+            .arg(&gate)
+            .arg(&ape)
+            .arg(&norm)
+            .arg(&past_carry)
+            .arg(&past_cache)
+            .arg(&carry)
+            .arg(&cache)
+            .arg(&batch_i)
+            .arg(&sequence_i)
+            .arg(&dim_i)
+            .arg(&past_i)
+            .arg(&records_i)
+            .arg(&cache_fp8)
+            .arg(&start);
+        // SAFETY: all arguments are contiguous device buffers whose shape was
+        // validated by the CPU factory; one serial thread owns each batch row.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (batch as u32, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio128_compress", error))?;
+        self.runtime.synchronize()
+    }
 }
 
 impl Kernel for CompressedSparseAttentionKernel {
@@ -628,6 +820,19 @@ impl Kernel for CompressedSparseAttentionKernel {
                         .htod(bytes, cuptr(output.data_ptr_mut::<u8>() as *const c_void))?;
                 }
             }
+        }
+
+        // B2 device stage-1: overwrite the host-oracle cache/carry with the
+        // independently computed device result.  The host invocation remains
+        // the compatibility path for all other stages and output shapes.
+        if self.device_compression
+            && self.dispatch.mode(CsaPipelineStage::CompressionUpdate) == CsaStageMode::Device
+            // The f32 cache remains B1's strict-Y reference path.  Its device
+            // attention consumes the exact f32 oracle record, while B2 owns the
+            // hybrid FP8 record format (including its BF16 RoPE tail).
+            && outputs[1].dtype == DataType::Uint8
+        {
+            self.run_device_compression(inputs, outputs, &staged)?;
         }
 
         // B1 device stage-7: recompute `Y` on device for ratio-128 f32-cache,

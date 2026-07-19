@@ -42,7 +42,7 @@ __device__ __forceinline__ unsigned char quantize_e2m1(float value) {
     const float values[8] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     const unsigned char sign = value < 0.0f ? 8u : 0u;
     value = fabsf(value);
-    unsigned char best = 0; float distance = CUDART_INF_F;
+    unsigned char best = 0; float distance = __int_as_float(0x7f800000);
     for (unsigned char i = 0; i < 8; ++i) {
         const float candidate = fabsf(value - values[i]);
         if (candidate < distance
