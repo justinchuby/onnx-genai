@@ -65,6 +65,9 @@ pub mod runtime;
 
 pub use capture::subgraph_graph_capturable;
 pub use kernels::attention::AttentionKernel;
-pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry};
+pub use kernels::csa_checkpoint::{
+    CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
+};
+pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
 pub use runtime::CudaRuntime;

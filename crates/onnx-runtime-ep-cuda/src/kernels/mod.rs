@@ -29,6 +29,7 @@ pub mod cast;
 pub mod compressed_sparse_attention;
 pub mod constant;
 pub mod conv;
+pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumsum;
 pub mod elementwise;
@@ -189,6 +190,18 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
 /// The shared [`CudaRuntime`] (context + stream + cuBLASLt handle) is threaded
 /// into every factory so kernels submit onto the EP's single stream.
 pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
+    build_cuda_registry_with_metrics(runtime, Arc::new(csa_checkpoint::CsaMetrics::default()))
+}
+
+/// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry
+/// surface (§8) into the CSA factory so the owning EP can read per-layer CSA
+/// observability after execution.
+///
+/// [`CsaMetrics`]: csa_checkpoint::CsaMetrics
+pub fn build_cuda_registry_with_metrics(
+    runtime: Arc<CudaRuntime>,
+    csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
     // GEMM family (cuBLASLt).
@@ -337,6 +350,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         Box::new(
             compressed_sparse_attention::CompressedSparseAttentionFactory {
                 runtime: runtime.clone(),
+                metrics: csa_metrics.clone(),
             },
         ),
     );

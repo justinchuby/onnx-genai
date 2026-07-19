@@ -62,6 +62,7 @@ use onnx_runtime_ir::{DataType, DeviceId, Dim, Node, Shape, as_static_shape};
 
 use crate::error::{driver_err, not_implemented};
 use crate::kernels::block_quant;
+use crate::kernels::csa_checkpoint::{CsaAttentionMode, CsaCursors, CsaLayerMetrics, CsaMetrics};
 use crate::kernels::csa_device_state::{CsaBufferLayout, CsaDeviceBufferManager};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -925,6 +926,17 @@ extern "C" __global__ void csa_ratio4_sink_attention(
 /// core) and wraps it so execution stages tensors through the host.
 pub struct CompressedSparseAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
+    /// Shared §8 telemetry surface owned by the EP; cloned into every CSA kernel.
+    pub metrics: Arc<CsaMetrics>,
+}
+
+/// Environment flag (D7) that forces the diagnostic host-staged oracle path even
+/// for a config that is otherwise device-default/capturable. Read once at runner
+/// construction so a captured kernel's mode never changes mid-flight.
+const FORCE_HOST_ENV: &str = "ONNX_GENAI_CSA_FORCE_HOST";
+
+fn force_host_from_env() -> bool {
+    std::env::var_os(FORCE_HOST_ENV).is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 impl KernelFactory for CompressedSparseAttentionFactory {
@@ -1028,6 +1040,13 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             device_attention,
             device_ratio4_attention,
             capturable,
+            // D7 switchover: the device path is the default for the capturable
+            // config; `ONNX_GENAI_CSA_FORCE_HOST` forces the host-staged oracle
+            // for differential debugging (never an automatic production fallback).
+            force_host: force_host_from_env(),
+            metrics: self.metrics.clone(),
+            layer_id: node.id.0 as u64,
+            ratio: ratio as u64,
             qk_rope_head_dim: usize::try_from(
                 node.attr("qk_rope_head_dim")
                     .and_then(|attribute| attribute.as_int())
@@ -1084,6 +1103,17 @@ struct CompressedSparseAttentionKernel {
     /// staging, no per-call alloc/free, cursor-driven launch) and
     /// `cuda_graph_compatible()` returns `true`.
     capturable: bool,
+    /// D7 diagnostic override: when set, `execute` takes the host-staged oracle
+    /// path even for the capturable config, and `cuda_graph_compatible()` reports
+    /// `false`. Read once from `ONNX_GENAI_CSA_FORCE_HOST` at construction.
+    force_host: bool,
+    /// Shared §8 telemetry surface (per-layer mode, bytes avoided, cursor
+    /// lengths, sink mass, host/device bytes). Recorded off the captured hot path.
+    metrics: Arc<CsaMetrics>,
+    /// Stable per-layer identity for the metrics surface (the node id).
+    layer_id: u64,
+    /// Compression ratio (4 or 128); drives the logical cursor derivation.
+    ratio: u64,
     qk_rope_head_dim: usize,
     /// Ratio-4 index-stream geometry (`index_num_heads`, `index_head_dim`);
     /// zero for ratio-128 where the index stream is absent.
@@ -1546,6 +1576,63 @@ impl CompressedSparseAttentionKernel {
         self.runtime.synchronize()
     }
 
+    /// Record §8 observability for one device-path decode into the shared
+    /// telemetry surface. Called off the captured hot path only (skipped while a
+    /// CUDA graph is capturing): every field is derived from host-side shapes and
+    /// the bounded cursor scalars, so recording never issues a device op on the
+    /// captured stream. `bytes_avoided` is the host↔device staging traffic the
+    /// device path elides — the sum of input D2H + output H2D copies the
+    /// host-staged path would perform.
+    fn record_device_metrics(&self, inputs: &[TensorView], outputs: &[TensorMut]) {
+        let seq_cursor = self.sequence_cursor(inputs);
+        let device_bytes: u64 = outputs.iter().map(|o| o.byte_size() as u64).sum();
+        let input_bytes: u64 = inputs
+            .iter()
+            .filter(|input| !input.is_absent())
+            .map(|input| input.byte_size() as u64)
+            .sum();
+        let sample = CsaLayerMetrics {
+            mode: CsaAttentionMode::Device,
+            cursors: CsaCursors::from_sequence(seq_cursor, self.ratio),
+            // Staging avoided = every input D2H blit + every output H2D blit the
+            // host-staged oracle would have issued for this decode.
+            bytes_avoided: input_bytes + device_bytes,
+            host_bytes: 0,
+            device_bytes,
+            sink_mass: 0.0,
+            stage_timings_us: [0; 8],
+            decode_count: 0,
+        };
+        self.metrics.record_layer(self.layer_id, sample);
+    }
+
+    /// Read the device-resident sequence cursor (`total_sequence_length`, input
+    /// 9) without a device round trip. The scalar is graph-threaded, so on the
+    /// captured/device path its value is unknown host-side; derive the cursor
+    /// from the query sequence length and past-position input (input 8) instead,
+    /// which the engine supplies host-side. Falls back to the query length.
+    fn sequence_cursor(&self, inputs: &[TensorView]) -> u64 {
+        let sequence = inputs.first().map(|q| q.shape[1]).unwrap_or(0) as u64;
+        // Input 8 is the 0-based past position scalar; total = past_position + 1
+        // for a single-token decode, or `sequence` for a from-empty prefill.
+        if let Some(view) = inputs.get(8) {
+            if !view.is_absent() && view.byte_size() >= 4 {
+                let mut raw = [0u8; 4];
+                // SAFETY: input 8 is a live i32 device scalar of at least 4 bytes.
+                if unsafe {
+                    self.runtime
+                        .dtoh(&mut raw, cuptr(view.data_ptr::<u8>() as *const c_void))
+                }
+                .is_ok()
+                {
+                    let past = i32::from_ne_bytes(raw).max(0) as u64;
+                    return past + sequence;
+                }
+            }
+        }
+        sequence
+    }
+
     /// B6 device-only, capture-clean pipeline for the ratio-4 fp8 6-output
     /// config. Every stage runs on device reading the `total_sequence_length`
     /// cursor, writing directly into the graph-threaded outputs using the
@@ -1555,6 +1642,11 @@ impl CompressedSparseAttentionKernel {
     /// scoring + replicate (output 5) → fused sparse attention (output 0). The
     /// trailing stream sync is skipped while a CUDA graph is capturing (a sync is
     /// illegal during capture); the graph replay/eager caller synchronizes.
+    ///
+    /// N2 (B6): this path requires a prior **eager warmup** `execute` so every
+    /// NVRTC module is compiled and cached before capture — a module load during
+    /// `cuStreamBeginCapture` would invalidate the graph. Callers capturing this
+    /// kernel must run one eager `execute` (see the capture/replay test) first.
     fn run_capturable_ratio4(
         &self,
         inputs: &[TensorView],
@@ -1564,7 +1656,11 @@ impl CompressedSparseAttentionKernel {
         self.run_device_index_compression(inputs, outputs, false)?;
         self.run_device_index_scoring(inputs, outputs, false)?;
         self.run_device_ratio4_attention(inputs, outputs, false)?;
+        // §8 metrics: record off the captured hot path only. `is_capturing` is a
+        // cheap host query (no sync), so it is capture-safe; during capture we
+        // skip recording entirely and the eager warmup pass supplies the sample.
         if !self.runtime.is_capturing()? {
+            self.record_device_metrics(inputs, outputs);
             self.runtime.synchronize()?;
         }
         Ok(())
@@ -1738,6 +1834,19 @@ impl CompressedSparseAttentionKernel {
         let records = outputs[3].shape[1];
         // selected_indices is [batch, index_heads, sequence, topk_width].
         let topk_width = outputs[5].shape[3];
+        // N1 (B6): the pooled `WS_SELECTED` scratch is sized to `max_topk`
+        // (`max_seq_len/4`, capped at 512). A `topk_width` above that bound would
+        // overrun the fixed-capacity selection scratch, so gate it here.
+        let max_topk = self.device_state.layout.max_seq_len.div_ceil(4).min(512);
+        debug_assert!(
+            topk_width <= max_topk,
+            "CSA topk_width {topk_width} exceeds pooled WS_SELECTED bound {max_topk}"
+        );
+        if topk_width > max_topk {
+            return Err(not_implemented(format!(
+                "{OP}: topk_width {topk_width} exceeds pooled selection capacity {max_topk}"
+            )));
+        }
         if batch == 0 || sequence == 0 || index_heads == 0 || topk_width == 0 {
             return Ok(());
         }
@@ -1849,12 +1958,14 @@ impl CompressedSparseAttentionKernel {
 
 impl Kernel for CompressedSparseAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // B6: the fully device-resident ratio-4 fp8 6-output config runs a
+        // B6/B7: the fully device-resident ratio-4 fp8 6-output config runs a
         // device-only pipeline — every stage reads the `total_sequence_length`
         // cursor on device, uses pre-reserved stable-address scratch, and skips
         // the final stream sync while a CUDA graph is capturing. No host staging,
-        // no per-call alloc/free, so the decode is capture-clean.
-        if self.capturable {
+        // no per-call alloc/free, so the decode is capture-clean. This is the
+        // **default** path after the B7 switchover (D7); the host-staged oracle
+        // below stays reachable only when `ONNX_GENAI_CSA_FORCE_HOST` is set.
+        if self.capturable && !self.force_host {
             return self.run_capturable_ratio4(inputs, outputs);
         }
         // Stage every present input host-side. Contiguity is required because the
@@ -2021,6 +2132,33 @@ impl Kernel for CompressedSparseAttentionKernel {
             self.run_device_ratio4_attention(inputs, outputs, true)?;
         }
 
+        // §8 metrics for the host-staged (diagnostic / non-capturable) path.
+        // `host_bytes` is the real staging traffic: every input D2H blit plus
+        // every output H2D blit. This runs off any captured path (the host-staged
+        // path is never capturable), so the record is capture-safe.
+        let host_bytes: u64 = staged.iter().map(|buf| buf.len() as u64).sum::<u64>()
+            + out_bufs.iter().map(|buf| buf.len() as u64).sum::<u64>();
+        let mode = if self.force_host && self.capturable {
+            CsaAttentionMode::Host
+        } else if self.device_ratio4_attention || self.device_attention {
+            CsaAttentionMode::Device
+        } else {
+            CsaAttentionMode::Host
+        };
+        self.metrics.record_layer(
+            self.layer_id,
+            CsaLayerMetrics {
+                mode,
+                cursors: CsaCursors::from_sequence(self.sequence_cursor(inputs), self.ratio),
+                bytes_avoided: 0,
+                host_bytes,
+                device_bytes: 0,
+                sink_mass: 0.0,
+                stage_timings_us: [0; 8],
+                decode_count: 0,
+            },
+        );
+
         self.runtime.synchronize()
     }
 
@@ -2030,12 +2168,14 @@ impl Kernel for CompressedSparseAttentionKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // B6: the ratio-4 fp8 6-output config runs a fully device-resident,
+        // B6/B7: the ratio-4 fp8 6-output config runs a fully device-resident,
         // cursor-driven pipeline with pre-reserved stable-address scratch and no
-        // per-call alloc/free/sync, so it is capture-clean. Every other config
-        // still host-stages (D2H inputs, H2D outputs, per-copy syncs) — illegal
-        // during capture — so it stays non-capturable.
-        self.capturable
+        // per-call alloc/free/sync, so it is capture-clean and the default path.
+        // `ONNX_GENAI_CSA_FORCE_HOST` (D7) forces the host-staged oracle, which
+        // host-stages (D2H inputs, H2D outputs, per-copy syncs) — illegal during
+        // capture — so it must report non-capturable. Every other config also
+        // stays non-capturable.
+        self.capturable && !self.force_host
     }
 }
 

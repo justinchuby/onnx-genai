@@ -20,8 +20,8 @@ use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::{CsaAttentionMode, CsaCheckpointJournal, CudaExecutionProvider};
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -93,9 +93,37 @@ impl HostTensor {
     }
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
+/// Serializes GPU test bodies within this binary. The capture/replay test uses
+/// `CU_STREAM_CAPTURE_MODE_GLOBAL`, under which any concurrent CUDA alloc/launch
+/// from another test thread in the same process/context errors out. Holding this
+/// lock for the whole test body (via [`GpuGuard`]) keeps capture from overlapping
+/// other CUDA work. Separate test binaries run in separate processes/contexts, so
+/// no cross-binary serialization is needed.
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A live CUDA EP plus the held [`GPU_SERIAL`] guard. Derefs to the EP so every
+/// existing `gpu()` call site is unchanged.
+struct GpuGuard {
+    ep: CudaExecutionProvider,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for GpuGuard {
+    type Target = CudaExecutionProvider;
+    fn deref(&self) -> &CudaExecutionProvider {
+        &self.ep
+    }
+}
+
+fn gpu() -> Option<GpuGuard> {
+    // Ignore poisoning: a panicking test still leaves the device usable, and we
+    // must not cascade one failure into spurious lock failures elsewhere.
+    let serial = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
+        Ok(ep) => Some(GpuGuard {
+            ep,
+            _serial: serial,
+        }),
         Err(error) => {
             eprintln!("skip: no CUDA GPU available ({error})");
             None
@@ -2130,4 +2158,502 @@ fn ratio4_capture_replay_decode_is_byte_identical_to_eager_and_cpu() {
             "eager ratio-4 decode {label} must be byte-exact vs the CPU oracle"
         );
     }
+}
+
+/// Upload `bytes` into a fresh device buffer sized exactly to it, returning the
+/// buffer (kept alive by the caller). Used to stand up the persistent,
+/// stable-address carry buffers a speculative in-place cache would rewind.
+fn upload_device(ep: &CudaExecutionProvider, bytes: &[u8]) -> DeviceBuffer {
+    let buffer = ep.allocate(bytes.len().max(1), 256).expect("device alloc");
+    if !bytes.is_empty() {
+        // SAFETY: allocation exactly covers `bytes`.
+        unsafe {
+            ep.runtime()
+                .htod(bytes, cuptr(buffer.as_ptr()))
+                .expect("htod");
+        }
+    }
+    buffer
+}
+
+/// Download `len` bytes from a device buffer.
+fn download_device(ep: &CudaExecutionProvider, buffer: &DeviceBuffer, len: usize) -> Vec<u8> {
+    let mut host = vec![0u8; len];
+    if len > 0 {
+        // SAFETY: destination exactly covers the buffer region read.
+        unsafe {
+            ep.runtime()
+                .dtoh(&mut host, cuptr(buffer.as_ptr()))
+                .expect("dtoh");
+        }
+    }
+    host
+}
+
+/// B7 — the core speculative-rollback correctness proof (D6, §4.6).
+///
+/// Establishes an accepted prefix of 13 tokens (prefill 12 + one decode), takes a
+/// stream-ordered checkpoint of the bounded carry state, drafts one more token
+/// (speculatively overwriting the committed carry buffers in place), then rejects
+/// it via `restore_prefix`. It asserts:
+///   1. the draft genuinely dirtied the carry (guards against a no-op test),
+///   2. `restore_prefix` rolls the carry buffers back **byte-exact** to the
+///      checkpoint and resets the device sequence cursor to the accepted prefix,
+///   3. a continuation decode from the restored state is **bit-identical** to a
+///      fresh run that only processed the accepted tokens, and to the INDEPENDENT
+///      CPU oracle (`max_ulp == 0` on `Y`, byte-exact on every present output and
+///      `selected_indices`).
+/// The rollback counter on the shared metrics surface is asserted to advance.
+#[test]
+fn ratio4_speculative_rollback_restores_accepted_prefix_bit_exact() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    // Two positions past the prefill: one to establish the accepted prefix
+    // (decode at PREFILL), one to draft-then-reject (decode at PREFILL+1).
+    let full = ratio4_inputs_prefill(
+        PREFILL + 2,
+        ratio4_values(
+            (PREFILL + 2) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            17,
+            0.0015,
+        ),
+        ratio4_values((PREFILL + 2) * RATIO4_INDEX_HEADS, 19, 0.01),
+    );
+
+    // Prefill the first PREFILL tokens.
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let (pg, pn) = ratio4_node(&prefill);
+    let pspecs = ratio4_topk_output_specs(PREFILL, PREFILL / RATIO4, 1);
+    let first = run_gpu(&ep, &pg, pn, &prefill, &pspecs).expect("prefill");
+
+    // Decode at PREFILL → the committed accepted prefix of 13 tokens.
+    let committed_inputs = ratio4_decode_step(&full, PREFILL, &first);
+    let crecords = (PREFILL + 1) / RATIO4;
+    let (cg, cn) = ratio4_node(&committed_inputs);
+    let cspecs = ratio4_topk_output_specs(1, crecords, 1);
+    let committed = run_gpu(&ep, &cg, cn, &committed_inputs, &cspecs).expect("committed decode");
+
+    // Stand up the persistent, stable-address carry buffers an in-place cache
+    // would rewind, seeded with the committed (accepted-prefix) carry state.
+    let main_carry = upload_device(&ep, &committed[2]);
+    let index_carry = upload_device(&ep, &committed[4]);
+    // Device sequence cursor scalar (i64), speculatively advanced to 14.
+    let seq_scalar = upload_device(&ep, &14i64.to_ne_bytes());
+
+    let metrics = ep.csa_metrics().clone();
+    let journal = CsaCheckpointJournal::new(
+        ep.runtime().clone(),
+        RATIO4 as u64,
+        committed[2].len(),
+        committed[4].len(),
+        metrics.clone(),
+    )
+    .expect("journal");
+
+    const GENERATION: u64 = 0xB7;
+    let accepted_cursor: u64 = 13;
+    // SAFETY: both carry buffers are live and sized to the committed carry bytes.
+    let checkpoint = unsafe {
+        journal.checkpoint(
+            cuptr(main_carry.as_ptr()),
+            cuptr(index_carry.as_ptr()),
+            committed[2].len(),
+            committed[4].len(),
+            accepted_cursor,
+            GENERATION,
+        )
+    }
+    .expect("checkpoint");
+    assert_eq!(checkpoint.cursors().seq_cursor, 13);
+    assert_eq!(checkpoint.cursors().compressed_len, 3);
+    assert_eq!(checkpoint.cursors().compression_carry_len, 1);
+
+    // Draft one token at PREFILL+1, speculatively overwriting the committed carry
+    // buffers in place (the reject we are about to roll back).
+    let draft_inputs = ratio4_decode_step(&full, PREFILL + 1, &committed);
+    let drecords = (PREFILL + 2) / RATIO4;
+    let (dg, dn) = ratio4_node(&draft_inputs);
+    let dspecs = ratio4_topk_output_specs(1, drecords, 1);
+    let draft = run_gpu(&ep, &dg, dn, &draft_inputs, &dspecs).expect("draft decode");
+    // SAFETY: buffers/sizes match the committed carry extents.
+    unsafe {
+        ep.runtime()
+            .htod(&draft[2], cuptr(main_carry.as_ptr()))
+            .expect("dirty main carry");
+        ep.runtime()
+            .htod(&draft[4], cuptr(index_carry.as_ptr()))
+            .expect("dirty index carry");
+    }
+    let dirty_main = download_device(&ep, &main_carry, committed[2].len());
+    assert_ne!(
+        dirty_main, committed[2],
+        "the draft must genuinely overwrite the committed carry (non-tautological guard)"
+    );
+
+    // Reject: roll back to the accepted prefix.
+    let rollbacks_before = metrics.rollback_count();
+    // SAFETY: buffers are the same live carry/scalar allocations checkpointed above.
+    let restored_cursors = unsafe {
+        journal.restore_prefix(
+            &checkpoint,
+            accepted_cursor,
+            GENERATION,
+            cuptr(main_carry.as_ptr()),
+            cuptr(index_carry.as_ptr()),
+            Some(cuptr(seq_scalar.as_ptr())),
+        )
+    }
+    .expect("restore");
+    assert_eq!(restored_cursors.seq_cursor, 13);
+    assert_eq!(
+        metrics.rollback_count(),
+        rollbacks_before + 1,
+        "restore must record a rollback in the §8 metrics"
+    );
+
+    // The device carry buffers and cursor scalar are back at the accepted prefix.
+    let restored_main = download_device(&ep, &main_carry, committed[2].len());
+    let restored_index = download_device(&ep, &index_carry, committed[4].len());
+    assert_eq!(
+        restored_main, committed[2],
+        "restore_prefix must roll the main carry back byte-exact"
+    );
+    assert_eq!(
+        restored_index, committed[4],
+        "restore_prefix must roll the index carry back byte-exact"
+    );
+    let restored_scalar = download_device(&ep, &seq_scalar, 8);
+    assert_eq!(
+        i64::from_ne_bytes(restored_scalar.try_into().unwrap()),
+        13,
+        "restore_prefix must reset the device sequence cursor to the accepted prefix"
+    );
+
+    // Continue from the RESTORED state: a decode at the accepted boundary
+    // (position 13) fed the rolled-back carry.
+    let mut restored_state = committed.clone();
+    restored_state[2] = restored_main;
+    restored_state[4] = restored_index;
+    let spec_inputs = ratio4_decode_step(&full, PREFILL + 1, &restored_state);
+    let (sg, sn) = ratio4_node(&spec_inputs);
+    let spec_specs = ratio4_topk_output_specs(1, drecords, 1);
+    let spec = run_gpu(&ep, &sg, sn, &spec_inputs, &spec_specs).expect("post-rollback continue");
+
+    // Fresh run that only processed the accepted tokens (no speculation) + the
+    // independent CPU oracle.
+    let fresh_inputs = ratio4_decode_step(&full, PREFILL + 1, &committed);
+    let (fg, fn_) = ratio4_node(&fresh_inputs);
+    let fresh = run_gpu(&ep, &fg, fn_, &fresh_inputs, &spec_specs).expect("fresh continue");
+    let cpu = run_cpu(&fg, fn_, &fresh_inputs, &spec_specs).expect("cpu oracle continue");
+
+    let labels = [
+        "Y",
+        "present_compressed_kv",
+        "present_compression_carry",
+        "present_index_key",
+        "present_index_carry",
+        "selected_indices",
+    ];
+    assert_eq!(
+        max_ulp(&spec[0], &fresh[0]),
+        0,
+        "post-rollback Y must be bit-identical to the fresh accepted-only run"
+    );
+    assert_eq!(
+        max_ulp(&spec[0], &cpu[0]),
+        0,
+        "post-rollback Y must be bit-exact vs the independent CPU oracle"
+    );
+    for (index, label) in labels.iter().enumerate().skip(1) {
+        assert_eq!(
+            spec[index], fresh[index],
+            "post-rollback {label} must equal the fresh accepted-only run"
+        );
+        assert_eq!(
+            spec[index], cpu[index],
+            "post-rollback {label} must be byte-exact vs the CPU oracle"
+        );
+    }
+
+    ep.deallocate(main_carry).unwrap();
+    ep.deallocate(index_carry).unwrap();
+    ep.deallocate(seq_scalar).unwrap();
+}
+
+/// B7 — greedy-token bit-identity across a draft/verify/correct sequence
+/// (§10-Q14). The greedy next token is `argmax(Y)`; after a checkpoint, a
+/// speculative draft, and a `restore_prefix`, the continuation's `Y` — and thus
+/// its argmax greedy token — must be bit-identical to a non-speculative decode
+/// and to the independent CPU oracle.
+#[test]
+fn ratio4_greedy_token_bit_identity_across_draft_verify_correct() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    let full = ratio4_inputs_prefill(
+        PREFILL + 2,
+        ratio4_values(
+            (PREFILL + 2) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            23,
+            0.0011,
+        ),
+        ratio4_values((PREFILL + 2) * RATIO4_INDEX_HEADS, 27, 0.008),
+    );
+
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let (pg, pn) = ratio4_node(&prefill);
+    let pspecs = ratio4_topk_output_specs(PREFILL, PREFILL / RATIO4, 1);
+    let first = run_gpu(&ep, &pg, pn, &prefill, &pspecs).expect("prefill");
+
+    let committed_inputs = ratio4_decode_step(&full, PREFILL, &first);
+    let (cg, cn) = ratio4_node(&committed_inputs);
+    let cspecs = ratio4_topk_output_specs(1, (PREFILL + 1) / RATIO4, 1);
+    let committed = run_gpu(&ep, &cg, cn, &committed_inputs, &cspecs).expect("committed decode");
+
+    let main_carry = upload_device(&ep, &committed[2]);
+    let index_carry = upload_device(&ep, &committed[4]);
+    let journal = CsaCheckpointJournal::new(
+        ep.runtime().clone(),
+        RATIO4 as u64,
+        committed[2].len(),
+        committed[4].len(),
+        ep.csa_metrics().clone(),
+    )
+    .expect("journal");
+    const GEN: u64 = 42;
+    // SAFETY: live carry buffers sized to the committed carry extents.
+    let checkpoint = unsafe {
+        journal.checkpoint(
+            cuptr(main_carry.as_ptr()),
+            cuptr(index_carry.as_ptr()),
+            committed[2].len(),
+            committed[4].len(),
+            13,
+            GEN,
+        )
+    }
+    .expect("checkpoint");
+
+    // Draft + dirty.
+    let draft_inputs = ratio4_decode_step(&full, PREFILL + 1, &committed);
+    let (dg, dn) = ratio4_node(&draft_inputs);
+    let dspecs = ratio4_topk_output_specs(1, (PREFILL + 2) / RATIO4, 1);
+    let draft = run_gpu(&ep, &dg, dn, &draft_inputs, &dspecs).expect("draft");
+    // SAFETY: sizes match.
+    unsafe {
+        ep.runtime()
+            .htod(&draft[2], cuptr(main_carry.as_ptr()))
+            .unwrap();
+        ep.runtime()
+            .htod(&draft[4], cuptr(index_carry.as_ptr()))
+            .unwrap();
+    }
+
+    // Correct: restore and continue.
+    // SAFETY: same live buffers as the checkpoint.
+    unsafe {
+        journal
+            .restore_prefix(
+                &checkpoint,
+                13,
+                GEN,
+                cuptr(main_carry.as_ptr()),
+                cuptr(index_carry.as_ptr()),
+                None,
+            )
+            .expect("restore");
+    }
+    let mut restored_state = committed.clone();
+    restored_state[2] = download_device(&ep, &main_carry, committed[2].len());
+    restored_state[4] = download_device(&ep, &index_carry, committed[4].len());
+    let spec_inputs = ratio4_decode_step(&full, PREFILL + 1, &restored_state);
+    let (sg, sn) = ratio4_node(&spec_inputs);
+    let spec = run_gpu(&ep, &sg, sn, &spec_inputs, &dspecs).expect("continue");
+
+    let fresh_inputs = ratio4_decode_step(&full, PREFILL + 1, &committed);
+    let (fg, fn_) = ratio4_node(&fresh_inputs);
+    let cpu = run_cpu(&fg, fn_, &fresh_inputs, &dspecs).expect("cpu oracle");
+
+    assert_eq!(
+        max_ulp(&spec[0], &cpu[0]),
+        0,
+        "draft/verify/correct continuation Y must be bit-exact vs the CPU oracle"
+    );
+    // Greedy token = argmax(Y): identical bits ⇒ identical argmax.
+    let greedy = |bytes: &[u8]| -> usize {
+        as_f32(bytes)
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            })
+            .0
+    };
+    assert_eq!(
+        greedy(&spec[0]),
+        greedy(&cpu[0]),
+        "greedy next token must match across draft/verify/correct"
+    );
+
+    ep.deallocate(main_carry).unwrap();
+    ep.deallocate(index_carry).unwrap();
+}
+
+/// B7 — the §8 observability metrics must be populated on the shared telemetry
+/// surface after a default (device-path) decode: attention mode Device, the five
+/// cursor lengths, device output bytes, and staging bytes avoided.
+#[test]
+fn ratio4_device_default_populates_observability_metrics() {
+    let Some(ep) = gpu() else { return };
+    const PREFILL: usize = 12;
+    let full = ratio4_inputs_prefill(
+        PREFILL + 1,
+        ratio4_values(
+            (PREFILL + 1) * RATIO4_INDEX_HEADS * RATIO4_INDEX_DIM,
+            17,
+            0.0015,
+        ),
+        ratio4_values((PREFILL + 1) * RATIO4_INDEX_HEADS, 19, 0.01),
+    );
+    let mut prefill = full.clone();
+    for index in [0usize, 1, 2, 3, 11, 12, 13, 14] {
+        prefill[index] = ratio4_sequence_slice(&full[index], 0, PREFILL);
+    }
+    prefill[8] = HostTensor::i32(&[1], &[(PREFILL - 1) as i32]);
+    prefill[9] = HostTensor::i64(&[], &[PREFILL as i64]);
+    let (pg, pn) = ratio4_node(&prefill);
+    let pspecs = ratio4_topk_output_specs(PREFILL, PREFILL / RATIO4, 1);
+    let first = run_gpu(&ep, &pg, pn, &prefill, &pspecs).expect("prefill");
+
+    let decode = ratio4_decode_step(&full, PREFILL, &first);
+    let (graph, node) = ratio4_node(&decode);
+    let specs = ratio4_topk_output_specs(1, (PREFILL + 1) / RATIO4, 1);
+    run_gpu(&ep, &graph, node, &decode, &specs).expect("device decode");
+
+    let layer_id = graph.node(node).id.0 as u64;
+    let layer = ep
+        .csa_metrics()
+        .layer(layer_id)
+        .expect("device decode must record §8 metrics for the layer");
+    assert_eq!(
+        layer.mode,
+        CsaAttentionMode::Device,
+        "the default ratio-4 fp8 decode must report Device attention mode"
+    );
+    assert_eq!(layer.cursors.seq_cursor, 13, "seq cursor length");
+    assert_eq!(layer.cursors.compressed_len, 3, "compressed records length");
+    assert_eq!(layer.cursors.index_len, 3, "index records length");
+    assert!(
+        layer.device_bytes > 0,
+        "device output bytes must be recorded"
+    );
+    assert!(
+        layer.bytes_avoided > 0,
+        "device path must record host-staging bytes avoided"
+    );
+    assert_eq!(layer.host_bytes, 0, "device path stages nothing host-side");
+    assert!(ep.csa_metrics().bytes_avoided_total() > 0);
+}
+
+/// B7 — composite checkpoint atomicity across two CSA layers (the non-model
+/// portion of the MTP-6 concern). Two independent journals (target + a second
+/// CSA layer) are checkpointed and rolled back together; both must restore their
+/// bounded carry state byte-exact, demonstrating the engine can orchestrate a
+/// composite rollback over per-layer backend journals (D6).
+#[test]
+fn csa_composite_checkpoint_rolls_back_all_layers() {
+    let Some(ep) = gpu() else { return };
+    let committed_a = vec![0.25f32; 64];
+    let committed_b = vec![-1.5f32; 96];
+    let bytes_a: Vec<u8> = committed_a.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let bytes_b: Vec<u8> = committed_b.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+    let carry_a = upload_device(&ep, &bytes_a);
+    let carry_b = upload_device(&ep, &bytes_b);
+    let metrics = ep.csa_metrics().clone();
+    let journal_a =
+        CsaCheckpointJournal::new(ep.runtime().clone(), 4, bytes_a.len(), 1, metrics.clone())
+            .unwrap();
+    let journal_b =
+        CsaCheckpointJournal::new(ep.runtime().clone(), 4, bytes_b.len(), 1, metrics.clone())
+            .unwrap();
+
+    const GEN: u64 = 9;
+    // SAFETY: live buffers sized to the committed carry extents.
+    let (ck_a, ck_b) = unsafe {
+        let a = journal_a
+            .checkpoint(cuptr(carry_a.as_ptr()), 0, bytes_a.len(), 0, 8, GEN)
+            .unwrap();
+        let b = journal_b
+            .checkpoint(cuptr(carry_b.as_ptr()), 0, bytes_b.len(), 0, 8, GEN)
+            .unwrap();
+        (a, b)
+    };
+
+    // Speculatively overwrite both layers' carry in place.
+    let dirty_a: Vec<u8> = vec![0.9f32; 64]
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect();
+    let dirty_b: Vec<u8> = vec![7.0f32; 96]
+        .iter()
+        .flat_map(|v| v.to_ne_bytes())
+        .collect();
+    // SAFETY: sizes match.
+    unsafe {
+        ep.runtime()
+            .htod(&dirty_a, cuptr(carry_a.as_ptr()))
+            .unwrap();
+        ep.runtime()
+            .htod(&dirty_b, cuptr(carry_b.as_ptr()))
+            .unwrap();
+    }
+
+    // Composite rollback: reject the draft on every layer.
+    // SAFETY: same live buffers as each checkpoint.
+    unsafe {
+        journal_a
+            .restore_prefix(&ck_a, 8, GEN, cuptr(carry_a.as_ptr()), 0, None)
+            .unwrap();
+        journal_b
+            .restore_prefix(&ck_b, 8, GEN, cuptr(carry_b.as_ptr()), 0, None)
+            .unwrap();
+    }
+
+    assert_eq!(download_device(&ep, &carry_a, bytes_a.len()), bytes_a);
+    assert_eq!(download_device(&ep, &carry_b, bytes_b.len()), bytes_b);
+
+    // A generation mismatch must be rejected (identity validation, D6).
+    // SAFETY: live buffer.
+    let mismatch =
+        unsafe { journal_a.restore_prefix(&ck_a, 8, GEN + 1, cuptr(carry_a.as_ptr()), 0, None) };
+    assert!(
+        mismatch.is_err(),
+        "restore must reject a checkpoint from a different generation"
+    );
+
+    ep.deallocate(carry_a).unwrap();
+    ep.deallocate(carry_b).unwrap();
+}
+
+/// B7 — full MTP composite decode smoke. Requires external Mobius/MTP model
+/// artifacts (a real target + MTP draft head sharing the CSA cache), which are
+/// not vendored here, so it is gated behind `#[ignore]`. The non-model composite
+/// atomicity is covered by `csa_composite_checkpoint_rolls_back_all_layers`; the
+/// MTP-6 composite-with-target-state path lands with the MTP integration.
+#[test]
+#[ignore = "requires external Mobius/MTP model artifacts (see decision note roy-csa-b7.md)"]
+fn mtp_composite_decode_smoke() {
+    // Intentionally empty: the model-dependent MTP smoke is scoped out of B7 core
+    // (external artifacts unavailable). See the CSA cursor+carry rollback tests
+    // for the in-scope correctness proof.
 }

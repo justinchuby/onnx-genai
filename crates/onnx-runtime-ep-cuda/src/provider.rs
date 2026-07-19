@@ -28,7 +28,8 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
-use crate::kernels::build_cuda_registry;
+use crate::kernels::build_cuda_registry_with_metrics;
+use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
@@ -42,6 +43,7 @@ pub struct CudaExecutionProvider {
     runtime: Arc<CudaRuntime>,
     initialized: bool,
     registry: OpRegistry,
+    csa_metrics: Arc<CsaMetrics>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -59,12 +61,14 @@ impl CudaExecutionProvider {
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
-        let registry = build_cuda_registry(runtime.clone());
+        let csa_metrics = Arc::new(CsaMetrics::default());
+        let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
         Ok(Self {
             device: DeviceId::cuda(ordinal),
             runtime,
             initialized: false,
             registry,
+            csa_metrics,
         })
     }
 
@@ -81,6 +85,14 @@ impl CudaExecutionProvider {
     /// Borrow the shared CUDA runtime (context + stream + cuBLASLt handle).
     pub fn runtime(&self) -> &Arc<CudaRuntime> {
         &self.runtime
+    }
+
+    /// Borrow the shared CSA observability surface (§8). Every CSA kernel this
+    /// EP builds records per-layer attention mode, bytes avoided, cursor
+    /// lengths, sink mass, and host/device byte counts here; speculative
+    /// rollbacks accumulate via the checkpoint journal.
+    pub fn csa_metrics(&self) -> &Arc<CsaMetrics> {
+        &self.csa_metrics
     }
 }
 
