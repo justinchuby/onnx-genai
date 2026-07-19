@@ -5,11 +5,16 @@ use onnx_runtime_ir::{DataType, Node};
 
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
+const SELU_ALPHA_DEFAULT: f32 = 1.673_263_2;
+const SELU_GAMMA_DEFAULT: f32 = 1.050_701;
+
 #[derive(Clone, Copy)]
 enum Activation {
     Elu { alpha: f32 },
     LeakyRelu { alpha: f32 },
     HardSigmoid { alpha: f32, beta: f32 },
+    Selu { alpha: f32, gamma: f32 },
+    ThresholdedRelu { alpha: f32 },
     Swish { alpha: f32 },
     Silu,
 }
@@ -20,6 +25,8 @@ impl Activation {
             Self::Elu { .. } => "Elu",
             Self::LeakyRelu { .. } => "LeakyRelu",
             Self::HardSigmoid { .. } => "HardSigmoid",
+            Self::Selu { .. } => "Selu",
+            Self::ThresholdedRelu { .. } => "ThresholdedRelu",
             Self::Swish { .. } => "Swish",
             Self::Silu => "Silu",
         }
@@ -42,6 +49,14 @@ impl Activation {
                 }
             }
             Self::HardSigmoid { alpha, beta } => (alpha * x + beta).clamp(0.0, 1.0),
+            Self::Selu { alpha, gamma } => gamma * if x > 0.0 { x } else { alpha * x.exp_m1() },
+            Self::ThresholdedRelu { alpha } => {
+                if x > alpha {
+                    x
+                } else {
+                    0.0
+                }
+            }
             // Swish/SiLU: x·sigmoid(alpha·x), evaluated via the numerically
             // stable logistic to avoid overflow at large-magnitude inputs.
             Self::Swish { alpha } => {
@@ -78,6 +93,8 @@ pub struct ActivationKernel {
 pub struct EluFactory;
 pub struct LeakyReluFactory;
 pub struct HardSigmoidFactory;
+pub struct SeluFactory;
+pub struct ThresholdedReluFactory;
 pub struct SwishFactory;
 pub struct SiluFactory;
 
@@ -110,6 +127,33 @@ impl KernelFactory for HardSigmoidFactory {
             activation: Activation::HardSigmoid {
                 alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(0.2),
                 beta: node.attr("beta").and_then(|a| a.as_float()).unwrap_or(0.5),
+            },
+        }))
+    }
+}
+
+impl KernelFactory for SeluFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ActivationKernel {
+            activation: Activation::Selu {
+                alpha: node
+                    .attr("alpha")
+                    .and_then(|a| a.as_float())
+                    .unwrap_or(SELU_ALPHA_DEFAULT),
+                gamma: node
+                    .attr("gamma")
+                    .and_then(|a| a.as_float())
+                    .unwrap_or(SELU_GAMMA_DEFAULT),
+            },
+        }))
+    }
+}
+
+impl KernelFactory for ThresholdedReluFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ActivationKernel {
+            activation: Activation::ThresholdedRelu {
+                alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
             },
         }))
     }
@@ -187,6 +231,7 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ir::{Attribute, NodeId};
 
     #[test]
     fn activation_formulas_and_defaults() {
@@ -213,6 +258,64 @@ mod tests {
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         assert_eq!(out.to_f32(), vec![0.3, 0.5, 0.7]);
+    }
+
+    #[test]
+    fn selu_default_and_custom_parameters() {
+        let x = Owned::f32(&[3], &[-1.0, 0.0, 2.0]);
+        let mut out = Owned::zeros_f32(&[3]);
+        let node = Node::new(NodeId(0), "Selu", vec![], vec![]);
+        SeluFactory
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        let expected = [
+            SELU_GAMMA_DEFAULT * SELU_ALPHA_DEFAULT * (-1.0f32).exp_m1(),
+            0.0,
+            SELU_GAMMA_DEFAULT * 2.0,
+        ];
+        for (got, want) in out.to_f32().into_iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+
+        let mut node = Node::new(NodeId(0), "Selu", vec![], vec![]);
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(2.0));
+        node.attributes
+            .insert("gamma".into(), Attribute::Float(0.5));
+        SeluFactory
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        let expected = [(-1.0f32).exp_m1(), 0.0, 1.0];
+        for (got, want) in out.to_f32().into_iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn thresholded_relu_default_custom_and_boundary() {
+        let x = Owned::f32(&[5], &[-1.0, 0.5, 1.0, 1.5, 2.0]);
+        let mut out = Owned::zeros_f32(&[5]);
+        let node = Node::new(NodeId(0), "ThresholdedRelu", vec![], vec![]);
+        ThresholdedReluFactory
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![0.0, 0.0, 0.0, 1.5, 2.0]);
+
+        let mut node = Node::new(NodeId(0), "ThresholdedRelu", vec![], vec![]);
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(0.5));
+        ThresholdedReluFactory
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![0.0, 0.0, 1.0, 1.5, 2.0]);
     }
 
     #[test]

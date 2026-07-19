@@ -56,6 +56,7 @@ pub mod indexing;
 pub mod layernorm;
 pub mod log_softmax;
 pub mod logical;
+pub mod lp_normalization;
 pub mod matmul;
 pub mod matmul_nbits;
 pub mod moe;
@@ -392,6 +393,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("PRelu", "", 16),
         Box::new(norm_ops::PReluFactory),
     );
+    reg.register(
+        OpKey::new("LpNormalization", "", 1),
+        Box::new(lp_normalization::LpNormalizationFactory),
+    );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
     reg.register(
         OpKey::new("RotaryEmbedding", "", 23),
@@ -604,6 +609,14 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("HardSigmoid", "", 1),
         Box::new(activations::HardSigmoidFactory),
+    );
+    reg.register(
+        OpKey::new("Selu", "", 6),
+        Box::new(activations::SeluFactory),
+    );
+    reg.register(
+        OpKey::new("ThresholdedRelu", "", 10),
+        Box::new(activations::ThresholdedReluFactory),
     );
     // Logical / selection.
     reg.register(OpKey::new("And", "", 7), Box::new(logical::AndFactory));
@@ -1382,7 +1395,7 @@ mod tests {
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 68);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 71);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1461,6 +1474,11 @@ mod tests {
         assert!(reg.lookup("GroupNormalization", "", 17).is_none());
         assert!(reg.lookup("PRelu", "", 16).is_some());
         assert!(reg.lookup("PRelu", "", 15).is_none());
+        assert!(reg.lookup("LpNormalization", "", 1).is_some());
+        assert!(reg.lookup("Selu", "", 6).is_some());
+        assert!(reg.lookup("Selu", "", 5).is_none());
+        assert!(reg.lookup("ThresholdedRelu", "", 10).is_some());
+        assert!(reg.lookup("ThresholdedRelu", "", 9).is_none());
         assert!(reg.lookup("RotaryEmbedding", "", 23).is_some());
         assert!(reg.lookup("RotaryEmbedding", "", 22).is_none());
         assert!(reg.lookup("Swish", "", 24).is_some());
