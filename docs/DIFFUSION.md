@@ -54,8 +54,7 @@ on `OFA-Sys/small-stable-diffusion-v0` unless noted.
 | `euler_ancestral`   | `EulerAncestralDiscreteScheduler`  | `euler_ancestral`      | 4.7e-2 / 1.3e-3 (stochastic) | `euler_a_e2e.py` |
 | `masked_diffusion`  | — (discrete language diffusion)    | —                      | synthetic fixture           | §7 |
 
-**Sigma spacing.** `use_karras_sigmas` on `SchedulerSpec` enables the Karras (rho=7) schedule for
-`euler`/`dpmpp_2m` — `DPM++ 2M Karras` is the most popular real-world combo.
+**Sigma spacing.** `use_karras_sigmas` (Karras rho=7) or `use_exponential_sigmas` on `SchedulerSpec` replace the default linspace schedule for `euler`/`dpmpp_2m`; `DPM++ 2M Karras` is the most popular real-world combo. Both match diffusers (`scripts/karras_parity.py`).
 
 **Timestep dtype.** Euler and any Karras schedule produce *fractional* timesteps, so the exported
 denoiser must take a **float32** timestep (int64 would truncate and corrupt the time embedding).
