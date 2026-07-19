@@ -29,12 +29,15 @@ use crate::strided::{elem_offset, next_index, numel};
 
 pub mod activations;
 pub mod add;
+pub mod affine_grid;
 pub mod attention;
 pub mod bitwise;
 pub mod block_dequant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
 pub mod cast;
+pub mod center_crop_pad;
+pub mod col2im;
 pub mod compressed_sparse_attention;
 pub mod concat;
 pub mod constant;
@@ -474,6 +477,18 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
     reg.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
     reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
+    reg.register(
+        OpKey::new("AffineGrid", "", 20),
+        Box::new(affine_grid::AffineGridFactory),
+    );
+    reg.register(
+        OpKey::new("Col2Im", "", 18),
+        Box::new(col2im::Col2ImFactory),
+    );
+    reg.register(
+        OpKey::new("CenterCropPad", "", 18),
+        Box::new(center_crop_pad::CenterCropPadFactory),
+    );
     reg.register(
         OpKey::new("ConstantOfShape", "", 1),
         Box::new(constant_of_shape::ConstantOfShapeFactory),
@@ -1395,7 +1410,7 @@ mod tests {
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 71);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 74);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
