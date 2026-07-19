@@ -164,6 +164,7 @@ fn spatial_index(coords: &[usize], shape: &[usize], storage_order: bool) -> usiz
 
 enum PoolKind {
     Average { include_pad: bool },
+    Lp { p: i32 },
     Max { storage_order: bool },
 }
 
@@ -175,6 +176,7 @@ pub struct PoolKernel {
 }
 
 pub struct AveragePoolFactory;
+pub struct LpPoolFactory;
 pub struct MaxPoolFactory;
 
 impl KernelFactory for AveragePoolFactory {
@@ -199,6 +201,30 @@ impl KernelFactory for AveragePoolFactory {
                     .unwrap_or(0)
                     != 0,
             },
+        }))
+    }
+}
+
+impl KernelFactory for LpPoolFactory {
+    fn create(&self, node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let dims = shapes
+            .first()
+            .ok_or_else(|| EpError::KernelFailed("LpPool: missing input shape".into()))?
+            .len()
+            .checked_sub(2)
+            .ok_or_else(|| EpError::KernelFailed("LpPool: input must have rank >= 3".into()))?;
+        let p = node.attr("p").and_then(Attribute::as_int).unwrap_or(2);
+        if p <= 0 || p > i32::MAX as i64 {
+            return Err(EpError::KernelFailed(
+                "LpPool: p must be a positive 32-bit integer".into(),
+            ));
+        }
+        let (params, auto_pad, ceil_mode) = pool_params(node, dims)?;
+        Ok(Box::new(PoolKernel {
+            params,
+            auto_pad,
+            ceil_mode,
+            kind: PoolKind::Lp { p: p as i32 },
         }))
     }
 }
@@ -241,9 +267,10 @@ impl Kernel for PoolKernel {
                 "MaxPool: supports at most two outputs".into(),
             ));
         }
-        if matches!(self.kind, PoolKind::Average { .. }) && outputs.len() != 1 {
+        if matches!(self.kind, PoolKind::Average { .. } | PoolKind::Lp { .. }) && outputs.len() != 1
+        {
             return Err(EpError::KernelFailed(
-                "AveragePool: has exactly one output".into(),
+                "AveragePool and LpPool have exactly one output".into(),
             ));
         }
         let spatial = &x_shape[2..];
@@ -310,6 +337,10 @@ impl Kernel for PoolKernel {
                             sum += value;
                             count += 1;
                         }
+                        PoolKind::Lp { p } => {
+                            sum += value.abs().powi(p);
+                            count += 1;
+                        }
                         PoolKind::Max { storage_order } => {
                             if value > maximum {
                                 maximum = value;
@@ -326,6 +357,13 @@ impl Kernel for PoolKernel {
                             0.0
                         } else {
                             sum / divisor as f32
+                        });
+                    }
+                    PoolKind::Lp { p } => {
+                        values.push(if count == 0 {
+                            0.0
+                        } else {
+                            sum.powf(1.0 / p as f32)
                         });
                     }
                     PoolKind::Max { .. } => {
@@ -354,21 +392,46 @@ impl Kernel for PoolKernel {
 }
 
 pub struct GlobalPoolKernel {
-    max: bool,
+    kind: GlobalPoolKind,
 }
 
 pub struct GlobalAveragePoolFactory;
+pub struct GlobalLpPoolFactory;
 pub struct GlobalMaxPoolFactory;
+
+enum GlobalPoolKind {
+    Average,
+    Lp(i32),
+    Max,
+}
 
 impl KernelFactory for GlobalAveragePoolFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(GlobalPoolKernel { max: false }))
+        Ok(Box::new(GlobalPoolKernel {
+            kind: GlobalPoolKind::Average,
+        }))
+    }
+}
+
+impl KernelFactory for GlobalLpPoolFactory {
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let p = node.attr("p").and_then(Attribute::as_int).unwrap_or(2);
+        if p <= 0 || p > i32::MAX as i64 {
+            return Err(EpError::KernelFailed(
+                "GlobalLpPool: p must be a positive 32-bit integer".into(),
+            ));
+        }
+        Ok(Box::new(GlobalPoolKernel {
+            kind: GlobalPoolKind::Lp(p as i32),
+        }))
     }
 }
 
 impl KernelFactory for GlobalMaxPoolFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(GlobalPoolKernel { max: true }))
+        Ok(Box::new(GlobalPoolKernel {
+            kind: GlobalPoolKind::Max,
+        }))
     }
 }
 
@@ -396,12 +459,17 @@ impl Kernel for GlobalPoolKernel {
         let mut values = Vec::with_capacity(shape[0] * shape[1]);
         for nc in 0..shape[0] * shape[1] {
             let input = &x[nc * spatial_size..(nc + 1) * spatial_size];
-            let value = if self.max {
-                input.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-            } else if spatial_size == 0 {
-                0.0
-            } else {
-                input.iter().sum::<f32>() / spatial_size as f32
+            let value = match self.kind {
+                GlobalPoolKind::Max => input.iter().copied().fold(f32::NEG_INFINITY, f32::max),
+                GlobalPoolKind::Average if spatial_size != 0 => {
+                    input.iter().sum::<f32>() / spatial_size as f32
+                }
+                GlobalPoolKind::Lp(p) if spatial_size != 0 => input
+                    .iter()
+                    .map(|value| value.abs().powi(p))
+                    .sum::<f32>()
+                    .powf(1.0 / p as f32),
+                GlobalPoolKind::Average | GlobalPoolKind::Lp(_) => 0.0,
             };
             values.push(value);
         }
@@ -552,14 +620,18 @@ mod tests {
             ],
         );
         let mut avg = Owned::zeros_f32(&[1, 2, 1, 1]);
-        GlobalPoolKernel { max: false }
-            .execute(&[x.view()], &mut [avg.view_mut()])
-            .unwrap();
+        GlobalPoolKernel {
+            kind: GlobalPoolKind::Average,
+        }
+        .execute(&[x.view()], &mut [avg.view_mut()])
+        .unwrap();
         assert_eq!(avg.to_f32(), vec![5., -5.]);
         let mut max = Owned::zeros_f32(&[1, 2, 1, 1]);
-        GlobalPoolKernel { max: true }
-            .execute(&[x.view()], &mut [max.view_mut()])
-            .unwrap();
+        GlobalPoolKernel {
+            kind: GlobalPoolKind::Max,
+        }
+        .execute(&[x.view()], &mut [max.view_mut()])
+        .unwrap();
         assert_eq!(max.to_f32(), vec![9., -1.]);
 
         let same = PoolKernel {
@@ -578,5 +650,143 @@ mod tests {
             average(&same, &x, &[1, 2, 2, 2]),
             average(&explicit, &x, &[1, 2, 2, 2])
         );
+    }
+
+    fn lp(kernel: PoolKernel, x: &Owned, shape: &[usize]) -> Vec<f32> {
+        let mut out = Owned::zeros_f32(shape);
+        kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        out.to_f32()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn lp_pool_1d_default_p() {
+        let x = Owned::f32(&[1, 1, 3], &[1., -2., 3.]);
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "LpPool", vec![], vec![]);
+        node.attributes
+            .insert("kernel_shape".into(), Attribute::Ints(vec![2]));
+        let kernel = LpPoolFactory.create(&node, &[vec![1, 1, 3]]).unwrap();
+        let mut output = Owned::zeros_f32(&[1, 1, 2]);
+        kernel
+            .execute(&[x.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_close(&output.to_f32(), &[5.0_f32.sqrt(), 13.0_f32.sqrt()]);
+    }
+
+    #[test]
+    fn lp_pool_2d_pads_strides_and_p_one() {
+        let x = Owned::f32(&[1, 1, 2, 2], &[1., 2., 3., 4.]);
+        let values = lp(
+            PoolKernel {
+                params: params(&[2, 2], &[1, 1], &[1, 1, 1, 1], &[1, 1]),
+                auto_pad: AutoPad::NotSet,
+                ceil_mode: false,
+                kind: PoolKind::Lp { p: 1 },
+            },
+            &x,
+            &[1, 1, 3, 3],
+        );
+        assert_eq!(values, vec![1., 3., 2., 4., 10., 6., 3., 7., 4.]);
+
+        let strided = lp(
+            PoolKernel {
+                params: params(&[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1]),
+                auto_pad: AutoPad::NotSet,
+                ceil_mode: false,
+                kind: PoolKind::Lp { p: 2 },
+            },
+            &Owned::f32(
+                &[1, 1, 4, 4],
+                &(1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+            ),
+            &[1, 1, 2, 2],
+        );
+        assert_close(
+            &strided,
+            &[
+                66.0_f32.sqrt(),
+                138.0_f32.sqrt(),
+                546.0_f32.sqrt(),
+                746.0_f32.sqrt(),
+            ],
+        );
+    }
+
+    #[test]
+    fn lp_pool_2d_dilations() {
+        let x = Owned::f32(
+            &[1, 1, 3, 3],
+            &(1..=9).map(|value| value as f32).collect::<Vec<_>>(),
+        );
+        let values = lp(
+            PoolKernel {
+                params: params(&[2, 2], &[1, 1], &[0, 0, 0, 0], &[2, 2]),
+                auto_pad: AutoPad::NotSet,
+                ceil_mode: false,
+                kind: PoolKind::Lp { p: 2 },
+            },
+            &x,
+            &[1, 1, 1, 1],
+        );
+        assert_close(&values, &[140.0_f32.sqrt()]);
+    }
+
+    #[test]
+    fn lp_pool_2d_same_upper_and_lower() {
+        let x = Owned::f32(
+            &[1, 1, 3, 3],
+            &(1..=9).map(|value| value as f32).collect::<Vec<_>>(),
+        );
+        let make_kernel = |auto_pad| PoolKernel {
+            params: params(&[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1]),
+            auto_pad,
+            ceil_mode: false,
+            kind: PoolKind::Lp { p: 2 },
+        };
+        assert_close(
+            &lp(make_kernel(AutoPad::SameUpper), &x, &[1, 1, 2, 2]),
+            &[46.0_f32.sqrt(), 45.0_f32.sqrt(), 113.0_f32.sqrt(), 9.],
+        );
+        assert_close(
+            &lp(make_kernel(AutoPad::SameLower), &x, &[1, 1, 2, 2]),
+            &[1., 13.0_f32.sqrt(), 65.0_f32.sqrt(), 206.0_f32.sqrt()],
+        );
+    }
+
+    #[test]
+    fn lp_pool_3d_and_global_lp_pool() {
+        let x = Owned::f32(
+            &[1, 1, 2, 2, 2],
+            &(1..=8).map(|value| value as f32).collect::<Vec<_>>(),
+        );
+        let values = lp(
+            PoolKernel {
+                params: params(&[2, 2, 2], &[1, 1, 1], &[0, 0, 0, 0, 0, 0], &[1, 1, 1]),
+                auto_pad: AutoPad::NotSet,
+                ceil_mode: false,
+                kind: PoolKind::Lp { p: 2 },
+            },
+            &x,
+            &[1, 1, 1, 1, 1],
+        );
+        assert_close(&values, &[204.0_f32.sqrt()]);
+
+        let global_input = Owned::f32(&[1, 1, 3], &[-1., 2., -2.]);
+        let mut global_output = Owned::zeros_f32(&[1, 1, 1]);
+        GlobalPoolKernel {
+            kind: GlobalPoolKind::Lp(3),
+        }
+        .execute(&[global_input.view()], &mut [global_output.view_mut()])
+        .unwrap();
+        assert_close(&global_output.to_f32(), &[17.0_f32.cbrt()]);
     }
 }

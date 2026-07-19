@@ -83,6 +83,7 @@ pub mod shape;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
+pub mod space_to_depth;
 pub mod sparse_kv_gather;
 pub mod split;
 pub mod transpose;
@@ -563,6 +564,18 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("GlobalMaxPool", "", 1),
         Box::new(pooling::GlobalMaxPoolFactory),
+    );
+    reg.register(
+        OpKey::new("LpPool", "", 18),
+        Box::new(pooling::LpPoolFactory),
+    );
+    reg.register(
+        OpKey::new("GlobalLpPool", "", 2),
+        Box::new(pooling::GlobalLpPoolFactory),
+    );
+    reg.register(
+        OpKey::new("SpaceToDepth", "", 13),
+        Box::new(space_to_depth::SpaceToDepthFactory),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
@@ -1426,6 +1439,9 @@ mod tests {
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
+        assert!(reg.lookup("LpPool", "", 18).is_some());
+        assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
+        assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
