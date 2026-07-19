@@ -755,8 +755,8 @@ impl<'a> DecodeSession<'a> {
                 .expect("device sampler initialized for device logits");
             let result = if let Some(params) = params {
                 device_sampler
-                    .sample(dtype, ptr, 1, cap.vocab, params)
-                    .map(|ids| StepLogits::Token(ids[0]))
+                    .sample_one(dtype, ptr, cap.vocab, params)
+                    .map(StepLogits::Token)
             } else {
                 device_logits_to_host_value(device_sampler.as_ref(), dtype, ptr, cap.vocab)
                     .map(StepLogits::Value)
