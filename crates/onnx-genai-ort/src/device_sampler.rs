@@ -60,6 +60,24 @@ pub(crate) trait DeviceSampler: Send {
         params: &DeviceSampleParams,
     ) -> Result<Vec<u32>>;
 
+    /// Select a single token id from one `vocab`-element row at `ptr_addr`.
+    ///
+    /// This is the captured single-token decode hot path: implementations should
+    /// avoid per-call heap allocation. The default forwards to [`Self::sample`]
+    /// for backends that do not specialise the single-row case.
+    fn sample_one(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        vocab: usize,
+        params: &DeviceSampleParams,
+    ) -> Result<u32> {
+        let ids = self.sample(dtype, ptr_addr, 1, vocab, params)?;
+        ids.first()
+            .copied()
+            .ok_or_else(|| OrtError::Cuda("device sampler returned no token for single row".into()))
+    }
+
     fn copy_row_to_host(
         &self,
         dtype: DataType,
@@ -82,9 +100,15 @@ const BLOCK: u32 = 1024;
 /// default as a correctness guard against any ORT configuration that leaves the
 /// stream running asynchronously; set `ONNX_GENAI_ARGMAX_CTX_SYNC=0` to drop it.
 fn ctx_sync_enabled() -> bool {
-    std::env::var("ONNX_GENAI_ARGMAX_CTX_SYNC")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(true)
+    // Cached after the first read: this is on the per-token decode hot path, so
+    // re-reading the environment (which allocates a `String`) every call would
+    // add avoidable per-token overhead. The setting is process-static.
+    static CTX_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CTX_SYNC.get_or_init(|| {
+        std::env::var("ONNX_GENAI_ARGMAX_CTX_SYNC")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true)
+    })
 }
 
 /// NVRTC source: three argmax entry points (f16 / bf16 / f32). Each launches
@@ -194,20 +218,24 @@ extern "C" __global__ void argmax_f32(const float* x, int rows, int vocab, int* 
 
 /// NVRTC source: the non-greedy sampling pipeline (f16 / bf16 / f32), one block
 /// per row (`blockIdx.x` selects the row). Each block runs the full device
-/// pipeline over its `vocab` contiguous logits — temperature scaling, numerically
-/// stable softmax, top-k, top-p (nucleus), min-p, then an inverse-CDF categorical
-/// draw — writing the selected token id into `out[row]`. The stages are composed
-/// from modular `__device__` helpers but issued as a single fixed launch per
-/// dtype so the sequence stays stable for later CUDA-graph capture.
+/// pipeline over its `vocab` contiguous logits — temperature scaling, then the
+/// host processor chain applied **sequentially** (top-k, then top-p renormalized
+/// over the top-k survivors, then min-p), then a fresh-softmax inverse-CDF
+/// categorical draw — writing the selected token id into `out[row]`. The stages
+/// are composed from modular `__device__` helpers but issued as a single fixed
+/// launch per dtype so the sequence stays stable for later CUDA-graph capture.
 ///
-/// Every threshold is a lower bound on probability, so a token survives iff its
-/// probability is `>= max(topk_thresh, topp_thresh, minp_thresh)`. The argmax
-/// token always has the maximum probability, so it always survives every filter
-/// (matching the greedy invariant), which also guarantees the survivor set is
-/// non-empty. f16/bf16 are decoded with pure integer bit math (no
-/// `<cuda_fp16.h>`), matching the argmax kernels. The RNG value is applied per
-/// row (each row samples independently with the same `rng`; see the Rust doc on
-/// multi-row handling).
+/// The filters are applied in the same order as the host `ProcessorChain`
+/// (`TopKProcessor` -> `TopPProcessor` -> `MinPProcessor`), each masking pruned
+/// logits to -inf so the next stage's softmax is renormalized over the current
+/// survivors. This is required for parity: computing the three thresholds
+/// independently over the full-vocab distribution and combining them selects a
+/// different nucleus than the host (e.g. top_k=3, top_p=0.9 over
+/// `[.505,.061,.040,10x.039]` keeps {0,1} on the host, not {0,1,2}). The argmax
+/// token survives every filter, so the survivor set is always non-empty. f16/bf16
+/// are decoded with pure integer bit math (no `<cuda_fp16.h>`), matching the
+/// argmax kernels. The RNG value is applied per row (each row samples
+/// independently with the same `rng`; see the Rust doc on multi-row handling).
 const SAMPLE_SRC: &str = r#"
 #define BLOCK 1024
 
@@ -268,109 +296,175 @@ __device__ __forceinline__ float blk_sum(float v) {
 }
 
 // `w` holds temperature-scaled logits (NaN entries pre-set to -inf) and `m` is
-// their max. Turns `w` into a filtered, renormalizable probability row and
-// writes the inverse-CDF categorical pick into out[row].
+// their max. It applies the host processor pipeline SEQUENTIALLY — top-k, then
+// top-p (renormalized over the top-k survivors), then min-p — masking filtered
+// entries to -inf in `w`, then performs a fresh-softmax inverse-CDF categorical
+// draw over the survivors and writes the chosen token id into out[row].
+//
+// This mirrors the host exactly: `TopKProcessor` -> `TopPProcessor` ->
+// `MinPProcessor` each recompute softmax over the CURRENT (already-masked)
+// logits, so top-p and min-p operate on the renormalized post-top-k
+// distribution rather than on independent thresholds over the full vocabulary.
 __device__ void finish_row(float* w, int vocab, float m,
                            int top_k, float top_p, float min_p, float rng,
                            int* out, int row) {
     int tid = threadIdx.x;
     const float NEG_INF = __int_as_float(0xff800000);
     const float POS_INF = __int_as_float(0x7f800000);
-    // All-NaN / empty row: match the argmax convention of index 0.
+    // All-NaN / empty / all-(-inf) row: match the argmax convention of index 0.
     if (m == NEG_INF) { if (tid == 0) out[row] = 0; return; }
 
-    // Stable softmax: exp(z - m), summed across the block.
-    float ls = 0.0f;
-    for (int i = tid; i < vocab; i += BLOCK) {
-        float z = w[i];
-        float e = (z == NEG_INF) ? 0.0f : expf(z - m);
-        w[i] = e;
-        ls += e;
+    // +inf max: exp(z - m) = exp(+inf - +inf) = NaN would poison the softmax and
+    // force token 0. The host categorical sampler instead sees a non-finite max
+    // and falls back to greedy, selecting the LOWEST-INDEX +inf token. Reproduce
+    // that here with a block-wide min-index reduction over the +inf entries.
+    if (m == POS_INF) {
+        __shared__ int smin[BLOCK];
+        int lidx = 0x7fffffff;
+        for (int i = tid; i < vocab; i += BLOCK) {
+            if (w[i] == POS_INF && i < lidx) lidx = i;
+        }
+        smin[tid] = lidx;
+        __syncthreads();
+        for (int off = BLOCK >> 1; off > 0; off >>= 1) {
+            if (tid < off) { int o = smin[tid + off]; if (o < smin[tid]) smin[tid] = o; }
+            __syncthreads();
+        }
+        if (tid == 0) out[row] = (smin[0] == 0x7fffffff) ? 0 : smin[0];
+        return;
     }
-    float S = blk_sum(ls);
-    if (!(S > 0.0f)) { if (tid == 0) out[row] = 0; return; }
-    float invS = 1.0f / S;
-    for (int i = tid; i < vocab; i += BLOCK) { w[i] *= invS; }
-    __syncthreads();
-    // The max logit maps to exp(0)=1, so the max probability is 1/S.
-    float p_max = invS;
 
-    // min-p: keep prob >= min_p * p_max.
-    float minp_thresh = (min_p > 0.0f) ? (min_p * p_max) : 0.0f;
-
-    // top-k: threshold = k-th largest probability (iterative selection of the
-    // next-highest value strictly below the running threshold; exact for
-    // distinct probabilities). O(k) block passes over the row.
-    float topk_thresh = 0.0f;
+    // ---------- top-k: mask logits below the k-th largest (with multiplicity) --
+    // Host `TopKProcessor` sorts the logits descending and thresholds at
+    // sorted[k-1], masking every logit strictly below it (ties at the threshold
+    // are all kept). Find that value by walking distinct logits downward until
+    // the running count of `>= thr` entries reaches k.
     if (top_k > 0 && top_k < vocab) {
         float thr = POS_INF;
-        for (int it = 0; it < top_k; ++it) {
-            float lm = NEG_INF;
+        int applied = 0;
+        for (;;) {
+            float lm = NEG_INF; // largest logit strictly below the current thr
             for (int i = tid; i < vocab; i += BLOCK) {
-                float p = w[i];
-                if (p < thr && p > lm) lm = p;
+                float v = w[i];
+                if (v < thr && v > lm) lm = v;
             }
             float cur = blk_max(lm);
+            if (cur == NEG_INF) break; // no more distinct finite values
             thr = cur;
-            if (thr == NEG_INF) break;
-        }
-        topk_thresh = (thr == NEG_INF) ? 0.0f : thr;
-    }
-
-    // top-p (nucleus): threshold = sup{ t : sum(prob >= t) >= top_p }, found by
-    // binary search on the cumulative mass (no full sort needed). Keeping
-    // prob >= this threshold reproduces the nucleus for distinct probabilities.
-    float topp_thresh = 0.0f;
-    if (top_p > 0.0f && top_p < 1.0f) {
-        float lo = 0.0f, hi = p_max;
-        // 32 bisections exhaust f32 precision on [0, p_max]; more only burns
-        // full-vocab reductions without moving the threshold.
-        for (int it = 0; it < 32; ++it) {
-            float mid = 0.5f * (lo + hi);
-            float loc = 0.0f;
+            applied = 1;
+            float lc = 0.0f;
             for (int i = tid; i < vocab; i += BLOCK) {
-                float p = w[i];
-                if (p >= mid) loc += p;
+                if (w[i] >= thr) lc += 1.0f;
             }
-            float sm = blk_sum(loc);
-            if (sm >= top_p) lo = mid; else hi = mid;
+            float cnt = blk_sum(lc);
+            if (cnt >= (float)top_k) break;
         }
-        topp_thresh = lo;
+        if (applied) {
+            for (int i = tid; i < vocab; i += BLOCK) {
+                if (w[i] < thr) w[i] = NEG_INF;
+            }
+            __syncthreads();
+        }
     }
 
-    // A token survives iff its prob >= the strongest (largest) lower bound.
-    float T = topk_thresh;
-    if (topp_thresh > T) T = topp_thresh;
-    if (minp_thresh > T) T = minp_thresh;
+    // ---------- top-p (nucleus) over the post-top-k renormalized distribution --
+    // Host `TopPProcessor` recomputes softmax over the current logits, sorts the
+    // probabilities descending, and keeps the smallest prefix whose cumulative
+    // mass reaches top_p. Equivalent: keep prob >= p_thr, where p_thr is the
+    // largest probability with cumulative(>= p_thr) >= top_p, found by bisecting
+    // the cumulative mass. Applying this AFTER the top-k mask (so `S` is the
+    // survivor sum) is what makes the device match the host.
+    if (top_p < 1.0f) {
+        float cutoff = (top_p > 0.0f) ? top_p : 0.0f;
+        float le = 0.0f;
+        for (int i = tid; i < vocab; i += BLOCK) {
+            float z = w[i];
+            le += (z == NEG_INF) ? 0.0f : expf(z - m);
+        }
+        float S = blk_sum(le);
+        if (S > 0.0f) {
+            float invS = 1.0f / S;
+            float p_max = invS; // max prob = exp(0) * invS
+            float lo = 0.0f, hi = p_max;
+            for (int it = 0; it < 32; ++it) {
+                float mid = 0.5f * (lo + hi);
+                float loc = 0.0f;
+                for (int i = tid; i < vocab; i += BLOCK) {
+                    float z = w[i];
+                    float p = (z == NEG_INF) ? 0.0f : expf(z - m) * invS;
+                    if (p >= mid) loc += p;
+                }
+                float sm = blk_sum(loc);
+                if (sm >= cutoff) lo = mid; else hi = mid;
+            }
+            for (int i = tid; i < vocab; i += BLOCK) {
+                float z = w[i];
+                if (z != NEG_INF) {
+                    float p = expf(z - m) * invS;
+                    if (p < lo) w[i] = NEG_INF;
+                }
+            }
+            __syncthreads();
+        }
+    }
 
-    // Renormalizing mass of the survivor set.
-    float loc = 0.0f;
+    // ---------- min-p over the post-top-p renormalized distribution -----------
+    // Host `MinPProcessor` recomputes softmax over the current logits, takes
+    // top_prob = 1/exp_sum (= max prob), and masks tokens with prob <
+    // min(min_p, 1) * top_prob.
+    if (min_p > 0.0f) {
+        float le = 0.0f;
+        for (int i = tid; i < vocab; i += BLOCK) {
+            float z = w[i];
+            le += (z == NEG_INF) ? 0.0f : expf(z - m);
+        }
+        float S = blk_sum(le);
+        if (S > 0.0f) {
+            float invS = 1.0f / S;
+            float mp = (min_p < 1.0f) ? min_p : 1.0f;
+            float thresh = mp * invS; // mp * top_prob
+            for (int i = tid; i < vocab; i += BLOCK) {
+                float z = w[i];
+                if (z != NEG_INF) {
+                    float p = expf(z - m) * invS;
+                    if (p < thresh) w[i] = NEG_INF;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // ---------- final: fresh softmax over survivors + inverse-CDF draw --------
+    // Mirrors host `sample_categorical` over the masked logits: recompute the
+    // softmax weights, then walk in index order returning the first token whose
+    // running cumulative mass exceeds `rng`. `target = rng * S` scales the draw
+    // into the unnormalized survivor weight, so `acc > target` is exactly the
+    // host's `rng < cumulative`.
+    float le = 0.0f;
     for (int i = tid; i < vocab; i += BLOCK) {
-        float p = w[i];
-        if (p >= T) loc += p;
+        float z = w[i];
+        le += (z == NEG_INF) ? 0.0f : expf(z - m);
     }
-    float Ssurv = blk_sum(loc);
-
-    // Inverse-CDF draw in index order over the survivors (deterministic and
-    // trivially reproducible on the host reference oracle).
+    float S = blk_sum(le);
+    if (!(S > 0.0f)) { if (tid == 0) out[row] = 0; return; }
     if (tid == 0) {
-        float target = rng * Ssurv;
+        float target = rng * S;
         float acc = 0.0f;
         int chosen = -1;
         int last_survivor = -1;
         for (int i = 0; i < vocab; i++) {
-            float p = w[i];
-            if (p >= T) {
+            float z = w[i];
+            if (z != NEG_INF) {
+                float e = expf(z - m);
                 last_survivor = i;
-                acc += p;
+                acc += e;
                 if (acc > target) { chosen = i; break; }
             }
         }
         // Float non-associativity: the sequential `acc` can fall just short of
-        // the parallel `Ssurv`, so an extreme-tail `target` may leave `chosen`
-        // unset. Fall back to the LAST survivor (mirrors the host oracle), never
-        // token 0 which may have been filtered out. `last_survivor` is always
-        // >= 0 because the argmax survives any valid threshold.
+        // the parallel `S`, so an extreme-tail `target` may leave `chosen` unset.
+        // Fall back to the LAST survivor (mirrors the host oracle), never token 0
+        // which may have been filtered out.
         out[row] = (chosen >= 0) ? chosen : (last_survivor >= 0 ? last_survivor : 0);
     }
 }
@@ -542,7 +636,10 @@ impl CudaSampler {
             f_sample_bf16,
             f_sample_f32,
             out: Mutex::new(OutScratch { ptr, cap: 1 }),
-            work: Mutex::new(WorkScratch { ptr: work_ptr, cap: 1 }),
+            work: Mutex::new(WorkScratch {
+                ptr: work_ptr,
+                cap: 1,
+            }),
         })
     }
 }
@@ -560,9 +657,27 @@ impl CudaSampler {
         rows: usize,
         vocab: usize,
     ) -> Result<Vec<u32>> {
+        let mut idx = vec![0i32; rows];
+        self.argmax_into(dtype, ptr_addr, rows, vocab, &mut idx)?;
+        Ok(idx.into_iter().map(|v| v as u32).collect())
+    }
+
+    /// Argmax into a caller-owned `out_idx` slice (`len == rows`), avoiding the
+    /// per-call heap allocation of [`Self::argmax_rows`]. The single-row captured
+    /// decode path passes a stack `[i32; 1]`, so no token-selection allocation
+    /// remains on the hot path.
+    fn argmax_into(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        rows: usize,
+        vocab: usize,
+        out_idx: &mut [i32],
+    ) -> Result<()> {
         if rows == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
+        debug_assert_eq!(out_idx.len(), rows);
         let mut out = self.out.lock().expect("cuda argmax scratch poisoned");
         self.ctx
             .bind_to_thread()
@@ -599,28 +714,22 @@ impl CudaSampler {
             shared_mem_bytes: 0,
         };
         let mut builder = self.stream.launch_builder(func);
-        builder
-            .arg(&x_ptr)
-            .arg(&rows_i)
-            .arg(&vocab_i)
-            .arg(&out.ptr);
+        builder.arg(&x_ptr).arg(&rows_i).arg(&vocab_i).arg(&out.ptr);
         // SAFETY: `func` is the compiled argmax entry; the argument list matches
         // its (const T*, int, int, int*) signature; `x_ptr` is a live device
         // buffer of `rows * vocab` elements and `out.ptr` holds `rows` i32 slots.
         unsafe { builder.launch(cfg) }
             .map_err(|e| OrtError::Cuda(format!("launch argmax: {e:?}")))?;
 
-        let mut idx = vec![0i32; rows];
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(idx.as_mut_ptr().cast::<u8>(), rows * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out_idx.as_mut_ptr().cast::<u8>(), rows * 4) };
         // SAFETY: `out.ptr` holds `rows` live i32 slots; `bytes` covers them.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(bytes, out.ptr) }
             .map_err(|e| OrtError::Cuda(format!("copy argmax result: {e:?}")))?;
         self.stream
             .synchronize()
             .map_err(|e| OrtError::Cuda(format!("stream synchronize: {e:?}")))?;
-        Ok(idx.into_iter().map(|v| v as u32).collect())
+        Ok(())
     }
 
     /// Non-greedy sampling: apply temperature, top-k, top-p, min-p and a final
@@ -641,12 +750,29 @@ impl CudaSampler {
         vocab: usize,
         params: &DeviceSampleParams,
     ) -> Result<Vec<u32>> {
+        let mut idx = vec![0i32; rows];
+        self.sample_into(dtype, ptr_addr, rows, vocab, params, &mut idx)?;
+        Ok(idx.into_iter().map(|v| v as u32).collect())
+    }
+
+    /// Sample into a caller-owned `out_idx` slice (`len == rows`), avoiding the
+    /// per-call heap allocation of [`Self::sample_rows`]; see [`Self::argmax_into`].
+    fn sample_into(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        rows: usize,
+        vocab: usize,
+        params: &DeviceSampleParams,
+        out_idx: &mut [i32],
+    ) -> Result<()> {
         if rows == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if vocab == 0 {
             return Err(OrtError::Cuda("device sample requires vocab > 0".into()));
         }
+        debug_assert_eq!(out_idx.len(), rows);
         let mut out = self.out.lock().expect("cuda sample out scratch poisoned");
         let mut work = self.work.lock().expect("cuda sample work scratch poisoned");
         self.ctx
@@ -715,17 +841,35 @@ impl CudaSampler {
         unsafe { builder.launch(cfg) }
             .map_err(|e| OrtError::Cuda(format!("launch sample: {e:?}")))?;
 
-        let mut idx = vec![0i32; rows];
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(idx.as_mut_ptr().cast::<u8>(), rows * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out_idx.as_mut_ptr().cast::<u8>(), rows * 4) };
         // SAFETY: `out.ptr` holds `rows` live i32 slots; `bytes` covers them.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(bytes, out.ptr) }
             .map_err(|e| OrtError::Cuda(format!("copy sample result: {e:?}")))?;
         self.stream
             .synchronize()
             .map_err(|e| OrtError::Cuda(format!("stream synchronize: {e:?}")))?;
-        Ok(idx.into_iter().map(|v| v as u32).collect())
+        Ok(())
+    }
+
+    /// Single-row token selection for the captured decode hot path. Reads the
+    /// winning id into a stack `[i32; 1]` and returns it as a scalar, so a decode
+    /// step performs **no** token-selection heap allocation (neither the `i32`
+    /// index vec nor the returned `u32` vec of the multi-row path).
+    pub(crate) fn sample_one(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        vocab: usize,
+        params: &DeviceSampleParams,
+    ) -> Result<u32> {
+        let mut idx = [0i32; 1];
+        if params.greedy {
+            self.argmax_into(dtype, ptr_addr, 1, vocab, &mut idx)?;
+        } else {
+            self.sample_into(dtype, ptr_addr, 1, vocab, params, &mut idx)?;
+        }
+        Ok(idx[0] as u32)
     }
 }
 
@@ -745,6 +889,18 @@ impl DeviceSampler for CudaSampler {
         }
         // Non-greedy: temperature/top-k/top-p/min-p + categorical draw on-device.
         self.sample_rows(dtype, ptr_addr, rows, vocab, params)
+    }
+
+    fn sample_one(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        vocab: usize,
+        params: &DeviceSampleParams,
+    ) -> Result<u32> {
+        // Greedy and non-greedy both dispatch through the allocation-free scalar
+        // path (stack `[i32; 1]`, no returned `Vec`).
+        CudaSampler::sample_one(self, dtype, ptr_addr, vocab, params)
     }
 
     /// Copy a `len`-element device row of `dtype` at `ptr_addr` into `dst`
@@ -789,38 +945,53 @@ impl DeviceSampler for CudaSampler {
 
 impl OutScratch {
     /// Ensure the scratch can hold `rows` i32 indices, reallocating if needed.
+    ///
+    /// Allocate-new-first, then free-old-and-swap only after the new allocation
+    /// succeeds. If `malloc_sync` fails, `self.ptr`/`self.cap` are left pointing
+    /// at the still-live existing buffer and the error is propagated, so neither
+    /// a retry nor `Drop` can double-free or dereference freed memory.
     fn ensure(&mut self, rows: usize) -> Result<()> {
         if rows <= self.cap {
             return Ok(());
         }
-        // SAFETY: `ptr` came from `malloc_sync`; free before replacing.
-        let _ = unsafe { cudarc::driver::result::free_sync(self.ptr) };
         let bytes = rows
             .checked_mul(4)
             .ok_or_else(|| OrtError::Cuda("argmax scratch size overflow".into()))?;
         // SAFETY: primary context is current (caller bound it); we own the result.
-        self.ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
+        let new_ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
             .map_err(|e| OrtError::Cuda(format!("grow argmax scratch: {e:?}")))?;
+        // New allocation succeeded: release the old buffer and adopt the new one.
+        let old_ptr = self.ptr;
+        self.ptr = new_ptr;
         self.cap = rows;
+        // SAFETY: `old_ptr` came from `malloc_sync` and is no longer referenced.
+        let _ = unsafe { cudarc::driver::result::free_sync(old_ptr) };
         Ok(())
     }
 }
 
 impl WorkScratch {
     /// Ensure the scratch can hold `slots` f32 values, reallocating if needed.
+    ///
+    /// Allocate-new-first, then free-old-and-swap only after the new allocation
+    /// succeeds (see [`OutScratch::ensure`] for the memory-safety rationale). On
+    /// failure the existing buffer is left intact and the error is propagated.
     fn ensure(&mut self, slots: usize) -> Result<()> {
         if slots <= self.cap {
             return Ok(());
         }
-        // SAFETY: `ptr` came from `malloc_sync`; free before replacing.
-        let _ = unsafe { cudarc::driver::result::free_sync(self.ptr) };
         let bytes = slots
             .checked_mul(4)
             .ok_or_else(|| OrtError::Cuda("sample scratch size overflow".into()))?;
         // SAFETY: primary context is current (caller bound it); we own the result.
-        self.ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
+        let new_ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
             .map_err(|e| OrtError::Cuda(format!("grow sample scratch: {e:?}")))?;
+        // New allocation succeeded: release the old buffer and adopt the new one.
+        let old_ptr = self.ptr;
+        self.ptr = new_ptr;
         self.cap = slots;
+        // SAFETY: `old_ptr` came from `malloc_sync` and is no longer referenced.
+        let _ = unsafe { cudarc::driver::result::free_sync(old_ptr) };
         Ok(())
     }
 }
@@ -930,104 +1101,338 @@ mod tests {
         ptr as usize
     }
 
-    /// Host reference implementing exactly the device pipeline (in f32) so the
-    /// two agree token-for-token on well-separated distributions:
-    /// temperature -> stable softmax -> top-k -> top-p -> min-p -> inverse-CDF.
-    fn host_pipeline(logits: &[f32], params: &DeviceSampleParams) -> u32 {
+    const NEG_INF: f32 = f32::NEG_INFINITY;
+
+    /// Clamp the RNG draw exactly as the device kernel wrapper does: NaN/negative
+    /// -> 0, `>= 1.0` -> the largest f32 below 1.0, otherwise unchanged.
+    fn clamp_rng(rng: f32) -> f32 {
+        if rng.is_nan() || rng < 0.0 {
+            0.0
+        } else if rng >= 1.0 {
+            f32::from_bits(0x3f7f_ffff)
+        } else {
+            rng
+        }
+    }
+
+    // ---- Faithful ports of the engine host processors (onnx-genai-engine) ----
+    // These mirror `TopKProcessor`/`TopPProcessor`/`MinPProcessor::process` and
+    // `sampling::sample_categorical` byte-for-byte so the differential tests
+    // compare the device algorithm against the *actual* host sampling semantics.
+
+    fn host_temperature(logits: &mut [f32], temperature: f32) {
+        if temperature.is_finite() && temperature > 0.0 && temperature != 1.0 {
+            for l in logits.iter_mut() {
+                *l /= temperature;
+            }
+        }
+    }
+
+    fn host_top_k(logits: &mut [f32], top_k: usize) {
+        if top_k == 0 || top_k >= logits.len() {
+            return;
+        }
+        let mut sorted: Vec<f32> = logits.iter().copied().filter(|v| !v.is_nan()).collect();
+        if sorted.is_empty() {
+            return;
+        }
+        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = sorted[top_k.saturating_sub(1).min(sorted.len() - 1)];
+        for l in logits.iter_mut() {
+            if l.is_nan() || *l < threshold {
+                *l = NEG_INF;
+            }
+        }
+    }
+
+    fn host_top_p(logits: &mut [f32], top_p: f32) {
+        if !top_p.is_finite() || top_p >= 1.0 || logits.is_empty() {
+            return;
+        }
+        let max_logit = logits
+            .iter()
+            .copied()
+            .filter(|v| !v.is_nan())
+            .fold(NEG_INF, f32::max);
+        if !max_logit.is_finite() {
+            return;
+        }
+        let exp_sum: f32 = logits
+            .iter()
+            .map(|&l| {
+                if l.is_nan() {
+                    0.0
+                } else {
+                    (l - max_logit).exp()
+                }
+            })
+            .sum();
+        if !exp_sum.is_finite() || exp_sum <= 0.0 {
+            return;
+        }
+        let mut probs: Vec<(usize, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| {
+                let prob = if l.is_nan() {
+                    0.0
+                } else {
+                    (l - max_logit).exp() / exp_sum
+                };
+                (i, prob)
+            })
+            .collect();
+        probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cumulative = 0.0;
+        let mut keep_count = 0;
+        let cutoff = top_p.max(0.0);
+        for &(_, prob) in &probs {
+            keep_count += 1;
+            cumulative += prob;
+            if cumulative >= cutoff {
+                break;
+            }
+        }
+        for &(idx, _) in probs.iter().skip(keep_count) {
+            logits[idx] = NEG_INF;
+        }
+    }
+
+    fn host_min_p(logits: &mut [f32], min_p: f32) {
+        if !min_p.is_finite() || min_p <= 0.0 || logits.is_empty() {
+            return;
+        }
+        let max_logit = logits
+            .iter()
+            .copied()
+            .filter(|v| !v.is_nan())
+            .fold(NEG_INF, f32::max);
+        if !max_logit.is_finite() {
+            return;
+        }
+        let weights: Vec<f32> = logits
+            .iter()
+            .map(|&l| {
+                if l.is_nan() {
+                    0.0
+                } else {
+                    (l - max_logit).exp()
+                }
+            })
+            .collect();
+        let exp_sum: f32 = weights.iter().sum();
+        if !exp_sum.is_finite() || exp_sum <= 0.0 {
+            return;
+        }
+        let top_prob = 1.0 / exp_sum;
+        let threshold = min_p.min(1.0) * top_prob;
+        for (l, weight) in logits.iter_mut().zip(weights) {
+            let prob = weight / exp_sum;
+            if !prob.is_finite() || prob < threshold {
+                *l = NEG_INF;
+            }
+        }
+    }
+
+    /// Faithful port of `onnx-genai-engine::sampling::sample_categorical`.
+    fn host_categorical(logits: &[f32], rng_value: f32) -> u32 {
+        if logits.is_empty() {
+            return 0;
+        }
+        let max_logit = logits
+            .iter()
+            .copied()
+            .filter(|v| !v.is_nan())
+            .fold(NEG_INF, f32::max);
+        if !max_logit.is_finite() {
+            return host_argmax(logits);
+        }
+        let weights: Vec<f32> = logits
+            .iter()
+            .map(|&l| {
+                if l.is_nan() {
+                    0.0
+                } else {
+                    (l - max_logit).exp()
+                }
+            })
+            .collect();
+        let exp_sum: f32 = weights.iter().sum();
+        if !exp_sum.is_finite() || exp_sum <= 0.0 {
+            return host_argmax(logits);
+        }
+        let target = rng_value.clamp(0.0, 1.0);
+        let mut cumulative = 0.0;
+        for (i, weight) in weights.iter().enumerate() {
+            cumulative += *weight / exp_sum;
+            if target < cumulative {
+                return i as u32;
+            }
+        }
+        (logits.len() - 1) as u32
+    }
+
+    /// The ground-truth host sampling path: the engine's processor chain
+    /// (temperature -> top-k -> top-p -> min-p, each applied SEQUENTIALLY with
+    /// its own re-normalized softmax) followed by the categorical draw. This is
+    /// what a seeded host decode actually selects; the device path must match it.
+    fn host_oracle(logits: &[f32], params: &DeviceSampleParams) -> u32 {
+        let mut w = logits.to_vec();
+        host_temperature(&mut w, params.temperature);
+        if params.top_k > 0 {
+            host_top_k(&mut w, params.top_k);
+        }
+        if params.top_p < 1.0 {
+            host_top_p(&mut w, params.top_p);
+        }
+        if params.min_p > 0.0 {
+            host_min_p(&mut w, params.min_p);
+        }
+        if params.greedy {
+            host_argmax(&w)
+        } else {
+            host_categorical(&w, clamp_rng(params.rng_value))
+        }
+    }
+
+    /// Faithful CPU port of the device `finish_row` kernel (Issues 1 & 2): the
+    /// same sequential top-k -> top-p(renorm) -> min-p masking, +inf handling,
+    /// and inverse-CDF draw. Running this on CPU lets the differential tests
+    /// guard the device semantics deterministically even with no GPU present,
+    /// and it is what the GPU kernel is expected to reproduce bit-for-token.
+    fn device_algo_cpu(logits: &[f32], params: &DeviceSampleParams) -> u32 {
         let vocab = logits.len();
+        if params.greedy {
+            return host_argmax(logits);
+        }
         let inv_t = if params.temperature > 0.0 && params.temperature != 1.0 {
             1.0 / params.temperature
         } else {
             1.0
         };
-        let z: Vec<f32> = logits
+        let mut w: Vec<f32> = logits
             .iter()
-            .map(|&l| if l.is_nan() { f32::NEG_INFINITY } else { l * inv_t })
+            .map(|&l| if l.is_nan() { NEG_INF } else { l * inv_t })
             .collect();
-        let m = z.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        if m == f32::NEG_INFINITY {
+        let m = w.iter().cloned().fold(NEG_INF, f32::max);
+        if m == NEG_INF {
             return 0;
         }
-        let mut w: Vec<f32> = z
-            .iter()
-            .map(|&zi| {
-                if zi == f32::NEG_INFINITY {
-                    0.0
-                } else {
-                    (zi - m).exp()
-                }
-            })
-            .collect();
-        let s: f32 = w.iter().sum();
-        if !(s > 0.0) {
-            return 0;
+        if m == f32::INFINITY {
+            // Lowest-index +inf token, matching the host greedy fallback.
+            return w.iter().position(|&v| v == f32::INFINITY).unwrap_or(0) as u32;
         }
-        let inv_s = 1.0 / s;
-        for wi in w.iter_mut() {
-            *wi *= inv_s;
-        }
-        let p_max = inv_s;
 
-        let minp_thresh = if params.min_p > 0.0 {
-            params.min_p * p_max
-        } else {
-            0.0
-        };
-
-        let mut topk_thresh = 0.0f32;
+        // top-k: mask logits below the k-th largest (with multiplicity).
         let top_k = params.top_k.min(vocab);
         if top_k > 0 && top_k < vocab {
             let mut thr = f32::INFINITY;
-            for _ in 0..top_k {
-                let mut lm = f32::NEG_INFINITY;
-                for &p in &w {
-                    if p < thr && p > lm {
-                        lm = p;
+            let mut applied = false;
+            loop {
+                let mut lm = NEG_INF;
+                for &v in &w {
+                    if v < thr && v > lm {
+                        lm = v;
                     }
                 }
+                if lm == NEG_INF {
+                    break;
+                }
                 thr = lm;
-                if thr == f32::NEG_INFINITY {
+                applied = true;
+                let cnt = w.iter().filter(|&&v| v >= thr).count();
+                if cnt >= top_k {
                     break;
                 }
             }
-            topk_thresh = if thr == f32::NEG_INFINITY { 0.0 } else { thr };
-        }
-
-        let mut topp_thresh = 0.0f32;
-        if params.top_p > 0.0 && params.top_p < 1.0 {
-            let (mut lo, mut hi) = (0.0f32, p_max);
-            for _ in 0..32 {
-                let mid = 0.5 * (lo + hi);
-                let sm: f32 = w.iter().filter(|&&p| p >= mid).sum();
-                if sm >= params.top_p {
-                    lo = mid;
-                } else {
-                    hi = mid;
+            if applied {
+                for v in w.iter_mut() {
+                    if *v < thr {
+                        *v = NEG_INF;
+                    }
                 }
             }
-            topp_thresh = lo;
         }
 
-        let t = topk_thresh.max(topp_thresh).max(minp_thresh);
-        let ssurv: f32 = w.iter().filter(|&&p| p >= t).sum();
-        let rng = if params.rng_value.is_nan() || params.rng_value < 0.0 {
-            0.0
-        } else if params.rng_value >= 1.0 {
-            f32::from_bits(0x3f7f_ffff)
-        } else {
-            params.rng_value
-        };
-        let target = rng * ssurv;
+        // top-p over the post-top-k renormalized distribution.
+        if params.top_p < 1.0 {
+            let cutoff = if params.top_p > 0.0 {
+                params.top_p
+            } else {
+                0.0
+            };
+            let s: f32 = w
+                .iter()
+                .map(|&z| if z == NEG_INF { 0.0 } else { (z - m).exp() })
+                .sum();
+            if s > 0.0 {
+                let inv_s = 1.0 / s;
+                let (mut lo, mut hi) = (0.0f32, inv_s);
+                for _ in 0..32 {
+                    let mid = 0.5 * (lo + hi);
+                    let sm: f32 = w
+                        .iter()
+                        .map(|&z| {
+                            if z == NEG_INF {
+                                0.0
+                            } else {
+                                (z - m).exp() * inv_s
+                            }
+                        })
+                        .filter(|&p| p >= mid)
+                        .sum();
+                    if sm >= cutoff {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                for z in w.iter_mut() {
+                    if *z != NEG_INF && (*z - m).exp() * inv_s < lo {
+                        *z = NEG_INF;
+                    }
+                }
+            }
+        }
+
+        // min-p over the post-top-p renormalized distribution.
+        if params.min_p > 0.0 {
+            let s: f32 = w
+                .iter()
+                .map(|&z| if z == NEG_INF { 0.0 } else { (z - m).exp() })
+                .sum();
+            if s > 0.0 {
+                let inv_s = 1.0 / s;
+                let thresh = params.min_p.min(1.0) * inv_s;
+                for z in w.iter_mut() {
+                    if *z != NEG_INF && (*z - m).exp() * inv_s < thresh {
+                        *z = NEG_INF;
+                    }
+                }
+            }
+        }
+
+        // final fresh-softmax inverse-CDF draw over survivors.
+        let s: f32 = w
+            .iter()
+            .map(|&z| if z == NEG_INF { 0.0 } else { (z - m).exp() })
+            .sum();
+        if !(s > 0.0) {
+            return 0;
+        }
+        let target = clamp_rng(params.rng_value) * s;
         let mut acc = 0.0f32;
-        for (i, &p) in w.iter().enumerate() {
-            if p >= t {
-                acc += p;
+        let mut last = None;
+        for (i, &z) in w.iter().enumerate() {
+            if z != NEG_INF {
+                last = Some(i);
+                acc += (z - m).exp();
                 if acc > target {
                     return i as u32;
                 }
             }
         }
-        0
+        last.map(|i| i as u32).unwrap_or(0)
     }
 
     fn host_argmax(logits: &[f32]) -> u32 {
@@ -1045,7 +1450,13 @@ mod tests {
         bidx
     }
 
-    fn params(temperature: f32, top_k: usize, top_p: f32, min_p: f32, rng: f32) -> DeviceSampleParams {
+    fn params(
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        min_p: f32,
+        rng: f32,
+    ) -> DeviceSampleParams {
         DeviceSampleParams {
             temperature,
             top_k,
@@ -1090,29 +1501,13 @@ mod tests {
     }
 
     #[test]
-    fn categorical_matches_host_pipeline_f32() {
+    fn categorical_matches_host_oracle_f32() {
         let Some(sampler) = new_sampler() else { return };
         let logits = sample_logits();
         let vocab = logits.len();
         let ptr = upload(&[logits.clone()], DataType::Float32);
-        let combos = [
-            params(1.0, 0, 1.0, 0.0, 0.05),
-            params(1.0, 0, 1.0, 0.0, 0.5),
-            params(1.0, 0, 1.0, 0.0, 0.95),
-            params(0.7, 0, 1.0, 0.0, 0.5),
-            params(1.5, 0, 1.0, 0.0, 0.5),
-            params(1.0, 4, 1.0, 0.0, 0.5),
-            params(1.0, 4, 1.0, 0.0, 0.9),
-            params(1.0, 0, 0.9, 0.0, 0.5),
-            params(1.0, 0, 0.5, 0.0, 0.8),
-            params(1.0, 0, 1.0, 0.1, 0.5),
-            params(1.0, 0, 1.0, 0.3, 0.99),
-            params(0.8, 8, 0.95, 0.05, 0.42),
-            params(0.8, 8, 0.95, 0.05, 0.02),
-            params(0.8, 8, 0.95, 0.05, 0.77),
-        ];
-        for p in combos {
-            let expected = host_pipeline(&logits, &p);
+        for p in parity_combos() {
+            let expected = host_oracle(&logits, &p);
             let ids = sampler
                 .sample(DataType::Float32, ptr, 1, vocab, &p)
                 .expect("categorical sample");
@@ -1140,7 +1535,11 @@ mod tests {
             let ids = sampler
                 .sample(DataType::Float32, ptr, 1, vocab, &p)
                 .expect("filtered sample");
-            assert_eq!(ids, vec![argmax], "collapsing filter {p:?} must yield argmax");
+            assert_eq!(
+                ids,
+                vec![argmax],
+                "collapsing filter {p:?} must yield argmax"
+            );
         }
     }
 
@@ -1175,7 +1574,172 @@ mod tests {
         let ids = sampler
             .sample(DataType::Float32, ptr, 2, vocab, &p)
             .expect("multi-row sample");
-        assert_eq!(ids[0], host_pipeline(&row0, &p), "row 0");
-        assert_eq!(ids[1], host_pipeline(&row1, &p), "row 1 (shared rng)");
+        assert_eq!(ids[0], host_oracle(&row0, &p), "row 0");
+        assert_eq!(ids[1], host_oracle(&row1, &p), "row 1 (shared rng)");
+    }
+
+    /// A broad sweep of (temperature, top_k, top_p, min_p, rng) combinations used
+    /// by both the GPU parity test and the CPU-only differential test.
+    fn parity_combos() -> Vec<DeviceSampleParams> {
+        let mut combos = vec![
+            params(1.0, 0, 1.0, 0.0, 0.05),
+            params(1.0, 0, 1.0, 0.0, 0.5),
+            params(1.0, 0, 1.0, 0.0, 0.95),
+            params(0.7, 0, 1.0, 0.0, 0.5),
+            params(1.5, 0, 1.0, 0.0, 0.5),
+            params(1.0, 4, 1.0, 0.0, 0.5),
+            params(1.0, 4, 1.0, 0.0, 0.9),
+            params(1.0, 0, 0.9, 0.0, 0.5),
+            params(1.0, 0, 0.5, 0.0, 0.8),
+            params(1.0, 0, 1.0, 0.1, 0.5),
+            params(1.0, 0, 1.0, 0.3, 0.99),
+            params(0.8, 8, 0.95, 0.05, 0.42),
+            params(0.8, 8, 0.95, 0.05, 0.02),
+            params(0.8, 8, 0.95, 0.05, 0.77),
+        ];
+        // A wider grid over the filters at several rng draws (seeds) so top-k and
+        // top-p interact across many boundaries.
+        for &tk in &[0usize, 1, 2, 3, 5, 8] {
+            for &tp in &[1.0f32, 0.95, 0.9, 0.6, 0.3] {
+                for &mp in &[0.0f32, 0.02, 0.1] {
+                    for &rng in &[0.0f32, 0.13, 0.37, 0.5, 0.63, 0.88, 0.999] {
+                        combos.push(params(1.0, tk, tp, mp, rng));
+                    }
+                }
+            }
+        }
+        combos
+    }
+
+    /// Gaff's rejection counterexample: probs `[.50505, .06061, .04040, 10x.03939]`.
+    /// Host semantics with `top_k=3, top_p=0.9` keep the nucleus {0, 1} (top-p is
+    /// applied AFTER top-k renormalizes over the three survivors); the old device
+    /// logic combined independent thresholds and kept {0, 1, 2}.
+    fn counterexample_logits() -> Vec<f32> {
+        let mut probs = vec![0.50505f32, 0.06061, 0.04040];
+        probs.extend(std::iter::repeat(0.03939).take(10));
+        // Logits whose softmax reproduces these probabilities (up to a constant).
+        probs.iter().map(|p| p.ln()).collect()
+    }
+
+    #[test]
+    fn device_algo_matches_host_oracle_cpu_sweep() {
+        // No GPU required: the faithful CPU port of the device kernel must select
+        // the same token as the true host sampling pipeline across a wide grid of
+        // filters and seeds, on several distributions. The rows are well-separated
+        // (distinct probabilities): with EXACT ties at a top-p boundary the host's
+        // `sort_unstable` + keep-count breaks ties non-reproducibly, so token-for-
+        // token parity is only defined for distinct distributions (see
+        // `counterexample_keeps_nucleus_zero_one` for the reviewer's case, whose
+        // nucleus boundary is distinct).
+        let rows = [
+            sample_logits(),
+            {
+                let mut r = sample_logits();
+                r.reverse();
+                r
+            },
+            vec![5.0, 4.9, 4.8, 4.7, 4.6, 4.5, 4.4, 4.3],
+            vec![8.0, 6.5, 5.0, 3.2, 2.1, 1.0, 0.3, -0.5, -1.4, -2.0],
+            vec![
+                0.5, 3.0, 1.0, 5.5, 2.0, 4.25, 0.75, 6.0, 1.5, 3.75, 2.5, 0.25, 4.75, 1.25, 5.0,
+                2.75, -1.0, -2.0, 7.1, 6.7,
+            ],
+        ];
+        for logits in &rows {
+            for p in parity_combos() {
+                let host = host_oracle(logits, &p);
+                let dev = device_algo_cpu(logits, &p);
+                assert_eq!(
+                    host, dev,
+                    "host/device divergence: logits={logits:?} params={p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counterexample_keeps_nucleus_zero_one() {
+        // The specific case from the review: top_k=3, top_p=0.9. Token 2 must NEVER
+        // be selectable, and the device must agree with the host for every seed.
+        let logits = counterexample_logits();
+        for &rng in &[0.0f32, 0.1, 0.3, 0.5, 0.7, 0.83, 0.9, 0.999] {
+            let p = params(1.0, 3, 0.9, 0.0, rng);
+            let host = host_oracle(&logits, &p);
+            let dev = device_algo_cpu(&logits, &p);
+            assert_eq!(host, dev, "rng={rng}");
+            assert!(
+                dev == 0 || dev == 1,
+                "rng={rng} selected token {dev}, expected nucleus {{0,1}}"
+            );
+        }
+    }
+
+    #[test]
+    fn counterexample_matches_host_on_gpu() {
+        let Some(sampler) = new_sampler() else { return };
+        let logits = counterexample_logits();
+        let vocab = logits.len();
+        let ptr = upload(&[logits.clone()], DataType::Float32);
+        for &rng in &[0.0f32, 0.3, 0.5, 0.7, 0.9, 0.999] {
+            let p = params(1.0, 3, 0.9, 0.0, rng);
+            let expected = host_oracle(&logits, &p);
+            let ids = sampler
+                .sample(DataType::Float32, ptr, 1, vocab, &p)
+                .expect("counterexample sample");
+            assert_eq!(ids, vec![expected], "gpu rng={rng}");
+            assert!(ids[0] == 0 || ids[0] == 1, "gpu rng={rng} token {}", ids[0]);
+        }
+    }
+
+    #[test]
+    fn plus_inf_selects_lowest_index_cpu() {
+        // Issue 2: a +inf max must select the LOWEST-INDEX +inf token (host greedy
+        // fallback), not token 0 (which the NaN-poisoned softmax used to force).
+        let mut logits = vec![0.0f32; 8];
+        logits[5] = f32::INFINITY;
+        assert_eq!(device_algo_cpu(&logits, &params(1.0, 0, 1.0, 0.0, 0.5)), 5);
+        assert_eq!(host_oracle(&logits, &params(1.0, 0, 1.0, 0.0, 0.5)), 5);
+
+        let mut multi = vec![1.0f32; 8];
+        multi[3] = f32::INFINITY;
+        multi[6] = f32::INFINITY;
+        for &rng in &[0.0f32, 0.5, 0.99] {
+            let p = params(1.0, 0, 1.0, 0.0, rng);
+            assert_eq!(device_algo_cpu(&multi, &p), 3, "multi +inf rng={rng}");
+            assert_eq!(host_oracle(&multi, &p), 3, "host multi +inf rng={rng}");
+        }
+    }
+
+    #[test]
+    fn plus_inf_selects_lowest_index_gpu() {
+        let Some(sampler) = new_sampler() else { return };
+        // Single +inf at index 5.
+        let mut logits = vec![0.0f32; 8];
+        logits[5] = f32::INFINITY;
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let ptr = upload(&[logits.clone()], dtype);
+            let ids = sampler
+                .sample(dtype, ptr, 1, logits.len(), &params(1.0, 0, 1.0, 0.0, 0.5))
+                .expect("inf sample");
+            assert_eq!(ids, vec![5], "single +inf dtype {dtype:?}");
+        }
+        // Multiple +inf: lowest index wins.
+        let mut multi = vec![1.0f32; 8];
+        multi[3] = f32::INFINITY;
+        multi[6] = f32::INFINITY;
+        let ptr = upload(&[multi.clone()], DataType::Float32);
+        for &rng in &[0.0f32, 0.5, 0.99] {
+            let ids = sampler
+                .sample(
+                    DataType::Float32,
+                    ptr,
+                    1,
+                    multi.len(),
+                    &params(1.0, 0, 1.0, 0.0, rng),
+                )
+                .expect("multi inf sample");
+            assert_eq!(ids, vec![3], "multi +inf rng={rng}");
+        }
     }
 }
