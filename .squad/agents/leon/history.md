@@ -86,3 +86,7 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 - 2026-07-18T05:55:00Z — Added CPU CSA `supports_op` claim validation via unified factory dry-run on lockout reassignment (`2a08ef9`); Deckard approved.
 - 2026-07-19: Fixed PR #30 device sampling parity/safety; continuing PR #32 rebase, build, and review-comment fixes.
 - 2026-07-19T07:55:00Z: PR #32's EP-capabilities refactor merged at `9683a08` after the rebase and three review fixes.
+
+## 2026-07-19T07:42:20Z — Mobius-head E2E harness landed
+
+- Landed `3d47ea9`: pinned GLM-5.2 and DeepSeek-V4-Flash manifest plus ignored, environment-gated real-engine E2E smoke. Gaff approved; absent artifacts skip cleanly and no download path was added.

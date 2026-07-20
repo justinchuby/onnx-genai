@@ -3,3 +3,20 @@
 ## 2026-07-15T01:52:00Z — Session update
 
 - Delivered KV insertion architecture revisions: Mobius controls its export contract; Phase 1 drops `past_present_share_buffer` for functional GQA, while paged attention is M=1-gated.
+
+## 2026-07-19T18:05Z — GLM-5.2 fp32 + int4 E2E
+
+- Proved tiny synthetic `glm_moe_dsa` runs prefill plus eight decode steps in fp32 (`bd908bf`) and int4 (`daa3518`).
+- Fixed Mobius indexer RoPE to rotate the full `index_head_dim` (`1198522`); quantized exporter helper landed as `c5740c4`.
+- Verified 34 asymmetric block-32 `MatMulNBits` nodes cover the full graph, including all MoE experts; fused QMoE/BlockQuantizedMoE export remains open.
+
+- 2026-07-19: Added opt-in fused `com.microsoft::QMoE` emission for GLM/DeepSeek experts (onnx-genai fe3e342; mobius 93cbcf7). Gated synthetic E2E passes through ORT's contrib QMoE kernel, not native Rust. Grouped-routing regression was repaired by Deckard before Chew approval.
+
+## 2026-07-20T05:20:00Z — MLAS feature passthrough
+
+- Plumbed the opt-in `mlas` feature through session, engine, server, and bench (`294d795`), making CPU MLAS reachable with `--features mlas` and `NXRT_CPU_GEMM_BACKEND=mlas`; coordinator-verified builds and `cargo tree` propagation.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Landed issue #40 Phase-1 slice 1a (`0d1d265`: shared protocol trace + ticketed pressure) and 1b (`e4d2883`: Communicator + BufferOwnership); slice 1c collectives/order remains in progress.

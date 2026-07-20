@@ -84,3 +84,37 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 - Landed `cdb4ee5`: CPU `com.microsoft::QMoE` now accepts 1/2/4/8-bit expert weights; 3-bit remains rejected because packed values would cross byte boundaries.
 - 2026-07-19: Added phased captured-run error classification and real no-replay tests for PR #30 (`bd17d07`).
 - 2026-07-19T07:55:00Z: The phase-aware captured-run classification and no-replay regression work remains integrated after PR #32's rebase.
+
+## 2026-07-19T07:42:20Z — CSA Phase B B4 landed
+
+- Landed device ratio-4 index scoring and deterministic top-k selection in `77a44a4`. Chew approved; 17/17 H200 GPU parity tests, including adversarial tie-break fixtures, are bit-exact.
+
+## 2026-07-19T07:42:20Z — CSA B5 fix landed
+
+- Fixed B5-1 by splitting ratio-128 and ratio-4 device-attention flags, preserving host-oracle fallback for five-output ratio-4 nodes, tightening no-bias parity to `max_ulp == 0`, and adding the regression test. Chew approved `1ddf01b`; 19/19 H200 tests passed.
+
+## 2026-07-19T07:42:20Z — CSA B5 fix landed
+
+- Fixed B5-1 by splitting ratio-128 and ratio-4 device-attention flags, preserving host-oracle fallback for five-output ratio-4 nodes, tightening no-bias parity to `max_ulp == 0`, and adding the regression test. Chew approved `1ddf01b`; 19/19 H200 tests passed.
+
+## 2026-07-19T07:42:20Z — CSA Phase B B6 landed
+
+- Landed `2a7703a`: CUDA-graph capture compatibility for ratio-4 fp8 6-output CSA, including device index replication, device-resident cursors, stable pooled workspaces, and a dedicated non-blocking compute stream.
+- `cuda_graph_compatible()` is true only for that configuration; 20/20 CSA tests and the full ep-cuda suite passed on H200. Chew approved with non-blocking nits deferred to B7.
+
+## 2026-07-19T07:42:20Z — CSA Phase B B7 landed
+
+- Landed `d81b96a`, completing CSA Phase B B0–B7 with stream-ordered checkpoint/restore, device-default ratio-4 fp8 capture path, host fallback flag, and instance-scoped metrics. Chew approved with non-blocking N1/N2 follow-ups; 24 CSA tests plus 1 ignored MTP smoke passed and the full ep-cuda suite was green on H200.
+
+
+## 2026-07-20T07:15Z — Decode bottleneck investigation
+
+- Profiled native int4 decode: MatMulNBits was 83% of time and GQA full-KV materialization 14.7%; the M=1 scheduling finding informed sapper-48.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Landed guarded row-parallel CPU GQA (`c391327`): +8.6% 512-token decode, 13.9% lower profiled GQA time, and much faster prefill with bit-identical output; Luv approved.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Made all four normalization decode variants capture-safe with persistent shape-keyed SkipSimplified metadata; Chew approved and `6184d82` landed.

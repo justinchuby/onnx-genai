@@ -95,3 +95,13 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Authored BitShift/OneHot/Compress CPU coverage (`9ca9375`); after review lockout, Sapper corrected OneHot bounds and BitShift required direction (`49d8827`), then Gaff approved.
+
+
+## 2026-07-19T20:10Z — CPU-EP op coverage Batch 4
+
+- Authored IsInf, EyeLike, and mixed-type Pow (`a32e08f`). Luv rejected EyeLike extreme-`k` overflow and dtype truncation; Pris was locked out, Deckard fixed the artifact, and the corrected work landed in `46b2e42`.
+
+- 2026-07-19: Reworked Unique to O(n log n) grouping with canonical NaN and signed-zero behavior. Pinned matched one- and eight-thread Rust/ORT benchmark configurations in 59b17ad; medium-f32 MatMul measured 21.4× and 16.4× slower than ORT respectively.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Added native decode replay integration coverage and corrected the real-Qwen H200 smoke to assert capture success: 1 capture, 62 replays, zero fallbacks (`4755575`, `42b71f7`).

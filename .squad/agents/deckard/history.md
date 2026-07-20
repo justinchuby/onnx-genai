@@ -33,3 +33,39 @@ Fixed the cudarc CUDA-version-feature conflict blocking `onnx-genai-engine --fea
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Corrected SpaceToDepth DCR ordering and pooling ceil-mode sizing (`014cf02`); also authored AffineGrid/Col2Im/CenterCropPad (`8e49948`).
+
+
+## 2026-07-19T20:10Z — CPU-EP op coverage Batch 4
+
+- Fixed Pris's rejected EyeLike artifact with checked diagonal arithmetic and checked dtype conversion (`114180e`); Luv approved.
+- Authored GridSample 2-D/3-D coverage (`1f63750`); Gaff rejected opset-16 rank-5 acceptance, locking Deckard out before Sapper's approved correction.
+
+## 2026-07-19T18:05Z — DeepSeek-V2 tiny E2E
+
+- Validated the shared MLA + MoE path with a tiny fp32 export: prefill plus eight decode tokens completed without runtime changes.
+- Added gated engine coverage (`0caaf32`) and the Mobius export helper (`2b629cc`); Gaff approved both.
+- DeepSeek-V4 remains blocked upstream by the missing usable reference configuration/export artifact.
+
+- 2026-07-19: ConvTranspose CPU kernel landed as 7219025 with 11 conformance tests; Gaff approved. Restored DeepSeek grouped top-k routing after QMoE regression (cd782dd), enabling Chew approval. Unique String attempt exposed runtime-layer UB and was superseded by safe removal. MLAS-style SIMD GEMM port remains in progress on `deckard/mlas-gemm`.
+
+
+### 2026-07-20 — Vendored MLAS CPU-GEMM parity
+
+Recorded the MLAS vendoring spike (`556b0d8`) and multi-threaded Rayon hook (`8764b3d`); provenance was corrected in `ee7a6cd`.
+
+## 2026-07-20T05:20:00Z — MLAS int4 and PackedB milestones
+
+- Landed MLAS PackedB reuse and MLAS SQNBitGemm wiring for CPU MatMul/MatMulNBits (`3eed80a`); f32 direct-output and feature reachability were completed in the same milestone batch. Gaff-51 reviewed the SQNBit change 🟢; int4 decode improved ~1.9× and prefill up to 9.5×.
+
+
+## 2026-07-20T07:15Z — M-based MLAS int4 routing
+
+- Landed `4bb98be`: M-based `NXRT_SQNBIT_PREFILL_MIN` routing keeps hand int4 for M=1 decode and MLAS for prefill; gaff-52 reviewed 🟢.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Investigated coarser CPU decode fork-join granularity, measured 7–8% regressions, reverted the prototype, and established GQA (20.6 ms) as larger than MatMulNBits (15.5 ms) post-residency.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Fixed CUDA graph handle ownership, persisted GQA decode scratch, hardened replay metadata bounds, and replaced elementwise boolean capture gates with exact warmed signatures (`5470c01`, `dcb4f1b`, `82c249d`, `85b6f4e`).

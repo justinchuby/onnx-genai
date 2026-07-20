@@ -76,3 +76,16 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 ## 2026-07-16T15:39:27Z — Scribe session update
 
 - 🟢 Third onnx-rs re-review cleared Deckard’s authoritative native-text residual merge, including adversarial list-cardinality and opaque-string edits.
+
+
+## 2026-07-20T07:15Z — MLAS int4 E2E benchmark
+
+- Established MLAS SQNBit regression for single-sequence decode and retained prefill potential; evidence informed Deckard’s hybrid M-routing.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Landed NVRTC online-softmax flash attention behind standard Attention (`a67b7a5`) and repaired the GQA prefill causal-origin bug, expanding parity 7→40 scenarios before landing `94fa2b6`; Chew approved the corrected artifact.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Landed the serialized CUDA graph runtime/decode foundation and on-device GQA metadata path, then completed real Qwen capture via persistent external-shape seeding (`13c094a`): zero fallbacks, token-exact parity, +251.8% tok/s at 256 and +106.7% at 1024.
