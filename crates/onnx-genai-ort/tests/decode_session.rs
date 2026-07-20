@@ -16,6 +16,11 @@ fn tiny_scatter_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx")
 }
 
+fn tiny_sharedbuffer_llm() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx")
+}
+
 fn deterministic_session_options() -> SessionOptions {
     SessionOptions::default().with_intra_op_threads(1)
 }
@@ -96,6 +101,46 @@ fn bound_decode_logits_match_naive_repass() {
             .step(&[*token], &vec![1; total], &[index as i64])
             .expect("bound step");
         assert_close(&logits.to_vec_f32().expect("bound logits"), &naive[index]);
+    }
+}
+
+#[test]
+fn shared_buffer_decode_matches_naive_repass() {
+    // The tiny-llm-sharedbuffer fixture is built with Mobius's `cpu` execution
+    // provider, which lowers fused attention to a float32
+    // `com.microsoft.GroupQueryAttention` node. That op keeps its past/present
+    // KV in a single fixed-capacity buffer, so forcing
+    // `past_present_share_buffer` drives DecodeSession's SharedBuffer path with
+    // in-place KV updates. The decoded logits must still match a naive
+    // growing-KV re-pass of the same model token for token.
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_sharedbuffer_llm(),
+        deterministic_session_options(),
+    )
+    .expect("shared-buffer session");
+
+    let tokens = [1_i64, 5, 7, 9, 6, 4];
+    let naive = naive_logits(&session, &tokens);
+
+    let options = DecodeSessionOptions {
+        max_length: Some(tokens.len()),
+        past_present_share_buffer: Some(true),
+        ..DecodeSessionOptions::default()
+    };
+    let mut decode = DecodeSession::new(&session, options).expect("shared-buffer decode session");
+    assert_eq!(decode.mode(), DecodeKvMode::SharedBuffer);
+
+    for (index, token) in tokens.iter().enumerate() {
+        let total = index + 1;
+        let logits = decode
+            .step(&[*token], &vec![1; total], &[index as i64])
+            .expect("shared-buffer step");
+        assert_close(
+            &logits.to_vec_f32().expect("shared-buffer logits"),
+            &naive[index],
+        );
     }
 }
 

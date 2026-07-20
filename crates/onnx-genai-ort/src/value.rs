@@ -501,6 +501,97 @@ impl Value {
         Ok(())
     }
 
+    /// Overwrite the leading `data.len()` `Int64` elements of a **CUDA
+    /// device-resident** tensor in place via a host->device copy, leaving the
+    /// tensor's OrtValue (and its device buffer address) unchanged.
+    ///
+    /// Device counterpart of [`write_i64_prefix`](Self::write_i64_prefix): the
+    /// captured decode loop keeps `input_ids` / `position_ids` device-resident so
+    /// the captured CUDA graph reads them in place on every replay (no per-step
+    /// clear + re-bind of the IoBinding set — see the note on
+    /// [`DecodeSession::step_captured`](crate::decode) and issue
+    /// microsoft/onnxruntime#29782). `device_id` pins the copy to the tensor's
+    /// CUDA device.
+    #[cfg(feature = "cuda")]
+    pub fn write_i64_prefix_device(&self, data: &[i64], device_id: i32) -> Result<()> {
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_i64_prefix_device requires an Int64 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        if data.len() > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_i64_prefix_device length {} exceeds tensor capacity {}",
+                data.len(),
+                self.numel()
+            )));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let dst = self.data_ptr_addr()?;
+        // SAFETY: `data` is a valid `[i64]`; reinterpreting it as bytes for the
+        // duration of this call yields exactly `size_of_val(data)` initialized
+        // bytes with no aliasing concerns (read-only view).
+        let src = unsafe {
+            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
+        };
+        let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+        crate::cuda_rt::memcpy_host_to_device(dst, src)
+    }
+
+    /// Set `count` consecutive `Int64` elements starting at `start` of a **CUDA
+    /// device-resident** tensor to `value`, in place, via a host->device copy.
+    ///
+    /// Device counterpart of [`fill_i64_range`](Self::fill_i64_range) for the
+    /// captured-decode attention mask (see
+    /// [`write_i64_prefix_device`](Self::write_i64_prefix_device)). Stages the
+    /// `count` values in a host buffer and copies them to the tensor's device
+    /// memory at the element offset `start`.
+    #[cfg(feature = "cuda")]
+    pub fn fill_i64_range_device(
+        &self,
+        start: usize,
+        count: usize,
+        value: i64,
+        device_id: i32,
+    ) -> Result<()> {
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "fill_i64_range_device requires an Int64 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        let end = start.checked_add(count).ok_or_else(|| {
+            OrtError::InvalidArgument("fill_i64_range_device range overflows usize".into())
+        })?;
+        if end > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "fill_i64_range_device end {} exceeds tensor capacity {}",
+                end,
+                self.numel()
+            )));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let dst = self
+            .data_ptr_addr()?
+            .checked_add(start * std::mem::size_of::<i64>())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("fill_i64_range_device offset overflows usize".into())
+            })?;
+        let host = vec![value; count];
+        // SAFETY: `host` is a valid `[i64; count]`; the byte view is read-only
+        // and lives for the duration of the copy.
+        let src = unsafe {
+            std::slice::from_raw_parts(host.as_ptr().cast::<u8>(), std::mem::size_of_val(&host[..]))
+        };
+        let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+        crate::cuda_rt::memcpy_host_to_device(dst, src)
+    }
+
     /// Deep-copy this tensor into a fresh host-owned [`Value`] with its own
     /// buffer. Used to snapshot a persistent captured-decode output buffer so
     /// the caller can consume it while the original is reused on the next step.
@@ -1117,3 +1208,150 @@ mod argmax_tests {
         assert_eq!(argmax_f16_bits(&[0x7E00, 0xFE00]), 0);
     }
 }
+
+/// Hardware validation of the device-resident captured-decode input helpers
+/// (`write_i64_prefix_device` / `fill_i64_range_device`) added for the
+/// IoBinding + CUDA-graph fix (issue microsoft/onnxruntime#29782). These are the
+/// primitives that update `input_ids` / `position_ids` / `attention_mask` in
+/// place on the device each token so the captured graph observes them on replay
+/// without a per-step clear + re-bind of the whole IoBinding set.
+///
+/// Requires a CUDA GPU and a CUDA-enabled ONNX Runtime, so the tests are
+/// `#[ignore]`d by default. Run from the repo root (PowerShell):
+///
+/// ```text
+/// $ort = "ort-gpu\onnxruntime-win-x64-gpu_cuda12-1.27.0"
+/// $env:ORT_ROOT = (Resolve-Path $ort)
+/// $env:PATH = "$((Resolve-Path "$ort\lib"));$env:PATH"
+/// cargo test -p onnx-genai-ort --features cuda --lib -- --ignored --nocapture cuda_device_write
+/// ```
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_device_write_tests {
+    use super::{DataType, Value};
+    use crate::{Allocator, Environment, Session, SessionOptions, ep_selection};
+    use std::path::Path;
+
+    const TINY_LLM: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/tiny-llm/model.onnx");
+
+    /// Build a CUDA session and return its device KV allocator together with the
+    /// EP-bound device id and the owning [`Environment`], or `None` when CUDA is
+    /// unavailable so the caller can skip gracefully.
+    ///
+    /// The `Environment` is returned (not dropped here) on purpose: ORT requires
+    /// the `OrtEnv` to outlive every `OrtSession`. Releasing the session after
+    /// its environment is a use-after-free that crashes with STATUS_ACCESS_VIOLATION
+    /// at `ReleaseSession`. Keeping the env in the returned tuple lets the caller
+    /// release everything in the correct order (value -> allocator -> session ->
+    /// environment).
+    fn cuda_device_allocator() -> Option<(Environment, Session, Allocator, i32)> {
+        let env = Environment::new("cuda-device-write-test").expect("env");
+        let options =
+            SessionOptions::with_execution_provider(ep_selection("cuda")).with_intra_op_threads(1);
+        let session = match Session::new(&env, Path::new(TINY_LLM), options) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("cuda session build failed: {error}");
+                return None;
+            }
+        };
+        let Some(device_id) = session.cuda_device_id() else {
+            eprintln!("cuda_device_id() is None (CUDA EP not attached?)");
+            return None;
+        };
+        match session.device_kv_allocator() {
+            Ok(Some(allocator)) => Some((env, session, allocator, device_id)),
+            Ok(None) => {
+                eprintln!(
+                    "device_kv_allocator() returned None (CUDA runtime/cuDNN not on the search path?)"
+                );
+                None
+            }
+            Err(error) => {
+                eprintln!("device_kv_allocator() failed: {error}");
+                None
+            }
+        }
+    }
+
+    /// Read back the full `count`-element Int64 device tensor into a host `Vec`.
+    fn read_device_i64(value: &Value, count: usize) -> Vec<i64> {
+        let source = value.data_ptr_addr().expect("device pointer");
+        let mut bytes = vec![0u8; count * std::mem::size_of::<i64>()];
+        crate::cuda_rt::memcpy_device_to_host(&mut bytes, source).expect("device-to-host copy");
+        bytes
+            .chunks_exact(std::mem::size_of::<i64>())
+            .map(|chunk| i64::from_ne_bytes(chunk.try_into().expect("i64 chunk")))
+            .collect()
+    }
+
+    /// Release the CUDA resources in ORT's required ownership order: the device
+    /// `Value` (frees memory through the allocator), then the `Allocator`, then
+    /// the `Session`, and finally the `Environment`. ORT mandates that the
+    /// `OrtEnv` outlive every `OrtSession`; releasing them out of order (e.g.
+    /// dropping the environment first) is a use-after-free that crashes with
+    /// STATUS_ACCESS_VIOLATION. Dropping in this order releases cleanly.
+    fn release_cuda_resources_in_order(
+        tensor: Value,
+        allocator: Allocator,
+        session: Session,
+        env: Environment,
+    ) {
+        drop(tensor);
+        drop(allocator);
+        drop(session);
+        drop(env);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
+    fn cuda_device_write_prefix_round_trips_through_device_memory() {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
+            eprintln!("skipping: no CUDA device allocator available");
+            return;
+        };
+
+        // A prefix write must land exactly, leaving the untouched tail alone.
+        let capacity = 6;
+        let tensor = Value::empty_in(&[1, capacity as i64], DataType::Int64, &allocator)
+            .expect("device tensor");
+        tensor
+            .fill_i64_range_device(0, capacity, -1, device_id)
+            .expect("initialize tail");
+        let prefix = [7_i64, 11, 13, 17];
+        tensor
+            .write_i64_prefix_device(&prefix, device_id)
+            .expect("prefix write");
+
+        let read_back = read_device_i64(&tensor, capacity);
+        assert_eq!(&read_back[..prefix.len()], &prefix);
+        assert_eq!(&read_back[prefix.len()..], &[-1_i64, -1]);
+
+        release_cuda_resources_in_order(tensor, allocator, session, env);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
+    fn cuda_device_fill_range_round_trips_through_device_memory() {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
+            eprintln!("skipping: no CUDA device allocator available");
+            return;
+        };
+
+        // Zero the whole mask, then mark a valid region — the captured attention
+        // mask update pattern (leading ones, zeroed tail).
+        let capacity = 8;
+        let mask = Value::empty_in(&[1, capacity as i64], DataType::Int64, &allocator)
+            .expect("device mask");
+        mask.fill_i64_range_device(0, capacity, 0, device_id)
+            .expect("zero mask");
+        mask.fill_i64_range_device(0, 5, 1, device_id)
+            .expect("mark valid");
+
+        let read_back = read_device_i64(&mask, capacity);
+        assert_eq!(read_back, vec![1, 1, 1, 1, 1, 0, 0, 0]);
+
+        release_cuda_resources_in_order(mask, allocator, session, env);
+    }
+}
+
