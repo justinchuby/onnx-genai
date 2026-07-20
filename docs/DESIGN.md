@@ -1324,10 +1324,22 @@ The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
 mechanism with a closed form. This path does not affect the single-AR-decoder TTS
 path or any other modality.
 
-**Gap to a real Qwen3-TTS export (not yet closed).** The fixture above exercises
-the nested-loop *mechanism*, but a real Qwen3-TTS package (Mobius `TTSTask`,
-`src/mobius/tasks/_tts.py`) differs materially and is **not** yet emittable/runnable
-end to end:
+**Real Qwen3-TTS export — build + codec-token validation DONE; engine/emitter WIP.**
+A real 1.7B Qwen3-TTS package (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) now **builds
+and runs end to end at the codec-token level** via Mobius (`examples/qwen3_tts.py`):
+the 3-model package (`embedding`, `talker`, `code_predictor`) produces valid multi-group
+codec frames (e.g. 27 frames × 16 codes for "Hello world.", all codes in the codebook
+range [0, 2047], natural EOS termination). Two Mobius build bugs were fixed to get there:
+(1) the stacked `codec_embeddings` table is exposed via `op.Identity(...)`, which onnx-ir
+folds so the initializer takes the unprefixed output name — the weight loader is now keyed
+to that name (verified `maxdiff 0.0` vs the HF `codec_embedding.{i}.weight` stack); and
+(2) the talker's interleaved-MRoPE `rope_scaling` (`{"interleaved": true,
+"mrope_section": [24,20,20], ...}`) was silently dropped by HF config standardization,
+so the talker fell back to 1D RoPE and ORT failed on a 4D `cos_cache` — the config
+resolver now preserves non-standard nested `rope_scaling` and the extractor accepts the
+`interleaved` key alias. The fixture above exercises the nested-loop *mechanism*, but the
+real package still differs materially from it and is **not** yet emittable/runnable end to
+end *inside the onnx-genai engine*:
 
 - **Components:** `embedding` (`text_ids + codec_ids -> text_embeds + codec_embeds`),
   `talker`, `code_predictor`, and an optional `speaker_encoder`. There is **no
@@ -1348,10 +1360,12 @@ end to end:
   loudly** on a `talker + code_predictor` package (`_looks_like_multi_decoder_tts`)
   rather than emit speculative metadata.
 
-Completing real Qwen3-TTS is therefore a focused, monitored effort: build the 1.7B
-model, validate/extend the outer-loop embedding path against its real I/O, then add
-the `build_tts_pipeline_metadata` emitter — in that order, since the exact wiring
-must be confirmed against a real export.
+Completing real Qwen3-TTS is therefore a focused, monitored effort. The build and
+codec-token validation are **done** (above); the remaining, ordered work is: (1) extend
+the engine's outer-loop embedding path (or add a Mobius pre-embedding component) to model
+the real talker `inputs_embeds` construction against its confirmed I/O, then (2) add the
+`build_tts_pipeline_metadata` emitter — in that order, since the exact wiring is now
+confirmable against the real, validated export.
 
 #### Speech-to-Text (ASR / Whisper-style)
 
