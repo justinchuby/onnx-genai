@@ -1220,6 +1220,200 @@ mod tests {
         InferenceSession::from_graph(graph).expect("build tiny decoder")
     }
 
+    #[cfg(feature = "cuda")]
+    fn capture_safe_cuda_decoder(
+        graph_capture: bool,
+        max_len: usize,
+    ) -> anyhow::Result<NativeDecodeSession> {
+        use prost::Message;
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let total = graph.intern_symbol("total");
+        let past = graph.intern_symbol("past");
+
+        let input_ids =
+            graph.create_named_value("input_ids", DataType::Int64, vec![1.into(), 1.into()]);
+        let attention_mask = graph.create_named_value(
+            "attention_mask",
+            DataType::Int64,
+            vec![1.into(), total.into()],
+        );
+        let position_ids =
+            graph.create_named_value("position_ids", DataType::Int64, vec![1.into(), 1.into()]);
+        let past_key = graph.create_named_value(
+            "past_key_values.0.key",
+            DataType::Float32,
+            vec![1.into(), 1.into(), past.into(), 1.into()],
+        );
+        let past_value = graph.create_named_value(
+            "past_key_values.0.value",
+            DataType::Float32,
+            vec![1.into(), 1.into(), past.into(), 1.into()],
+        );
+        for input in [
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key,
+            past_value,
+        ] {
+            graph.add_input(input);
+        }
+
+        let logits =
+            graph.create_named_value("logits", DataType::Float32, vec![1.into(), 1.into()]);
+        insert_op(
+            &mut graph,
+            "Cast",
+            vec![input_ids],
+            logits,
+            &[("to", Attribute::Int(DataType::Float32 as i64))],
+        );
+        let present_key = graph.create_named_value(
+            "present.0.key",
+            DataType::Float32,
+            vec![1.into(), 1.into(), past.into(), 1.into()],
+        );
+        insert_op(
+            &mut graph,
+            "Cast",
+            vec![past_key],
+            present_key,
+            &[("to", Attribute::Int(DataType::Float32 as i64))],
+        );
+        let present_value = graph.create_named_value(
+            "present.0.value",
+            DataType::Float32,
+            vec![1.into(), 1.into(), past.into(), 1.into()],
+        );
+        insert_op(
+            &mut graph,
+            "Cast",
+            vec![past_value],
+            present_value,
+            &[("to", Attribute::Int(DataType::Float32 as i64))],
+        );
+        for output in [logits, present_key, present_value] {
+            graph.add_output(output);
+        }
+
+        let model = onnx_rs::Model::new(graph).to_proto()?.encode_to_vec();
+        let session = InferenceSession::builder()
+            .model_bytes(&model)
+            .device(DevicePreference::Gpu { index: Some(0) })
+            .build()
+            .context("build capture-safe CUDA decoder")?;
+        NativeDecodeSession::from_session_with_cuda_options(
+            session,
+            NativeDecodeCudaOptions {
+                kv_max_len: Some(max_len),
+                graph_capture: Some(graph_capture),
+            },
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    fn binding_addresses(session: &NativeDecodeSession) -> Vec<usize> {
+        session
+            .cuda
+            .as_ref()
+            .expect("CUDA state")
+            .bindings
+            .iter()
+            .map(|binding| binding.device_ptr() as usize)
+            .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn input_update_stats(session: &NativeDecodeSession) -> [DeviceBindingTransferStats; 3] {
+        let state = session.cuda.as_ref().expect("CUDA state");
+        [
+            state.bindings[0].transfer_stats(),
+            state.bindings[state.input_ids_binding].transfer_stats(),
+            state.bindings[state.position_ids_binding.expect("position_ids binding")]
+                .transfer_stats(),
+        ]
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_single_value_uploads(
+        before: [DeviceBindingTransferStats; 3],
+        after: [DeviceBindingTransferStats; 3],
+    ) {
+        for (before, after) in before.into_iter().zip(after) {
+            assert_eq!(after.host_upload_calls, before.host_upload_calls + 1);
+            assert_eq!(
+                after.host_upload_bytes,
+                before.host_upload_bytes + std::mem::size_of::<i64>() as u64
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_decode_bindings(
+        session: &mut NativeDecodeSession,
+        addresses: &[usize],
+        token: TokenId,
+        position: usize,
+        max_len: usize,
+    ) -> anyhow::Result<()> {
+        assert_eq!(binding_addresses(session), addresses);
+        let state = session.cuda.as_mut().expect("CUDA state");
+
+        let input = state.bindings[state.input_ids_binding].read_bytes()?;
+        assert_eq!(
+            i64::from_le_bytes(input.try_into().expect("one input id")),
+            i64::from(token)
+        );
+
+        let position_bytes = state.bindings
+            [state.position_ids_binding.expect("position_ids binding")]
+        .read_bytes()?;
+        assert_eq!(
+            i64::from_le_bytes(position_bytes.try_into().expect("one position id")),
+            position as i64
+        );
+
+        let mask = state.bindings[0]
+            .read_bytes()?
+            .chunks_exact(std::mem::size_of::<i64>())
+            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(mask.len(), max_len);
+        assert!(mask[..=position].iter().all(|&value| value == 1));
+        assert!(mask[position + 1..].iter().all(|&value| value == 0));
+        assert_eq!(state.bindings[0].logical_shape(), &[1, position + 1]);
+        for binding in &state.bindings[state.kv_binding_range.clone()] {
+            assert_eq!(binding.logical_shape()[2], position + 1);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_capture_safe_decode(
+        session: &mut NativeDecodeSession,
+        tokens: &[TokenId],
+        addresses: &[usize],
+        max_len: usize,
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
+        let mut logits = Vec::with_capacity(tokens.len());
+        for (position, &token) in tokens.iter().enumerate() {
+            let before = input_update_stats(session);
+            let step = session.decode(&[token], position)?;
+            let after = input_update_stats(session);
+            assert_single_value_uploads(before, after);
+            assert_decode_bindings(session, addresses, token, position, max_len)?;
+            logits.push(
+                step.into_iter()
+                    .flatten()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        Ok(logits)
+    }
+
     #[test]
     fn native_decode_advances_kv_and_rewinds() {
         let mut session =
@@ -1238,6 +1432,76 @@ mod tests {
         assert_eq!(session.current_len(), 2);
         session.decode(&[5], 2).expect("decode after rewind");
         assert_eq!(session.current_len(), 3);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_cuda_capture_replay_is_bit_exact_and_refreshes_decode_inputs() -> anyhow::Result<()> {
+        if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+            eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+            return Ok(());
+        }
+
+        const MAX_LEN: usize = 16;
+        const TOKENS: [TokenId; 10] = [3, 17, 5, 29, 11, 23, 7, 31, 13, 2];
+
+        let mut eager = capture_safe_cuda_decoder(false, MAX_LEN)?;
+        let eager_addresses = binding_addresses(&eager);
+        let eager_first = run_capture_safe_decode(&mut eager, &TOKENS, &eager_addresses, MAX_LEN)?;
+        let eager_stats = eager.cuda_kv_debug_stats().expect("CUDA stats");
+        assert!(!eager_stats.graph.enabled);
+        assert_eq!(eager_stats.graph.captures, 0);
+        assert_eq!(eager_stats.graph.replays, 0);
+        assert_eq!(eager_stats.graph.fallbacks, 0);
+
+        let mut captured = capture_safe_cuda_decoder(true, MAX_LEN)?;
+        let captured_addresses = binding_addresses(&captured);
+        let captured_first =
+            run_capture_safe_decode(&mut captured, &TOKENS, &captured_addresses, MAX_LEN)?;
+        let first_stats = captured.cuda_kv_debug_stats().expect("CUDA stats");
+        assert!(first_stats.graph.enabled);
+        assert_eq!(first_stats.graph.captures, 1);
+        assert_eq!(first_stats.graph.replays, TOKENS.len() as u64 - 2);
+        assert_eq!(first_stats.graph.fallbacks, 0);
+        assert_eq!(captured_first, eager_first);
+        assert_eq!(
+            captured_first,
+            TOKENS
+                .iter()
+                .map(|&token| vec![(token as f32).to_bits()])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(captured_addresses, binding_addresses(&captured));
+        assert_eq!(
+            first_stats.kv_transfers,
+            DeviceBindingTransferStats::default()
+        );
+
+        eager.reset()?;
+        captured.reset()?;
+        let eager_second = run_capture_safe_decode(&mut eager, &TOKENS, &eager_addresses, MAX_LEN)?;
+        let captured_second =
+            run_capture_safe_decode(&mut captured, &TOKENS, &captured_addresses, MAX_LEN)?;
+        let second_stats = captured.cuda_kv_debug_stats().expect("CUDA stats");
+        assert_eq!(captured_second, eager_second);
+        assert_eq!(captured_second, captured_first);
+        assert_eq!(second_stats.graph.captures, 2);
+        assert_eq!(second_stats.graph.replays, 2 * (TOKENS.len() as u64 - 2));
+        assert_eq!(second_stats.graph.fallbacks, 0);
+        assert_eq!(captured_addresses, binding_addresses(&captured));
+        assert_eq!(
+            second_stats.kv_transfers,
+            DeviceBindingTransferStats::default()
+        );
+
+        eprintln!(
+            "native CUDA capture-safe decode parity: captures={} replays={} fallbacks={} steps_per_generation={}",
+            second_stats.graph.captures,
+            second_stats.graph.replays,
+            second_stats.graph.fallbacks,
+            TOKENS.len()
+        );
+        Ok(())
     }
 
     #[test]
