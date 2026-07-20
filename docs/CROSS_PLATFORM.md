@@ -1,96 +1,91 @@
-# Cross-platform audit
+# Cross-platform audit (Windows / macOS / Linux)
 
-Audit date: 2026-07-14. Scope: the Cargo workspace under `crates/`, Python
-packaging, and GitHub Actions. This is a first-pass, read-only audit; it does not
-claim that any target has passed a native build yet.
+Audit date: 2026-07-20. Scope: all 35 crate directories under `crates/`
+(822 tracked crate files), Python packaging, and GitHub Actions at
+`e33a0f5`. This was a read-only source audit; it does not claim native execution
+on any platform.
 
-## Support matrix
+## Intended support
 
-| Operating system | CPU EP | CUDA EP | Metal |
+| Platform | CPU | CUDA | Metal |
 |---|---:|---:|---:|
-| Linux (x86_64; arm64 where dependencies permit) | Required | Required on NVIDIA systems | N/A |
-| Windows (x86_64 initially) | Required | Required on NVIDIA systems | N/A |
-| macOS (x86_64 and arm64) | Required | Unsupported; CUDA absence must never break import or CPU use | Future/optional; MLX plugin currently macOS arm64 only |
+| Linux x86_64 | Required | Required with NVIDIA driver | N/A |
+| Windows x86_64 | Required | Required with NVIDIA driver | N/A |
+| macOS x86_64 / arm64 | Required | Unsupported; CPU import must remain usable | Optional plugin; currently arm64-oriented |
 
-The default `nxrt` wheel must import and run CPU inference on every row. A CUDA
-build must probe the driver and user-space libraries at runtime and report
-availability accurately. Missing CUDA must produce either `available == false`
-or an actionable error that says what was missing, why it is needed, and how to
-install/select CPU instead; it must not panic or silently execute on CPU.
+Priorities mean:
 
-Linux, macOS, and Windows `nxrt` wheels use the pure-Rust CPU backend. The
-removed oneDNN source build is no longer bundled or configured.
+- **P0:** can silently select the wrong backend or makes a supported CUDA wheel unusable.
+- **P1:** blocks a supported build/release path or leaves it materially untested.
+- **P2:** portability hardening, developer tooling, or divergent edge behavior.
 
 ## Findings
 
-| Severity | Area | File:line | Issue | Recommended fix |
-|---|---|---|---|---|
-| 🔴 | CI | `.github/workflows/ci.yml:13-36` | All formatting, clippy, build, and test coverage runs only on `ubuntu-latest`. Windows and macOS compile failures are invisible. | Under `xplat-ci-wheel-matrix`, add Ubuntu, Windows, macOS x86_64, and macOS arm64 coverage. Run the portable CPU surface everywhere; compile-check CUDA on Linux/Windows and assert it is disabled on macOS. |
-| 🔴 | Wheel release | `crates/onnx-runtime-python/pyproject.toml:6-42`; `.github/workflows/publish.yml:12-114` | Maturin metadata exists, but there is no cibuildwheel configuration or Python wheel publishing job. The current publish workflow is Linux-only and publishes Rust crates only. | Add cibuildwheel jobs for manylinux, Windows, macOS x86_64, and macOS arm64, with separate standard `cp310-abi3` and free-threaded `abi3t` lanes as specified by `docs/PIPELINE.md:940-968`; use Trusted Publishing and install/import smoke tests. |
-| 🔴 | CUPTI loading | `crates/onnx-runtime-tracer/src/cupti.rs:92-100` | Every hardcoded CUPTI candidate is a Linux soname: `libcupti.so`, `.so.13`, `.so.12`, `.so.11`. Windows candidates such as `cupti64_*.dll` are absent. | Under `xplat-dlopen-oses`, use target-specific candidate lists. CUDA 13 Windows candidates must include the actual NVIDIA wheel/toolkit names (for example `cupti64_2025.1.0.dll`, while allowing compatible CUDA-13 variants). macOS should return unavailable without attempting CUDA names. |
-| 🔴 | CUPTI wheel discovery | `crates/onnx-runtime-tracer/src/cupti.rs:158-166` | Loading tries bare filenames through the process loader only. It never searches pip-installed `nvidia/cuda_cupti/lib` on Linux or `nvidia/cuda_cupti/bin` on Windows, so the promised zero-setup CUDA wheel will not find CUPTI without loader-path configuration. | Discover Python `site-packages` roots, then try absolute paths under both OS layouts before system candidates. Preserve graceful `available == false`; optionally retain the failed candidates for a RULES.md #1 diagnostic. |
-| 🔴 | CUDA library discovery | `crates/onnx-runtime-ep-cuda/Cargo.toml:16-26`; `Cargo.lock:584-590` | Resolved cudarc 0.19.8 dynamically loads base names `cuda`/`nvcuda`, `cublasLt`, and `nvrtc`. Its generated OS-aware candidates include Linux `libcuda.so.1`, `libcublasLt.so.13`, `libnvrtc.so.13` and Windows `nvcuda.dll`, `cublasLt64_13.dll`, `nvrtc64_130_0.dll`, but it searches only normal loader paths—not pip wheel `nvidia/*/lib` or `nvidia/*/bin` directories. | Add an nxrt-owned discovery/preload seam or an upstream cudarc extension that accepts absolute candidate paths. Search `nvidia/cublas`, `nvidia/cuda_nvrtc`, and any runtime dependency in `lib` (Linux) or `bin` (Windows); the NVIDIA driver library remains a system prerequisite. |
-| 🔴 | CUDA graceful absence | `crates/onnx-runtime-ep-cuda/src/runtime.rs:38-47`; `crates/onnx-runtime-ep-cuda/src/blas.rs:99-103`; `crates/onnx-runtime-ep-cuda/src/error.rs:1-20` | The local API promises `CudaRuntime::new` returns an error when libraries are absent, but cudarc's dynamic loader panics when a required library cannot be loaded. The local `map_err` runs only after symbol loading succeeds, so missing CUDA can unwind instead of becoming an actionable `EpError`. | Replace/patchextend the loader with fallible library acquisition before calling cudarc symbols. Never use `catch_unwind` as the primary design. Report the missing component, searched paths/names, required driver/PyPI package, and CPU fallback option. |
-| 🔴 | Python CUDA availability | `crates/onnx-runtime-python/src/lib.rs:51-82,224-299`; `crates/onnx-runtime-python/Cargo.toml:22-39` | A CUDA-feature build advertises `CUDAExecutionProvider` solely at compile time. Session construction validates the string but always creates the same CPU `RtSession`; requested CUDA is stored and reported without wiring a CUDA EP or probing its libraries/device. This is a silent correctness failure and can misreport CUDA on macOS/driverless hosts. | Wire the requested EP into session creation. Compute availability from a fallible runtime probe, advertise CUDA only on supported OSes with a usable stack, and return a what/why/how-to-fix error if explicitly requested but unavailable. Default remains CPU. |
-| 🔴 | ORT Windows bootstrap | `crates/onnx-genai-ort/ort-sys/build.rs:204-267` | Automatic Windows setup downloads a zip and invokes an external `unzip` executable. `unzip` is not a Windows platform guarantee, so a clean native build can fail before compilation. Existing panic text does not explain how to install the tool or use `ORT_ROOT`. | Extract with a Rust zip crate or a guaranteed platform facility. If an external command remains, include the command, archive path, underlying error, and concrete `ORT_ROOT` workaround per RULES.md #1. |
-| ✅ | Removed oneDNN Windows feature | The former native GEMM source build and wheel configuration were removed. | The backend did not meet the multi-threaded parity target and added unnecessary CMake/bindgen dependencies. | No follow-up; `SimdX86` and Generic require no platform-specific native build. |
-| 🟡 | ORT target coverage | `crates/onnx-genai-ort/ort-sys/build.rs:274-287` | Automatic ORT download supports Linux x64, macOS x86_64/arm64, and Windows x64 only. Other Linux/Windows architectures hit an unsupported or wrong-target path. | Make the supported target triples explicit in documentation and errors; add archives/checksums for required arm64 targets before claiming those targets. |
-| 🟡 | ORT integrity | `crates/onnx-genai-ort/ort-sys/build.rs:22-35,277-282,290-300` | macOS x86_64 is selectable but has no pinned checksum, so the build warns and continues without archive verification. | Pin the official macOS x86_64 digest and make a missing checksum a hard, actionable build error for every release target. |
-| 🟡 | Python paths | `crates/onnx-runtime-python/src/lib.rs:266-288` | Python path-like values are converted through `str` into a Rust UTF-8 `String`. This is fragile for Windows paths that are not representable as Unicode and does not use Python's filesystem-path protocol directly. | Use `os.fspath`/PyO3 path extraction and retain an `OsString`/`PathBuf` through the Rust boundary where possible. Include the rejected path representation in errors. |
-| 🟡 | Developer-specific test path | `crates/onnx-runtime-loader/tests/loader.rs:755-769` | A test falls back to `/home/justinchu/...`. It skips when absent, so it does not fail other OSes, but it hides coverage everywhere except one developer machine. | Require `BERT_TOY_MODEL` for an explicitly ignored real-model test, or use a repository fixture. Do not encode a user home directory. |
-| 🟡 | Native CPU dependency | `crates/onnx-runtime-cpuinfo/build.rs:4-31`; `crates/onnx-runtime-cpuinfo/src/lib.rs:115-146` | cpuinfo is built unconditionally with CMake and bindings are generated with libclang. The C library is cross-platform, but no Windows/macOS CI proves the toolchain, static library names, or generated bindings. | Cover it in the OS matrix. Prefer checked-in/version-pinned bindings if practical, and make missing CMake/libclang errors identify the dependency and installation/feature workaround. |
-| 🟡 | Benchmark host metadata | `crates/onnx-genai-bench/src/bin/compare.rs:637-648` | Core/OS collection assumes `sysctl`, `getconf`, and `uname`. Windows runs continue, but reports lose useful machine metadata as `unknown`. | Use `std::thread::available_parallelism` and `std::env::consts`; add a Windows-specific version query only when needed. |
-| 🟢 | Loader mmap | `crates/onnx-runtime-loader/src/weights.rs:9-13,56-69`; `crates/onnx-runtime-loader/src/epcontext.rs:241-250` | Weight and EPContext mapping use `memmap2::Mmap`, not raw `libc::mmap`; the production loader contains no Unix-only mmap/page-size calls. | Keep `memmap2`; add native Windows/macOS loader tests to prove file locking, mapping lifetime, and deletion semantics. |
-| 🟢 | Path traversal handling | `crates/onnx-runtime-loader/src/pathsafe.rs:1-20,40-55` | External-data paths use `Path` components and explicitly test Unix absolute paths and Windows rooted/prefixed paths. | Retain this pattern and add a Windows drive/UNC regression case in the Windows CI lane. |
-| 🟢 | Temporary files | `crates/onnx-runtime-capi/tests/capi.rs:122-125`; `crates/onnx-runtime-loader/tests/writer.rs:1-9,44`; `crates/onnx-genai-server/src/models_config.rs:272-335` | Audited temporary outputs use `CARGO_TARGET_TMPDIR` or `tempfile`; no production code writes to a literal `/tmp`. | Keep using `tempfile`/`std::env::temp_dir` and path APIs. |
-| 🟢 | Generated filenames | `crates/onnx-runtime-loader/src/writer.rs:340-379`; `crates/onnx-runtime-loader/tests/writer.rs:428-442` | EP sidecar components replace unsafe characters and tests reject both Unix and Windows separators. A repository path scan found no case-fold collisions or Windows-invalid tracked names. | Extend the test with Windows reserved basenames (`CON`, `NUL`, `COM1`) if user-controlled names can ever become the complete filename stem. |
-| 🟢 | CRLF handling | `crates/onnx-genai-ort/ort-sys/build.rs:343-349,396-410`; `crates/onnx-runtime-tracer/tests/collectors.rs:125-131` | Text parsing uses `str::lines()` or semantic parsers; no production parser was found that requires LF-only input. Protocol output intentionally uses the protocol-required newline form. | Keep semantic parsing; add CRLF fixtures when introducing line-oriented configuration formats. |
-| 🟢 | Endianness | `crates/onnx-runtime-loader/src/weights.rs:35-39,192-232`; `crates/onnx-runtime-eager/src/tensor.rs:174-183,244-253`; `crates/onnx-runtime-session/src/tensor.rs:165-215` | Tensor storage is explicitly little-endian. This is correct for ONNX data and all currently intended Windows/macOS/Linux hardware, but would need conversion on a big-endian target. | Document little-endian as the supported host contract or add a target-endian conversion layer before adding big-endian targets. |
-| 🟢 | macOS CPU default | `crates/onnx-runtime-python/Cargo.toml:26-39`; `crates/onnx-runtime-python/src/lib.rs:53-60,255-264` | CUDA is optional and the default Python provider is CPU, so a normal macOS CPU build does not import CUDA code. | Preserve feature separation; fix runtime probing/advertising before shipping any CUDA-enabled wheel. |
+### P0
 
-## Prioritized fix checklist
+| File:line | Issue and affected OS | Recommended fix |
+|---|---|---|
+| `crates/onnx-runtime-tracer/src/cupti.rs:93-95,245-317` | CUPTI discovery is Linux-only: candidates are only `libcupti.so.13` / `libcupti.so`, and the pip layout is hardcoded to `nvidia/cuda_cupti/lib`. A Windows CUDA wheel installs DLLs under a `bin` layout and needs `cupti64_*.dll`, so tracing always reports unavailable there. macOS also tries irrelevant Linux names instead of immediately reporting unsupported. | Implement target-specific names and layouts under **`xplat-dlopen-oses`**; use `lib` on Linux, `bin` plus safe DLL-directory handling on Windows, and an unsupported result on macOS. Wheel bundling/discovery belongs to **`tracer-cupti-wheel-bundle`**; do not duplicate it here. |
+| `crates/onnx-genai-ort/src/cuda_rt.rs:58-68` | The local CUDA runtime loader only names CUDA 12 (`cudart64_12.dll`, `cudart64_120.dll`, `libcudart.so.12`) while Python declares CUDA 13 dependencies (`crates/onnx-runtime-python/pyproject.toml:32-40`). A clean CUDA-13-only Linux or Windows environment cannot load this path. | In **`xplat-dlopen-oses`**, derive candidates from the selected CUDA ABI and include CUDA-13 Linux/Windows names. Share one resolver with the EP rather than maintaining a second stale list. |
+| `crates/onnx-runtime-ep-cuda/src/runtime.rs:31-56`; `crates/onnx-runtime-python/src/lib.rs:1349-1390` | CUDA header/library discovery is not shared. NVRTC headers inspect `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda/include`, and Linux `LD_LIBRARY_PATH`; Python injects real `sys.path` only into CUPTI. Linux/Windows `nvidia-*` wheels and Conda installs can therefore provide CUDA 13 successfully but remain undiscoverable to NVRTC/cuBLAS/runtime components, especially Windows `nvidia/<component>/bin`. | Under **`xplat-dlopen-oses`**, centralize NVIDIA component discovery from live Python paths, Conda, CUDA roots, and platform loader paths. Support Linux `lib`, Windows `bin`/`Library\\bin`, and actionable per-component errors. |
+| `crates/onnx-runtime-python/src/lib.rs:62-72,270-345,993-1017` | A CUDA-feature build advertises `CUDAExecutionProvider`, accepts it, then constructs the same CPU-only `onnx_runtime_session::InferenceSession`; `device_to_providers` explicitly says CUDA falls back to CPU. Linux/Windows callers can silently benchmark or serve CPU while reporting CUDA. A mistakenly CUDA-enabled macOS build would advertise an impossible provider. | Make provider availability a fallible runtime fact and wire the chosen CUDA EP into session creation. Explicit CUDA requests must either execute CUDA or fail with the missing driver/library/device and CPU fallback instructions; never silently run CPU. |
 
-### P0 — `xplat-dlopen-oses`
+### P1
 
-- [ ] Centralize target-specific CUDA library candidates and absolute search
-  paths. Cover driver (`libcuda.so.1` / `nvcuda.dll`), cuBLASLt
-  (`libcublasLt.so.13` / `cublasLt64_13.dll`), NVRTC
-  (`libnvrtc.so.13` / `nvrtc64_130_0.dll`), and CUPTI
-  (`libcupti.so.13` / CUDA-13 `cupti64_*.dll`).
-- [ ] Search pip NVIDIA wheel directories: `nvidia/<component>/lib` on Linux and
-  `nvidia/<component>/bin` on Windows. Do not expect CUDA on macOS.
-- [ ] Make every loader fallible. Missing libraries, missing symbols, driver
-  mismatch, or no device must never panic or break Python import.
-- [ ] Make CUDA availability a runtime fact, not a Cargo-feature fact. Wire the
-  selected CUDA EP into Python sessions; never report CUDA while executing CPU.
-- [ ] Add RULES.md #1 diagnostics listing the missing component, searched
-  names/paths, the matching `nvidia-*-cu13` package where applicable, the NVIDIA
-  driver prerequisite, and the CPU fallback.
+| File:line | Issue and affected OS | Recommended fix |
+|---|---|---|
+| `.github/workflows/ci.yml:61-100,150-178`; `.github/workflows/wheels.yml:22-115` | CI now has Linux/Windows/macOS portable lanes and four CPU wheel targets, but portable tests cover only six runtime crates. The GenAI engine/server/ORT/C APIs, Python CPU behavior, `mlas-sys`, and native ORT bootstrap do not run on Windows/macOS. CUDA is compile/import-only on Linux/Windows with no GPU/provider assertion. | Complete **`xplat-ci-wheel-matrix`**: add representative native ORT + GenAI tests on every supported OS, Windows/macOS C API smoke tests, opt-in MLAS target checks, clean-wheel CPU inference, unavailable-CUDA behavior, and GPU-backed CUDA promotion tests. |
+| `crates/onnx-genai-ort/ort-sys/build.rs:22-35,364-377` | Automatic ORT download maps every Linux target to `linux-x64` and every Windows target to `win-x64`; Linux/Windows arm64 therefore downloads the wrong ABI. macOS x86_64 is selected but has no pinned checksum, so the release wheel lane continues after a warning. | Match full target triples, reject unsupported architectures before download, pin the macOS x86_64 digest, and make missing checksums fatal for release targets. |
+| `crates/onnx-genai-ort/ort-sys/build.rs:441-470,473-529` | The build mutates the resolved ORT installation: it creates Unix symlinks in `lib/`, rewrites macOS install names, and re-codesigns dylibs. `ORT_ROOT`/`ORT_LIB_DIR` may point to read-only or centrally managed installations, causing Linux/macOS builds to fail or unexpectedly alter vendor artifacts. The commands also use target OS to select tools that execute on the host, impeding cross-compilation to macOS. | Copy/stage required runtime files in `OUT_DIR`, create links and adjust install names only in that private staging directory, and distinguish host tools from target selection. Never mutate user-supplied ORT installations. |
+| `crates/mlas-sys/build.rs:1-21,147-180`; `crates/onnx-runtime-ep-cpu/Cargo.toml:11-20` | The opt-in `mlas` feature is described as x86-64 Linux and compiles GAS `.S` files plus Unix-oriented headers/flags. Enabling it on Windows MSVC or macOS is not target-gated and will fail before the Rust fallback can run. | Gate the current implementation to its proven target with a clear compile error, then add upstream Windows MASM and macOS assembly/source groups before advertising the feature there. Add feature-specific CI. |
+| `crates/onnx-genai-ort/ort-sys/build.rs:204-238` | Native ORT bootstrap shells out to `curl` on all OSes and `tar` on Linux/macOS. GitHub runners provide them, but clean developer machines and hermetic builders are not guaranteed to do so; failure occurs during dependency build. | Use a Rust HTTP/archive implementation, or document and validate the tools up front with an `ORT_ROOT` workaround. Keep the already-portable Rust ZIP extraction used on Windows. |
+| `crates/onnx-runtime-python/src/lib.rs:1366-1390` | Python module and `sys.path` entries are extracted as UTF-8 `String`. Windows supports filesystem paths that Python can represent but Rust UTF-8 conversion may reject or alter; those environments then lose CUDA wheel discovery. | Extract via Python's filesystem-path protocol into `PathBuf`/`OsString` without lossy conversion. Apply the same path-preserving boundary to model loading. |
 
-### P0/P1 — `xplat-ci-wheel-matrix`
+### P2
 
-- [ ] Convert Rust CI to an OS/architecture matrix. At minimum: Ubuntu x86_64,
-  Windows x86_64 MSVC, macOS x86_64, and macOS arm64.
-- [ ] Exercise the default CPU workspace everywhere. Add CUDA compile/discovery
-  tests on Linux/Windows without requiring a
-  GPU; assert CPU-only behavior on macOS.
-- [ ] Configure cibuildwheel for manylinux, Windows, macOS x86_64, and macOS
-  arm64. Build `cp310-abi3` plus the separately specified `abi3t` artifacts.
-- [ ] Produce CPU wheels for all three OSes and CUDA wheels/extras only for
-  Linux/Windows. Declare the complete CUDA-13 NVIDIA wheel dependency set with
-  platform markers and the correct `lib`/`bin` discovery behavior.
-- [ ] Smoke-test each wheel in a clean environment: import, CPU inference,
-  `get_available_providers`, explicit unavailable-CUDA error, and CUDA discovery
-  where a GPU runner is available.
-- [ ] Replace Windows `unzip` dependence and pin every ORT archive checksum.
-- [ ] Publish wheels with PyPI Trusted Publishing; retain the stable ABI policy
-  in `docs/PIPELINE.md` rather than multiplying wheels per CPython minor.
+| File:line | Issue and affected OS | Recommended fix |
+|---|---|---|
+| `crates/onnx-runtime-loader/src/writer.rs:335-389` | EP source/partition components are sanitized, but the original model/output stem is copied verbatim into generated context and sidecar names. A file created on Linux with `:`, trailing dot/space, or a Windows-reserved stem (`CON`, `NUL`, `COM1`) cannot be recreated or unpacked on Windows. | Sanitize generated stems against the Windows superset, including reserved basenames and trailing dots/spaces; preserve the requested directory separately. |
+| `crates/onnx-genai-server/src/models_config.rs:108-155` | Model discovery probes exact lowercase marker names. Case-insensitive default Windows/macOS filesystems may accept `MODEL.ONNX`, while case-sensitive Linux does not, producing deployment-dependent discovery. | Define canonical filenames explicitly and enforce them uniformly by enumerating entries, or intentionally perform ASCII case-insensitive matching on every OS with collision detection. |
+| `crates/onnx-runtime-loader/tests/loader.rs:759-770`; `crates/onnx-genai-engine/src/native_decode.rs:1552` | Tests contain `/home/justinchu/...` fallbacks. They skip when absent, so other developers and all CI platforms silently lose coverage. | Make real-model tests explicitly ignored/opt-in via environment variables, with no personal fallback, or add a repository fixture. |
+| `crates/onnx-runtime-session/tests/projection_fusion.rs:52-58` | The test invokes `python3`, which is normally `python.exe`/`py` on Windows even when Python is installed. The portable CI installs Python but this test can still fail when included. | Use a configured interpreter (`PYTHON`, `pyo3-build-config`, or CI-provided path) and fall back by platform with an actionable skip/error. |
+| `crates/onnx-genai-bench/src/bin/compare.rs:623-635,845-880`; `crates/onnx-genai-ort/examples/long_context_bench.rs:328-341` | Benchmark metadata/RSS collection assumes Unix/macOS commands (`hostname -s`, `sysctl`, `date +...`, `pmset`, `ps`). Windows reports partial `unknown`/`NaN` metadata, reducing result comparability. | Use Rust APIs for date, hostname, CPU count, OS, and memory; isolate optional OS probes behind `cfg` modules. |
+| `crates/onnx-genai-ort/ort-sys/build.rs:70-79` | Bindgen calls `header_path.to_str().unwrap()`. A non-Unicode checkout/build path panics; Windows path representations make this especially visible. | Pass an OS-native path if supported by bindgen, or return an actionable error rather than unwrapping. |
+| `crates/onnx-genai-ort/ort-sys/build.rs:297-360` | ZIP extraction writes symlink entries as ordinary files and ignores Unix permission-setting failures. The current Windows ORT archive does not depend on these semantics, but reusing the helper for Unix/vendor archives would be incorrect. | Explicitly reject symlink entries or use a tested safe extractor; propagate permission failures when permissions matter. |
 
-### P2 — portability hardening
+## Audited categories with no current blocker
 
-- [ ] Replace the developer-specific real-model fallback with an opt-in
-  environment variable or repository fixture.
-- [ ] Preserve non-Unicode filesystem paths across the Python/Rust boundary.
-- [ ] Improve Windows benchmark host metadata.
-- [ ] Add Windows UNC/drive/reserved-name tests, macOS case-insensitive
-  filesystem tests, CRLF fixtures, and mmap lifecycle tests.
+- **Hardcoded separators:** fixture joins such as `Path::join("../../tests/fixtures/...")`
+  use Rust `Path` parsing; `/` is accepted as a separator on Windows. URL
+  construction uses `/` intentionally. The material exception is the NVIDIA
+  package layout called out above.
+- **Temporary paths:** production/tests use `std::env::temp_dir`, `tempfile`, or
+  Cargo target directories. Literal `/tmp` occurrences found in
+  `onnx-runtime-session` are test values, not writes.
+- **Filename timestamps:** no production filename generation from RFC3339 or
+  `%H:%M:%S` was found. The `.squad` log naming policy already replaces `:` with
+  `-`.
+- **CRLF/text mode:** line-oriented parsing uses `str::lines()` or semantic
+  JSON/TOML/YAML parsers; Rust file writes are byte-oriented. No LF-only
+  production parser was found.
+- **Signals/TTY:** no production Unix signal API, raw TTY/ioctl, or
+  `std::os::unix` terminal dependency was found under `crates/`.
+- **Application-data homes:** production code does not invent storage beneath
+  `HOME`, `USERPROFILE`, XDG, or `%APPDATA%`; paths are caller/config supplied.
+- **Path traversal:** `crates/onnx-runtime-loader/src/pathsafe.rs:3-20,40-55`
+  uses `Path::components` and has separate Unix and Windows rooted-path tests.
+- **Dynamic names already handled:** cuDNN diagnostics name both
+  `libcudnn.so.9` and `cudnn64_9.dll`
+  (`crates/onnx-runtime-ep-cuda/src/error.rs:25-37`), and ORT library selection
+  distinguishes `.so`, `.dylib`, and `.dll`
+  (`crates/onnx-genai-ort/ort-sys/build.rs:532-557`).
+
+## Recommended order
+
+1. **P0:** finish `xplat-dlopen-oses`, including the stale CUDART list and shared
+   pip/Conda resolver; finish `tracer-cupti-wheel-bundle`; make Python CUDA
+   selection truthful.
+2. **P1:** finish `xplat-ci-wheel-matrix`, then harden ORT target/checksum/staging
+   behavior and explicitly target-gate MLAS.
+3. **P2:** make generated filenames Windows-safe, remove personal test paths,
+   preserve non-Unicode paths, and replace shell-based benchmark metadata.
