@@ -1,0 +1,435 @@
+ir_version: 11
+producer_name: "onnx-genai-tests"
+graph {
+  node {
+    input: "inputs_embeds"
+    input: "slice_starts"
+    input: "slice_ends"
+    input: "slice_axes"
+    output: "cur_state"
+    name: "slice_cur"
+    op_type: "Slice"
+  }
+  node {
+    input: "cur_state"
+    output: "projected_state"
+    name: "projected_state"
+    op_type: "Identity"
+  }
+  node {
+    input: "cur_state"
+    input: "assistant_w"
+    output: "base_logits"
+    name: "assistant_matmul"
+    op_type: "MatMul"
+  }
+  node {
+    input: "shared_kv.sliding_attention.key"
+    output: "shared_reduce_0"
+    name: "shared_reduce_0"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "shared_kv.sliding_attention.value"
+    output: "shared_reduce_1"
+    name: "shared_reduce_1"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "shared_reduce_0"
+    input: "shared_reduce_1"
+    output: "shared_acc_1"
+    name: "shared_acc_1"
+    op_type: "Add"
+  }
+  node {
+    input: "shared_kv.full_attention.key"
+    output: "shared_reduce_2"
+    name: "shared_reduce_2"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "shared_acc_1"
+    input: "shared_reduce_2"
+    output: "shared_acc_2"
+    name: "shared_acc_2"
+    op_type: "Add"
+  }
+  node {
+    input: "shared_kv.full_attention.value"
+    output: "shared_reduce_3"
+    name: "shared_reduce_3"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "shared_acc_2"
+    input: "shared_reduce_3"
+    output: "shared_acc_3"
+    name: "shared_acc_3"
+    op_type: "Add"
+  }
+  node {
+    input: "shared_acc_3"
+    input: "assist_zero"
+    output: "shared_zero_term"
+    name: "shared_zero_term"
+    op_type: "Mul"
+  }
+  node {
+    input: "base_logits"
+    input: "shared_zero_term"
+    output: "logits"
+    name: "assistant_logits"
+    op_type: "Add"
+  }
+  name: "tiny_gemma4_assistant_mixed"
+  initializer {
+    dims: 16
+    dims: 32
+    data_type: 1
+    name: "assistant_w"
+    raw_data: "\346\356\344<\302C\254=]\036\315=\033\354\r\276\003\036\215=\346A\255=\375\037\244=M\231\313<UU\361\275\354};\2759\323\320\275\216\325\231=`m$\276\032\320\311=D\372\004\275\3502\330=j\264\274=?:\207\275\311\024\220\275\016\355n\275d;\245\275_<\353\275\240|\200=\002\356#\276\014\005p=\204+\300=UY/>\'\346$\275{\004\317\275\370\n\252\275Cf\t\276\227\217\207=6\271\211\274X\207F\275\324\'\224\275>\236\341=#\335z=6\310g>*i\016>\374\003o\274\000b\003=\306I\251=\306\225\025\276\3337\234\275\334d\330<\215\345\333\275\014b\370;;\343\225=\226\275P=\2015\022>D\305\202\276*\022\204\275\252\201\275=\2322L>V\264c=\257\026C\274:\024r=\313\023\027>\303_\230\2744\373\237\274\222\314+\276im\331=e3?\276\243\214\347\274>\373T\275h\324\346=\274\021\t>\223p\r\276Z\215\243<u\2160\275\335\352\'\273\346x\3019\227\244\273\275l\300\275\273U\316U\274\277\217\235\275\265*<\274\352\\f\275nl*>\205\345\027\273\251\332@\274\326\260\031=p\272\361\275hu\t>|\241>\276\227\\\260=\237\241\333<uj\270\275\341\313\025\275Z\230k=:\321\027\275u0\245\275\376\315\233\275y\026\217=\325\356\010\276\265\365\247=\325!q=\220\361\003>Nz\r>!\341n\276\310\352U=P\260\037\274\332)\020=\32637=\252\276C\275\252\214n=\016^\202\274\240\\\">cf\221<\\+\204=\356ci>)\316M=\356\341f=J\036\030>\322\357>\276\353\301\\<\342\277\203\275\024\024!=\004,\227=/\354\223\275\201g\310=/Q\320<0\270\340=-wo\276\277(\333\274\302\"e>X\303%\275\277\354\347<e\025\264=\350\217\n>\352\324\205\275\374@\307=\277\215\212\275XH\010\275\271\356\020>\216\252\347\274\253vK\275tp\267=M\010\375=:\331o;\3022]=\212,\200\275\335(\317\275l3\376=h\272!=\002\021(\275\350\257e=\321\312\200\275\365\213\220<\244\237\235<\264t/\275\037\336\253\2754C?>\202\213\300=\203i\372=\030\352\375\275\263n\t<\034l\333<,\t\t\276\354!-\276\313\232\220=\253K\001>\023q\376=\037.6\275p\274l\274\322\246-=\n\263\017=N\036\211\27562\010\276\016\337s\275\270\016!\276_\223\256=\204\214\033>\215\273\204=\007\022H\276u\336\330\274\334\220Z\275<B\212<\244\214\332\275\344\316\205\275,S^\274\347\361!\274\340D\"=\223Yz>\301i\032>\223\001\021\275\034A\322\275i\334\257=*(\225\274\244\344p\274\000l\276\273\004\204\301\275^\264\200\275\363f\001\275\224\355\347\275\310\361(\275\277\220\361=\315\241\347<\255\321|<\341\005?=\026\360\223>nC\006\276\355\221\356<0\365\366\275_6\244<\246\223\221\274U\"\207\275\034\220\206=6\3235>\233 \312<\244\337w<e\226\267\275(\033 >\265\2633\275\264]R\275\032\267d>\344\325->\3156\241\275\217E\n\276i\202;=\235\377 \276\371\263\365=\025\000\017\273\374\274z\276\213\001F\275s\200\332\273V\247\262=\302\314\370=2\327\347\274\365\rv<\212\365\315=d\376\327=\375\353\\\275\236\265K\275\201\216l\274Y\336\004\275[\275\035=\265J?\275\227\256\"\275\312kD\276Q\016\205\275\217\357\351\271\331\325\n\2764\277\246\273h\037\227\274\020\0235=\305\300\027>ro\027\276\337v\224=b\"\235\274N\3775>\212\244\253;\247\346w=\322\3314\276\200\026\237=.\214\323=\241)\204=\0301\214<\036];\276 \344\341\275B\037\306\275\2300\317\275H\265\006=\255Z\310=-\273K\274\016m =\270\250\276=`\277\220\274\205G~<y\302\025\276\241\331\204\275\322 \300=\344<q>\330r\244\2748\370\004>Ev[=\251\3337\276&\372\271\273\223`\354<\356\032\232\275\206\307\027\275F\255c;\322\237&;\2447\034<\212\315`\275g\322t\276\372\')\275\345\177\r>^i\030>\202\273\262<\255\213\024\275Og\021\276\345\332\337\273\272R\232\273\"\235B\275!\214\222\274\215\226\236=a\350f\275sM;=.D_=\220\211&=\334\242\221\275U\002\003=\013@\223\275\004\267\265=\356\204\215\275\361XE<E\222\227\275\247\246k;\253\005\214=E\373\331=\371\330v\274{\226\r\276\347\t\227\275n\264\231\275h\000\030=\001\231)\276\377\263\365=/\016\235\275\033\325.>\247\210\264<\220\2255\275\336\"v<\244{,=g~?\275\355\337\243\275d\330\216\275\243\220m<\325\227\\=X\275\006\276\266l\000\276\316\272\221<T\356e\276c\"\324\275\221]\002\276h\302\241\275j%H=O\220\202=s\037\260\274\227Xc<\036\237\016>\333\003k\274\340\n\220=\014\347\315\274@\216\221\273jF\201\276\343\322N\276\000J\235\274\330C\274\275\214\366e>-FC\275\357)S\274\021qH\275}\314\310\275XV;=\313\343y\274\300f6\273\370\204\362=\257\005\r=\001(\226=\032b\215\275\"/\357\274\225\340\346=\346\010\204=uc\320\275\233\347\372=\246\\\376=i\374\227\274\2409\204\275\344\320\"\275,\223\222<\332\026h\275&\267\020\273\201s\233\272K$\242\275\027G\236\275\313g\n=U\001\211\275a*6\275\353H\005\275\373\017\025\274\320 \233=\033\340\234\275\342=\321\275\274\337\334\274\326\021J=i\315\304\275\302\222\240<\303\261\034\275yw(\275\346\337(<\357 \221\275\310\347\035\276\233z\251=\345\244\014\276\335y\327\275xw\r>X\277>>\000~+\276\356\232\276<\362\376\267\275\232\376\204\276!Z\253\275M\251\000<mP\226\275\260\256U\275\232\010\274\274\331\005\353\273\242\345:>\203\2467\275\241\246!=M.H<\351\214\022>\373:\r>\310\023\017=I?3\275\203x\336=\377\314\221\275\334\301\320=<\234l\275\177\037T=\277\016\202<a\301]=k\020Q\276\230\305\201={\203\301\271L>\332\275\312l\342=\307e\277\273\312g\213\275.\370\034\276\251Rf\276\376\236\371=\354\305\320=z\204\"=\217\251\300<\367\217\252\2750m\224\2759\1774\276\201J\230=\000oJ\275\221\345L>\373\345\322=/kW;\013x\024\276\223\214\357<\335\r_<\373&\255\2758.\236\275}\177\236<\243\270\263\275\220\264\216\275\241!\030=F<\242\274\373\321A\276\325,\236<t\227\312\275w\326\307\275m\034\006\276R\270\n\276>QV>\033\214\235\275e\020\254\275d#\231\275j\242\366<\312\214\223\274\311&\314=\004\016\304\275\245\304K\276\200\304f\274\205\345\202\275\267\3049\275\333\366\235<IR\271\2756\203A>\241\224\360;\030\256v=\222\240\365<\376\354,\275\213\341\243=&w\376=l\274\253\274\355\006\234\275\273,\017\276\3507\235=O!\302=\337S\035\2763\346\010=\276\027\374=c\327\n\276\3172\241=;\233\212<o\034\021=(\222G>\225\315\360\275\201\024<\274^u\271\275\017-\000\276mn\245\275a\241x\275z\236\264=\262[#\274U\314d\275\310\335e\275\254\360/\276=\3431\274\373@\276=\3033\332\275\241`\275\274\003\355\007\2767t~\274O|/\276"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "slice_starts"
+    raw_data: "\020\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "slice_ends"
+    raw_data: " \000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "slice_axes"
+    raw_data: "\002\000\000\000\000\000\000\000"
+  }
+  initializer {
+    data_type: 1
+    name: "assist_zero"
+    raw_data: "\000\000\000\000"
+  }
+  input {
+    name: "inputs_embeds"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "q"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "q"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "attention_mask"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "kv_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "shared_kv.sliding_attention.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "kv_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "shared_kv.sliding_attention.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "kv_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "shared_kv.full_attention.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "kv_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "shared_kv.full_attention.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "kv_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "q"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "projected_state"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "q"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "cur_state"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "q"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "base_logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "q"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_reduce_0"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_reduce_1"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_acc_1"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_reduce_2"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_acc_2"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_reduce_3"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_acc_3"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "shared_zero_term"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}
