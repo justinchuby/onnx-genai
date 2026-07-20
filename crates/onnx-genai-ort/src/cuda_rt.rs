@@ -27,6 +27,13 @@ use libloading::Library;
 
 use crate::{OrtError, Result};
 
+/// `cudaMemcpyKind::cudaMemcpyHostToDevice`.
+const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+
+/// `cudaMemcpyKind::cudaMemcpyDeviceToHost`.
+#[cfg(test)]
+const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+
 /// `cudaMemcpyKind::cudaMemcpyDeviceToDevice`.
 const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
@@ -228,6 +235,79 @@ pub(crate) fn memset_zero(dst: usize, bytes: usize) -> Result<()> {
     if code != 0 {
         return Err(OrtError::InvalidArgument(format!(
             "cudaMemset failed with CUDA error code {code}"
+        )));
+    }
+    Ok(())
+}
+
+/// Copy `src.len()` bytes from host memory `src` into device address `dst`
+/// (`cudaMemcpyHostToDevice`).
+///
+/// WHY THIS EXISTS: the static-shape captured decode loop keeps its small
+/// dynamic inputs (`input_ids`, `position_ids`, `attention_mask`) device-resident
+/// at fixed addresses so a captured CUDA graph reads them in place on every
+/// replay (see the ORT IoBinding + CUDA-graph note in `decode.rs`, issue
+/// microsoft/onnxruntime#29782). Each token refreshes those buffers with this
+/// host->device copy instead of clearing and re-binding the whole IoBinding set.
+///
+/// The runtime-API `cudaMemcpy` is synchronous for a pageable host source: it
+/// returns only once the transfer to device memory has completed, so the fresh
+/// values are globally visible before the caller launches the graph replay
+/// (RAW-safe). Ordering against the *previous* replay's read of these buffers
+/// (WAR) is guaranteed by the caller: the device sampler fully synchronizes the
+/// device at the end of every captured step before the next step overwrites the
+/// inputs.
+pub(crate) fn memcpy_host_to_device(dst: usize, src: &[u8]) -> Result<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    let rt = runtime()?;
+    // SAFETY: `dst` is a valid device pointer owned by a live tensor with at
+    // least `src.len()` bytes of capacity; `src` is a valid host slice of that
+    // length; `memcpy` matches the `cudart` ABI and the kind constant is the
+    // documented enum value.
+    let code = unsafe {
+        (rt.memcpy)(
+            dst as *mut c_void,
+            src.as_ptr().cast::<c_void>(),
+            src.len(),
+            CUDA_MEMCPY_HOST_TO_DEVICE,
+        )
+    };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaMemcpy (host-to-device) failed with CUDA error code {code}"
+        )));
+    }
+    Ok(())
+}
+
+/// Copy `src.len()` bytes from device address `src` into host memory `dst`
+/// (`cudaMemcpyDeviceToHost`).
+///
+/// The runtime-API `cudaMemcpy` is synchronous for a pageable host destination,
+/// so `dst` holds the copied bytes once this returns. Used by tests to read back
+/// device-resident tensors written through the captured-decode input helpers.
+#[cfg(test)]
+pub(crate) fn memcpy_device_to_host(dst: &mut [u8], src: usize) -> Result<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    let rt = runtime()?;
+    // SAFETY: `src` is a valid device pointer with at least `dst.len()` bytes of
+    // capacity; `dst` is a valid host slice of that length; `memcpy` matches the
+    // `cudart` ABI and the kind constant is the documented enum value.
+    let code = unsafe {
+        (rt.memcpy)(
+            dst.as_mut_ptr().cast::<c_void>(),
+            src as *const c_void,
+            dst.len(),
+            CUDA_MEMCPY_DEVICE_TO_HOST,
+        )
+    };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaMemcpy (device-to-host) failed with CUDA error code {code}"
         )));
     }
     Ok(())

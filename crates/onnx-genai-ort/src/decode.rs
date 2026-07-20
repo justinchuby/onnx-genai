@@ -444,6 +444,105 @@ struct CaptureState {
     /// argmax kernel instead of copying the full vocabulary to the host.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     logits_on_device: bool,
+    /// Whether `input_ids` / `position_ids` / `attention_mask` are CUDA
+    /// device-resident (allocated on the session's CUDA allocator). When set,
+    /// each step refreshes them with a host->device copy in place and the
+    /// captured graph reads the updated device bytes on replay, so the IoBinding
+    /// set is bound **once** and never cleared/re-bound per token. When unset
+    /// (host inputs / CPU-argmax path) the loop falls back to the per-step
+    /// `clear_inputs` + re-bind that a captured graph needs to observe fresh CPU
+    /// inputs (see the `step_captured` binding comment and issue
+    /// microsoft/onnxruntime#29782).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    inputs_on_device: bool,
+    /// CUDA device id backing the device-resident capture buffers. Used to pin
+    /// the per-step host->device input copies to the correct device.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    device_id: i32,
+}
+
+impl CaptureState {
+    /// Refresh the per-step dynamic inputs in their persistent **host** buffers.
+    ///
+    /// `input_ids` / `position_ids` are overwritten; the attention mask's valid
+    /// region only grows within a generation (rewind/reset clear it) and prior
+    /// entries are already 1, so only the newly-valid tail is filled — typically
+    /// a single element — keeping this step O(1) in context rather than
+    /// rewriting the whole prefix.
+    fn write_step_inputs_host(
+        &mut self,
+        token: i64,
+        position: i64,
+        valid_len: usize,
+    ) -> Result<()> {
+        self.input_ids.write_i64_prefix(&[token])?;
+        self.position_ids.write_i64_prefix(&[position])?;
+        if valid_len > self.mask_valid_len {
+            self.attention_mask
+                .fill_i64_range(self.mask_valid_len, valid_len - self.mask_valid_len, 1)?;
+        } else if valid_len < self.mask_valid_len {
+            // Defensive: a shrink without an intervening reset — clear the tail
+            // that is no longer valid so it does not leak into this step.
+            self.attention_mask
+                .fill_i64_range(valid_len, self.mask_valid_len - valid_len, 0)?;
+        }
+        self.mask_valid_len = valid_len;
+        Ok(())
+    }
+
+    /// Refresh the per-step dynamic inputs in their persistent **CUDA
+    /// device-resident** buffers with in-place host->device copies. The captured
+    /// graph reads these device buffers directly, so the update is observed on
+    /// the next replay without any re-bind (see `step_captured`). Mirrors the
+    /// O(1) mask-tail growth of [`write_step_inputs_host`](Self::write_step_inputs_host).
+    #[cfg(feature = "cuda")]
+    fn write_step_inputs_device(
+        &mut self,
+        token: i64,
+        position: i64,
+        valid_len: usize,
+    ) -> Result<()> {
+        let device_id = self.device_id;
+        self.input_ids.write_i64_prefix_device(&[token], device_id)?;
+        self.position_ids
+            .write_i64_prefix_device(&[position], device_id)?;
+        if valid_len > self.mask_valid_len {
+            self.attention_mask.fill_i64_range_device(
+                self.mask_valid_len,
+                valid_len - self.mask_valid_len,
+                1,
+                device_id,
+            )?;
+        } else if valid_len < self.mask_valid_len {
+            self.attention_mask.fill_i64_range_device(
+                valid_len,
+                self.mask_valid_len - valid_len,
+                0,
+                device_id,
+            )?;
+        }
+        self.mask_valid_len = valid_len;
+        Ok(())
+    }
+
+    /// Zero the currently-valid prefix of the attention mask (device- or
+    /// host-resident) and reset the valid-length counter. Only the previously
+    /// valid prefix is cleared — the rest is already zero.
+    fn clear_valid_mask(&mut self) -> Result<()> {
+        if self.mask_valid_len == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "cuda")]
+        if self.inputs_on_device {
+            self.attention_mask
+                .fill_i64_range_device(0, self.mask_valid_len, 0, self.device_id)?;
+            self.mask_valid_len = 0;
+            return Ok(());
+        }
+        self.attention_mask.fill_i64_range(0, self.mask_valid_len, 0)?;
+        self.mask_valid_len = 0;
+        Ok(())
+    }
 }
 
 impl Drop for DecodeSession<'_> {
@@ -850,48 +949,52 @@ impl<'a> DecodeSession<'a> {
                 ),
             )));
         }
-        cap.input_ids
-            .write_i64_prefix(&[token])
-            .map_err(CapturedStepError::PreRun)?;
-        cap.position_ids
-            .write_i64_prefix(&[position])
-            .map_err(CapturedStepError::PreRun)?;
-        // The mask's valid region only grows within a generation (rewind/reset
-        // clear it), and prior entries are already 1, so fill just the newly
-        // valid tail — typically a single element — keeping this step O(1) in
-        // context rather than rewriting (and heap-allocating) the whole prefix.
-        if valid_len > cap.mask_valid_len {
-            cap.attention_mask
-                .fill_i64_range(cap.mask_valid_len, valid_len - cap.mask_valid_len, 1)
-                .map_err(CapturedStepError::PreRun)?;
-        } else if valid_len < cap.mask_valid_len {
-            // Defensive: a shrink without an intervening reset — clear the tail
-            // that is no longer valid so it does not leak into this step.
-            cap.attention_mask
-                .fill_i64_range(valid_len, cap.mask_valid_len - valid_len, 0)
+        // Refresh the per-step dynamic inputs in their persistent, fixed-address
+        // buffers. Device-resident inputs are updated in place with a
+        // host->device copy (the captured graph reads them directly on replay);
+        // host inputs are updated with a plain memcpy and ORT re-copies them on
+        // the re-bind below.
+        if cap.inputs_on_device {
+            #[cfg(feature = "cuda")]
+            {
+                cap.write_step_inputs_device(token, position, valid_len)
+                    .map_err(CapturedStepError::PreRun)?;
+            }
+        } else {
+            cap.write_step_inputs_host(token, position, valid_len)
                 .map_err(CapturedStepError::PreRun)?;
         }
-        cap.mask_valid_len = valid_len;
 
         // On the first step under this capture id (and after any reset/rewind/KV
         // grow that calls `invalidate_captured_graph`), bind every input and
         // output so the graph is captured against these exact buffers. On later
         // steps that merely replay the captured graph, the output tensors (KV
         // shared buffers and logits) are device-resident and unchanged, so their
-        // bindings persist untouched. Inputs must be cleared and re-bound so ORT
-        // re-copies the mutated CPU inputs (new token id, position, mask tail)
-        // host->device before the replay; clearing inputs also drops the KV
-        // input bindings, so those are re-bound too (cheap: device-resident, no
-        // copy). Skipping the ~30 output binds per token (each a CString alloc +
-        // FFI call) removes about half the per-token bind cost.
+        // bindings persist untouched.
+        //
+        // How the *inputs* are refreshed depends on where they live:
+        // - Device-resident inputs (the CUDA device-argmax path): the captured
+        //   graph reads their device buffers directly, so mutating those buffers
+        //   in place (above) is observed on the next replay. The one-time
+        //   binding stands — nothing is cleared or re-bound per token. This is
+        //   the fix for microsoft/onnxruntime#29782: binding tiny CPU inputs
+        //   forced a per-step `ClearBoundInputs` + full re-bind of the entire set
+        //   (including the large, unchanged KV buffers) purely to trigger the
+        //   host->device copy.
+        // - Host CPU inputs (CPU-argmax fallback): ORT only copies a bound CPU
+        //   input host->device on (re)bind, so the mutated inputs must be cleared
+        //   and re-bound each step; clearing inputs also drops the KV input
+        //   bindings, so those are re-bound too (cheap: device-resident, no copy).
         let bind_span = crate::prof_span!("ort.bind_inputs");
         if self.capture_bound {
-            self.binding
-                .clear_inputs()
-                .map_err(CapturedStepError::PreRun)?;
-            self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)
-                .map_err(CapturedStepError::PreRun)?;
-            self.bind_kv_inputs().map_err(CapturedStepError::PreRun)?;
+            if !cap.inputs_on_device {
+                self.binding
+                    .clear_inputs()
+                    .map_err(CapturedStepError::PreRun)?;
+                self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)
+                    .map_err(CapturedStepError::PreRun)?;
+                self.bind_kv_inputs().map_err(CapturedStepError::PreRun)?;
+            }
         } else {
             self.binding.clear().map_err(CapturedStepError::PreRun)?;
             self.bind_standard_inputs(&cap.input_ids, &cap.attention_mask, &cap.position_ids)
@@ -1013,9 +1116,12 @@ impl<'a> DecodeSession<'a> {
                 OrtError::InvalidArgument("logits output has no static vocab dim".into())
             })?;
 
-        let input_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
-        let position_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
-        let attention_mask = Value::from_vec_i64(vec![0i64; mask_len], &[1, mask_len as i64])?;
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut input_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut position_ids = Value::from_vec_i64(vec![0i64], &[1, 1])?;
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut attention_mask = Value::from_vec_i64(vec![0i64; mask_len], &[1, mask_len as i64])?;
         let logits_dtype = logits_info.dtype;
         let vocab_usize = usize::try_from(vocab)
             .map_err(|_| OrtError::InvalidArgument("logits vocab dim is negative".into()))?;
@@ -1031,6 +1137,17 @@ impl<'a> DecodeSession<'a> {
         // logits `Value` (mirroring the shared KV buffers).
         #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
         let mut logits_on_device = false;
+        // When logits stay on-device we also keep the small dynamic inputs
+        // (`input_ids` / `position_ids` / `attention_mask`) device-resident: the
+        // captured graph then reads them in place on every replay, so the whole
+        // IoBinding set is bound once and never cleared/re-bound per token. The
+        // device sampler that this same branch installs fully synchronizes the
+        // device at the end of each step, which orders the next step's in-place
+        // input overwrite after the prior replay's read (see `step_captured`).
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut inputs_on_device = false;
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut device_id = 0i32;
         let logits;
         #[cfg(feature = "cuda")]
         {
@@ -1040,6 +1157,24 @@ impl<'a> DecodeSession<'a> {
                 if let Some(allocator) = self.kv_allocator.as_ref() {
                     logits = Value::empty_in(&[1, 1, vocab], logits_dtype, allocator)?;
                     logits_on_device = true;
+                    device_id = self.session.cuda_device_id().unwrap_or(0).max(0);
+                    // Move the per-step dynamic inputs onto the CUDA device.
+                    // `empty_in` memory is uninitialized: `input_ids` /
+                    // `position_ids` are fully overwritten each step, but the
+                    // attention mask's masked-out tail must read zero, so zero
+                    // the whole mask buffer once here.
+                    let device_input_ids = Value::empty_in(&[1, 1], DataType::Int64, allocator)?;
+                    let device_position_ids =
+                        Value::empty_in(&[1, 1], DataType::Int64, allocator)?;
+                    let device_attention_mask =
+                        Value::empty_in(&[1, mask_len as i64], DataType::Int64, allocator)?;
+                    device_input_ids.write_i64_prefix_device(&[0], device_id)?;
+                    device_position_ids.write_i64_prefix_device(&[0], device_id)?;
+                    device_attention_mask.fill_i64_range_device(0, mask_len, 0, device_id)?;
+                    input_ids = device_input_ids;
+                    position_ids = device_position_ids;
+                    attention_mask = device_attention_mask;
+                    inputs_on_device = true;
                 } else {
                     logits = Value::empty(&[1, 1, vocab], logits_dtype)?;
                 }
@@ -1076,6 +1211,8 @@ impl<'a> DecodeSession<'a> {
             mask_valid_len: 0,
             vocab: vocab_usize,
             logits_on_device,
+            inputs_on_device,
+            device_id,
         });
         Ok(())
     }
@@ -1196,9 +1333,7 @@ impl<'a> DecodeSession<'a> {
     /// rest is already zero — so this stays O(previous context), not O(max_len).
     fn reset_captured_mask(&mut self) -> Result<()> {
         if let Some(cap) = self.capture.as_mut() {
-            cap.attention_mask
-                .fill_i64_range(0, cap.mask_valid_len, 0)?;
-            cap.mask_valid_len = 0;
+            cap.clear_valid_mask()?;
         }
         Ok(())
     }
@@ -1492,15 +1627,23 @@ impl<'a> DecodeSession<'a> {
         // The captured attention mask capacity must equal the KV buffer
         // capacity. Build its replacement before mutating the session so a
         // fallible allocation cannot leave the KV and capture state out of sync.
-        let grown_mask = if let Some(cap) = self.capture.as_ref() {
-            let valid_ones = cap.mask_valid_len;
-            let mut mask = vec![0i64; new_capacity];
-            for slot in mask.iter_mut().take(valid_ones) {
-                *slot = 1;
-            }
+        // Preserve the mask's residency: a device-resident captured mask (the
+        // CUDA device-argmax path) must stay on the device allocator so the
+        // captured graph keeps reading it in place after re-capture.
+        let grown_mask = if let Some((valid_ones, on_device, mask_device_id)) = self
+            .capture
+            .as_ref()
+            .map(|cap| (cap.mask_valid_len, cap.inputs_on_device, cap.device_id))
+        {
             let mask_len = i64::try_from(new_capacity)
                 .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
-            Some(Value::from_vec_i64(mask, &[1, mask_len])?)
+            Some(self.build_grown_capture_mask(
+                new_capacity,
+                mask_len,
+                valid_ones,
+                on_device,
+                mask_device_id,
+            )?)
         } else {
             None
         };
@@ -1515,6 +1658,43 @@ impl<'a> DecodeSession<'a> {
             cap.mask_len = new_capacity;
         }
         Ok(())
+    }
+
+    /// Build a replacement captured attention mask of `capacity` elements
+    /// (shape `[1, mask_len]`) with the leading `valid_ones` set to 1 and the
+    /// rest zero, preserving the mask's residency: device-resident when
+    /// `on_device` (allocated on the retained CUDA allocator and initialized with
+    /// host->device fills), host-resident otherwise. Used by
+    /// [`grow_kv_buffers`](Self::grow_kv_buffers) when the KV capacity grows.
+    fn build_grown_capture_mask(
+        &self,
+        capacity: usize,
+        mask_len: i64,
+        valid_ones: usize,
+        on_device: bool,
+        device_id: i32,
+    ) -> Result<Value> {
+        #[cfg(feature = "cuda")]
+        if on_device {
+            let allocator = self.kv_allocator.as_ref().ok_or_else(|| {
+                OrtError::InvalidArgument(
+                    "device-resident captured mask requires a CUDA device allocator".into(),
+                )
+            })?;
+            let mask = Value::empty_in(&[1, mask_len], DataType::Int64, allocator)?;
+            mask.fill_i64_range_device(0, capacity, 0, device_id)?;
+            if valid_ones > 0 {
+                mask.fill_i64_range_device(0, valid_ones, 1, device_id)?;
+            }
+            return Ok(mask);
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (on_device, device_id);
+        let mut mask = vec![0i64; capacity];
+        for slot in mask.iter_mut().take(valid_ones) {
+            *slot = 1;
+        }
+        Value::from_vec_i64(mask, &[1, mask_len])
     }
 
     /// Classify where the shared KV buffers live so [`grow_kv_buffers`] can pick
