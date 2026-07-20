@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-20T14:15Z — CPU decode-pool residency and GQA parallelism, CUDA flash attention for Attention/GQA prefill, and issue #40 Phase-1 slices 1a–1c landed._
+_Last updated: 2026-07-20T20:00Z — CUDA-graph M4 decode capture landed (lifecycle + decode-loop integration), and MatMulNBits/GQA decode kernels made capture-safe; remaining GQA metadata-D2H, normalization, and elementwise kernels in progress._
 
-**Current `origin/main` implementation HEAD:** `2ffb4e4`.
+**Current `origin/main` implementation HEAD:** `dcb4f1b`.
+
+## 2026-07-20 — CUDA graph capture for native decode (M4)
+
+- **M4 graph lifecycle ✅ (`5470c01`):** `CudaRuntime` gained CUDA-graph begin/end-capture, instantiate, replay, and reset over the EP's dedicated non-default stream, with a capturability gate (`capture.rs::subgraph_graph_capturable`). A `CUgraph` leak on the instantiate-failure path (cudarc 0.19.8's combined `end_capture`) was caught in review and fixed by splitting end/instantiate with RAII destroy-exec-then-graph. GPU suite 263 pass. (Chew 🔴 leak → Deckard fix → Chew 🟢)
+- **M4 decode-loop integration ✅ (`4755575`):** the native decode loop captures/replays the steady-state q_seq==1 step behind `ONNX_GENAI_CUDA_GRAPH=1` with persistent O(1) input/position/logits buffers (H2D-updated each token; replay re-copies nothing), a process-unique capture handle, and invalidation on reset/rewind/KV-capacity/shape change and prefill. Token-exact parity ON/OFF; a capture-safe Cast-only decoder test drives the real replay branch (captures=2 replays=16, bit-identical eager/replay logits). An initial test that only exercised the eager-fallback path was rejected and re-covered. (Chew 🔴 test-gap → Pris coverage → Chew 🟢)
+- **Kernel capture-safety audit 🟡 in progress:** to make the real Qwen decode step actually capture (not fall back), each decode kernel must be free of per-call alloc/free, mid-step D2H, and in-kernel stream sync. **MatMulNBits M=1 decode ✅ (`a210703`):** trailing syncs removed, `cuda_graph_compatible` shape-gated to the m==1 no-g_idx GEMV — standalone **−65.8%** on the 121-launch decode slice (1.304→0.446 ms/token). **GQA decode scratch ✅ (`dcb4f1b`):** per-call decode scratch made persistent and the trailing stream sync removed (~1.4% eager win); the flag stays conservatively `false` pending on-device metadata. Remaining: GQA per-step metadata D2H (`seqlens_k`/`total`/`position`), plus the normalization and elementwise per-call metadata-alloc kernels.
+- **Distributed equivalence broadened ✅ (`128440d`):** the distributed-equals-single-device equivalence test now covers 6 collectives (all_reduce / reduce_scatter / all_gather / broadcast / all_to_all / all_to_all_v), 56→61 tests, closing prior non-blocking review notes. (Gaff 🟢)
 
 ## 2026-07-20 — CPU/CUDA attention performance and issue #40 Phase 1
 
