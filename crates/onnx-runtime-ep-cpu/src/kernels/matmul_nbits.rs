@@ -21,7 +21,12 @@ use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
 use crate::strided::numel;
 
+/// Overrides the bounded M=1 decode pool size; set to `0` to use the global
+/// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Default M=1 decode pool size. Profiling found 4--8 workers optimal for the
+/// tiny projections in decode, while 16 or more workers regressed throughput.
+const DEFAULT_DECODE_THREADS: usize = 8;
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
 
@@ -633,7 +638,11 @@ fn configured_decode_threads() -> Option<usize> {
 
 fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    let threads = raw?.parse::<usize>().ok()?;
+    let threads = match raw {
+        Some("0") => return None,
+        Some(raw) => raw.parse::<usize>().unwrap_or(DEFAULT_DECODE_THREADS),
+        None => DEFAULT_DECODE_THREADS,
+    };
     (threads > 0).then(|| threads.min(available))
 }
 
@@ -1779,19 +1788,19 @@ mod tests {
 
     #[test]
     fn decode_thread_count_defaults_invalid_values_and_clamps() {
-        assert_eq!(resolve_decode_threads(None, 8), None);
-        assert_eq!(resolve_decode_threads(Some(""), 8), None);
+        assert_eq!(resolve_decode_threads(None, 96), Some(8));
+        assert_eq!(resolve_decode_threads(None, 4), Some(4));
+        assert_eq!(resolve_decode_threads(Some(""), 96), Some(8));
         assert_eq!(resolve_decode_threads(Some("0"), 8), None);
-        assert_eq!(resolve_decode_threads(Some("-4"), 8), None);
-        assert_eq!(resolve_decode_threads(Some("abc"), 8), None);
-        assert_eq!(resolve_decode_threads(Some("3"), 8), Some(3));
-        assert_eq!(resolve_decode_threads(Some("999999"), 8), Some(8));
-        assert_eq!(resolve_decode_threads(Some("1"), 8), Some(1));
-        assert_eq!(resolve_decode_threads(Some("3"), 0), None);
+        assert_eq!(resolve_decode_threads(Some("4"), 96), Some(4));
+        assert_eq!(resolve_decode_threads(Some("1000"), 96), Some(96));
+        assert_eq!(resolve_decode_threads(Some("abc"), 96), Some(8));
+        assert_eq!(resolve_decode_threads(Some("-4"), 4), Some(4));
+        assert_eq!(resolve_decode_threads(Some("4"), 0), None);
     }
 
     #[test]
-    fn decode_thread_pool_is_opt_in() {
+    fn decode_thread_pool_supports_global_pool_opt_out() {
         assert!(build_decode_pool(None).unwrap().is_none());
         let pool = build_decode_pool(Some(3)).unwrap().unwrap();
         assert_eq!(pool.install(rayon::current_num_threads), 3);
