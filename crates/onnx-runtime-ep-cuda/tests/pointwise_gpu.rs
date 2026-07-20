@@ -573,3 +573,211 @@ fn comparison_claims_integer_dtypes_and_rejects_unsupported_dtype() {
             if reason.contains("Equal: operand dtype Float64 not supported on CUDA EP")
     ));
 }
+
+#[test]
+fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
+    let Some(ep) = cuda_ep() else { return };
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let decode_shape = [1, 1, 4];
+    let bias_shape = [4];
+    let decode_strides = compute_contiguous_strides(&decode_shape);
+    let bias_strides = compute_contiguous_strides(&bias_shape);
+    let a_values = [1.0_f32, 2.0, 3.0, 4.0];
+    let b_values = [0.5_f32, -1.0, 2.0, 3.0];
+    let expected = [1.5_f32, 1.0, 5.0, 7.0];
+
+    let a_buf = ep.allocate(std::mem::size_of_val(&a_values), 256).unwrap();
+    let b_buf = ep.allocate(std::mem::size_of_val(&b_values), 256).unwrap();
+    let mut y_buf = ep.allocate(std::mem::size_of_val(&expected), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(bytes(&a_values), cuptr(a_buf.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(bytes(&b_values), cuptr(b_buf.as_ptr()))
+            .unwrap();
+    }
+    let inputs = [
+        TensorView::new(
+            DevicePtr(a_buf.as_ptr()),
+            DataType::Float32,
+            &decode_shape,
+            &decode_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(b_buf.as_ptr()),
+            DataType::Float32,
+            &bias_shape,
+            &bias_strides,
+            device,
+        ),
+    ];
+    let kernel = ep
+        .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
+        .unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Float32,
+        &decode_shape,
+        &decode_strides,
+        device,
+    );
+    kernel.execute(&inputs, &mut [output]).unwrap();
+    assert!(kernel.cuda_graph_compatible());
+    let mut eager_bytes = vec![0_u8; std::mem::size_of_val(&expected)];
+    unsafe {
+        runtime
+            .dtoh(&mut eager_bytes, cuptr(y_buf.as_ptr()))
+            .unwrap()
+    };
+    let eager = eager_bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(eager, expected);
+    let after_warmup = runtime.allocation_counts();
+
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Float32,
+        &decode_shape,
+        &decode_strides,
+        device,
+    );
+    kernel.execute(&inputs, &mut [output]).unwrap();
+    assert_eq!(runtime.allocation_counts(), after_warmup);
+
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let output = TensorMut::new(
+        DevicePtrMut(y_buf.as_mut_ptr()),
+        DataType::Float32,
+        &decode_shape,
+        &decode_strides,
+        device,
+    );
+    kernel.execute(&inputs, &mut [output]).unwrap();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+    let mut replay_bytes = vec![0_u8; std::mem::size_of_val(&expected)];
+    unsafe {
+        runtime
+            .dtoh(&mut replay_bytes, cuptr(y_buf.as_ptr()))
+            .unwrap()
+    };
+    let replay = replay_bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(replay, eager);
+    assert_eq!(runtime.allocation_counts(), after_warmup);
+    assert!(runtime.reset_graph().unwrap());
+
+    let prefill_shape = [1, 2, 4];
+    let prefill_strides = compute_contiguous_strides(&prefill_shape);
+    let prefill_values = [1.0_f32; 8];
+    let prefill_a = ep
+        .allocate(std::mem::size_of_val(&prefill_values), 256)
+        .unwrap();
+    let mut prefill_y = ep
+        .allocate(std::mem::size_of_val(&prefill_values), 256)
+        .unwrap();
+    unsafe {
+        runtime
+            .htod(bytes(&prefill_values), cuptr(prefill_a.as_ptr()))
+            .unwrap()
+    };
+    let prefill_inputs = [
+        TensorView::new(
+            DevicePtr(prefill_a.as_ptr()),
+            DataType::Float32,
+            &prefill_shape,
+            &prefill_strides,
+            device,
+        ),
+        inputs[1],
+    ];
+    let prefill_output = TensorMut::new(
+        DevicePtrMut(prefill_y.as_mut_ptr()),
+        DataType::Float32,
+        &prefill_shape,
+        &prefill_strides,
+        device,
+    );
+    let before_shape_change = runtime.allocation_counts();
+    kernel
+        .execute(&prefill_inputs, &mut [prefill_output])
+        .unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+    let after_shape_change = runtime.allocation_counts();
+    assert_eq!(
+        after_shape_change.allocations,
+        before_shape_change.allocations + 1
+    );
+    assert_eq!(after_shape_change.frees, before_shape_change.frees + 1);
+
+    let i64_values = [1_i64, 2, 3, 4];
+    let i64_bias = [1_i64; 4];
+    let i64_a = ep
+        .allocate(std::mem::size_of_val(&i64_values), 256)
+        .unwrap();
+    let i64_b = ep.allocate(std::mem::size_of_val(&i64_bias), 256).unwrap();
+    let mut i64_y = ep
+        .allocate(std::mem::size_of_val(&i64_values), 256)
+        .unwrap();
+    unsafe {
+        runtime
+            .htod(bytes(&i64_values), cuptr(i64_a.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(bytes(&i64_bias), cuptr(i64_b.as_ptr()))
+            .unwrap();
+    }
+    let i64_inputs = [
+        TensorView::new(
+            DevicePtr(i64_a.as_ptr()),
+            DataType::Int64,
+            &decode_shape,
+            &decode_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(i64_b.as_ptr()),
+            DataType::Int64,
+            &bias_shape,
+            &bias_strides,
+            device,
+        ),
+    ];
+    let i64_kernel = ep
+        .get_kernel(&Node::new(NodeId(1), "Add", vec![], vec![]), &[], 17)
+        .unwrap();
+    assert!(!i64_kernel.cuda_graph_compatible());
+    let i64_output = TensorMut::new(
+        DevicePtrMut(i64_y.as_mut_ptr()),
+        DataType::Int64,
+        &decode_shape,
+        &decode_strides,
+        device,
+    );
+    i64_kernel.execute(&i64_inputs, &mut [i64_output]).unwrap();
+    assert!(!i64_kernel.cuda_graph_compatible());
+
+    let before_kernel_drop = runtime.allocation_counts();
+    drop(kernel);
+    assert_eq!(
+        runtime.allocation_counts().frees,
+        before_kernel_drop.frees + 1
+    );
+    ep.deallocate(prefill_a).unwrap();
+    ep.deallocate(prefill_y).unwrap();
+    ep.deallocate(i64_a).unwrap();
+    ep.deallocate(i64_b).unwrap();
+    ep.deallocate(i64_y).unwrap();
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(b_buf).unwrap();
+    ep.deallocate(y_buf).unwrap();
+}
