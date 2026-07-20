@@ -383,6 +383,13 @@ impl InProcessCommunicator {
             .complete(self.group_id, self.rank, instance, false);
     }
 
+    /// Runs one synchronous in-process collective rendezvous.
+    ///
+    /// The `compute` callback, including reduction work, runs while the
+    /// rendezvous mutex is held. That is acceptable only for this in-process
+    /// correctness oracle. Real asynchronous transports (for example, NCCL)
+    /// must not copy this pattern into their hot path; they must publish
+    /// rendezvous state and perform transport/reduction work outside the mutex.
     fn run_collective<F>(
         &self,
         instance: CommInstanceId,
@@ -1425,6 +1432,212 @@ mod tests {
         for handle in handles {
             assert_eq!(handle.join().unwrap(), expected_bytes);
         }
+    }
+
+    #[test]
+    fn distributed_reduce_scatter_matches_single_device_bitwise() {
+        let shards = [
+            vec![1.0f32, 2.5, -3.0, 4.0, 8.0, -0.5],
+            vec![0.5f32, -1.5, 7.0, 2.0, -3.0, 2.5],
+            vec![3.0f32, 4.0, -2.0, 1.0, 0.25, 6.0],
+        ];
+        let mut reduced = shards[0].clone();
+        for shard in &shards[1..] {
+            for (value, partial) in reduced.iter_mut().zip(shard) {
+                *value += *partial;
+            }
+        }
+        let expected: Vec<Vec<u8>> = reduced.chunks_exact(2).map(f32_bytes).collect();
+        let world = InProcessCommunicator::world(shards.len());
+        let handles: Vec<_> = world
+            .into_iter()
+            .zip(shards)
+            .map(|(comm, shard)| {
+                std::thread::spawn(move || {
+                    let send = comm.allocate_from(f32_bytes(&shard));
+                    let mut recv = comm.allocate_buffer(2 * DType::F32.size());
+                    block_on(comm.reduce_scatter(
+                        instance(0),
+                        &send,
+                        &mut recv,
+                        2,
+                        DType::F32,
+                        ReduceOp::Sum,
+                    ))
+                    .unwrap();
+                    recv.as_slice().to_vec()
+                })
+            })
+            .collect();
+        let actual: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn distributed_all_gather_matches_single_device_bitwise() {
+        let shards = [vec![1u8, 2, 3], vec![10u8, 11, 12], vec![20u8, 21, 22]];
+        let expected: Vec<u8> = shards.iter().flatten().copied().collect();
+        let recv_len = expected.len();
+        let world = InProcessCommunicator::world(shards.len());
+        let handles: Vec<_> = world
+            .into_iter()
+            .zip(shards)
+            .map(|(comm, shard)| {
+                std::thread::spawn(move || {
+                    let send = comm.allocate_from(shard);
+                    let mut recv = comm.allocate_buffer(recv_len);
+                    block_on(comm.all_gather(instance(0), &send, &mut recv, 3, DType::U8)).unwrap();
+                    recv.as_slice().to_vec()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn distributed_broadcast_matches_single_device_bitwise() {
+        let inputs = [vec![0u8, 0, 0, 0], vec![0u8, 0, 0, 0], vec![7u8, 8, 9, 10]];
+        let expected = inputs[2].clone();
+        let world = InProcessCommunicator::world(inputs.len());
+        let handles: Vec<_> = world
+            .into_iter()
+            .zip(inputs)
+            .map(|(comm, input)| {
+                std::thread::spawn(move || {
+                    let mut buffer = comm.allocate_from(input);
+                    block_on(comm.broadcast(instance(0), &mut buffer, 4, DType::U8, RankId(2)))
+                        .unwrap();
+                    buffer.as_slice().to_vec()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn distributed_all_to_all_matches_single_device_bitwise() {
+        let sends = [
+            [vec![0u8, 1], vec![10, 11], vec![20, 21]],
+            [vec![30u8, 31], vec![40, 41], vec![50, 51]],
+            [vec![60u8, 61], vec![70, 71], vec![80, 81]],
+        ];
+        let expected: Vec<Vec<Vec<u8>>> = (0..sends.len())
+            .map(|destination| {
+                sends
+                    .iter()
+                    .map(|source| source[destination].clone())
+                    .collect()
+            })
+            .collect();
+        let world = InProcessCommunicator::world(sends.len());
+        let handles: Vec<_> = world
+            .into_iter()
+            .zip(sends)
+            .map(|(comm, chunks)| {
+                std::thread::spawn(move || {
+                    let sends: Vec<_> = chunks
+                        .into_iter()
+                        .map(|chunk| comm.allocate_from(chunk))
+                        .collect();
+                    let send_refs: Vec<_> = sends.iter().collect();
+                    let mut recvs: Vec<_> = (0..comm.group_size())
+                        .map(|_| comm.allocate_buffer(2))
+                        .collect();
+                    let mut recv_refs: Vec<_> = recvs.iter_mut().collect();
+                    block_on(comm.all_to_all(
+                        instance(0),
+                        &send_refs,
+                        &mut recv_refs,
+                        &[2, 2, 2],
+                        DType::U8,
+                    ))
+                    .unwrap();
+                    recvs
+                        .into_iter()
+                        .map(|buffer| buffer.as_slice().to_vec())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let actual: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn distributed_all_to_all_v_matches_single_device_bitwise() {
+        let sends = [
+            [vec![0u8], vec![10, 11], vec![20]],
+            [vec![30u8, 31], vec![40], vec![50, 51]],
+            [vec![60u8], vec![70, 71], vec![80]],
+        ];
+        let expected: Vec<Vec<u8>> = (0..sends.len())
+            .map(|destination| {
+                sends
+                    .iter()
+                    .flat_map(|source| source[destination].iter().copied())
+                    .collect()
+            })
+            .collect();
+        let world = InProcessCommunicator::world(sends.len());
+        let handles: Vec<_> = world
+            .into_iter()
+            .zip(sends)
+            .map(|(comm, chunks)| {
+                std::thread::spawn(move || {
+                    let counts: Vec<_> = chunks.iter().map(Vec::len).collect();
+                    let send_offsets: Vec<_> = counts
+                        .iter()
+                        .scan(0, |offset, count| {
+                            let current = *offset;
+                            *offset += count;
+                            Some(current)
+                        })
+                        .collect();
+                    let send = comm.allocate_from(chunks.into_iter().flatten().collect());
+                    let ticket = block_on(comm.exchange_counts(
+                        instance(0),
+                        &counts,
+                        &WireTensorSpec::identity(DType::U8),
+                    ))
+                    .unwrap();
+                    let recv_offsets: Vec<_> = ticket
+                        .recv_counts()
+                        .iter()
+                        .scan(0, |offset, count| {
+                            let current = *offset;
+                            *offset += count;
+                            Some(current)
+                        })
+                        .collect();
+                    let recv_len = ticket.recv_counts().iter().sum();
+                    let mut recv = comm.allocate_buffer(recv_len);
+                    block_on(comm.all_to_all_v(
+                        &send,
+                        &send_offsets,
+                        &mut recv,
+                        &recv_offsets,
+                        ticket,
+                    ))
+                    .unwrap();
+                    recv.as_slice().to_vec()
+                })
+            })
+            .collect();
+        let actual: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

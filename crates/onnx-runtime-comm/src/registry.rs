@@ -211,7 +211,10 @@ pub struct OwnershipSnapshot {
     pub detached_active: usize,
     /// Distinct allocations currently under an active read or write lease.
     pub leased_allocations: usize,
-    /// Distinct allocations the allocator has freed.
+    /// Cumulative number of allocations freed since this registry started.
+    ///
+    /// This is a total-ever-freed counter, not the number of currently live
+    /// freed-allocation tombstones.
     pub freed_allocations: usize,
     /// Terminal operations that completed successfully so far.
     pub completed_ok: u64,
