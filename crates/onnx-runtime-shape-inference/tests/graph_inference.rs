@@ -662,7 +662,7 @@ fn skip_simplified_layer_norm_resolves_outputs_without_value_info() {
 fn bert_toy_fully_resolves() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../onnx-runtime-session/tests/fixtures/bert_toy/model.onnx"
+        "/../onnx-runtime-session/tests/fixtures/bert_toy/model.onnx.textproto"
     );
     let mut graph = onnx_runtime_loader::load_model(path).expect("load bert_toy");
 

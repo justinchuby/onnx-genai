@@ -1995,7 +1995,7 @@ mod tests {
         let environment = ENVIRONMENT
             .get_or_init(|| Environment::new("engine-eagle3-test").expect("environment"));
         let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-eagle3/model.onnx");
+            .join("../../tests/fixtures/tiny-eagle3/model.onnx.textproto");
         Ok(Session::new(
             environment,
             &head_path,
@@ -2011,7 +2011,7 @@ mod tests {
         let environment =
             ENVIRONMENT.get_or_init(|| Environment::new("engine-mtp-test").expect("environment"));
         let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx");
+            .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx.textproto");
         let head = Session::new(
             environment,
             &head_path,
@@ -2092,7 +2092,7 @@ mod tests {
         let environment = ENVIRONMENT
             .get_or_init(|| Environment::new("engine-mtp-hc-test").expect("environment"));
         let head_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-hc-mtp/model.onnx");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-hc-mtp/model.onnx.textproto");
         let head = Session::new(
             environment,
             &head_path,
@@ -2147,7 +2147,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-mtp-full");
         let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
-            &fixture.join("model.onnx"),
+            &fixture.join("model.onnx.textproto"),
             "transformer.wte.weight",
             "lm_head.weight_t",
             16,

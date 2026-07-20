@@ -115,8 +115,8 @@ def constant(name: str, array: np.ndarray) -> ir.Node:
 
 
 def save_model(model: ir.Model, path: Path) -> None:
-    ir.save(model, path)
-    onnx.checker.check_model(path)
+    ir.save(model, path, format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
 
 
 def build_vision_encoder(path: Path) -> None:
@@ -334,13 +334,13 @@ METADATA = """\
 pipeline:
   models:
     vision_encoder:
-      filename: vision_encoder.onnx
+      filename: vision_encoder.onnx.textproto
       type: vision_encoder
     embedding:
-      filename: embedding.onnx
+      filename: embedding.onnx.textproto
       type: encoder
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
   dataflow:
@@ -412,17 +412,22 @@ def compute_expected_tokens(prompt: list[int], max_new_tokens: int) -> tuple[lis
     return generated, [image_feat_last]
 
 
+def _textproto_bytes(path) -> bytes:
+    """Load a .onnx.textproto fixture and return serialized binary ModelProto bytes."""
+    return ir.to_proto(ir.load(str(path), format="textproto")).SerializeToString()
+
+
 def validate_with_ort(output_dir: Path, prompt: list[int], max_new_tokens: int) -> list[int]:
     import onnxruntime as ort
 
     vision = ort.InferenceSession(
-        str(output_dir / "vision_encoder.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "vision_encoder.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
     embedding = ort.InferenceSession(
-        str(output_dir / "embedding.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "embedding.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
     decoder = ort.InferenceSession(
-        str(output_dir / "decoder.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "decoder.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
 
     pixels = tiny_pixels()
@@ -473,9 +478,9 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    build_vision_encoder(out_dir / "vision_encoder.onnx")
-    build_embedding(out_dir / "embedding.onnx")
-    build_decoder(out_dir / "decoder.onnx")
+    build_vision_encoder(out_dir / "vision_encoder.onnx.textproto")
+    build_embedding(out_dir / "embedding.onnx.textproto")
+    build_decoder(out_dir / "decoder.onnx.textproto")
     write_tokenizer(out_dir / "tokenizer.json")
     (out_dir / "inference_metadata.yaml").write_text(METADATA)
 

@@ -52,7 +52,7 @@ def build(output_dir: Path) -> None:
             init.const_value = ir.Tensor(arr, name=name)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    ir.save(model, output_dir / "denoiser.onnx")
+    ir.save(model, output_dir / "denoiser.onnx.textproto", format="textproto")
 
     # Emit the onnx-genai pipeline metadata via the Mobius integration (the
     # feature added in mobius integrations/onnx_genai) — proving the full chain:
@@ -62,14 +62,14 @@ def build(output_dir: Path) -> None:
     write_diffusion_pipeline_metadata(
         str(output_dir),
         num_inference_steps=3,
-        denoiser_filename="denoiser.onnx",
+        denoiser_filename="denoiser.onnx.textproto",
     )
 
     # Smoke check with ONNX Runtime.
     import onnxruntime as ort
 
     sess = ort.InferenceSession(
-        str(output_dir / "denoiser.onnx"), providers=["CPUExecutionProvider"]
+        ir.to_proto(model).SerializeToString(), providers=["CPUExecutionProvider"]
     )
     out = sess.run(
         None,
@@ -80,8 +80,8 @@ def build(output_dir: Path) -> None:
         },
     )
     assert out[0].shape == (1, 4, 8, 8), out[0].shape
-    size = (output_dir / "denoiser.onnx").stat().st_size
-    print(f"Wrote {output_dir} (denoiser.onnx {size} bytes); noise_pred {out[0].shape}")
+    size = (output_dir / "denoiser.onnx.textproto").stat().st_size
+    print(f"Wrote {output_dir} (denoiser.onnx.textproto {size} bytes); noise_pred {out[0].shape}")
 
 
 def main() -> None:

@@ -86,8 +86,8 @@ def constant(name: str, array: np.ndarray) -> ir.Node:
 
 
 def save_model(model: ir.Model, path: Path) -> None:
-    ir.save(model, path)
-    onnx.checker.check_model(path)
+    ir.save(model, path, format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
 
 
 def build_talker(path: Path) -> None:
@@ -495,14 +495,14 @@ def write_metadata(path: Path) -> None:
 pipeline:
   models:
     talker:
-      filename: talker.onnx
+      filename: talker.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
     code_predictor:
-      filename: code_predictor.onnx
+      filename: code_predictor.onnx.textproto
       type: decoder
     vocoder:
-      filename: vocoder.onnx
+      filename: vocoder.onnx.textproto
       type: vocoder
   dataflow:
     # Per-frame hidden binding: inner step 0 seed.
@@ -550,17 +550,22 @@ def _expected_codes() -> np.ndarray:
     return codes
 
 
+def _textproto_bytes(path) -> bytes:
+    """Load a .onnx.textproto fixture and return serialized binary ModelProto bytes."""
+    return ir.to_proto(ir.load(str(path), format="textproto")).SerializeToString()
+
+
 def validate_with_ort(output_dir: Path) -> None:
     import onnxruntime as ort
 
     talker = ort.InferenceSession(
-        str(output_dir / "talker.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "talker.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
     code_predictor = ort.InferenceSession(
-        str(output_dir / "code_predictor.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "code_predictor.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
     vocoder = ort.InferenceSession(
-        str(output_dir / "vocoder.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "vocoder.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
 
     talker_past_key = np.zeros((1, 1, 0, HEAD_DIM), dtype=np.float32)
@@ -623,9 +628,9 @@ def main() -> None:
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
-    build_talker(args.output / "talker.onnx")
-    build_code_predictor(args.output / "code_predictor.onnx")
-    build_vocoder(args.output / "vocoder.onnx")
+    build_talker(args.output / "talker.onnx.textproto")
+    build_code_predictor(args.output / "code_predictor.onnx.textproto")
+    build_vocoder(args.output / "vocoder.onnx.textproto")
     write_tokenizer(args.output / "tokenizer.json")
     write_metadata(args.output / "inference_metadata.yaml")
     if not args.no_validate:

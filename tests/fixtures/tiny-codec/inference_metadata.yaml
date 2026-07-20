@@ -4,10 +4,10 @@
 pipeline:
   models:
     encoder:
-      filename: encoder.onnx
+      filename: encoder.onnx.textproto
       type: audio_encoder
     vocoder:
-      filename: vocoder.onnx
+      filename: vocoder.onnx.textproto
       type: vocoder
   dataflow:
     - from: encoder.codes

@@ -25,7 +25,7 @@ METADATA = """\
 pipeline:
   models:
     denoiser:
-      filename: lm.onnx
+      filename: lm.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.logits
@@ -70,8 +70,8 @@ def build(output_dir: Path) -> None:
     model = ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-masked-diffusion")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    ir.save(model, output_dir / "lm.onnx")
-    onnx.checker.check_model(output_dir / "lm.onnx")
+    ir.save(model, output_dir / "lm.onnx.textproto", format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
     (output_dir / "inference_metadata.yaml").write_text(METADATA)
     print(f"Wrote {output_dir} (target {TARGET}, mask {MASK_TOKEN})")
 

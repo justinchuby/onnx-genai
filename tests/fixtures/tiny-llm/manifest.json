@@ -12,8 +12,7 @@
   "num_key_value_heads": 2,
   "head_dim": 8,
   "files": {
-    "model.onnx": 15807,
-    "model.onnx.data": 13312,
+    "model.onnx.textproto": 75291,
     "tokenizer.json": 2038
   }
 }

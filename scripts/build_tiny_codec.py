@@ -61,8 +61,8 @@ def constant(name: str, array: np.ndarray) -> ir.Node:
 
 
 def save_model(model: ir.Model, path: Path) -> None:
-    ir.save(model, path)
-    onnx.checker.check_model(path)
+    ir.save(model, path, format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
 
 
 def build_encoder(path: Path) -> None:
@@ -129,10 +129,10 @@ METADATA = """\
 pipeline:
   models:
     encoder:
-      filename: encoder.onnx
+      filename: encoder.onnx.textproto
       type: audio_encoder
     vocoder:
-      filename: vocoder.onnx
+      filename: vocoder.onnx.textproto
       type: vocoder
   dataflow:
     - from: encoder.codes
@@ -172,8 +172,8 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    build_encoder(out_dir / "encoder.onnx")
-    build_vocoder(out_dir / "vocoder.onnx")
+    build_encoder(out_dir / "encoder.onnx.textproto")
+    build_vocoder(out_dir / "vocoder.onnx.textproto")
     (out_dir / "inference_metadata.yaml").write_text(METADATA)
     print(f"wrote tiny-codec fixture to {out_dir}")
 

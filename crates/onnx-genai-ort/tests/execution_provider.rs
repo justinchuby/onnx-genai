@@ -5,7 +5,7 @@ use onnx_genai_ort::{
 };
 
 fn tiny_llm() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
 }
 
 #[test]

@@ -768,7 +768,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures")
             .join(name)
-            .join("model.onnx")
+            .join("model.onnx.textproto")
     }
 
     fn load_session(name: &str) -> anyhow::Result<(Environment, Session)> {

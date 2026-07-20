@@ -9,11 +9,11 @@ use onnx_genai_ort::{
 };
 
 fn tiny_llm() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
 }
 
 fn tiny_scatter_llm() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
 }
 
 fn deterministic_session_options() -> SessionOptions {

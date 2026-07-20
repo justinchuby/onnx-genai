@@ -469,8 +469,8 @@ fn real_fixture_round_trips_if_present() {
         .and_then(|p| p.parent())
         .expect("workspace root");
     let candidates = [
-        "crates/onnx-runtime-session/tests/fixtures/bert_toy/model.onnx",
-        "tests/fixtures/tiny-whisper/encoder.onnx",
+        "crates/onnx-runtime-session/tests/fixtures/bert_toy/model.onnx.textproto",
+        "tests/fixtures/tiny-whisper/encoder.onnx.textproto",
     ];
 
     let mut ran = false;
@@ -479,7 +479,7 @@ fn real_fixture_round_trips_if_present() {
         if !path.exists() {
             continue;
         }
-        let bytes1 = std::fs::read(&path).expect("read fixture");
+        let bytes1 = onnx_runtime_loader::read_model_binary(&path).expect("read fixture");
         let base = path.parent().unwrap();
         let (graph1, store1) =
             load_model_bytes_with_weights(&bytes1, base).expect("decode fixture");

@@ -139,6 +139,13 @@ def _build(module, config, task, output_dir: Path, overrides=None):
     _materialize_static_reshape_dims(package["model"])
     output_dir.mkdir(parents=True, exist_ok=True)
     package.save(str(output_dir), check_weights=True, progress_bar=False)
+    model = package["model"]
+    # Re-emit as git-friendly textproto with weights inlined, then drop binaries.
+    ir.save(model, str(output_dir / "model.onnx.textproto"), format="textproto")
+    for stale in ("model.onnx", "model.onnx.data"):
+        stale_path = output_dir / stale
+        if stale_path.exists():
+            stale_path.unlink()
     return package["model"], state
 
 
@@ -214,7 +221,7 @@ def main() -> None:
             "embedding_layout": "[vocab, hidden]",
             "lm_head_weights": "lm_head.f32",
             "lm_head_layout": "[hidden, vocab]",
-            "mtp_head_model": "mtp/model.onnx",
+            "mtp_head_model": "mtp/model.onnx.textproto",
             "mtp_kv_mode": "HiddenThreaded",
         },
     }

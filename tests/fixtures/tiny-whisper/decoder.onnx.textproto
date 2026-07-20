@@ -1,0 +1,526 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-whisper fixture"
+graph {
+  node {
+    input: "decoder_input_ids"
+    output: "input_shape"
+    name: "node_Shape_0"
+    op_type: "Shape"
+  }
+  node {
+    output: "batch_index"
+    name: "node_Constant_1"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 7
+        name: "batch_index_value"
+        raw_data: "\000\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "sequence_index"
+    name: "node_Constant_2"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 7
+        name: "sequence_index_value"
+        raw_data: "\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "axes_zero"
+    name: "node_Constant_3"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "axes_zero_value"
+        raw_data: "\000\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "input_shape"
+    input: "batch_index"
+    output: "batch"
+    name: "node_Gather_4"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "input_shape"
+    input: "sequence_index"
+    output: "sequence"
+    name: "node_Gather_5"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "batch"
+    input: "axes_zero"
+    output: "batch_vec"
+    name: "node_Unsqueeze_6"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "sequence"
+    input: "axes_zero"
+    output: "sequence_vec"
+    name: "node_Unsqueeze_7"
+    op_type: "Unsqueeze"
+  }
+  node {
+    output: "one"
+    name: "node_Constant_8"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "one_value"
+        raw_data: "\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "four"
+    name: "node_Constant_9"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "four_value"
+        raw_data: "\004\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "eight"
+    name: "node_Constant_10"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "eight_value"
+        raw_data: "\010\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "batch_vec"
+    input: "one"
+    input: "sequence_vec"
+    input: "four"
+    output: "cache_shape"
+    name: "node_Concat_11"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "batch_vec"
+    input: "sequence_vec"
+    input: "eight"
+    output: "logits_shape"
+    name: "node_Concat_12"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "decoder_input_ids"
+    output: "ids_float"
+    name: "node_Cast_13"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    output: "cache_axes"
+    name: "node_Constant_14"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 2
+        data_type: 7
+        name: "cache_axes_value"
+        raw_data: "\001\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "ids_float"
+    input: "cache_axes"
+    output: "ids_cache"
+    name: "node_Unsqueeze_15"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "ids_cache"
+    input: "cache_shape"
+    output: "current_key"
+    name: "node_Expand_16"
+    op_type: "Expand"
+  }
+  node {
+    input: "current_key"
+    input: "value_offset"
+    output: "current_value"
+    name: "node_Add_17"
+    op_type: "Add"
+  }
+  node {
+    input: "past_key_values.0.key"
+    input: "current_key"
+    output: "present.0.key"
+    name: "node_Concat_18"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  node {
+    input: "past_key_values.0.value"
+    input: "current_value"
+    output: "present.0.value"
+    name: "node_Concat_19"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  node {
+    input: "logits_shape"
+    output: "zero_logits"
+    name: "node_ConstantOfShape_20"
+    op_type: "ConstantOfShape"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 1
+        name: "zero_logits_value"
+        raw_data: "\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "encoder_hidden_states"
+    output: "encoder_bias"
+    name: "node_ReduceMean_21"
+    op_type: "ReduceMean"
+    attribute {
+      name: "axes"
+      ints: 1
+      ints: 2
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "zero_logits"
+    input: "encoder_bias"
+    output: "conditioned_logits"
+    name: "node_Add_22"
+    op_type: "Add"
+  }
+  node {
+    input: "position_ids"
+    output: "position_float"
+    name: "node_Cast_23"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    output: "logits_axis"
+    name: "node_Constant_24"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "logits_axis_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "position_float"
+    input: "logits_axis"
+    output: "position_bias"
+    name: "node_Unsqueeze_25"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "conditioned_logits"
+    input: "position_bias"
+    output: "positioned_logits"
+    name: "node_Add_26"
+    op_type: "Add"
+  }
+  node {
+    input: "positioned_logits"
+    input: "token_bias"
+    output: "logits"
+    name: "node_Add_27"
+    op_type: "Add"
+  }
+  name: "tiny_whisper_decoder"
+  initializer {
+    data_type: 1
+    name: "value_offset"
+    raw_data: "\000\000\000?"
+  }
+  initializer {
+    dims: 1
+    dims: 1
+    dims: 8
+    data_type: 1
+    name: "token_bias"
+    raw_data: "\000\000\200\300\000\000\200\300\000\000\200\300\000\000\200\300\000\000\000A\000\000\200\300\000\000\200\300\000\000\200\300"
+  }
+  input {
+    name: "decoder_input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "encoder_hidden_states"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 4
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence_len"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence_len"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "value_offset"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "token_bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

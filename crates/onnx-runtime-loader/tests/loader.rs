@@ -495,8 +495,8 @@ fn smoke_load_real_fixture_if_present() {
         .and_then(|p| p.parent())
         .expect("workspace root");
     let candidates = [
-        "tests/fixtures/tiny-eagle3/model.onnx",     // external data
-        "tests/fixtures/tiny-whisper/encoder.onnx",  // inline
+        "tests/fixtures/tiny-eagle3/model.onnx.textproto",     // external data
+        "tests/fixtures/tiny-whisper/encoder.onnx.textproto",  // inline
     ];
     let mut loaded_any = false;
     for rel in candidates {
@@ -517,8 +517,66 @@ fn smoke_load_real_fixture_if_present() {
     }
 }
 
-// ── load_*_with_weights: bytes survive after load, work for inline + external ──
+/// Loading a git-friendly `*.onnx.textproto` fixture must yield the same valid
+/// graph as its binary `.onnx` counterpart. Textproto is parsed as ONNX
+/// protobuf TextFormat and converted to binary before the normal decode path,
+/// so this is the nxrt-side end-to-end check for textproto support.
+#[test]
+fn load_textproto_fixture_matches_binary_io() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let root = std::path::Path::new(manifest)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let path = root.join("tests/fixtures/tiny-whisper/encoder.onnx.textproto");
+    if !path.exists() {
+        eprintln!("load_textproto_fixture_matches_binary_io: fixture absent, skipping");
+        return;
+    }
 
+    assert!(
+        onnx_runtime_loader::is_textproto_path(&path),
+        "expected textproto detection by suffix"
+    );
+
+    let (graph, store) = onnx_runtime_loader::load_model_with_weights(&path)
+        .unwrap_or_else(|e| panic!("failed to load textproto fixture: {e}"));
+    graph
+        .validate()
+        .unwrap_or_else(|e| panic!("invalid graph from textproto fixture: {e:?}"));
+    assert!(graph.num_nodes() > 0, "textproto graph must have nodes");
+
+    // The tiny-whisper encoder takes `input_features` and produces
+    // `encoder_hidden_states`.
+    let input_names: Vec<&str> = graph
+        .inputs
+        .iter()
+        .filter_map(|v| graph.value(*v).name.as_deref())
+        .collect();
+    let output_names: Vec<&str> = graph
+        .outputs
+        .iter()
+        .filter_map(|v| graph.value(*v).name.as_deref())
+        .collect();
+    assert!(
+        input_names.contains(&"input_features"),
+        "inputs were {input_names:?}"
+    );
+    assert!(
+        output_names.contains(&"encoder_hidden_states"),
+        "outputs were {output_names:?}"
+    );
+
+    // Any inline initializer bytes must be retrievable via the weight store.
+    for weight_ref in graph.initializers.values() {
+        assert!(
+            store.bytes(weight_ref).is_some(),
+            "weight bytes must be resolvable for inline textproto fixture"
+        );
+    }
+}
+
+// ── load_*_with_weights: bytes survive after load, work for inline + external ──
 /// Build a tiny model with inline weights and verify that the Arc<WeightStore>
 /// keeps the bytes accessible after `load_model_bytes_with_weights` returns.
 #[test]
@@ -562,25 +620,29 @@ fn load_bytes_with_weights_inline_survives() {
     assert_eq!(std::sync::Arc::strong_count(&store2), 2);
 }
 
-/// Load a real fixture that has an external-data file and verify that the
-/// `Arc<WeightStore>` exposes non-empty byte slices for External WeightRefs.
-/// Skips gracefully if the fixture directory is absent.
+/// Load real converted fixtures (now inlined into `.onnx.textproto`) and verify
+/// that the `Arc<WeightStore>` exposes non-empty byte slices for every
+/// initializer, and that those bytes stay live after the `Graph` is dropped.
+///
+/// External-data (`.onnx.data`) resolution itself is covered independently by
+/// `external_data_paths.rs`; these fixtures inline all weights, so every
+/// `WeightRef` is `Inline` here.
+/// Skips gracefully if the fixtures are absent.
 #[test]
-fn load_with_weights_external_data_fixture() {
+fn load_with_weights_inlined_fixtures_survive_graph_drop() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let root = std::path::Path::new(manifest)
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root");
 
-    // Pick any fixture that ships with external data.
     let candidates = [
-        "tests/fixtures/tiny-eagle3/model.onnx",
-        "tests/fixtures/tiny-llm/model.onnx",
-        "tests/fixtures/tiny-llm-scatter/model.onnx",
+        "tests/fixtures/tiny-eagle3/model.onnx.textproto",
+        "tests/fixtures/tiny-llm/model.onnx.textproto",
+        "tests/fixtures/tiny-llm-scatter/model.onnx.textproto",
     ];
 
-    let mut tested_external = false;
+    let mut tested_any = false;
     for rel in candidates {
         let path = root.join(rel);
         if !path.exists() {
@@ -594,36 +656,27 @@ fn load_with_weights_external_data_fixture() {
             .validate()
             .unwrap_or_else(|e| panic!("invalid graph from {rel}: {e:?}"));
 
-        // For every initializer, store.bytes() must return Some with len > 0.
-        for (vid, weight_ref) in &graph.initializers {
-            let raw = store
-                .bytes(weight_ref)
-                .unwrap_or_else(|| panic!("store.bytes() returned None for value {vid:?}"));
+        // Snapshot every initializer's WeightRef, then drop the graph and verify
+        // the Arc<WeightStore> still yields the (inline) bytes.
+        let weights: Vec<_> = graph.initializers.values().cloned().collect();
+        assert!(
+            !weights.is_empty(),
+            "fixture {rel} is expected to carry initializers"
+        );
+
+        drop(graph); // graph gone — Arc<WeightStore> must keep bytes alive
+
+        for w in &weights {
+            let raw = store.bytes(w).expect("weight bytes live after graph drop");
             assert!(!raw.is_empty(), "weight bytes must be non-empty");
-        }
-
-        // Verify external refs specifically yield bytes even after we drop the
-        // graph (mmap still alive via Arc).
-        let externals: Vec<_> = graph
-            .initializers
-            .values()
-            .filter(|w| matches!(w, WeightRef::External { .. }))
-            .cloned()
-            .collect();
-
-        drop(graph); // graph gone — Arc<WeightStore> must keep mmaps alive
-
-        for w in &externals {
-            let raw = store.bytes(w).expect("external bytes live after graph drop");
-            assert!(!raw.is_empty());
-            tested_external = true;
+            tested_any = true;
         }
 
         break; // one fixture is enough
     }
 
-    if !tested_external {
-        eprintln!("load_with_weights_external_data_fixture: no external-data fixture found, skipping");
+    if !tested_any {
+        eprintln!("load_with_weights_inlined_fixtures_survive_graph_drop: no fixture found, skipping");
     }
 }
 

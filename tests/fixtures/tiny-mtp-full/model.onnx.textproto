@@ -1,0 +1,1624 @@
+ir_version: 11
+producer_name: "mobius"
+producer_version: "0.1.0"
+graph {
+  node {
+    input: "transformer.wte.weight"
+    input: "input_ids"
+    output: "v_transformer.wte.Gather_0"
+    name: "transformer/wte/Gather_node_0"
+    op_type: "Gather"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/wte: Embedding"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'Embedding\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'wte\']"
+    }
+  }
+  node {
+    input: "transformer.wpe.weight"
+    input: "position_ids"
+    output: "v_transformer.wpe.Gather_1"
+    name: "transformer/wpe/Gather_node_1"
+    op_type: "Gather"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/wpe: Embedding"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'Embedding\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'wpe\']"
+    }
+  }
+  node {
+    input: "attention_mask"
+    output: "v_transformer.Cast_3"
+    name: "transformer/Cast_node_3"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 9
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "v_transformer.Cast_3"
+    input: "const_1d_0"
+    output: "v_transformer.Unsqueeze_4"
+    name: "transformer/Unsqueeze_node_4"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "input_ids"
+    output: "v_transformer.Shape_5"
+    name: "transformer/Shape_node_5"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "input_ids"
+    output: "v_transformer.Shape_6"
+    name: "transformer/Shape_node_6"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "attention_mask"
+    output: "v_transformer.Shape_7"
+    name: "transformer/Shape_node_7"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "v_transformer.Shape_5"
+    input: "v_transformer.Shape_6"
+    input: "v_transformer.Shape_7"
+    output: "v_transformer.Concat_8"
+    name: "transformer/Concat_node_8"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "v_transformer.Unsqueeze_4"
+    input: "v_transformer.Concat_8"
+    output: "v_transformer.Expand_9"
+    name: "transformer/Expand_node_9"
+    op_type: "Expand"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "v_transformer.Expand_9"
+    input: "const_1d_0"
+    output: "v_transformer.Unsqueeze_10"
+    name: "transformer/Unsqueeze_node_10"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\']"
+    }
+  }
+  node {
+    input: "v_transformer.wte.Gather_0"
+    input: "v_transformer.wpe.Gather_1"
+    input: "transformer.h.0.ln_1.weight"
+    input: "transformer.h.0.ln_1.bias"
+    output: "v_transformer.h.0.ln_1.LayerNormalization_11"
+    output: "val_0"
+    output: "val_1"
+    output: "val_2"
+    name: "node_SkipLayerNormalization_0"
+    op_type: "SkipLayerNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    domain: "com.microsoft"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/ln_1: LayerNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'LayerNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'ln_1\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.rewriter.rule_name"
+      value: "AddLayerNormToSkipLayerNorm"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.ln_1.LayerNormalization_11"
+    input: "transformer.h.0.attn.q_proj.weight_t"
+    output: "v_transformer.h.0.attn.q_proj.MatMul_13"
+    name: "transformer/h.0/attn/q_proj/MatMul_node_13"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/attn: Attention/q_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'attn\', \'q_proj\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.ln_1.LayerNormalization_11"
+    input: "transformer.h.0.attn.k_proj.weight_t"
+    output: "v_transformer.h.0.attn.k_proj.MatMul_15"
+    name: "transformer/h.0/attn/k_proj/MatMul_node_15"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/attn: Attention/k_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'attn\', \'k_proj\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.ln_1.LayerNormalization_11"
+    input: "transformer.h.0.attn.v_proj.weight_t"
+    output: "v_transformer.h.0.attn.v_proj.MatMul_17"
+    name: "transformer/h.0/attn/v_proj/MatMul_node_17"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/attn: Attention/v_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'attn\', \'v_proj\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.attn.q_proj.MatMul_13"
+    input: "v_transformer.h.0.attn.k_proj.MatMul_15"
+    input: "v_transformer.h.0.attn.v_proj.MatMul_17"
+    input: "v_transformer.Unsqueeze_10"
+    input: "past_key_values.0.key"
+    input: "past_key_values.0.value"
+    output: "v_transformer.h.0.attn.Attention_18_0"
+    output: "present.0.key"
+    output: "present.0.value"
+    name: "transformer/h.0/attn/Attention_node_18"
+    op_type: "Attention"
+    attribute {
+      name: "is_causal"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "kv_num_heads"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "q_num_heads"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "softcap"
+      f: 0.0
+      type: FLOAT
+    }
+    attribute {
+      name: "scale"
+      f: 0.35355338
+      type: FLOAT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/attn: Attention"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'Attention\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'attn\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.attn.Attention_18_0"
+    input: "transformer.h.0.attn.o_proj.weight_t"
+    output: "v_transformer.h.0.attn.o_proj.MatMul_20"
+    name: "transformer/h.0/attn/o_proj/MatMul_node_20"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/attn: Attention/o_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'attn\', \'o_proj\']"
+    }
+  }
+  node {
+    input: "val_2"
+    input: "v_transformer.h.0.attn.o_proj.MatMul_20"
+    input: "transformer.h.0.ln_2.weight"
+    input: "transformer.h.0.ln_2.bias"
+    output: "v_transformer.h.0.ln_2.LayerNormalization_22"
+    output: "val_3"
+    output: "val_4"
+    output: "val_5"
+    name: "node_SkipLayerNormalization_1"
+    op_type: "SkipLayerNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    domain: "com.microsoft"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/ln_2: LayerNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'LayerNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'ln_2\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.rewriter.rule_name"
+      value: "AddLayerNormToSkipLayerNorm"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.ln_2.LayerNormalization_22"
+    input: "transformer.h.0.mlp.up_proj.weight_t"
+    output: "v_transformer.h.0.mlp.up_proj.MatMul_24"
+    name: "transformer/h.0/mlp/up_proj/MatMul_node_24"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/mlp: FCMLP/up_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'FCMLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'mlp\', \'up_proj\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.mlp.up_proj.MatMul_24"
+    input: "transformer.h.0.mlp.up_proj.bias"
+    output: "v_transformer.h.0.mlp.up_proj.Add_25"
+    name: "transformer/h.0/mlp/up_proj/Add_node_25"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/mlp: FCMLP/up_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'FCMLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'mlp\', \'up_proj\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.mlp.up_proj.Add_25"
+    output: "v_transformer.h.0.mlp.Gelu_26"
+    name: "transformer/h.0/mlp/Gelu_node_26"
+    op_type: "Gelu"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/mlp: FCMLP"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'FCMLP\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'mlp\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.mlp.Gelu_26"
+    input: "transformer.h.0.mlp.down_proj.weight_t"
+    output: "v_transformer.h.0.mlp.down_proj.MatMul_28"
+    name: "transformer/h.0/mlp/down_proj/MatMul_node_28"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/mlp: FCMLP/down_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'FCMLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'mlp\', \'down_proj\']"
+    }
+  }
+  node {
+    input: "v_transformer.h.0.mlp.down_proj.MatMul_28"
+    input: "transformer.h.0.mlp.down_proj.bias"
+    output: "v_transformer.h.0.mlp.down_proj.Add_29"
+    name: "transformer/h.0/mlp/down_proj/Add_node_29"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/h.0: _GPT2DecoderLayer/mlp: FCMLP/down_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'_GPT2DecoderLayer\', \'FCMLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'h.0\', \'mlp\', \'down_proj\']"
+    }
+  }
+  node {
+    input: "val_5"
+    input: "v_transformer.h.0.mlp.down_proj.Add_29"
+    input: "transformer.ln_f.weight"
+    input: "transformer.ln_f.bias"
+    output: "hidden_states.0"
+    output: "val_6"
+    output: "val_7"
+    output: "val_8"
+    name: "node_SkipLayerNormalization_2"
+    op_type: "SkipLayerNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    domain: "com.microsoft"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/transformer: _GPT2TextModel/ln_f: LayerNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'_GPT2TextModel\', \'LayerNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'transformer\', \'ln_f\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.rewriter.rule_name"
+      value: "AddLayerNormToSkipLayerNorm"
+    }
+  }
+  node {
+    input: "hidden_states.0"
+    input: "lm_head.weight_t"
+    output: "logits"
+    name: "lm_head/MatMul_node_33"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": GPT2CausalLMWithHidden/lm_head: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'GPT2CausalLMWithHidden\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'lm_head\']"
+    }
+  }
+  name: "main_graph"
+  initializer {
+    dims: 32
+    dims: 16
+    data_type: 1
+    name: "transformer.wte.weight"
+    raw_data: "\311\312t\2743\375\316<\263\002\301\2744\3548\274\274\316\273;&\036K\274e!\332<>\024\227\273P\223 <\264\344\230\274\034\026]\274\247\\w<L\'\331\274\276\201\261<F\312\317\274j=\356<i\312a\274\374\374\252\274vL\216<G\320,\275n-\307<F\314\263;\317t\206\274\341\0038=k=\301\273|z`\274&B\025\275\010\373\032<W\221`<\313\253U\273d\353\213;D\215\'\275\217,L;$\301\261\273l\331\222\272\220\020y<T\316J<\233\"\207<\352\035>\272\337\253\034\274\275\214\021\275\2546\315\274{\201{<\251\267\032\275]\256,\275\373\252\343<\334iq\274\226\006\200<\307\200\252;p\374\311\274\375y\027;U$\024\275\377\001\220\274 \361\t;S\335@<yCk<\007\370\000<\034\211\000\274}\313\215\274\224\240\030;8,\032=\346\216c</\343\355<\253\325\014=\361\214\236<\316\211^\274\251u3;\\\3300;\374\034\255; \342b\274\023\313\362\274\342\364\352<\333\022\220\273&S\277\272|[\222\274O}\213:\037\344\203<\374P\021<\212jh\274\327\274Q\274\351\211\251;,K\013\273\247\325\025\274N\213\322\274L2\373;\2000W;\353\343\333<&\212\346:\236\267\247\274\212\324\177\274i\373\n\273\205z\';R\223\306\274\246[9\274\312\216\350<\303_\000\275\\\334b\274\260\3374<E\277\201<C]\023\274\255]\212\274\307\364\255<D\0221\274\355f\253\274\345\223\224<\376q.<\241n\235\274B\213`=<\022\263<\023\203\261\274\206u\227<\276\371.\274\263\313\034=\364[E\275\315E=<\204\026\236<\2736b<P\245\334\273\001\251\030=\200\3527\274\363\215j<\241&\267<\337(\231\274;G\326\272\277a\202\273}\261\201\274\"\224\006\275\222e\362\273rj*\274\364\255\242:\023\000\245<\004[\202<\342\307\026<\313\257\205\274\2649\240:\030,\\\274\246j\301\273Rr\034\275\3560x<d\274\217<Y\312\347\273\267\2001\272\206.\202\2738A_\274t\004\246;\233\261\014\275\257\241j=\\\327\211<\234\023\300<0\234u\275l\001U\273\307\014\034\275\225\346\377\273\204S\212;\344HR\275n\240\224<\005Ak\2749\250q\274X\353\003:<\300\325:\355\314\022\274\277<\222<\246n\253;8\002Z\274\253P\316;h\030\033<\335G\022=\367\3637\273\204.\275\274\351mB\274\006\014\375<b\211\023<.\272\253\274\020\277\233\273\253\364l:\177Y\023\274\3114Y\274\342=\014\275-g\265<\342q\223<\260\356\001=Wg\351;s\324\256\274\304W\231<\260\217{\273\347\3428<\350\273\033<\274\301U;u\247\t=#\312\365;0 j<7\2052\274\024\025)<\312\225D\275\017\256D<\270\265\232\274\001%\350\273\206G:<UQ\006\274\371\200U\275\313\242\037\275\241m\252\273\"\251m<\245\366X<i\024\000\274\t\313U;\334{(\275\251\2035\274\212\376\254<\325\260\365\274\370\255\0069F\206\024=\332\340\226\274j\362\361\272w<F9\267&A\274YL\215<\201f\215\274o9a\274\036RY;\013\007\'<\256}\240\2744M]:\306\274\033\275r]\377\272R\300\353\273\273\005@\274G\370i\274\024\256{<w\320\031=\342B\346<\377\207\242;]:;<}y\255<\376y\314\274!)\330\273\303\313z;7\033\343\273\265\314\341\2744z\257<%\0042;\316m%=\265;:\274\223#\326;\032\034\241\273y:\005;O\333p<@\256\344\273\202\274*=\330\206\327;`\362\026=\001\325\002:\234.\262\273\265\217{<i\n\027<\333\267\177;\271(\027\275[\0167\274\327\023A<`\0332\274\004\035\234\273\225\322\017\274\nV\036\273\334\023\246<\247\264\032=\307&\000\274 u\230<\360\315\247<`\033&\274\001\t\004\273\010\016\203<\204\365c\273\202e\343\273o\3131\273I\223[<]\353\250;\224aj<\320\000\037<d\235<\274\355\353\023=\246#\235\274rN\000=\363|q<W\224\323<\t\017\022=5\347\355;\213\251J=\326\311\257\270\361} \274\347\030\"\274iN\036\273\226p/\275\205\375\305\272\353W\n<\3164\227<\261\345\013\275\220\264p\274\252\\\017\274i\020\312:\276Xp<\231\261\304<\330\310C=\023\217\007\275P\377\376;V\250\234\273\035\203<\274b\337\265<\001.\364<y+\204<\335\232\r\274\251l\367\274\364\n\003\273[\305\036\275-&\250<\006\254\277<\220-4=\025\266\302\274%\210q\274\213`\2108\347O\262;\220\264\200\273\315\246;<\262\302\030=%\270\277\274\302\246\n;`bC;\357B\211\272n\007\373;p\230\255\273\004\362\013=Y.\354\273,Pf\273\331\200\"\274]\336l<\230\325\344\274\252H\314<\027\022\024\274\255{\200\273\333\032\272\274gU\336<\373\234\004=\315RL\274\217\275\n=9e\007\275F\210\333\274~Q\331<\202\207\314\274\'\236\240<\374\273W\274\201L\255\274O\235\025=\302P\250\274[\210\355;a\371\263<\200\212\367\272\205#\332\273}\207N<\342c-\273\033\3074\274\266\354\245\274*_\002<B\227M<\260\325h\274\'\206\310;\355\236\212\274\362L\326\273 \033\351\274A\364\374;*\022\275\274-\342\243<tO\034\273\235\027a=\304\314\030\273\335\332\001<\371\364\250\273\"}\233\274\245\'\312\273\336\325\356\273D\036\216<G\352Y\274=\341:</\274O;\245\242\243\274g\353w<\313\256\364\273\305r\356\273\367E-=p\304\'<\227\202\004;w\342\020=\317\226\212;\t\372\310\274\316\006\332\274E\t \272\260\036*\274\013\264\247<-\213\312<\275\016\025<\346V\245<\335A<9\317\262\375<\371E\003\274F=\300\274=\037\217\273\002\373\300<\"\242!\274am\266\272\353\351\364;\031\370\027\275\366c\023=\207\327\215\273\220W\222\274\036\343\226<\2453\201\274\221\333\235\274\347\202\007=\331s\321\274\2051\255\273\270\032\365<\306\310\221<\200\332s;{\2302=e-[<I<\010;\361\301\227<\374\005\250<\256%\232\273\3561P\274Y#\241\274\200\240\262\274R\252o<\'\224\216<\325\260\325\274\017\202\341<{\316\355\273\326%(\273\276\351\271<\251]\240<\027ek<\374\364\307\273.\365K<\027\330x<[\3319;nFj<\213\305\336<\364R\336\272\035\316t\275`<M<\232\000\025=2\r~<\0029-=9\200/\274j\241\277\273\246\327\010\274\236-.<\276\303K=+\324X\274\252\001#;\223,<\275\333[\201\274\315\361\236\274\263\340r\274\362C\234;`\010\271;X\365\226\274\324\307_<Q0#\274\204\000\241\274\273\275\225\272<\275\346\273\221B\216;JfE\273w\331\"\273\304f\244<\300\177\257\274tT\347<\322?3\275\224\203f\274\242\307 <\353\346k\273\301_\241<\365\366\242<\241\273L\274\236\344\255<\253\376=\273\364D\021<N\363\\\275\373\217_<6\030\212<\373#\374\274\202\212/<\023\271\366;r\323\r=\34516<Uc\315;1\263\013\274\245\342+<\314\252\2049\251h\374\272\262\233\221\274y\271\311\273\000\304!\274\031c<<3\300C<!\023\264\273\315\032\311\2748UY:\306\366r\274)\347(;3 \244\274\253\371B<g7\010="
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "transformer.wpe.weight"
+    raw_data: "J\313=\275\346\204\345\274\244L\337\273\307\\e\274b\317><p\017T\2752\311\216\273[V\221<\242k\340\274a^l<B\007\226\274\0068]\274\347T\277<C\177~:\242pI\273\3043R\2720v&<]oB\274\276\010\236\273>\325\303\274\360,!<\320._\274I<\330\273\025\373\267\272\210\334\227\274$\002f\273S\313F\274\224=\316<\230E\2579\246\000E=\033\021#\274\331\210\230<X\222[\274\r\231\201\273\205b\355;f \014={e\302<\256TG\274\367\216+\274\rqB;\204\332\332;\363\363n\274\031<\332\274\'=B=\n\225*\274\225\0205\273\240\231\t\273\334\365I\274\304pC\274\350\324\200\274\323\236\245<R\212L:\333\227\024\272\373\375\327:k\027\277<\244<O\274\220w\301<]\"\254\272{\003\020\270\251Z\363<\234(\244<\203\\\370<b\364\355<\035\237\016=\271\253\203<\205\010\226<\257\204\034\274oN\303\274\363\033\007<$Y\235\274\005\3354\274\237\246\007;\362.\202\273\365\355\272:\\\263v<}o\024=\207\317!\274K\006\246\274\344\323W\274\036d\343<\371\345\350\274\345\210|\274\223\'\340\273\365y\037\274\241G\321<t\360\026\273\224R\330<\233\"\317;\227\230\205\274y\023\311\274\266x-\274Yj0\273\023\363e<#\272\352</&\205\272\235\003\323\274\230\324\262\272\252\207\354<\242l!;\317\031j\273\362A\332\273\374\203\342\274/\017\036=\253o6<\231V\371<\305\355v<B\364 =\263\037z;\315\377A\275*\307\211=+\033\235\274\266\362\201<(\242\001;\013S\010\275\023\374\230\274\212p6\274y\336\3259%\334\363<E\350e\274EoQ\274\363<\202<\230?k<\324\253\301\273f\340<\271=}\346\2747\350\226<x\210\036=v[\237\273\345\375r\2752m\305:\307\235\375;\236\210\021\273!\232\025;\373\266\022\274\266\334\037;\3263\022\274\270W\325<\211\235V;\341\302(\273%\247\374<!\262\246\274\214\326\334\274\252\230P<\241\262\256\274-H\2579gx\212<8c\364\273\r\215-<\235\320\025<\022)5\274f-\217<\345tP=7\272\263\274\374\212\231<,\027\232\272\307\252m\274>\001\270<`\344(\274\275t\233\274/\036\250\2743~\366<\215|=<e\227C;}u]\274\316\363\021=\255\243!\274\014\232^=\211d\002\275)\030\371<\356\346B<\342\200\270<)t\002\275\204\031\033\274\223\257\316<\306\250\353\274=}\365<\205\361L\275\353\3524\274d\273W\274\266\032\000=Y\333?;7\267l=\225F\025\274\2257\327\272\356\343\"\275\025>\367<\202~\315;L\304\346\273\006\274\277\274k\r\006\275>\200\375\274\003\374y<S$\021\274\202I\035=\tS\363<\3578\262\274\336\335\301\274D\357K\273\302\310\030<\024V\253\2739\232\373\274\251\322\260;\326\320/\275$^\2558\344\032\";=\036\030\275\224|\t<d\035\230\273X\263i\274\256\252\277<=\226C\275\267\034\377<\005\t\302;\274\363\342\274\215\274\010\275\246\027\323\274t\224H<\320w\257<SUF\274V\230\216\273)\002i\274+\035\275\272\265\367\265\273\323\n\236<\022\034\207;\'\032\017\275LQ\374;\017~*;\013$\222\274<3@\274 \033\234\274\335N\342;\271*\332\273\"\032\245<n\347\211\274U\311\357;\325\325\031=\335v\"=\227\314\266;\331\247e<\000\r\334\273d\037\030\274\205\200\257<\025\350\324<\231\271l<\240\026j<\020\312`\274\252\342\254\273\2354\212\275\017(\000\275\245\333J=J\0132\274^\336\353<&%\001=\313e\332<\311\034\203<"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "const_1d_0"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.ln_1.weight"
+    raw_data: "\213E0\275\236\"\250\271=b\351\273\3400\364<a\265\307\273A\274U<\214\001`<\0031\362\274GW@\273\241\005c<\340_I\272qy\203\270$+\212\274i\262\037<7B9\275\352i\246\274"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.ln_1.bias"
+    raw_data: "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.ln_2.weight"
+    raw_data: "\371=\007<[~:<\223\235\376;\341\305\'<\212 \311;\205QA\275\253m\215\274Y\325\022\274KA\233<\371\026L<\225u\017\274nd\020<\357O\010\275\031\345\262<\317\330\021;R\016\230\272"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.ln_2.bias"
+    raw_data: "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 32
+    data_type: 1
+    name: "transformer.h.0.mlp.up_proj.bias"
+    raw_data: "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.mlp.down_proj.bias"
+    raw_data: "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.ln_f.weight"
+    raw_data: "\322\300\266\274\357o\025\274\t\230\036\275{\007]<c{\365<\033\237\222;\3403q\274Y,\353\272\3603\221\273\255\021K\274\307\223\000\275\016N0<g2\277\272\311\003\002<SJ\3179~\347\353;"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "transformer.ln_f.bias"
+    raw_data: "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.attn.q_proj.weight_t"
+    raw_data: "o\036:\275\275\335\307<\336GF<\207\034\"=8\262\322;$\205\t\275V\303\220<\3000\r\274\373^\250\274\241\271a\273r\274\237;\264\345\3119\267\330\252<\362\251\016<..N\274\317|&<g\301\310;\223\372.\274\376c>\274\3139\"\275d\023:\275\251\264\227\274\233\352\027=\254\340\177:^i\014\274\022\336\222\2743\226\341\274\213M$\273\267\373\264\273\241\r\306\274\035\376\261\274p\374\251\274\363\335\351\274\030\014\212\272e\326\371\274\246?\236\273O\034\230\274\362\236q<\230\314\31399\377\300<\211_\202;!\005\236\273\331\366\236\274)\360\261\273\351@\363<\353\262\266;P|\212\274sn\021=\204d)\274\340E\271<f|\244\273kZ(\275}\263\310<K\216\200:j\\i\273\357`U<\365\303\326<\217\306\032=\364\207T=\304\266\272;%\026\357;\260\256\351<\373\026\n=K\343\247\274\245\371\320\274\271q!\274C\025\000\275y\350D<\240 \325\273\257J\255<}\213\010\275o\210\201\274\341E\352\272\356\203\207<\344Q#9T1\304\274\"%\001\274\022\351\255\274\356J%:)\245 <\205.\302\274$\370\316<\236-\332\272L\246\345\2744XN\275\211\025\007=\2525)\275\336%\232<\320\243Y;\034\256\375\274\363\'\303<\371\307\251<&\ts<\367\033u;\322\347\226<\005\035\272<V\277\206;}\002Q\274$db\274{\205J\275\035Z]\274\360\344\353;\020\307\\\273\'\212\217\274\206\3334\274JMN;\001\341V;\022\320\271<L\267\232\274\217\000\253<\3700\324<6\322\211\274\312\216?<\2202~<\026@\217\274\335\357<\274\274\305\324;\240\245\000=\031\244\277<\331\327R<]nS<a\205\352<\362j\312<\023\217\370\273\212c\205\274\366\001\251;X\200a=\315\274\023<\211\273\321:\225;\033<\031\304^<3\335\375\273\267\262\206\274\357E\204<\377)\225<\0340\226\271h\327\016=\362\351\356;\201\246\323;\247\035\342\2737\027\027<\267\037i\273\302\367\217:8\252\201:i\034\241;AY\274\273$/7;\307\335\031<\373\355\337;G+\014=\300\234s\274\357><\272\333\371\274\274\377\236\214;\2575\024<\263\306\200\274\201\326X<\313\364\245\274\344X\214\275\364\304\225\270i\371`\274\035\014\344;\245\214F<\217Z\315\274|f\252;\360\277\017;3$\261<\006\341\265<\000\233\271\274\253qj;\345\363\034\275\275\251\000\274 a0\274f\241\314\273O\233!\274\324T\036<\216;G\272\301\307\313\272}\370T\275\025\000\267<$\270#<|\\K;l\331`\274\222O\034<&&\026\275\215\237\204\274\273[\031\274d\243\020=\327\205\340\273\222\"t\273@u\275\274\257\225\020<*\336\352<G\355 \274,\340\332<u\256E\274\215\031%\274\230`\362\274\366\231\222\274o\331b<=}x;\344\226\210<\204\230\230\274\340\025\376\273])\213<\3477O\274\207\350B<\207\354q;4\354\346<\312\360\357<\331)\221<\352-\303\274\034\230\366;KEo<\247\035\"\274\202X+\2755\0344\273@\345!<\362\207\010\272\'\224\351\272\032h\220\274\025\300\331<B\"\026\275r\rW\274\213\027D\274\207\3214\272\271f\350<\002T\251<1\305\202\274/\265\257\274A\313\320\273\231`\330<\351c5:\247K\t\274Y\266\245\274VY\003\273\273\320\266\274\357\363\205\274.T\340:\376\361\301<\t\330C<>\215\240\274\246t\232;\001\241e;\007\371\206\274(\372\205\273\216\r(;xk\324\2749\261\010\275\376\346V\274\316\252\336\272.-\310\273\026\234\251<]\307\272\274\260j\014=\300\371\034<"
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.attn.k_proj.weight_t"
+    raw_data: "^\227|\274W\373\211<P\221\357\273\000%%<\347\241\214\274\226E\t<;\025\277:\302Yb;\277\024\005=\\\315\377\273\316\tJ\274\224\264\321\274k\301n\274>\304\263:\221\n\202<\342[Q\274~Z\274\273t\030\254;!\353j;\343\272|\274v:\230\274+\035\037\275\217I\020\274\217\212f<\326\207\n=\024s\026<x\220\262\274-\037\014<\351E&\273\264\250E<7\237\030<[\301\220<=\263\303;\217\2522<\t\246\221\273\242\266U<\2026#<\315\364\001\274p\246\037\275\2208V<yY\311\2743i]\274\351\n\251\273D2\032\273)\343\274:\316\277\270\274D\267\000=\342 \033=d\216\037\274\3666\025<\275^q=2g\341:R\356\304<M\365\244;)\220\030=~\214\203<\365I\374\273_\035\002\275\332\340\022\275\215n\020<\276\367\243<+\221#\274\364\276\013=\347o\305;S<f\273\2551*\275\370wk<@\345\001=\201\225%<\352\310x\273\366`\010\275f\301\322\273e\310 \273\274\335\327<\244\201\264\273\344\377H\274nk\354\273\344(\"\273RD\316\274\220*U<\220S\027\274M\017\234\274\233\373\216\273*\220\234<\234?\252<g\306\000=\256\375\031\275\3027L<D7R;\023\243k;\373N\243<g6c\271\267\215\017\274\242\006\227<\262\345\242\273\035\206\263;,\343\325\274\335m\267:E\240P<\233r\210;\250\244\240\274t\213\342<{\240\260\274\304\275 <2\'\311\274C6\177;\273\001\243\273\202\274\377\274\025l\305<\031K#;sZ\312\274p.\241\274|\220\325\274\226\267\017\275mh/\275\357\270\220\274\263|};{0u\274\271\344\024:\331\360\n\275\334\243;\274\021m\002=\2671f\274cv\221<b\267?\274^7\316\274\007\0348;El\254<\317\2202\272dY\206\273\202sA\274\252.\307\274\204/E\275T\032\241<\'Q\273<\320.\023<\002\354\007=w`/=t0\362\274\251$\000\275k\347\263:^\300\354\2749\356\001=3\216I<[\202\300\274\013\342\247\272\316L\035<\233l\202;\007}Q\275\220\035\036=\001c\254\274\245\323\243<\313\257\201\272\\\036\336\274\036\035W\274x\320B\272;\010\334\274\300\363\213<\001\343{\2743%\263\274\357\344\020\274 UJ<\0267\242<\025Z\301<\374\023\032\274f \367\27421\'<\277s\202\273A\'H;\206\253\221\274W\246\226;\263+\003\275\353+\277;E(D\274\317\326\"\274\362\210\221\274\224P\034\274U~G=\\\313\270\273\360\213&=\344\026\307\274\276{\256;3o\314<y\021E<&+H\275oJ\266<~\243\315<\311\323\304<\371\324\274;\364\205\276<;\323,<\325\373\217\273\031\025\253\273\247\271!\274j\251\314\274x%\253\274\022\365c;4\351\334;\346\210L\274\367V&\274\277\245\013\274\027\304\236\273\340\257\013\275dR\330\274O\r7\274\254cV\273\315\307\241<\247o\277<\351\033\323<\364\351\326\274\354&\034=\351o\246\274{\301P\274\341\006\3639{\243C\2748A\255\274m\262\304\274\371\345\215\274\333\022H\274.\217\261\2742_\351<\200\"\314\273\275\351K<\005\354\226<\363>\211\273]\207 \274n\360\264\273\342\034\253\272\356\213B\273\036\217\311\274A\305A=\317J\010<\213\251\250;\335(\014\274iZ\265;o\006y\274\354\360\\\273\252?\021=\320\007m\271\202\362\254<s\226\325<\017\362\221\274R`H\274-\210+<\300\3041\274 g_<\251\316:=s\335\300<\000l(<nJf<a\221A\271t\374);Bfa\274\270\3264\273\3369\000\275\364EO<"
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.attn.v_proj.weight_t"
+    raw_data: "[A\275\273;\210\336<F\330\035\274t9\265\273\320\347+<+\223\314\274B\243$<W +\274}\363\000<\275U\307\274O\274\315<\177\367\037\273\310\376\000\274i\210.\273s\310.=\206\301G\274\257\207\020<\353\2318\275\215\364\023\274\302\003\013;r\315\363\274\017\2660=\344\317H<\034\354\324<\374\242#\274\310\311\010\275\006\333\302<\330_\035\273\207\312}<\3315:<\206Z\373<\216(\324\274[\325n\274jJ\211\271\202\354X\274\341\273b\273\344\202\004\275KC\364\274\334O&\273n\257D\274J&A<\306^\214\274l\363u\274\2017\304\272Iuj<\240\'\300:\317\356\302\272\271\236\027;\357\'\216\273\266\314\244<\000 \010\274\320\376$\274K\032\331\273\363\001\200\274%X\203\267\315\221\241\273\375\210\247\272\251\'\031<\224\327\030\275++\234<I2(\273G\341\213\273\352r\303\274&\313\257<\317\272\371<[;:<\302\032\037\275o\351Y\274\331\024\037\275\017i\006=\345\344\215\273(\312\023\272\363\006\311<\305n\250\274\006[\006\275\211\214\\\272\300\263\344\272\234\3762\2737}\347\274v\n\251\274\375\003\315\274C-\025<\224\352\376\274\215\311\270\274\204\032\307\274\207\016\377<B\364\321<\373%Z;\014\335f\274\256O\310;\271\004\237;\353o\325<\333\320\220\274\231\367\356\272~p\354\273\333\252\327\274\341(U<\264j5<8\034)\273\327\331\032\275^V\270\274\2318\000<\206\020k;N\231/\274&\305\201\274\235\273#\275\353C\237<8\201\352\273T\177l;]\307\230\274m\361\016\274\013\034\202\274\004\315/<d{\214\274\357\221\202<8j\321\274$\207\214\274I\217{;\235\r\037\275\3351\323<\226\272\001\274\3143\364\273\314\242\177;\036\t\016\275\246\354O<\267i\223\274\227\313E<\227\243\t<\277[\007<\326\310\023\274`\033\231\2749)\014<\260hR\274;b]<\231\352\206\272]\\\270\272\273A\336<dX\310\274\257s\035\275f\267^<\234[\014<\334\233I<t@\203;\n\317K\274\2135\223<\340 \016=\345\234\021<\020\221\020<\306\374~\274O|\216;\235P\312:\315\027\034<\242)\021<P/\021\273\260$\376\274)\377d\274\346M_</A\340<\3249\2219\245\220\301\274\354\\[<AA}\2740HK<\254\004\021=\253\322>\275@b\216\272\324:\277\274dj\347<&\377\346<\351\023\251<\341\004\001\275\257P\221<$\301\250<\235e\250<\277\327\002;\306\034\233<\227G\377\273\244\234\n\274\2333\r<\211\363\355<\\\250\340\274\013\232\017\273\322\317\342\274\336\007\313\274\360X\022<\357\003\205<\016\032\272\274\324\345\246;S\254M<4\021\200\274=\022\210\274n\203\027\275\373\317\017=Ew;\274\3618\013=\235~7;i\250\027\274\327\250\374\273\271\246\315;\371\267[\275\006s#\275~\027\323<\367\342\002\275n\255\222;>,\261<\030Q\252<+j\341;\362x\333<\251i\225\274\266K,;\214\271\214\273PdN;\213@\304\273\007\215\036\274-\\\237<\227\324\007=\301\032\334\274\024\223n\274\201\235\327<2\2158\274\206\367 <\013\275\353<\023E}\274\364\253\223\273\330\030E<\247\004\361<l\222\364;T\005\220:\312O\336<#Ai;l\265\216\274\367\000==\220\350\r\275\036P\317\271pl2=g$\252<\311\001\362\273\224\2768:\302\273\177\274\356\301f\274$\256U\274\233ce<}c\n=\033\254)<\335\277\037\274\025+\010=\006\t\232;\036S\314<\344S2\272\264\017\t\275e\253\371\272\336\013C<\306\003.<\0276\377<GG\225<.j\273<"
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.attn.o_proj.weight_t"
+    raw_data: "\333j?\274W\312(=\274\250R\274\306\204\301\273\247\372\246<\2234\357;=\373\325\274w\243\371\272\251\030Y\272aR\350<C\356\226\274\302l\253<{C\277<\253j)\275\362\200\201\274l\220\037\274\307\335\207\274B\266B\274\031\2728\274\265\240_<\234\357\3739G\t\276\274\247\032\316:\202(E\273\252\214\314\274\301\342\366<\256\376\335\272\270\013\022\274\313\300\003\275\232\205\014\275\367\027\223<\357\004\365\274\277\007#\275r\000\321\273\2574F=\234{\242\274/\000\250\274\200\n\025;\324H\"\274/\31358Sf\376\273\235o\260\274BW\256\2737\331\253\274U\375\273<\227\304B<\230\003\\9\316\237\210;<X\340;\0006e\274Sb=<\005\212\335;\246Y7\272\2073\252<R\225^\273\234\362\247<.\273\237\274#\351\373\27341G<\'\224\010=\206J\262; $\333\273\247\177\260</Q\345\274)an<\220\367\260\274\335\300\241<\3119\354;G\350\020<\013P\326\273w\261:\275\376\203\374<\214\004\324\274x\037\'=\311\t`<\020K\371;\233\257\367\266;\364\023\274\251\351f<\027A1<\316B\217<\223\234\266\272\367\256\247\274b\322\021=\256Y \275\346d\344\274e\275\346\273W\256\035<\300\230_<\332/\234\274MuF<l\030^;\035\024\307<@\000#\274r\361\356\274@\331\203<D\'\231<\374{\001\273\334\216~<\202I\031\274\236)\r\274\241\351\200\274\242\177H;\352\200,< \367\374<\227g]<&K\004\272\255\355\001<\366<\000<(\027\022=\312\265\"\272\344>1=;`o<\273\325\206\273\2628\214<\335\260\275\274\322\322\301<|ue\273D^M\273 \004\232\274\306d\336\273\262\202w<@l2<X\315\'\274\300y5;\tK\265<\305\336<;i\303 \272\223\036G;\204\355\231;\200\006W\274\203\240\234\274\220\226\225\274\306\027p<\333\0223<\374P]\273\336\2225=\0330\030<\222[\032=#\223\355<\017,y\274n\n\217;\351\204K\274\211\306\310<\377v\025\275uB\271\274\317\210\\<\342\334\226\273\247\022\251\273\205]\031\275\034\317F\275]\312\250\273\245\360:=\225\313\372<\204,\223\273\264b\247\274Vt\003<\3401\277\274\"\323\337<\362W\374\274F\030\002<\312\330e\274h\223\017;\000y\371;\002\352\241\274D\367\201<#\313\350\273\256\344`\274P\254\006<\004<\330\272>\374\304<\247vu\274\376\013P\274\317\201\024=\270\256K\274T\n\237<)\254\235;\360\2422\273\271\022\207\274%c/\275v\225)\274\220;\311\273\327\320\337<Jp,=\362\2559;\001\251\006=\327\032]\274\257\315\243;S\322\254\274\202\274\270;\311\212\007<\230\002\231\274M\360)\274\3534\317;\336r\344<\312\214f\273j\023\352<\243\027\230\273\264\220\267\274\234Y\232<\206@\t<\364\332J<.\216\273;\013\276@\274\305\002\203\274J\"\004=\336/5<\262\316\237\274$\271\222<\'\200\231<\027\350\376:\263\232\311\271\265s\326<\2274\232\274i\204\234<6\221,<\327\252\035\274CA!\275\022`b\274\236\262\343;\262\273\277\273\3559\223<\240\2160\274\004=\252<2\257\257\274\271\372\035\274\302]f\274\300\325l\272\002\251\340\274+T\205\274i\204E\274r-&<\375L\305\274\330\367/\273\202\341\330\274\366\370/=Sc/<\264\216\237<\217\020\356<\375\262\2209$\275\036\274K\033c<I\261\026<\2529R\273\351\255\211<F\240$\273\350\275\210\274\005g\362\274R\341\212\274\240\320\235<\370p\275\271\334E\"\273[Q\373;\017/\275<6\\\006\273|\010\016\274"
+  }
+  initializer {
+    dims: 16
+    dims: 32
+    data_type: 1
+    name: "transformer.h.0.mlp.up_proj.weight_t"
+    raw_data: "g\005%\274\217\351X\275NH\207\274\013\236H<\240\n*=3\374\325:\3359\r\275\027\265\372\274\301\343_<\360l\342\272\036\301\257<<\310\177\272\355\244@\275\376\217\303<\016\301Z<\211\343(=\263\305\237:\300\303\246\274\313qS\274q[\206;7\277\213<\037\205\223;\206U\200\274\304\032\004\275f%\007\274U\026\215\274\242\235W\273[\274\346<\245\036\237\275;o9;r\315\207\274 \271\214<,\034T;[a\032\271\212\371\320\274\271\260\350\272\305\252-\274 \317\035<\223\3303<\216\354\371\273J $<WC\274\272\022\202\023\274\252a\037\275=+f<)7\227\274\242R\331\274yhR<\017\000\374<|\237A<\217\004\215\273i\251\024<\006b\020\275\"\030\360\274s\260\214\273\367\330\207;4\345\225\274\265l\262\273\347f!<\311\333D\273\306@\364<-\314\272<\351h\245<\355\332\000\275\306?\206<\"\3346<\rQ\216:-\034\264\274\265\302\330\274\207\301\024\275\210\311\032<\310\351\234\273\252\326J=\212xx\274T\230\276\274\002\316\234\274\302\224\252\273\213\333\357\274\005\030\354\274\252\367\357\273f&B\273\371F\357\274\206\327/\2740\023\026\275!r\313;\271\207\266<\302Z\010<\250\303\020\275\212\274c\274\230\373n;\246\233i\274\352\331N;\227\262\r\274e+v;y\036\233\274\301\346\206;\235\271x\273 9\214=\360\206J<&\370#<E\302$\274\247#\035<\2271\027<y\'\275<\273\t\371<\031\n\300\274/\331\341\274\376\210\002<\231\226\224<\024\221\020\275b\001\232<\rm\247\274\022$\316\273`\340\257<i\3757;\033\212\206<\362\300\320\273\357\027\240\274b\025\277;\346\235\004\274\364\241\320<i\242\375;? !=o+\240<\022\300\331:\330\253\310:\026\000\232<\016);\273q\360\014=\273\273k<\031G+;\035\344\363\273\310\263\002<\204\2010\271\t\023\240\274-\230\241\275\2578\244\273\013\346\203\273\240\255\203\274\226t\260\273F\215h<\274\006\000\275I\014\330<\366\003\001\275\342\333\n<I\361\227\274\355:\272\270\324\016:</\017\003\274\341\300\003\2745\326>=\323n\023=\362 \260\273\026\324$<\336\267\320\274\005\215\032;\360\222\030=g\211\r<7\211\347:NW\032\275\327\333\317\272m\305\000\274\377\342\030\275iZ\277;\317w\260\274m\204\230:\276\007\252\274\002J\215; >2\274\273C\231<\340\016\340\274\255 \007\274\225\312\177\274\212P\310;m\036\207\274\241\221\253;\026Z\030\275\315\272\304\273\212\006<\272\250F\203\274/`\261\2737qI\274\024\030P\275\014\234\342\273$\352\272;i\222\255;\233\357\361\2738\245j\274\341J0\274Z\235\036\275\002\t\257<\331\346:<\006\007x\274\030\256\271<\224\326\252<N\272\202\2744&L\274\005\346=\275\260\2225\274\326\240+<[r\274\273~\347\366\274\'\271\200<\214\307\001<TQ\027\274&\355N<x\277*<9\030\202<.\205\324;\020\300\362\273f\320\303<\231<\265<\007\020\016<\007:%\275\271\322i;\\`\031\271\336\226\254\274\035\020\276;\264\252\250<\"ym<\017\330H=e$I<\213M\272:\014\\\377<\331t><\213\2675;\030\r\220;)\251\306\274\203\025\"<\\p\016=\312y\022\274\1777\"\274\373\003I\2732\204\325<\034\377E\274\0243\246<\333\000\023\274\230\276\221\273iaY\274\000\232\224<6\313\000\275eqb\273G\336\016\275\327\r,<\202\204\260;\267\014\031\274\257\212\213<\270\376@<\322pO\274\231\30617P\270/\273\341\361\307:\002\034\244<\374bZ<\317W/<\300c\003<\223Xt\273\202\315\006\275\207l\026=`{E:p\3218\273W\326\347\273}\315m\274\302\235\336\273\235\313\215<\212\004H\274\026.\034\275\377e\006;\200\t\277\274pmy\273\312\257\007<v\345\006<\036\237\030<F\331z<.\312\242\273\033\242\020\274P\205\262\274a\025\270\273\240;\267<tO\227\274\317\330\224<8\305z\274\347\374\331<i\\A;\274\230\t=\322i\222;\210\324\037<T\356\013=\014\261\316\274\227\305\224\272;\245\270<od\325;\001\354_<\026\014\"<\362\305\006=5\303\215<\034X\"\274&\021\225;/v\366\274=\361x\274\307\335\203<\356\332h\2740\341\177\274E\027\342<K^\314<;\326\375;\204\345U<\313\331\210;\025\016\370\273)\n\354\2746A\245<|\312\226\272X\360N<\267\266\321;j0K;G\230\236<k\252S\274B[\304;\332=\022\275:\303\202\271+\261\004\274\215\303J<\311\355\240\274\215\213\246\274\205y\247<\233\313\206\274\226\263\022\274i\037[;%2G\274\242\020f;\233f\261\273\221\342\216<O\017\326\274\237\302\023<\227,\373\272x\240#\274\224\245F;\235\267j\274\3379\202<cFu\274\\o\333\272%q\346\273]\\\331;\347H\206<\272 \025=`\275g:`\232\023;<\370\003<\212\023p<\347\316\321<\2020o\274\036\263#\273\216\274\246;2l\334\274\"5\214\273\n\312I\274B0\205<\241*\236:*\211\270\273\360\"{<\240\317\023<\300\237<<\313\362\304\273\005\277<<S\277\331\273\352\330{<#\310\362\274\260y,\274\361i\216<\033\356f\274\264\346\234\274\327\373\006;\374f\202<0\r\001=\312h\236\274\271\022;\272\340s\013<H)\036\275k\370\217\274R\361\225;nB\203\270\301\"\374\273~=\214\2747\216\220<Ps\t=\001\223\355;\224e\221;\205\356\246;A4p\274\371\025\177<\355\025\240\274\333\275f\273&\"h<\035\332\312\274\300e\214;\226\364\244\274\322\262\003<\271&+\274\240\014y\2749P\037<\374\272\002=P\241\362\273\370{\342\274XL\005=\',\371\274@\264A;a\320\260:\010\225\211<\243\006{<\236\307p;+\255\346\272\227Il\273\340Ei\274\213\2613\275w\226}\274N\353\375\271\245\2572\275\271\246\000\274P\231\321\272\2576.\274\360}9<{\266\323<\216$\000\273?\346\240\274ly\231\273\362\230F;\335\3233\274!2\223\274=\235\330<r\253\021\275\311\266\232\273\275+=\274y\021B\274\353\030\004\275s\0372=\306\352\027\274\\\341|\274\270:5=\335\314\035\274\301N\351;\024\255J=m\224\204;\206\331\013<\306\030\033\2747\026\020\275^[\263\273\257\273\274\274\324\302D=\016\324\250<\003!k\274\2234\300<\214\321\016=.zT;\031\241\236<|\226\206<\260^\215\274\360s\220;\360Z\255<f!\356\274`\262\212\274\270~_\272+\270\352\273\004\016\337<\"\302\223\274\320\334\307\273\314\256\025<\256;\266<\000\277\337\274\245A\244<2\260\323\273B\211\225<\214\\\347<\247\246\226<\034y <+\214\334\273\333a\016;\3244\204\274\260\0001<\304\366\r=Ko\317<\251z\327<\t\212+=\251E\006\275\323\002\211<jVx\273pf\360\274@&\002\275Rc\261<\303,n:\035\317T\274\211w\020\275\220\316\202< \021\355\274\276\210{\274\013\260q\274\275\232&\2734\271\221\272\3762\001<+\r\303\274\352\026\336\273\007d\323\273\237#\221\274\315\304\021<\345\304f\274)\340t\2747\\C<\000\247\036=\313\316r\274\020\365\300\274\224\257\025;\252/\264\273`:\007\275"
+  }
+  initializer {
+    dims: 32
+    dims: 16
+    data_type: 1
+    name: "transformer.h.0.mlp.down_proj.weight_t"
+    raw_data: "\02736<\004\203\r;b\342\376;3\254\356\273\020A,<\302\334\273;\254\024\341\274\265\177\313\273~\375f=\246K2<W\345\2129\200\r4<N\nh\275w\266\300\274\240\251\342\273\355\372+<\002\001L;\213\260C;\333V\244=\355l\242\2744=\217\274\306\227P\274\t\221B\274\3434\001<\261\020\203<\002\251\002<\366$\252\273\367\330\330<\273H\003\2744\255\020<\227X\237\270\305q\350;r\006\332\272,-\320\272\263\203N\273w\353\302<S\010\214<x\315\t\274j]\213;\267\231=\272 \272Z\274OB\234\273\275q\206;`_\347\273i%\377;\217\352X<\217\346\332:\213\243L\273\t\347\032=7 t\2742\342L\274\224\027\330\274`s0\274\301\353\3738y\t\214<\341L\272<\224\021\177;\275\214\254\273nv\376<\375z\230\274B\0027\274\007~\206\274\367 B\273.L~<\361\022\221<\376:\353<0\032\241\273F\231?<\263\225<\273k\201f<Y>\207;0:i<\357\003\366:\306\315#\274\365\203Q<\000 \202\272\302v\372\274\212o\254<-\221\220\2747;p<\223a\352\272-|\303<}\351\177;\245\032\361\274}\205@<|\317}\272i\344\260<\201C\327<3\302K<]\364\002=]<\350\274\330&)\2732e\037<\034\023+=R\351\001\274\202\0314\274TC%\273\373\036\225\2741\266\036<\212 &=\017\321\334;Q\237 \2745\3237:\213\'\244<\347\034o\274\304\341\002\275k\204\361:f\277\273\274\357D\034<<q\254\273\356\310\3229t\022G\275\247_\354;\275\3717\275\001O\210<\273\005\000\274\024\314\327\274\312\033o\274\262\016S\274\006b3\273D\206\320\273$2\324;\240\320\215\274W\346T\275@\315\317;@;5\274\202\013\214\274\262\337y<8d\376\274\333\353\010\270\236VT\274LB\337<\260\261\323\273\023\330\367<=\003\257\274y\024\273\274SF\270<\223T\324\274&,\025\275P\305\242\272A \306<\030\200I<\374\247\336\274\306\326\341;(\317\242<\340\032s\274U\244\326;&\354\'=\211<\331<A\273G<\317\243\257<\241\262\364\273\211:\350;\376Ye\274\0008\265\274 \315\014\274\031U\333<k\301\3428\004\330(<\030\215$=\313\212\334<n\250\357;>~\214<\257)\205<\212\262M<l\327\222<\\u\316<\027[\222\274\'\331\251<Zv\035<k\353\021;\216\357C<Z\007\221<\214}T<\341\312\364;\206\271\206\273\275\260{\274\3701\t={Ys;\271\201\231\274\330\006\272\271\022\260\345<*\271\313\274-\266@<\351b}\2732\337\242\273\264\255V\274\373\371\316\274\341$,<&E\377\273%\226&\274\001&\325\274\230\003\020\274\353\331-;\264\337\030;x\227\003<\335\253\032\273\206\rM\273\375|Q\274\274\377\246\274\242\231\303\274\356+\242\273\033\nR\274\231\373\311\274\302\310P<B\363\317<g`\026<2\177\244<\320\251\250<\332\275\022\274\000\314V\274\204c\227\274.\223\007\274&\324l\274\020$\266<\017\271\207\272\311\264\205\271\"W\212\274b{-\274l\275\350:\312*7\274\013\273\245;\236\322\221\274{\302\031\274{\233O\274\024F\323\274\227R2\273m\'\231\274\212\262\233\273\370|\304\274\036Y.\275\t\312\2409\262\2304<\302\350\001\274\014\022Q\275^\230\324\274A\366\346<\331x\317\272\320\316/\275\006\'\244\274I>\337;\370\035\331\274r\333\253\274j\243x<NY4\274\316\237\265<\035f\003<\212j\306<E\222\247\2748O-<2\223)\274\254G\240\272\370\264G<j\341\256\273\222\317N<\'\340/\273y\206\007<\356\033\';\001\006\377<\216D\007<v\336\"\274\3030\204\274\222]\"=\217\370y\272)\311\016\272nP\310\274\264Q.:`\337\230\274\255\231@\274\031o\360<t\016\216\273^\203\234<\026\336\217\274\314\n\t\275R\001*\274\001%\312\274\022K\253\274\036\326Q\274\031\222`\274\0200\345\2745\306\020\275\224c\213\274\324\201\231\273\226\223\255<r\n\352\271\273&\330;\034?\177\274as\3279)\210\370<\001\234y;\013\034t\274\2440\263\274S0\343;\034-\343<\257\246\313;O\354\365<;O\212\274\022\216\256;\007\322\277\273\345\020\033<\322n\034\275\r\031=;\035sN=\317>\231\273|\343(\273O\361\014<\327\234\020\274\3265\236<D\277\304:\333\277!;$\231\014\275V0\203;\264T\243\271\274~V<43\221<*\363i;\357\373\007=\022R#\273\354\214\335\274\317\217B\274\031]\002\275\2146\3649\306\343<\274\t\271\350\274\266@\003=)\316\265<p\203]\273\317\372\360\272\373|\316\273\357*\233\274\273\250\233<\006\003.=\006(\226<\02793\274\\\036\275<\337#\226\274\252\271\007<\006D\230\2748\0358\273~\002R8$\210\252<:\351\031\275\324\273\004\274\211Z\270<GN\032\275\247\350\200\274\227\234\215\272I6\005\274G\022\346\273\373\301\304<\231\026\033\274\202HB<\005)V\2713\031:<\332Y\206\274\216\276y<*\241e<\323\272\215\274\362\005\177\274\2516V\273&\262A<\317\253\257\274\275\314\r\2748U\211\272\313(\250\274]\256\240\274\204\210\207<\325\207>\275[~\224<\002\241\013\274\275\217\256\274g2c<\033\347\275\274}\340v<\323J?\273\024\177\026<\364\214\211<\"\206*:ZI\026\274T\010>\274ox/<v\304\210\273J^\005\275\032\002\227<\263\367\312<\264\365\270\272mN\020<\276\327S< .\220\274J\332d\274\305\333\362<D\265^<\030\247\365;8w.;\370\315\260;\353\n/<s\352\305:\205\302\313<\205\212\301;\206\251\014==\325\030\274\332^#\273e\025\'=U\307\377\273{\006\356\274\2653\241\273G\272\003\274\371\315\004=\3233u<9\360\035=\342<\237\274\017\330l\274\036\215\235;\000y\014=\254\311\366;\033\014\250\273\236\347.\273\215\210\251;\242~\036<;/\202\274\235-\353\274A\333H=\354\345\004<\2347\253\273\014\267\375\273\240\243\275\274\344\313\276;\3653\314<\316q\343;\303&\366\274Y\n\021\274\316v|\273]\267\030=\234A\341<@{n\274t\005\241\273\304\214\017;\237\177\010\275FU\311\274\274\241\227\274X~\374\272na\365<\213\300\033\275\"F\274;\013\275\213<\'\317\210\274y\001b=\260\001\347<i\361G\274\031\337\324;C\315\006=\310(\006\275\032\223\020\274A{\016=\211T\006<\013\332H:\336\377W\273//\254\274~#\025\274TB\026\275b\020W:t\224\003\2747\375f\275?\234\222<O\253l\274\017\377\270<\360\212l:\235\022\314<\271\376\254<\0250\272<\'K\210\274\256cy;\217]^<&\014\003\275\246\264\201\274P\371\007\275a})<\231\025$=\227VF\273\354\337\321\273\227\256\315\274\324\201\"\275D\033\n\273\006\311\025\275[\322\306\271\222\016=< \254\305\273\351\216\257<\022\300\200\272\271x\203:KA<\274e\n\244\274\'\322\217<i\336\346<\331_\351\274_\322\226<C~\032\274\202\364\320\273\251\273\276\271\332\331\201\274\357)\004\275\207\2039=\224y\373:\013\332-\275Ib=<\362\n\327<\367\\\347:NVr\272T\365\332<M6\017<D\2705<cz\350\274"
+  }
+  initializer {
+    dims: 16
+    dims: 32
+    data_type: 1
+    name: "lm_head.weight_t"
+    raw_data: ".\004+\274o\231\220:\314j\221<\262L\336\274S\245^;X\244\265\274\306Y\024=i\306h<<\006\200\272=\370\337\273M\330\014\275?\364\026;6\242\216\274\263\350N\274\270\273\273\2738\320\272\274r\037\313;\206\035\205<S\200\273\274\031\310\271\274\205%\317\274\207\265\243\274\355\n\013\275\247\373==\206\005-:\034r\005<\244\r\350:\030\370\'=\227\275\240;\'\326B\274\030\221\350\273\2432\364\273<L]<\275WR;\201\2027<%\304\235\274\274\365\376<\204`\312\274\223\305u\273BA\373\273\242b<\275\323\032\301\272\035\305Q\274\213P\016=\017\313\306\274}\276m<\033\221\317<\014Y\240\274u\362\355\274#\333\0369\2075\250\274S/\347<TC\017=\246L\371\272\262\032+\273\304t\274<O\340\212<\000\320b=B\352\213;\241\"\023<\017]\364\273\274\305V\274\227\311V\273\207\220\306\274K\311\207<\323\234\263<\022\235\252\273Ld\374;\252\267\363<\212CI8{/\377\273=\255\215<\307\257\376\273i\223\3219\212\261\3349Y|K\274\355\243\026\273\304\275\324\273x\036\006<W\354\236\272\316\200&\274\2356\220<\204 S\274b\304I<\302\227\036\275\204\260b;\r\231\014\273D\352\n\272\237.\004\274 \354F\274oX}\274\3640\225;\007\363o\274S\256\373\274\t\2343\273\224\246t\274\0009\210;[\343\236\274\031\005\204<j\0275\271x%\357\274 \035Q:\207\035N<S\323\025\275\363\357\006;\212\306=\275\304\243\260\274\347(\305\274u\226\205\274\ru&;\322\201\002\274\233\004\302<\353\233\371\273\322\260E\273w4\200\274.\264\376\2742\274m\274\274[\316;\267H\007=\355|\236\274\235\"\026\2734\361\303\274t\337\022=\256\375g<s\032\377\273&\263\246<\307\034Q=\341V/<~\270I\274\311DC<\275\337\001<\343d\n=\241\341Q\274\235\372\267\274\375qV<\260[\301\273f?M\273%w\215<S\364v<0d\357<IN]\272\347\317[<\311\372\217<\230\013\305<J\240)\274\337\225\235;4\217|;\230\031\003=\226x&;Szu<z\004\001\274u\001@<;0|<JW\333;o\322\336\274*K\251<G\277\007<\353\257h;\026\260\243\274\240\035(\274`\007\025\273\315\254\243\272\000f =)\023\007\275\007\211\023;\301\227\224\273\231.F: J\264\270\030\305\272\274jF4\2746\350\250\274\241P\315<\306K0<\220}\261\274\353\373\223;w\260\254<\245\325\302<\245V\265<\220d\255;\367\362\027<o\260S\272\2719L\274\352\001\177\274\23103\272\225C\301\273\275\226\002=\036\270\233\272\344\262.;\221%\033;\317n\304;\221@\024<\001w0<\373\355\235\271\022\323\275<\2218\210<\2562\2379N\217\014\274E1\212\2743Q\357<D\2538\274\325.\014=&\326\205:B\"H<\206\353\272<\376\024\363\274\320\252(=8f~\273\016\230\236\273\010\'\032=\305\364\377\272Vc\254\274\227D\276:\231&\007\274Fz\013<\344\264\206\274\336\370M\274\215\027\214\274I\362q<?0\213\274\013\031\360<t`\n\275\300>\272\274]\210X\274\257C\025\274\244\030\265<\316l\346<\362\237\022;\031\001m<\tb\237\274\267\372\342<\033\306\017<P\211O\274}\235}<o\202\207\273\246\326\033=\020\341\355\273\036w\036\274\312\177F\272\267x\321;\270\026\356<\256\215\252\274\206BY<z\222\231;9\311\277\272\005U\215;2\256*<\245)\307\274\224\214\327;\311Ow:\375n\024<\267\357\013\273)\206\327\273\336\203\266;e\327\257\274I\266\373;\265\203\233<\314\037\204\273\364\201\267\274\252$\266<u\000\006\275\227K\227\273\322Ca<&\332\250<\n\0224\274\"\2765<o\321T<\252\r\343\273\3628w\274 \311\301\273.\375\332<r\340\245<\024g\365\274%09\274t\321,\274p\303\300\274\266\006,;\342\347\345\273\330/\246;\207\203\250<\252\025\365\274\020\372M;Pd\331\272CP\020\275Z\220\024<\001=r\275\205\361O\273\226\354\211\274%Rr\274n\236\000=\363E\310\273nG\330\274,\234`<\371p\274<\033\261\257;\213m\331\273S\343\326\274\231\002\204\274 \004\326;?\032\222;\324.\215=\331\214D9.\234\010\274\267\241\265\272>9\341\272.)\306\273\222\245\037\273\256x\374\273\257\346\010\273=\333\362\273\nN8<o\306\002\275\212\263\205<\252\330\334\274\007\004Z<\360\030\226<\204\365\261;\000\354\355\274\211ug\273\0065\004\275\024\312\312<\227\307T=F\211\210\273y\214A\274\371\003/<`Rw<\256>\234\273t:\300;\034\026\254\274\344\257\341<\325\203\374<\364\350\003\274\367\207<\274b\376O<\252\301\271<\340m\230;\217d.;W[m=\302\312#=\360gH\275-\370)=\255\370\204\274\351 \357;\tk+\274\264VW<\204\235\033\275<9Y\274\313o\"<`\274\363\271F\270\000<\033\255\333\274\215\340\033\274H\314\013\274\313\234\231\273\025\365\367<\3062G;-j:\273\374Q^:\302\004u<\240v%\274\312\\~<\375\236k<\333\031b\2730\305\234\272Wd\361;~\002\306\273\200\251\224<!\270\216;\230}\006\275\234\347\270\274\375\"@\274/\273\236\274\335\321\016<\373\305\004=@&\260\273\356F\'=\211\205y\2747/)<\347A\004\274\302\342\222<\344wR\274\320[\263;\323\'\003\274\213,4\2729\2757<k\255\231<]>\331\274M\232$<e\235\245\270m\004\245\2735\202\344<\264\241\270<e\343\354\273c\000\241<\254\374\002\2734\240%\274%6)\275YyT<\265v4\274G\237\024<]\217\007\274\215t?<O\225\005<\236\251\213\274\000\217\034\274\267@D\274\251\353\035\274o&\026<PH-\274\232\303\016\275[\350`<\376\261S\273y~\177<\347\245\327;\353\246\226\273\343*\034\273\236\353\320\274\225\205x\274\215\236=<\320\322K<\304\313\272<\265\345\366;O\351\351<\311\342\235<\252\201\223\272]\2110<\235\255\222;\007\037\265:J\311Q<\262\006\361<\273,5\272\360\322\372<\352\302\005\274S\236:\274\2316\255<\302D/<\256\331\274\273k\344h\274Y\322\017\275f@\301;^\360\331\274p\344\032\274\027\225\263\273\363\333\311\274\340-\224<\271\376\235;.\321\342\274{:\211<\023QO\2740a\241\274\345)\357\274\245\306Y<fLT\274&Y\234\274\322\370\363:\260H\323:\016F\324;\300\232\233;\356\304\001<\267g\312\274\307\241c<l\253\376\273\350\205\r<\364\371\316;\241Z\023\273\242R\267<\252\"\265\274\304F\240;n\371\036\273\300t\352\272\000\314\315\273p\220\221\274^\373\201;J5C=Gu\255\272#1w\274\360\354\314\273{>L\275\2628\362;\027\027\213\274\307JM\274%\036\205;\355[\232\274\375:\343\274\\H9\272\315\255\006\272\313!\247\273-*G\274\354\303\375\273T\025&\275\331\350x\2744U\246\274L7\017\273\216\221\211<\340-/<\370\335\313<\3408(\275\236S\341\274\220\237\323<\031c\300\274\023M\260;o<\300;\256A\372;\224\000\212\272\"\355P<x\331i<\311\320&8~\305\354<!|!\275\220x\201< \327\025\275\034\236\276<\347sV\274"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "attention_mask"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "past_sequence_len + sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_param: "past_sequence_len + sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "hidden_states.0"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.wte.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.wpe.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_1d_0"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.ln_1.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.ln_1.bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.ln_2.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.ln_2.bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.mlp.up_proj.bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.mlp.down_proj.bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.ln_f.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.ln_f.bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.attn.q_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.attn.k_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.attn.v_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.attn.o_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.mlp.up_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "transformer.h.0.mlp.down_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "lm_head.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.wte.Gather_0"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.wpe.Gather_1"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.Cast_3"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.Unsqueeze_4"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.Shape_5"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"batch\"]"
+    }
+  }
+  value_info {
+    name: "v_transformer.Shape_6"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"sequence_len\"]"
+    }
+  }
+  value_info {
+    name: "v_transformer.Shape_7"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"past_seq_len + seq_len\"]"
+    }
+  }
+  value_info {
+    name: "v_transformer.Concat_8"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 3
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"batch\", \"sequence_len\", \"past_seq_len + seq_len\"]"
+    }
+  }
+  value_info {
+    name: "v_transformer.Expand_9"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.Unsqueeze_10"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.ln_1.LayerNormalization_11"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.attn.q_proj.MatMul_13"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.attn.k_proj.MatMul_15"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.attn.v_proj.MatMul_17"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.attn.Attention_18_0"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.attn.o_proj.MatMul_20"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.ln_2.LayerNormalization_22"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.mlp.up_proj.MatMul_24"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.mlp.up_proj.Add_25"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.mlp.Gelu_26"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.mlp.down_proj.MatMul_28"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_transformer.h.0.mlp.down_proj.Add_29"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}
+opset_import {
+  domain: "com.microsoft"
+  version: 1
+}
+functions {
+  name: "SkipLayerNormalization"
+  input: "input"
+  input: "skip"
+  input: "weight"
+  input: "bias"
+  output: "norm_out"
+  output: "mean_out"
+  output: "inv_std_out"
+  output: "add_out"
+  node {
+    input: "input"
+    input: "skip"
+    output: "add_out"
+    name: "Add_node_0"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.shape_inference_error"
+      value: "Type of input 0 value input of node Add_node_0 not known"
+    }
+  }
+  node {
+    input: "add_out"
+    input: "weight"
+    input: "bias"
+    output: "norm_out"
+    output: "mean_out"
+    output: "inv_std_out"
+    name: "LayerNormalization_node_1"
+    op_type: "LayerNormalization"
+    attribute {
+      name: "epsilon"
+      type: FLOAT
+      ref_attr_name: "epsilon"
+    }
+    attribute {
+      name: "axis"
+      i: -1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.shape_inference_error"
+      value: "Type of input 0 value v_Add_0 of node LayerNormalization_node_1 not known"
+    }
+  }
+  opset_import {
+    domain: ""
+    version: 24
+  }
+  domain: "com.microsoft"
+  attribute_proto {
+    name: "epsilon"
+    f: 1e-05
+    type: FLOAT
+  }
+}

@@ -1,10 +1,10 @@
 pipeline:
   models:
     encoder:
-      filename: encoder.onnx
+      filename: encoder.onnx.textproto
       type: encoder
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
   dataflow:

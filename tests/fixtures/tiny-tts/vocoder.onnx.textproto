@@ -1,0 +1,140 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-tts fixture"
+graph {
+  node {
+    input: "codes"
+    output: "codes_float"
+    name: "node_Cast_0"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "codes_float"
+    input: "gain"
+    output: "scaled"
+    name: "node_Mul_1"
+    op_type: "Mul"
+  }
+  node {
+    output: "unsqueeze_axis"
+    name: "node_Constant_2"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "unsqueeze_axis_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "scaled"
+    input: "unsqueeze_axis"
+    output: "scaled_col"
+    name: "node_Unsqueeze_3"
+    op_type: "Unsqueeze"
+  }
+  node {
+    output: "repeats"
+    name: "node_Constant_4"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 3
+        data_type: 7
+        name: "repeats_value"
+        raw_data: "\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "scaled_col"
+    input: "repeats"
+    output: "tiled"
+    name: "node_Tile_5"
+    op_type: "Tile"
+  }
+  node {
+    output: "flat_shape"
+    name: "node_Constant_6"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 2
+        data_type: 7
+        name: "flat_shape_value"
+        raw_data: "\001\000\000\000\000\000\000\000\377\377\377\377\377\377\377\377"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "tiled"
+    input: "flat_shape"
+    output: "audio"
+    name: "node_Reshape_7"
+    op_type: "Reshape"
+  }
+  name: "tiny_tts_vocoder"
+  initializer {
+    data_type: 1
+    name: "gain"
+    raw_data: "\000\000\000@"
+  }
+  input {
+    name: "codes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "num_codes"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "audio"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "num_samples"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "gain"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

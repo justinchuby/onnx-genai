@@ -63,7 +63,7 @@ fn f32_reference(name: &str) -> Vec<f32> {
 /// Build a session at the given optimization level (`None` = default/off) and
 /// run the three committed inputs, returning the two model outputs.
 fn run_bert(optimization: Option<&str>) -> Result<Vec<Tensor>, SessionError> {
-    let model_path = fixture_dir().join("model.onnx");
+    let model_path = fixture_dir().join("model.onnx.textproto");
     let mut builder = InferenceSession::builder().model(&model_path);
     if let Some(level) = optimization {
         builder = builder.option("optimization", level);
@@ -260,7 +260,7 @@ fn full_optimization_actually_fuses_layernorm_and_matmul_bias() {
         ConstantFolding, DeadNodeElimination, OpFusion, PassContext, run_passes,
     };
 
-    let model_path = fixture_dir().join("model.onnx");
+    let model_path = fixture_dir().join("model.onnx.textproto");
     let mut graph = onnx_runtime_loader::load_model(&model_path).expect("load bert_toy");
 
     let count = |g: &onnx_runtime_ir::Graph, op: &str| -> usize {

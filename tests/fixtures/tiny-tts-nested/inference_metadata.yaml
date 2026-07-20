@@ -7,14 +7,14 @@
 pipeline:
   models:
     talker:
-      filename: talker.onnx
+      filename: talker.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
     code_predictor:
-      filename: code_predictor.onnx
+      filename: code_predictor.onnx.textproto
       type: decoder
     vocoder:
-      filename: vocoder.onnx
+      filename: vocoder.onnx.textproto
       type: vocoder
   dataflow:
     # Per-frame hidden binding: inner step 0 seed.

@@ -72,8 +72,8 @@ def constant(name: str, array: np.ndarray) -> ir.Node:
 
 
 def save_model(model: ir.Model, path: Path) -> None:
-    ir.save(model, path)
-    onnx.checker.check_model(path)
+    ir.save(model, path, format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
 
 
 def build_decoder(path: Path) -> None:
@@ -313,11 +313,11 @@ def write_metadata(path: Path) -> None:
 pipeline:
   models:
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
     vocoder:
-      filename: vocoder.onnx
+      filename: vocoder.onnx.textproto
       type: vocoder
   dataflow:
     - from: decoder.output_ids
@@ -347,14 +347,19 @@ pipeline:
     )
 
 
+def _textproto_bytes(path) -> bytes:
+    """Load a .onnx.textproto fixture and return serialized binary ModelProto bytes."""
+    return ir.to_proto(ir.load(str(path), format="textproto")).SerializeToString()
+
+
 def validate_with_ort(output_dir: Path) -> None:
     import onnxruntime as ort
 
     decoder = ort.InferenceSession(
-        str(output_dir / "decoder.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "decoder.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
     vocoder = ort.InferenceSession(
-        str(output_dir / "vocoder.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "vocoder.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
 
     # Greedy decode from a 1-token prompt at position 0; argmax == position, so
@@ -399,8 +404,8 @@ def main() -> None:
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
-    build_decoder(args.output / "decoder.onnx")
-    build_vocoder(args.output / "vocoder.onnx")
+    build_decoder(args.output / "decoder.onnx.textproto")
+    build_vocoder(args.output / "vocoder.onnx.textproto")
     write_tokenizer(args.output / "tokenizer.json")
     write_metadata(args.output / "inference_metadata.yaml")
     if not args.no_validate:

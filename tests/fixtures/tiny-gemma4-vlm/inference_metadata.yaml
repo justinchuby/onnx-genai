@@ -5,13 +5,13 @@
 pipeline:
   models:
     vision_encoder:
-      filename: vision_encoder.onnx
+      filename: vision_encoder.onnx.textproto
       type: vision_encoder
     embedding:
-      filename: embedding.onnx
+      filename: embedding.onnx.textproto
       type: encoder
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
   dataflow:

@@ -6,11 +6,11 @@
 pipeline:
   models:
     decoder:
-      filename: decoder.onnx
+      filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
     vocoder:
-      filename: vocoder.onnx
+      filename: vocoder.onnx.textproto
       type: vocoder
   dataflow:
     - from: decoder.output_ids

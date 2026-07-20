@@ -1,32 +1,17 @@
 /target
 models/
 *.onnx
-!tests/fixtures/tiny-llm-scatter/model.onnx
-!tests/fixtures/tiny-qwen35-mtp/model.onnx
-!tests/fixtures/tiny-eagle3/model.onnx
-!tests/fixtures/tiny-mtp-full/model.onnx
-!tests/fixtures/tiny-mtp-full/mtp/model.onnx
-!tests/fixtures/tiny-whisper/encoder.onnx
-!tests/fixtures/tiny-whisper/decoder.onnx
-!tests/fixtures/tiny-diffusion/denoiser.onnx
-!tests/fixtures/tiny-diffusion/vae.onnx
-!tests/fixtures/tiny-diffusion/denoiser_multi.onnx
-!tests/fixtures/tiny-diffusion/denoiser_dualcond.onnx
-!tests/fixtures/tiny-diffusion/denoiser_step.onnx
-!tests/fixtures/tiny-dit-diffusion/denoiser.onnx
-!tests/fixtures/tiny-masked-diffusion/lm.onnx
+# Fixture models are stored as git-friendly ONNX protobuf TextFormat
+# (`*.onnx.textproto`), which is not matched by the `*.onnx` ignore above and is
+# therefore tracked. The line below documents that intent explicitly.
+!**/*.onnx.textproto
+# `speculator-eagle3/model.onnx` is an 8-byte placeholder (never loaded as a
+# model), kept as-is for model-directory resolution tests.
 !crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
-!tests/fixtures/tiny-gemma4-assistant/model.onnx
-!tests/fixtures/tiny-gemma4-assistant/assistant/model.onnx
-!tests/fixtures/tiny-gemma4-vlm/vision_encoder.onnx
-!tests/fixtures/tiny-gemma4-vlm/embedding.onnx
-!tests/fixtures/tiny-gemma4-vlm/decoder.onnx
-!tests/fixtures/tiny-tts/decoder.onnx
-!tests/fixtures/tiny-tts/vocoder.onnx
-!tests/fixtures/tiny-tts-nested/talker.onnx
-!tests/fixtures/tiny-tts-nested/code_predictor.onnx
-!tests/fixtures/tiny-tts-nested/vocoder.onnx
-!crates/onnx-runtime-session/tests/fixtures/bert_toy/model.onnx
+# `qmoe_weight_offload/model.onnx` intentionally stays binary: its test exercises
+# external-data (`weights.bin`) mmap weight-offload, which requires External
+# weight refs that an inlined textproto cannot represent.
+!crates/onnx-runtime-ep-cpu/tests/fixtures/qmoe_weight_offload/model.onnx
 *.safetensors
 .DS_Store
 

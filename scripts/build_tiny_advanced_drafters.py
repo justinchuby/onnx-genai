@@ -126,6 +126,14 @@ def _save_fixture(name: str, module, config, task, contract: dict) -> None:
     package.save(str(output_dir), check_weights=True, progress_bar=False)
 
     model = package["model"]
+    # Re-emit as git-friendly textproto with weights inlined, then drop the
+    # binary artifacts (the runtimes load `.onnx.textproto` directly).
+    ir.save(model, str(output_dir / "model.onnx.textproto"), format="textproto")
+    for stale in ("model.onnx", "model.onnx.data"):
+        stale_path = output_dir / stale
+        if stale_path.exists():
+            stale_path.unlink()
+
     manifest = {
         "generator": "scripts/build_tiny_advanced_drafters.py",
         "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
@@ -151,7 +159,7 @@ def _save_fixture(name: str, module, config, task, contract: dict) -> None:
         "contract": contract,
         "files": {
             filename: (output_dir / filename).stat().st_size
-            for filename in ("model.onnx", "model.onnx.data")
+            for filename in ("model.onnx.textproto",)
         },
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

@@ -9,7 +9,7 @@ Unlike the other fixtures this one is built with the raw ONNX IR API
 (:mod:`onnx_ir`) rather than Mobius, so it needs no external exporter. It emits
 two graphs under ``tests/fixtures/tiny-gemma4-assistant``:
 
-* ``model.onnx`` -- a tiny *target* decoder. Its logits and hidden state are a
+* ``model.onnx.textproto`` -- a tiny *target* decoder. Its logits and hidden state are a
   deterministic function of the current token only (a Gather into random but
   fixed tables), so plain greedy decoding is fully reproducible. It carries a
   two-layer paged KV cache (layer 0 stands in for Gemma4's sliding-attention
@@ -17,7 +17,7 @@ two graphs under ``tests/fixtures/tiny-gemma4-assistant``:
   to the logits -- only the growing shapes matter for the runtime plumbing.
   It also exposes ``hidden_states.0`` (Float32 ``[B, S, H]``) for seeding the
   assistant.
-* ``assistant/model.onnx`` -- a tiny Gemma4 assistant matching the shared-KV
+* ``assistant/model.onnx.textproto`` -- a tiny Gemma4 assistant matching the shared-KV
   contract: ``inputs_embeds`` ``[B, q, 2*H]``, ``position_ids``,
   ``attention_mask`` and ``shared_kv.{sliding,full}_attention.{key,value}``
   inputs; ``logits`` ``[B, q, V]`` and ``projected_state`` ``[B, q, H]``
@@ -297,8 +297,8 @@ def main() -> None:
     target = build_target()
     assistant = build_assistant()
 
-    ir.save(target, str(OUT_DIR / "model.onnx"))
-    ir.save(assistant, str(assistant_dir / "model.onnx"))
+    ir.save(target, str(OUT_DIR / "model.onnx.textproto"), format="textproto")
+    ir.save(assistant, str(assistant_dir / "model.onnx.textproto"), format="textproto")
     _copy_tokenizer(OUT_DIR / "tokenizer.json")
 
     # The shared-KV proposer builds inputs_embeds from the *target* input-token

@@ -1,7 +1,7 @@
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.noise_pred
