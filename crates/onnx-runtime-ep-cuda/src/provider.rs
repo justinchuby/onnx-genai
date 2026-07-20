@@ -320,6 +320,19 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(Fence::default())
     }
 
+    fn device_argmax_supported(&self) -> bool {
+        true
+    }
+
+    fn device_argmax(
+        &self,
+        logits: &DeviceBuffer,
+        elements: usize,
+        result: &mut DeviceBuffer,
+    ) -> Result<()> {
+        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, result)
+    }
+
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
         assert_eq!(
             dst.device(),

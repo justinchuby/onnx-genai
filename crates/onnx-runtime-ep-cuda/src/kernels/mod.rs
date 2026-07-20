@@ -32,6 +32,7 @@ pub mod conv;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumsum;
+pub(crate) mod device_argmax;
 pub mod elementwise;
 mod flash_attention;
 pub mod fused_gemm;

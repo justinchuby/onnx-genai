@@ -320,10 +320,36 @@ impl DeviceIoBinding {
 
     pub fn read_bytes(&mut self) -> Result<Vec<u8>> {
         let mut bytes = vec![0; self.buffer().len()];
-        self.allocator.copy_to_host(self.buffer(), &mut bytes)?;
+        self.read_bytes_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub fn read_bytes_into(&mut self, bytes: &mut [u8]) -> Result<()> {
+        self.allocator.copy_to_host(self.buffer(), bytes)?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
-        Ok(bytes)
+        Ok(())
+    }
+
+    pub fn device_argmax_supported(&self) -> bool {
+        self.allocator.device_argmax_supported()
+    }
+
+    pub fn device_argmax(&self, elements: usize, result: &mut DeviceIoBinding) -> Result<()> {
+        if self.dtype != DataType::Float32 || result.dtype != DataType::Uint32 {
+            return Err(SessionError::Internal(format!(
+                "device argmax requires f32 logits and u32 result, got {:?} and {:?}",
+                self.dtype, result.dtype
+            )));
+        }
+        if !Arc::ptr_eq(&self.allocator, &result.allocator) {
+            return Err(SessionError::Internal(
+                "device argmax bindings must belong to the same execution provider".into(),
+            ));
+        }
+        Ok(self
+            .allocator
+            .device_argmax(self.buffer(), elements, result.buffer_mut())?)
     }
 
     pub(crate) fn buffer(&self) -> &DeviceBuffer {

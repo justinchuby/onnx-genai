@@ -4,6 +4,7 @@ use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
+use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim};
@@ -72,6 +73,7 @@ struct DecodeCudaState {
     position_ids_binding: Option<usize>,
     logits_binding: usize,
     logits_shape: Vec<usize>,
+    greedy_result: DeviceIoBinding,
     graph_enabled: bool,
     graph_phase: DecodeCudaGraphPhase,
     graph_captures: u64,
@@ -531,6 +533,42 @@ impl NativeDecodeSession {
         self.current_len = total_len;
         Ok(logits)
     }
+
+    fn decode_cuda_greedy(
+        &mut self,
+        token_id: TokenId,
+        past_len: usize,
+    ) -> anyhow::Result<TokenId> {
+        let total_len = past_len
+            .checked_add(1)
+            .context("native decode context length overflow")?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.max_len {
+            bail!(
+                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
+                state.max_len
+            );
+        }
+        state.extend_mask(past_len, total_len)?;
+        state.write_decode_inputs(token_id, past_len)?;
+        if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+            let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+        }
+        let (token_id, capture_error) = state.read_greedy_result()?;
+        if capture_error != 0 {
+            let _ = state.invalidate_graph(&mut self.session);
+            bail!(
+                "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
+            );
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(token_id)
+    }
 }
 
 impl DecodeCudaState {
@@ -650,6 +688,12 @@ impl DecodeCudaState {
             logits_shape.clone(),
             logits_shape.clone(),
         )?);
+        let greedy_result = session.allocate_device_output_binding(
+            "__native_greedy_argmax",
+            DataType::Uint32,
+            vec![2],
+            vec![2],
+        )?;
 
         Ok(Self {
             logical_len: 0,
@@ -661,6 +705,7 @@ impl DecodeCudaState {
             position_ids_binding,
             logits_binding,
             logits_shape,
+            greedy_result,
             graph_enabled,
             graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
             graph_captures: 0,
@@ -767,6 +812,24 @@ impl DecodeCudaState {
         let bytes = self.bindings[self.logits_binding].read_bytes()?;
         let logits = Tensor::from_raw(DataType::Float32, self.logits_shape.clone(), &bytes)?;
         extract_logits(&logits)
+    }
+
+    fn greedy_fastpath_supported(&self) -> bool {
+        self.bindings[self.logits_binding].device_argmax_supported()
+    }
+
+    fn read_greedy_result(&mut self) -> anyhow::Result<(TokenId, u32)> {
+        let vocab = *self
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        self.bindings[self.logits_binding].device_argmax(vocab, &mut self.greedy_result)?;
+        let mut bytes = [0_u8; 2 * std::mem::size_of::<u32>()];
+        self.greedy_result.read_bytes_into(&mut bytes)?;
+        Ok((
+            u32::from_ne_bytes(bytes[..4].try_into().expect("four token-id bytes")),
+            u32::from_ne_bytes(bytes[4..].try_into().expect("four capture-error bytes")),
+        ))
     }
 
     fn invalidate_graph(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
@@ -992,6 +1055,22 @@ impl DecodeLoopBackend for NativeLoopAdapter<'_> {
             .decode(&self.pending_tokens, past_len)?
             .pop()
             .context("native decoder produced no logits")
+    }
+
+    fn greedy_fastpath_supported(&self) -> bool {
+        self.session
+            .cuda
+            .as_ref()
+            .is_some_and(DecodeCudaState::greedy_fastpath_supported)
+    }
+
+    fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
+        if self.pending_tokens.len() != 1 {
+            return Ok(sample_greedy(&self.next_logits()?));
+        }
+        let past_len = self.session.current_len();
+        self.session
+            .decode_cuda_greedy(self.pending_tokens[0], past_len)
     }
 
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {

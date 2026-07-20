@@ -333,6 +333,27 @@ pub trait ExecutionProvider: Send + Sync {
     /// Asynchronous copy; returns a [`Fence`] to await.
     fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence>;
 
+    /// Whether this EP can select the first maximum f32 element on-device and
+    /// return the token id together with its capture-error status.
+    fn device_argmax_supported(&self) -> bool {
+        false
+    }
+
+    /// Launch an allocation-free device argmax over `elements` contiguous f32
+    /// values. `result` receives two native-endian u32 values: token id, then
+    /// the latching device capture-error bitmask.
+    fn device_argmax(
+        &self,
+        _logits: &DeviceBuffer,
+        _elements: usize,
+        _result: &mut DeviceBuffer,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device argmax is not supported",
+            self.name()
+        )))
+    }
+
     /// Begin recording the supplied, already-compiled kernel sequence into a
     /// device graph. EPs without graph support reject the request.
     fn begin_device_graph_capture(&self, _kernels: &[&dyn Kernel]) -> Result<()> {
