@@ -1,7 +1,8 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, clone_value, extract_next_token_logits, run_decode_step_with_extra,
+    DecodeState, clone_value, extract_next_token_logits, is_token_input_name,
+    run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -263,8 +264,19 @@ impl PipelineEngine {
         )?;
 
         let mut tensors = pipeline_request.inputs;
+        // Seed the prompt token ids into the shared pool so a prompt-phase
+        // fusion component (Gemma4-style `embedding`) can consume `input_ids`.
+        self.seed_prompt_token_inputs(&ar.prompt_components, &prompt_tokens, &mut tensors)?;
         self.run_prompt_phase_components(&ar.prompt_components, &mut tensors, "prologue", None)?;
-        let decoder_extras = self.decoder_extra_inputs(&ar.decoder, &tensors)?;
+        // A decoder whose prompt input is `inputs_embeds` (not `input_ids`) needs
+        // the fusion component re-run each step to embed the running token; the
+        // routed prompt embeddings are otherwise stale after prefill.
+        let embeds_binding = self.embeds_step_binding(&ar.decoder, &tensors)?;
+        let decoder_extras = self.decoder_extra_inputs(
+            &ar.decoder,
+            &tensors,
+            embeds_binding.as_ref().map(|b| b.decoder_input.as_str()),
+        )?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
         self.decoder_state = Some({
@@ -279,6 +291,19 @@ impl PipelineEngine {
             .models
             .session(&ar.decoder)
             .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
+        let embed_session = match &embeds_binding {
+            Some(binding) => Some(
+                self.models
+                    .session(&binding.component)
+                    .with_context(|| {
+                        format!(
+                            "pipeline embedding component '{}' was not loaded",
+                            binding.component
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         let tokenizer = self
             .models
             .tokenizer_for(&self.tokenizer_component)
@@ -292,6 +317,8 @@ impl PipelineEngine {
                 .as_mut()
                 .expect("autoregressive pipeline has decode state"),
             decoder_extras: &decoder_extras,
+            embed_session,
+            embeds_binding,
             context_tokens: prompt_tokens,
             prompt_len: 0,
             generated_count: 0,
@@ -912,6 +939,7 @@ impl PipelineEngine {
         &self,
         decoder: &str,
         tensors: &PipelineTensors,
+        exclude_input: Option<&str>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let mut extras = Vec::new();
         for edge in self
@@ -920,12 +948,153 @@ impl PipelineEngine {
             .filter(|edge| endpoint_component(&edge.from).is_some_and(|from| from != decoder))
         {
             let (_, input) = parse_endpoint(&edge.to)?;
+            // The per-step `inputs_embeds` edge is threaded dynamically by the
+            // decode loop (re-embedding each step), not carried as a fixed extra.
+            if exclude_input == Some(input) {
+                continue;
+            }
             let value = tensors
                 .get(&edge.from)
                 .with_context(|| format!("missing routed pipeline tensor '{}'", edge.from))?;
             extras.push((input.to_string(), clone_value(value)?));
         }
         Ok(extras)
+    }
+
+    /// Seed the prompt token ids into the shared pool for any prompt-phase
+    /// component that consumes a token input (`input_ids`) which is neither
+    /// supplied by the caller nor routed by a dataflow edge.
+    ///
+    /// A Gemma4-style VLM fuses image features into text-token embeddings via a
+    /// prompt-phase `embedding` component whose `input_ids` come from the prompt
+    /// itself (not from another model). Without this seam that component would
+    /// fail with a `missing pipeline input 'embedding.input_ids'` error.
+    fn seed_prompt_token_inputs(
+        &self,
+        components: &[String],
+        prompt_tokens: &[TokenId],
+        tensors: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        for component in components {
+            let session = self
+                .models
+                .session(component)
+                .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
+            for info in session.inputs() {
+                if !is_token_input_name(&info.name.to_ascii_lowercase()) {
+                    continue;
+                }
+                let endpoint = format!("{component}.{}", info.name);
+                let routed = self.plan.dataflow().iter().any(|edge| edge.to == endpoint);
+                if routed || tensors.contains_key(&endpoint) {
+                    continue;
+                }
+                let ids: Vec<i64> = prompt_tokens.iter().map(|&t| i64::from(t)).collect();
+                let value = Value::from_slice_i64(&ids, &[1, ids.len() as i64])?;
+                tensors.insert(endpoint, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Detect a decoder whose per-step sequence input is `inputs_embeds` (fused
+    /// image + text embeddings) rather than `input_ids`, and bind the fusion
+    /// component that must re-embed the running token on every decode step.
+    ///
+    /// Returns `None` for a conventional decoder that carries its own token
+    /// input (and embeds internally). When `Some`, the decode loop re-runs the
+    /// fusion component each step with the running token so the decoder receives
+    /// a single-token `inputs_embeds`; cross-conditioning inputs (image features)
+    /// are resolved once and re-supplied unchanged.
+    fn embeds_step_binding(
+        &self,
+        decoder: &str,
+        tensors: &PipelineTensors,
+    ) -> anyhow::Result<Option<EmbedsStepBinding>> {
+        let session = self
+            .models
+            .session(decoder)
+            .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
+        // A decoder with its own token input embeds internally: nothing to bind.
+        if session
+            .inputs()
+            .iter()
+            .any(|info| is_token_input_name(&info.name.to_ascii_lowercase()))
+        {
+            return Ok(None);
+        }
+        let Some(embeds_input) = session.inputs().iter().find(|info| {
+            let lower = info.name.to_ascii_lowercase();
+            lower == "inputs_embeds" || lower.ends_with(".inputs_embeds")
+        }) else {
+            return Ok(None);
+        };
+        let decoder_input = embeds_input.name.clone();
+        let endpoint = format!("{decoder}.{decoder_input}");
+        let edge = self
+            .plan
+            .dataflow()
+            .iter()
+            .find(|edge| edge.to == endpoint)
+            .with_context(|| {
+                format!(
+                    "decoder '{decoder}' consumes '{decoder_input}' but no dataflow edge feeds \
+                     it; a Gemma4-style VLM needs an embedding fusion component routed to \
+                     '{endpoint}'"
+                )
+            })?;
+        let (component, output) = parse_endpoint(&edge.from)?;
+        let component = component.to_string();
+        let output = output.to_string();
+        let embed_session = self.models.session(&component).with_context(|| {
+            format!("pipeline embedding component '{component}' was not loaded")
+        })?;
+
+        // The fusion component's token input carries the running token each step;
+        // every other input (e.g. image_features) is fixed conditioning resolved
+        // once here from the shared pool (directly or via a dataflow edge).
+        let mut token_input = None;
+        let mut conditioning = Vec::new();
+        for info in embed_session.inputs() {
+            if is_token_input_name(&info.name.to_ascii_lowercase()) {
+                token_input = Some(info.name.clone());
+                continue;
+            }
+            let cond_endpoint = format!("{component}.{}", info.name);
+            let routed = self
+                .plan
+                .dataflow()
+                .iter()
+                .find(|edge| edge.to == cond_endpoint)
+                .and_then(|edge| tensors.get(&edge.from));
+            let value = tensors
+                .get(&cond_endpoint)
+                .or(routed)
+                .with_context(|| format!("missing embedding fusion input '{cond_endpoint}'"))?;
+            conditioning.push((info.name.clone(), coerce_value_to_dtype(value, info.dtype)?));
+        }
+        let token_input = token_input.with_context(|| {
+            format!(
+                "embedding fusion component '{component}' must consume a token input (input_ids) \
+                 so the decode loop can embed the running token each step"
+            )
+        })?;
+        let prefill = clone_value(tensors.get(&edge.from).with_context(|| {
+            format!(
+                "prompt-phase embeddings '{}' were not produced; the fusion component must run \
+                 in the prompt phase to seed prefill",
+                edge.from
+            )
+        })?)?;
+
+        Ok(Some(EmbedsStepBinding {
+            decoder_input,
+            component,
+            output,
+            token_input,
+            conditioning,
+            prefill,
+        }))
     }
 }
 
@@ -1048,13 +1217,106 @@ fn expand_image_placeholders_count_based(
     Ok(expanded)
 }
 
+/// Per-step embedding fusion for a decoder whose prompt input is `inputs_embeds`
+/// (Gemma4-style VLM) rather than `input_ids`. Built by
+/// [`PipelineEngine::embeds_step_binding`].
+///
+/// The decoder has no token input of its own, so each decode step re-runs the
+/// fusion component to embed the running token into a single-token
+/// `inputs_embeds`. The prompt (prefill) step reuses the full-prompt embeddings
+/// already produced in the prompt phase.
+struct EmbedsStepBinding {
+    /// Decoder input port that receives the fused embeddings (`inputs_embeds`).
+    decoder_input: String,
+    /// Prompt-phase fusion component that produces the embeddings.
+    component: String,
+    /// The fusion component's output port routed to `decoder_input`.
+    output: String,
+    /// The fusion component's token input port (`input_ids`).
+    token_input: String,
+    /// Fusion conditioning (e.g. `image_features`) resolved once from the pool
+    /// and re-supplied unchanged on every decode step.
+    conditioning: Vec<(String, Value)>,
+    /// Full-prompt embeddings from the prompt phase, reused for the prefill step.
+    prefill: Value,
+}
+
 struct PipelineDecodeLoopBackend<'a> {
     decoder: &'a Session,
     decoder_state: &'a mut DecodeState,
     decoder_extras: &'a [(String, Value)],
+    /// Fusion component session, present iff `embeds_binding` is `Some`.
+    embed_session: Option<&'a Session>,
+    /// Per-step `inputs_embeds` fusion binding for a Gemma4-style VLM decoder.
+    embeds_binding: Option<EmbedsStepBinding>,
     context_tokens: Vec<TokenId>,
     prompt_len: usize,
     generated_count: usize,
+}
+
+impl PipelineDecodeLoopBackend<'_> {
+    /// Build this step's decoder extra inputs. When an [`EmbedsStepBinding`] is
+    /// active, append a freshly-computed `inputs_embeds`: the full-prompt
+    /// embeddings on prefill, or the re-embedded running token on later steps.
+    fn step_extras(&self) -> anyhow::Result<Vec<(String, Value)>> {
+        let Some(binding) = &self.embeds_binding else {
+            return self
+                .decoder_extras
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), clone_value(value)?)))
+                .collect();
+        };
+        let embeds = if self.generated_count == 0 {
+            clone_value(&binding.prefill)?
+        } else {
+            // Re-embed only the running (last generated) token. It is text-only
+            // with no image placeholder, so the fusion yields the pure token
+            // embedding; image conditioning is re-supplied but contributes zero.
+            let embed_session = self
+                .embed_session
+                .expect("embeds binding implies a loaded fusion session");
+            let last = *self
+                .context_tokens
+                .last()
+                .expect("a decode step always has a prior token");
+            let mut inputs: Vec<(String, Value)> =
+                Vec::with_capacity(binding.conditioning.len() + 1);
+            inputs.push((
+                binding.token_input.clone(),
+                Value::from_slice_i64(&[i64::from(last)], &[1, 1])?,
+            ));
+            for (name, value) in &binding.conditioning {
+                inputs.push((name.clone(), clone_value(value)?));
+            }
+            let refs = inputs
+                .iter()
+                .map(|(name, value)| (name.as_str(), value))
+                .collect::<Vec<_>>();
+            let outputs = embed_session.run(&refs).map_err(|e| {
+                anyhow::anyhow!(
+                    "ORT embedding fusion '{}' failed during decode: {e}",
+                    binding.component
+                )
+            })?;
+            let index = embed_session
+                .output_names()
+                .iter()
+                .position(|name| name == &binding.output)
+                .with_context(|| {
+                    format!(
+                        "embedding fusion component '{}' has no output '{}'",
+                        binding.component, binding.output
+                    )
+                })?;
+            clone_value(&outputs[index])?
+        };
+        let mut extras = Vec::with_capacity(self.decoder_extras.len() + 1);
+        for (name, value) in self.decoder_extras {
+            extras.push((name.clone(), clone_value(value)?));
+        }
+        extras.push((binding.decoder_input.clone(), embeds));
+        Ok(extras)
+    }
 }
 
 impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
@@ -1083,12 +1345,13 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         } else {
             self.context_tokens.clone()
         };
+        let extras = self.step_extras()?;
         let outputs = run_decode_step_with_extra(
             self.decoder,
             self.decoder_state,
             &input_tokens,
             past_len,
-            self.decoder_extras,
+            &extras,
         )?;
         extract_next_token_logits(self.decoder, outputs)
     }

@@ -1610,7 +1610,7 @@ fn ensure_i64(info: &TensorInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_token_input_name(lower_name: &str) -> bool {
+pub(crate) fn is_token_input_name(lower_name: &str) -> bool {
     lower_name == "input_ids"
         || lower_name == "decoder_input_ids"
         || lower_name.ends_with(".input_ids")

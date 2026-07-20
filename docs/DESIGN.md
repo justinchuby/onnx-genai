@@ -1362,7 +1362,47 @@ pipeline:
           kv_cache: { enabled: true }
 ```
 
-#### Reranking / Cross-Encoder
+#### Vision-Language (Gemma4-style, `inputs_embeds` fusion)
+
+Unlike OCR/captioning above (which conditions the decoder via cross-attention
+`encoder_hidden_states`), a Gemma-3/Gemma-4 VLM fuses image and text in
+**embedding space**: a prompt-phase `embedding` model merges `image_features`
+into the text-token embeddings at the image placeholder positions, and the
+decoder's prompt input is `inputs_embeds` (it has **no** `input_ids` input).
+
+```yaml
+pipeline:
+  models:
+    vision_encoder: { filename: vision_encoder.onnx, type: vision_encoder }
+    embedding:      { filename: embedding.onnx,      type: encoder }
+    decoder:        { filename: decoder.onnx,        type: decoder, tokenizer: tokenizer.json }
+  dataflow:
+    - { from: vision_encoder.image_features, to: embedding.image_features, dtype: fp32 }
+    - { from: embedding.inputs_embeds,       to: decoder.inputs_embeds,    dtype: fp32 }
+  strategy:
+    kind: composite
+    stages:
+      - { name: encode_vision,   strategy: { kind: single_pass,    model: vision_encoder }, run_on: prompt_only }
+      - { name: fuse_embeddings, strategy: { kind: single_pass,    model: embedding },      run_on: prompt_only }
+      - { name: decode,          strategy: { kind: autoregressive, decoder: decoder },      run_on: every_step }
+```
+
+The engine handles two seams unique to `inputs_embeds` fusion (see
+`pipeline.rs`: `seed_prompt_token_inputs`, `embeds_step_binding`):
+
+1. **Prompt seeding** — the prompt token ids are seeded into the shared pool as
+   `embedding.input_ids` (they come from the prompt, not another model), so the
+   fusion component can run in the prompt phase.
+2. **Per-step re-embedding** — because the decoder's `inputs_embeds` is a *self*
+   sequence input (unlike seq-independent cross-conditioning such as
+   `encoder_hidden_states`), each decode step re-runs the fusion component on the
+   single running token to produce that step's `inputs_embeds`; the prefill step
+   reuses the full-prompt embeddings. Cross-conditioning inputs (image features)
+   are resolved once and re-supplied unchanged. A decoder that carries its own
+   `input_ids` input embeds internally and skips this path.
+
+Fixture + test: `scripts/build_tiny_gemma4_vlm.py`,
+`tests/fixtures/tiny-gemma4-vlm/`, `gemma4_vlm_pipeline_e2e.rs`.
 
 ```yaml
 pipeline:

@@ -18,6 +18,9 @@ models/
 !crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
 !tests/fixtures/tiny-gemma4-assistant/model.onnx
 !tests/fixtures/tiny-gemma4-assistant/assistant/model.onnx
+!tests/fixtures/tiny-gemma4-vlm/vision_encoder.onnx
+!tests/fixtures/tiny-gemma4-vlm/embedding.onnx
+!tests/fixtures/tiny-gemma4-vlm/decoder.onnx
 !crates/onnx-runtime-session/tests/fixtures/bert_toy/model.onnx
 *.safetensors
 .DS_Store
