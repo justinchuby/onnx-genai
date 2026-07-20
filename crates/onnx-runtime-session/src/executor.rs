@@ -1929,15 +1929,28 @@ impl Executor {
         }
 
         let mut kernels = Vec::<&dyn onnx_runtime_ep_api::Kernel>::with_capacity(self.plan.len());
+        let mut incompatible = Vec::new();
         for plan in &self.plan {
             if plan
                 .outputs
                 .iter()
                 .any(|output| !resolved.contains_key(output))
             {
+                let node = self.graph.node(plan.node_id);
+                let domain = if node.domain.is_empty() {
+                    "ai.onnx"
+                } else {
+                    node.domain.as_str()
+                };
+                let name = if node.name.is_empty() {
+                    "<unnamed>"
+                } else {
+                    node.name.as_str()
+                };
                 return Err(format!(
-                    "node {} has a data-dependent output shape that was unresolved before capture",
-                    plan.node_id.0
+                    "node {} {name:?} ({domain}::{}) has a data-dependent output shape that was \
+                     unresolved before capture",
+                    plan.node_id.0, node.op_type
                 ));
             }
             let input_shapes = plan
@@ -1965,7 +1978,30 @@ impl Executor {
                     plan.node_id.0
                 )
             })?;
+            if !kernel.cuda_graph_compatible() {
+                let node = self.graph.node(plan.node_id);
+                let domain = if node.domain.is_empty() {
+                    "ai.onnx"
+                } else {
+                    node.domain.as_str()
+                };
+                let name = if node.name.is_empty() {
+                    "<unnamed>"
+                } else {
+                    node.name.as_str()
+                };
+                incompatible.push(format!(
+                    "node {} {name:?} ({domain}::{})",
+                    plan.node_id.0, node.op_type
+                ));
+            }
             kernels.push(kernel.as_ref());
+        }
+        if !incompatible.is_empty() {
+            return Err(format!(
+                "CUDA graph capture rejected before begin_capture: incompatible kernels: {}",
+                incompatible.join(", ")
+            ));
         }
         self.ep
             .begin_device_graph_capture(&kernels)

@@ -74,6 +74,7 @@ struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    graph_fallback_reason: Option<String>,
 }
 
 struct DecodeCudaIo<'a> {
@@ -288,6 +289,12 @@ impl NativeDecodeSession {
         self.cuda
             .as_ref()
             .map(|state| state.debug_stats(&self.session))
+    }
+
+    pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
+        self.cuda
+            .as_ref()
+            .and_then(|state| state.graph_fallback_reason.as_deref())
     }
 
     pub fn decode(
@@ -628,6 +635,7 @@ impl DecodeCudaState {
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            graph_fallback_reason: None,
         })
     }
 
@@ -697,6 +705,7 @@ impl DecodeCudaState {
                     DeviceGraphCaptureResult::NotCapturable(reason) => {
                         self.graph_fallbacks += 1;
                         self.graph_phase = DecodeCudaGraphPhase::Unsupported;
+                        self.graph_fallback_reason = Some(reason.clone());
                         tracing::warn!(
                             "native CUDA decode graph capture disabled for this generation: {reason}"
                         );
@@ -1466,6 +1475,7 @@ mod tests {
         assert_eq!(eager_stats.graph.captures, 0);
         assert_eq!(eager_stats.graph.replays, 0);
         assert_eq!(eager_stats.graph.fallbacks, 0);
+        assert!(eager.cuda_graph_fallback_reason().is_none());
 
         let mut captured = capture_safe_cuda_decoder(true, MAX_LEN)?;
         let captured_addresses = binding_addresses(&captured);
@@ -1476,6 +1486,7 @@ mod tests {
         assert_eq!(first_stats.graph.captures, 1);
         assert_eq!(first_stats.graph.replays, TOKENS.len() as u64 - 2);
         assert_eq!(first_stats.graph.fallbacks, 0);
+        assert!(captured.cuda_graph_fallback_reason().is_none());
         assert_eq!(captured_first, eager_first);
         assert_eq!(
             captured_first,
@@ -1627,6 +1638,11 @@ mod tests {
         assert_eq!(captured_after.graph.captures, 0);
         assert_eq!(captured_after.graph.replays, 0);
         assert_eq!(captured_after.graph.fallbacks, 1);
+        let fallback_reason = captured
+            .cuda_graph_fallback_reason()
+            .context("Qwen graph fallback must expose its diagnostic")?;
+        assert!(fallback_reason.contains("GroupQueryAttention"));
+        assert!(fallback_reason.contains("data-dependent output shape"));
 
         let eager_us = eager_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
         let captured_us = captured_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;

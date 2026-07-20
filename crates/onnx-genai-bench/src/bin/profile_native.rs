@@ -64,11 +64,13 @@ fn generate(
     tokenizer: &Tokenizer,
     tokens: usize,
 ) -> Result<Vec<u32>> {
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = tokens;
-    options.temperature = 0.0;
-    options.greedy = true;
-    options.stop_on_eos = false;
+    let options = GenerateOptions {
+        max_new_tokens: tokens,
+        temperature: 0.0,
+        greedy: true,
+        stop_on_eos: false,
+        ..GenerateOptions::default()
+    };
     let result = session.generate(prompt_tokens, &options, &ProcessorChain::new(), tokenizer)?;
     Ok(result.token_ids)
 }
@@ -164,8 +166,23 @@ fn main() -> Result<()> {
          ({generated} generated tokens in {:.3} ms)",
         elapsed.as_secs_f64() * 1_000.0
     );
+    if let Some(stats) = session.cuda_kv_debug_stats() {
+        println!(
+            "cuda_graph: enabled={} captures={} replays={} fallbacks={}",
+            stats.graph.enabled, stats.graph.captures, stats.graph.replays, stats.graph.fallbacks
+        );
+        if let Some(reason) = session.cuda_graph_fallback_reason() {
+            println!("cuda_graph_fallback_reason: {reason}");
+        }
+    }
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
+        println!(
+            "generated_text: {:?}",
+            tokenizer
+                .decode(&tokens)
+                .context("decode generated tokens")?
+        );
     }
     Ok(())
 }
