@@ -1235,10 +1235,16 @@ mod cuda_device_write_tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/tiny-llm/model.onnx");
 
     /// Build a CUDA session and return its device KV allocator together with the
-    /// EP-bound device id, or `None` when CUDA is unavailable so the caller can
-    /// skip gracefully. The `Session` is returned to keep the allocator (which
-    /// borrows the session's lifetime) valid.
-    fn cuda_device_allocator() -> Option<(Session, Allocator, i32)> {
+    /// EP-bound device id and the owning [`Environment`], or `None` when CUDA is
+    /// unavailable so the caller can skip gracefully.
+    ///
+    /// The `Environment` is returned (not dropped here) on purpose: ORT requires
+    /// the `OrtEnv` to outlive every `OrtSession`. Releasing the session after
+    /// its environment is a use-after-free that crashes with STATUS_ACCESS_VIOLATION
+    /// at `ReleaseSession`. Keeping the env in the returned tuple lets the caller
+    /// release everything in the correct order (value -> allocator -> session ->
+    /// environment).
+    fn cuda_device_allocator() -> Option<(Environment, Session, Allocator, i32)> {
         let env = Environment::new("cuda-device-write-test").expect("env");
         let options =
             SessionOptions::with_execution_provider(ep_selection("cuda")).with_intra_op_threads(1);
@@ -1254,7 +1260,7 @@ mod cuda_device_write_tests {
             return None;
         };
         match session.device_kv_allocator() {
-            Ok(Some(allocator)) => Some((session, allocator, device_id)),
+            Ok(Some(allocator)) => Some((env, session, allocator, device_id)),
             Ok(None) => {
                 eprintln!(
                     "device_kv_allocator() returned None (CUDA runtime/cuDNN not on the search path?)"
@@ -1279,21 +1285,28 @@ mod cuda_device_write_tests {
             .collect()
     }
 
-    /// Deliberately leak the device tensor, allocator, and session at the end of
-    /// a test. Releasing the ORT CUDA session/allocator during process teardown
-    /// segfaults with this ORT build (a known ORT CUDA shutdown issue, unrelated
-    /// to the code under test); leaking them in this short-lived test process is
-    /// harmless and keeps the assertions authoritative.
-    fn leak_cuda_resources(tensor: Value, allocator: Allocator, session: Session) {
-        std::mem::forget(tensor);
-        std::mem::forget(allocator);
-        std::mem::forget(session);
+    /// Release the CUDA resources in ORT's required ownership order: the device
+    /// `Value` (frees memory through the allocator), then the `Allocator`, then
+    /// the `Session`, and finally the `Environment`. ORT mandates that the
+    /// `OrtEnv` outlive every `OrtSession`; releasing them out of order (e.g.
+    /// dropping the environment first) is a use-after-free that crashes with
+    /// STATUS_ACCESS_VIOLATION. Dropping in this order releases cleanly.
+    fn release_cuda_resources_in_order(
+        tensor: Value,
+        allocator: Allocator,
+        session: Session,
+        env: Environment,
+    ) {
+        drop(tensor);
+        drop(allocator);
+        drop(session);
+        drop(env);
     }
 
     #[test]
     #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
     fn cuda_device_write_prefix_round_trips_through_device_memory() {
-        let Some((session, allocator, device_id)) = cuda_device_allocator() else {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
             eprintln!("skipping: no CUDA device allocator available");
             return;
         };
@@ -1314,13 +1327,13 @@ mod cuda_device_write_tests {
         assert_eq!(&read_back[..prefix.len()], &prefix);
         assert_eq!(&read_back[prefix.len()..], &[-1_i64, -1]);
 
-        leak_cuda_resources(tensor, allocator, session);
+        release_cuda_resources_in_order(tensor, allocator, session, env);
     }
 
     #[test]
     #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
     fn cuda_device_fill_range_round_trips_through_device_memory() {
-        let Some((session, allocator, device_id)) = cuda_device_allocator() else {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
             eprintln!("skipping: no CUDA device allocator available");
             return;
         };
@@ -1338,7 +1351,7 @@ mod cuda_device_write_tests {
         let read_back = read_device_i64(&mask, capacity);
         assert_eq!(read_back, vec![1, 1, 1, 1, 1, 0, 0, 0]);
 
-        leak_cuda_resources(mask, allocator, session);
+        release_cuda_resources_in_order(mask, allocator, session, env);
     }
 }
 
