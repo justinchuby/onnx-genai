@@ -699,6 +699,31 @@ pub struct PipelineStrategy {
     /// Ordered child stages for a composite strategy.
     #[serde(default)]
     pub stages: Vec<PipelineStrategyStage>,
+
+    /// Outer autoregressive decoder for a `nested_autoregressive` stage.
+    ///
+    /// The multi-decoder TTS (Qwen3-TTS-style) shape: one outer step is one
+    /// audio frame. The outer decoder (talker) produces a per-frame
+    /// `last_hidden_state` that seeds the inner loop (see `inner`).
+    #[serde(default)]
+    pub outer: Option<String>,
+
+    /// Inner autoregressive decoder for a `nested_autoregressive` stage.
+    ///
+    /// The code_predictor: for each outer frame it runs a short inner AR loop of
+    /// `num_code_groups` steps over the residual codebooks, seeded at inner step
+    /// 0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge
+    /// `outer.last_hidden_state -> inner.inputs_embeds`) and threading its own
+    /// per-step code embedding on later steps.
+    #[serde(default)]
+    pub inner: Option<String>,
+
+    /// Inner-loop depth (RVQ residual codebook count) for a
+    /// `nested_autoregressive` stage: the number of code tokens collected per
+    /// outer frame. Must be at least 1.
+    #[schemars(range(min = 1))]
+    #[serde(default)]
+    pub num_code_groups: Option<usize>,
 }
 
 /// Named child stage of a composite pipeline strategy.
@@ -806,6 +831,12 @@ pub enum PipelineStrategyKind {
     SinglePass,
     /// Ordered composition of nested strategies.
     Composite,
+    /// Dual, hierarchically-nested autoregressive loops (multi-decoder TTS).
+    ///
+    /// An outer decoder (talker) AR loop where each outer step drives an inner
+    /// decoder (code_predictor) AR loop; see [`PipelineStrategy::outer`],
+    /// [`PipelineStrategy::inner`], and [`PipelineStrategy::num_code_groups`].
+    NestedAutoregressive,
     /// Future strategy family not recognized by this runtime version.
     Other(String),
 }
@@ -821,6 +852,7 @@ impl<'de> Deserialize<'de> for PipelineStrategyKind {
             "iterative" | "diffusion_steps" | "diffusion-steps" => Self::Iterative,
             "single_pass" | "single-pass" => Self::SinglePass,
             "composite" => Self::Composite,
+            "nested_autoregressive" | "nested-autoregressive" => Self::NestedAutoregressive,
             _ => Self::Other(value),
         })
     }
@@ -1234,6 +1266,8 @@ mod schema_helpers {
                 "single_pass",
                 "single-pass",
                 "composite",
+                "nested_autoregressive",
+                "nested-autoregressive",
             ],
         );
     }

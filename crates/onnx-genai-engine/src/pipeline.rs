@@ -1,7 +1,7 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, clone_value, extract_next_token_logits, is_token_input_name,
+    DecodeState, clone_value, extract_next_token_logits, is_present_output, is_token_input_name,
     run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
@@ -201,6 +201,11 @@ impl PipelineEngine {
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
                 (Some(DecodeState::new(decoder)?), ar.decoder.clone())
             }
+            // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
+            // decode loops with per-loop `DecodeState`s built inside the driver,
+            // so no shared decode state is created here. The tokenizer component
+            // is the outer decoder (talker).
+            PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone()),
             PipelinePlan::SinglePass(sp) => (None, sp.model.clone()),
             PipelinePlan::Iterative(it) => (None, it.denoiser.clone()),
             // A pure composite produces tensors (run_pipeline), not text; it has
@@ -244,6 +249,14 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
+        // loops; `generate` returns the flattened per-frame code tokens (use
+        // `synthesize` to also run the post-decode vocoder into a waveform).
+        if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
+            return self
+                .run_nested_autoregressive(pipeline_request)
+                .map(|(result, _pool)| result);
+        }
         self.run_autoregressive(pipeline_request, callback)
             .map(|(result, _pool)| result)
     }
@@ -265,6 +278,12 @@ impl PipelineEngine {
         &mut self,
         pipeline_request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineSynthesis> {
+        // A nested-AR (multi-decoder TTS) pipeline publishes its assembled codes
+        // as `{outer}.output_codes` inside its own driver; run the post-decode
+        // vocoder over the shared pool separately.
+        if matches!(self.plan, PipelinePlan::NestedAutoregressive(_)) {
+            return self.synthesize_nested(pipeline_request);
+        }
         let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None)?;
         let ar = self.plan.autoregressive_plan()?.clone();
 
@@ -412,6 +431,176 @@ impl PipelineEngine {
         Ok((result, tensors))
     }
 
+    /// Post-decode counterpart to [`synthesize`](Self::synthesize) for a
+    /// nested-AR (multi-decoder TTS) pipeline: drive the outer/inner loops (which
+    /// publish `{outer}.output_codes` into the pool), then run the `final_only`
+    /// vocoder stage over the pool to produce the waveform.
+    fn synthesize_nested(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineSynthesis> {
+        let post_decode_components = match &self.plan {
+            PipelinePlan::NestedAutoregressive(plan) => plan.post_decode_components.clone(),
+            _ => anyhow::bail!("internal error: synthesize_nested on a non-nested plan"),
+        };
+        let (generation, mut tensors) = self.run_nested_autoregressive(pipeline_request)?;
+        self.run_prompt_phase_components(&post_decode_components, &mut tensors, "postlogue", None)?;
+        Ok(PipelineSynthesis {
+            generation,
+            tensors,
+        })
+    }
+
+    /// Drive a **dual, hierarchically-nested autoregressive** pipeline — the
+    /// multi-decoder TTS (Qwen3-TTS-style) shape (DESIGN.md §20.3).
+    ///
+    /// The **outer** decoder (talker) runs up to `max_frames` frames; each outer
+    /// step (one audio frame) produces a `last_hidden_state` that seeds the
+    /// **inner** decoder (code_predictor) AR loop of `num_code_groups` steps.
+    /// The inner loop threads the outer hidden state at inner step 0 and the
+    /// inner decoder's own per-code embedding output on later steps. Every code
+    /// group is assembled into the synthetic pool tensor `{outer}.output_codes`
+    /// of shape `[1, frames, num_code_groups]` (int64), and the flattened codes
+    /// are returned as the [`GenerateResult`]'s token ids.
+    fn run_nested_autoregressive(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+    ) -> anyhow::Result<(GenerateResult, PipelineTensors)> {
+        let plan = match &self.plan {
+            PipelinePlan::NestedAutoregressive(plan) => plan.clone(),
+            _ => anyhow::bail!(
+                "synthesize()/generate() on a nested pipeline requires a nested_autoregressive plan"
+            ),
+        };
+
+        let options = pipeline_request.request.options.clone();
+        options.validate()?;
+        let prompt_tokens = tokenize_with(self.tokenizer()?, &pipeline_request.request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+
+        let mut tensors = pipeline_request.inputs;
+        self.seed_prompt_token_inputs(&plan.prompt_components, &prompt_tokens, &mut tensors)?;
+        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors, "prologue", None)?;
+
+        // Fixed routed extras for each decoder (encoder conditioning etc.). The
+        // inner decoder's seed input is threaded per inner step, so exclude it.
+        let outer_extras = self.decoder_extra_inputs(&plan.outer, &tensors, None)?;
+        let inner_extras =
+            self.decoder_extra_inputs(&plan.inner, &tensors, Some(&plan.inner_embeds_input))?;
+
+        let outer_session = self
+            .models
+            .session(&plan.outer)
+            .with_context(|| format!("nested outer decoder '{}' was not loaded", plan.outer))?;
+        let inner_session = self
+            .models
+            .session(&plan.inner)
+            .with_context(|| format!("nested inner decoder '{}' was not loaded", plan.inner))?;
+
+        // The inner decoder's per-code embedding output: its sole output that is
+        // neither logits nor a present-KV tensor. Threaded into the next inner
+        // step's seed input.
+        let inner_embed_output = inner_session
+            .output_names()
+            .iter()
+            .find(|name| {
+                let lower = name.to_ascii_lowercase();
+                !lower.contains("logits") && !is_present_output(name)
+            })
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "nested inner decoder '{}' must expose a per-code embedding output (a \
+                     non-logits, non-KV output) to thread across inner steps",
+                    plan.inner
+                )
+            })?;
+
+        let mut outer_state = DecodeState::new(outer_session)?;
+        let mut codes: Vec<i64> = Vec::with_capacity(plan.max_frames * plan.num_code_groups);
+        // The outer loop feeds the full prompt on frame 0 (prefill), then the
+        // previous frame's outer argmax token on each subsequent frame.
+        let mut outer_input_tokens = prompt_tokens.clone();
+        let mut outer_past_len = 0usize;
+
+        for _frame in 0..plan.max_frames {
+            // --- Outer talker step: one audio frame. ---
+            let outer_outputs = run_decode_step_with_extra(
+                outer_session,
+                &mut outer_state,
+                &outer_input_tokens,
+                outer_past_len,
+                &outer_extras,
+            )?;
+            outer_past_len += outer_input_tokens.len();
+
+            let outer_logits = named_output(outer_session, &outer_outputs, "logits", true)?;
+            let outer_token = argmax_last_row(outer_logits)?;
+            let hidden = named_output(
+                outer_session,
+                &outer_outputs,
+                &plan.outer_hidden_output,
+                false,
+            )?;
+            let seed = last_position_hidden(hidden)?;
+            // The talker autoregresses on its own per-frame prediction.
+            outer_input_tokens = vec![u32::try_from(outer_token).unwrap_or(0)];
+
+            // --- Inner code_predictor loop: num_code_groups residual codes. ---
+            let mut inner_state = DecodeState::new(inner_session)?;
+            let mut inner_embeds = seed;
+            for step in 0..plan.num_code_groups {
+                let mut step_extras = Vec::with_capacity(inner_extras.len() + 1);
+                for (name, value) in &inner_extras {
+                    step_extras.push((name.clone(), clone_value(value)?));
+                }
+                step_extras.push((plan.inner_embeds_input.clone(), inner_embeds));
+
+                let inner_outputs = run_decode_step_with_extra(
+                    inner_session,
+                    &mut inner_state,
+                    &[0],
+                    step,
+                    &step_extras,
+                )?;
+                let inner_logits = named_output(inner_session, &inner_outputs, "logits", true)?;
+                codes.push(argmax_last_row(inner_logits)?);
+                // Thread the inner decoder's per-code embedding into the next step.
+                inner_embeds = clone_value(named_output(
+                    inner_session,
+                    &inner_outputs,
+                    &inner_embed_output,
+                    false,
+                )?)?;
+            }
+        }
+
+        // Publish the assembled per-frame codes as `{outer}.output_codes`
+        // [1, frames, num_code_groups] (int64) for the post-decode vocoder stage.
+        let codes_endpoint = format!("{}.output_codes", plan.outer);
+        let codes_value = Value::from_slice_i64(
+            &codes,
+            &[1, plan.max_frames as i64, plan.num_code_groups as i64],
+        )
+        .with_context(|| format!("failed to build generated-codes tensor '{codes_endpoint}'"))?;
+        tensors.insert(codes_endpoint, codes_value);
+
+        let token_ids: Vec<TokenId> = codes
+            .iter()
+            .map(|&c| u32::try_from(c).unwrap_or(0))
+            .collect();
+        let result = GenerateResult {
+            text: String::new(),
+            token_ids,
+            finish_reason: crate::FinishReason::MaxTokens,
+            prefix_cache_hit_len: 0,
+            logprobs: None,
+        };
+        Ok((result, tensors))
+    }
+
     pub fn spec(&self) -> &PipelineSpec {
         &self.models.directory.spec
     }
@@ -451,6 +640,10 @@ impl PipelineEngine {
             PipelinePlan::Autoregressive(_) => anyhow::bail!(
                 "run_pipeline() runs single-pass or iterative pipelines; use generate() for \
                  autoregressive text pipelines"
+            ),
+            PipelinePlan::NestedAutoregressive(_) => anyhow::bail!(
+                "run_pipeline() runs single-pass or iterative pipelines; use synthesize() for \
+                 a nested-autoregressive (multi-decoder TTS) pipeline"
             ),
         }
     }
@@ -1446,6 +1639,8 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
 #[derive(Debug, Clone)]
 enum PipelinePlan {
     Autoregressive(AutoregressivePlan),
+    /// Dual, hierarchically-nested AR loops (multi-decoder TTS, DESIGN.md §20.3).
+    NestedAutoregressive(NestedAutoregressivePlan),
     SinglePass(SinglePassPlan),
     Iterative(Box<IterativePlan>),
     /// Multi-stage pipeline (DESIGN.md §20): ordered stages run over a shared
@@ -1496,6 +1691,46 @@ struct AutoregressivePlan {
     /// Single-pass components declared `final_only`: run once, in declared
     /// order, after the decode loop completes (e.g. a TTS vocoder). Empty for a
     /// conventional text decoder or a Whisper-style ASR pipeline.
+    post_decode_components: Vec<String>,
+    dataflow: Vec<DataflowEdge>,
+}
+
+/// Dual, hierarchically-nested autoregressive pipeline — the multi-decoder TTS
+/// (Qwen3-TTS-style) shape (DESIGN.md §20.3).
+///
+/// An **outer** AR loop (talker) runs up to `max_frames` frames; each outer step
+/// is one audio frame and produces a per-frame `last_hidden_state`. That hidden
+/// state seeds an **inner** AR loop (code_predictor) of `num_code_groups` steps
+/// that emits the residual code groups for the frame. The inner loop threads the
+/// seed at inner step 0 (via the dataflow edge
+/// `{outer}.last_hidden_state -> {inner}.inputs_embeds`) and, on later steps, the
+/// inner decoder's own per-code embedding output (threaded by the driver — no
+/// dataflow self-edge, so the acyclic/single-producer validator stays happy).
+///
+/// All generated codes assemble into the synthetic pool tensor
+/// `{outer}.output_codes` of shape `[1, frames, num_code_groups]` (int64), routed
+/// to a post-decode `final_only` vocoder stage by a dataflow edge (e.g.
+/// `talker.output_codes -> vocoder.codes`).
+#[derive(Debug, Clone)]
+struct NestedAutoregressivePlan {
+    /// Outer decoder component (talker); one outer step == one audio frame.
+    outer: String,
+    /// Inner decoder component (code_predictor); expands one frame's residuals.
+    inner: String,
+    /// Inner-loop depth: code groups collected per frame (RVQ residual count).
+    num_code_groups: usize,
+    /// Maximum number of outer frames to generate.
+    max_frames: usize,
+    /// Outer decoder output port carrying the per-frame hidden state that seeds
+    /// the inner loop (from the `{outer}.last_hidden_state -> {inner}.inputs_embeds`
+    /// dataflow edge).
+    outer_hidden_output: String,
+    /// Inner decoder input port that receives the seed / threaded embedding.
+    inner_embeds_input: String,
+    /// Prompt-phase components (`prompt_only`), run once before the outer loop.
+    prompt_components: Vec<String>,
+    /// Post-decode components (`final_only`, e.g. a vocoder), run once after the
+    /// outer loop over the shared pool (which holds `{outer}.output_codes`).
     post_decode_components: Vec<String>,
     dataflow: Vec<DataflowEdge>,
 }
@@ -2855,6 +3090,12 @@ impl Scheduler for Dpmpp2m {
 
 impl PipelinePlan {
     fn from_spec(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
+        // A dual, hierarchically-nested AR pipeline (multi-decoder TTS) is
+        // detected before the single-decoder AR path: its outer+inner decoders
+        // are driven by a dedicated nested loop, not the flat AR decode driver.
+        if let Some(stage) = nested_autoregressive_strategy(&spec.strategy) {
+            return Self::nested_autoregressive(spec, stage);
+        }
         // A composite whose stages contain an autoregressive decoder is treated
         // as an autoregressive text pipeline (unchanged legacy behavior). Pure
         // iterative / single-pass composites are a follow-up.
@@ -2867,6 +3108,11 @@ impl PipelinePlan {
             PipelineStrategyKind::Composite => Self::composite(spec),
             PipelineStrategyKind::Autoregressive => {
                 anyhow::bail!("autoregressive strategy is missing its 'decoder' component")
+            }
+            PipelineStrategyKind::NestedAutoregressive => {
+                anyhow::bail!(
+                    "nested_autoregressive strategy is missing its 'outer'/'inner' decoders"
+                )
             }
             PipelineStrategyKind::Other(ref value) => {
                 anyhow::bail!("unsupported pipeline strategy kind '{value}'")
@@ -2882,6 +3128,112 @@ impl PipelinePlan {
         let post_decode_components = post_decode_components(spec, &decoder)?;
         Ok(Self::Autoregressive(AutoregressivePlan {
             decoder,
+            prompt_components,
+            post_decode_components,
+            dataflow: spec.dataflow.clone(),
+        }))
+    }
+
+    /// Build a [`NestedAutoregressivePlan`] (multi-decoder TTS, DESIGN.md §20.3)
+    /// from the `nested_autoregressive` strategy `nested` (which may be a
+    /// top-level strategy or a composite stage). Validates the outer/inner
+    /// decoders, the inner-loop depth, and the per-frame hidden binding.
+    fn nested_autoregressive(
+        spec: &PipelineSpec,
+        nested: &PipelineStrategy,
+    ) -> anyhow::Result<Self> {
+        let outer = nested
+            .outer
+            .clone()
+            .context("nested_autoregressive strategy is missing its 'outer' decoder")?;
+        let inner = nested
+            .inner
+            .clone()
+            .context("nested_autoregressive strategy is missing its 'inner' decoder")?;
+        if !spec.models.contains_key(&outer) {
+            anyhow::bail!(
+                "nested_autoregressive outer decoder '{outer}' is not declared in models"
+            );
+        }
+        if !spec.models.contains_key(&inner) {
+            anyhow::bail!(
+                "nested_autoregressive inner decoder '{inner}' is not declared in models"
+            );
+        }
+        if outer == inner {
+            anyhow::bail!(
+                "nested_autoregressive 'outer' and 'inner' must be distinct decoders (both '{outer}')"
+            );
+        }
+        let num_code_groups = nested
+            .num_code_groups
+            .context("nested_autoregressive strategy is missing 'num_code_groups'")?;
+        if num_code_groups == 0 {
+            anyhow::bail!("nested_autoregressive 'num_code_groups' must be greater than zero");
+        }
+        let max_frames = nested
+            .max_tokens
+            .context("nested_autoregressive strategy is missing 'max_tokens' (max audio frames)")?;
+        if max_frames == 0 {
+            anyhow::bail!(
+                "nested_autoregressive 'max_tokens' (max frames) must be greater than zero"
+            );
+        }
+
+        // The per-frame hidden binding is the dataflow edge feeding the inner
+        // decoder's seed input from the outer decoder's hidden-state output.
+        let inner_embeds_endpoint_edge = spec
+            .dataflow
+            .iter()
+            .find(|edge| {
+                endpoint_component(&edge.to) == Some(inner.as_str())
+                    && endpoint_component(&edge.from) == Some(outer.as_str())
+            })
+            .with_context(|| {
+                format!(
+                    "nested_autoregressive needs a per-frame hidden binding: a dataflow edge \
+                     '{outer}.last_hidden_state -> {inner}.inputs_embeds'"
+                )
+            })?;
+        let (_, outer_hidden_output) = parse_endpoint(&inner_embeds_endpoint_edge.from)?;
+        let (_, inner_embeds_input) = parse_endpoint(&inner_embeds_endpoint_edge.to)?;
+        let outer_hidden_output = outer_hidden_output.to_string();
+        let inner_embeds_input = inner_embeds_input.to_string();
+
+        // The inner decoder threads its own per-code embedding on later steps;
+        // its exact output port is resolved from the loaded session in the driver
+        // (the sole non-logits, non-KV output), since sessions are not available
+        // at plan-build time.
+
+        // Prompt-phase (`prompt_only`) and post-decode (`final_only`) components,
+        // treating both loop decoders as loop components (neither pre nor post).
+        let mut prompt_components = Vec::new();
+        let mut post_decode_components = Vec::new();
+        for component in topological_components(spec)? {
+            if component == outer || component == inner {
+                continue;
+            }
+            match component_phase(spec, &component, &outer) {
+                PhaseRunOn::PromptOnly => prompt_components.push(component),
+                PhaseRunOn::FinalOnly => post_decode_components.push(component),
+                PhaseRunOn::OnDemand => {}
+                PhaseRunOn::EveryStep => anyhow::bail!(
+                    "nested_autoregressive component '{component}' declares run_on: every_step, \
+                     but only the outer/inner decoders may run inside the nested loop"
+                ),
+                PhaseRunOn::Other(value) => anyhow::bail!(
+                    "unsupported phase '{value}' for pipeline component '{component}'"
+                ),
+            }
+        }
+
+        Ok(Self::NestedAutoregressive(NestedAutoregressivePlan {
+            outer,
+            inner,
+            num_code_groups,
+            max_frames,
+            outer_hidden_output,
+            inner_embeds_input,
             prompt_components,
             post_decode_components,
             dataflow: spec.dataflow.clone(),
@@ -2954,7 +3306,9 @@ impl PipelinePlan {
                     "composite iterative stage '{}' is not yet supported (single-pass stages only)",
                     stage.name
                 ),
-                PipelineStrategyKind::Autoregressive | PipelineStrategyKind::Composite => {
+                PipelineStrategyKind::Autoregressive
+                | PipelineStrategyKind::Composite
+                | PipelineStrategyKind::NestedAutoregressive => {
                     anyhow::bail!(
                         "composite stage '{}' has an unsupported nested strategy kind for a \
                          non-autoregressive composite",
@@ -3096,6 +3450,7 @@ impl PipelinePlan {
     fn dataflow(&self) -> &[DataflowEdge] {
         match self {
             Self::Autoregressive(plan) => &plan.dataflow,
+            Self::NestedAutoregressive(plan) => &plan.dataflow,
             Self::SinglePass(plan) => &plan.dataflow,
             Self::Iterative(plan) => &plan.dataflow,
             Self::Composite(plan) => &plan.dataflow,
@@ -3171,7 +3526,22 @@ fn autoregressive_decoder(strategy: &PipelineStrategy) -> Option<String> {
             .find_map(|stage| autoregressive_decoder(&stage.strategy)),
         PipelineStrategyKind::Iterative
         | PipelineStrategyKind::SinglePass
+        | PipelineStrategyKind::NestedAutoregressive
         | PipelineStrategyKind::Other(_) => None,
+    }
+}
+
+/// Find the `nested_autoregressive` strategy in a pipeline: either the top-level
+/// strategy or a stage of a composite. Returns the strategy carrying the
+/// `outer` / `inner` / `num_code_groups` fields.
+fn nested_autoregressive_strategy(strategy: &PipelineStrategy) -> Option<&PipelineStrategy> {
+    match strategy.kind {
+        PipelineStrategyKind::NestedAutoregressive => Some(strategy),
+        PipelineStrategyKind::Composite => strategy
+            .stages
+            .iter()
+            .find_map(|stage| nested_autoregressive_strategy(&stage.strategy)),
+        _ => None,
     }
 }
 
@@ -3228,6 +3598,81 @@ fn endpoint_component(endpoint: &str) -> Option<&str> {
     parse_endpoint(endpoint)
         .ok()
         .map(|(component, _)| component)
+}
+
+/// Locate a named session output by index and return a reference to its value.
+///
+/// With `contains == false` the name must match exactly; with `contains == true`
+/// an exact match is preferred but a case-insensitive substring match (e.g. a
+/// prefixed `logits`) is accepted as a fallback, mirroring the decode helpers.
+fn named_output<'a>(
+    session: &Session,
+    outputs: &'a [Value],
+    name: &str,
+    contains: bool,
+) -> anyhow::Result<&'a Value> {
+    let index = session
+        .output_names()
+        .iter()
+        .position(|out| out == name)
+        .or_else(|| {
+            if contains {
+                let needle = name.to_ascii_lowercase();
+                session
+                    .output_names()
+                    .iter()
+                    .position(|out| out.to_ascii_lowercase().contains(&needle))
+            } else {
+                None
+            }
+        })
+        .with_context(|| format!("model did not expose output '{name}'"))?;
+    outputs
+        .get(index)
+        .with_context(|| format!("output '{name}' index was out of range"))
+}
+
+/// Argmax over the last sequence row of a logits tensor (`[V]`, `[S, V]`, or
+/// `[1, S, V]`), returning the winning vocabulary index. Ties take the lowest
+/// index, matching greedy decoding.
+fn argmax_last_row(logits: &Value) -> anyhow::Result<i64> {
+    let shape = logits.shape();
+    let data = logits
+        .to_vec_f32_lossy()
+        .map_err(|e| anyhow::anyhow!("failed to read logits tensor: {e}"))?;
+    let vocab = match shape {
+        [vocab] if *vocab > 0 => *vocab as usize,
+        [seq, vocab] if *seq > 0 && *vocab > 0 => *vocab as usize,
+        [batch, seq, vocab] if *batch == 1 && *seq > 0 && *vocab > 0 => *vocab as usize,
+        other => anyhow::bail!("unsupported logits tensor shape: {other:?}"),
+    };
+    let start = data.len() - vocab;
+    let row = &data[start..];
+    let mut best = 0usize;
+    for (i, &value) in row.iter().enumerate() {
+        if value > row[best] {
+            best = i;
+        }
+    }
+    Ok(best as i64)
+}
+
+/// Slice the last sequence position of a hidden-state tensor (`[H]`, `[S, H]`,
+/// or `[1, S, H]`) into a `[1, 1, H]` `float32` seed for the inner decoder.
+fn last_position_hidden(hidden: &Value) -> anyhow::Result<Value> {
+    let shape = hidden.shape();
+    let data = hidden
+        .to_vec_f32_lossy()
+        .map_err(|e| anyhow::anyhow!("failed to read hidden-state tensor: {e}"))?;
+    let hidden_dim = match shape {
+        [h] if *h > 0 => *h as usize,
+        [seq, h] if *seq > 0 && *h > 0 => *h as usize,
+        [batch, seq, h] if *batch == 1 && *seq > 0 && *h > 0 => *h as usize,
+        other => anyhow::bail!("unsupported hidden-state tensor shape: {other:?}"),
+    };
+    let start = data.len() - hidden_dim;
+    Value::from_slice_f32(&data[start..], &[1, 1, hidden_dim as i64])
+        .map_err(|e| anyhow::anyhow!("failed to build inner seed embedding: {e}"))
 }
 
 #[cfg(test)]
@@ -3486,6 +3931,9 @@ pipeline:
                 cfg_conditioning_input: None,
                 guidance_scale: None,
                 state: None,
+                outer: None,
+                inner: None,
+                num_code_groups: None,
                 stages: vec![
                     PipelineStrategyStage {
                         name: "encode".to_string(),
@@ -3508,6 +3956,9 @@ pipeline:
                             cfg_conditioning_input: None,
                             guidance_scale: None,
                             state: None,
+                            outer: None,
+                            inner: None,
+                            num_code_groups: None,
                             stages: vec![],
                         }),
                         run_on: Some(PhaseRunOn::PromptOnly),
@@ -3533,6 +3984,9 @@ pipeline:
                             cfg_conditioning_input: None,
                             guidance_scale: None,
                             state: None,
+                            outer: None,
+                            inner: None,
+                            num_code_groups: None,
                             stages: vec![],
                         }),
                         run_on: Some(PhaseRunOn::EveryStep),
@@ -3590,6 +4044,9 @@ pipeline:
             cfg_conditioning_input: None,
             guidance_scale: None,
             state: None,
+            outer: None,
+            inner: None,
+            num_code_groups: None,
             stages: vec![],
         }
     }

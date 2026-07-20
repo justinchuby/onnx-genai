@@ -1251,47 +1251,78 @@ generated codes and the final tensor pool (see §20.4). `generate` still works o
 a TTS pipeline — it drives the AR loop and returns the code tokens only, without
 running the post-decode stages.
 
-#### Multi-decoder TTS (Qwen3-TTS-style) — design, not yet implemented
+#### Multi-decoder TTS (Qwen3-TTS-style) — `nested_autoregressive`
 
 The TTS example above is the **single-AR-decoder** shape (one code stream → vocoder).
 Production neural TTS such as **Qwen3-TTS** (built by Mobius `TTSTask`) is a
-**dual, nested autoregressive** architecture that the current composite contract
-does **not** express. Its components (Mobius `src/mobius/tasks/_tts.py`):
+**dual, nested autoregressive** architecture expressed by the
+`nested_autoregressive` composite stage kind. Its components (Mobius
+`src/mobius/tasks/_tts.py`):
 
 - `embedding`: `text_ids + codec_ids → text_embeds + codec_embeds` (fusion).
-- `talker` (AR decoder): `inputs_embeds → logits (first code group) + last_hidden_state + KV`.
-- `code_predictor` (AR decoder): `inputs_embeds → hidden_states + KV` — an **inner**
-  loop that expands the talker's per-frame `last_hidden_state` into the remaining
-  residual code groups (RVQ depth), with its own KV cache and 1D RoPE.
-- `speaker_encoder` (optional): `mel → speaker_embedding` conditioning.
-- The waveform is produced by a **separate** codec/vocoder model (e.g. Mimi
-  `codec` decoder, `codes → waveform`), not part of the TTS package.
+- `talker` (AR **outer** decoder): `inputs_embeds → logits (first code group) +
+  last_hidden_state + KV`. One outer step = one audio frame.
+- `code_predictor` (AR **inner** decoder): `inputs_embeds → logits + KV` — an
+  inner loop that expands the talker's per-frame `last_hidden_state` into the
+  residual code groups (RVQ depth = `num_code_groups`), with its own KV cache.
+- The waveform is produced by a **separate** codec/vocoder model
+  (`codes → waveform`), not part of the TTS package.
 
-Why it exceeds the current contract: the composite strategy supports **one** loop
-stage (AR or iterative) plus single-pass pre/post stages. Qwen3-TTS needs **two
-autoregressive loops composed hierarchically** — for each talker step (one frame),
-the code_predictor runs a short inner AR loop over the residual codebooks, threading
-the talker's `last_hidden_state` in and collecting all code groups per frame.
+The `nested_autoregressive` stage composes **two autoregressive loops
+hierarchically**: for each outer (talker) step — one frame — the inner
+(code_predictor) decoder runs a short AR loop of `num_code_groups` steps,
+threading the talker's `last_hidden_state` in and collecting all code groups for
+that frame.
 
-Proposed contract extension (deliberate, not to be rushed):
+**Contract.** A composite stage carries:
 
-1. A new nested loop stage kind, e.g. `kind: nested_autoregressive`, with an
-   `outer` decoder (talker) and an `inner` decoder (code_predictor), plus the
-   per-frame binding `talker.last_hidden_state -> code_predictor.inputs_embeds`
-   and the residual-depth (`num_code_groups`) count for the inner loop.
-2. A generated-codes tensor contract that assembles `[frames, num_code_groups]`
-   codes into `decoder.output_codes`, consumed by an external codec `vocoder`
-   single-pass post-stage via a normal dataflow edge (as in the simple TTS case).
-3. Engine work: generalize the AR decode driver so a per-step callback can run the
-   inner loop and emit multiple code tokens per outer step, reusing `DecodeState`
-   for both decoders. Emission work: a `_looks_like_tts` structural detector
-   (`talker` + `code_predictor` present) + a `build_tts_pipeline_metadata` emitter
-   in Mobius. Until both land, Mobius **fails loudly** on a multi-decoder TTS
-   package rather than mis-emitting bare-decoder metadata (see
-   `write_onnx_genai_config`).
+```yaml
+strategy:
+  kind: composite
+  stages:
+    - {name: fuse, strategy: {kind: single_pass, model: embedding}, run_on: prompt_only}
+    - name: generate_codes
+      strategy:
+        kind: nested_autoregressive
+        outer: talker            # AR outer decoder (one step per audio frame)
+        inner: code_predictor    # AR inner decoder (num_code_groups steps per frame)
+        num_code_groups: 4       # inner-loop depth (RVQ residual codebooks)
+      run_on: every_step
+    - {name: vocode, strategy: {kind: single_pass, model: vocoder}, run_on: final_only}
+dataflow:
+  # inner step-0 seed: talker frame hidden state → inner decoder input embeds
+  - {from: talker.last_hidden_state, to: code_predictor.inputs_embeds}
+  # assembled per-frame codes → external codec vocoder
+  - {from: talker.output_codes, to: vocoder.codes}
+```
 
-This is a self-contained follow-up feature; it does not affect the single-AR-decoder
-TTS path (§20.3) or any other modality.
+1. **Fields.** `nested_autoregressive` adds `outer` (talker decoder name),
+   `inner` (code_predictor decoder name) and `num_code_groups` (inner-loop
+   depth) to `PipelineStrategy`. Validation requires both decoders to be declared
+   models and `num_code_groups >= 1`.
+2. **Per-frame hidden seed.** The dataflow edge
+   `talker.last_hidden_state -> code_predictor.inputs_embeds` supplies the inner
+   loop's **step-0** input. On later inner steps the driver threads the inner
+   decoder's own per-code embedding output (its sole non-logits, non-KV output)
+   back into `inputs_embeds` — an in-driver loop-carry rather than a dataflow
+   self-edge (the validator permits at most one edge per destination port and
+   allows self-edges only for iterative denoisers).
+3. **Assembled codes.** Every code group is written into the synthetic pool
+   tensor `{outer}.output_codes` (e.g. `talker.output_codes`) of shape
+   `[1, frames, num_code_groups]` (int64). A `final_only` single-pass `vocoder`
+   stage consumes it via the `talker.output_codes -> vocoder.codes` dataflow
+   edge, reusing the post-decode-stage machinery of the single-AR TTS path.
+4. **Engine.** `PipelinePlan::NestedAutoregressive` drives an outer AR loop (up to
+   `max_frames`) and, per frame, a fresh inner AR loop of `num_code_groups`
+   steps, reusing `DecodeState` for both decoders. `generate` returns the
+   flattened per-frame code tokens; `synthesize` additionally runs the vocoder
+   post-stage into a waveform.
+
+The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
+`scripts/build_tiny_tts_nested.py`) and the test
+`crates/onnx-genai-engine/tests/tts_nested_pipeline_e2e.rs` prove the nested-loop
+mechanism with a closed form. This path does not affect the single-AR-decoder TTS
+path or any other modality.
 
 #### Speech-to-Text (ASR / Whisper-style)
 

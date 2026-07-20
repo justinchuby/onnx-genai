@@ -1075,6 +1075,14 @@
           "format": "float",
           "minimum": 0.0
         },
+        "inner": {
+          "description": "Inner autoregressive decoder for a `nested_autoregressive` stage.\n\nThe code_predictor: for each outer frame it runs a short inner AR loop of\n`num_code_groups` steps over the residual codebooks, seeded at inner step\n0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge\n`outer.last_hidden_state -> inner.inputs_embeds`) and threading its own\nper-step code embedding on later steps.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "kind": {
           "description": "Strategy family; determines which strategy-specific fields are meaningful.",
           "$ref": "#/$defs/PipelineStrategyKind"
@@ -1098,6 +1106,16 @@
             "null"
           ]
         },
+        "num_code_groups": {
+          "description": "Inner-loop depth (RVQ residual codebook count) for a\n`nested_autoregressive` stage: the number of code tokens collected per\nouter frame. Must be at least 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
+        },
         "num_steps": {
           "description": "Number of iterative or diffusion steps.",
           "type": [
@@ -1106,6 +1124,14 @@
           ],
           "format": "uint",
           "minimum": 1
+        },
+        "outer": {
+          "description": "Outer autoregressive decoder for a `nested_autoregressive` stage.\n\nThe multi-decoder TTS (Qwen3-TTS-style) shape: one outer step is one\naudio frame. The outer decoder (talker) produces a per-frame\n`last_hidden_state` that seeds the inner loop (see `inner`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "scheduler": {
           "description": "Scheduler identifier for iterative or diffusion execution.",
@@ -1194,7 +1220,9 @@
             "diffusion-steps",
             "single_pass",
             "single-pass",
-            "composite"
+            "composite",
+            "nested_autoregressive",
+            "nested-autoregressive"
           ]
         },
         {
@@ -1208,7 +1236,9 @@
               "diffusion-steps",
               "single_pass",
               "single-pass",
-              "composite"
+              "composite",
+              "nested_autoregressive",
+              "nested-autoregressive"
             ]
           }
         }
