@@ -495,6 +495,16 @@ impl CaptureState {
     /// graph reads these device buffers directly, so the update is observed on
     /// the next replay without any re-bind (see `step_captured`). Mirrors the
     /// O(1) mask-tail growth of [`write_step_inputs_host`](Self::write_step_inputs_host).
+    ///
+    /// The copies are issued on cudart's default stream and, for pageable host
+    /// sources, may return before the DMA to device memory has completed (CUDA
+    /// API synchronization contract). ORT replays the captured graph on a
+    /// `cudaStreamNonBlocking` stream that does not serialize against the default
+    /// stream, so this synchronizes the device before returning to guarantee the
+    /// fresh input bytes are globally visible before the replay reads them (RAW
+    /// ordering — microsoft/onnxruntime#29782). At this point the device is
+    /// otherwise idle (the prior step's device sampler already synchronized it),
+    /// so the sync only drains these few tiny transfers.
     #[cfg(feature = "cuda")]
     fn write_step_inputs_device(
         &mut self,
@@ -522,6 +532,10 @@ impl CaptureState {
             )?;
         }
         self.mask_valid_len = valid_len;
+        // Order the host->device input copies above before ORT's non-blocking
+        // captured-graph replay reads these buffers (see the doc comment).
+        let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+        crate::cuda_rt::device_synchronize()?;
         Ok(())
     }
 

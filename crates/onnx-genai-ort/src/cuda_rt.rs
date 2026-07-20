@@ -250,13 +250,17 @@ pub(crate) fn memset_zero(dst: usize, bytes: usize) -> Result<()> {
 /// microsoft/onnxruntime#29782). Each token refreshes those buffers with this
 /// host->device copy instead of clearing and re-binding the whole IoBinding set.
 ///
-/// The runtime-API `cudaMemcpy` is synchronous for a pageable host source: it
-/// returns only once the transfer to device memory has completed, so the fresh
-/// values are globally visible before the caller launches the graph replay
-/// (RAW-safe). Ordering against the *previous* replay's read of these buffers
-/// (WAR) is guaranteed by the caller: the device sampler fully synchronizes the
-/// device at the end of every captured step before the next step overwrites the
-/// inputs.
+/// This issues `cudaMemcpy` on cudart's default stream. Per the CUDA API
+/// synchronization contract, a copy from *pageable* host memory to device memory
+/// returns once the source has been staged for DMA, but **the DMA to device
+/// memory may not have completed** when the call returns. ORT replays the
+/// captured graph on a stream created with `cudaStreamNonBlocking`, which does
+/// not serialize against the default stream, so the caller MUST synchronize the
+/// device between the input refresh and the replay to make the fresh bytes
+/// globally visible (RAW ordering — done in `CaptureState::write_step_inputs_device`).
+/// Ordering against the *previous* replay's read of these buffers (WAR) is
+/// guaranteed separately: the device sampler fully synchronizes the device at the
+/// end of every captured step before the next step overwrites the inputs.
 pub(crate) fn memcpy_host_to_device(dst: usize, src: &[u8]) -> Result<()> {
     if src.is_empty() {
         return Ok(());
