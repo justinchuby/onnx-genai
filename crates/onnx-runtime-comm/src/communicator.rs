@@ -1,17 +1,9 @@
 //! The runtime-level [`Communicator`] abstraction
 //! (`docs/DISTRIBUTED_RUNTIME.md` §3.1).
 //!
-//! # Slice 1b scope
-//!
-//! This slice defines the full trait shape and provides the
-//! [`InProcessCommunicator`](crate::InProcessCommunicator) reference backend's
-//! **plumbing**: identity/topology, point-to-point `send`/`recv`, `barrier`,
-//! `abort`, and the buffer-ownership registry integration. The collective
-//! *algorithms* — reduction math (`all_reduce`, `reduce_scatter`), data
-//! movement and variable-size permutation (`all_gather`, `broadcast`,
-//! `all_to_all`, `exchange_counts`, `all_to_all_v`), and the collective-ordering
-//! submit sequencer — are slice 1c. Those methods return
-//! [`CommError::CollectiveDeferred`](crate::CommError::CollectiveDeferred) here.
+//! The [`InProcessCommunicator`](crate::InProcessCommunicator) is the
+//! single-process correctness oracle: it implements every method, deterministic
+//! reduction math, and per-group collective ordering.
 
 use async_trait::async_trait;
 
@@ -58,7 +50,7 @@ pub trait Communicator: Send + Sync {
     /// Human-readable backend name (e.g., "inprocess", "nccl", "gloo").
     fn backend_name(&self) -> &str;
 
-    // ── Collective operations (algorithms deferred to slice 1c) ──
+    // ── Collective operations ──
 
     /// In-place all-reduce: every rank ends with the element-wise reduction of
     /// all inputs.

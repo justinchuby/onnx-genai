@@ -1,18 +1,15 @@
 //! Runtime communicator abstraction, in-process reference backend, and the
-//! backend buffer-ownership lease registry (distributed-runtime **slice 1b**).
+//! backend buffer-ownership lease registry and collective ordering.
 //!
-//! See `docs/COMMUNICATOR_BUFFER_IMPL.md` for the design, the
-//! `BufferOwnership.tla` linearization-point table, the conformance campaigns,
-//! and what is deferred to slice 1c.
+//! See `docs/COMMUNICATOR_BUFFER_IMPL.md` and
+//! `docs/COLLECTIVE_ORDERING_IMPL.md`.
 //!
 //! # What this crate provides
 //!
 //! * [`Communicator`] — the runtime-level collective/point-to-point trait
 //!   (`docs/DISTRIBUTED_RUNTIME.md` §3.1).
 //! * [`InProcessCommunicator`] — the Phase-1 single-process, multi-rank
-//!   reference backend and test oracle (§4.6). Slice 1b implements its
-//!   point-to-point, barrier, and buffer-ownership plumbing; collective
-//!   *algorithms* are slice 1c.
+//!   reference backend and test oracle (§4.6), including all collectives.
 //! * [`OwnershipRegistry`] — the backend buffer-ownership lease registry,
 //!   refined against `specs/tla/BufferOwnership.tla`, emitting contract-revision
 //!   trace events at each linearization point for the independent replay
@@ -22,11 +19,14 @@
 
 pub mod communicator;
 pub mod inprocess;
+pub mod ordering;
+mod reduction;
 pub mod registry;
 pub mod types;
 
 pub use communicator::Communicator;
 pub use inprocess::InProcessCommunicator;
+pub use ordering::{CollectiveSequencer, membership_hash};
 pub use registry::{
     CommLeaseSet, OperationLease, OwnershipError, OwnershipRegistry, OwnershipSnapshot,
 };

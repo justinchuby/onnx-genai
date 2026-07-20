@@ -105,6 +105,10 @@ pub enum OwnershipError {
     /// `free_buffer` was asked to free an allocation that is already freed.
     #[error("allocation {0} is already freed")]
     AlreadyFreed(PhysicalAllocationId),
+    /// The bounded exact tombstone window is full. The allocator must seal an
+    /// epoch before more out-of-order frees can be recorded.
+    #[error("freed-allocation tombstone window is full; seal an allocator epoch")]
+    FreedTrackingCapacity,
 }
 
 /// Backend registry state for one operation. Maps to `BufferOwnership.tla`'s
@@ -135,7 +139,12 @@ impl OperationEntry {
 #[derive(Debug)]
 struct RegistryState {
     operations: BTreeMap<OperationId, OperationEntry>,
+    /// Exact tombstones at or above `retired_before`.
     freed: BTreeSet<PhysicalAllocationId>,
+    /// Allocator-proven floor: identities below this value can never be leased
+    /// again, allowing their exact tombstones to be reclaimed.
+    retired_before: u64,
+    freed_total: u64,
     next_operation: u64,
     source_sequence: u64,
     /// Count of terminally-completed operations, for the invariant gate.
@@ -144,6 +153,12 @@ struct RegistryState {
 }
 
 impl RegistryState {
+    const MAX_FREED_TOMBSTONES: usize = 4096;
+
+    fn is_freed(&self, buffer: PhysicalAllocationId) -> bool {
+        buffer.get() < self.retired_before || self.freed.contains(&buffer)
+    }
+
     /// Checks that a candidate lease set is admissible: no freed allocation and
     /// no conflict with any active operation. Mirrors
     /// `BufferOwnership.tla!BuffersAvailable` generalized to lease *sets*.
@@ -153,7 +168,7 @@ impl RegistryState {
         writes: &BTreeSet<PhysicalAllocationId>,
     ) -> Result<(), OwnershipError> {
         for buffer in reads.iter().chain(writes.iter()) {
-            if self.freed.contains(buffer) {
+            if self.is_freed(*buffer) {
                 return Err(OwnershipError::FreedAllocation(*buffer));
             }
         }
@@ -234,6 +249,8 @@ impl OwnershipRegistry {
                 state: Mutex::new(RegistryState {
                     operations: BTreeMap::new(),
                     freed: BTreeSet::new(),
+                    retired_before: 0,
+                    freed_total: 0,
                     next_operation: 1,
                     source_sequence: 0,
                     completed_ok: 0,
@@ -387,7 +404,7 @@ impl OwnershipRegistry {
     /// allocation can never be leased again (the ABA-prevention obligation).
     pub fn free_buffer(&self, buffer: PhysicalAllocationId) -> Result<(), OwnershipError> {
         let mut state = self.inner.lock();
-        if state.freed.contains(&buffer) {
+        if state.is_freed(buffer) {
             return Err(OwnershipError::AlreadyFreed(buffer));
         }
         for (holder, entry) in &state.operations {
@@ -398,9 +415,44 @@ impl OwnershipRegistry {
                 });
             }
         }
+        if state.freed.len() >= RegistryState::MAX_FREED_TOMBSTONES {
+            return Err(OwnershipError::FreedTrackingCapacity);
+        }
         state.freed.insert(buffer);
+        state.freed_total = state.freed_total.saturating_add(1);
         self.inner
             .emit_locked(&mut state, BufferOwnershipEvent::FreeBuffer { buffer });
+        Ok(())
+    }
+
+    /// Reclaims exact free tombstones below an allocator-proven identity floor.
+    ///
+    /// The caller must only advance this floor after proving that no live or
+    /// future buffer can carry an identity below `next_live_allocation`. Such
+    /// identities remain permanently rejected; only their individual set
+    /// entries are discarded, so no-reuse-after-free is preserved while memory
+    /// stays bounded across allocator epochs.
+    pub fn seal_allocator_epoch(
+        &self,
+        next_live_allocation: PhysicalAllocationId,
+    ) -> Result<(), OwnershipError> {
+        let mut state = self.inner.lock();
+        for (holder, entry) in &state.operations {
+            if let Some(allocation) = entry
+                .reads
+                .iter()
+                .chain(&entry.writes)
+                .find(|allocation| allocation.get() < next_live_allocation.get())
+            {
+                return Err(OwnershipError::BufferStillLeased {
+                    allocation: *allocation,
+                    holder: *holder,
+                });
+            }
+        }
+        state.retired_before = state.retired_before.max(next_live_allocation.get());
+        let floor = state.retired_before;
+        state.freed.retain(|buffer| buffer.get() >= floor);
         Ok(())
     }
 
@@ -430,7 +482,7 @@ impl OwnershipRegistry {
 
         // Invariant: no freed allocation is still leased (FreedHasNoLease).
         for buffer in &leased {
-            if state.freed.contains(buffer) {
+            if state.is_freed(*buffer) {
                 return Err(OwnershipError::FreedAllocation(*buffer));
             }
         }
@@ -464,7 +516,7 @@ impl OwnershipRegistry {
             active: submitted + aborting,
             detached_active,
             leased_allocations: leased.len(),
-            freed_allocations: state.freed.len(),
+            freed_allocations: usize::try_from(state.freed_total).unwrap_or(usize::MAX),
             completed_ok: state.completed_ok,
             completed_error: state.completed_error,
         })
@@ -658,6 +710,35 @@ mod tests {
         assert!(matches!(err, OwnershipError::FreedAllocation(_)));
         let err = reg.free_buffer(alloc(6)).unwrap_err();
         assert!(matches!(err, OwnershipError::AlreadyFreed(_)));
+    }
+
+    #[test]
+    fn allocator_epoch_reclaims_exact_tombstones_without_allowing_reuse() {
+        let reg = registry();
+        reg.free_buffer(alloc(1)).unwrap();
+        reg.free_buffer(alloc(2)).unwrap();
+        reg.seal_allocator_epoch(alloc(3)).unwrap();
+        assert!(matches!(
+            reg.submit(&CommLeaseSet::read_only([alloc(1)])),
+            Err(OwnershipError::FreedAllocation(_))
+        ));
+        assert_eq!(reg.snapshot().unwrap().freed_allocations, 2);
+    }
+
+    #[test]
+    fn freed_tombstone_window_is_bounded() {
+        let reg = registry();
+        for id in 1..=RegistryState::MAX_FREED_TOMBSTONES as u64 {
+            reg.free_buffer(alloc(id)).unwrap();
+        }
+        assert_eq!(
+            reg.free_buffer(alloc(RegistryState::MAX_FREED_TOMBSTONES as u64 + 1)),
+            Err(OwnershipError::FreedTrackingCapacity)
+        );
+        reg.seal_allocator_epoch(alloc(RegistryState::MAX_FREED_TOMBSTONES as u64 + 1))
+            .unwrap();
+        reg.free_buffer(alloc(RegistryState::MAX_FREED_TOMBSTONES as u64 + 1))
+            .unwrap();
     }
 
     #[test]

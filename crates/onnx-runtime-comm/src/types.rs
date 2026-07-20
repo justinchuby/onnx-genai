@@ -1,8 +1,8 @@
 //! Communicator supporting types (`docs/DISTRIBUTED_RUNTIME.md` §3.1).
 //!
 //! These are the identity, buffer, and result types referenced by the
-//! [`Communicator`](crate::Communicator) trait. For slice 1b they are the
-//! in-process reference projections: `DeviceBuffer` is host-backed, and
+//! [`Communicator`](crate::Communicator) trait. For the in-process backend they
+//! are reference projections: `DeviceBuffer` is host-backed, and
 //! `DType`/`DeviceType` are the minimal set the in-process backend needs. Real
 //! hardware backends (NCCL, Gloo, Thunderbolt) reuse the same identities but
 //! provide device-native buffers.
@@ -59,7 +59,7 @@ pub enum ReduceOp {
 
 /// The minimal element dtype set the in-process backend understands. This is a
 /// 1b transport projection; the reduction *semantics* over these dtypes are a
-/// slice-1c concern.
+/// implemented deterministically by the in-process oracle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
     F32,
@@ -194,12 +194,12 @@ pub enum CommError {
     /// A checked byte-extent computation overflowed or exceeded a reservation.
     #[error("checked extent error: {0}")]
     Extent(String),
-    /// A collective *algorithm* (reduction math, variable-size permutation,
-    /// collective ordering) is deferred to slice 1c. Slice 1b provides the
-    /// trait shape, the in-process point-to-point/barrier plumbing, and the
-    /// buffer-ownership registry only.
-    #[error("collective '{0}' is deferred to slice 1c (algorithm + ordering)")]
+    /// A later backend capability is not implemented by the in-process oracle.
+    #[error("collective capability '{0}' is not implemented")]
     CollectiveDeferred(&'static str),
+    /// A rank attempted to diverge from its group's established transport order.
+    #[error("collective ordering violation: {0}")]
+    Ordering(String),
 }
 
 /// Convenience result alias.
@@ -310,7 +310,7 @@ impl WireTensorSpec {
 
     /// Checked encoded byte length for `logical_elements`. Identity codec is
     /// `elements * wire_dtype.size()` with overflow rejected; codec-aware
-    /// (block-quantized) sizing is deferred to slice 1c.
+    /// (block-quantized) sizing is deferred to the codec-capability slice.
     pub fn encoded_bytes(&self, logical_elements: usize) -> CommResult<usize> {
         match self.codec {
             WireCodec::Identity => logical_elements
@@ -344,7 +344,7 @@ impl WireTensorSpec {
 }
 
 /// Opaque, single-use result of a count exchange for a variable-size all-to-all.
-/// Consumed exactly once by `all_to_all_v` (slice 1c).
+/// Consumed exactly once by `all_to_all_v`.
 #[derive(Debug)]
 pub struct AllToAllVTicket {
     pub(crate) group: GroupId,

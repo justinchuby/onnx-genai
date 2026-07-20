@@ -1,6 +1,6 @@
 [package]
 name = "onnx-runtime-comm"
-description = "Runtime communicator abstraction, in-process backend, and buffer-ownership lease registry (distributed-runtime slice 1b)"
+description = "Runtime communicator, in-process collective oracle, ordering sequencer, and buffer leases"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,7 @@ publish = false
 onnx-runtime-protocol-trace = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+half = "2"
 
 [dev-dependencies]
 # Enables the test-only independent replay-checker harness for the

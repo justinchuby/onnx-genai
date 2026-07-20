@@ -46,7 +46,7 @@ pub enum ProtocolEvent {
     /// Communicator buffer-ownership protocol (transport-held allocation
     /// leases; `specs/tla/BufferOwnership.tla`).
     BufferOwnership(BufferOwnershipEvent),
-    /// Communicator collective-ordering protocol (reserved for a future slice).
+    /// Communicator collective-ordering protocol.
     CollectiveOrdering(CollectiveOrderingEvent),
 }
 
@@ -160,10 +160,72 @@ pub enum BufferOwnershipEvent {
     FreeBuffer { buffer: PhysicalAllocationId },
 }
 
-/// Placeholder payload for the future communicator collective-ordering slice.
+/// Coordinator decision recorded for one execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CollectiveOrderingEvent {}
+pub enum CollectiveDecision {
+    Admitted,
+    Skipped,
+}
+
+/// Collective operation family occupying one transport-order slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectiveKind {
+    AllReduce,
+    AllToAll,
+    AllToAllV,
+    AllGather,
+    Broadcast,
+    ReduceScatter,
+}
+
+/// Communicator collective-ordering linearization events.
+///
+/// Group membership is repeated on rank-local events so an independent checker
+/// can reconstruct communicator groups from the trace alone. `membership_hash`
+/// is computed from the ordered world-rank vector, never from addresses or
+/// process-local vector positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectiveOrderingEvent {
+    /// `CollectiveOrdering!AdmitNext` / `SkipNext`.
+    Decide {
+        execution: u64,
+        decision: CollectiveDecision,
+    },
+    /// `CollectiveOrdering!Submit`, immediately before backend enqueue.
+    Submit {
+        group: u32,
+        members: Vec<u32>,
+        membership_hash: u64,
+        rank: u32,
+        execution: u64,
+        sequence: u32,
+        collective: CollectiveKind,
+        /// Stable hash of ordering-relevant arguments (never payload bytes).
+        signature: u64,
+    },
+    /// `CollectiveOrdering!ObserveSkip`.
+    ObserveSkip {
+        group: u32,
+        members: Vec<u32>,
+        membership_hash: u64,
+        rank: u32,
+        execution: u64,
+        sequence: u32,
+    },
+    /// `CollectiveOrdering!CompleteLocal`.
+    CompleteLocal {
+        group: u32,
+        members: Vec<u32>,
+        membership_hash: u64,
+        rank: u32,
+        execution: u64,
+        sequence: u32,
+        success: bool,
+    },
+    /// `CollectiveOrdering!Abort`. This globally freezes new submissions for the
+    /// topology epoch; already-submitted rank-local operations may still quiesce.
+    Abort,
+}
 
 /// A sink that records protocol trace events at their linearization points.
 ///

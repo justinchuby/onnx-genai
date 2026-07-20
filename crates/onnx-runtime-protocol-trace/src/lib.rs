@@ -1,8 +1,8 @@
 //! Shared protocol-conformance trace framework.
 //!
 //! This crate is protocol-agnostic infrastructure reused across the memory and
-//! distributed-runtime slices (the Ticketed Non-Blocking Pressure Protocol
-//! today; Communicator `BufferOwnership` / `CollectiveOrdering` later). It
+//! distributed-runtime slices (the Ticketed Non-Blocking Pressure Protocol,
+//! Communicator `BufferOwnership`, and `CollectiveOrdering`). It
 //! provides two things:
 //!
 //! 1. A lossless, test-visible trace [`ProtocolTraceEvent`] envelope and the
@@ -27,8 +27,8 @@ pub mod ids;
 pub mod checker;
 
 pub use event::{
-    BufferOwnershipEvent, CollectiveOrderingEvent, NullTraceSink, PressureEvent, ProtocolEvent,
-    ProtocolTraceEvent, ProtocolTraceSink,
+    BufferOwnershipEvent, CollectiveDecision, CollectiveKind, CollectiveOrderingEvent,
+    NullTraceSink, PressureEvent, ProtocolEvent, ProtocolTraceEvent, ProtocolTraceSink,
 };
 pub use ids::{
     LocalDeviceId, OperationId, PhysicalAllocationId, PressureGeneration, PressureRequestId,

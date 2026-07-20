@@ -1934,6 +1934,7 @@ name = "onnx-runtime-comm"
 version = "0.1.0-dev.2"
 dependencies = [
  "async-trait",
+ "half",
  "onnx-runtime-protocol-trace",
  "thiserror 2.0.18",
 ]
