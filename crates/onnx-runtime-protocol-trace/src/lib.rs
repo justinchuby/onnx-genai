@@ -31,7 +31,8 @@ pub use event::{
     ProtocolTraceEvent, ProtocolTraceSink,
 };
 pub use ids::{
-    LocalDeviceId, PhysicalAllocationId, PressureGeneration, PressureRequestId, ProtocolSourceId,
+    LocalDeviceId, OperationId, PhysicalAllocationId, PressureGeneration, PressureRequestId,
+    ProtocolSourceId,
 };
 
 /// The protocol contract revision this crate implements.

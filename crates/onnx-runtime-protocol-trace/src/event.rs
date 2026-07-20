@@ -1,7 +1,8 @@
 //! The lossless protocol trace envelope and event families.
 
 use crate::ids::{
-    LocalDeviceId, PhysicalAllocationId, PressureGeneration, PressureRequestId, ProtocolSourceId,
+    LocalDeviceId, OperationId, PhysicalAllocationId, PressureGeneration, PressureRequestId,
+    ProtocolSourceId,
 };
 
 /// A single lossless, test-visible protocol event.
@@ -42,7 +43,8 @@ pub struct ProtocolTraceEvent {
 pub enum ProtocolEvent {
     /// Ticketed non-blocking pressure protocol (HostGovernor).
     Pressure(PressureEvent),
-    /// Communicator buffer-ownership protocol (reserved for a future slice).
+    /// Communicator buffer-ownership protocol (transport-held allocation
+    /// leases; `specs/tla/BufferOwnership.tla`).
     BufferOwnership(BufferOwnershipEvent),
     /// Communicator collective-ordering protocol (reserved for a future slice).
     CollectiveOrdering(CollectiveOrderingEvent),
@@ -114,14 +116,49 @@ pub enum PressureEvent {
     Reclaim { owner: LocalDeviceId, bytes: u64 },
 }
 
-/// Placeholder payload for the future communicator buffer-ownership slice.
+/// Communicator buffer-ownership linearization events.
 ///
-/// Reserved so the [`ProtocolEvent`] grouping is demonstrably extensible under
-/// revision 2. It carries no fields yet; the buffer-ownership slice will define
-/// them without disturbing the pressure encoding.
+/// Each variant corresponds to exactly one `BufferOwnership.tla` action at the
+/// concrete linearization point named in `REFINEMENT.md` § "Linearization Map".
+/// Every lease set recorded here is the *complete* read/write
+/// [`PhysicalAllocationId`] set committed to (or released from) the backend
+/// registry in that critical section, never a pointer or vector position.
+///
+/// The `reads`/`writes` vectors are recorded in ascending allocation-id order so
+/// a fixed schedule produces a byte-identical trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BufferOwnershipEvent {}
+pub enum BufferOwnershipEvent {
+    /// `BufferOwnership!Submit` — the backend registry takes ownership of the
+    /// operation and its full read/write lease sets before transport/device
+    /// enqueue. No conflicting active lease exists at this point.
+    Submit {
+        operation: OperationId,
+        reads: Vec<PhysicalAllocationId>,
+        writes: Vec<PhysicalAllocationId>,
+    },
+    /// `BufferOwnership!Detach` — the user-visible handle detaches without
+    /// changing registry ownership; both leases remain owned.
+    Detach { operation: OperationId },
+    /// `BufferOwnership!BeginAbort` — the operation becomes aborting while all
+    /// leases remain owned by the registry.
+    BeginAbort { operation: OperationId },
+    /// `BufferOwnership!CompleteSuccess` — the backend proves terminal success
+    /// and releases every registry lease in one critical section; each written
+    /// allocation advances its reuse generation.
+    CompleteSuccess {
+        operation: OperationId,
+        writes: Vec<PhysicalAllocationId>,
+    },
+    /// `BufferOwnership!QuiesceAbort` — abort reaches quiescence, releasing every
+    /// registry lease; each written allocation advances its reuse generation.
+    QuiesceAbort {
+        operation: OperationId,
+        writes: Vec<PhysicalAllocationId>,
+    },
+    /// `BufferOwnership!FreeBuffer` — the allocator commits free/reuse only after
+    /// no registry read or write lease references the physical allocation.
+    FreeBuffer { buffer: PhysicalAllocationId },
+}
 
 /// Placeholder payload for the future communicator collective-ordering slice.
 #[derive(Debug, Clone, PartialEq, Eq)]

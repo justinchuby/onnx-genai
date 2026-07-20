@@ -428,12 +428,14 @@ impl HostGovernor {
         }
 
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let cancel_wakeups = self.drain_cancellations_locked(&mut ledger);
 
         let budget = ledger.max_satisfiable();
         if request.bytes > budget {
             // Oversized, or an impossible pinned request that could never fit
             // even after full reclaim.
+            drop(ledger);
+            Self::wake_all(cancel_wakeups);
             return Err(ResourceError::HostQuotaDenied {
                 requested_bytes: request.bytes,
                 reclaimable_budget_bytes: budget,
@@ -485,15 +487,21 @@ impl HostGovernor {
         // Immediate charge when capacity is available: arbitration will grant
         // this request if it fits and sorts first. No new capacity was added,
         // so it can only grant the just-submitted request.
-        let wakeups = self.arbitrate_locked(&mut ledger)?;
+        let mut wakeups = cancel_wakeups;
+        match self.arbitrate_locked(&mut ledger) {
+            Ok(mut arbitrated) => wakeups.append(&mut arbitrated),
+            Err(err) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(err);
+            }
+        }
         self.inner.enqueue_reclaim_notices_locked(&mut ledger);
         drop(ledger);
 
         // Wake after releasing the ledger lock (harmless for a not-yet-awaited
         // ticket).
-        for notify in wakeups {
-            notify.wake();
-        }
+        Self::wake_all(wakeups);
 
         Ok(PressureTicket {
             request_id,
@@ -509,15 +517,22 @@ impl HostGovernor {
     /// granted tickets after unlocking.
     pub fn release_host_pages(&self, allocation: HostAllocation) -> Result<(), ResourceError> {
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let mut wakeups = self.drain_cancellations_locked(&mut ledger);
 
-        let entry = ledger.entries.get(&allocation.request_id).ok_or_else(|| {
-            ResourceError::HostLedgerInvariant {
-                operation: "release",
-                reason: format!("no ledger entry for request {}", allocation.request_id),
+        let entry = match ledger.entries.get(&allocation.request_id) {
+            Some(entry) => entry,
+            None => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(ResourceError::HostLedgerInvariant {
+                    operation: "release",
+                    reason: format!("no ledger entry for request {}", allocation.request_id),
+                });
             }
-        })?;
+        };
         if !matches!(entry.state, PressureState::Claimed) {
+            drop(ledger);
+            Self::wake_all(wakeups);
             return Err(ResourceError::HostLedgerInvariant {
                 operation: "release",
                 reason: format!(
@@ -527,6 +542,8 @@ impl HostGovernor {
             });
         }
         if entry.bytes != allocation.bytes {
+            drop(ledger);
+            Self::wake_all(wakeups);
             return Err(ResourceError::HostLedgerInvariant {
                 operation: "release",
                 reason: "released extent does not match the claimed extent".to_string(),
@@ -534,7 +551,14 @@ impl HostGovernor {
         }
 
         let bytes = allocation.bytes;
-        ledger.free = checked_add(ledger.free, bytes, "release credit")?;
+        match checked_add(ledger.free, bytes, "release credit") {
+            Ok(free) => ledger.free = free,
+            Err(err) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(err);
+            }
+        }
         ledger.entries.remove(&allocation.request_id);
 
         self.inner.emit_locked(
@@ -546,13 +570,18 @@ impl HostGovernor {
             },
         );
 
-        let wakeups = self.arbitrate_locked(&mut ledger)?;
+        match self.arbitrate_locked(&mut ledger) {
+            Ok(mut arbitrated) => wakeups.append(&mut arbitrated),
+            Err(err) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(err);
+            }
+        }
         self.inner.enqueue_reclaim_notices_locked(&mut ledger);
         drop(ledger);
 
-        for notify in wakeups {
-            notify.wake();
-        }
+        Self::wake_all(wakeups);
         Ok(())
     }
 
@@ -563,12 +592,26 @@ impl HostGovernor {
             return Ok(());
         }
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let mut wakeups = self.drain_cancellations_locked(&mut ledger);
 
         let available = ledger.reclaimable.get(&device).copied().unwrap_or(0);
-        let remaining = checked_sub(available, bytes, "reclaim debit")?;
+        let remaining = match checked_sub(available, bytes, "reclaim debit") {
+            Ok(remaining) => remaining,
+            Err(err) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(err);
+            }
+        };
         ledger.reclaimable.insert(device, remaining);
-        ledger.free = checked_add(ledger.free, bytes, "reclaim credit")?;
+        match checked_add(ledger.free, bytes, "reclaim credit") {
+            Ok(free) => ledger.free = free,
+            Err(err) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(err);
+            }
+        }
 
         self.inner.emit_locked(
             &mut ledger,
@@ -578,13 +621,18 @@ impl HostGovernor {
             },
         );
 
-        let wakeups = self.arbitrate_locked(&mut ledger)?;
+        match self.arbitrate_locked(&mut ledger) {
+            Ok(mut arbitrated) => wakeups.append(&mut arbitrated),
+            Err(err) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(err);
+            }
+        }
         self.inner.enqueue_reclaim_notices_locked(&mut ledger);
         drop(ledger);
 
-        for notify in wakeups {
-            notify.wake();
-        }
+        Self::wake_all(wakeups);
         Ok(())
     }
 
@@ -592,7 +640,7 @@ impl HostGovernor {
     /// pending request under the same ledger lock (`Reconfigure`).
     pub fn reconfigure(&self) -> Result<(), ResourceError> {
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let mut wakeups = self.drain_cancellations_locked(&mut ledger);
 
         let new_generation = ledger.generation.next();
         ledger.generation = new_generation;
@@ -604,7 +652,6 @@ impl HostGovernor {
             .map(|(id, _)| *id)
             .collect();
 
-        let mut wakeups = Vec::new();
         for id in stale {
             let entry = ledger.entries.get_mut(&id).expect("entry present");
             let stale_generation = entry.generation.get();
@@ -620,9 +667,7 @@ impl HostGovernor {
             .emit_locked(&mut ledger, PressureEvent::Reconfigure { new_generation });
         drop(ledger);
 
-        for notify in wakeups {
-            notify.wake();
-        }
+        Self::wake_all(wakeups);
         Ok(())
     }
 
@@ -640,10 +685,14 @@ impl HostGovernor {
             NoOp,
         }
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let mut wakeups = self.drain_cancellations_locked(&mut ledger);
 
         let kind = match ledger.entries.get(&request_id) {
-            None => return Ok(TimeoutOutcome::NoOp),
+            None => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Ok(TimeoutOutcome::NoOp);
+            }
             Some(entry) => match &entry.state {
                 PressureState::Pending(_) => Deadline::Pending,
                 PressureState::Granted(allocation) => Deadline::Granted {
@@ -667,12 +716,20 @@ impl HostGovernor {
                         request: request_id,
                     },
                 );
+                wakeups.push(notify);
                 drop(ledger);
-                notify.wake();
+                Self::wake_all(wakeups);
                 Ok(TimeoutOutcome::Pending)
             }
             Deadline::Granted { alloc, bytes } => {
-                ledger.free = checked_add(ledger.free, bytes, "timeout granted credit")?;
+                match checked_add(ledger.free, bytes, "timeout granted credit") {
+                    Ok(free) => ledger.free = free,
+                    Err(err) => {
+                        drop(ledger);
+                        Self::wake_all(wakeups);
+                        return Err(err);
+                    }
+                }
                 let entry = ledger.entries.get_mut(&request_id).expect("entry");
                 entry.state = PressureState::Failed(ResourceError::HostPressureTimeout {
                     request_id: request_id.get(),
@@ -687,15 +744,24 @@ impl HostGovernor {
                     },
                 );
                 // Reconsider queued tickets now that bytes returned.
-                let mut wakeups = self.arbitrate_locked(&mut ledger)?;
+                match self.arbitrate_locked(&mut ledger) {
+                    Ok(mut arbitrated) => wakeups.append(&mut arbitrated),
+                    Err(err) => {
+                        drop(ledger);
+                        Self::wake_all(wakeups);
+                        return Err(err);
+                    }
+                }
                 wakeups.push(notify);
                 drop(ledger);
-                for notify in wakeups {
-                    notify.wake();
-                }
+                Self::wake_all(wakeups);
                 Ok(TimeoutOutcome::Granted)
             }
-            Deadline::NoOp => Ok(TimeoutOutcome::NoOp),
+            Deadline::NoOp => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                Ok(TimeoutOutcome::NoOp)
+            }
         }
     }
 
@@ -704,8 +770,17 @@ impl HostGovernor {
     /// exceeds capacity, is a hard conformance failure.
     pub fn snapshot(&self) -> Result<HostLedgerSnapshot, ResourceError> {
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let wakeups = self.drain_cancellations_locked(&mut ledger);
 
+        // Recompute under the lock, then release it and hoist any cancel-drain
+        // wakeups out (wake-after-unlock), regardless of the recompute result.
+        let result = Self::snapshot_locked(&ledger);
+        drop(ledger);
+        Self::wake_all(wakeups);
+        result
+    }
+
+    fn snapshot_locked(ledger: &Ledger) -> Result<HostLedgerSnapshot, ResourceError> {
         let reclaimable_bytes = ledger.reclaimable_total();
         let reserved_bytes = ledger.reserved_total();
         let claimed_bytes = ledger.claimed_total();
@@ -758,29 +833,50 @@ impl HostGovernor {
     /// Drains and applies any queued cancellations (test/observability hook).
     pub fn process_cancellations(&self) {
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let wakeups = self.drain_cancellations_locked(&mut ledger);
+        drop(ledger);
+        Self::wake_all(wakeups);
     }
 
     // ── internal helpers (all run under the ledger lock) ──
 
-    fn drain_cancellations_locked(&self, ledger: &mut Ledger) {
+    fn drain_cancellations_locked(&self, ledger: &mut Ledger) -> Vec<Arc<TicketNotify>> {
         let commands = self.inner.mailbox.lock().expect("mailbox poisoned").drain();
+        let mut wakeups = Vec::new();
         for command in commands {
-            self.apply_cancel_locked(ledger, command);
+            wakeups.extend(self.apply_cancel_locked(ledger, command));
+        }
+        wakeups
+    }
+
+    /// Wakes a batch of tickets after the ledger lock has been released. All
+    /// wakeups produced under the lock are hoisted out to a call site like this
+    /// one so no `notify.wake()` ever runs inside the ledger critical section.
+    fn wake_all(wakeups: Vec<Arc<TicketNotify>>) {
+        for notify in wakeups {
+            notify.wake();
         }
     }
 
-    fn apply_cancel_locked(&self, ledger: &mut Ledger, command: CancelCommand) {
+    /// Applies one cancellation under the ledger lock and RETURNS any tickets
+    /// that became grantable as a result, so the caller can wake them after
+    /// unlocking (the wake-after-unlock discipline). Never wakes under the lock.
+    fn apply_cancel_locked(
+        &self,
+        ledger: &mut Ledger,
+        command: CancelCommand,
+    ) -> Vec<Arc<TicketNotify>> {
         enum CancelKind {
             Pending,
             Granted {
                 alloc: PhysicalAllocationId,
                 bytes: u64,
             },
+            ReapTerminal,
             NoOp,
         }
         let kind = match ledger.entries.get(&command.request_id) {
-            None => return,
+            None => return Vec::new(),
             Some(entry) if entry.generation != command.generation => {
                 // Stale cancellation for a superseded incarnation. Request IDs
                 // are never reused, so for a live entry this cannot mismatch;
@@ -793,8 +889,14 @@ impl HostGovernor {
                     alloc: allocation.id,
                     bytes: entry.bytes,
                 },
-                // Claimed / already terminal: grant-wins, cancellation is a no-op.
-                _ => CancelKind::NoOp,
+                // A claimed ticket owns its allocation (grant-wins); it is live
+                // and is reaped only when the claim is released.
+                PressureState::Claimed => CancelKind::NoOp,
+                // Already-terminal (timed-out / reconfiguration-failed) entries
+                // linger only until observed. A cancel-drop is that observation:
+                // reap them so recomputation stays O(live). This emits no new
+                // event — the terminal transition was already published.
+                PressureState::Cancelled | PressureState::Failed(_) => CancelKind::ReapTerminal,
             },
         };
 
@@ -812,6 +914,7 @@ impl HostGovernor {
                     },
                 );
                 self.remove_terminal_locked(ledger, command.request_id);
+                Vec::new()
             }
             CancelKind::Granted { alloc, bytes } => {
                 // Cancel-wins over a later claim: return the exact allocation.
@@ -832,14 +935,15 @@ impl HostGovernor {
                     },
                 );
                 self.remove_terminal_locked(ledger, command.request_id);
-                // Returned bytes may now satisfy a queued ticket.
-                if let Ok(wakeups) = self.arbitrate_locked(ledger) {
-                    for notify in wakeups {
-                        notify.wake();
-                    }
-                }
+                // Returned bytes may now satisfy a queued ticket. Hoist the
+                // wakeups out to the caller (wake-after-unlock).
+                self.arbitrate_locked(ledger).unwrap_or_default()
             }
-            CancelKind::NoOp => {}
+            CancelKind::ReapTerminal => {
+                self.remove_terminal_locked(ledger, command.request_id);
+                Vec::new()
+            }
+            CancelKind::NoOp => Vec::new(),
         }
     }
 
@@ -927,7 +1031,7 @@ impl HostGovernor {
             Failed(ResourceError),
         }
         let mut ledger = self.inner.lock_ledger();
-        self.drain_cancellations_locked(&mut ledger);
+        let wakeups = self.drain_cancellations_locked(&mut ledger);
 
         let outcome = match ledger.entries.get(&request_id) {
             // Removed terminal entry we have not yet observed: treat as
@@ -942,7 +1046,7 @@ impl HostGovernor {
             },
         };
 
-        match outcome {
+        let poll = match outcome {
             Claimable::Pending => TicketPoll::Pending,
             Claimable::Granted(allocation) => {
                 let alloc_id = allocation.id;
@@ -968,7 +1072,10 @@ impl HostGovernor {
                 self.remove_terminal_locked(&mut ledger, request_id);
                 TicketPoll::Failed(err)
             }
-        }
+        };
+        drop(ledger);
+        Self::wake_all(wakeups);
+        poll
     }
 }
 

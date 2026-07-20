@@ -76,6 +76,15 @@ id_newtype!(
     u32
 );
 
+id_newtype!(
+    /// Stable identity of a single transport-held operation in the communicator
+    /// buffer-ownership registry (`specs/tla/BufferOwnership.tla` `Operations`).
+    /// Never reused within a process; a queue index or handle address is *not* a
+    /// stable identity.
+    OperationId,
+    u64
+);
+
 impl PressureGeneration {
     /// Returns the next generation.
     #[inline]

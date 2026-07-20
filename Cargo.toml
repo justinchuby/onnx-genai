@@ -38,6 +38,9 @@ members = [
     # ── Protocol conformance framework (new — see docs/PRESSURE_PROTOCOL_IMPL.md) ──
     "crates/onnx-runtime-protocol-trace",
 
+    # ── Distributed runtime: communicator + buffer ownership (new — see docs/COMMUNICATOR_BUFFER_IMPL.md) ──
+    "crates/onnx-runtime-comm",
+
     # ── onnx-rs standard library (new — see docs/ONNX_RS.md) ──
     "crates/onnx-rs",
     "crates/onnx-rs-python",
@@ -83,6 +86,7 @@ default-members = [
     "crates/onnx-runtime-python",
     "crates/onnx-runtime-dlpack",
     "crates/onnx-runtime-protocol-trace",
+    "crates/onnx-runtime-comm",
     "crates/onnx-rs",
     "crates/onnx-rs-python",
 ]
@@ -126,6 +130,7 @@ onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.2
 onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer", version = "=0.1.0-dev.2" }
 onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-dev.2" }
 onnx-runtime-protocol-trace = { path = "crates/onnx-runtime-protocol-trace", version = "=0.1.0-dev.2" }
+onnx-runtime-comm = { path = "crates/onnx-runtime-comm", version = "=0.1.0-dev.2" }
 
 # onnx-rs standard library (new — see docs/ONNX_RS.md)
 onnx-rs = { path = "crates/onnx-rs", version = "=0.1.0-dev.2" }
