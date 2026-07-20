@@ -73,7 +73,7 @@ id_newtype!(
 );
 
 id_newtype!(
-    /// Monotonic event sequence within an actor.
+    /// Monotonic event sequence within a host-scoped actor.
     EventSequence,
     u64
 );

@@ -12,7 +12,7 @@ use crate::{
 pub struct EventEnvelope<P = PressurePayload> {
     /// Stable identity of this event.
     pub event_id: EventId,
-    /// Monotonic sequence within [`Self::actor_id`].
+    /// Monotonic sequence within (`host_id`, `actor_id`).
     pub sequence: EventSequence,
     /// Host that produced the event.
     pub host_id: HostId,

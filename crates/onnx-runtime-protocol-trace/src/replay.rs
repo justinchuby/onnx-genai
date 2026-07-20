@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{ActorId, EventEnvelope, EventId, EventSequence, LogicalTimestamp};
+use crate::{ActorId, EventEnvelope, EventId, EventSequence, HostId, LogicalTimestamp};
 
 /// A protocol-specific reducer used by [`ReplayHarness`].
 ///
@@ -64,11 +64,13 @@ pub enum ReplayViolationKind {
         event_id: EventId,
     },
     NonMonotonicSequence {
+        host_id: HostId,
         actor_id: ActorId,
         previous: EventSequence,
         found: EventSequence,
     },
     NonMonotonicLogicalTimestamp {
+        host_id: HostId,
         actor_id: ActorId,
         previous: LogicalTimestamp,
         found: LogicalTimestamp,
@@ -123,13 +125,14 @@ impl<R> ReplayHarness<R> {
             }
 
             if let Some((previous_sequence, previous_timestamp)) =
-                actor_order.get(&event.actor_id).copied()
+                actor_order.get(&(event.host_id, event.actor_id)).copied()
             {
                 if event.sequence <= previous_sequence {
                     return Err(ReplayViolation {
                         prefix_len: events_checked,
                         event_id: Some(event.event_id),
                         kind: ReplayViolationKind::NonMonotonicSequence {
+                            host_id: event.host_id,
                             actor_id: event.actor_id,
                             previous: previous_sequence,
                             found: event.sequence,
@@ -141,6 +144,7 @@ impl<R> ReplayHarness<R> {
                         prefix_len: events_checked,
                         event_id: Some(event.event_id),
                         kind: ReplayViolationKind::NonMonotonicLogicalTimestamp {
+                            host_id: event.host_id,
                             actor_id: event.actor_id,
                             previous: previous_timestamp,
                             found: event.logical_timestamp,
@@ -148,7 +152,10 @@ impl<R> ReplayHarness<R> {
                     });
                 }
             }
-            actor_order.insert(event.actor_id, (event.sequence, event.logical_timestamp));
+            actor_order.insert(
+                (event.host_id, event.actor_id),
+                (event.sequence, event.logical_timestamp),
+            );
 
             self.reducer
                 .apply(&mut state, &event)
@@ -181,17 +188,16 @@ impl<R> ReplayHarness<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PressurePayload;
 
     struct NoopReducer;
 
-    impl ReplayReducer<PressurePayload> for NoopReducer {
+    impl<P> ReplayReducer<P> for NoopReducer {
         type State = ();
 
         fn apply(
             &self,
             _state: &mut Self::State,
-            _event: &EventEnvelope<PressurePayload>,
+            _event: &EventEnvelope<P>,
         ) -> Result<(), InvariantViolation> {
             Ok(())
         }
@@ -203,9 +209,54 @@ mod tests {
 
     #[test]
     fn trivial_reducer_accepts_empty_stream() -> Result<(), ReplayViolation> {
-        let report = ReplayHarness::new(NoopReducer).check((), Vec::new())?;
+        let report = ReplayHarness::new(NoopReducer).check((), Vec::<EventEnvelope<()>>::new())?;
 
         assert_eq!(report.events_checked, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn equal_actor_ids_on_different_hosts_have_independent_ordering() -> Result<(), ReplayViolation>
+    {
+        let actor_id = ActorId::new(7);
+        let events = [
+            EventEnvelope {
+                event_id: EventId::new(1),
+                sequence: EventSequence::new(1),
+                host_id: HostId::new(1),
+                actor_id,
+                logical_timestamp: LogicalTimestamp::new(10),
+                payload: (),
+            },
+            EventEnvelope {
+                event_id: EventId::new(2),
+                sequence: EventSequence::new(1),
+                host_id: HostId::new(2),
+                actor_id,
+                logical_timestamp: LogicalTimestamp::new(1),
+                payload: (),
+            },
+            EventEnvelope {
+                event_id: EventId::new(3),
+                sequence: EventSequence::new(2),
+                host_id: HostId::new(1),
+                actor_id,
+                logical_timestamp: LogicalTimestamp::new(11),
+                payload: (),
+            },
+            EventEnvelope {
+                event_id: EventId::new(4),
+                sequence: EventSequence::new(2),
+                host_id: HostId::new(2),
+                actor_id,
+                logical_timestamp: LogicalTimestamp::new(2),
+                payload: (),
+            },
+        ];
+
+        let report = ReplayHarness::new(NoopReducer).check((), events)?;
+
+        assert_eq!(report.events_checked, 4);
         Ok(())
     }
 }
