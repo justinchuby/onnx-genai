@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-20T07:15Z — MLAS CPU MatMulNBits/int4 decode/prefill routing and bounded decode scheduling landed; classic Stable Diffusion 1.x renders end-to-end from a from-scratch Mobius package and the diffusion demo Image tab is live._
+_Last updated: 2026-07-20T14:15Z — CPU decode-pool residency and GQA parallelism, CUDA flash attention for Attention/GQA prefill, and issue #40 Phase-1 slices 1a–1c landed._
 
-**Current `origin/main` implementation HEAD:** `d7a0819`.
+**Current `origin/main` implementation HEAD:** `2ffb4e4`.
+
+## 2026-07-20 — CPU/CUDA attention performance and issue #40 Phase 1
+
+- **CPU decode wins ✅ (`cbacb75`, `c391327`):** persistent bounded-pool residency across the whole M=1 forward removes repeated Rayon pool installs for a bit-identical **+3–6% decode** gain. Guarded row-parallel `GroupQueryAttention` then attacks the new dominant serial cost, improving 512-token decode by **8.6%**, reducing profiled GQA time by **13.9%**, and accelerating long prefill while retaining a serial threshold for small work. A coarser MatMulNBits fork-join prototype regressed 7–8% and was correctly not landed.
+- **CUDA fused flash attention ✅ (`a67b7a5`, `94fa2b6`):** NVRTC tiled online-softmax with f16 WMMA/f32 accumulation now sits behind standard `Attention` and eligible `GroupQueryAttention` prefill, covering f32/f16/bf16, MHA/GQA/MQA, masks, cache/RoPE, and ragged lengths. H200 winning shapes improve about **1.3–1.5×** and avoid **48 MiB** score scratch; automatic dispatch retains the baseline for decode, unsupported shapes, and measured-slower long/cached cases. The GQA path's initial unequal-Q/K causal-origin defect was corrected and verified across a 40-scenario parity matrix.
+- **Issue #40 Phase 1 🟡 in progress:** slice **1a ✅** landed `onnx-runtime-protocol-trace` plus the ticketed non-blocking `HostGovernor` pressure protocol (`0d1d265`, conforming to `PressureProtocol.tla`); slice **1b ✅** landed the `Communicator` trait, `InProcessCommunicator`, and `BufferOwnership` lease registry (`e4d2883`, conforming to `BufferOwnership.tla`); slice **1c ✅** landed collective algorithms plus `CollectiveOrdering` conformance and a bit-identical distributed-equals-single-device equivalence test (`2ffb4e4`, conforming to `CollectiveOrdering.tla`; an abort-path condvar lost-wakeup caught in review was fixed with deterministic regression coverage). Remaining Phase-1 work: slice 1d weight residency.
+- **Deferred:** the TLC model gate remains CI-deferred; Phase-1 slice **1d weight residency** and issue #40 **Phases 2–4** remain pending.
 
 ## 2026-07-20 — MLAS CPU-GEMM parity (vendored FFI)
 
