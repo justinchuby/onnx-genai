@@ -18,9 +18,9 @@
 //!   `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`) via runtime-compiled (NVRTC) f32
 //!   pointwise kernels — kept as our own kernels so they can later fuse into a
 //!   GEMM epilogue or an elementwise chain (RULES.md #4).
-//! * **Attention** — tiled online-softmax prefill (`Attention`,
-//!   `com.microsoft`) compiled by NVRTC, with an f16 tensor-core specialization
-//!   and the retained cuBLASLt Phase-2a path for decode/unsupported shapes.
+//! * **Attention** — tiled online-softmax prefill (`Attention` and
+//!   `GroupQueryAttention`, `com.microsoft`) compiled by NVRTC, with an f16
+//!   tensor-core specialization and retained decode/unsupported-shape baselines.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
 //! prioritised custom-kernel candidate list live in `docs/CUDA_COVERAGE.md`.
@@ -68,6 +68,7 @@ pub use kernels::attention::AttentionKernel;
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };
+pub use kernels::group_query_attention::{GroupQueryAttentionBackend, GroupQueryAttentionKernel};
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
 pub use runtime::CudaRuntime;

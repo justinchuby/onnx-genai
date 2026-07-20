@@ -286,14 +286,14 @@ const SOFTMAX_ENTRY: &str = "attn_softmax_f32";
 const SOFTMAX_HALF_MODULE: &str = "attn_softmax_half_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttentionDtype {
+pub(super) enum AttentionDtype {
     F32,
     F16,
     Bf16,
 }
 
 impl AttentionDtype {
-    fn from_onnx(dtype: DataType) -> Result<Self> {
+    pub(super) fn from_onnx(dtype: DataType) -> Result<Self> {
         match dtype {
             DataType::Float32 => Ok(Self::F32),
             DataType::Float16 => Ok(Self::F16),
@@ -312,7 +312,7 @@ impl AttentionDtype {
         }
     }
 
-    fn element_size(self) -> u64 {
+    pub(super) fn element_size(self) -> u64 {
         match self {
             Self::F32 => std::mem::size_of::<f32>() as u64,
             Self::F16 | Self::Bf16 => std::mem::size_of::<u16>() as u64,
@@ -618,6 +618,7 @@ impl AttentionKernel {
                 batch,
                 sq,
                 sk,
+                sk,
                 d,
                 group,
                 scale,
@@ -627,6 +628,9 @@ impl AttentionKernel {
                 o_base,
                 mask_ptr,
                 mask_planes,
+                0,
+                0,
+                0,
                 0.0,
             )
         } else {
@@ -662,7 +666,7 @@ impl AttentionKernel {
 /// always accumulates GEMMs in fp32; the softmax kernel likewise widens every
 /// reduction value to fp32 before narrowing probabilities to the IO dtype.
 #[allow(clippy::too_many_arguments)]
-fn run_attention_phase2a(
+pub(super) fn run_attention_phase2a(
     runtime: &CudaRuntime,
     dtype: AttentionDtype,
     num_heads: usize,

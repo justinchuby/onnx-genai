@@ -31,16 +31,20 @@ __device__ __forceinline__ void flash_attention_body(
     const T* key,
     const T* value,
     const T* mask,
+    const int* total_lengths,
+    const int* past_lengths,
     T* output,
     int batch,
     int q_heads,
     int kv_heads,
     int sq,
     int sk,
+    int kv_capacity,
     int dim,
     int group,
     int causal,
     int mask_planes,
+    int local_window,
     float scale,
     float softcap)
 {
@@ -64,6 +68,10 @@ __device__ __forceinline__ void flash_attention_body(
     const int kvh = h / group;
     const int qi = query_tile * FLASH_Q_TILE + warp;
     const bool valid_q = b < batch && qi < sq;
+    const int logical_sk = total_lengths ? total_lengths[b] : sk;
+    const int causal_max = past_lengths ? past_lengths[b] + qi : logical_sk - sq + qi;
+    const int local_min =
+        local_window > 0 ? max(0, causal_max + 1 - local_window) : 0;
 
     float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (lane == 0) {
@@ -75,7 +83,7 @@ __device__ __forceinline__ void flash_attention_body(
     const unsigned long long q_base =
         ((unsigned long long)(b * q_heads + h) * sq + qi) * dim;
     const unsigned long long kv_base =
-        (unsigned long long)(b * kv_heads + kvh) * sk * dim;
+        (unsigned long long)(b * kv_heads + kvh) * kv_capacity * dim;
 
     for (int key0 = 0; key0 < sk; key0 += FLASH_K_TILE) {
         const int tile_keys = min(FLASH_K_TILE, sk - key0);
@@ -112,8 +120,8 @@ __device__ __forceinline__ void flash_attention_body(
             if (lane == 0) {
                 const int j = key0 + kj;
                 float score = valid_q ? dot * scale : FLASH_NEG_INF;
-                const int causal_max = sk - sq + qi;
-                if (!valid_q || (causal && j > causal_max)) {
+                if (!valid_q || j >= logical_sk || (causal && j > causal_max)
+                    || j < local_min) {
                     score = FLASH_NEG_INF;
                 } else {
                     if (softcap > 0.0f) {
@@ -214,11 +222,14 @@ template <> __device__ __forceinline__ float flash_store<float>(float value) { r
 
 const FLASH_F32_SUFFIX: &str = r#"
 extern "C" __global__ void flash_attention_f32(
-    const float* q, const float* key, const float* value, const float* mask, float* output,
+    const float* q, const float* key, const float* value, const float* mask,
+    const int* total_lengths, const int* past_lengths, float* output,
     int batch, int q_heads, int kv_heads, int sq, int sk, int dim, int group,
-    int causal, int mask_planes, float scale, float softcap) {
-    flash_attention_body<float>(q, key, value, mask, output, batch, q_heads, kv_heads,
-                                sq, sk, dim, group, causal, mask_planes, scale, softcap);
+    int kv_capacity, int causal, int mask_planes, int local_window,
+    float scale, float softcap) {
+    flash_attention_body<float>(q, key, value, mask, total_lengths, past_lengths, output,
+                                batch, q_heads, kv_heads, sq, sk, kv_capacity, dim, group, causal,
+                                mask_planes, local_window, scale, softcap);
 }
 "#;
 
@@ -243,19 +254,25 @@ template <> __device__ __forceinline__ __nv_bfloat16 flash_store<__nv_bfloat16>(
 
 const FLASH_HALF_SUFFIX: &str = r#"
 extern "C" __global__ void flash_attention_f16(
-    const __half* q, const __half* key, const __half* value, const __half* mask, __half* output,
+    const __half* q, const __half* key, const __half* value, const __half* mask,
+    const int* total_lengths, const int* past_lengths, __half* output,
     int batch, int q_heads, int kv_heads, int sq, int sk, int dim, int group,
-    int causal, int mask_planes, float scale, float softcap) {
-    flash_attention_body<__half>(q, key, value, mask, output, batch, q_heads, kv_heads,
-                                 sq, sk, dim, group, causal, mask_planes, scale, softcap);
+    int kv_capacity, int causal, int mask_planes, int local_window,
+    float scale, float softcap) {
+    flash_attention_body<__half>(q, key, value, mask, total_lengths, past_lengths, output,
+                                 batch, q_heads, kv_heads, sq, sk, kv_capacity, dim, group, causal,
+                                 mask_planes, local_window, scale, softcap);
 }
 extern "C" __global__ void flash_attention_bf16(
     const __nv_bfloat16* q, const __nv_bfloat16* key, const __nv_bfloat16* value,
-    const __nv_bfloat16* mask, __nv_bfloat16* output,
+    const __nv_bfloat16* mask, const int* total_lengths, const int* past_lengths,
+    __nv_bfloat16* output,
     int batch, int q_heads, int kv_heads, int sq, int sk, int dim, int group,
-    int causal, int mask_planes, float scale, float softcap) {
-    flash_attention_body<__nv_bfloat16>(q, key, value, mask, output, batch, q_heads, kv_heads,
-                                        sq, sk, dim, group, causal, mask_planes, scale, softcap);
+    int kv_capacity, int causal, int mask_planes, int local_window,
+    float scale, float softcap) {
+    flash_attention_body<__nv_bfloat16>(
+        q, key, value, mask, total_lengths, past_lengths, output, batch, q_heads, kv_heads,
+        sq, sk, kv_capacity, dim, group, causal, mask_planes, local_window, scale, softcap);
 }
 "#;
 
@@ -267,9 +284,11 @@ const FLASH_F16_TENSOR_CORE: &str = r#"
 #define FLASH_TC_D 128
 
 extern "C" __global__ void flash_attention_f16_tc(
-    const __half* q, const __half* key, const __half* value, const __half* mask, __half* output,
+    const __half* q, const __half* key, const __half* value, const __half* mask,
+    const int* total_lengths, const int* past_lengths, __half* output,
     int batch, int q_heads, int kv_heads, int sq, int sk, int dim, int group,
-    int causal, int mask_planes, float scale, float softcap)
+    int kv_capacity, int causal, int mask_planes, int local_window,
+    float scale, float softcap)
 {
     using namespace nvcuda;
     __shared__ __half q_tile[FLASH_TC_Q * FLASH_TC_D];
@@ -292,10 +311,11 @@ extern "C" __global__ void flash_attention_f16_tc(
     const int b = plane / q_heads;
     const int kvh = h / group;
     const int query0 = query_tile_index * FLASH_TC_Q;
+    const int logical_sk = total_lengths ? total_lengths[b] : sk;
     const unsigned long long q_plane =
         (unsigned long long)(b * q_heads + h) * sq * dim;
     const unsigned long long kv_plane =
-        (unsigned long long)(b * kv_heads + kvh) * sk * dim;
+        (unsigned long long)(b * kv_heads + kvh) * kv_capacity * dim;
 
     for (int index = tid; index < FLASH_TC_Q * FLASH_TC_D; index += blockDim.x) {
         const int row = index / FLASH_TC_D;
@@ -349,8 +369,12 @@ extern "C" __global__ void flash_attention_f16_tc(
             const int qi = query0 + row;
             const int kj = key0 + col;
             float score = scores[tid] * scale;
-            const int causal_max = sk - sq + qi;
-            if (qi >= sq || kj >= sk || (causal && kj > causal_max)) {
+            const int causal_max =
+                past_lengths ? past_lengths[b] + qi : logical_sk - sq + qi;
+            const int local_min =
+                local_window > 0 ? max(0, causal_max + 1 - local_window) : 0;
+            if (qi >= sq || kj >= logical_sk || (causal && kj > causal_max)
+                || kj < local_min) {
                 score = FLASH_NEG_INF;
             } else {
                 if (softcap > 0.0f) {
@@ -478,6 +502,7 @@ pub(super) fn run(
     batch: usize,
     sq: usize,
     sk: usize,
+    kv_capacity: usize,
     head_dim: usize,
     group: usize,
     scale: f32,
@@ -487,6 +512,9 @@ pub(super) fn run(
     output: CUdeviceptr,
     mask: CUdeviceptr,
     mask_planes: i32,
+    total_lengths: CUdeviceptr,
+    past_lengths: CUdeviceptr,
+    local_window: i32,
     softcap: f32,
 ) -> Result<()> {
     if !supported(sq, head_dim) {
@@ -542,6 +570,7 @@ pub(super) fn run(
     let kv_heads_i = as_i32("num_kv_heads", num_kv_heads)?;
     let sq_i = as_i32("seq_q", sq)?;
     let sk_i = as_i32("seq_k", sk)?;
+    let kv_capacity_i = as_i32("KV capacity", kv_capacity)?;
     let dim_i = as_i32("head_dim", head_dim)?;
     let group_i = as_i32("GQA group", group)?;
     let causal_i = i32::from(causal);
@@ -566,6 +595,8 @@ pub(super) fn run(
         .arg(&k)
         .arg(&v)
         .arg(&mask)
+        .arg(&total_lengths)
+        .arg(&past_lengths)
         .arg(&output)
         .arg(&batch_i)
         .arg(&heads_i)
@@ -574,8 +605,10 @@ pub(super) fn run(
         .arg(&sk_i)
         .arg(&dim_i)
         .arg(&group_i)
+        .arg(&kv_capacity_i)
         .arg(&causal_i)
         .arg(&mask_planes)
+        .arg(&local_window)
         .arg(&scale)
         .arg(&softcap);
     // SAFETY: the selected entry matches the dtype-specific pointer ABI; all

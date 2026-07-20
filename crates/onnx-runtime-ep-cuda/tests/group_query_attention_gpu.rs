@@ -1,12 +1,17 @@
+use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, KernelMatch, TensorMut,
+    TensorView,
 };
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::{
+    CudaExecutionProvider, GroupQueryAttentionBackend, GroupQueryAttentionKernel,
+};
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
+use std::time::Instant;
 
 #[derive(Clone)]
 struct HostTensor {
@@ -24,10 +29,26 @@ fn typed_bytes<T: Copy>(values: &[T]) -> Vec<u8> {
 }
 
 fn f32_tensor(shape: &[usize], values: &[f32]) -> HostTensor {
+    float_tensor(DataType::Float32, shape, values)
+}
+
+fn float_tensor(dtype: DataType, shape: &[usize], values: &[f32]) -> HostTensor {
+    let bytes = match dtype {
+        DataType::Float32 => typed_bytes(values),
+        DataType::Float16 => values
+            .iter()
+            .flat_map(|&value| f16::from_f32(value).to_bits().to_ne_bytes())
+            .collect(),
+        DataType::BFloat16 => values
+            .iter()
+            .flat_map(|&value| bf16::from_f32(value).to_bits().to_ne_bytes())
+            .collect(),
+        _ => unreachable!("floating GQA test tensor dtype"),
+    };
     HostTensor {
-        dtype: DataType::Float32,
+        dtype,
         shape: shape.to_vec(),
-        bytes: typed_bytes(values),
+        bytes,
     }
 }
 
@@ -54,6 +75,28 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn decode_float(bytes: &[u8], dtype: DataType) -> Vec<f32> {
+    match dtype {
+        DataType::Float32 => bytes_to_f32(bytes),
+        DataType::Float16 | DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .map(|chunk| {
+                let bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                match dtype {
+                    DataType::Float16 => f16::from_bits(bits).to_f32(),
+                    DataType::BFloat16 => bf16::from_bits(bits).to_f32(),
+                    _ => unreachable!(),
+                }
+            })
+            .collect(),
+        _ => unreachable!("floating GQA test output dtype"),
+    }
+}
+
+fn quantize(values: &[f32], dtype: DataType) -> Vec<f32> {
+    decode_float(&float_tensor(dtype, &[], values).bytes, dtype)
+}
+
 fn gpu() -> Option<CudaExecutionProvider> {
     match CudaExecutionProvider::new_default() {
         Ok(ep) => Some(ep),
@@ -69,6 +112,16 @@ fn run(
     attrs: &[(&str, Attribute)],
     inputs: &[Option<HostTensor>],
     output_shapes: &[Vec<usize>],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<f32>>> {
+    run_with_backend(ep, attrs, inputs, output_shapes, None)
+}
+
+fn run_with_backend(
+    ep: &CudaExecutionProvider,
+    attrs: &[(&str, Attribute)],
+    inputs: &[Option<HostTensor>],
+    output_shapes: &[Vec<usize>],
+    backend: Option<GroupQueryAttentionBackend>,
 ) -> onnx_runtime_ep_api::Result<Vec<Vec<f32>>> {
     let mut graph = Graph::new();
     graph.opset_imports.insert("com.microsoft".into(), 1);
@@ -87,13 +140,22 @@ fn run(
             })
         })
         .collect();
+    let output_dtype = inputs[0]
+        .as_ref()
+        .map(|input| input.dtype)
+        .unwrap_or(DataType::Float32);
+    let element_size = match output_dtype {
+        DataType::Float32 => 4,
+        DataType::Float16 | DataType::BFloat16 => 2,
+        _ => unreachable!("floating GQA output dtype"),
+    };
     let node_outputs: Vec<_> = output_shapes
         .iter()
         .enumerate()
         .map(|(index, shape)| {
             graph.create_named_value(
                 format!("output_{index}"),
-                DataType::Float32,
+                output_dtype,
                 static_shape(shape.clone()),
             )
         })
@@ -113,7 +175,36 @@ fn run(
         graph.add_output(output);
     }
     let model = Model::new(&graph);
-    let kernel = ep.get_kernel(model.graph.node(node_id), &[], 1)?;
+    let kernel: Box<dyn Kernel> = if let Some(backend) = backend {
+        let int_attr = |name: &str, default: i64| {
+            attrs
+                .iter()
+                .find(|(attr_name, _)| *attr_name == name)
+                .and_then(|(_, value)| value.as_int())
+                .unwrap_or(default)
+        };
+        let float_attr = |name: &str| {
+            attrs
+                .iter()
+                .find(|(attr_name, _)| *attr_name == name)
+                .and_then(|(_, value)| value.as_float())
+        };
+        Box::new(
+            GroupQueryAttentionKernel::new(
+                ep.runtime().clone(),
+                usize::try_from(int_attr("num_heads", 0)).unwrap(),
+                usize::try_from(int_attr("kv_num_heads", 0)).unwrap(),
+                float_attr("scale"),
+                int_attr("do_rotary", 0) != 0,
+                int_attr("rotary_interleaved", 0) != 0,
+                int_attr("local_window_size", -1),
+                float_attr("softcap").unwrap_or(0.0),
+            )?
+            .with_backend(backend),
+        )
+    } else {
+        ep.get_kernel(model.graph.node(node_id), &[], 1)?
+    };
 
     let runtime = ep.runtime();
     let device = ep.device_id();
@@ -159,7 +250,7 @@ fn run(
 
     let mut output_buffers = output_shapes
         .iter()
-        .map(|shape| ep.allocate(shape.iter().product::<usize>() * 4, 256))
+        .map(|shape| ep.allocate(shape.iter().product::<usize>() * element_size, 256))
         .collect::<onnx_runtime_ep_api::Result<Vec<_>>>()?;
     let output_strides: Vec<_> = output_shapes
         .iter()
@@ -173,7 +264,7 @@ fn run(
             .map(|((buffer, shape), strides)| {
                 TensorMut::new(
                     DevicePtrMut(buffer.as_mut_ptr()),
-                    DataType::Float32,
+                    output_dtype,
                     shape,
                     strides,
                     device,
@@ -188,12 +279,12 @@ fn run(
 
     let mut results = Vec::with_capacity(output_buffers.len());
     for (buffer, shape) in output_buffers.iter().zip(output_shapes) {
-        let mut bytes = vec![0u8; shape.iter().product::<usize>() * 4];
+        let mut bytes = vec![0u8; shape.iter().product::<usize>() * element_size];
         // SAFETY: the output allocation contains exactly this many bytes.
         unsafe {
             runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr()))?;
         }
-        results.push(bytes_to_f32(&bytes));
+        results.push(decode_float(&bytes, output_dtype));
     }
     drop(input_views);
     for buffer in input_buffers.into_iter().flatten() {
@@ -482,12 +573,39 @@ fn base_inputs(
     seqlens: &[i32],
     total: i32,
 ) -> Vec<Option<HostTensor>> {
+    base_inputs_dtype(
+        DataType::Float32,
+        q_shape,
+        q,
+        k_shape,
+        k,
+        v,
+        past_k,
+        past_v,
+        seqlens,
+        total,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn base_inputs_dtype(
+    dtype: DataType,
+    q_shape: &[usize],
+    q: &[f32],
+    k_shape: &[usize],
+    k: &[f32],
+    v: &[f32],
+    past_k: Option<(&[usize], &[f32])>,
+    past_v: Option<(&[usize], &[f32])>,
+    seqlens: &[i32],
+    total: i32,
+) -> Vec<Option<HostTensor>> {
     vec![
-        Some(f32_tensor(q_shape, q)),
-        Some(f32_tensor(k_shape, k)),
-        Some(f32_tensor(k_shape, v)),
-        past_k.map(|(shape, data)| f32_tensor(shape, data)),
-        past_v.map(|(shape, data)| f32_tensor(shape, data)),
+        Some(float_tensor(dtype, q_shape, q)),
+        Some(float_tensor(dtype, k_shape, k)),
+        Some(float_tensor(dtype, k_shape, v)),
+        past_k.map(|(shape, data)| float_tensor(dtype, shape, data)),
+        past_v.map(|(shape, data)| float_tensor(dtype, shape, data)),
         Some(i32_tensor(&[seqlens.len()], seqlens)),
         Some(i32_tensor(&[], &[total])),
     ]
@@ -662,6 +780,622 @@ fn attrs<'a>(extra: &'a [(&'a str, Attribute)]) -> Vec<(&'a str, Attribute)> {
     ];
     attrs.extend_from_slice(extra);
     attrs
+}
+
+fn fill(count: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+fn assert_close(got: &[f32], expected: &[f32], atol: f32, rtol: f32) {
+    assert_eq!(got.len(), expected.len());
+    let mut max_abs = 0.0f32;
+    for (index, (&got, &expected)) in got.iter().zip(expected).enumerate() {
+        let error = (got - expected).abs();
+        max_abs = max_abs.max(error);
+        assert!(
+            error <= atol + rtol * expected.abs(),
+            "{index}: {got} != {expected}, error={error}, atol={atol}, rtol={rtol}"
+        );
+    }
+    eprintln!("GQA fused-vs-baseline max_abs={max_abs:e}");
+}
+
+#[derive(Clone)]
+struct ParityCase {
+    name: String,
+    dtype: DataType,
+    batch: usize,
+    heads: usize,
+    kv_heads: usize,
+    q_seq: usize,
+    k_seq: usize,
+    dim: usize,
+    past_capacity: usize,
+    capacity: usize,
+    totals: Vec<usize>,
+    rope: bool,
+    local_window: i64,
+    softcap: f32,
+    magnitude: f32,
+    seed: u64,
+}
+
+fn parity_tolerances(dtype: DataType) -> (f32, f32) {
+    match dtype {
+        DataType::Float32 => (3e-6, 2e-6),
+        DataType::Float16 => (7e-4, 7e-4),
+        DataType::BFloat16 => (5e-3, 5e-3),
+        _ => unreachable!("GQA parity dtype"),
+    }
+}
+
+fn parity_fixture(
+    case: &ParityCase,
+) -> (
+    Vec<(&'static str, Attribute)>,
+    Vec<Option<HostTensor>>,
+    Vec<Vec<usize>>,
+) {
+    assert_eq!(case.totals.len(), case.batch);
+    assert!(case.totals.iter().all(|&total| total >= case.k_seq));
+    assert!(case.totals.iter().all(|&total| total >= case.q_seq));
+    assert!(
+        case.totals
+            .iter()
+            .all(|&total| total - case.k_seq <= case.past_capacity)
+    );
+    let scale_values = |mut values: Vec<f32>| {
+        for value in &mut values {
+            *value *= case.magnitude;
+        }
+        quantize(&values, case.dtype)
+    };
+    let q = scale_values(fill(
+        case.batch * case.q_seq * case.heads * case.dim,
+        case.seed,
+    ));
+    let k = scale_values(fill(
+        case.batch * case.k_seq * case.kv_heads * case.dim,
+        case.seed + 1,
+    ));
+    let v = quantize(
+        &fill(
+            case.batch * case.k_seq * case.kv_heads * case.dim,
+            case.seed + 2,
+        ),
+        case.dtype,
+    );
+    let past_k = (case.past_capacity > 0).then(|| {
+        quantize(
+            &fill(
+                case.batch * case.kv_heads * case.past_capacity * case.dim,
+                case.seed + 3,
+            ),
+            case.dtype,
+        )
+    });
+    let past_v = (case.past_capacity > 0).then(|| {
+        quantize(
+            &fill(
+                case.batch * case.kv_heads * case.past_capacity * case.dim,
+                case.seed + 4,
+            ),
+            case.dtype,
+        )
+    });
+    let past_shape = [case.batch, case.kv_heads, case.past_capacity, case.dim];
+    let seqlens = case
+        .totals
+        .iter()
+        .map(|&total| (total - 1) as i32)
+        .collect::<Vec<_>>();
+    let mut inputs = base_inputs_dtype(
+        case.dtype,
+        &[case.batch, case.q_seq, case.heads * case.dim],
+        &q,
+        &[case.batch, case.k_seq, case.kv_heads * case.dim],
+        &k,
+        &v,
+        past_k
+            .as_ref()
+            .map(|data| (&past_shape[..], data.as_slice())),
+        past_v
+            .as_ref()
+            .map(|data| (&past_shape[..], data.as_slice())),
+        &seqlens,
+        case.capacity as i32,
+    );
+    let mut attrs = vec![
+        ("num_heads", Attribute::Int(case.heads as i64)),
+        ("kv_num_heads", Attribute::Int(case.kv_heads as i64)),
+    ];
+    if case.rope {
+        attrs.push(("do_rotary", Attribute::Int(1)));
+        let mut cos = Vec::with_capacity(case.capacity * case.dim / 2);
+        let mut sin = Vec::with_capacity(cos.capacity());
+        for position in 0..case.capacity {
+            for index in 0..case.dim / 2 {
+                let angle = position as f32 * (index + 1) as f32 * 0.013;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        inputs.push(Some(f32_tensor(&[case.capacity, case.dim / 2], &cos)));
+        inputs.push(Some(f32_tensor(&[case.capacity, case.dim / 2], &sin)));
+    }
+    if case.local_window > 0 {
+        attrs.push(("local_window_size", Attribute::Int(case.local_window)));
+    }
+    if case.softcap > 0.0 {
+        attrs.push(("softcap", Attribute::Float(case.softcap)));
+    }
+    let output_shapes = vec![
+        vec![case.batch, case.q_seq, case.heads * case.dim],
+        vec![case.batch, case.kv_heads, case.capacity, case.dim],
+        vec![case.batch, case.kv_heads, case.capacity, case.dim],
+    ];
+    (attrs, inputs, output_shapes)
+}
+
+fn run_forced_parity_case(ep: &CudaExecutionProvider, case: &ParityCase) {
+    let (attrs, inputs, output_shapes) = parity_fixture(case);
+    let fused = run_available(run_with_backend(
+        ep,
+        &attrs,
+        &inputs,
+        &output_shapes,
+        Some(GroupQueryAttentionBackend::Fused),
+    ))
+    .unwrap();
+    let baseline = run_available(run_with_backend(
+        ep,
+        &attrs,
+        &inputs,
+        &output_shapes,
+        Some(GroupQueryAttentionBackend::Phase2a),
+    ))
+    .unwrap();
+    let (atol, rtol) = parity_tolerances(case.dtype);
+    eprintln!("GQA forced parity {}", case.name);
+    assert!(fused[0].iter().all(|value| value.is_finite()));
+    assert_close(&fused[0], &baseline[0], atol, rtol);
+    assert_eq!(fused[1], baseline[1]);
+    assert_eq!(fused[2], baseline[2]);
+}
+
+#[test]
+fn gqa_gpu_fused_causal_origin_matches_baseline_when_query_and_key_lengths_differ() {
+    let Some(ep) = gpu() else { return };
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for (name, batch, totals, past_capacity, capacity, seed) in [
+            ("fresh", 1usize, vec![4usize], 0usize, 4usize, 681u64),
+            (
+                "cached-ragged",
+                2usize,
+                vec![7usize, 9usize],
+                6usize,
+                10usize,
+                691u64,
+            ),
+        ] {
+            run_forced_parity_case(
+                &ep,
+                &ParityCase {
+                    name: format!(
+                        "causal-origin-{name}-q2-k4-{}",
+                        format!("{dtype:?}").to_lowercase()
+                    ),
+                    dtype,
+                    batch,
+                    heads: 4,
+                    kv_heads: 2,
+                    q_seq: 2,
+                    k_seq: 4,
+                    dim: 64,
+                    past_capacity,
+                    capacity,
+                    totals,
+                    rope: false,
+                    local_window: -1,
+                    softcap: 0.0,
+                    magnitude: 1.0,
+                    seed,
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn gqa_gpu_forced_fused_matches_baseline_parity_matrix() {
+    let Some(ep) = gpu() else { return };
+    let mut cases = Vec::new();
+    let mut seed = 701u64;
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for (sharing, heads, kv_heads) in [
+            ("mha", 4usize, 4usize),
+            ("gqa", 8usize, 2usize),
+            ("mqa", 4usize, 1usize),
+        ] {
+            for (mode, batch, past_capacity, capacity, totals, local_window, softcap) in [
+                (
+                    "fresh-uniform",
+                    1usize,
+                    0usize,
+                    7usize,
+                    vec![7usize],
+                    -1,
+                    0.0,
+                ),
+                ("cached-uniform-window-softcap", 1, 6, 12, vec![10], 4, 2.0),
+                ("cached-ragged", 2, 7, 12, vec![8, 11], -1, 0.0),
+            ] {
+                cases.push(ParityCase {
+                    name: format!("{}-{sharing}-{mode}", format!("{dtype:?}").to_lowercase()),
+                    dtype,
+                    batch,
+                    heads,
+                    kv_heads,
+                    q_seq: if mode == "fresh-uniform" { 7 } else { 5 },
+                    k_seq: if mode == "fresh-uniform" { 7 } else { 5 },
+                    dim: 64,
+                    past_capacity,
+                    capacity,
+                    totals,
+                    rope: false,
+                    local_window,
+                    softcap,
+                    magnitude: 1.0,
+                    seed,
+                });
+                seed += 10;
+            }
+        }
+        cases.push(ParityCase {
+            name: format!("{}-mqa-rope", format!("{dtype:?}").to_lowercase()),
+            dtype,
+            batch: 1,
+            heads: 4,
+            kv_heads: 1,
+            q_seq: 5,
+            k_seq: 5,
+            dim: 64,
+            past_capacity: 0,
+            capacity: 5,
+            totals: vec![5],
+            rope: true,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 1.0,
+            seed,
+        });
+        seed += 10;
+    }
+    cases.extend([
+        ParityCase {
+            name: "float16-gqa-generic-non-wmma-d72".into(),
+            dtype: DataType::Float16,
+            batch: 1,
+            heads: 8,
+            kv_heads: 2,
+            q_seq: 6,
+            k_seq: 6,
+            dim: 72,
+            past_capacity: 0,
+            capacity: 6,
+            totals: vec![6],
+            rope: false,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 1.0,
+            seed,
+        },
+        ParityCase {
+            name: "float32-gqa-ragged-large-magnitude".into(),
+            dtype: DataType::Float32,
+            batch: 2,
+            heads: 8,
+            kv_heads: 2,
+            q_seq: 5,
+            k_seq: 5,
+            dim: 64,
+            past_capacity: 8,
+            capacity: 16,
+            totals: vec![8, 11],
+            rope: false,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 40.0,
+            seed: seed + 10,
+        },
+    ]);
+
+    for case in &cases {
+        run_forced_parity_case(&ep, case);
+    }
+}
+
+#[test]
+fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
+    let Some(ep) = gpu() else { return };
+    for case in [
+        ParityCase {
+            name: "auto-decode-fallback".into(),
+            dtype: DataType::Float16,
+            batch: 1,
+            heads: 4,
+            kv_heads: 1,
+            q_seq: 1,
+            k_seq: 1,
+            dim: 64,
+            past_capacity: 8,
+            capacity: 9,
+            totals: vec![9],
+            rope: false,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 1.0,
+            seed: 991,
+        },
+        ParityCase {
+            name: "auto-cached-large-slow-fallback".into(),
+            dtype: DataType::Float16,
+            batch: 1,
+            heads: 4,
+            kv_heads: 1,
+            q_seq: 512,
+            k_seq: 512,
+            dim: 64,
+            past_capacity: 512,
+            capacity: 1024,
+            totals: vec![1024],
+            rope: false,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 1.0,
+            seed: 1001,
+        },
+    ] {
+        let (attrs, inputs, output_shapes) = parity_fixture(&case);
+        let auto_kernel = GroupQueryAttentionKernel::new(
+            ep.runtime().clone(),
+            case.heads,
+            case.kv_heads,
+            None,
+            false,
+            false,
+            case.local_window,
+            case.softcap,
+        )
+        .unwrap();
+        assert_eq!(
+            auto_kernel.selected_backend_for_shape(
+                case.dtype,
+                case.q_seq,
+                *case.totals.iter().max().unwrap(),
+                case.dim,
+            ),
+            GroupQueryAttentionBackend::Phase2a,
+            "{} must select the baseline",
+            case.name
+        );
+        let auto = run_available(run_with_backend(
+            &ep,
+            &attrs,
+            &inputs,
+            &output_shapes,
+            Some(GroupQueryAttentionBackend::Auto),
+        ))
+        .unwrap();
+        let baseline = run_available(run_with_backend(
+            &ep,
+            &attrs,
+            &inputs,
+            &output_shapes,
+            Some(GroupQueryAttentionBackend::Phase2a),
+        ))
+        .unwrap();
+        let (atol, rtol) = parity_tolerances(case.dtype);
+        eprintln!("GQA {}", case.name);
+        assert_close(&auto[0], &baseline[0], atol, rtol);
+        assert_eq!(auto[1], baseline[1]);
+        assert_eq!(auto[2], baseline[2]);
+    }
+}
+
+fn benchmark_gqa_case(
+    ep: &CudaExecutionProvider,
+    q_seq: usize,
+    past_len: usize,
+    backend: GroupQueryAttentionBackend,
+    iterations: usize,
+) -> f64 {
+    let (batch, heads, kv_heads, dim) = (1usize, 32usize, 8usize, 128usize);
+    let total = past_len + q_seq;
+    let capacity = total;
+    let dtype = DataType::Float16;
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let upload = |values: &[f32]| {
+        let bytes = float_tensor(dtype, &[], values).bytes;
+        let buffer = ep.allocate(bytes.len(), 256).unwrap();
+        // SAFETY: the allocation exactly covers the encoded values.
+        unsafe {
+            runtime.htod(&bytes, cuptr(buffer.as_ptr())).unwrap();
+        }
+        buffer
+    };
+    let q = upload(&fill(batch * q_seq * heads * dim, 801 + q_seq as u64));
+    let k = upload(&fill(batch * q_seq * kv_heads * dim, 802 + q_seq as u64));
+    let v = upload(&fill(batch * q_seq * kv_heads * dim, 803 + q_seq as u64));
+    let mut cache_k = upload(&fill(batch * kv_heads * capacity * dim, 804 + q_seq as u64));
+    let mut cache_v = upload(&fill(batch * kv_heads * capacity * dim, 805 + q_seq as u64));
+    let seqlens_host = i32_tensor(&[1], &[(total - 1) as i32]);
+    let total_host = i32_tensor(&[], &[capacity as i32]);
+    let seqlens = upload_bytes(ep, &seqlens_host);
+    let total_length = upload_bytes(ep, &total_host);
+    let mut output = ep.allocate(batch * q_seq * heads * dim * 2, 256).unwrap();
+
+    let q_shape = [batch, q_seq, heads * dim];
+    let kv_shape = [batch, q_seq, kv_heads * dim];
+    let cache_shape = [batch, kv_heads, capacity, dim];
+    let q_strides = compute_contiguous_strides(&q_shape);
+    let kv_strides = compute_contiguous_strides(&kv_shape);
+    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let scalar_strides = compute_contiguous_strides(&[]);
+    let seqlens_strides = compute_contiguous_strides(&[1]);
+    let output_strides = compute_contiguous_strides(&q_shape);
+    let inputs = vec![
+        TensorView::new(DevicePtr(q.as_ptr()), dtype, &q_shape, &q_strides, device),
+        TensorView::new(DevicePtr(k.as_ptr()), dtype, &kv_shape, &kv_strides, device),
+        TensorView::new(DevicePtr(v.as_ptr()), dtype, &kv_shape, &kv_strides, device),
+        if past_len > 0 {
+            TensorView::new(
+                DevicePtr(cache_k.as_ptr()),
+                dtype,
+                &cache_shape,
+                &cache_strides,
+                device,
+            )
+        } else {
+            TensorView::absent(dtype)
+        },
+        if past_len > 0 {
+            TensorView::new(
+                DevicePtr(cache_v.as_ptr()),
+                dtype,
+                &cache_shape,
+                &cache_strides,
+                device,
+            )
+        } else {
+            TensorView::absent(dtype)
+        },
+        TensorView::new(
+            DevicePtr(seqlens.as_ptr()),
+            DataType::Int32,
+            &[1],
+            &seqlens_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(total_length.as_ptr()),
+            DataType::Int32,
+            &[],
+            &scalar_strides,
+            device,
+        ),
+    ];
+    let kernel = GroupQueryAttentionKernel::new(
+        runtime.clone(),
+        heads,
+        kv_heads,
+        Some(1.0 / (dim as f32).sqrt()),
+        false,
+        false,
+        -1,
+        0.0,
+    )
+    .unwrap()
+    .with_backend(backend);
+    let mut run = || {
+        kernel
+            .execute(
+                &inputs,
+                &mut [
+                    TensorMut::new(
+                        DevicePtrMut(output.as_mut_ptr()),
+                        dtype,
+                        &q_shape,
+                        &output_strides,
+                        device,
+                    ),
+                    TensorMut::new(
+                        DevicePtrMut(cache_k.as_mut_ptr()),
+                        dtype,
+                        &cache_shape,
+                        &cache_strides,
+                        device,
+                    ),
+                    TensorMut::new(
+                        DevicePtrMut(cache_v.as_mut_ptr()),
+                        dtype,
+                        &cache_shape,
+                        &cache_strides,
+                        device,
+                    ),
+                ],
+            )
+            .unwrap();
+    };
+    run();
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        run();
+        samples.push(start.elapsed().as_secs_f64() * 1_000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let median = samples[samples.len() / 2];
+    drop(run);
+    drop(inputs);
+    for buffer in [q, k, v, cache_k, cache_v, seqlens, total_length, output] {
+        ep.deallocate(buffer).unwrap();
+    }
+    median
+}
+
+fn upload_bytes(ep: &CudaExecutionProvider, tensor: &HostTensor) -> DeviceBuffer {
+    let buffer = ep.allocate(tensor.bytes.len(), 256).unwrap();
+    // SAFETY: the allocation exactly covers the source bytes.
+    unsafe {
+        ep.runtime()
+            .htod(&tensor.bytes, cuptr(buffer.as_ptr()))
+            .unwrap();
+    }
+    buffer
+}
+
+#[test]
+#[ignore = "H200 performance benchmark; run explicitly with --ignored --nocapture"]
+fn gqa_prefill_h200_benchmark() {
+    let ep = CudaExecutionProvider::new_default().expect("benchmark requires a CUDA GPU");
+    for (q_seq, iterations) in [(512usize, 10usize), (2048usize, 3usize)] {
+        for past_len in [0usize, q_seq] {
+            let fused = benchmark_gqa_case(
+                &ep,
+                q_seq,
+                past_len,
+                GroupQueryAttentionBackend::Fused,
+                iterations,
+            );
+            let baseline = benchmark_gqa_case(
+                &ep,
+                q_seq,
+                past_len,
+                GroupQueryAttentionBackend::Phase2a,
+                iterations,
+            );
+            let total = q_seq + past_len;
+            let score_bytes = 32usize * q_seq * total * 2;
+            let baseline_scratch = score_bytes + 32 * 1024 * 1024;
+            println!(
+                "H200 GQA f16 causal B=1 H=32 KVH=8 Q={q_seq} past={past_len} D=128: \
+                 fused={fused:.3} ms baseline={baseline:.3} ms speedup={:.2}x; \
+                 attention scratch fused=0 MiB baseline={:.1} MiB",
+                baseline / fused,
+                baseline_scratch as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
 }
 
 #[test]
