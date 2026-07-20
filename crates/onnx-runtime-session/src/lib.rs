@@ -22,11 +22,13 @@ use onnx_runtime_ir::{DataType, DeviceType, Shape};
 pub use epcontext::{
     CompiledPartition, EpContextPlacement, dump_session_ep_context, load_ep_context_nodes,
 };
+pub use error::SessionError;
+pub use executor::{
+    CacheStats, ControlFlowStats, DeviceAllocationCounts, DeviceGraphCaptureResult,
+};
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
-pub use error::SessionError;
-pub use executor::{CacheStats, ControlFlowStats};
 pub use tensor::{DeviceBindingTransferStats, DeviceIoBinding, Tensor, cpu_allocator};
 
 mod epcontext;
@@ -181,9 +183,7 @@ mod error {
         #[error("internal executor error: {0}")]
         Internal(String),
 
-        #[error(
-            "Sequence op {op}: {reason}"
-        )]
+        #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
 
         #[error("control-flow op {op}: {reason}")]
@@ -502,33 +502,34 @@ impl SessionBuilder {
         // Memory limits and profiling remain reserved builder intents.
         let _ = (self.memory_limit, self.enable_profiling);
 
-        let (mut graph, weights, model_dir, model_metadata) = match (self.model_path, self.model_bytes) {
-            (Some(path), _) => {
-                // The EPContext load path resolves `embed_mode=0` external blob
-                // paths relative to the model file's directory (§55.3), so
-                // retain it (same base dir the loader used for external data).
-                let model_dir = path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("."));
-                let bytes = std::fs::read(&path).map_err(|source| {
-                    onnx_runtime_loader::LoaderError::Io {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-                let metadata = model_metadata_from_bytes(&bytes)?;
-                let (g, w) =
-                    onnx_runtime_loader::load_model_bytes_with_weights(&bytes, &model_dir)?;
-                (g, w, model_dir, metadata)
-            }
-            (None, Some(bytes)) => {
-                let metadata = model_metadata_from_bytes(&bytes)?;
-                let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?;
-                (g, w, PathBuf::from("."), metadata)
-            }
-            (None, None) => return Err(SessionError::NoModelSource),
-        };
+        let (mut graph, weights, model_dir, model_metadata) =
+            match (self.model_path, self.model_bytes) {
+                (Some(path), _) => {
+                    // The EPContext load path resolves `embed_mode=0` external blob
+                    // paths relative to the model file's directory (§55.3), so
+                    // retain it (same base dir the loader used for external data).
+                    let model_dir = path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let bytes = std::fs::read(&path).map_err(|source| {
+                        onnx_runtime_loader::LoaderError::Io {
+                            path: path.clone(),
+                            source,
+                        }
+                    })?;
+                    let metadata = model_metadata_from_bytes(&bytes)?;
+                    let (g, w) =
+                        onnx_runtime_loader::load_model_bytes_with_weights(&bytes, &model_dir)?;
+                    (g, w, model_dir, metadata)
+                }
+                (None, Some(bytes)) => {
+                    let metadata = model_metadata_from_bytes(&bytes)?;
+                    let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?;
+                    (g, w, PathBuf::from("."), metadata)
+                }
+                (None, None) => return Err(SessionError::NoModelSource),
+            };
 
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
@@ -813,6 +814,51 @@ impl InferenceSession {
         )
     }
 
+    /// Allocate a persistent buffer for a graph output without also binding it
+    /// as an input.
+    pub fn allocate_device_output_binding(
+        &self,
+        output_name: impl Into<String>,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<DeviceIoBinding> {
+        self.exec.allocate_device_output_binding(
+            output_name.into(),
+            dtype,
+            physical_shape,
+            logical_shape,
+        )
+    }
+
+    /// Execute once while recording the kernel launches into a device graph.
+    ///
+    /// `NotCapturable` means the mandatory all-kernel audit rejected the run
+    /// before stream capture began, so callers may safely retry eagerly.
+    pub fn try_capture_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        self.exec.try_capture_with_device_bindings(inputs, bindings)
+    }
+
+    /// Replay the installed device graph after the caller has refreshed any
+    /// persistent scalar inputs.
+    pub fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<()> {
+        self.exec.replay_device_graph(bindings)
+    }
+
+    /// Invalidate the installed device graph before reset, rewind, shape change,
+    /// or binding destruction.
+    pub fn reset_device_graph(&mut self) -> Result<bool> {
+        self.exec.reset_device_graph()
+    }
+
+    pub fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
+        self.exec.device_allocation_counts()
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }
@@ -923,7 +969,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<InferenceSession> {
 #[cfg(test)]
 mod device_binding_tests {
     use super::*;
-    use onnx_runtime_ir::{Graph, Node, NodeId, static_shape};
+    use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, static_shape};
 
     #[test]
     fn persistent_binding_aliases_input_output_and_suppresses_materialization() {
@@ -941,13 +987,7 @@ mod device_binding_tests {
         graph.add_output(output);
         let mut session = InferenceSession::from_graph(graph).unwrap();
         let mut binding = session
-            .allocate_device_binding(
-                "input",
-                Some("output"),
-                DataType::Float32,
-                vec![4],
-                vec![2],
-            )
+            .allocate_device_binding("input", Some("output"), DataType::Float32, vec![4], vec![2])
             .unwrap();
         let ptr = binding.device_ptr();
         let bytes = [-2.0f32, 3.0, -4.0, 5.0]
@@ -979,6 +1019,88 @@ mod device_binding_tests {
                 host_download_bytes: 16,
             }
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_graph_replay_uses_persistent_io_without_device_allocations() {
+        let Ok(mut ep) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+            eprintln!("skipping session CUDA graph test: CUDA runtime unavailable");
+            return;
+        };
+        onnx_runtime_ep_api::ExecutionProvider::initialize(&mut ep, &Default::default()).unwrap();
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("".into(), 13);
+        let input = graph.create_named_value("input", DataType::Int64, static_shape([1]));
+        graph.add_input(input);
+        let output = graph.create_named_value("output", DataType::Float32, static_shape([1]));
+        let mut cast = Node::new(NodeId(0), "Cast", vec![Some(input)], vec![output]);
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+        graph.insert_node(cast);
+        graph.add_output(output);
+
+        let mut session = InferenceSession::from_parts(
+            graph,
+            std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            EpContextDumpConfig::default(),
+            ModelMetadata::default(),
+            std::sync::Arc::new(ep),
+        )
+        .unwrap();
+        let mut input = session
+            .allocate_device_binding("input", None::<String>, DataType::Int64, vec![1], vec![1])
+            .unwrap();
+        let output = session
+            .allocate_device_output_binding("output", DataType::Float32, vec![1], vec![1])
+            .unwrap();
+        input.write_bytes(0, &7i64.to_le_bytes()).unwrap();
+        let mut bindings = vec![input, output];
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+
+        input_write(&mut bindings[0], 11);
+        assert!(matches!(
+            session
+                .try_capture_with_device_bindings(&[], &mut bindings)
+                .unwrap(),
+            DeviceGraphCaptureResult::Captured(_)
+        ));
+        assert_eq!(read_bound_f32(&mut bindings[1]), 11.0);
+
+        let before = session.device_allocation_counts().unwrap();
+        input_write(&mut bindings[0], 23);
+        session.replay_device_graph(&mut bindings).unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 23.0);
+        assert_eq!(session.device_allocation_counts().unwrap(), before);
+        assert!(session.reset_device_graph().unwrap());
+
+        input_write(&mut bindings[0], 31);
+        assert!(matches!(
+            session
+                .try_capture_with_device_bindings(&[], &mut bindings)
+                .unwrap(),
+            DeviceGraphCaptureResult::Captured(_)
+        ));
+        assert_eq!(read_bound_f32(&mut bindings[1]), 31.0);
+        input_write(&mut bindings[0], 47);
+        session.replay_device_graph(&mut bindings).unwrap();
+        assert_eq!(read_bound_f32(&mut bindings[1]), 47.0);
+        assert!(session.reset_device_graph().unwrap());
+    }
+
+    #[cfg(feature = "cuda")]
+    fn input_write(binding: &mut DeviceIoBinding, value: i64) {
+        binding.write_bytes(0, &value.to_le_bytes()).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_bound_f32(binding: &mut DeviceIoBinding) -> f32 {
+        let bytes = binding.read_bytes().unwrap();
+        f32::from_le_bytes(bytes.try_into().unwrap())
     }
 }
 
@@ -1021,7 +1143,11 @@ mod option_tests {
             ("BASIC", OptimizationLevel::Basic),
             ("All", OptimizationLevel::All),
         ] {
-            assert_eq!(level_of(&[("optimization", v)]).unwrap(), want, "value {v:?}");
+            assert_eq!(
+                level_of(&[("optimization", v)]).unwrap(),
+                want,
+                "value {v:?}"
+            );
         }
     }
 
@@ -1095,8 +1221,18 @@ mod option_tests {
 
     #[test]
     fn ep_context_embed_mode_parses_and_rejects() {
-        assert_eq!(ctx_of(&[("ep.context_embed_mode", "0")]).unwrap().embed_mode, 0);
-        assert_eq!(ctx_of(&[("ep.context_embed_mode", "1")]).unwrap().embed_mode, 1);
+        assert_eq!(
+            ctx_of(&[("ep.context_embed_mode", "0")])
+                .unwrap()
+                .embed_mode,
+            0
+        );
+        assert_eq!(
+            ctx_of(&[("ep.context_embed_mode", "1")])
+                .unwrap()
+                .embed_mode,
+            1
+        );
 
         let err = ctx_of(&[("ep.context_embed_mode", "2")]).unwrap_err();
         assert!(matches!(

@@ -397,6 +397,27 @@ impl ExecutionProvider for CudaExecutionProvider {
         unsafe { self.runtime.dtoh(dst, cuptr(src.as_ptr())) }
     }
 
+    fn begin_device_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
+        self.runtime.begin_graph_capture(kernels)
+    }
+
+    fn end_device_graph_capture(&self) -> Result<()> {
+        self.runtime.end_graph_capture()
+    }
+
+    fn replay_device_graph(&self) -> Result<()> {
+        self.runtime.replay_graph()
+    }
+
+    fn reset_device_graph(&self) -> Result<bool> {
+        self.runtime.reset_graph()
+    }
+
+    fn device_allocation_counts(&self) -> Option<(u64, u64)> {
+        let counts = self.runtime.allocation_counts();
+        Some((counts.allocations, counts.frees))
+    }
+
     fn sync(&self) -> Result<()> {
         self.runtime.synchronize()
     }

@@ -126,6 +126,7 @@ pub struct DeviceBindingTransferStats {
 /// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
     input_name: String,
+    bind_input: bool,
     output_name: Option<String>,
     pub dtype: DataType,
     physical_shape: Vec<usize>,
@@ -139,6 +140,7 @@ impl DeviceIoBinding {
     pub(crate) fn allocate(
         allocator: Arc<dyn ExecutionProvider>,
         input_name: String,
+        bind_input: bool,
         output_name: Option<String>,
         dtype: DataType,
         physical_shape: Vec<usize>,
@@ -157,6 +159,7 @@ impl DeviceIoBinding {
         let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
         Ok(Self {
             input_name,
+            bind_input,
             output_name,
             dtype,
             physical_shape,
@@ -169,6 +172,10 @@ impl DeviceIoBinding {
 
     pub fn input_name(&self) -> &str {
         &self.input_name
+    }
+
+    pub(crate) fn binds_input(&self) -> bool {
+        self.bind_input
     }
 
     pub fn output_name(&self) -> Option<&str> {
@@ -248,6 +255,7 @@ impl std::fmt::Debug for DeviceIoBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceIoBinding")
             .field("input_name", &self.input_name)
+            .field("bind_input", &self.bind_input)
             .field("output_name", &self.output_name)
             .field("dtype", &self.dtype)
             .field("physical_shape", &self.physical_shape)
@@ -262,6 +270,7 @@ impl std::fmt::Debug for DeviceIoBinding {
 impl Drop for DeviceIoBinding {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
+            let _ = self.allocator.reset_device_graph();
             let _ = self.allocator.deallocate(buffer);
         }
     }
@@ -431,17 +440,26 @@ impl Tensor {
         if bytes.len() != expected {
             return Err(SessionError::Internal(format!(
                 "Tensor::overwrite_bytes: got {} bytes for shape {:?} dtype {:?}, expected {expected}",
-                bytes.len(), self.shape, self.dtype
+                bytes.len(),
+                self.shape,
+                self.dtype
             )));
         }
-        let buffer = self.buffer.as_mut().expect("Tensor buffer taken only in Drop");
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("Tensor buffer taken only in Drop");
         self.allocator.copy_from_host(bytes, buffer)?;
         Ok(())
     }
 
     /// Copy out the elements as `f32`. Panics if the dtype is not `Float32`.
     pub fn to_vec_f32(&self) -> Vec<f32> {
-        assert_eq!(self.dtype, DataType::Float32, "to_vec_f32 on non-f32 tensor");
+        assert_eq!(
+            self.dtype,
+            DataType::Float32,
+            "to_vec_f32 on non-f32 tensor"
+        );
         self.as_bytes()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -542,9 +560,17 @@ mod tests {
         // The tensor aliases the backing store without copying it.
         assert_eq!(tensor.as_bytes().len(), 16);
         assert_eq!(tensor.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(drops.load(Ordering::SeqCst), 0, "guard alive while tensor is");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "guard alive while tensor is"
+        );
 
         drop(tensor);
-        assert_eq!(drops.load(Ordering::SeqCst), 1, "guard runs exactly once on drop");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "guard runs exactly once on drop"
+        );
     }
 }

@@ -298,6 +298,42 @@ pub trait ExecutionProvider: Send + Sync {
     /// Asynchronous copy; returns a [`Fence`] to await.
     fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence>;
 
+    /// Begin recording the supplied, already-compiled kernel sequence into a
+    /// device graph. EPs without graph support reject the request.
+    fn begin_device_graph_capture(&self, _kernels: &[&dyn Kernel]) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device graph capture is not supported",
+            self.name()
+        )))
+    }
+
+    /// End device-graph capture and install the resulting executable.
+    fn end_device_graph_capture(&self) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device graph capture is not supported",
+            self.name()
+        )))
+    }
+
+    /// Replay the installed device graph.
+    fn replay_device_graph(&self) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device graph replay is not supported",
+            self.name()
+        )))
+    }
+
+    /// Destroy any installed device graph before its referenced buffers move or
+    /// are released.
+    fn reset_device_graph(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Explicit device allocation/free counters, when the EP exposes them.
+    fn device_allocation_counts(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Synchronously upload host bytes into a buffer owned by this EP.
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
         if !dst.device().is_host_accessible() {

@@ -43,7 +43,10 @@ pub use logits::{
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
 };
 #[cfg(feature = "native-backend")]
-pub use native_decode::{NativeDecodeDevice, NativeDecodeSession};
+pub use native_decode::{
+    CudaGraphDebugStats, CudaKvDebugStats, NativeDecodeCudaOptions, NativeDecodeDevice,
+    NativeDecodeSession,
+};
 pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
 pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,

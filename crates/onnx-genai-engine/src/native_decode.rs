@@ -8,7 +8,8 @@ use anyhow::{Context, bail};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim};
 use onnx_runtime_session::{
-    DeviceBindingTransferStats, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
+    DeviceAllocationCounts, DeviceBindingTransferStats, DeviceGraphCaptureResult, DeviceIoBinding,
+    DevicePreference, InferenceSession, Tensor,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,6 +25,12 @@ pub enum NativeDecodeDevice {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeDecodeCudaOptions {
+    pub kv_max_len: Option<usize>,
+    pub graph_capture: Option<bool>,
+}
+
 const DEFAULT_CUDA_KV_MAX_LEN: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,12 +39,48 @@ pub struct CudaKvDebugStats {
     pub max_len: usize,
     pub device_ptrs: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
+    pub graph: CudaGraphDebugStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaGraphDebugStats {
+    pub enabled: bool,
+    pub captures: u64,
+    pub replays: u64,
+    pub fallbacks: u64,
+    pub allocation_counts: DeviceAllocationCounts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeCudaGraphPhase {
+    NeedsWarmup,
+    Armed,
+    Ready,
+    Unsupported,
 }
 
 struct DecodeCudaState {
     logical_len: usize,
     max_len: usize,
     bindings: Vec<DeviceIoBinding>,
+    base_binding_count: usize,
+    kv_binding_range: std::ops::Range<usize>,
+    input_ids_binding: usize,
+    position_ids_binding: Option<usize>,
+    logits_binding: usize,
+    logits_shape: Vec<usize>,
+    graph_enabled: bool,
+    graph_phase: DecodeCudaGraphPhase,
+    graph_captures: u64,
+    graph_replays: u64,
+    graph_fallbacks: u64,
+}
+
+struct DecodeCudaIo<'a> {
+    input_ids: &'a str,
+    attention_mask: &'a str,
+    position_ids: Option<&'a str>,
+    logits: &'a str,
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
@@ -57,7 +100,7 @@ pub struct NativeDecodeSession {
 impl NativeDecodeSession {
     /// Load a decoder-with-past ONNX model on the requested native device.
     pub fn load(path: impl AsRef<Path>, device: NativeDecodeDevice) -> anyhow::Result<Self> {
-        Self::load_with_cuda_kv_max_len(path, device, None)
+        Self::load_with_cuda_options(path, device, NativeDecodeCudaOptions::default())
     }
 
     pub(crate) fn load_with_weight_offload_host_cache(
@@ -89,6 +132,23 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         cuda_kv_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options(
+            path,
+            device,
+            NativeDecodeCudaOptions {
+                kv_max_len: cuda_kv_max_len,
+                graph_capture: None,
+            },
+        )
+    }
+
+    /// Load with explicit native-CUDA decode options. Unspecified graph capture
+    /// follows `ONNX_GENAI_CUDA_GRAPH` and remains disabled by default.
+    pub fn load_with_cuda_options(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        options: NativeDecodeCudaOptions,
+    ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -98,17 +158,30 @@ impl NativeDecodeSession {
             .device(preference)
             .build()
             .context("load native decoder model")?;
-        Self::from_session_with_cuda_kv_max_len(session, cuda_kv_max_len)
+        Self::from_session_with_cuda_options(session, options)
     }
 
     /// Wrap an already-built native session, validating its decoder-with-past I/O.
     pub fn from_session(session: InferenceSession) -> anyhow::Result<Self> {
-        Self::from_session_with_cuda_kv_max_len(session, None)
+        Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
     }
 
     fn from_session_with_cuda_kv_max_len(
-        mut session: InferenceSession,
+        session: InferenceSession,
         cuda_kv_max_len: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        Self::from_session_with_cuda_options(
+            session,
+            NativeDecodeCudaOptions {
+                kv_max_len: cuda_kv_max_len,
+                graph_capture: None,
+            },
+        )
+    }
+
+    fn from_session_with_cuda_options(
+        mut session: InferenceSession,
+        cuda_options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
         let input_names = session
             .inputs()
@@ -165,16 +238,25 @@ impl NativeDecodeSession {
         }
 
         let cuda = if session.device_id().device_type == DeviceType::Cuda {
-            let max_len = match cuda_kv_max_len {
+            let max_len = match cuda_options.kv_max_len {
                 Some(0) => bail!("CUDA KV max length must be greater than zero"),
                 Some(value) => value,
                 None => cuda_kv_max_len_from_env()?,
             };
+            let graph_enabled = cuda_options
+                .graph_capture
+                .unwrap_or_else(|| onnx_genai_runtime_config::runtime_config().cuda_graph);
             Some(DecodeCudaState::new(
                 &mut session,
-                &attention_mask,
+                DecodeCudaIo {
+                    input_ids: &input_ids,
+                    attention_mask: &attention_mask,
+                    position_ids: position_ids.as_deref(),
+                    logits: &logits,
+                },
                 &present_to_past,
                 max_len,
+                graph_enabled,
             )?)
         } else {
             None
@@ -203,7 +285,9 @@ impl NativeDecodeSession {
     }
 
     pub fn cuda_kv_debug_stats(&self) -> Option<CudaKvDebugStats> {
-        self.cuda.as_ref().map(DecodeCudaState::debug_stats)
+        self.cuda
+            .as_ref()
+            .map(|state| state.debug_stats(&self.session))
     }
 
     pub fn decode(
@@ -322,6 +406,22 @@ impl NativeDecodeSession {
         }
         state.extend_mask(past_len, total_len)?;
 
+        if token_ids.len() == 1 {
+            state.write_decode_inputs(token_ids[0], past_len)?;
+            if let Err(error) = state.run_one_token(&mut self.session) {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            }
+            let logits = state.read_logits()?;
+            if logits.iter().flatten().any(|value| !value.is_finite()) {
+                bail!("native decoder produced non-finite logits");
+            }
+            state.set_logical_len(total_len)?;
+            self.current_len = total_len;
+            return Ok(logits);
+        }
+
+        state.invalidate_graph(&mut self.session)?;
         let ids = token_ids
             .iter()
             .map(|&id| i64::from(id))
@@ -344,7 +444,7 @@ impl NativeDecodeSession {
             .collect::<Vec<_>>();
         let outputs = match self
             .session
-            .run_with_device_bindings(&bindings, &mut state.bindings)
+            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
         {
             Ok(outputs) => outputs,
             Err(error) => {
@@ -385,12 +485,13 @@ impl NativeDecodeSession {
 impl DecodeCudaState {
     fn new(
         session: &mut InferenceSession,
-        attention_mask: &str,
+        io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
         max_len: usize,
+        graph_enabled: bool,
     ) -> anyhow::Result<Self> {
         let mut mask = session.allocate_device_binding(
-            attention_mask,
+            io.attention_mask,
             None::<String>,
             DataType::Int64,
             vec![1, max_len],
@@ -403,8 +504,9 @@ impl DecodeCudaState {
             .map(|(present, past)| (present.clone(), past.clone()))
             .collect::<Vec<_>>();
         pairs.sort_unstable_by(|left, right| left.1.cmp(&right.1));
-        let mut bindings = Vec::with_capacity(1 + pairs.len());
+        let mut bindings = Vec::with_capacity(4 + pairs.len());
         bindings.push(mask);
+        let kv_start = bindings.len();
         for (present, past) in pairs {
             let meta = session
                 .inputs()
@@ -444,10 +546,75 @@ impl DecodeCudaState {
                 logical_shape,
             )?);
         }
+        let kv_end = bindings.len();
+        let base_binding_count = bindings.len();
+
+        let input_ids_binding = bindings.len();
+        bindings.push(session.allocate_device_binding(
+            io.input_ids,
+            None::<String>,
+            DataType::Int64,
+            vec![1, 1],
+            vec![1, 1],
+        )?);
+        let position_ids_binding = if let Some(position_ids) = io.position_ids {
+            let index = bindings.len();
+            bindings.push(session.allocate_device_binding(
+                position_ids,
+                None::<String>,
+                DataType::Int64,
+                vec![1, 1],
+                vec![1, 1],
+            )?);
+            Some(index)
+        } else {
+            None
+        };
+
+        let logits_meta = session
+            .outputs()
+            .iter()
+            .find(|meta| meta.name == io.logits)
+            .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
+        if logits_meta.dtype != DataType::Float32 || logits_meta.shape.is_empty() {
+            bail!(
+                "CUDA logits output '{}' must be non-scalar f32, got {:?} {:?}",
+                io.logits,
+                logits_meta.dtype,
+                logits_meta.shape
+            );
+        }
+        let logits_shape = logits_meta
+            .shape
+            .iter()
+            .map(|dim| match dim {
+                Dim::Static(value) => *value,
+                Dim::Symbolic(_) => 1,
+            })
+            .collect::<Vec<_>>();
+        let logits_binding = bindings.len();
+        bindings.push(session.allocate_device_output_binding(
+            io.logits,
+            DataType::Float32,
+            logits_shape.clone(),
+            logits_shape.clone(),
+        )?);
+
         Ok(Self {
             logical_len: 0,
             max_len,
             bindings,
+            base_binding_count,
+            kv_binding_range: kv_start..kv_end,
+            input_ids_binding,
+            position_ids_binding,
+            logits_binding,
+            logits_shape,
+            graph_enabled,
+            graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
+            graph_captures: 0,
+            graph_replays: 0,
+            graph_fallbacks: 0,
         })
     }
 
@@ -467,7 +634,7 @@ impl DecodeCudaState {
     }
 
     fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
-        for binding in self.bindings.iter_mut().skip(1) {
+        for binding in &mut self.bindings[self.kv_binding_range.clone()] {
             let mut shape = binding.physical_shape().to_vec();
             shape[2] = len;
             binding.set_logical_shape(shape)?;
@@ -485,12 +652,72 @@ impl DecodeCudaState {
         self.set_logical_len(target_len)
     }
 
-    fn debug_stats(&self) -> CudaKvDebugStats {
+    fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {
+        self.bindings[self.input_ids_binding].write_bytes(0, &i64::from(token_id).to_le_bytes())?;
+        if let Some(index) = self.position_ids_binding {
+            let position = i64::try_from(position).context("position id exceeds i64 range")?;
+            self.bindings[index].write_bytes(0, &position.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn run_one_token(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
+        if !self.graph_enabled {
+            session.run_with_device_bindings(&[], &mut self.bindings)?;
+            return Ok(());
+        }
+
+        match self.graph_phase {
+            DecodeCudaGraphPhase::NeedsWarmup => {
+                session.run_with_device_bindings(&[], &mut self.bindings)?;
+                self.graph_phase = DecodeCudaGraphPhase::Armed;
+            }
+            DecodeCudaGraphPhase::Armed => {
+                match session.try_capture_with_device_bindings(&[], &mut self.bindings)? {
+                    DeviceGraphCaptureResult::Captured(outputs) => {
+                        if outputs.iter().any(Option::is_some) {
+                            bail!("captured CUDA decode unexpectedly materialized a host output");
+                        }
+                        self.graph_captures += 1;
+                        self.graph_phase = DecodeCudaGraphPhase::Ready;
+                    }
+                    DeviceGraphCaptureResult::NotCapturable(reason) => {
+                        self.graph_fallbacks += 1;
+                        self.graph_phase = DecodeCudaGraphPhase::Unsupported;
+                        tracing::warn!(
+                            "native CUDA decode graph capture disabled for this generation: {reason}"
+                        );
+                        session.run_with_device_bindings(&[], &mut self.bindings)?;
+                    }
+                }
+            }
+            DecodeCudaGraphPhase::Ready => {
+                session.replay_device_graph(&mut self.bindings)?;
+                self.graph_replays += 1;
+            }
+            DecodeCudaGraphPhase::Unsupported => {
+                session.run_with_device_bindings(&[], &mut self.bindings)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_logits(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
+        let bytes = self.bindings[self.logits_binding].read_bytes()?;
+        let logits = Tensor::from_raw(DataType::Float32, self.logits_shape.clone(), &bytes)?;
+        extract_logits(&logits)
+    }
+
+    fn invalidate_graph(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
+        session.reset_device_graph()?;
+        self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+        Ok(())
+    }
+
+    fn debug_stats(&self, session: &InferenceSession) -> CudaKvDebugStats {
         let mut transfers = DeviceBindingTransferStats::default();
-        let device_ptrs = self
-            .bindings
+        let device_ptrs = self.bindings[self.kv_binding_range.clone()]
             .iter()
-            .skip(1)
             .map(|binding| {
                 let stats = binding.transfer_stats();
                 transfers.host_upload_calls += stats.host_upload_calls;
@@ -505,6 +732,13 @@ impl DecodeCudaState {
             max_len: self.max_len,
             device_ptrs,
             kv_transfers: transfers,
+            graph: CudaGraphDebugStats {
+                enabled: self.graph_enabled,
+                captures: self.graph_captures,
+                replays: self.graph_replays,
+                fallbacks: self.graph_fallbacks,
+                allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+            },
         }
     }
 }
@@ -643,6 +877,7 @@ impl DecodeBackend for NativeDecodeSession {
             return Ok(());
         }
         if let Some(state) = &mut self.cuda {
+            state.invalidate_graph(&mut self.session)?;
             state.rewind(target_len)?;
             self.current_len = target_len;
             return Ok(());
@@ -663,6 +898,14 @@ impl DecodeBackend for NativeDecodeSession {
         }
         self.current_len = target_len;
         Ok(())
+    }
+}
+
+impl Drop for NativeDecodeSession {
+    fn drop(&mut self) {
+        if let Some(state) = &mut self.cuda {
+            let _ = state.invalidate_graph(&mut self.session);
+        }
     }
 }
 
@@ -1026,107 +1269,107 @@ mod tests {
         }
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
         let prompt = tokenizer.encode("Hello")?;
+        const HORIZON: usize = 64;
+        let generate = |session: &mut NativeDecodeSession| -> anyhow::Result<(Vec<TokenId>, u128)> {
+            let mut logits = session
+                .decode(&prompt, 0)?
+                .pop()
+                .context("prefill must produce logits")?;
+            let mut tokens = Vec::with_capacity(HORIZON);
+            let mut decode_nanos = 0u128;
+            for step in 0..HORIZON {
+                let token = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                    .map(|(index, _)| index as TokenId)
+                    .context("logits must not be empty")?;
+                tokens.push(token);
+                if step + 1 == HORIZON {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                logits = session
+                    .decode(&[token], session.current_len())?
+                    .pop()
+                    .context("decode must produce logits")?;
+                decode_nanos += start.elapsed().as_nanos();
+            }
+            Ok((tokens, decode_nanos))
+        };
 
         let mut cpu =
             NativeDecodeSession::load(model_dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
-        let mut cuda = NativeDecodeSession::load_with_cuda_kv_max_len(
+        let (cpu_tokens, _) = generate(&mut cpu)?;
+        drop(cpu);
+
+        let mut eager = NativeDecodeSession::load_with_cuda_options(
             model_dir.join("model.onnx"),
             NativeDecodeDevice::Cuda { index: Some(0) },
-            Some(128),
+            NativeDecodeCudaOptions {
+                kv_max_len: Some(128),
+                graph_capture: Some(false),
+            },
         )?;
-        let before = cuda
+        let eager_before = eager
             .cuda_kv_debug_stats()
             .context("CUDA session must expose device KV stats")?;
-        assert_eq!(before.device_ptrs.len(), 48);
-        assert!(before.device_ptrs.iter().all(|&ptr| ptr != 0));
-        assert_eq!(before.kv_transfers, DeviceBindingTransferStats::default());
+        let (eager_tokens, eager_nanos) = generate(&mut eager)?;
+        let eager_after = eager.cuda_kv_debug_stats().unwrap();
+        assert!(!eager_after.graph.enabled);
+        assert_eq!(eager_after.graph.captures, 0);
+        assert_eq!(eager_after.graph.replays, 0);
+        drop(eager);
 
-        let mut cpu_logits = cpu
-            .decode(&prompt, 0)?
-            .pop()
-            .context("CPU prefill must produce logits")?;
-        let mut cuda_logits = cuda
-            .decode(&prompt, 0)?
-            .pop()
-            .context("CUDA prefill must produce logits")?;
-        const HORIZON: usize = 64;
-        // The offending-shape MatMulNBits test bounds its synthetic worst case
-        // at 3e-5; this real recurrent decode has the tighter 2e-5 budget.
-        const LOGIT_ATOL: f32 = 2.0e-5;
-        let mut cpu_tokens = Vec::with_capacity(HORIZON);
-        let mut cuda_tokens = Vec::with_capacity(HORIZON);
-        for step in 0..HORIZON {
-            let mut cpu_ranked = cpu_logits.iter().copied().enumerate().collect::<Vec<_>>();
-            cpu_ranked.sort_unstable_by(|(_, a), (_, b)| b.total_cmp(a));
-            let mut cuda_ranked = cuda_logits.iter().copied().enumerate().collect::<Vec<_>>();
-            cuda_ranked.sort_unstable_by(|(_, a), (_, b)| b.total_cmp(a));
-            let max_abs = cpu_logits
-                .iter()
-                .zip(&cuda_logits)
-                .map(|(&cpu, &cuda)| (cpu - cuda).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                max_abs <= LOGIT_ATOL,
-                "step {step}: CPU/CUDA max logit difference {max_abs:e} exceeds {LOGIT_ATOL:e}"
-            );
-            let cpu_token = cpu_ranked[0].0 as TokenId;
-            let cuda_token = cuda_ranked[0].0 as TokenId;
-            assert_eq!(
-                cuda_token,
-                cpu_token,
-                "step {step}: CUDA top-2 {:?}, CPU top-2 {:?}",
-                &cuda_ranked[..2],
-                &cpu_ranked[..2]
-            );
-            if step == 16 {
-                let cpu_gap = cpu_ranked[0].1 - cpu_ranked[1].1;
-                let cuda_gap = cuda_ranked[0].1 - cuda_ranked[1].1;
-                assert_eq!([cpu_ranked[0].0, cpu_ranked[1].0], [1181, 330]);
-                assert_eq!([cuda_ranked[0].0, cuda_ranked[1].0], [1181, 330]);
-                assert!(cpu_gap > 0.6 && cuda_gap > 0.6);
-                eprintln!(
-                    "token-16 fixed: CPU top-2={:?} gap={cpu_gap:e}; CUDA top-2={:?} gap={cuda_gap:e}; max_abs={max_abs:e}",
-                    &cpu_ranked[..2],
-                    &cuda_ranked[..2],
-                );
-            }
-            cpu_tokens.push(cpu_token);
-            cuda_tokens.push(cuda_token);
-            if step + 1 == HORIZON {
-                break;
-            }
-            cpu_logits = cpu
-                .decode(&[cpu_token], cpu.current_len())?
-                .pop()
-                .context("CPU decode must produce logits")?;
-            cuda_logits = cuda
-                .decode(&[cuda_token], cuda.current_len())?
-                .pop()
-                .context("CUDA decode must produce logits")?;
-        }
-        let after = cuda
-            .cuda_kv_debug_stats()
-            .context("CUDA session must retain device KV stats")?;
+        let mut captured = NativeDecodeSession::load_with_cuda_options(
+            model_dir.join("model.onnx"),
+            NativeDecodeDevice::Cuda { index: Some(0) },
+            NativeDecodeCudaOptions {
+                kv_max_len: Some(128),
+                graph_capture: Some(true),
+            },
+        )?;
+        let captured_before = captured.cuda_kv_debug_stats().unwrap();
+        let (captured_tokens, captured_nanos) = generate(&mut captured)?;
+        let captured_after = captured.cuda_kv_debug_stats().unwrap();
 
         assert_eq!(cpu_tokens.len(), HORIZON);
-        assert_eq!(cuda_tokens.len(), cpu_tokens.len());
-        assert_eq!(cuda_tokens, cpu_tokens);
+        assert_eq!(eager_tokens, cpu_tokens);
+        assert_eq!(captured_tokens, eager_tokens);
         assert_eq!(
             &cpu_tokens[..8],
             &[11576, 42740, 11, 358, 614, 264, 3405, 911]
         );
-        assert_eq!(after.device_ptrs, before.device_ptrs);
-        assert_eq!(after.kv_transfers, DeviceBindingTransferStats::default());
-        assert!(after.logical_len > 8);
+        assert_eq!(eager_before.device_ptrs, eager_after.device_ptrs);
+        assert_eq!(captured_before.device_ptrs, captured_after.device_ptrs);
+        assert_eq!(
+            captured_after.kv_transfers,
+            DeviceBindingTransferStats::default()
+        );
+        assert!(captured_after.graph.enabled);
+        assert_eq!(captured_after.graph.captures, 0);
+        assert_eq!(captured_after.graph.replays, 0);
+        assert_eq!(captured_after.graph.fallbacks, 1);
 
-        cuda.rewind(after.logical_len - 2)?;
-        let rewound = cuda.cuda_kv_debug_stats().unwrap();
-        assert_eq!(rewound.logical_len, after.logical_len - 2);
-        assert_eq!(rewound.device_ptrs, before.device_ptrs);
+        let eager_us = eager_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
+        let captured_us = captured_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
+        eprintln!(
+            "native CUDA decode wall-time: eager={eager_us:.1} us/token, graph-flag={captured_us:.1} us/token, delta={:.1}%",
+            (captured_us / eager_us - 1.0) * 100.0
+        );
+
+        captured.rewind(captured_after.logical_len - 2)?;
+        let rewound = captured.cuda_kv_debug_stats().unwrap();
+        assert_eq!(rewound.logical_len, captured_after.logical_len - 2);
+        assert_eq!(rewound.device_ptrs, captured_before.device_ptrs);
         assert_eq!(rewound.kv_transfers, DeviceBindingTransferStats::default());
 
-        cuda.reset()?;
-        let error = cuda
+        captured.reset()?;
+        let (second_tokens, _) = generate(&mut captured)?;
+        assert_eq!(second_tokens, captured_tokens);
+
+        captured.reset()?;
+        let error = captured
             .decode(&vec![0; 129], 0)
             .expect_err("decode beyond configured KV capacity must fail");
         assert!(error.to_string().contains("CUDA KV capacity exceeded"));

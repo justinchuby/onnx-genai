@@ -296,7 +296,11 @@ impl CastKernel {
         // int, int, int) argument list matches its signature; `x_ptr`/`y_ptr` are
         // live device allocations of `n` elements of the src/dst dtype.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        self.runtime.synchronize()
+        if self.runtime.is_capturing()? {
+            Ok(())
+        } else {
+            self.runtime.synchronize()
+        }
     }
 }
 

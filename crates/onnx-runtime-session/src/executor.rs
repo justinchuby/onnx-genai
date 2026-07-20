@@ -157,6 +157,32 @@ pub struct ControlFlowStats {
     pub subgraph_runs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceAllocationCounts {
+    pub allocations: u64,
+    pub frees: u64,
+}
+
+pub enum DeviceGraphCaptureResult {
+    Captured(Vec<Option<Tensor>>),
+    NotCapturable(String),
+}
+
+enum ScopedRunResult {
+    Executed(Vec<Option<Tensor>>),
+    NotCapturable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeviceBindingSignature {
+    input_name: String,
+    binds_input: bool,
+    output_name: Option<String>,
+    dtype: DataType,
+    physical_shape: Vec<usize>,
+    device_ptr: usize,
+}
+
 /// Shape-keyed kernel cache (§11.1). Owns the compiled kernels for the session.
 #[derive(Default)]
 pub(crate) struct KernelCache {
@@ -296,6 +322,7 @@ pub(crate) struct Executor {
     /// for (a shape-varying loop body — rare).
     subgraph_execs: HashMap<(NodeId, String), ChildExecutor>,
     control_flow_stats: ControlFlowStats,
+    device_graph_signature: Option<Vec<DeviceBindingSignature>>,
     /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
     /// a strided view aliasing another value's buffer (a layout/movement-op
     /// output such as `Slice`) rather than an owner in [`Self::buffers`]. Built
@@ -775,8 +802,7 @@ fn run_ep_scoped_passes(
     }
 
     let resolver = Arc::new(WeightStoreInitializerResolver(Arc::clone(weights)));
-    let context =
-        onnx_runtime_optimizer::PassContext::new().with_initializer_resolver(resolver);
+    let context = onnx_runtime_optimizer::PassContext::new().with_initializer_resolver(resolver);
     onnx_runtime_optimizer::run_passes(graph, &passes, &context)?;
 
     let registry = InferenceRegistry::default_registry();
@@ -1177,6 +1203,7 @@ impl Executor {
             name_index,
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
+            device_graph_signature: None,
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
@@ -1374,7 +1401,26 @@ impl Executor {
         DeviceIoBinding::allocate(
             self.ep.clone(),
             input_name,
+            true,
             output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+        )
+    }
+
+    pub(crate) fn allocate_device_output_binding(
+        &self,
+        output_name: String,
+        dtype: DataType,
+        physical_shape: Vec<usize>,
+        logical_shape: Vec<usize>,
+    ) -> Result<DeviceIoBinding> {
+        DeviceIoBinding::allocate(
+            self.ep.clone(),
+            String::new(),
+            false,
+            Some(output_name),
             dtype,
             physical_shape,
             logical_shape,
@@ -1517,6 +1563,62 @@ impl Executor {
         self.run_scoped(inputs, &HashMap::new(), &external)
     }
 
+    pub(crate) fn try_capture_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        let external = self.prepare_external_bindings(bindings)?;
+        match self.run_scoped_mode(inputs, &HashMap::new(), &external, true)? {
+            ScopedRunResult::Executed(outputs) => {
+                self.device_graph_signature = Some(Self::binding_signature(bindings));
+                Ok(DeviceGraphCaptureResult::Captured(outputs))
+            }
+            ScopedRunResult::NotCapturable(reason) => {
+                Ok(DeviceGraphCaptureResult::NotCapturable(reason))
+            }
+        }
+    }
+
+    pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<()> {
+        self.prepare_external_bindings(bindings)?;
+        let signature = Self::binding_signature(bindings);
+        if self.device_graph_signature.as_ref() != Some(&signature) {
+            self.reset_device_graph()?;
+            return Err(SessionError::Internal(
+                "device graph replay bindings changed shape, address, or I/O identity; graph was invalidated"
+                    .into(),
+            ));
+        }
+        self.ep.replay_device_graph()?;
+        Ok(())
+    }
+
+    pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
+        self.device_graph_signature = None;
+        Ok(self.ep.reset_device_graph()?)
+    }
+
+    pub(crate) fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
+        self.ep
+            .device_allocation_counts()
+            .map(|(allocations, frees)| DeviceAllocationCounts { allocations, frees })
+    }
+
+    fn binding_signature(bindings: &[DeviceIoBinding]) -> Vec<DeviceBindingSignature> {
+        bindings
+            .iter()
+            .map(|binding| DeviceBindingSignature {
+                input_name: binding.input_name().to_string(),
+                binds_input: binding.binds_input(),
+                output_name: binding.output_name().map(str::to_string),
+                dtype: binding.dtype,
+                physical_shape: binding.physical_shape().to_vec(),
+                device_ptr: binding.device_ptr() as usize,
+            })
+            .collect()
+    }
+
     fn prepare_external_bindings(
         &self,
         bindings: &mut [DeviceIoBinding],
@@ -1524,6 +1626,7 @@ impl Executor {
         let mut external = ExternalBindings::default();
         for binding in bindings {
             let input_name = binding.input_name().to_string();
+            let bind_input = binding.binds_input();
             let output_name = binding.output_name().map(str::to_string);
             let dtype = binding.dtype;
             let shape = binding.physical_shape().to_vec();
@@ -1542,13 +1645,6 @@ impl Executor {
                 )));
             }
             let ptr = binding.buffer_mut().as_mut_ptr();
-            let input_vid =
-                *self
-                    .input_index
-                    .get(&input_name)
-                    .ok_or_else(|| SessionError::InputNotFound {
-                        name: input_name.clone(),
-                    })?;
             let value = ExternalValue {
                 dtype,
                 shape: shape.clone(),
@@ -1556,10 +1652,17 @@ impl Executor {
                 len,
                 device,
             };
-            if external.inputs.insert(input_vid, value.clone()).is_some() {
-                return Err(SessionError::Internal(format!(
-                    "duplicate device input binding '{input_name}'"
-                )));
+            if bind_input {
+                let input_vid = *self.input_index.get(&input_name).ok_or_else(|| {
+                    SessionError::InputNotFound {
+                        name: input_name.clone(),
+                    }
+                })?;
+                if external.inputs.insert(input_vid, value.clone()).is_some() {
+                    return Err(SessionError::Internal(format!(
+                        "duplicate device input binding '{input_name}'"
+                    )));
+                }
             }
             if let Some(output_name) = output_name {
                 let output_vid = self
@@ -1603,6 +1706,19 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
     ) -> Result<Vec<Option<Tensor>>> {
+        match self.run_scoped_mode(inputs, outer_scope, external, false)? {
+            ScopedRunResult::Executed(outputs) => Ok(outputs),
+            ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
+        }
+    }
+
+    fn run_scoped_mode(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+        capture: bool,
+    ) -> Result<ScopedRunResult> {
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
         self.views.clear();
@@ -1671,44 +1787,79 @@ impl Executor {
             self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
 
+        let capture_started = if capture {
+            match self.begin_device_graph_capture(&resolved, external) {
+                Ok(()) => true,
+                Err(reason) => return Ok(ScopedRunResult::NotCapturable(reason)),
+            }
+        } else {
+            false
+        };
+
         // --- Execute nodes ---------------------------------------------------
         // Iterate by index so a control-flow node can take `&mut self` (it must
         // build/reuse child executors) while an ordinary kernel node uses the
         // disjoint-field borrow split inside `exec_kernel_node`.
-        if profile_ops_enabled() {
-            let run_start = Instant::now();
-            let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
-            for pi in 0..self.plan.len() {
-                let node_id = self.plan[pi].node_id;
-                let node = self.graph.node(node_id);
-                let op_type = node.op_type.clone();
-                let start = Instant::now();
-                let result = if is_control_flow_op(&node.op_type, &node.domain) {
-                    self.exec_control_flow(pi, &mut resolved, outer_scope)
-                } else if is_sequence_op(&node.op_type, &node.domain) {
-                    self.exec_sequence_node(pi, &mut resolved)
-                } else {
-                    self.exec_kernel_node(pi, &mut resolved, external)
-                };
-                let elapsed = start.elapsed();
-                let entry = timings.entry(op_type).or_insert((Duration::ZERO, 0));
-                entry.0 += elapsed;
-                entry.1 += 1;
-                result?;
-            }
-            print_op_profile(run_start.elapsed(), timings);
-        } else {
-            for pi in 0..self.plan.len() {
-                let node_id = self.plan[pi].node_id;
-                let node = self.graph.node(node_id);
-                if is_control_flow_op(&node.op_type, &node.domain) {
-                    self.exec_control_flow(pi, &mut resolved, outer_scope)?;
-                } else if is_sequence_op(&node.op_type, &node.domain) {
-                    self.exec_sequence_node(pi, &mut resolved)?;
-                } else {
-                    self.exec_kernel_node(pi, &mut resolved, external)?;
+        let execution = (|| -> Result<()> {
+            if profile_ops_enabled() {
+                let run_start = Instant::now();
+                let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
+                for pi in 0..self.plan.len() {
+                    let node_id = self.plan[pi].node_id;
+                    let node = self.graph.node(node_id);
+                    let op_type = node.op_type.clone();
+                    let start = Instant::now();
+                    let result = if is_control_flow_op(&node.op_type, &node.domain) {
+                        self.exec_control_flow(pi, &mut resolved, outer_scope)
+                    } else if is_sequence_op(&node.op_type, &node.domain) {
+                        self.exec_sequence_node(pi, &mut resolved)
+                    } else {
+                        self.exec_kernel_node(pi, &mut resolved, external)
+                    };
+                    let elapsed = start.elapsed();
+                    let entry = timings.entry(op_type).or_insert((Duration::ZERO, 0));
+                    entry.0 += elapsed;
+                    entry.1 += 1;
+                    result?;
+                }
+                print_op_profile(run_start.elapsed(), timings);
+            } else {
+                for pi in 0..self.plan.len() {
+                    let node_id = self.plan[pi].node_id;
+                    let node = self.graph.node(node_id);
+                    if is_control_flow_op(&node.op_type, &node.domain) {
+                        self.exec_control_flow(pi, &mut resolved, outer_scope)?;
+                    } else if is_sequence_op(&node.op_type, &node.domain) {
+                        self.exec_sequence_node(pi, &mut resolved)?;
+                    } else {
+                        self.exec_kernel_node(pi, &mut resolved, external)?;
+                    }
                 }
             }
+            Ok(())
+        })();
+
+        if capture_started {
+            let end = self.ep.end_device_graph_capture();
+            if let Err(error) = execution {
+                let _ = end;
+                let _ = self.ep.reset_device_graph();
+                return Ok(ScopedRunResult::NotCapturable(format!(
+                    "kernel execution rejected CUDA graph capture: {error}"
+                )));
+            }
+            if let Err(error) = end {
+                let _ = self.ep.reset_device_graph();
+                return Ok(ScopedRunResult::NotCapturable(format!(
+                    "ending CUDA graph capture failed: {error}"
+                )));
+            }
+            if let Err(error) = self.ep.replay_device_graph() {
+                let _ = self.ep.reset_device_graph();
+                return Err(error.into());
+            }
+        } else {
+            execution?;
         }
 
         // --- Collect graph outputs into owned tensors -----------------------
@@ -1747,7 +1898,74 @@ impl Executor {
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
             results.push(Some(Tensor::from_raw(dtype, shape, &bytes)?));
         }
-        Ok(results)
+        Ok(ScopedRunResult::Executed(results))
+    }
+
+    fn begin_device_graph_capture(
+        &self,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> std::result::Result<(), String> {
+        if self.plan.iter().any(|plan| {
+            let node = self.graph.node(plan.node_id);
+            is_control_flow_op(&node.op_type, &node.domain)
+                || is_sequence_op(&node.op_type, &node.domain)
+        }) {
+            return Err("control-flow and sequence nodes are not device-graph capturable".into());
+        }
+        if self
+            .graph
+            .outputs
+            .iter()
+            .any(|output| !external.outputs.contains_key(output))
+        {
+            return Err(
+                "every graph output must use a persistent device binding during capture".into(),
+            );
+        }
+
+        let mut kernels = Vec::<&dyn onnx_runtime_ep_api::Kernel>::with_capacity(self.plan.len());
+        for plan in &self.plan {
+            if plan
+                .outputs
+                .iter()
+                .any(|output| !resolved.contains_key(output))
+            {
+                return Err(format!(
+                    "node {} has a data-dependent output shape that was unresolved before capture",
+                    plan.node_id.0
+                ));
+            }
+            let input_shapes = plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| resolved.get(&value).cloned())
+                        .unwrap_or(Some(Vec::new()))
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    format!(
+                        "node {} has a data-dependent shape that was unresolved before capture",
+                        plan.node_id.0
+                    )
+                })?;
+            let key = KernelKey {
+                node: plan.node_id.0,
+                shapes: input_shapes,
+            };
+            let kernel = self.cache.entries.get(&key).ok_or_else(|| {
+                format!(
+                    "node {} has not been warmed for the requested capture shape",
+                    plan.node_id.0
+                )
+            })?;
+            kernels.push(kernel.as_ref());
+        }
+        self.ep
+            .begin_device_graph_capture(&kernels)
+            .map_err(|error| error.to_string())
     }
 
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
@@ -1843,7 +2061,11 @@ impl Executor {
                 });
                 continue;
             };
-            if let Some(value) = external.inputs.get(&vid).or_else(|| external.outputs.get(&vid)) {
+            if let Some(value) = external
+                .inputs
+                .get(&vid)
+                .or_else(|| external.outputs.get(&vid))
+            {
                 let strides = compute_contiguous_strides(&value.shape);
                 view_bounds(&value.shape, &strides, 0, value.dtype, value.len)?;
                 in_infos.push(InInfo {
@@ -1995,9 +2217,7 @@ impl Executor {
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
         // aliasing the source buffer and skip compute + allocation entirely.
-        if !has_lazy_inputs
-            && let Some(specs) = kernel.view_outputs(&views, outputs.len())
-        {
+        if !has_lazy_inputs && let Some(specs) = kernel.view_outputs(&views, outputs.len()) {
             if outputs
                 .iter()
                 .any(|output| external.outputs.contains_key(output))
@@ -2355,19 +2575,17 @@ impl Executor {
                     .and_then(|a| a.as_int());
                 let dtype = match dtype_attr {
                     None => DataType::Float32, // ONNX default element type.
-                    Some(raw) => {
-                        i32::try_from(raw)
-                            .ok()
-                            .and_then(DataType::from_onnx)
-                            .ok_or_else(|| SessionError::SequenceOp {
-                                op: op.clone(),
-                                reason: format!(
-                                    "attribute 'dtype' = {raw} is not a known ONNX \
+                    Some(raw) => i32::try_from(raw)
+                        .ok()
+                        .and_then(DataType::from_onnx)
+                        .ok_or_else(|| SessionError::SequenceOp {
+                            op: op.clone(),
+                            reason: format!(
+                                "attribute 'dtype' = {raw} is not a known ONNX \
                                  TensorProto.DataType. To fix: use a valid element \
                                  dtype id (e.g. 1=float32, 7=int64)"
-                                ),
-                            })?
-                    }
+                            ),
+                        })?,
                 };
                 self.sequences
                     .insert(outputs[0], SequenceValue::empty(dtype));
@@ -3438,12 +3656,14 @@ impl Executor {
             }
         }
 
-        let cond_vid = node.inputs.first().and_then(|s| *s).ok_or_else(|| {
-            SessionError::ControlFlow {
-                op: "If".to_string(),
-                reason: "missing required 'cond' input".to_string(),
-            }
-        })?;
+        let cond_vid =
+            node.inputs
+                .first()
+                .and_then(|s| *s)
+                .ok_or_else(|| SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: "missing required 'cond' input".to_string(),
+                })?;
         let cond_t = self.value_tensor(cond_vid, resolved)?;
         if cond_t.dtype != DataType::Bool {
             return Err(SessionError::DtypeMismatch {
@@ -3630,26 +3850,27 @@ impl Executor {
             }
             None => None,
         };
-        let mut cond: Option<bool> = match node.inputs.get(1).and_then(|s| *s) {
-            Some(vid) => {
-                let t = self.value_tensor(vid, resolved)?;
-                if t.dtype != DataType::Bool {
-                    return Err(SessionError::DtypeMismatch {
-                        name: "Loop cond".to_string(),
-                        expected: format!("{:?}", DataType::Bool),
-                        got: format!("{:?}", t.dtype),
-                    });
-                }
-                Some(tensor_scalar_bool(&t).ok_or_else(|| SessionError::ControlFlow {
+        let mut cond: Option<bool> =
+            match node.inputs.get(1).and_then(|s| *s) {
+                Some(vid) => {
+                    let t = self.value_tensor(vid, resolved)?;
+                    if t.dtype != DataType::Bool {
+                        return Err(SessionError::DtypeMismatch {
+                            name: "Loop cond".to_string(),
+                            expected: format!("{:?}", DataType::Bool),
+                            got: format!("{:?}", t.dtype),
+                        });
+                    }
+                    Some(tensor_scalar_bool(&t).ok_or_else(|| SessionError::ControlFlow {
                     op: "Loop".to_string(),
                     reason: format!(
                         "'cond' must be a BOOL scalar or single-element tensor, got shape {:?}",
                         t.shape
                     ),
                 })?)
-            }
-            None => None,
-        };
+                }
+                None => None,
+            };
 
         // Initial loop-carried dependencies (inputs after M and cond).
         let mut carried: Vec<Tensor> = Vec::new();
@@ -3678,8 +3899,7 @@ impl Executor {
             )));
         }
         let num_scan = num_outputs - num_carried;
-        let empty_scan_specs =
-            self.loop_body_scan_specs(node, &carried, num_scan, resolved)?;
+        let empty_scan_specs = self.loop_body_scan_specs(node, &carried, num_scan, resolved)?;
         let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan)
             .map(|_| TensorStackAccumulator::new())
             .collect();
@@ -3725,10 +3945,8 @@ impl Executor {
                 ))
             })?);
             let next_carried: Vec<Tensor> = (&mut it).take(num_carried).collect();
-            for (index, (tensor, (expected_dtype, expected_shape))) in next_carried
-                .iter()
-                .zip(&carried_invariants)
-                .enumerate()
+            for (index, (tensor, (expected_dtype, expected_shape))) in
+                next_carried.iter().zip(&carried_invariants).enumerate()
             {
                 if tensor.dtype != *expected_dtype {
                     return Err(SessionError::ControlFlow {
@@ -3756,21 +3974,19 @@ impl Executor {
                 acc.push(it.next().expect("scan output present"))?;
             }
 
-            iter = iter.checked_add(1).ok_or_else(|| SessionError::ControlFlow {
-                op: "Loop".to_string(),
-                reason: "iteration counter overflowed INT64".to_string(),
-            })?;
+            iter = iter
+                .checked_add(1)
+                .ok_or_else(|| SessionError::ControlFlow {
+                    op: "Loop".to_string(),
+                    reason: "iteration counter overflowed INT64".to_string(),
+                })?;
         }
 
         // Emit outputs: carried finals, then stacked scan outputs.
         for (i, t) in carried.iter().enumerate() {
             self.store_output_tensor(node.outputs[i], t, resolved)?;
         }
-        for (s, (acc, empty_spec)) in scan_acc
-            .into_iter()
-            .zip(empty_scan_specs)
-            .enumerate()
-        {
+        for (s, (acc, empty_spec)) in scan_acc.into_iter().zip(empty_scan_specs).enumerate() {
             let (dtype, shape, bytes) = acc.finish_with_empty(empty_spec, s)?;
             self.store_output_bytes(
                 node.outputs[num_carried + s],
@@ -3832,7 +4048,8 @@ impl Executor {
                         op: "Scan".to_string(),
                         reason: format!(
                             "state {kind} {index} has dtype {:?}, but its initial value has dtype {:?}",
-                            body.value(value).dtype, initial.dtype
+                            body.value(value).dtype,
+                            initial.dtype
                         ),
                     });
                 }
@@ -3849,7 +4066,8 @@ impl Executor {
                     op: "Scan".to_string(),
                     reason: format!(
                         "scan formal input {index} has dtype {:?}, but scan input {index} has dtype {:?}",
-                        body.value(formal).dtype, input.dtype
+                        body.value(formal).dtype,
+                        input.dtype
                     ),
                 });
             }
@@ -3971,8 +4189,7 @@ impl Executor {
         }
         let num_scan_outputs = node.outputs.len() - num_state;
         let input_axes_raw = scan_list_attr(node, "scan_input_axes", num_scan_inputs, 0)?;
-        let input_directions =
-            scan_list_attr(node, "scan_input_directions", num_scan_inputs, 0)?;
+        let input_directions = scan_list_attr(node, "scan_input_directions", num_scan_inputs, 0)?;
         let output_axes = scan_list_attr(node, "scan_output_axes", num_scan_outputs, 0)?;
         let output_directions =
             scan_list_attr(node, "scan_output_directions", num_scan_outputs, 0)?;
@@ -4037,8 +4254,10 @@ impl Executor {
             }
         }
 
-        let state_specs: Vec<(DataType, Vec<usize>)> =
-            state.iter().map(|tensor| (tensor.dtype, tensor.shape.clone())).collect();
+        let state_specs: Vec<(DataType, Vec<usize>)> = state
+            .iter()
+            .map(|tensor| (tensor.dtype, tensor.shape.clone()))
+            .collect();
         let empty_specs = self.scan_body_specs(
             node,
             &state,
@@ -4074,8 +4293,11 @@ impl Executor {
                     .zip(scan_slices.iter_mut())
                     .enumerate()
                 {
-                    let source_index =
-                        if direction == 0 { step } else { trip_count - 1 - step };
+                    let source_index = if direction == 0 {
+                        step
+                    } else {
+                        trip_count - 1 - step
+                    };
                     let (_, bytes) = scan_slice(input, axis, source_index, index)?;
                     slice.overwrite_bytes(&bytes)?;
                 }
@@ -4133,8 +4355,7 @@ impl Executor {
             .zip(output_axes.iter().zip(&output_directions))
             .enumerate()
         {
-            let (dtype, shape, bytes) =
-                acc.finish_scan(axis, direction, empty_spec, s)?;
+            let (dtype, shape, bytes) = acc.finish_scan(axis, direction, empty_spec, s)?;
             self.store_output_bytes(node.outputs[num_state + s], dtype, shape, &bytes, resolved)?;
         }
         Ok(())
@@ -4176,12 +4397,13 @@ fn scan_slice(
         || format!("Scan input {input_index}"),
         &t.shape,
     )?;
-    let total_bytes = outer.checked_mul(inner_bytes).ok_or_else(|| {
-        SessionError::ShapeOverflow {
-            value: format!("Scan input {input_index} slice"),
-            dims: shape.clone(),
-        }
-    })?;
+    let total_bytes =
+        outer
+            .checked_mul(inner_bytes)
+            .ok_or_else(|| SessionError::ShapeOverflow {
+                value: format!("Scan input {input_index} slice"),
+                dims: shape.clone(),
+            })?;
     let source = t.as_bytes();
     let mut bytes = vec![0u8; total_bytes];
     for outer_index in 0..outer {
@@ -4322,14 +4544,15 @@ impl TensorStackAccumulator {
         if direction == 1 {
             elements.reverse();
         }
-        let (shape, bytes) =
-            stack_new_axis(&elements, &elem_shape, axis, dtype.byte_size())?;
+        let (shape, bytes) = stack_new_axis(&elements, &elem_shape, axis, dtype.byte_size())?;
         Ok((dtype, shape, bytes))
     }
 }
 
 impl Drop for Executor {
     fn drop(&mut self) {
+        let _ = self.ep.reset_device_graph();
+        self.device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
@@ -4363,7 +4586,9 @@ mod tests {
     impl WeightDeliveryKernel {
         fn copy_bytes(bytes: &[u8], output: &mut TensorMut<'_>) -> onnx_runtime_ep_api::Result<()> {
             if bytes.len() != output.byte_size() {
-                return Err(EpError::KernelFailed("test output byte count mismatch".into()));
+                return Err(EpError::KernelFailed(
+                    "test output byte count mismatch".into(),
+                ));
             }
             // SAFETY: the executor bounds-checked and exclusively borrowed the
             // output allocation, which is exactly `output.byte_size()` bytes.
@@ -4397,15 +4622,11 @@ mod tests {
             outputs: &mut [TensorMut],
         ) -> onnx_runtime_ep_api::Result<()> {
             match &inputs[0] {
-                KernelInput::Tensor(view) => self.execute(
-                    std::slice::from_ref(view),
-                    outputs,
-                ),
+                KernelInput::Tensor(view) => self.execute(std::slice::from_ref(view), outputs),
                 KernelInput::Weight(handle) => {
                     self.deliveries.lock().unwrap().push("lazy");
-                    let NegotiatedWeight::Lazy(lazy) = handle.negotiate(
-                        &ExecutionProviderCapabilities::nxrt_weight_paging(),
-                    )?
+                    let NegotiatedWeight::Lazy(lazy) =
+                        handle.negotiate(&ExecutionProviderCapabilities::nxrt_weight_paging())?
                     else {
                         return Err(EpError::KernelFailed(
                             "nxrt test EP expected a lazy WeightHandle".into(),
@@ -4588,15 +4809,10 @@ mod tests {
                     available: 0,
                 });
             }
-            Ok(unsafe {
-                DeviceBuffer::from_raw_parts(ptr.cast(), self.device, size, alignment)
-            })
+            Ok(unsafe { DeviceBuffer::from_raw_parts(ptr.cast(), self.device, size, alignment) })
         }
 
-        fn deallocate(
-            &self,
-            buffer: DeviceBuffer,
-        ) -> onnx_runtime_ep_api::Result<()> {
+        fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
             if self.device.is_host_accessible() {
                 return self.cpu.deallocate(buffer);
             }
@@ -4691,7 +4907,12 @@ mod tests {
             },
         );
         let output = graph.create_named_value("output", DataType::Uint8, static_shape([4]));
-        let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", vec![Some(weight)], vec![output]);
+        let mut node = Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(weight)],
+            vec![output],
+        );
         node.domain = "pkg.nxrt".into();
         graph.insert_node(node);
         graph.add_output(output);
@@ -4913,7 +5134,11 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         );
-        let report = || validate_cuda_only_coverage(&graph, &ep).unwrap_err().to_string();
+        let report = || {
+            validate_cuda_only_coverage(&graph, &ep)
+                .unwrap_err()
+                .to_string()
+        };
         let first = report();
         let second = report();
 
