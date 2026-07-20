@@ -1,6 +1,7 @@
 //! CUDA graph capture eligibility.
 
 use onnx_runtime_ep_api::Kernel;
+use onnx_runtime_ep_api::{EpError, Result};
 
 /// Returns whether every kernel in a subgraph is eligible for CUDA graph capture.
 ///
@@ -10,11 +11,31 @@ pub fn subgraph_graph_capturable(kernels: &[&dyn Kernel]) -> bool {
     kernels.iter().all(|kernel| kernel.cuda_graph_compatible())
 }
 
+/// Reject a kernel sequence before stream capture unless every kernel has
+/// explicitly opted into the CUDA graph contract.
+pub fn require_subgraph_graph_capturable(kernels: &[&dyn Kernel]) -> Result<()> {
+    let incompatible = kernels
+        .iter()
+        .enumerate()
+        .filter_map(|(index, kernel)| (!kernel.cuda_graph_compatible()).then_some(index))
+        .collect::<Vec<_>>();
+    if incompatible.is_empty() {
+        return Ok(());
+    }
+
+    Err(EpError::KernelFailed(format!(
+        "cuda_ep: CUDA graph capture rejected before begin_capture: kernels at sequence indices \
+         {incompatible:?} are not graph-compatible (capture forbids device allocation/free, \
+         lazy NVRTC or library initialization, D2H validation, stream synchronization, and \
+         changing tensor shapes or addresses)"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use onnx_runtime_ep_api::{Kernel, Result, TensorMut, TensorView};
 
-    use super::subgraph_graph_capturable;
+    use super::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 
     struct TestKernel {
         capturable: bool,
@@ -47,5 +68,17 @@ mod tests {
             &incompatible,
             &compatible_b,
         ]));
+    }
+
+    #[test]
+    fn audit_returns_a_clear_error_for_incompatible_kernels() {
+        let compatible = TestKernel { capturable: true };
+        let incompatible = TestKernel { capturable: false };
+
+        let error = require_subgraph_graph_capturable(&[&compatible, &incompatible]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("rejected before begin_capture"));
+        assert!(message.contains("[1]"));
+        assert!(message.contains("allocation/free"));
     }
 }

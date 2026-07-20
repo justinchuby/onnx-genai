@@ -59,11 +59,12 @@ pub mod blas;
 pub mod capture;
 pub mod cudnn;
 pub mod error;
+mod graph;
 pub mod kernels;
 pub mod provider;
 pub mod runtime;
 
-pub use capture::subgraph_graph_capturable;
+pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 pub use kernels::attention::AttentionKernel;
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
@@ -71,4 +72,4 @@ pub use kernels::csa_checkpoint::{
 pub use kernels::group_query_attention::{GroupQueryAttentionBackend, GroupQueryAttentionKernel};
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
-pub use runtime::CudaRuntime;
+pub use runtime::{CudaAllocationCounts, CudaRuntime};

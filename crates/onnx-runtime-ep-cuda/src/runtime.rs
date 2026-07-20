@@ -1,4 +1,4 @@
-//! Shared CUDA runtime state: the driver context, its default stream, and vendor
+//! Shared CUDA runtime state: the driver context, its dedicated stream, and vendor
 //! library backends. One [`CudaRuntime`] is created per
 //! [`CudaExecutionProvider`] and shared (via `Arc`) into every kernel the
 //! provider hands out, so the whole EP drives a single device + stream.
@@ -6,18 +6,27 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
 use onnx_runtime_ep_api::EpError;
+use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
 use crate::error::{driver_err, nvrtc_err};
+use crate::graph::CudaGraphLifecycle;
+
+/// Counts explicit device allocation/free calls made through a runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaAllocationCounts {
+    pub allocations: u64,
+    pub frees: u64,
+}
 
 fn nvrtc_include_paths() -> Vec<String> {
     let mut candidates = Vec::<PathBuf>::new();
@@ -145,6 +154,7 @@ fn reduction_launch_params(
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    graph: CudaGraphLifecycle,
     blas: CublasLt,
     cudnn: CudnnBackend,
     ordinal: u32,
@@ -159,6 +169,8 @@ pub struct CudaRuntime {
     /// compiled directly to the device's native SM CUBIN instead of repeating
     /// the failed load.
     nvrtc_cubin_fallback: AtomicBool,
+    allocations: AtomicU64,
+    frees: AtomicU64,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -171,7 +183,7 @@ impl std::fmt::Debug for CudaRuntime {
 }
 
 impl CudaRuntime {
-    /// Initialise the primary context on CUDA device `ordinal`, its default
+    /// Initialise the primary context on CUDA device `ordinal`, its dedicated
     /// stream, and a cuBLASLt handle. Returns an error (never panics) when no
     /// such device exists or the CUDA driver / cuBLASLt cannot be loaded.
     pub fn new(ordinal: u32) -> Result<Self> {
@@ -230,9 +242,11 @@ impl CudaRuntime {
             .map_err(|e| driver_err("create compute stream", e))?;
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
+        let graph = CudaGraphLifecycle::new(stream.clone());
         Ok(Self {
             context,
             stream,
+            graph,
             blas,
             cudnn,
             ordinal,
@@ -241,6 +255,8 @@ impl CudaRuntime {
             cubin_arch,
             modules: Mutex::new(HashMap::new()),
             nvrtc_cubin_fallback: AtomicBool::new(false),
+            allocations: AtomicU64::new(0),
+            frees: AtomicU64::new(0),
         })
     }
 
@@ -272,6 +288,48 @@ impl CudaRuntime {
     /// The EP's compute stream (for `launch_builder`-based kernel launches).
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Begin capture on the EP stream after auditing the complete kernel sequence.
+    pub fn begin_graph_capture(&self, kernels: &[&dyn Kernel]) -> Result<()> {
+        crate::capture::require_subgraph_graph_capturable(kernels)?;
+        self.graph.begin()
+    }
+
+    /// End stream capture and install the instantiated graph executable.
+    pub fn end_graph_capture(&self) -> Result<()> {
+        self.graph.end()
+    }
+
+    /// Launch the installed graph executable on the same EP stream.
+    pub fn replay_graph(&self) -> Result<()> {
+        self.graph.replay()
+    }
+
+    /// Destroy the installed graph and graph-exec handles.
+    ///
+    /// Returns whether an executable was invalidated. Reset is rejected while a
+    /// capture is active; callers must end the capture first.
+    pub fn reset_graph(&self) -> Result<bool> {
+        self.graph.reset()
+    }
+
+    /// Whether this runtime currently owns an instantiated graph executable.
+    pub fn has_graph_executable(&self) -> Result<bool> {
+        self.graph.has_executable()
+    }
+
+    /// Driver-reported capture status for the EP stream.
+    pub fn graph_capture_status(&self) -> Result<cudarc::driver::sys::CUstreamCaptureStatus> {
+        self.graph.capture_status()
+    }
+
+    /// Snapshot explicit device allocation/free calls made through this runtime.
+    pub fn allocation_counts(&self) -> CudaAllocationCounts {
+        CudaAllocationCounts {
+            allocations: self.allocations.load(Ordering::Relaxed),
+            frees: self.frees.load(Ordering::Relaxed),
+        }
     }
 
     /// Build a power-of-two reduction launch that fits both the function and
@@ -512,7 +570,7 @@ impl CudaRuntime {
             .map_err(|e| driver_err("bind_to_thread", e))
     }
 
-    /// Block until all submitted work on the default stream completes.
+    /// Block until all submitted work on the EP's dedicated stream completes.
     pub fn synchronize(&self) -> Result<()> {
         self.stream
             .synchronize()
@@ -523,15 +581,8 @@ impl CudaRuntime {
     /// A stream synchronize is illegal during capture, so device-resident kernels
     /// use this to skip the trailing sync while a graph is being recorded.
     pub fn is_capturing(&self) -> Result<bool> {
-        let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
-        // SAFETY: `stream_ptr` is this runtime's live stream and `status` is a
-        // valid out-pointer for the duration of the call.
-        unsafe {
-            cudarc::driver::sys::cuStreamIsCapturing(self.stream_ptr(), &mut status)
-                .result()
-                .map_err(|e| driver_err("cuStreamIsCapturing", e))?;
-        }
-        Ok(status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
+        Ok(self.graph_capture_status()?
+            != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
     /// Allocate `bytes` (>= 1) of device memory, returning the raw device
@@ -540,8 +591,10 @@ impl CudaRuntime {
         self.bind()?;
         // SAFETY: `malloc_sync` returns a fresh device allocation on the current
         // (bound) context; we own it and free it exactly once via `free_raw`.
-        unsafe { cudarc::driver::result::malloc_sync(bytes.max(1)) }
-            .map_err(|e| driver_err("cuMemAlloc", e))
+        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.max(1)) }
+            .map_err(|e| driver_err("cuMemAlloc", e))?;
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        Ok(ptr)
     }
 
     /// Free a device pointer previously returned by [`CudaRuntime::alloc_raw`].
@@ -551,7 +604,10 @@ impl CudaRuntime {
     pub unsafe fn free_raw(&self, ptr: CUdeviceptr) -> Result<()> {
         self.bind()?;
         // SAFETY: caller upholds the single-free contract.
-        unsafe { cudarc::driver::result::free_sync(ptr) }.map_err(|e| driver_err("cuMemFree", e))
+        unsafe { cudarc::driver::result::free_sync(ptr) }
+            .map_err(|e| driver_err("cuMemFree", e))?;
+        self.frees.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Copy `bytes` host → device (H2D). `dst` must be large enough.

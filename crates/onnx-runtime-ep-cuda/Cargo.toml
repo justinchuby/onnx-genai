@@ -8,6 +8,10 @@ repository.workspace = true
 keywords = ["onnx", "cuda", "execution-provider", "cublaslt", "runtime"]
 categories = ["science", "hardware-support"]
 
+[features]
+default = []
+cuda = []
+
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
