@@ -855,6 +855,14 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Read (without clearing) any latching device capture-safety error recorded
+    /// during graph replay, as a raw violation bitmask (zero when none). Callers
+    /// poll this at the per-step logits sync to fail before consuming a token
+    /// produced from an out-of-range captured replay.
+    pub fn check_device_capture_error(&self) -> Result<u32> {
+        self.exec.check_device_capture_error()
+    }
+
     pub fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
         self.exec.device_allocation_counts()
     }

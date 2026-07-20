@@ -329,6 +329,17 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(false)
     }
 
+    /// Read (without clearing) any latching device-side capture-safety error a
+    /// captured kernel recorded during graph replay, as a raw violation bitmask
+    /// (zero when none). EPs without device graphs report no error.
+    ///
+    /// The decode loop calls this at the per-step logits device→host sync so an
+    /// out-of-range bounds violation becomes a hard error before the produced
+    /// token is consumed, without adding a separate synchronization.
+    fn check_device_capture_error(&self) -> Result<u32> {
+        Ok(0)
+    }
+
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None

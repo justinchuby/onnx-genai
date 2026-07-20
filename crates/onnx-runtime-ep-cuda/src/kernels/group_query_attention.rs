@@ -63,6 +63,18 @@ extern "C" __global__ void gqa_prepare_metadata(
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch) return;
+    // Latch-first poison propagation: if any prior captured kernel (an earlier
+    // step, an earlier replay, or an earlier layer in this replay) already
+    // recorded a bounds violation, force this step into the sentinel/skip state
+    // deterministically. A later in-range step can therefore never resume writes
+    // over a KV row that a poisoned step skipped, so no stale hole can form.
+    // `atomicOr(flag, 0)` performs a coherent global read without mutating it.
+    if (error_flag && atomicOr(error_flag, 0) != 0) {
+        total_lengths[b] = -1;
+        past_lengths[b] = -1;
+        query_starts[b] = -1;
+        return;
+    }
     const long long total = (long long)seqlens_k[b] + 1;
     const long long past = total - current_key_length;
     const long long query_start = total - query_length;
@@ -474,15 +486,17 @@ const WS_OUT_BNSH: usize = 7;
 const WS_PRESENT_K: usize = 8;
 const WS_PRESENT_V: usize = 9;
 const WS_SCORES: usize = 10;
-const WS_METADATA_ERROR: usize = 11;
-const WS_COUNT: usize = 12;
+const WS_COUNT: usize = 11;
 
-const METADATA_ERROR_TOTAL_OVERFLOW: u32 = 1;
-const METADATA_ERROR_PAST_NEGATIVE: u32 = 2;
-const METADATA_ERROR_QUERY_NEGATIVE: u32 = 4;
-const METADATA_ERROR_PAST_CAPACITY: u32 = 8;
-const METADATA_ERROR_PRESENT_CAPACITY: u32 = 16;
-const METADATA_ERROR_POSITION: u32 = 32;
+/// Bit flags a captured GQA prep kernel `atomicOr`s into the runtime's latching
+/// capture-error word when a decode-metadata invariant is violated during graph
+/// replay. Exposed so hosts (and tests) can identify which bound was breached.
+pub const GQA_CAPTURE_ERROR_TOTAL_OVERFLOW: u32 = 1;
+pub const GQA_CAPTURE_ERROR_PAST_NEGATIVE: u32 = 2;
+pub const GQA_CAPTURE_ERROR_QUERY_NEGATIVE: u32 = 4;
+pub const GQA_CAPTURE_ERROR_PAST_CAPACITY: u32 = 8;
+pub const GQA_CAPTURE_ERROR_PRESENT_CAPACITY: u32 = 16;
+pub const GQA_CAPTURE_ERROR_POSITION: u32 = 32;
 
 pub struct GroupQueryAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
@@ -610,7 +624,6 @@ struct WorkspaceSlot {
 struct GqaWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [WorkspaceSlot; WS_COUNT],
-    metadata_error_initialized: bool,
 }
 
 impl GqaWorkspace {
@@ -618,7 +631,6 @@ impl GqaWorkspace {
         Self {
             runtime,
             slots: [WorkspaceSlot::default(); WS_COUNT],
-            metadata_error_initialized: false,
         }
     }
 
@@ -653,32 +665,6 @@ impl GqaWorkspace {
         }
         self.slots[index] = WorkspaceSlot { ptr, bytes };
         Ok(ptr)
-    }
-
-    fn metadata_error_flag(&mut self) -> Result<CUdeviceptr> {
-        let ptr = self.reserve(WS_METADATA_ERROR, std::mem::size_of::<u32>())?;
-        if !self.metadata_error_initialized {
-            // SAFETY: the metadata error slot is a live four-byte allocation.
-            unsafe { self.runtime.htod(&0_u32.to_ne_bytes(), ptr) }?;
-            self.metadata_error_initialized = true;
-        }
-        Ok(ptr)
-    }
-
-    fn take_metadata_error(&mut self) -> Result<u32> {
-        if !self.metadata_error_initialized {
-            return Ok(0);
-        }
-        let ptr = self.slots[WS_METADATA_ERROR].ptr;
-        let mut bytes = [0_u8; std::mem::size_of::<u32>()];
-        // SAFETY: the initialized metadata error slot contains one u32.
-        unsafe { self.runtime.dtoh(&mut bytes, ptr) }?;
-        let error = u32::from_ne_bytes(bytes);
-        if error != 0 {
-            // SAFETY: the metadata error slot remains a live four-byte allocation.
-            unsafe { self.runtime.htod(&0_u32.to_ne_bytes(), ptr) }?;
-        }
-        Ok(error)
     }
 }
 
@@ -716,30 +702,36 @@ fn require_matching_capture_signature(
     Ok(())
 }
 
-fn metadata_error_to_ep_error(error: u32) -> EpError {
+/// Human-readable description of the invariant(s) a captured GQA decode step
+/// latched into the runtime capture-error word, given its raw bitmask. Returns
+/// `None` for a zero (un-poisoned) mask.
+pub fn gqa_capture_error_description(error: u32) -> Option<String> {
+    if error == 0 {
+        return None;
+    }
     let mut violations = Vec::new();
-    if error & METADATA_ERROR_TOTAL_OVERFLOW != 0 {
+    if error & GQA_CAPTURE_ERROR_TOTAL_OVERFLOW != 0 {
         violations.push("seqlens_k + 1 overflows int32");
     }
-    if error & METADATA_ERROR_PAST_NEGATIVE != 0 {
+    if error & GQA_CAPTURE_ERROR_PAST_NEGATIVE != 0 {
         violations.push("seqlens_k + 1 is shorter than current key sequence");
     }
-    if error & METADATA_ERROR_QUERY_NEGATIVE != 0 {
+    if error & GQA_CAPTURE_ERROR_QUERY_NEGATIVE != 0 {
         violations.push("seqlens_k + 1 is shorter than current query sequence");
     }
-    if error & METADATA_ERROR_PAST_CAPACITY != 0 {
+    if error & GQA_CAPTURE_ERROR_PAST_CAPACITY != 0 {
         violations.push("effective past length exceeds past cache extent");
     }
-    if error & METADATA_ERROR_PRESENT_CAPACITY != 0 {
+    if error & GQA_CAPTURE_ERROR_PRESENT_CAPACITY != 0 {
         violations.push("valid sequence length exceeds present cache capacity");
     }
-    if error & METADATA_ERROR_POSITION != 0 {
+    if error & GQA_CAPTURE_ERROR_POSITION != 0 {
         violations.push("position_ids or implicit rotary position exceeds cache rows");
     }
-    EpError::KernelFailed(format!(
-        "cuda_ep GroupQueryAttention: deferred device metadata validation failed: {}",
-        violations.join("; ")
-    ))
+    if violations.is_empty() {
+        violations.push("unrecognized capture-safety violation");
+    }
+    Some(violations.join("; "))
 }
 
 fn require_dense(view: &TensorView, name: &str, dtype: DataType) -> Result<()> {
@@ -879,21 +871,6 @@ impl GroupQueryAttentionKernel {
             )
         })?;
         let warmed_signature = last_signature.take();
-        let capturing = self.runtime.is_capturing()?;
-        if !capturing {
-            let metadata_error = self
-                .workspace
-                .lock()
-                .map_err(|_| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: workspace lock poisoned".into(),
-                    )
-                })?
-                .take_metadata_error()?;
-            if metadata_error != 0 {
-                return Err(metadata_error_to_ep_error(metadata_error));
-            }
-        }
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep GroupQueryAttention: expected 7..14 inputs and 1..3 outputs, got {} and {}",
@@ -1329,7 +1306,10 @@ impl GroupQueryAttentionKernel {
         let past_lengths_gpu = workspace.reserve(WS_PAST_LENGTHS, metadata_bytes)?;
         let query_starts_gpu = workspace.reserve(WS_QUERY_STARTS, metadata_bytes)?;
         let metadata_error_gpu = if capture_candidate.is_some() {
-            workspace.metadata_error_flag()?
+            // Capture-safe decode steps latch any bounds violation into the
+            // runtime-shared word so every captured GQA layer poisons the same
+            // flag, and the host detects it once per step at the logits sync.
+            self.runtime.capture_error_ptr()
         } else {
             0
         };

@@ -5,7 +5,9 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
-    CudaExecutionProvider, GroupQueryAttentionBackend, GroupQueryAttentionKernel,
+    CudaExecutionProvider, GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE,
+    GQA_CAPTURE_ERROR_POSITION, GQA_CAPTURE_ERROR_QUERY_NEGATIVE, GQA_CAPTURE_ERROR_TOTAL_OVERFLOW,
+    GroupQueryAttentionBackend, GroupQueryAttentionKernel, gqa_capture_error_description,
 };
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
@@ -1811,9 +1813,9 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
     let positions = upload(&ep, &valid_positions).unwrap();
     let mut output = ep.allocate(8 * std::mem::size_of::<f32>(), 256).unwrap();
 
-    let mut capture_invalid = |bad_seqlens: Option<i32>,
-                               bad_position: Option<i64>|
-     -> onnx_runtime_ep_api::EpError {
+    let mut capture_invalid = |bad_seqlens: Option<i32>, bad_position: Option<i64>| -> u32 {
+        // Explicit host reset returns the latch to a clean slate for each case.
+        runtime.reset_capture_error().unwrap();
         overwrite(&ep, &seqlens, &valid_seqlens).unwrap();
         overwrite(&ep, &positions, &valid_positions).unwrap();
         execute_in_place_packed_f32_gqa(
@@ -1860,6 +1862,8 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
         }
         runtime.replay_graph().unwrap();
         runtime.synchronize().unwrap();
+        // Sentinel skip is preserved: the out-of-range step writes no KV row and
+        // can never alias another sequence's cache.
         assert_eq!(
             read_bytes(&ep, &cache_k, cache_k_before.len()).unwrap(),
             cache_k_before
@@ -1868,43 +1872,267 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
             read_bytes(&ep, &cache_v, cache_v_before.len()).unwrap(),
             cache_v_before
         );
+        // Detection-before-consumption: the violation is visible at the replay
+        // sync (the same point the host reads logits), so the plausible-looking
+        // zero token would be rejected before it is ever consumed.
+        let bits = runtime.check_capture_error().unwrap();
+        assert!(
+            bits != 0,
+            "captured out-of-range replay did not latch an error"
+        );
         assert!(runtime.reset_graph().unwrap());
-
-        overwrite(&ep, &seqlens, &valid_seqlens).unwrap();
-        overwrite(&ep, &positions, &valid_positions).unwrap();
-        execute_in_place_packed_f32_gqa(
-            &kernel,
-            &ep,
-            &packed,
-            &mut cache_k,
-            &mut cache_v,
-            &seqlens,
-            &total,
-            &cos,
-            &sin,
-            &positions,
-            &mut output,
-            1,
-        )
-        .unwrap_err()
+        bits
     };
 
     let overflow = capture_invalid(Some(i32::MAX), None);
-    assert!(format!("{overflow}").contains("seqlens_k + 1 overflows int32"));
+    assert_ne!(overflow & GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, 0);
+    assert!(
+        gqa_capture_error_description(overflow)
+            .unwrap()
+            .contains("seqlens_k + 1 overflows int32")
+    );
 
     let negative = capture_invalid(Some(-1), None);
-    let negative = format!("{negative}");
+    assert_ne!(negative & GQA_CAPTURE_ERROR_PAST_NEGATIVE, 0);
+    assert_ne!(negative & GQA_CAPTURE_ERROR_QUERY_NEGATIVE, 0);
+    let negative = gqa_capture_error_description(negative).unwrap();
     assert!(negative.contains("shorter than current key sequence"));
     assert!(negative.contains("shorter than current query sequence"));
 
     let capacity = capture_invalid(Some(6), None);
-    assert!(format!("{capacity}").contains("effective past length exceeds past cache extent"));
+    assert_ne!(capacity & GQA_CAPTURE_ERROR_PAST_CAPACITY, 0);
+    assert!(
+        gqa_capture_error_description(capacity)
+            .unwrap()
+            .contains("effective past length exceeds past cache extent")
+    );
 
     let position = capture_invalid(None, Some(i64::MAX));
-    assert!(format!("{position}").contains("rotary position exceeds cache rows"));
+    assert_ne!(position & GQA_CAPTURE_ERROR_POSITION, 0);
+    assert!(
+        gqa_capture_error_description(position)
+            .unwrap()
+            .contains("rotary position exceeds cache rows")
+    );
+
+    // Leave the latch clean for any later kernel sharing this runtime.
+    runtime.reset_capture_error().unwrap();
 
     for buffer in [
         output, positions, sin, cos, total, seqlens, cache_v, cache_k, packed,
+    ] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+#[test]
+fn gqa_gpu_capture_error_latches_until_reset_without_resuming_over_hole() {
+    let Some(ep) = gpu() else { return };
+    let runtime = ep.runtime();
+    let kernel =
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+    let eager_kernel =
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+
+    let packed_host = f32_tensor(
+        &[1, 1, 16],
+        &[
+            1., 0., 1., 0., 0., 1., 0., 1., 1., 1., 10., 10., 5., 6., 50., 60.,
+        ],
+    );
+    let cache_k_host = f32_tensor(
+        &[1, 2, 5, 2],
+        &[
+            1., 0., 0., 1., 91., 92., 93., 94., 95., 96., 10., 0., 0., 10., 81., 82., 83., 84.,
+            85., 86.,
+        ],
+    );
+    let cache_v_host = f32_tensor(
+        &[1, 2, 5, 2],
+        &[
+            1., 2., 3., 4., 71., 72., 73., 74., 75., 76., 10., 20., 30., 40., 61., 62., 63., 64.,
+            65., 66.,
+        ],
+    );
+    let seqlens_host = i32_tensor(&[1], &[1]);
+    let total_host = i32_tensor(&[1], &[5]);
+    let cos_host = f32_tensor(&[5, 1], &[1.0, 0.0, -1.0, 0.5, -0.5]);
+    let sin_host = f32_tensor(&[5, 1], &[0.0, 1.0, 0.0, 0.866_025_4, 0.866_025_4]);
+    let positions_host = i64_tensor(&[1, 2], &[1, 0]);
+
+    let packed = upload(&ep, &packed_host).unwrap();
+    let mut cache_k = upload(&ep, &cache_k_host).unwrap();
+    let mut cache_v = upload(&ep, &cache_v_host).unwrap();
+    let seqlens = upload(&ep, &seqlens_host).unwrap();
+    let total = upload(&ep, &total_host).unwrap();
+    let cos = upload(&ep, &cos_host).unwrap();
+    let sin = upload(&ep, &sin_host).unwrap();
+    let positions = upload(&ep, &positions_host).unwrap();
+    let output_bytes = 8 * std::mem::size_of::<f32>();
+    let mut output = ep.allocate(output_bytes, 256).unwrap();
+
+    let mut eager_cache_k = upload(&ep, &cache_k_host).unwrap();
+    let mut eager_cache_v = upload(&ep, &cache_v_host).unwrap();
+    let eager_seqlens = upload(&ep, &seqlens_host).unwrap();
+    let eager_positions = upload(&ep, &positions_host).unwrap();
+    let mut eager_output = ep.allocate(output_bytes, 256).unwrap();
+
+    let cache_bytes = 20 * std::mem::size_of::<f32>();
+    runtime.reset_capture_error().unwrap();
+
+    // Warm the fixed decode signature, then capture it.
+    execute_in_place_packed_f32_gqa(
+        &kernel,
+        &ep,
+        &packed,
+        &mut cache_k,
+        &mut cache_v,
+        &seqlens,
+        &total,
+        &cos,
+        &sin,
+        &positions,
+        &mut output,
+        1,
+    )
+    .unwrap();
+    execute_in_place_packed_f32_gqa(
+        &eager_kernel,
+        &ep,
+        &packed,
+        &mut eager_cache_k,
+        &mut eager_cache_v,
+        &eager_seqlens,
+        &total,
+        &cos,
+        &sin,
+        &eager_positions,
+        &mut eager_output,
+        1,
+    )
+    .unwrap();
+    assert!(kernel.cuda_graph_compatible());
+
+    let kernels: [&dyn Kernel; 1] = [&kernel];
+    runtime.begin_graph_capture(&kernels).unwrap();
+    execute_in_place_packed_f32_gqa(
+        &kernel,
+        &ep,
+        &packed,
+        &mut cache_k,
+        &mut cache_v,
+        &seqlens,
+        &total,
+        &cos,
+        &sin,
+        &positions,
+        &mut output,
+        1,
+    )
+    .unwrap();
+    runtime.end_graph_capture().unwrap();
+
+    // A normal in-range advancing replay stays bit-identical to the eager kernel
+    // and never latches an error.
+    for step in 2_i32..=3 {
+        let seqlens_step = i32_tensor(&[1], &[step]);
+        let positions_step = i64_tensor(&[1], &[i64::from(step)]);
+        overwrite(&ep, &seqlens, &seqlens_step).unwrap();
+        overwrite(&ep, &positions, &positions_step).unwrap();
+        overwrite(&ep, &eager_seqlens, &seqlens_step).unwrap();
+        overwrite(&ep, &eager_positions, &positions_step).unwrap();
+        execute_in_place_packed_f32_gqa(
+            &eager_kernel,
+            &ep,
+            &packed,
+            &mut eager_cache_k,
+            &mut eager_cache_v,
+            &eager_seqlens,
+            &total,
+            &cos,
+            &sin,
+            &eager_positions,
+            &mut eager_output,
+            1,
+        )
+        .unwrap();
+        runtime.replay_graph().unwrap();
+        assert_eq!(runtime.check_capture_error().unwrap(), 0);
+        assert_eq!(
+            read_bytes(&ep, &output, output_bytes).unwrap(),
+            read_bytes(&ep, &eager_output, output_bytes).unwrap(),
+            "in-range replay diverged from eager at step {step}"
+        );
+        assert_eq!(
+            read_bytes(&ep, &cache_k, cache_bytes).unwrap(),
+            read_bytes(&ep, &eager_cache_k, cache_bytes).unwrap(),
+            "in-range replay KV diverged from eager at step {step}"
+        );
+    }
+
+    // Freeze the current captured KV state, then inject an out-of-range length.
+    let frozen_k = read_bytes(&ep, &cache_k, cache_bytes).unwrap();
+    let frozen_v = read_bytes(&ep, &cache_v, cache_bytes).unwrap();
+    overwrite(&ep, &seqlens, &i32_tensor(&[1], &[i32::MAX])).unwrap();
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+    // Detection-before-consumption: the latch is set at the replay sync.
+    let tripped = runtime.check_capture_error().unwrap();
+    assert_ne!(tripped & GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, 0);
+    // Sentinel skip: no KV row was written.
+    assert_eq!(read_bytes(&ep, &cache_k, cache_bytes).unwrap(), frozen_k);
+    assert_eq!(read_bytes(&ep, &cache_v, cache_bytes).unwrap(), frozen_v);
+
+    // The crux: restore an otherwise-valid length and replay again. Because the
+    // latch is sticky, the poison propagates — the step still skips its KV write
+    // rather than resuming over the hole, and the error remains detectable.
+    overwrite(&ep, &seqlens, &i32_tensor(&[1], &[4])).unwrap();
+    overwrite(&ep, &positions, &i64_tensor(&[1], &[4])).unwrap();
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+    assert_ne!(
+        runtime.check_capture_error().unwrap(),
+        0,
+        "latch cleared itself; a later step could resume over a skipped KV row"
+    );
+    assert_eq!(
+        read_bytes(&ep, &cache_k, cache_bytes).unwrap(),
+        frozen_k,
+        "poisoned replay resumed a KV write over a hole"
+    );
+    assert_eq!(read_bytes(&ep, &cache_v, cache_bytes).unwrap(), frozen_v);
+
+    // Explicit host reset clears the latch; a fresh in-range replay resumes
+    // normal operation and advances the KV cache again.
+    runtime.reset_capture_error().unwrap();
+    assert_eq!(runtime.check_capture_error().unwrap(), 0);
+    runtime.replay_graph().unwrap();
+    runtime.synchronize().unwrap();
+    assert_eq!(runtime.check_capture_error().unwrap(), 0);
+    assert_ne!(
+        read_bytes(&ep, &cache_k, cache_bytes).unwrap(),
+        frozen_k,
+        "cache did not advance after the latch was reset"
+    );
+
+    let _ = runtime.reset_graph();
+    runtime.reset_capture_error().unwrap();
+
+    for buffer in [
+        eager_output,
+        eager_positions,
+        eager_seqlens,
+        eager_cache_v,
+        eager_cache_k,
+        output,
+        positions,
+        sin,
+        cos,
+        total,
+        seqlens,
+        cache_v,
+        cache_k,
+        packed,
     ] {
         ep.deallocate(buffer).unwrap();
     }

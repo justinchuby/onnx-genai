@@ -1599,6 +1599,10 @@ impl Executor {
         Ok(self.ep.reset_device_graph()?)
     }
 
+    pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
+        Ok(self.ep.check_device_capture_error()?)
+    }
+
     pub(crate) fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
         self.ep
             .device_allocation_counts()
