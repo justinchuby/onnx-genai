@@ -85,6 +85,9 @@ mod error {
         #[error("failed to parse ONNX protobuf: {0}")]
         ProtobufParse(String),
 
+        #[error("failed to parse ONNX protobuf TextFormat: {0}")]
+        TextProtoParse(String),
+
         #[error("unsupported opset: domain={domain}, version={version}")]
         UnsupportedOpset { domain: String, version: u64 },
 
@@ -306,12 +309,42 @@ pub fn load_model_with_weights(
     path: impl AsRef<Path>,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|source| LoaderError::Io {
+    let bytes = read_model_binary(path)?;
+    let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    build_from_bytes_with_weights(&bytes, model_dir)
+}
+
+/// Read a model file into the binary protobuf bytes of its `ModelProto`.
+///
+/// Detection is by filename suffix: a path ending in `.textproto` is parsed as
+/// ONNX protobuf **TextFormat** and converted to the binary wire encoding (see
+/// [`proto::textproto_to_binary`]); any other path is read verbatim as an
+/// already-binary `.onnx` model. This is the single seam that lets every
+/// path-based loader entry accept git-friendly textproto fixtures while keeping
+/// binary `.onnx` loading unchanged.
+///
+/// Note: textproto has no model-directory context for external weights, so
+/// textproto fixtures must inline all initializer data.
+pub fn read_model_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, LoaderError> {
+    let path = path.as_ref();
+    let raw = std::fs::read(path).map_err(|source| LoaderError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let model_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    build_from_bytes_with_weights(&bytes, model_dir)
+    if is_textproto_path(path) {
+        let text = String::from_utf8(raw)
+            .map_err(|e| LoaderError::TextProtoParse(format!("model is not valid UTF-8: {e}")))?;
+        proto::textproto_to_binary(&text)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Whether `path` names an ONNX protobuf TextFormat fixture (`*.textproto`).
+pub fn is_textproto_path(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("textproto"))
 }
 
 /// Load a model from an in-memory protobuf buffer, returning both the

@@ -1802,6 +1802,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
+ "onnx-rs",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2020,6 +2021,7 @@ dependencies = [
  "onnx-runtime-shape-inference",
  "prost",
  "prost-build",
+ "prost-reflect",
  "protox",
  "thiserror 2.0.18",
 ]

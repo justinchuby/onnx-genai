@@ -13,6 +13,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }
 thiserror = { workspace = true }
 prost = "0.13"
+prost-reflect = { version = "0.14", features = ["text-format"] }
 memmap2 = "0.9"
 
 [build-dependencies]
