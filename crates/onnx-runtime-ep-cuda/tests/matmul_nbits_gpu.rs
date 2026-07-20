@@ -176,6 +176,57 @@ fn accuracy4_reference(
     output
 }
 
+fn accuracy4_reference_columns(
+    activations: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+    columns: &[usize],
+) -> Vec<f32> {
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let max_abs = activations
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0, f32::max);
+    if max_abs == 0.0 {
+        return vec![0.0; columns.len()];
+    }
+    let activation_scale = max_abs / 127.0;
+    let inverse_scale = activation_scale.recip();
+    let quantized_activations: Vec<i32> = activations
+        .iter()
+        .map(|value| (value * inverse_scale).round().clamp(-127.0, 127.0) as i32)
+        .collect();
+    columns
+        .iter()
+        .map(|&column| {
+            assert!(column < n);
+            let mut value = 0.0;
+            for block in 0..blocks {
+                let begin = block * block_size;
+                let end = (begin + block_size).min(k);
+                let packed_start = (column * blocks + block) * blob_size;
+                let mut dot = 0i32;
+                for depth in begin..end {
+                    let within = depth - begin;
+                    let byte = packed[packed_start + within / 2];
+                    let quantized_weight = if within % 2 == 0 {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    dot += quantized_activations[depth] * (i32::from(quantized_weight) - 8);
+                }
+                value += dot as f32 * scales[column * blocks + block];
+            }
+            value * activation_scale
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_case(
     ep: &CudaExecutionProvider,
@@ -479,7 +530,7 @@ fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
 }
 
 #[test]
-fn matmul_nbits_gpu_m1_capture_replay_is_bit_exact() {
+fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
     let Some(ep) = gpu() else { return };
     let (k, n, block_size) = (1003usize, 37usize, 32usize);
     let blocks = k.div_ceil(block_size);
@@ -520,6 +571,8 @@ fn matmul_nbits_gpu_m1_capture_replay_is_bit_exact() {
     node.attributes.insert("bits".into(), Attribute::Int(4));
     node.attributes
         .insert("block_size".into(), Attribute::Int(block_size as i64));
+    node.attributes
+        .insert("accuracy_level".into(), Attribute::Int(4));
     let node = graph.insert_node(node);
     graph.add_output(output);
     let model = Model::new(&graph);
@@ -776,4 +829,60 @@ fn matmul_nbits_gpu_accuracy4_offending_decode_shape_stays_within_cpu_vnni_toler
     eprintln!(
         "accuracy_level=4 K=4864,N=896 CPU/CUDA max_abs_diff={max_abs_diff:e} max_ulp_diff={max_ulp_diff}"
     );
+}
+
+#[test]
+fn matmul_nbits_gpu_accuracy4_real_decode_widths_match_current_algorithm() {
+    let Some(ep) = gpu() else { return };
+    let mut state = 0x2c91_a560_18f4_7b3du64;
+    for (k, n) in [
+        (4864usize, 896usize),
+        (896, 1152),
+        (896, 4864),
+        (896, 151_936),
+    ] {
+        let blocks = k.div_ceil(32);
+        let blob_size = 16;
+        let activations: Vec<f32> = (0..k)
+            .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 6.0)
+            .collect();
+        let packed: Vec<u8> = (0..n * blocks * blob_size)
+            .map(|_| random_u32(&mut state) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..n * blocks)
+            .map(|_| 0.001 + (random_u32(&mut state) as f32 / u32::MAX as f32) * 0.09)
+            .collect();
+        let columns = [0, n / 7, n / 3, n / 2, n - 1];
+        let expected =
+            accuracy4_reference_columns(&activations, &packed, &scales, k, n, 32, &columns);
+        let actual = run_case(
+            &ep,
+            &[1, k],
+            &activations,
+            &packed,
+            &scales,
+            None,
+            k,
+            n,
+            32,
+            4,
+        )
+        .unwrap();
+        let sampled: Vec<f32> = columns.iter().map(|&column| actual[column]).collect();
+        assert_close(&sampled, &expected);
+        let max_abs = sampled
+            .iter()
+            .zip(&expected)
+            .map(|(&actual, &expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let max_rel = sampled
+            .iter()
+            .zip(&expected)
+            .map(|(&actual, &expected)| (actual - expected).abs() / expected.abs().max(1e-3))
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "accuracy_level=4 K={k},N={n} sampled current-algorithm parity \
+             max_abs_diff={max_abs:e} max_rel_diff={max_rel:e}"
+        );
+    }
 }

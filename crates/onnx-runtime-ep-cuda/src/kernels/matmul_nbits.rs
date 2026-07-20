@@ -2,10 +2,10 @@
 //! block-wise dequantization and f32 cuBLASLt GEMM fallback used for prefill.
 
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
@@ -17,11 +17,14 @@ const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
 const GEMV_MODULE: &str = "matmul_nbits_gemv";
 const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
+const QUANTIZE_ACCURACY4_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32";
 const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
 const ACCURACY4_MODULE: &str = "matmul_nbits_accuracy4";
 const ACCURACY4_ENTRY: &str = "matmul_nbits_accuracy4";
 const BLOCK_THREADS: u32 = 256;
-const GEMV_ACCURACY4_THREADS: u32 = 32;
+const GEMV_ACCURACY4_THREADS: u32 = 256;
+const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
+const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 
 const DEQUANT_SRC: &str = r#"
 extern "C" __global__ void matmul_nbits_dequant_f32(
@@ -128,8 +131,53 @@ extern "C" __global__ void matmul_nbits_gemv_f32(
     }
 }
 
-extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
+extern "C" __global__ void matmul_nbits_quantize_accuracy4_block32(
     const float* activation,
+    signed char* quantized_activation,
+    float* activation_scale_out,
+    const int k,
+    const int padded_k)
+{
+    const int lane = (int)threadIdx.x;
+    float max_abs = 0.0f;
+    for (int depth = lane; depth < k; depth += 32) {
+        max_abs = fmaxf(max_abs, fabsf(activation[depth]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(max_abs,
+            __shfl_down_sync(0xffffffffu, max_abs, offset));
+    }
+    max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+
+    const float activation_scale = max_abs == 0.0f ? 0.0f : max_abs / 127.0f;
+    const float inverse_scale =
+        activation_scale == 0.0f ? 0.0f : 1.0f / activation_scale;
+    if (lane == 0) {
+        *activation_scale_out = activation_scale;
+    }
+    for (int depth = lane; depth < padded_k; depth += 32) {
+        int quantized = 0;
+        if (depth < k && activation_scale != 0.0f) {
+            quantized = (int)roundf(fminf(127.0f, fmaxf(-127.0f,
+                activation[depth] * inverse_scale)));
+        }
+        quantized_activation[depth] = (signed char)quantized;
+    }
+}
+
+__device__ __forceinline__ int unpack_int4x4(unsigned int packed, int offset)
+{
+    const int w0 = (int)((packed >> (offset + 0)) & 15u) - 8;
+    const int w1 = (int)((packed >> (offset + 4)) & 15u) - 8;
+    const int w2 = (int)((packed >> (offset + 8)) & 15u) - 8;
+    const int w3 = (int)((packed >> (offset + 12)) & 15u) - 8;
+    return (w0 & 255) | ((w1 & 255) << 8) | ((w2 & 255) << 16)
+        | ((w3 & 255) << 24);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
+    const signed char* quantized_activation,
+    const float* activation_scale_ptr,
     const unsigned char* packed,
     const float* scales,
     const float* bias,
@@ -138,52 +186,57 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
     const int n,
     const int k_blocks)
 {
-    const int column = (int)blockIdx.x;
-    if (column >= n) {
-        return;
-    }
-
-    float max_abs = 0.0f;
-    for (int depth = (int)threadIdx.x; depth < k; depth += 32) {
-        max_abs = fmaxf(max_abs, fabsf(activation[depth]));
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        max_abs = fmaxf(max_abs,
-            __shfl_down_sync(0xffffffffu, max_abs, offset));
-    }
-    max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
-    if (max_abs == 0.0f) {
-        if (threadIdx.x == 0) {
+    extern __shared__ signed char activation_tile[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int column = (int)blockIdx.x * 8 + warp;
+    const float activation_scale = *activation_scale_ptr;
+    if (activation_scale == 0.0f) {
+        if (lane == 0 && column < n) {
             output[column] = bias ? bias[column] : 0.0f;
         }
         return;
     }
 
-    const float activation_scale = max_abs / 127.0f;
-    const float inverse_scale = 1.0f / activation_scale;
     float value = 0.0f;
-    for (int block = (int)threadIdx.x; block < k_blocks; block += 32) {
-        const int begin = block * 32;
-        const int end = begin + 32 < k ? begin + 32 : k;
-        const long packed_start = ((long)column * k_blocks + block) * 16;
-        int dot = 0;
-        for (int depth = begin; depth < end; ++depth) {
-            const int within = depth - begin;
-            const unsigned char byte = packed[packed_start + within / 2];
-            const int quantized_weight =
-                (within & 1) ? (byte >> 4) : (byte & 15);
-            const int quantized_activation =
-                (int)roundf(fminf(127.0f, fmaxf(-127.0f,
-                    activation[depth] * inverse_scale)));
-            dot += quantized_activation * (quantized_weight - 8);
+    for (int tile_block = 0; tile_block < k_blocks; tile_block += 32) {
+        const int tile_blocks = min(32, k_blocks - tile_block);
+        const int tile_depths = tile_blocks * 32;
+        for (int depth = tid; depth < tile_depths; depth += (int)blockDim.x) {
+            activation_tile[depth] =
+                quantized_activation[tile_block * 32 + depth];
         }
-        const float scaled =
-            __fmul_rn((float)dot, scales[(long)column * k_blocks + block]);
-        value = __fadd_rn(value, scaled);
+        __syncthreads();
+
+        const int block = tile_block + lane;
+        if (column < n && block < k_blocks) {
+            const long packed_start = ((long)column * k_blocks + block) * 16;
+            const uint4 packed_weights =
+                *reinterpret_cast<const uint4*>(packed + packed_start);
+            const unsigned int words[4] = {
+                packed_weights.x, packed_weights.y, packed_weights.z, packed_weights.w
+            };
+            const signed char* activation_block = activation_tile + lane * 32;
+            int dot = 0;
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                const int activation0 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8);
+                const int activation1 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
+                dot = __dp4a(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
+            }
+            const float scaled =
+                __fmul_rn((float)dot, scales[(long)column * k_blocks + block]);
+            value = __fadd_rn(value, scaled);
+        }
+        __syncthreads();
     }
 
     value = __fmul_rn(warp_sum(value), activation_scale);
-    if (threadIdx.x == 0) {
+    if (lane == 0 && column < n) {
         output[column] = bias ? __fadd_rn(value, bias[column]) : value;
     }
 }
@@ -295,14 +348,55 @@ impl KernelFactory for MatMulNBitsFactory {
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
+        let accuracy4_workspace = if accuracy_level == 4 && block_size == 32 {
+            Some(Mutex::new(Accuracy4Workspace::new(
+                self.runtime.clone(),
+                k,
+            )?))
+        } else {
+            None
+        };
         Ok(Box::new(MatMulNBitsKernel {
             runtime: self.runtime.clone(),
             k,
             n,
             block_size,
             accuracy_level,
+            accuracy4_workspace,
             last_call_capture_safe: AtomicBool::new(false),
         }))
+    }
+}
+
+#[derive(Debug)]
+struct Accuracy4Workspace {
+    runtime: Arc<CudaRuntime>,
+    quantized_activation: CUdeviceptr,
+    activation_scale: CUdeviceptr,
+    padded_k: usize,
+}
+
+impl Accuracy4Workspace {
+    fn new(runtime: Arc<CudaRuntime>, k: usize) -> Result<Self> {
+        let padded_k = k.div_ceil(32) * 32;
+        let quantized_activation = runtime.alloc_raw(padded_k + std::mem::size_of::<f32>())?;
+        Ok(Self {
+            runtime,
+            quantized_activation,
+            activation_scale: quantized_activation + padded_k as CUdeviceptr,
+            padded_k,
+        })
+    }
+}
+
+impl Drop for Accuracy4Workspace {
+    fn drop(&mut self) {
+        if self.quantized_activation != 0 {
+            // SAFETY: this persistent buffer is exclusively owned by the kernel.
+            let _ = unsafe { self.runtime.free_raw(self.quantized_activation) };
+            self.quantized_activation = 0;
+            self.activation_scale = 0;
+        }
     }
 }
 
@@ -313,6 +407,7 @@ pub struct MatMulNBitsKernel {
     n: usize,
     block_size: usize,
     accuracy_level: i64,
+    accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
     last_call_capture_safe: AtomicBool,
 }
 
@@ -587,9 +682,18 @@ impl MatMulNBitsKernel {
         output: &mut TensorMut,
         k_blocks: usize,
     ) -> Result<()> {
-        let function = self
-            .runtime
-            .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_ENTRY)?;
+        let workspace = self
+            .accuracy4_workspace
+            .as_ref()
+            .ok_or_else(|| error("accuracy_level=4 GEMV workspace is unavailable"))?
+            .lock()
+            .map_err(|_| error("accuracy_level=4 GEMV workspace lock poisoned"))?;
+        let quantize_function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, QUANTIZE_ACCURACY4_ENTRY)?;
+        let gemv_function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_ENTRY)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -600,9 +704,30 @@ impl MatMulNBitsKernel {
         let k = as_i32("K", self.k)?;
         let n = as_i32("N", self.n)?;
         let k_blocks = as_i32("K block count", k_blocks)?;
-        let mut builder = self.runtime.stream().launch_builder(&function);
-        builder
+        let padded_k = as_i32("padded K", workspace.padded_k)?;
+
+        let mut quantize_builder = self.runtime.stream().launch_builder(&quantize_function);
+        quantize_builder
             .arg(&activation_ptr)
+            .arg(&workspace.quantized_activation)
+            .arg(&workspace.activation_scale)
+            .arg(&k)
+            .arg(&padded_k);
+        // SAFETY: the persistent workspace covers padded_k int8 values plus the
+        // f32 scale, and the scalar ABI matches the quantization entry point.
+        unsafe {
+            quantize_builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 quantization", err))?;
+
+        let mut gemv_builder = self.runtime.stream().launch_builder(&gemv_function);
+        gemv_builder
+            .arg(&workspace.quantized_activation)
+            .arg(&workspace.activation_scale)
             .arg(&packed_ptr)
             .arg(&scales_ptr)
             .arg(&bias_ptr)
@@ -610,13 +735,18 @@ impl MatMulNBitsKernel {
             .arg(&k)
             .arg(&n)
             .arg(&k_blocks);
-        // SAFETY: this path is restricted to symmetric block-32 M=1 inputs and
-        // the scalar ABI matches `matmul_nbits_gemv_accuracy4_block32`.
+        // SAFETY: this path is restricted to symmetric block-32 M=1 inputs; the
+        // persistent quantized activation is initialized by the preceding stream
+        // launch, and the scalar ABI matches the tiled GEMV entry point.
         unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (self.n as u32, 1, 1),
+            gemv_builder.launch(LaunchConfig {
+                grid_dim: (
+                    self.n.div_ceil(GEMV_ACCURACY4_COLUMNS_PER_BLOCK) as u32,
+                    1,
+                    1,
+                ),
                 block_dim: (GEMV_ACCURACY4_THREADS, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: GEMV_ACCURACY4_SHARED_BYTES,
             })
         }
         .map(|_| ())
@@ -760,9 +890,10 @@ impl Kernel for MatMulNBitsKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // The m=1 no-g_idx GEMV is allocation-, D2H-, and synchronization-free.
-        // Prefill GEMM allocates/frees scratch buffers and synchronizes, while
-        // g_idx validation performs D2H, so those paths must report false.
+        // The m=1 no-g_idx GEMV uses only launch-time shared memory and a
+        // shape-fixed persistent accuracy-4 activation workspace; it performs no
+        // per-call allocation, D2H, or synchronization. Prefill GEMM and g_idx
+        // validation retain their non-capturable behavior.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
