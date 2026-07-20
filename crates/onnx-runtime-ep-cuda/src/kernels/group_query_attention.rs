@@ -20,6 +20,7 @@ use crate::runtime::{CudaRuntime, cuptr};
 use super::attention::{AttentionDtype, run_attention_phase2a};
 use super::flash_attention;
 use super::gqa_decode;
+use super::gqa_decode_fp16;
 
 const PREP_SRC: &str = r#"
 extern "C" __global__ void gqa_transpose_bsh_to_bnsh(
@@ -1595,6 +1596,32 @@ impl GroupQueryAttentionKernel {
             // so it records/replays inside a CUDA graph. Keeps the reference
             // kernel below for f32 prefill and unsupported head dims.
             gqa_decode::run(
+                &self.runtime,
+                batch,
+                self.num_heads,
+                self.kv_num_heads,
+                q_seq,
+                dim,
+                present_capacity,
+                self.num_heads / self.kv_num_heads,
+                scale,
+                q_bnsh,
+                present_k_ptr,
+                present_v_ptr,
+                out_bnsh,
+                totals_gpu,
+                local_window_i,
+                self.softcap,
+            )?;
+        } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
+            // Capture-safe fp16 flash-decode sibling of the f32 `gqa_decode`
+            // branch above. Same launcher signature/units; passes the fp16
+            // device pointers for query/present-K/present-V/output. Reads the
+            // valid length on-device from `totals_gpu` and allocates only
+            // fixed-size dynamic shared memory, so it records/replays inside a
+            // CUDA graph. Unsupported fp16 shapes (e.g. prefill Sq>1) still fall
+            // through to the phase-2a path below.
+            gqa_decode_fp16::run(
                 &self.runtime,
                 batch,
                 self.num_heads,

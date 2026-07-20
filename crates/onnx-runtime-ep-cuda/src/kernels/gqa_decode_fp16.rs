@@ -46,11 +46,6 @@
 //!     same tensor the reference kernel reads — so replays observe the updated
 //!     length with no relaunch or resize.
 
-// Wired into the module tree but not yet dispatched from decode (that wiring is
-// a deliberate follow-up to avoid a merge collision in `native_decode.rs`), so
-// the launcher/gate are exercised only by the parity test for now.
-#![allow(dead_code)]
-
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Result};
