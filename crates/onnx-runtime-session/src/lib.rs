@@ -37,6 +37,43 @@ mod executor;
 pub mod sequence;
 mod tensor;
 
+/// A graph output produced by the runtime.
+#[derive(Debug)]
+pub enum SessionOutput {
+    Tensor(Tensor),
+    Sequence(sequence::SequenceValue),
+}
+
+impl SessionOutput {
+    pub fn as_tensor(&self) -> Option<&Tensor> {
+        match self {
+            Self::Tensor(tensor) => Some(tensor),
+            Self::Sequence(_) => None,
+        }
+    }
+
+    pub fn as_sequence(&self) -> Option<&sequence::SequenceValue> {
+        match self {
+            Self::Tensor(_) => None,
+            Self::Sequence(sequence) => Some(sequence),
+        }
+    }
+
+    pub fn into_tensor(self) -> Option<Tensor> {
+        match self {
+            Self::Tensor(tensor) => Some(tensor),
+            Self::Sequence(_) => None,
+        }
+    }
+
+    pub fn into_sequence(self) -> Option<sequence::SequenceValue> {
+        match self {
+            Self::Tensor(_) => None,
+            Self::Sequence(sequence) => Some(sequence),
+        }
+    }
+}
+
 /// Operator-set version associated with an operator dispatch failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpsetVersion {
@@ -784,6 +821,11 @@ impl InferenceSession {
     /// Run inference with named inputs, returning the graph outputs in order.
     pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
         self.exec.run(inputs)
+    }
+
+    /// Run inference and preserve tensor or sequence graph-output types.
+    pub fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
+        self.exec.run_outputs(inputs)
     }
 
     /// Run with persistent device allocations supplying graph inputs and,

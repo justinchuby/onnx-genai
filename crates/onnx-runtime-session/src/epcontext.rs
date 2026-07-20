@@ -251,13 +251,18 @@ pub fn dump_session_ep_context(
     let mut owned = Vec::with_capacity(partitions.len());
     for part in partitions {
         let ctx = part.ep.save_context()?;
-        let source = part.ep.context_source_keys().into_iter().next().ok_or_else(|| {
-            SessionError::Internal(format!(
-                "EP {:?} produced a context but declares no `source` key — the \
+        let source = part
+            .ep
+            .context_source_keys()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "EP {:?} produced a context but declares no `source` key — the \
                  EPContext node could not be dispatched on reload (§55.6)",
-                part.ep.name()
-            ))
-        })?;
+                    part.ep.name()
+                ))
+            })?;
         owned.push(Owned {
             source,
             ctx,

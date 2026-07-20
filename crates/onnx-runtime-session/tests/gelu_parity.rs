@@ -27,9 +27,9 @@
 use std::f64::consts::SQRT_2;
 
 use onnx_runtime_ir::{
-    static_shape, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+    DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
-use onnx_runtime_loader::{encode_model, Model};
+use onnx_runtime_loader::{Model, encode_model};
 use onnx_runtime_session::{InferenceSession, Tensor};
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
@@ -51,7 +51,11 @@ fn f32_init(g: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId 
 }
 
 fn op(g: &mut Graph, op_type: &str, name: &str, inputs: &[ValueId], out_dims: &[usize]) -> ValueId {
-    let out = g.create_named_value(name, DataType::Float32, static_shape(out_dims.iter().copied()));
+    let out = g.create_named_value(
+        name,
+        DataType::Float32,
+        static_shape(out_dims.iter().copied()),
+    );
     let node = Node::new(
         NodeId(0),
         op_type,
@@ -157,8 +161,15 @@ fn gelu_parity_and_fusion_fires() {
         gelu_node.domain, "com.microsoft",
         "Gelu must be emitted in the contrib domain"
     );
-    assert_eq!(gelu_node.inputs.len(), 1, "exact Gelu takes the single input X");
-    assert!(gelu_node.attributes.is_empty(), "exact Gelu has no attributes");
+    assert_eq!(
+        gelu_node.inputs.len(),
+        1,
+        "exact Gelu takes the single input X"
+    );
+    assert!(
+        gelu_node.attributes.is_empty(),
+        "exact Gelu has no attributes"
+    );
 
     let fused_out = fused.run(&[("X", &x)]).expect("run fused");
 

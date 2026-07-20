@@ -62,9 +62,10 @@ use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
+use crate::SessionOutput;
 use crate::error::{Result, SessionError};
 use crate::sequence::{
-    SeqTensor, SequenceError, SequenceValue, SplitSpec, concat, split_tensor, stack_new_axis,
+    ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
 use crate::tensor::{DeviceIoBinding, SharedTensorBuffer, Tensor};
 
@@ -244,7 +245,7 @@ pub enum DeviceGraphCaptureResult {
 }
 
 enum ScopedRunResult {
-    Executed(Vec<Option<Tensor>>),
+    Executed(Vec<Option<SessionOutput>>),
     NotCapturable(CaptureDeclineReport),
 }
 
@@ -484,7 +485,21 @@ struct ExternalValue {
     shape: Vec<usize>,
     ptr: *mut std::ffi::c_void,
     len: usize,
+    alignment: usize,
     device: onnx_runtime_ir::DeviceId,
+}
+
+impl ExternalValue {
+    fn writable_buffer(&self) -> Result<DeviceBuffer> {
+        // SAFETY: `prepare_external_bindings` obtains this pointer from a live
+        // `DeviceIoBinding` exclusively borrowed for the run. The binding owns
+        // the allocation, outlives this alias, and is not otherwise accessed
+        // until execution returns.
+        unsafe {
+            DeviceBuffer::from_borrowed_mut_parts(self.ptr, self.device, self.len, self.alignment)
+        }
+        .ok_or_else(|| SessionError::Internal("external output binding has a null pointer".into()))
+    }
 }
 
 #[derive(Default)]
@@ -1644,6 +1659,21 @@ impl Executor {
 
     /// Sequential topological executor.
     pub(crate) fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
+        self.run_outputs(inputs)?
+            .into_iter()
+            .map(|output| {
+                match output {
+                    SessionOutput::Tensor(tensor) => Ok(tensor),
+                    SessionOutput::Sequence(_) => Err(SessionError::SequenceOp {
+                        op: "<graph output>".to_string(),
+                        reason: "the tensor-only run API received a Sequence graph output; use InferenceSession::run_outputs to preserve sequence values".to_string(),
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
         self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default())?
             .into_iter()
             .map(|output| {
@@ -1662,7 +1692,17 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         let external = self.prepare_external_bindings(bindings)?;
-        self.run_scoped(inputs, &HashMap::new(), &external)
+        self.run_scoped(inputs, &HashMap::new(), &external)?
+            .into_iter()
+            .map(|output| match output {
+                None => Ok(None),
+                Some(SessionOutput::Tensor(tensor)) => Ok(Some(tensor)),
+                Some(SessionOutput::Sequence(_)) => Err(SessionError::SequenceOp {
+                    op: "<graph output>".to_string(),
+                    reason: "run_with_device_bindings cannot return an unbound Sequence graph output; use run_outputs without tensor device bindings".to_string(),
+                }),
+            })
+            .collect()
     }
 
     pub(crate) fn try_capture_with_device_bindings(
@@ -1673,8 +1713,23 @@ impl Executor {
         let external = self.prepare_external_bindings(bindings)?;
         match self.run_scoped_mode(inputs, &HashMap::new(), &external, true)? {
             ScopedRunResult::Executed(outputs) => {
+                let mut tensors = Vec::with_capacity(outputs.len());
+                for output in outputs {
+                    match output {
+                        None => tensors.push(None),
+                        Some(SessionOutput::Tensor(tensor)) => tensors.push(Some(tensor)),
+                        Some(SessionOutput::Sequence(_)) => {
+                            self.reset_device_graph()?;
+                            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                                CaptureDeclineReport::one(CaptureDecline::graph(
+                                    "device graph capture cannot return a Sequence graph output",
+                                )),
+                            ));
+                        }
+                    }
+                }
                 self.device_graph_signature = Some(Self::binding_signature(bindings));
-                Ok(DeviceGraphCaptureResult::Captured(outputs))
+                Ok(DeviceGraphCaptureResult::Captured(tensors))
             }
             ScopedRunResult::NotCapturable(reason) => {
                 Ok(DeviceGraphCaptureResult::NotCapturable(reason))
@@ -1737,6 +1792,7 @@ impl Executor {
             let dtype = binding.dtype;
             let shape = binding.physical_shape().to_vec();
             let len = binding.buffer().len();
+            let alignment = binding.buffer().alignment();
             let device = binding.buffer().device();
             if device != self.ep.device_id() {
                 return Err(SessionError::Internal(format!(
@@ -1756,6 +1812,7 @@ impl Executor {
                 shape: shape.clone(),
                 ptr,
                 len,
+                alignment,
                 device,
             };
             if bind_input {
@@ -1784,6 +1841,14 @@ impl Executor {
                             "device binding output not found: {output_name}"
                         ))
                     })?;
+                if self.sequence_values.contains(&output_vid) {
+                    return Err(SessionError::SequenceOp {
+                        op: "<graph output binding>".to_string(),
+                        reason: format!(
+                            "graph output '{output_name}' is a Sequence value and cannot be bound to tensor device storage"
+                        ),
+                    });
+                }
                 if self.value_dtypes[&output_vid] != dtype {
                     return Err(SessionError::DtypeMismatch {
                         name: output_name.clone(),
@@ -1811,7 +1876,7 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<Vec<Option<SessionOutput>>> {
         match self.run_scoped_mode(inputs, outer_scope, external, false)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
@@ -1926,7 +1991,7 @@ impl Executor {
                     let result = if is_control_flow_op(&node.op_type, &node.domain) {
                         self.exec_control_flow(pi, &mut resolved, outer_scope)
                     } else if is_sequence_op(&node.op_type, &node.domain) {
-                        self.exec_sequence_node(pi, &mut resolved)
+                        self.exec_sequence_node(pi, &mut resolved, external)
                     } else {
                         self.exec_kernel_node(pi, &mut resolved, external)
                     };
@@ -1944,7 +2009,7 @@ impl Executor {
                     if is_control_flow_op(&node.op_type, &node.domain) {
                         self.exec_control_flow(pi, &mut resolved, outer_scope)?;
                     } else if is_sequence_op(&node.op_type, &node.domain) {
-                        self.exec_sequence_node(pi, &mut resolved)?;
+                        self.exec_sequence_node(pi, &mut resolved, external)?;
                     } else {
                         self.exec_kernel_node(pi, &mut resolved, external)?;
                     }
@@ -1988,31 +2053,23 @@ impl Executor {
                 results.push(None);
                 continue;
             }
-            // A Sequence value cannot be returned through the tensor-typed
-            // `run` boundary. Diagnose it clearly instead of misreading it as
-            // tensor bytes; consumers extract tensors via SequenceAt /
-            // ConcatFromSequence before the graph output.
             if self.sequence_values.contains(&vid) {
-                let name = self
-                    .graph
-                    .try_value(vid)
-                    .and_then(|v| v.name.clone())
-                    .unwrap_or_else(|| format!("value#{}", vid.0));
-                return Err(SessionError::SequenceOp {
-                    op: "<graph output>".to_string(),
-                    reason: format!(
-                        "graph output {name} is a Sequence value, which cannot be \
-                         returned through the tensor `run` API. To fix: end the graph \
-                         with ConcatFromSequence or SequenceAt to produce tensor \
-                         output(s)"
-                    ),
-                });
+                let sequence = self.sequences.get(&vid).cloned().ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "sequence graph output value#{} has no live runtime value",
+                        vid.0
+                    ))
+                })?;
+                results.push(Some(SessionOutput::Sequence(sequence)));
+                continue;
             }
 
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-            results.push(Some(Tensor::from_raw(dtype, shape, &bytes)?));
+            results.push(Some(SessionOutput::Tensor(Tensor::from_raw(
+                dtype, shape, &bytes,
+            )?)));
         }
         Ok(ScopedRunResult::Executed(results))
     }
@@ -2704,6 +2761,7 @@ impl Executor {
         &mut self,
         pi: usize,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         let node_id = self.plan[pi].node_id;
         let inputs = self.plan[pi].inputs.clone();
@@ -2786,7 +2844,7 @@ impl Executor {
                         })?;
                 let pos = self.read_scalar_i64(pvid, resolved, &op)?;
                 let elem = seq.at(pos).map_err(seq_err)?;
-                self.store_seq_element_output(outputs[0], elem, resolved)
+                self.store_seq_element_output(outputs[0], elem, resolved, external)
             }
             "SequenceLength" => {
                 let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
@@ -2802,13 +2860,14 @@ impl Executor {
                     Vec::new(),
                     &len.to_le_bytes(),
                     resolved,
+                    external,
                 )
             }
             "SplitToSequence" => {
                 self.exec_split_to_sequence(node_id, &op, &inputs, &outputs, resolved)
             }
             "ConcatFromSequence" => {
-                self.exec_concat_from_sequence(node_id, &op, &inputs, &outputs, resolved)
+                self.exec_concat_from_sequence(node_id, &op, &inputs, &outputs, resolved, external)
             }
             other => Err(SessionError::SequenceOp {
                 op: other.to_string(),
@@ -2892,6 +2951,7 @@ impl Executor {
         inputs: &[Option<ValueId>],
         outputs: &[ValueId],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         let node = self.graph.node(node_id);
         let axis_attr =
@@ -2905,15 +2965,35 @@ impl Executor {
         let new_axis = node.attr("new_axis").and_then(|a| a.as_int()).unwrap_or(0) != 0;
 
         let seq = self.get_sequence(inputs.first().copied().flatten(), op)?;
-        let elem = concat(&seq, axis_attr, new_axis).map_err(seq_err)?;
-        drop(seq);
-        self.store_raw_tensor_output(
+        let plan = ConcatPlan::new(&seq, axis_attr, new_axis).map_err(seq_err)?;
+        self.prepare_tensor_output(
             outputs[0],
-            elem.dtype,
-            elem.shape.clone(),
-            elem.as_bytes(),
+            plan.dtype,
+            plan.shape.clone(),
+            plan.bytes,
             resolved,
-        )
+            external,
+        )?;
+        let ep = Arc::clone(&self.ep);
+        if let Some(value) = external.outputs.get(&outputs[0]) {
+            let mut buffer = value.writable_buffer()?;
+            plan.write(&seq, |offset, bytes| {
+                ep.copy_from_host_at(bytes, &mut buffer, offset)?;
+                Ok(())
+            })?;
+        } else {
+            let buffer = self.buffers.get_mut(&outputs[0]).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "missing ConcatFromSequence output buffer for value#{}",
+                    outputs[0].0
+                ))
+            })?;
+            plan.write(&seq, |offset, bytes| {
+                ep.copy_from_host_at(bytes, buffer, offset)?;
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// Build (or share) a `SeqTensor` for a tensor value entering a sequence.
@@ -2974,18 +3054,29 @@ impl Executor {
     }
 
     fn restore_shared_buffers(&mut self) -> Result<()> {
+        let mut retained = Vec::new();
         for (vid, storage) in self.shared_buffers.drain() {
             if let Some(alias) = self.buffers.remove(&vid) {
                 self.ep.deallocate(alias)?;
             }
-            let storage = Arc::try_unwrap(storage).map_err(|storage| {
-                SessionError::Internal(format!(
-                    "shared sequence buffer value#{} still has {} live handles at the next run boundary",
-                    vid.0,
-                    Arc::strong_count(&storage)
-                ))
-            })?;
-            self.buffers.insert(vid, storage.into_buffer());
+            match Arc::try_unwrap(storage) {
+                Ok(storage) => {
+                    self.buffers.insert(vid, storage.into_buffer());
+                }
+                Err(storage) if self.graph.initializers.contains_key(&vid) => {
+                    self.buffers.insert(vid, storage.alias());
+                    retained.push((vid, storage));
+                }
+                Err(storage) => {
+                    let replacement = self
+                        .ep
+                        .allocate(storage.buffer().len(), storage.buffer().alignment())?;
+                    self.buffers.insert(vid, replacement);
+                }
+            }
+        }
+        for (vid, storage) in retained {
+            self.shared_buffers.insert(vid, storage);
         }
         Ok(())
     }
@@ -3068,6 +3159,7 @@ impl Executor {
         vid: ValueId,
         elem: SeqTensor,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         if elem.device() != self.ep.device_id() {
             return Err(SessionError::SequenceOp {
@@ -3078,6 +3170,12 @@ impl Executor {
                     self.ep.device_id()
                 ),
             });
+        }
+        if external.outputs.contains_key(&vid) {
+            let dtype = elem.dtype;
+            let shape = elem.shape.clone();
+            let bytes = elem.contiguous_bytes().map_err(seq_err)?;
+            return self.store_raw_tensor_output(vid, dtype, shape, &bytes, resolved, external);
         }
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
@@ -3101,31 +3199,60 @@ impl Executor {
         dims: Vec<usize>,
         bytes: &[u8],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
-        // A value that was seq-element-backed on a prior run must not shadow the
-        // fresh buffer we write here.
+        self.prepare_tensor_output(vid, dtype, dims, bytes.len(), resolved, external)?;
+        if let Some(value) = external.outputs.get(&vid) {
+            let mut buffer = value.writable_buffer()?;
+            self.ep.copy_from_host(bytes, &mut buffer)?;
+        } else {
+            let buffer = self.buffers.get_mut(&vid).ok_or_else(|| {
+                SessionError::Internal(format!("missing tensor output buffer for value#{}", vid.0))
+            })?;
+            self.ep.copy_from_host(bytes, buffer)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_tensor_output(
+        &mut self,
+        vid: ValueId,
+        dtype: DataType,
+        dims: Vec<usize>,
+        bytes: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
         self.seq_elem_values.remove(&vid);
         self.views.remove(&vid);
-        let need = bytes.len().max(1);
-        let fits = self
-            .buffers
-            .get(&vid)
-            .map(|b| b.len() == need)
-            .unwrap_or(false);
-        if !fits {
-            if let Some(old) = self.buffers.remove(&vid) {
-                self.ep.deallocate(old)?;
+        let need = bytes.max(1);
+        if let Some(value) = external.outputs.get(&vid) {
+            if value.dtype != dtype || value.shape != dims || value.len < need {
+                let name = self.graph.value(vid).name.as_deref().unwrap_or("<unnamed>");
+                return Err(SessionError::Internal(format!(
+                    "external output '{name}' has {:?} {:?} ({} bytes), sequence op requires {:?} {:?} ({need} bytes)",
+                    value.dtype, value.shape, value.len, dtype, dims
+                )));
             }
-            self.shared_buffers.remove(&vid);
-            let buf = self
-                .ep
-                .allocate(need, TensorLayout::contiguous().alignment)?;
-            self.buffers.insert(vid, buf);
+        } else {
+            let fits = self
+                .buffers
+                .get(&vid)
+                .map(|buffer| buffer.len() == need)
+                .unwrap_or(false);
+            if !fits {
+                if let Some(old) = self.buffers.remove(&vid) {
+                    self.ep.deallocate(old)?;
+                }
+                self.shared_buffers.remove(&vid);
+                let buffer = self
+                    .ep
+                    .allocate(need, TensorLayout::contiguous().alignment)?;
+                self.buffers.insert(vid, buffer);
+            }
+            self.buffer_shapes.insert(vid, dims.clone());
         }
-        let buf = self.buffers.get_mut(&vid).expect("just ensured");
-        self.ep.copy_from_host(bytes, buf)?;
         self.value_dtypes.insert(vid, dtype);
-        self.buffer_shapes.insert(vid, dims.clone());
         resolved.insert(vid, dims);
         Ok(())
     }
@@ -3490,12 +3617,22 @@ impl ChildExecutor {
             .run_scoped(&inputs, outer_scope, &ExternalBindings::default())?
             .into_iter()
             .map(|output| {
-                output.ok_or_else(|| {
+                let output = output.ok_or_else(|| {
                     SessionError::Internal(format!(
                         "subgraph '{}' unexpectedly suppressed an output",
                         self.name
                     ))
-                })
+                })?;
+                match output {
+                    SessionOutput::Tensor(tensor) => Ok(tensor),
+                    SessionOutput::Sequence(_) => Err(SessionError::SequenceOp {
+                        op: "<control-flow output>".to_string(),
+                        reason: format!(
+                            "subgraph '{}' produced a Sequence output where this control-flow path requires a tensor",
+                            self.name
+                        ),
+                    }),
+                }
             })
             .collect()
     }
@@ -4820,6 +4957,7 @@ mod tests {
             shape,
             ptr: std::ptr::null_mut(),
             len: 0,
+            alignment: 1,
             device: onnx_runtime_ir::DeviceId::cpu(),
         };
         let mut external = ExternalBindings::default();

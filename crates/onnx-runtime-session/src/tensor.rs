@@ -379,6 +379,41 @@ impl Drop for DeviceIoBinding {
 }
 
 impl Tensor {
+    pub(crate) fn allocate_cpu(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
+        let numel = shape.iter().try_fold(1usize, |product, &dim| {
+            product.checked_mul(dim).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "Tensor::allocate_cpu: element count overflows for shape {shape:?}"
+                ))
+            })
+        })?;
+        let bytes = dtype.checked_storage_bytes(numel).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "Tensor::allocate_cpu: byte count overflows for shape {shape:?} dtype {dtype:?}"
+            ))
+        })?;
+        let allocator: Arc<dyn ExecutionProvider> = shared_cpu_ep();
+        let layout = TensorLayout::contiguous();
+        let buffer = allocator.allocate(bytes.max(1), layout.alignment)?;
+        Ok(Self {
+            dtype,
+            shape,
+            layout,
+            device: buffer.device(),
+            buffer: Some(buffer),
+            allocator,
+            import_guard: None,
+        })
+    }
+
+    pub(crate) fn copy_from_host_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let buffer = self.buffer.as_mut().ok_or_else(|| {
+            SessionError::Internal("Tensor buffer is unavailable for writing".to_string())
+        })?;
+        self.allocator.copy_from_host_at(bytes, buffer, offset)?;
+        Ok(())
+    }
+
     /// Allocate a tensor from raw little-endian element bytes using `allocator`.
     ///
     /// `bytes` must hold exactly `storage_bytes(numel)` bytes for `dtype` and

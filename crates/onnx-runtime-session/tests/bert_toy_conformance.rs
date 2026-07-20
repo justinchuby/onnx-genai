@@ -93,7 +93,11 @@ fn bert_toy_matches_onnxruntime_cpu() {
 
     let cases: [(&str, &str, &[usize]); 2] = [
         ("prediction_scores", "prediction_scores.bin", &[1, 8, 99]),
-        ("seq_relationship_score", "seq_relationship_score.bin", &[1, 2]),
+        (
+            "seq_relationship_score",
+            "seq_relationship_score.bin",
+            &[1, 2],
+        ),
     ];
 
     let mut overall_max_abs = 0.0f32;
@@ -121,7 +125,8 @@ fn bert_toy_matches_onnxruntime_cpu() {
             .filter(|&(&a, &r)| (a - r).abs() > ATOL + RTOL * r.abs())
             .count();
         assert_eq!(
-            n_fail, 0,
+            n_fail,
+            0,
             "{label}: {n_fail}/{} elements exceed atol={ATOL:.0e} + rtol={RTOL:.0e}; \
              max_abs={max_abs:.3e}, max_rel={max_rel:.3e}",
             actual.len()

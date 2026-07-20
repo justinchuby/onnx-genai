@@ -1,12 +1,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use onnx_runtime_ir::{
-    DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape,
-};
-use onnx_runtime_loader::{
-    EpContextDumpConfig, EpContextPartition, Model, dump_ep_context,
-};
+use onnx_runtime_ir::{DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
+use onnx_runtime_loader::{EpContextDumpConfig, EpContextPartition, Model, dump_ep_context};
 use onnx_runtime_optimizer::{
     ConstantFolding, DeadNodeElimination, OpFusion, OptimizationPass, PassContext,
 };
@@ -117,8 +113,11 @@ fn fusion_pair_graph(nodes: usize) -> Graph {
             vec![Some(a), Some(w)],
             vec![product],
         ));
-        let output =
-            graph.create_named_value(format!("output_{i}"), DataType::Float32, static_shape([1, 1]));
+        let output = graph.create_named_value(
+            format!("output_{i}"),
+            DataType::Float32,
+            static_shape([1, 1]),
+        );
         graph.insert_node(Node::new(
             NodeId(0),
             "Add",
@@ -348,8 +347,7 @@ fn graph_partition_performance_audit() {
         let elapsed = measure(
             || {
                 let graph = wide_graph(nodes, true);
-                let covered: Vec<Vec<NodeId>> =
-                    graph.nodes.keys().map(|node| vec![node]).collect();
+                let covered: Vec<Vec<NodeId>> = graph.nodes.keys().map(|node| vec![node]).collect();
                 let partitions: Vec<EpContextPartition<'_>> = covered
                     .iter()
                     .map(|nodes| EpContextPartition {

@@ -11,7 +11,9 @@
 //!   and the round-trip through the sequence never mutates data;
 //! * actionable error paths (out-of-bounds index, empty-sequence concat).
 
-use onnx_runtime_ir::{static_shape, Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
+};
 use onnx_runtime_session::InferenceSession;
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
@@ -25,7 +27,11 @@ fn f32_init(g: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId 
     let vid = g.create_named_value(name, DataType::Float32, static_shape(dims.iter().copied()));
     g.set_initializer(
         vid,
-        WeightRef::Inline(TensorData::from_raw(DataType::Float32, dims.to_vec(), f32_bytes(data))),
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            dims.to_vec(),
+            f32_bytes(data),
+        )),
     );
     vid
 }
@@ -33,7 +39,11 @@ fn i64_init(g: &mut Graph, name: &str, dims: &[usize], data: &[i64]) -> ValueId 
     let vid = g.create_named_value(name, DataType::Int64, static_shape(dims.iter().copied()));
     g.set_initializer(
         vid,
-        WeightRef::Inline(TensorData::from_raw(DataType::Int64, dims.to_vec(), i64_bytes(data))),
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            dims.to_vec(),
+            i64_bytes(data),
+        )),
     );
     vid
 }
@@ -71,9 +81,23 @@ fn construct_then_at_roundtrips_values() {
     let a = f32_init(&mut g, "a", &[2], &[1., 2.]);
     let b = f32_init(&mut g, "b", &[2], &[3., 4.]);
     let c = f32_init(&mut g, "c", &[2], &[5., 6.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b, c], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b, c],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[1]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[2], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[2],
+        &[],
+    );
     g.add_output(at);
 
     let mut s = InferenceSession::from_graph(g).expect("build");
@@ -88,9 +112,23 @@ fn at_negative_index() {
     let mut g = Graph::new();
     let a = f32_init(&mut g, "a", &[1], &[10.]);
     let b = f32_init(&mut g, "b", &[1], &[20.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[-1]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
@@ -104,12 +142,33 @@ fn insert_at_position_then_at() {
     let a = f32_init(&mut g, "a", &[1], &[1.]);
     let b = f32_init(&mut g, "b", &[1], &[2.]);
     let ins = f32_init(&mut g, "ins", &[1], &[99.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let pos = i64_init(&mut g, "pos", &[], &[0]);
-    let seq2 = op(&mut g, "SequenceInsert", &[seq, ins, pos], DataType::Float32, &[], &[]);
+    let seq2 = op(
+        &mut g,
+        "SequenceInsert",
+        &[seq, ins, pos],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     // seq2 == [99, 1, 2]; read index 0
     let idx = i64_init(&mut g, "idx", &[], &[0]);
-    let at = op(&mut g, "SequenceAt", &[seq2, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq2, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
@@ -123,8 +182,22 @@ fn insert_default_append_and_length() {
     let a = f32_init(&mut g, "a", &[1], &[1.]);
     let b = f32_init(&mut g, "b", &[1], &[2.]);
     let ins = f32_init(&mut g, "ins", &[1], &[3.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b], DataType::Float32, &[], &[]);
-    let seq2 = op(&mut g, "SequenceInsert", &[seq, ins], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let seq2 = op(
+        &mut g,
+        "SequenceInsert",
+        &[seq, ins],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let len = op(&mut g, "SequenceLength", &[seq2], DataType::Int64, &[], &[]);
     g.add_output(len);
     let mut s = InferenceSession::from_graph(g).expect("build");
@@ -141,7 +214,14 @@ fn construct_insert_at_and_length_execute_together() {
     let a = f32_init(&mut g, "a", &[1], &[1.]);
     let b = f32_init(&mut g, "b", &[1], &[2.]);
     let inserted = f32_init(&mut g, "inserted", &[1], &[99.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let insert_pos = i64_init(&mut g, "insert_pos", &[], &[-1]);
     let seq2 = op(
         &mut g,
@@ -152,7 +232,14 @@ fn construct_insert_at_and_length_execute_together() {
         &[],
     );
     let at_pos = i64_init(&mut g, "at_pos", &[], &[-2]);
-    let at = op(&mut g, "SequenceAt", &[seq2, at_pos], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq2, at_pos],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     let len = op(&mut g, "SequenceLength", &[seq2], DataType::Int64, &[], &[]);
     g.add_output(at);
     g.add_output(len);
@@ -172,9 +259,23 @@ fn erase_then_length() {
     let a = f32_init(&mut g, "a", &[1], &[1.]);
     let b = f32_init(&mut g, "b", &[1], &[2.]);
     let c = f32_init(&mut g, "c", &[1], &[3.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b, c], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b, c],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let erased = op(&mut g, "SequenceErase", &[seq], DataType::Float32, &[], &[]);
-    let len = op(&mut g, "SequenceLength", &[erased], DataType::Int64, &[], &[]);
+    let len = op(
+        &mut g,
+        "SequenceLength",
+        &[erased],
+        DataType::Int64,
+        &[],
+        &[],
+    );
     g.add_output(len);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
@@ -191,15 +292,43 @@ fn seq_at_feeds_consumer_no_copy_roundtrip() {
     let mut g = Graph::new();
     let a = f32_init(&mut g, "a", &[3], &[7., 8., 9.]);
     let filler = f32_init(&mut g, "filler", &[3], &[0., 0., 0.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let pos0 = i64_init(&mut g, "pos0", &[], &[0]);
     // Insert filler at front → [filler, a]; a is now index 1.
-    let seq2 = op(&mut g, "SequenceInsert", &[seq, filler, pos0], DataType::Float32, &[], &[]);
+    let seq2 = op(
+        &mut g,
+        "SequenceInsert",
+        &[seq, filler, pos0],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     // Erase front → [a]; a is now index 0.
     let pos0b = i64_init(&mut g, "pos0b", &[], &[0]);
-    let seq3 = op(&mut g, "SequenceErase", &[seq2, pos0b], DataType::Float32, &[], &[]);
+    let seq3 = op(
+        &mut g,
+        "SequenceErase",
+        &[seq2, pos0b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[0]);
-    let at = op(&mut g, "SequenceAt", &[seq3, idx], DataType::Float32, &[3], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq3, idx],
+        DataType::Float32,
+        &[3],
+        &[],
+    );
     // Consume the seq-backed tensor with Identity (reads it zero-copy).
     let ident = op(&mut g, "Identity", &[at], DataType::Float32, &[3], &[]);
     g.add_output(ident);
@@ -253,7 +382,14 @@ fn split_keepdims0_squeezes() {
         &[("axis", Attribute::Int(0)), ("keepdims", Attribute::Int(0))],
     );
     let idx = i64_init(&mut g, "idx", &[], &[1]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[2], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[2],
+        &[],
+    );
     g.add_output(at);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
@@ -276,7 +412,14 @@ fn split_explicit_sizes() {
         &[("axis", Attribute::Int(1))],
     );
     let idx = i64_init(&mut g, "idx", &[], &[1]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[2, 2], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[2, 2],
+        &[],
+    );
     g.add_output(at);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
@@ -315,9 +458,23 @@ fn split_one_element_1d_sizes_produces_one_chunk() {
     let mut g = Graph::new();
     let data = f32_init(&mut g, "data", &[1], &[42.]);
     let split = i64_init(&mut g, "split", &[1], &[1]);
-    let seq = op(&mut g, "SplitToSequence", &[data, split], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data, split],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[0]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
 
     let mut s = InferenceSession::from_graph(g).expect("build");
@@ -332,7 +489,14 @@ fn split_scalar_chunk_size_produces_even_chunks() {
     let mut g = Graph::new();
     let data = f32_init(&mut g, "data", &[4], &[1., 2., 3., 4.]);
     let split = i64_init(&mut g, "split", &[], &[2]);
-    let seq = op(&mut g, "SplitToSequence", &[data, split], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data, split],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
     g.add_output(len);
 
@@ -347,9 +511,23 @@ fn split_scalar_chunk_size_keeps_uneven_final_chunk() {
     let mut g = Graph::new();
     let data = f32_init(&mut g, "data", &[4], &[1., 2., 3., 4.]);
     let split = i64_init(&mut g, "split", &[], &[3]);
-    let seq = op(&mut g, "SplitToSequence", &[data, split], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data, split],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[1]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
 
     let mut s = InferenceSession::from_graph(g).expect("build");
@@ -364,7 +542,14 @@ fn concat_new_axis_stacks() {
     let mut g = Graph::new();
     let a = f32_init(&mut g, "a", &[2], &[1., 2.]);
     let b = f32_init(&mut g, "b", &[2], &[3., 4.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a, b], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let cat = op(
         &mut g,
         "ConcatFromSequence",
@@ -393,9 +578,23 @@ fn empty_then_insert() {
         &[],
         &[("dtype", Attribute::Int(1))], // 1 == float32
     );
-    let seq2 = op(&mut g, "SequenceInsert", &[seq, t], DataType::Float32, &[], &[]);
+    let seq2 = op(
+        &mut g,
+        "SequenceInsert",
+        &[seq, t],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[0]);
-    let at = op(&mut g, "SequenceAt", &[seq2, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq2, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let out = s.run(&[]).expect("run");
@@ -415,7 +614,14 @@ fn empty_insert_mismatched_dtype_errors_actionably() {
         &[],
         &[("dtype", Attribute::Int(7))], // 7 == int64
     );
-    let seq2 = op(&mut g, "SequenceInsert", &[seq, t], DataType::Int64, &[], &[]);
+    let seq2 = op(
+        &mut g,
+        "SequenceInsert",
+        &[seq, t],
+        DataType::Int64,
+        &[],
+        &[],
+    );
     let len = op(&mut g, "SequenceLength", &[seq2], DataType::Int64, &[], &[]);
     g.add_output(len);
 
@@ -431,9 +637,23 @@ fn empty_insert_mismatched_dtype_errors_actionably() {
 fn at_out_of_bounds_errors_actionably() {
     let mut g = Graph::new();
     let a = f32_init(&mut g, "a", &[1], &[1.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a],
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let idx = i64_init(&mut g, "idx", &[], &[5]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
     let mut s = InferenceSession::from_graph(g).expect("build");
     let err = s.run(&[]).unwrap_err();
@@ -454,7 +674,14 @@ fn at_empty_sequence_errors_cleanly() {
         &[("dtype", Attribute::Int(1))],
     );
     let idx = i64_init(&mut g, "idx", &[], &[0]);
-    let at = op(&mut g, "SequenceAt", &[seq, idx], DataType::Float32, &[1], &[]);
+    let at = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     g.add_output(at);
 
     let mut s = InferenceSession::from_graph(g).expect("build");
@@ -488,16 +715,179 @@ fn construct_non_homogeneous_dtypes_errors_cleanly() {
     assert!(msg.contains("does not match"), "msg: {msg}");
 }
 
-/// A raw Sequence graph output is rejected with an actionable message.
 #[test]
-fn sequence_graph_output_rejected() {
+fn sequence_empty_graph_output_succeeds() {
     let mut g = Graph::new();
-    let a = f32_init(&mut g, "a", &[1], &[1.]);
-    let seq = op(&mut g, "SequenceConstruct", &[a], DataType::Float32, &[], &[]);
+    let seq = op(
+        &mut g,
+        "SequenceEmpty",
+        &[],
+        DataType::Float32,
+        &[],
+        &[("dtype", Attribute::Int(1))],
+    );
     g.add_output(seq);
     let mut s = InferenceSession::from_graph(g).expect("build");
-    let err = s.run(&[]).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("Sequence value"), "msg: {msg}");
-    assert!(msg.contains("ConcatFromSequence") || msg.contains("SequenceAt"), "msg: {msg}");
+    let mut outputs = s.run_outputs(&[]).expect("run");
+    let sequence = outputs.remove(0).into_sequence().expect("sequence output");
+    assert_eq!(sequence.elem_dtype(), DataType::Float32);
+    assert_eq!(sequence.length(), 0);
+}
+
+#[test]
+fn sequence_construct_graph_output_succeeds() {
+    let mut g = Graph::new();
+    let a = f32_init(&mut g, "a", &[2], &[1., 2.]);
+    let b = f32_init(&mut g, "b", &[2], &[3., 4.]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    g.add_output(seq);
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let mut outputs = s.run_outputs(&[]).expect("run");
+    let sequence = outputs.remove(0).into_sequence().expect("sequence output");
+    assert_eq!(sequence.length(), 2);
+    assert_eq!(
+        sequence.elements()[0].contiguous_bytes().unwrap(),
+        f32_bytes(&[1., 2.])
+    );
+    assert_eq!(
+        sequence.elements()[1].contiguous_bytes().unwrap(),
+        f32_bytes(&[3., 4.])
+    );
+    let rerun = s.run_outputs(&[]).expect("rerun with first output alive");
+    assert_eq!(rerun[0].as_sequence().expect("sequence output").length(), 2);
+    assert_eq!(
+        sequence.elements()[0].contiguous_bytes().unwrap(),
+        f32_bytes(&[1., 2.])
+    );
+}
+
+#[test]
+fn split_to_sequence_graph_output_succeeds() {
+    let mut g = Graph::new();
+    let data = f32_init(&mut g, "data", &[2, 3], &[0., 1., 2., 3., 4., 5.]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data],
+        DataType::Float32,
+        &[],
+        &[("axis", Attribute::Int(1))],
+    );
+    g.add_output(seq);
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let mut outputs = s.run_outputs(&[]).expect("run");
+    let sequence = outputs.remove(0).into_sequence().expect("sequence output");
+    assert_eq!(sequence.length(), 3);
+    assert_eq!(
+        sequence.elements()[1].contiguous_bytes().unwrap(),
+        f32_bytes(&[1., 4.])
+    );
+}
+
+#[test]
+fn sequence_at_writes_bound_output_bytes() {
+    let mut g = Graph::new();
+    let a = f32_init(&mut g, "a", &[2], &[1., 2.]);
+    let b = f32_init(&mut g, "b", &[2], &[3., 4.]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let idx = i64_init(&mut g, "idx", &[], &[1]);
+    let output = op(
+        &mut g,
+        "SequenceAt",
+        &[seq, idx],
+        DataType::Float32,
+        &[2],
+        &[],
+    );
+    g.value_mut(output).name = Some("output".to_string());
+    g.add_output(output);
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let mut binding = s
+        .allocate_device_output_binding("output", DataType::Float32, vec![2], vec![2])
+        .expect("binding");
+    binding.write_bytes(0, &f32_bytes(&[-1., -1.])).unwrap();
+    let outputs = s
+        .run_with_device_bindings(&[], std::slice::from_mut(&mut binding))
+        .expect("run");
+    assert!(outputs[0].is_none());
+    assert_eq!(binding.read_bytes().unwrap(), f32_bytes(&[3., 4.]));
+}
+
+#[test]
+fn sequence_length_writes_bound_output_bytes() {
+    let mut g = Graph::new();
+    let a = f32_init(&mut g, "a", &[1], &[1.]);
+    let b = f32_init(&mut g, "b", &[1], &[2.]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let output = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.value_mut(output).name = Some("output".to_string());
+    g.add_output(output);
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let mut binding = s
+        .allocate_device_output_binding("output", DataType::Int64, vec![], vec![])
+        .expect("binding");
+    binding.write_bytes(0, &(-1i64).to_le_bytes()).unwrap();
+    let outputs = s
+        .run_with_device_bindings(&[], std::slice::from_mut(&mut binding))
+        .expect("run");
+    assert!(outputs[0].is_none());
+    assert_eq!(binding.read_bytes().unwrap()[..8], 2i64.to_le_bytes());
+}
+
+#[test]
+fn concat_from_sequence_writes_bound_output_bytes() {
+    let mut g = Graph::new();
+    let a = f32_init(&mut g, "a", &[2], &[1., 2.]);
+    let b = f32_init(&mut g, "b", &[2], &[3., 4.]);
+    let seq = op(
+        &mut g,
+        "SequenceConstruct",
+        &[a, b],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let output = op(
+        &mut g,
+        "ConcatFromSequence",
+        &[seq],
+        DataType::Float32,
+        &[4],
+        &[("axis", Attribute::Int(0))],
+    );
+    g.value_mut(output).name = Some("output".to_string());
+    g.add_output(output);
+    let mut s = InferenceSession::from_graph(g).expect("build");
+    let mut binding = s
+        .allocate_device_output_binding("output", DataType::Float32, vec![4], vec![4])
+        .expect("binding");
+    binding
+        .write_bytes(0, &f32_bytes(&[-1., -1., -1., -1.]))
+        .unwrap();
+    let outputs = s
+        .run_with_device_bindings(&[], std::slice::from_mut(&mut binding))
+        .expect("run");
+    assert!(outputs[0].is_none());
+    assert_eq!(binding.read_bytes().unwrap(), f32_bytes(&[1., 2., 3., 4.]));
 }

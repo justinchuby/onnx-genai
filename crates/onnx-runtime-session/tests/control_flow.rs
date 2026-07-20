@@ -7,7 +7,8 @@
 //! numeric result against a reference computed here in the test.
 
 use onnx_runtime_ir::{
-    static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
+    Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
+    static_shape,
 };
 use onnx_runtime_session::{InferenceSession, SessionError, Tensor};
 
@@ -36,7 +37,10 @@ fn input(g: &mut Graph, name: &str, dtype: DataType, dims: &[usize]) -> ValueId 
 /// Add an inline initializer of the given dtype, returning its value id.
 fn init(g: &mut Graph, name: &str, dtype: DataType, dims: &[usize], bytes: Vec<u8>) -> ValueId {
     let vid = g.create_named_value(name, dtype, static_shape(dims.iter().copied()));
-    g.set_initializer(vid, WeightRef::Inline(TensorData::from_raw(dtype, dims.to_vec(), bytes)));
+    g.set_initializer(
+        vid,
+        WeightRef::Inline(TensorData::from_raw(dtype, dims.to_vec(), bytes)),
+    );
     vid
 }
 
@@ -93,7 +97,9 @@ fn control_flow_node(
 /// looks up when it runs the control-flow node.
 fn register(parent: &mut Graph, node_id: NodeId, attr_key: &str, mut body: Graph) {
     body.opset_imports.entry(String::new()).or_insert(17);
-    parent.subgraphs.insert((node_id, attr_key.to_string()), body);
+    parent
+        .subgraphs
+        .insert((node_id, attr_key.to_string()), body);
 }
 
 fn new_parent() -> Graph {
@@ -113,8 +119,22 @@ fn new_parent_at_opset(opset: u64) -> Graph {
 fn if_branch(bin_op: &str) -> Graph {
     let mut b = Graph::new();
     let x = capture(&mut b, "X", DataType::Float32, &[2]);
-    let ones = init(&mut b, "ones", DataType::Float32, &[2], f32_bytes(&[1.0, 1.0]));
-    let out = op(&mut b, bin_op, &[x, ones], Some("branch_out"), DataType::Float32, &[2], &[]);
+    let ones = init(
+        &mut b,
+        "ones",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[1.0, 1.0]),
+    );
+    let out = op(
+        &mut b,
+        bin_op,
+        &[x, ones],
+        Some("branch_out"),
+        DataType::Float32,
+        &[2],
+        &[],
+    );
     b.add_output(out);
     b
 }
@@ -280,7 +300,15 @@ fn if_rebuilds_subgraph_for_shape_varying_capture() {
 
     let mut branch = Graph::new();
     let x = capture(&mut branch, "X", DataType::Float32, &[1]);
-    let out = op(&mut branch, "Identity", &[x], Some("branch_out"), DataType::Float32, &[1], &[]);
+    let out = op(
+        &mut branch,
+        "Identity",
+        &[x],
+        Some("branch_out"),
+        DataType::Float32,
+        &[1],
+        &[],
+    );
     branch.add_output(out);
     register(&mut g, node, "then_branch", branch);
     register(&mut g, node, "else_branch", if_branch("Identity"));
@@ -296,7 +324,10 @@ fn if_rebuilds_subgraph_for_shape_varying_capture() {
     }
 
     let stats = session.control_flow_stats();
-    assert!(stats.subgraph_builds > 1, "shape changes must rebuild the subgraph executor");
+    assert!(
+        stats.subgraph_builds > 1,
+        "shape changes must rebuild the subgraph executor"
+    );
     assert_eq!(stats.subgraph_builds, 2);
     assert_eq!(stats.subgraph_runs, 2);
 }
@@ -316,13 +347,42 @@ fn loop_sum_body() -> Graph {
     b.add_input(cond_in);
     b.add_input(acc);
 
-    let iter_f = op(&mut b, "Cast", &[iter], Some("iter_f"), DataType::Float32, &[], &[(
-        "to",
-        Attribute::Int(DataType::Float32 as i64),
-    )]);
-    let acc_out = op(&mut b, "Add", &[acc, iter_f], Some("acc_out"), DataType::Float32, &[], &[]);
-    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
-    let scan = op(&mut b, "Identity", &[acc_out], Some("scan_out"), DataType::Float32, &[], &[]);
+    let iter_f = op(
+        &mut b,
+        "Cast",
+        &[iter],
+        Some("iter_f"),
+        DataType::Float32,
+        &[],
+        &[("to", Attribute::Int(DataType::Float32 as i64))],
+    );
+    let acc_out = op(
+        &mut b,
+        "Add",
+        &[acc, iter_f],
+        Some("acc_out"),
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let cond_out = op(
+        &mut b,
+        "Identity",
+        &[cond_in],
+        Some("cond_out"),
+        DataType::Bool,
+        &[],
+        &[],
+    );
+    let scan = op(
+        &mut b,
+        "Identity",
+        &[acc_out],
+        Some("scan_out"),
+        DataType::Float32,
+        &[],
+        &[],
+    );
     b.add_output(cond_out);
     b.add_output(acc_out);
     b.add_output(scan);
@@ -377,11 +437,24 @@ fn loop_countdown_body() -> Graph {
     b.add_input(rem);
 
     let one = init(&mut b, "one", DataType::Float32, &[], f32_bytes(&[1.0]));
-    let rem_out = op(&mut b, "Sub", &[rem, one], Some("rem_out"), DataType::Float32, &[], &[]);
-    let cond_out = op(&mut b, "Cast", &[rem_out], Some("cond_out"), DataType::Bool, &[], &[(
-        "to",
-        Attribute::Int(DataType::Bool as i64),
-    )]);
+    let rem_out = op(
+        &mut b,
+        "Sub",
+        &[rem, one],
+        Some("rem_out"),
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let cond_out = op(
+        &mut b,
+        "Cast",
+        &[rem_out],
+        Some("cond_out"),
+        DataType::Bool,
+        &[],
+        &[("to", Attribute::Int(DataType::Bool as i64))],
+    );
     b.add_output(cond_out);
     b.add_output(rem_out);
     b
@@ -421,11 +494,34 @@ fn loop_zero_iteration_body() -> Graph {
     b.add_input(cond_in);
     b.add_input(carried);
 
-    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
-    let carried_out =
-        op(&mut b, "Identity", &[carried], Some("carried_out"), DataType::Float32, &[], &[]);
+    let cond_out = op(
+        &mut b,
+        "Identity",
+        &[cond_in],
+        Some("cond_out"),
+        DataType::Bool,
+        &[],
+        &[],
+    );
+    let carried_out = op(
+        &mut b,
+        "Identity",
+        &[carried],
+        Some("carried_out"),
+        DataType::Float32,
+        &[],
+        &[],
+    );
     let pair = init(&mut b, "pair", DataType::Int64, &[2], i64_bytes(&[7, 9]));
-    let scan = op(&mut b, "Identity", &[pair], Some("scan_out"), DataType::Int64, &[2], &[]);
+    let scan = op(
+        &mut b,
+        "Identity",
+        &[pair],
+        Some("scan_out"),
+        DataType::Int64,
+        &[2],
+        &[],
+    );
     b.add_output(cond_out);
     b.add_output(carried_out);
     b.add_output(scan);
@@ -436,7 +532,13 @@ fn loop_zero_iteration_body() -> Graph {
 fn loop_zero_iterations_preserves_carried_and_types_empty_scan_output() {
     let mut g = new_parent();
     let m = init(&mut g, "M", DataType::Int64, &[], i64_bytes(&[0]));
-    let carried0 = init(&mut g, "carried0", DataType::Float32, &[], f32_bytes(&[42.0]));
+    let carried0 = init(
+        &mut g,
+        "carried0",
+        DataType::Float32,
+        &[],
+        f32_bytes(&[42.0]),
+    );
     let carried_final = g.create_named_value("carried_final", DataType::Float32, scalar());
     let scan = g.create_named_value("scan", DataType::Int64, static_shape([0, 2]));
 
@@ -471,9 +573,33 @@ fn loop_capture_body() -> Graph {
     b.add_input(cond_in);
     b.add_input(acc);
 
-    let acc_out = op(&mut b, "Add", &[acc, step], Some("acc_out"), DataType::Float32, &[], &[]);
-    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
-    let scan = op(&mut b, "Identity", &[acc_out], Some("scan_out"), DataType::Float32, &[], &[]);
+    let acc_out = op(
+        &mut b,
+        "Add",
+        &[acc, step],
+        Some("acc_out"),
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let cond_out = op(
+        &mut b,
+        "Identity",
+        &[cond_in],
+        Some("cond_out"),
+        DataType::Bool,
+        &[],
+        &[],
+    );
+    let scan = op(
+        &mut b,
+        "Identity",
+        &[acc_out],
+        Some("scan_out"),
+        DataType::Float32,
+        &[],
+        &[],
+    );
     b.add_output(cond_out);
     b.add_output(acc_out);
     b.add_output(scan);
@@ -573,8 +699,7 @@ fn loop_huge_trip_count_with_early_exit_stacks_one_scan_slice() {
     let cond = init(&mut g, "cond", DataType::Bool, &[], vec![1]);
     let scan = g.create_named_value("scan", DataType::Float32, static_shape([1, 2]));
 
-    let node =
-        control_flow_node(&mut g, "Loop", vec![Some(m), Some(cond)], vec![scan], &[]);
+    let node = control_flow_node(&mut g, "Loop", vec![Some(m), Some(cond)], vec![scan], &[]);
     register(&mut g, node, "body", loop_single_scan_then_stop_body());
     g.add_output(scan);
 
@@ -605,20 +730,45 @@ fn loop_shape_changing_carried_body() -> Graph {
         &[],
     );
     let two = init(&mut b, "two", DataType::Int64, &[1], i64_bytes(&[2]));
-    let end = op(&mut b, "Sub", &[two, iter_vec], Some("end"), DataType::Int64, &[1], &[]);
+    let end = op(
+        &mut b,
+        "Sub",
+        &[two, iter_vec],
+        Some("end"),
+        DataType::Int64,
+        &[1],
+        &[],
+    );
     let start = init(&mut b, "start", DataType::Int64, &[1], i64_bytes(&[0]));
     let axis = init(&mut b, "axis", DataType::Int64, &[1], i64_bytes(&[0]));
     let step = init(&mut b, "step", DataType::Int64, &[1], i64_bytes(&[1]));
     let dynamic = b.intern_symbol("dynamic_carried");
-    let carried_out =
-        b.create_named_value("carried_out", DataType::Float32, vec![Dim::Symbolic(dynamic)]);
+    let carried_out = b.create_named_value(
+        "carried_out",
+        DataType::Float32,
+        vec![Dim::Symbolic(dynamic)],
+    );
     b.insert_node(Node::new(
         NodeId(0),
         "Slice",
-        vec![Some(carried), Some(start), Some(end), Some(axis), Some(step)],
+        vec![
+            Some(carried),
+            Some(start),
+            Some(end),
+            Some(axis),
+            Some(step),
+        ],
         vec![carried_out],
     ));
-    let cond_out = op(&mut b, "Identity", &[cond_in], Some("cond_out"), DataType::Bool, &[], &[]);
+    let cond_out = op(
+        &mut b,
+        "Identity",
+        &[cond_in],
+        Some("cond_out"),
+        DataType::Bool,
+        &[],
+        &[],
+    );
     b.add_output(cond_out);
     b.add_output(carried_out);
     b
@@ -636,8 +786,7 @@ fn loop_rejects_carried_shape_change_on_second_iteration() {
         &[2],
         f32_bytes(&[7.0, 11.0]),
     );
-    let carried_final =
-        g.create_named_value("carried_final", DataType::Float32, static_shape([2]));
+    let carried_final = g.create_named_value("carried_final", DataType::Float32, static_shape([2]));
 
     let node = control_flow_node(
         &mut g,
@@ -730,12 +879,33 @@ fn scan_two_input_body() -> Graph {
     b.add_input(state);
     b.add_input(x);
     b.add_input(y);
-    let state_x =
-        op(&mut b, "Add", &[state, x], Some("state_x"), DataType::Float32, &[2], &[]);
-    let state_out =
-        op(&mut b, "Add", &[state_x, y], Some("state_out"), DataType::Float32, &[2], &[]);
-    let scan_out =
-        op(&mut b, "Identity", &[state_out], Some("scan_out"), DataType::Float32, &[2], &[]);
+    let state_x = op(
+        &mut b,
+        "Add",
+        &[state, x],
+        Some("state_x"),
+        DataType::Float32,
+        &[2],
+        &[],
+    );
+    let state_out = op(
+        &mut b,
+        "Add",
+        &[state_x, y],
+        Some("state_out"),
+        DataType::Float32,
+        &[2],
+        &[],
+    );
+    let scan_out = op(
+        &mut b,
+        "Identity",
+        &[state_out],
+        Some("scan_out"),
+        DataType::Float32,
+        &[2],
+        &[],
+    );
     b.add_output(state_out);
     b.add_output(scan_out);
     b
@@ -941,8 +1111,15 @@ fn scan_shape_changing_body() -> Graph {
     b.add_input(state);
     b.add_input(end);
     let axes = init(&mut b, "axes", DataType::Int64, &[1], i64_bytes(&[0]));
-    let end_vec =
-        op(&mut b, "Unsqueeze", &[end, axes], Some("end_vec"), DataType::Int64, &[1], &[]);
+    let end_vec = op(
+        &mut b,
+        "Unsqueeze",
+        &[end, axes],
+        Some("end_vec"),
+        DataType::Int64,
+        &[1],
+        &[],
+    );
     let starts = init(&mut b, "starts", DataType::Int64, &[1], i64_bytes(&[0]));
     let steps = init(&mut b, "steps", DataType::Int64, &[1], i64_bytes(&[1]));
     let dynamic = b.intern_symbol("dynamic_state");
@@ -992,9 +1169,8 @@ fn scan_rejects_state_shape_change() {
         .run(&[("ends", &ends)])
         .expect_err("Scan must reject a state shape change");
     assert!(
-        err.to_string().contains(
-            "control-flow op Scan: state output 0 shape mismatch: expected [2], got [1]"
-        ),
+        err.to_string()
+            .contains("control-flow op Scan: state output 0 shape mismatch: expected [2], got [1]"),
         "unexpected error: {err}"
     );
     assert_eq!(session.control_flow_stats().subgraph_runs, 2);

@@ -12,7 +12,7 @@
 //! * the error path for an unsupported slice parameter (step == 0).
 
 use onnx_runtime_ir::{
-    static_shape, Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+    Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_session::InferenceSession;
 
@@ -148,7 +148,14 @@ fn slice_view_into_contiguous_only_consumer_is_materialized() {
     let data = f32_init(&mut g, "data", &[4, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
     // Strided view: rows [0:4:2] → rows 0 and 2 → [[1,2],[5,6]] (stride 2 on ax0)
     let strided = slice_node(&mut g, data, "s", &[0], &[4], &[0], &[2], &[2, 2]);
-    let ident = op(&mut g, "Identity", &[strided], DataType::Float32, &[2, 2], &[]);
+    let ident = op(
+        &mut g,
+        "Identity",
+        &[strided],
+        DataType::Float32,
+        &[2, 2],
+        &[],
+    );
     g.add_output(ident);
 
     let mut session = InferenceSession::from_graph(g).expect("build");

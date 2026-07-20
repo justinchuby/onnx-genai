@@ -26,9 +26,9 @@
 //! `"optimization"` is a generic, model-agnostic option.
 
 use onnx_runtime_ir::{
-    static_shape, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+    DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
-use onnx_runtime_loader::{encode_model, Model};
+use onnx_runtime_loader::{Model, encode_model};
 use onnx_runtime_session::{InferenceSession, Tensor};
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
@@ -49,14 +49,12 @@ fn f32_init(g: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId 
     vid
 }
 
-fn op(
-    g: &mut Graph,
-    op_type: &str,
-    name: &str,
-    inputs: &[ValueId],
-    out_dims: &[usize],
-) -> ValueId {
-    let out = g.create_named_value(name, DataType::Float32, static_shape(out_dims.iter().copied()));
+fn op(g: &mut Graph, op_type: &str, name: &str, inputs: &[ValueId], out_dims: &[usize]) -> ValueId {
+    let out = g.create_named_value(
+        name,
+        DataType::Float32,
+        static_shape(out_dims.iter().copied()),
+    );
     let node = Node::new(
         NodeId(0),
         op_type,
@@ -128,7 +126,11 @@ fn fused_gemm_parity_and_fusion_fires() {
         1,
         "expected exactly one FusedGemm node in the optimized graph"
     );
-    assert_eq!(count(fg, "MatMul"), 0, "no standalone MatMul should survive");
+    assert_eq!(
+        count(fg, "MatMul"),
+        0,
+        "no standalone MatMul should survive"
+    );
     assert_eq!(count(fg, "Add"), 0, "no standalone Add should survive");
     assert_eq!(count(fg, "Relu"), 0, "no standalone Relu should survive");
     let fused_node = fg
