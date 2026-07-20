@@ -10,5 +10,11 @@ categories = ["concurrency", "science"]
 
 [dependencies]
 onnx-genai-kv = { workspace = true }
+onnx-runtime-protocol-trace = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Enables the test-only independent replay-checker harness for the pressure
+# protocol conformance campaigns.
+onnx-runtime-protocol-trace = { workspace = true, features = ["conformance"] }

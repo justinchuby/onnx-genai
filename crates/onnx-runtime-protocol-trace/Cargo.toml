@@ -1,0 +1,18 @@
+[package]
+name = "onnx-runtime-protocol-trace"
+description = "Shared protocol-conformance trace envelope and independent replay-checker harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["conformance", "protocol", "concurrency", "verification"]
+categories = ["concurrency"]
+publish = false
+
+[features]
+# The independent replay-checker harness is test-only infrastructure. The trace
+# envelope and identity types are always compiled as normal public API; only the
+# checker driver is feature-gated so it never ships in production builds.
+conformance = []
+
+[dependencies]

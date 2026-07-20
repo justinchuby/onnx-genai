@@ -226,6 +226,45 @@ pub enum ResourceError {
         operation: &'static str,
         reason: String,
     },
+
+    // ── Ticketed non-blocking pressure protocol (HostGovernor, §5.3.1) ──
+    #[error(
+        "host page request is invalid: {reason}; request a non-zero extent no larger than the \
+         reclaimable host budget"
+    )]
+    InvalidHostRequest { reason: String },
+
+    #[error(
+        "host quota denied: requested {requested_bytes} B but the machine-wide reclaimable host \
+         budget is only {reclaimable_budget_bytes} B; this request can never be satisfied even \
+         after full reclaim"
+    )]
+    HostQuotaDenied {
+        requested_bytes: u64,
+        reclaimable_budget_bytes: u64,
+    },
+
+    #[error("host pressure ticket {request_id} timed out before it could be granted or claimed")]
+    HostPressureTimeout { request_id: u64 },
+
+    #[error(
+        "host pressure ticket {request_id} was invalidated by HostGovernor reconfiguration \
+         (admitted under generation {stale_generation}, current generation {current_generation})"
+    )]
+    HostReconfigurationInvalidated {
+        request_id: u64,
+        stale_generation: u64,
+        current_generation: u64,
+    },
+
+    #[error(
+        "host ledger arithmetic error during {operation}: {reason}; overflow, negative headroom, \
+         duplicate physical identity, or a snapshot mismatch is a hard conformance failure"
+    )]
+    HostLedgerInvariant {
+        operation: &'static str,
+        reason: String,
+    },
 }
 
 /// Resolve a limit against a tier's detected total capacity.

@@ -9,6 +9,7 @@
 pub mod byte_budget;
 pub mod governor;
 pub mod policy;
+pub mod pressure;
 
 pub use byte_budget::{
     BudgetSnapshot, ByteBudget, ByteBudgetError, ReconfigureOutcome as ByteBudgetReconfigureOutcome,
@@ -20,6 +21,10 @@ pub use governor::{
     resolve_limit,
 };
 pub use policy::FairSharePolicy;
+pub use pressure::{
+    HostAllocation, HostGovernor, HostGovernorConfig, HostLedgerSnapshot, HostPageRequest,
+    HostPriority, PressureState, PressureTicket, TicketPoll, TimeoutOutcome,
+};
 
 use onnx_genai_kv::SequenceId;
 

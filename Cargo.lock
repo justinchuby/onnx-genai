@@ -1863,6 +1863,7 @@ name = "onnx-genai-scheduler"
 version = "0.1.0-dev.2"
 dependencies = [
  "onnx-genai-kv",
+ "onnx-runtime-protocol-trace",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2029,6 +2030,10 @@ dependencies = [
  "onnx-runtime-loader",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "onnx-runtime-protocol-trace"
+version = "0.1.0-dev.2"
 
 [[package]]
 name = "onnx-runtime-python"
