@@ -627,10 +627,12 @@ impl CudaRuntime {
     /// `src` is a live device allocation of at least `dst.len()` bytes.
     pub unsafe fn dtoh(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // The EP uses a non-default stream, while synchronous cuMemcpyDtoH is
+        // not ordered behind work queued there. Wait before reading `src`.
+        self.synchronize()?;
         // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyDtoH", e))?;
-        self.synchronize()
+            .map_err(|e| driver_err("cuMemcpyDtoH", e))
     }
 
     /// Copy `bytes` device → device (D2D).

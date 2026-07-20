@@ -236,6 +236,7 @@ fn run_case(
     graph.add_output(output);
     let model = Model::new(&graph);
     let kernel = ep.get_kernel(model.graph.node(node), &[], 1)?;
+    assert!(!kernel.cuda_graph_compatible());
 
     let mut inputs = vec![
         tensor(DataType::Float32, a_shape, activations),
@@ -289,6 +290,10 @@ fn run_case(
         device,
     );
     kernel.execute(&input_views, &mut [output_view])?;
+    assert_eq!(
+        kernel.cuda_graph_compatible(),
+        a_shape[..a_shape.len() - 1].iter().product::<usize>() == 1
+    );
 
     let mut bytes = vec![0u8; output_len * 4];
     // SAFETY: output allocation contains `output_len` f32 values.
@@ -471,6 +476,157 @@ fn matmul_nbits_gpu_gemv_streams_random_packed_int4() {
     eprintln!(
         "MatMulNBits default GEMV CPU-reference max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}"
     );
+}
+
+#[test]
+fn matmul_nbits_gpu_m1_capture_replay_is_bit_exact() {
+    let Some(ep) = gpu() else { return };
+    let (k, n, block_size) = (1003usize, 37usize, 32usize);
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let mut state = 0xb63a_0975_4c21_d8efu64;
+    let initial: Vec<f32> = (0..k)
+        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 4.0)
+        .collect();
+    let mutated: Vec<f32> = (0..k)
+        .map(|_| (random_u32(&mut state) as f32 / u32::MAX as f32 - 0.5) * 6.0)
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * blob_size)
+        .map(|_| random_u32(&mut state) as u8)
+        .collect();
+    let scales: Vec<f32> = (0..n * blocks)
+        .map(|_| 0.002 + (random_u32(&mut state) as f32 / u32::MAX as f32) * 0.08)
+        .collect();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+    let b = graph.create_named_value("B", DataType::Uint8, static_shape([n, blocks, blob_size]));
+    let scales_value =
+        graph.create_named_value("scales", DataType::Float32, static_shape([n, blocks]));
+    for value in [a, b, scales_value] {
+        graph.add_input(value);
+    }
+    let output = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+    let mut node = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(a), Some(b), Some(scales_value)],
+        vec![output],
+    );
+    node.domain = "com.microsoft".into();
+    node.attributes.insert("K".into(), Attribute::Int(k as i64));
+    node.attributes.insert("N".into(), Attribute::Int(n as i64));
+    node.attributes.insert("bits".into(), Attribute::Int(4));
+    node.attributes
+        .insert("block_size".into(), Attribute::Int(block_size as i64));
+    let node = graph.insert_node(node);
+    graph.add_output(output);
+    let model = Model::new(&graph);
+    let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let inputs = [
+        tensor(DataType::Float32, &[1, k], &initial),
+        tensor(DataType::Uint8, &[n, blocks, blob_size], &packed),
+        tensor(DataType::Float32, &[n, blocks], &scales),
+    ];
+    let mut input_buffers = Vec::<DeviceBuffer>::new();
+    for input in &inputs {
+        let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+        // SAFETY: allocation size equals the source byte length.
+        unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
+        input_buffers.push(buffer);
+    }
+    let input_strides: Vec<_> = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect();
+    let input_views: Vec<_> = inputs
+        .iter()
+        .zip(&input_buffers)
+        .zip(&input_strides)
+        .map(|((input, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                input.dtype,
+                &input.shape,
+                strides,
+                device,
+            )
+        })
+        .collect();
+    let mut output_buffer = ep.allocate(n * 4, 256).unwrap();
+    let output_shape = [1, n];
+    let output_strides = compute_contiguous_strides(&output_shape);
+    macro_rules! execute {
+        () => {{
+            let output_view = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                device,
+            );
+            kernel.execute(&input_views, &mut [output_view]).unwrap();
+        }};
+    }
+
+    execute!();
+    assert!(kernel.cuda_graph_compatible());
+    let mutated_bytes = typed_bytes(&mutated);
+    // SAFETY: the first input allocation exactly covers the activation bytes.
+    unsafe {
+        runtime
+            .htod(&mutated_bytes, cuptr(input_buffers[0].as_ptr()))
+            .unwrap()
+    };
+    execute!();
+    let mut eager = vec![0u8; n * 4];
+    // SAFETY: the output allocation exactly covers `eager`.
+    unsafe {
+        runtime
+            .dtoh(&mut eager, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+
+    let initial_bytes = typed_bytes(&initial);
+    // SAFETY: the first input allocation exactly covers the activation bytes.
+    unsafe {
+        runtime
+            .htod(&initial_bytes, cuptr(input_buffers[0].as_ptr()))
+            .unwrap()
+    };
+    let allocation_counts = runtime.allocation_counts();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute!();
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.has_graph_executable().unwrap());
+
+    // SAFETY: the first input allocation exactly covers the activation bytes.
+    unsafe {
+        runtime
+            .htod(&mutated_bytes, cuptr(input_buffers[0].as_ptr()))
+            .unwrap()
+    };
+    runtime.replay_graph().unwrap();
+    let mut replayed = vec![0u8; n * 4];
+    // SAFETY: the output allocation exactly covers `replayed`.
+    unsafe {
+        runtime
+            .dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(replayed, eager);
+    assert_eq!(runtime.allocation_counts(), allocation_counts);
+    assert!(runtime.reset_graph().unwrap());
+    drop(input_views);
+    for buffer in input_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output_buffer).unwrap();
 }
 
 #[test]

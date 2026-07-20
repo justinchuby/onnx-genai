@@ -3,6 +3,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -300,6 +301,7 @@ impl KernelFactory for MatMulNBitsFactory {
             n,
             block_size,
             accuracy_level,
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -311,10 +313,12 @@ pub struct MatMulNBitsKernel {
     n: usize,
     block_size: usize,
     accuracy_level: i64,
+    last_call_capture_safe: AtomicBool,
 }
 
 impl MatMulNBitsKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         if !(3..=6).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 3 to 6 inputs and 1 output, got {} inputs and {} outputs",
@@ -412,6 +416,8 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        self.last_call_capture_safe
+            .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
             if self.accuracy_level == 4 && self.block_size == 32 && zero_points.is_none() {
                 return self.launch_accuracy4_gemv(
@@ -567,8 +573,8 @@ impl MatMulNBitsKernel {
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|err| driver_err("launch MatMulNBits f32 GEMV", err))?;
-        self.runtime.synchronize()
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits f32 GEMV", err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -613,8 +619,8 @@ impl MatMulNBitsKernel {
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 GEMV", err))?;
-        self.runtime.synchronize()
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 GEMV", err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -682,8 +688,8 @@ impl MatMulNBitsKernel {
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4", err))?;
-        self.runtime.synchronize()
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4", err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -754,7 +760,10 @@ impl Kernel for MatMulNBitsKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        false
+        // The m=1 no-g_idx GEMV is allocation-, D2H-, and synchronization-free.
+        // Prefill GEMM allocates/frees scratch buffers and synchronizes, while
+        // g_idx validation performs D2H, so those paths must report false.
+        self.last_call_capture_safe.load(Ordering::Relaxed)
     }
 }
 
