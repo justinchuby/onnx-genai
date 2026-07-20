@@ -16,12 +16,13 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_metadata::{
     DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
-    PipelineVisionConfig,
+    PipelineVisionConfig, SchedulerSpec,
 };
 use onnx_genai_ort::{
-    PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
+    DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 use std::path::Path;
 
 /// Named tensors supplied to or produced by pipeline components.
@@ -29,6 +30,26 @@ use std::path::Path;
 /// Keys are fully-qualified endpoints of the form `component.input_name` or
 /// `component.output_name`.
 pub type PipelineTensors = HashMap<String, Value>;
+
+/// Per-request overrides for an iterative (diffusion) pipeline's loop
+/// parameters. This enables ComfyUI-style *live* editing — re-driving the same
+/// already-loaded models with different dynamics, with no re-export or reload.
+///
+/// The seed, prompt and negative prompt are already live: they are supplied as
+/// per-request inputs (`denoiser.sample`, `text_encoder.input_ids`, and any
+/// `*.uncond` conditioning), so only the loop *parameters* need overrides here.
+#[derive(Debug, Clone, Default)]
+pub struct IterativeOverrides {
+    /// Override the number of denoise steps. Rebuilds the scheduler for the new
+    /// step count; rejected when the pipeline declares an explicit per-step
+    /// timestep schedule (which is tied to the original step count).
+    pub num_steps: Option<usize>,
+    /// Override the classifier-free-guidance scale (ComfyUI `cfg`). `1.0`
+    /// disables guidance.
+    pub guidance_scale: Option<f32>,
+    /// Override the first step index of a partial (img2img) denoise loop.
+    pub start_step: Option<usize>,
+}
 
 /// A pipeline generation request.
 pub struct PipelineGenerateRequest {
@@ -40,6 +61,8 @@ pub struct PipelineGenerateRequest {
     /// This is known only after preprocessing and must be supplied before
     /// decoder KV allocation for encoder-free multimodal pipelines.
     pub num_image_tiles: Option<usize>,
+    /// Live overrides for an iterative pipeline's loop parameters.
+    pub iterative_overrides: IterativeOverrides,
 }
 
 impl PipelineGenerateRequest {
@@ -48,6 +71,7 @@ impl PipelineGenerateRequest {
             request,
             inputs: HashMap::new(),
             num_image_tiles: None,
+            iterative_overrides: IterativeOverrides::default(),
         }
     }
 
@@ -58,6 +82,13 @@ impl PipelineGenerateRequest {
 
     pub fn with_image_tile_count(mut self, num_image_tiles: usize) -> Self {
         self.num_image_tiles = Some(num_image_tiles);
+        self
+    }
+
+    /// Attach live overrides for an iterative pipeline's loop parameters
+    /// (steps / guidance scale / start step).
+    pub fn with_iterative_overrides(mut self, overrides: IterativeOverrides) -> Self {
+        self.iterative_overrides = overrides;
         self
     }
 }
@@ -72,7 +103,9 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 pub struct PipelineEngine {
     models: PipelineModels,
     plan: PipelinePlan,
-    decoder_state: DecodeState,
+    /// Autoregressive decode state; `None` for non-autoregressive pipelines
+    /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
+    decoder_state: Option<DecodeState>,
     tokenizer_component: String,
 }
 
@@ -87,6 +120,16 @@ impl Engine {
     ) -> anyhow::Result<PipelineEngine> {
         PipelineEngine::from_dir_with_config(pipeline_dir, config)
     }
+
+    /// Load a pipeline directory with a custom [`SchedulerRegistry`] so users
+    /// can plug in their own [`Scheduler`] implementations.
+    pub fn from_pipeline_dir_with_schedulers(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        schedulers: &SchedulerRegistry,
+    ) -> anyhow::Result<PipelineEngine> {
+        PipelineEngine::from_dir_with_schedulers(pipeline_dir, config, schedulers)
+    }
 }
 
 impl PipelineEngine {
@@ -96,6 +139,18 @@ impl PipelineEngine {
     }
 
     pub fn from_dir_with_config(pipeline_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        Self::from_dir_with_schedulers(pipeline_dir, config, &SchedulerRegistry::builtin())
+    }
+
+    /// Load a pipeline with a **custom [`SchedulerRegistry`]**, so a user can
+    /// plug in their own [`Scheduler`] implementations (referenced by
+    /// `scheduler_config.kind` in the pipeline metadata) alongside the built-in
+    /// `ddim` / `masked_diffusion`.
+    pub fn from_dir_with_schedulers(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        schedulers: &SchedulerRegistry,
+    ) -> anyhow::Result<Self> {
         let decode_backend = requested_decode_backend(config.decode_backend)?;
         if decode_backend == EngineDecodeBackend::Native {
             anyhow::bail!(
@@ -116,13 +171,22 @@ impl PipelineEngine {
         }
         let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
-        let plan = PipelinePlan::from_spec(&models.directory.spec)?;
-        let decoder = models
-            .session(&plan.decoder)
-            .with_context(|| format!("pipeline decoder '{}' was not loaded", plan.decoder))?;
-        let _kv_model = infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
-        let decoder_state = DecodeState::new(decoder)?;
-        let tokenizer_component = plan.decoder.clone();
+        let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
+        // Only autoregressive pipelines drive a token-by-token decode loop and
+        // therefore need a `DecodeState` + KV model info. Single-pass and
+        // iterative (diffusion) pipelines run tensors through `run_pipeline`.
+        let (decoder_state, tokenizer_component) = match &plan {
+            PipelinePlan::Autoregressive(ar) => {
+                let decoder = models.session(&ar.decoder).with_context(|| {
+                    format!("pipeline decoder '{}' was not loaded", ar.decoder)
+                })?;
+                let _kv_model =
+                    infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
+                (Some(DecodeState::new(decoder)?), ar.decoder.clone())
+            }
+            PipelinePlan::SinglePass(sp) => (None, sp.model.clone()),
+            PipelinePlan::Iterative(it) => (None, it.denoiser.clone()),
+        };
         Ok(Self {
             models,
             plan,
@@ -151,6 +215,18 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        // Guard first: a non-autoregressive pipeline (single-pass / iterative
+        // diffusion) has no token decode loop, so surface the actionable error
+        // before touching the tokenizer or options.
+        let ar = self
+            .plan
+            .autoregressive_plan()
+            .context(
+                "generate() requires an autoregressive pipeline; use run_pipeline() for \
+                 single-pass or iterative (diffusion) pipelines",
+            )?
+            .clone();
+
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
         if options.eos_token_id.is_none() {
@@ -175,21 +251,22 @@ impl PipelineEngine {
         )?;
 
         let mut tensors = pipeline_request.inputs;
-        self.run_prompt_phase_components(&mut tensors)?;
-        let decoder_extras = self.decoder_extra_inputs(&tensors)?;
+        self.run_prompt_phase_components(&ar.prompt_components, &mut tensors, "prologue", None)?;
+        let decoder_extras = self.decoder_extra_inputs(&ar.decoder, &tensors)?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        self.decoder_state = {
-            let decoder = self.models.session(&self.plan.decoder).with_context(|| {
-                format!("pipeline decoder '{}' was not loaded", self.plan.decoder)
-            })?;
+        self.decoder_state = Some({
+            let decoder = self
+                .models
+                .session(&ar.decoder)
+                .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
             DecodeState::new(decoder)?
-        };
+        });
 
         let decoder = self
             .models
-            .session(&self.plan.decoder)
-            .with_context(|| format!("pipeline decoder '{}' was not loaded", self.plan.decoder))?;
+            .session(&ar.decoder)
+            .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
         let tokenizer = self
             .models
             .tokenizer_for(&self.tokenizer_component)
@@ -198,7 +275,10 @@ impl PipelineEngine {
             })?;
         let mut backend = PipelineDecodeLoopBackend {
             decoder,
-            decoder_state: &mut self.decoder_state,
+            decoder_state: self
+                .decoder_state
+                .as_mut()
+                .expect("autoregressive pipeline has decode state"),
             decoder_extras: &decoder_extras,
             context_tokens: prompt_tokens,
             prompt_len: 0,
@@ -221,14 +301,522 @@ impl PipelineEngine {
         &self.models.directory.spec
     }
 
+    /// The `init_noise_sigma` of the diffusion scheduler this pipeline drives.
+    ///
+    /// Returns `None` when the pipeline is not iterative (diffusion) or carries
+    /// no scheduler. The caller pre-scales the seed latent by this factor so it
+    /// lives in the scheduler's sigma space (`1.0` for DDIM / DPM-Solver++;
+    /// `sigmas[0]` for Euler / Euler-Ancestral). This lets a runner reuse the
+    /// exact scheduler the pipeline builds instead of duplicating the sigma math.
+    pub fn diffusion_init_noise_sigma(&self) -> Option<f32> {
+        match &self.plan {
+            PipelinePlan::Iterative(iterative) => iterative
+                .scheduler
+                .as_ref()
+                .map(|scheduler| scheduler.init_noise_sigma()),
+            _ => None,
+        }
+    }
+
+    /// Execute a **non-autoregressive** pipeline (single-pass or iterative /
+    /// diffusion) and return the final named output tensors, keyed by
+    /// `component.output_name`.
+    ///
+    /// This is the tensor-producing counterpart to [`generate`](Self::generate)
+    /// (which drives an autoregressive token loop). Use it for diffusion
+    /// denoisers, VAE decoders, audio vocoders, and other tensor-out models.
+    pub fn run_pipeline(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        match &self.plan {
+            PipelinePlan::Iterative(_) => self.run_iterative(request),
+            PipelinePlan::SinglePass(_) => self.run_single_pass(request),
+            PipelinePlan::Autoregressive(_) => anyhow::bail!(
+                "run_pipeline() runs single-pass or iterative pipelines; use generate() for \
+                 autoregressive text pipelines"
+            ),
+        }
+    }
+
+    /// Run a bounded iterative (diffusion) denoise loop.
+    ///
+    /// Semantics: prompt-phase components run once; then the denoiser runs
+    /// `num_steps` times, threading loop-carried state (its self-edges) from one
+    /// step's output into the next step's input while constant conditioning
+    /// (e.g. encoder hidden states) is re-supplied each step; then final-phase
+    /// components run once. `guidance_scale` is carried but not yet applied —
+    /// classifier-free guidance and timestep/sigma schedules are supplied by the
+    /// scheduler-registry follow-up.
+    fn run_iterative(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let PipelinePlan::Iterative(plan) = &self.plan else {
+            anyhow::bail!("internal error: run_iterative on a non-iterative plan");
+        };
+
+        // Live overrides (ComfyUI-style): re-drive the already-loaded models with
+        // different loop parameters, no reload. Seed / prompt / negative are
+        // already live via per-request inputs, so only loop params are overridden.
+        let overrides = &request.iterative_overrides;
+        let num_steps = overrides.num_steps.unwrap_or(plan.num_steps);
+        let start_step = overrides.start_step.unwrap_or(plan.start_step);
+        if num_steps == 0 {
+            anyhow::bail!("iterative override num_steps must be >= 1");
+        }
+        if start_step >= num_steps {
+            anyhow::bail!(
+                "iterative override start_step ({start_step}) must be < num_steps ({num_steps})"
+            );
+        }
+        // Rebuild the scheduler when the step count changes (its schedule may be
+        // baked at build time). An explicit per-step timestep schedule is tied to
+        // the original step count, so reject a step-count override in that case.
+        let rebuilt_scheduler = if num_steps != plan.num_steps {
+            if plan.timesteps.is_some() {
+                anyhow::bail!(
+                    "cannot override num_steps for a pipeline with an explicit timestep schedule"
+                );
+            }
+            match &plan.scheduler_spec {
+                Some(spec) => Some(plan.scheduler_registry.build(spec, num_steps)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let scheduler = rebuilt_scheduler.as_ref().or(plan.scheduler.as_ref());
+
+        // Classifier-free guidance scale (active only when set and != 1.0).
+        let guidance = overrides
+            .guidance_scale
+            .or(plan.guidance_scale)
+            .filter(|s| *s != 1.0);
+        // `constants` holds external inputs + prompt-phase outputs and is NOT
+        // mutated by the loop, so a denoiser whose output port shares a name
+        // with a conditioning input cannot clobber that conditioning. Denoiser
+        // outputs live in a separate `loop_state`, keyed by output port.
+        let mut constants = request.inputs;
+        let mut stage_timings: Vec<serde_json::Value> = Vec::new();
+        self.run_prompt_phase_components(
+            &plan.prompt_components,
+            &mut constants,
+            "encode",
+            Some(&mut stage_timings),
+        )?;
+
+        let denoiser = self
+            .models
+            .session(&plan.denoiser)
+            .with_context(|| format!("pipeline denoiser '{}' was not loaded", plan.denoiser))?;
+
+        // Precompute the CFG unconditional conditioning once. Any denoiser input
+        // port with a supplied `{denoiser}.{port}.uncond` embedding is overridden
+        // on the unconditional pass — this supports multi-conditioning models
+        // (e.g. SDXL overrides both `encoder_hidden_states` and pooled
+        // `text_embeds`, while sharing `time_ids`). The primary
+        // `cfg_conditioning_input` is additionally zeroed when no `.uncond` is
+        // supplied (the zeros fallback for a single-conditioning SD model).
+        let cfg_uncond: Vec<(String, Value)> = if guidance.is_some() {
+            if let Some(primary) = plan.cfg_conditioning_input.clone() {
+                let mut overrides: Vec<(String, Value)> = Vec::new();
+                let mut seen: BTreeSet<String> = BTreeSet::new();
+                for info in denoiser.inputs() {
+                    let port = info.name.as_str();
+                    let uncond_endpoint = format!("{}.{}.uncond", plan.denoiser, port);
+                    if let Some(u) = constants.get(&uncond_endpoint) {
+                        overrides.push((port.to_string(), clone_value(u)?));
+                        seen.insert(port.to_string());
+                    }
+                }
+                if !seen.contains(&primary) {
+                    let cond_endpoint = format!("{}.{}", plan.denoiser, primary);
+                    let cond = constants
+                        .get(&cond_endpoint)
+                        .or_else(|| {
+                            plan.dataflow
+                                .iter()
+                                .find(|e| e.to == cond_endpoint)
+                                .and_then(|e| constants.get(&e.from))
+                        })
+                        .with_context(|| format!("cfg conditioning '{cond_endpoint}' not found"))?;
+                    overrides.push((
+                        primary.clone(),
+                        Value::from_slice_f32(&vec![0.0f32; cond.numel()], cond.shape())?,
+                    ));
+                }
+                overrides
+            } else {
+                // No static conditioning input: the unconditional pass is a
+                // transform of the loop-carried sample (discrete language
+                // diffusion re-masks the prompt via `cfg_uncond_sample`).
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // `carried` holds the value to feed each loop-carried INPUT port next
+        // step (keyed by input port); `last_outputs` holds the denoiser's raw
+        // outputs from the final step (keyed by output port). Keeping them
+        // separate from the immutable `constants` pool prevents an output whose
+        // name collides with a conditioning input from clobbering it.
+        let mut carried: HashMap<String, Value> = HashMap::new();
+        let mut last_outputs: HashMap<String, Value> = HashMap::new();
+        // Reset any multistep scheduler state before the loop (img2img reuses a
+        // plan whose scheduler may hold state from a previous run).
+        if let Some(scheduler) = scheduler {
+            scheduler.reset();
+        }
+        // Denoiser timestep schedule: prefer the plan's explicit `strategy.timesteps`,
+        // otherwise fall back to the scheduler's own timesteps (so from-scratch
+        // packages that omit the table still drive the denoiser with the correct
+        // diffusion timesteps rather than the raw step index).
+        let scheduler_timesteps: Option<Vec<f32>> = if plan.timesteps.is_some() {
+            None
+        } else {
+            scheduler.and_then(|scheduler| scheduler.timesteps())
+        };
+        // Partial (img2img) loops start at `start_step`; the seed is then the
+        // encoded image already noised to `timesteps[start_step]`.
+        let denoise_start = std::time::Instant::now();
+        for step in start_step..num_steps {
+            let step_start = std::time::Instant::now();
+            let is_first = step == start_step;
+            // Timestep/sigma for this step: explicit plan schedule when provided,
+            // else the scheduler's timesteps, else the 0-based step index.
+            let timestep = plan
+                .timesteps
+                .as_ref()
+                .or(scheduler_timesteps.as_ref())
+                .and_then(|ts| ts.get(step).copied())
+                .unwrap_or(step as f32);
+
+            // Raw (unscaled) loop-carried sample feeding each loop input this
+            // step: the seed on the first step, otherwise the value carried from
+            // the previous step. The scheduler's `step` consumes these raw samples.
+            let mut raw_samples: HashMap<String, Value> = HashMap::new();
+            for (_, in_port) in &plan.loop_edges {
+                let raw = if is_first {
+                    let endpoint = format!("{}.{}", plan.denoiser, in_port);
+                    constants.get(&endpoint).with_context(|| {
+                        format!("missing iterative pipeline seed '{endpoint}' at start step")
+                    })?
+                } else {
+                    carried.get(in_port).with_context(|| {
+                        format!("loop-carried input '{}.{in_port}' was not produced", plan.denoiser)
+                    })?
+                };
+                raw_samples.insert(in_port.clone(), clone_value(raw)?);
+            }
+
+            // Some schedulers (e.g. Euler) scale the loop-carried sample before
+            // it reaches the denoiser. Compute those scaled values once and feed
+            // them as per-port overrides; schedulers that don't scale (DDIM,
+            // masked diffusion) leave the raw sample untouched.
+            let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
+            if let Some(scheduler) = scheduler {
+                for (_, in_port) in &plan.loop_edges {
+                    let raw = &raw_samples[in_port];
+                    if let Some(scaled) = scheduler.scale_input(step, num_steps, raw)? {
+                        scaled_inputs.insert(in_port.clone(), scaled);
+                    }
+                }
+            }
+            let scale_overrides: Vec<(&str, &Value)> = scaled_inputs
+                .iter()
+                .map(|(port, value)| (port.as_str(), value))
+                .collect();
+
+            // Conditional pass (all inputs as declared, plus any input scaling).
+            let cond_out = self.run_denoiser_pass(
+                denoiser,
+                plan,
+                start_step,
+                &constants,
+                &carried,
+                step,
+                timestep,
+                &scale_overrides,
+            )?;
+
+            // Classifier-free guidance: run an unconditional pass with the
+            // conditioning replaced by the unconditional embedding, then combine
+            // per output port:  pred = uncond + scale * (cond - uncond).
+            let out_map = if let Some(scale) = guidance {
+                let mut cfg_overrides = scale_overrides.clone();
+                for (port, value) in &cfg_uncond {
+                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                    cfg_overrides.push((port.as_str(), value));
+                }
+                // Language-diffusion CFG: the unconditional pass feeds the
+                // loop-carried input with its prompt tokens re-masked. Computed
+                // per step from the current sample (owned here so its references
+                // live through the unconditional denoiser pass).
+                let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
+                if let Some(scheduler) = scheduler {
+                    for (_, in_port) in &plan.loop_edges {
+                        let raw = &raw_samples[in_port];
+                        if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
+                            prompt_masked_inputs.push((in_port.clone(), uncond_sample));
+                        }
+                    }
+                }
+                for (port, value) in &prompt_masked_inputs {
+                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                    cfg_overrides.push((port.as_str(), value));
+                }
+                let uncond_out = self.run_denoiser_pass(
+                    denoiser,
+                    plan,
+                    start_step,
+                    &constants,
+                    &carried,
+                    step,
+                    timestep,
+                    &cfg_overrides,
+                )?;
+                let mut combined: HashMap<String, Value> = HashMap::new();
+                for (port, cond_value) in &cond_out {
+                    let uncond_value = uncond_out.get(port).with_context(|| {
+                        format!("unconditional pass did not produce '{}.{port}'", plan.denoiser)
+                    })?;
+                    let cond_v = cond_value.to_vec_f32_lossy()?;
+                    let uncond_v = uncond_value.to_vec_f32_lossy()?;
+                    let guided: Vec<f32> = uncond_v
+                        .iter()
+                        .zip(&cond_v)
+                        .map(|(u, c)| u + scale * (c - u))
+                        .collect();
+                    combined.insert(port.clone(), Value::from_slice_f32(&guided, cond_value.shape())?);
+                }
+                combined
+            } else {
+                cond_out
+            };
+
+            // Compute the next value for each loop-carried input. Without a
+            // scheduler this is identity feedback (output -> input). With a
+            // scheduler the output is a noise prediction and the next sample is
+            // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
+            for (out_port, in_port) in &plan.loop_edges {
+                let model_output = out_map.get(out_port).with_context(|| {
+                    format!("denoiser did not produce loop output '{}.{out_port}'", plan.denoiser)
+                })?;
+                let next = if let Some(scheduler) = scheduler {
+                    let sample = raw_samples.get(in_port).with_context(|| {
+                        format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
+                    })?;
+                    if scheduler.needs_noise() {
+                        let noise = self.step_noise(plan, num_steps, &constants, in_port, step, sample)?;
+                        scheduler.step_with_noise(
+                            step,
+                            num_steps,
+                            sample,
+                            model_output,
+                            Some(&noise),
+                        )?
+                    } else {
+                        scheduler.step(step, num_steps, sample, model_output)?
+                    }
+                } else {
+                    clone_value(model_output)?
+                };
+                dump_iterative_step(
+                    &plan.denoiser,
+                    in_port,
+                    step,
+                    &next,
+                    step_start.elapsed().as_secs_f64() * 1e3,
+                );
+                carried.insert(in_port.clone(), next);
+            }
+            last_outputs = out_map;
+        }
+        let denoise_ms = denoise_start.elapsed().as_secs_f64() * 1e3;
+        stage_timings.push(serde_json::json!({
+            "component": plan.denoiser,
+            "phase": "denoise",
+            "ms": denoise_ms,
+            "steps": num_steps - start_step,
+        }));
+
+        // Publish the final denoiser outputs (raw predictions) and the final
+        // loop-carried samples, then run final-phase components once. A VAE can
+        // route from either the output port or the (post-scheduler) sample port.
+        let mut tensors = constants;
+        for (out_port, value) in last_outputs {
+            tensors.insert(format!("{}.{}", plan.denoiser, out_port), value);
+        }
+        for (in_port, value) in carried {
+            tensors.insert(format!("{}.{}", plan.denoiser, in_port), value);
+        }
+        self.run_prompt_phase_components(
+            &plan.final_components,
+            &mut tensors,
+            "decode",
+            Some(&mut stage_timings),
+        )?;
+        dump_stage_timings(&stage_timings);
+        Ok(tensors)
+    }
+
+    /// Run one denoiser invocation for `step`. Returns `(outputs, sample_in)`
+    /// keyed by port. `override_input`, when set as `(port, value)`, substitutes
+    /// that input's value — used to supply the unconditional conditioning on the
+    /// CFG unconditional pass.
+    #[allow(clippy::too_many_arguments)]
+    fn run_denoiser_pass(
+        &self,
+        denoiser: &Session,
+        plan: &IterativePlan,
+        start_step: usize,
+        constants: &PipelineTensors,
+        carried: &HashMap<String, Value>,
+        step: usize,
+        timestep: f32,
+        overrides: &[(&str, &Value)],
+    ) -> anyhow::Result<HashMap<String, Value>> {
+        let mut inputs: Vec<(String, Value)> = Vec::new();
+        for info in denoiser.inputs() {
+            let port = info.name.as_str();
+            let endpoint = format!("{}.{}", plan.denoiser, port);
+            // An override wins for its port. Two producers use overrides: the
+            // scheduler's per-step input scaling (Euler) and CFG's unconditional
+            // conditioning embedding.
+            if let Some((_, over_value)) = overrides.iter().find(|(p, _)| *p == port) {
+                inputs.push((port.to_string(), coerce_value_to_dtype(over_value, info.dtype)?));
+                continue;
+            }
+            // Per-step timestep injection takes precedence for its port. Honor
+            // the port dtype: real diffusion denoisers (DiT/UNet) declare an
+            // INT64 timestep, while others take a float sigma.
+            if plan.timestep_input.as_deref() == Some(port) {
+                let ts = match info.dtype {
+                    DataType::Int64 => Value::from_vec_i64(vec![timestep as i64], &[1])?,
+                    _ => Value::from_slice_f32(&[timestep], &[1])?,
+                };
+                inputs.push((port.to_string(), ts));
+                continue;
+            }
+            let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
+            let value = if is_loop {
+                if step == start_step {
+                    constants.get(&endpoint).with_context(|| {
+                        format!("missing iterative pipeline seed '{endpoint}' at start step")
+                    })?
+                } else {
+                    carried
+                        .get(port)
+                        .with_context(|| format!("loop-carried input '{endpoint}' was not produced"))?
+                }
+            } else {
+                let routed = plan
+                    .dataflow
+                    .iter()
+                    .find(|edge| edge.to == endpoint)
+                    .and_then(|edge| constants.get(&edge.from));
+                constants
+                    .get(&endpoint)
+                    .or(routed)
+                    .with_context(|| format!("missing pipeline input '{endpoint}'"))?
+            };
+            inputs.push((port.to_string(), coerce_value_to_dtype(value, info.dtype)?));
+        }
+        let refs = inputs
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect::<Vec<_>>();
+        let outputs = denoiser.run(&refs).map_err(|e| {
+            anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
+        })?;
+        let mut out_map: HashMap<String, Value> = HashMap::new();
+        for (name, value) in denoiser.output_names().iter().zip(outputs) {
+            out_map.insert(name.clone(), value);
+        }
+        Ok(out_map)
+    }
+
+    /// Fetch the per-step Gaussian noise an ancestral scheduler needs at `step`.
+    ///
+    /// The caller supplies an external tensor `{denoiser}.{in_port}.noise` shaped
+    /// `[num_steps, *sample_shape]` (so the noise sequence is reproducible and can
+    /// match a reference generator); this slices out the `step`-th sample.
+    fn step_noise(
+        &self,
+        plan: &IterativePlan,
+        num_steps: usize,
+        constants: &PipelineTensors,
+        in_port: &str,
+        step: usize,
+        sample: &Value,
+    ) -> anyhow::Result<Value> {
+        let endpoint = format!("{}.{}.noise", plan.denoiser, in_port);
+        let all = constants.get(&endpoint).with_context(|| {
+            format!(
+                "ancestral scheduler requires per-step noise tensor '{endpoint}' \
+                 shaped [num_steps, ...]"
+            )
+        })?;
+        let elem: usize = sample.shape().iter().map(|&d| d as usize).product();
+        let data = all.to_vec_f32_lossy()?;
+        let want = num_steps * elem;
+        if data.len() != want {
+            anyhow::bail!(
+                "noise tensor '{endpoint}' has {} elements but expected {want} \
+                 ({num_steps} steps x {elem})",
+                data.len(),
+            );
+        }
+        let slice = &data[step * elem..(step + 1) * elem];
+        Value::from_slice_f32(slice, sample.shape()).map_err(Into::into)
+    }
+
+    /// Run a single-pass pipeline: prompt-phase components once, then one
+    /// forward invocation of the strategy `model`.
+    fn run_single_pass(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let PipelinePlan::SinglePass(plan) = &self.plan else {
+            anyhow::bail!("internal error: run_single_pass on a non-single-pass plan");
+        };
+        let mut tensors = request.inputs;
+        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors, "prologue", None)?;
+
+        let model = self
+            .models
+            .session(&plan.model)
+            .with_context(|| format!("pipeline model '{}' was not loaded", plan.model))?;
+        let inputs = self.component_inputs(&plan.model, model, &tensors)?;
+        let refs = inputs
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+            .collect::<Vec<_>>();
+        let outputs = model
+            .run(&refs)
+            .map_err(|e| anyhow::anyhow!("ORT pipeline model '{}' failed: {e}", plan.model))?;
+        for (name, value) in model.output_names().iter().zip(outputs) {
+            tensors.insert(format!("{}.{}", plan.model, name), value);
+        }
+        Ok(tensors)
+    }
+
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
         self.models
             .tokenizer_for(&self.tokenizer_component)
             .with_context(|| format!("no tokenizer available for '{}'", self.tokenizer_component))
     }
 
-    fn run_prompt_phase_components(&self, tensors: &mut PipelineTensors) -> anyhow::Result<()> {
-        for component in &self.plan.prompt_components {
+    fn run_prompt_phase_components(
+        &self,
+        components: &[String],
+        tensors: &mut PipelineTensors,
+        phase: &str,
+        mut timings: Option<&mut Vec<serde_json::Value>>,
+    ) -> anyhow::Result<()> {
+        for component in components {
             let session = self
                 .models
                 .session(component)
@@ -238,9 +826,17 @@ impl PipelineEngine {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
                 .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
             let outputs = session
                 .run(&refs)
                 .map_err(|e| anyhow::anyhow!("ORT pipeline component '{component}' failed: {e}"))?;
+            if let Some(sink) = timings.as_deref_mut() {
+                sink.push(serde_json::json!({
+                    "component": component,
+                    "phase": phase,
+                    "ms": started.elapsed().as_secs_f64() * 1e3,
+                }));
+            }
             for (name, value) in session.output_names().iter().zip(outputs) {
                 tensors.insert(format!("{component}.{name}"), value);
             }
@@ -259,7 +855,7 @@ impl PipelineEngine {
             let endpoint = format!("{component}.{}", info.name);
             let routed = self
                 .plan
-                .dataflow
+                .dataflow()
                 .iter()
                 .find(|edge| edge.to == endpoint)
                 .and_then(|edge| tensors.get(&edge.from));
@@ -267,22 +863,21 @@ impl PipelineEngine {
                 .get(&endpoint)
                 .or(routed)
                 .with_context(|| format!("missing pipeline input '{endpoint}'"))?;
-            inputs.push((info.name.clone(), clone_value(value)?));
+            inputs.push((info.name.clone(), coerce_value_to_dtype(value, info.dtype)?));
         }
         Ok(inputs)
     }
 
     fn decoder_extra_inputs(
         &self,
+        decoder: &str,
         tensors: &PipelineTensors,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let mut extras = Vec::new();
         for edge in self
             .plan
-            .edges_to_component(&self.plan.decoder)
-            .filter(|edge| {
-                endpoint_component(&edge.from).is_some_and(|from| from != self.plan.decoder)
-            })
+            .edges_to_component(decoder)
+            .filter(|edge| endpoint_component(&edge.from).is_some_and(|from| from != decoder))
         {
             let (_, input) = parse_endpoint(&edge.to)?;
             let value = tensors
@@ -465,52 +1060,1613 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
     }
 }
 
+/// Executable plan for a pipeline, discriminated by strategy family.
+///
+/// Autoregressive pipelines drive a token decode loop (`generate`); single-pass
+/// and iterative (diffusion) pipelines produce tensors (`run_pipeline`).
 #[derive(Debug, Clone)]
-struct PipelinePlan {
+enum PipelinePlan {
+    Autoregressive(AutoregressivePlan),
+    SinglePass(SinglePassPlan),
+    Iterative(Box<IterativePlan>),
+}
+
+/// Token-by-token decoder pipeline (optionally with prompt-phase encoders).
+#[derive(Debug, Clone)]
+struct AutoregressivePlan {
     decoder: String,
     prompt_components: Vec<String>,
     dataflow: Vec<DataflowEdge>,
 }
 
-impl PipelinePlan {
-    fn from_spec(spec: &PipelineSpec) -> anyhow::Result<Self> {
-        let decoder = autoregressive_decoder(&spec.strategy)
-            .context("pipeline strategy must contain an autoregressive decoder")?;
-        if !spec.models.contains_key(&decoder) {
-            anyhow::bail!("pipeline decoder '{decoder}' is not declared in models");
-        }
+/// One forward invocation of a single model with no runtime-managed loop.
+#[derive(Debug, Clone)]
+struct SinglePassPlan {
+    model: String,
+    /// Components that run once before the model (e.g. an encoder).
+    prompt_components: Vec<String>,
+    dataflow: Vec<DataflowEdge>,
+}
 
-        let mut prompt_components = Vec::new();
-        for component in topological_components(spec)? {
-            if component == decoder {
+/// Coerce a float tensor to a model input's declared float dtype so the f32-space
+/// pipeline math (schedulers, classifier-free guidance) can feed an fp16 / bf16
+/// model and read its outputs back. Non-float dtypes and already-matching dtypes
+/// are cloned unchanged.
+fn coerce_value_to_dtype(value: &Value, target: DataType) -> anyhow::Result<Value> {
+    if value.dtype() == target {
+        return clone_value(value);
+    }
+    match (value.dtype(), target) {
+        (
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16,
+        ) => {
+            let data = value.to_vec_f32_lossy()?;
+            Value::from_f32_slice_as(&data, value.shape(), target)
+                .map_err(|e| anyhow::anyhow!("failed to coerce value to {target:?}: {e}"))
+        }
+        _ => clone_value(value),
+    }
+}
+
+/// Dump one iterative step's loop-carried tensor to `ONNX_GENAI_STEP_DUMP_DIR`
+/// (when set) as `step_{i}_{port}.json` — used by the diffusion demo to animate
+/// the reverse process. Best-effort; failures are ignored (never affects a run).
+fn dump_iterative_step(denoiser: &str, port: &str, step: usize, value: &Value, step_ms: f64) {
+    let Ok(dir) = std::env::var("ONNX_GENAI_STEP_DUMP_DIR") else {
+        return;
+    };
+    let shape: Vec<i64> = value.shape().to_vec();
+    // Emit int64 token sequences as integers (language diffusion) and everything
+    // else as f32 (image latents). `step_ms` is this step's wall-clock time.
+    let payload = match value.dtype() {
+        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => value
+            .to_vec_i64()
+            .ok()
+            .map(|data| serde_json::json!({"dtype": "i64", "shape": shape, "data": data, "step_ms": step_ms})),
+        _ => value
+            .to_vec_f32()
+            .ok()
+            .map(|data| serde_json::json!({"dtype": "f32", "shape": shape, "data": data, "step_ms": step_ms})),
+    };
+    if let Some(payload) = payload {
+        let path = std::path::Path::new(&dir).join(format!("step_{step:04}_{denoiser}_{port}.json"));
+        let _ = std::fs::write(path, payload.to_string());
+    }
+}
+
+/// Write the per-pipeline-stage timing report (`stages.json`) to the step-dump
+/// directory when `ONNX_GENAI_STEP_DUMP_DIR` is set. Each entry is
+/// `{component, phase, ms[, steps]}`, covering the prompt encoders (`encode`),
+/// the denoiser loop total (`denoise`), and the final VAE-style pass (`decode`).
+fn dump_stage_timings(stages: &[serde_json::Value]) {
+    let Ok(dir) = std::env::var("ONNX_GENAI_STEP_DUMP_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("stages.json");
+    let _ = std::fs::write(path, serde_json::json!({ "stages": stages }).to_string());
+}
+
+#[derive(Debug, Clone)]
+struct IterativePlan {
+    /// The component re-invoked once per step.
+    denoiser: String,
+    /// Number of loop iterations.
+    num_steps: usize,
+    /// Classifier-free-guidance scale, carried for the scheduler follow-up.
+    ///
+    /// Not applied by this seam: CFG requires model-specific conditional /
+    /// unconditional batching supplied by the scheduler registry (follow-up).
+    guidance_scale: Option<f32>,
+    /// Components run once before the loop (e.g. a text/prompt encoder).
+    prompt_components: Vec<String>,
+    /// Components run once after the loop (`final_only`, e.g. a VAE decoder).
+    final_components: Vec<String>,
+    /// Loop-carried edges internal to the denoiser: `(output_port, input_port)`.
+    ///
+    /// Each step i>0 feeds step (i-1)'s `output_port` into `input_port`. Step 0
+    /// reads the seed from the external `denoiser.input_port` tensor.
+    loop_edges: Vec<(String, String)>,
+    /// Denoiser input port that receives the per-step timestep scalar, if any.
+    timestep_input: Option<String>,
+    /// First step index (0 for txt2img; >0 for a partial img2img denoise loop).
+    start_step: usize,
+    /// Explicit per-step timestep schedule (length == `num_steps`); when absent
+    /// the 0-based step index is fed instead.
+    timesteps: Option<Vec<f32>>,
+    /// Optional scheduler applied to loop-carried edges (`None` = identity
+    /// feedback). Built from the registry by `scheduler_config.kind`.
+    scheduler: Option<Arc<dyn Scheduler>>,
+    /// CFG conditioning input port zeroed on the unconditional pass (set only
+    /// when guidance is active).
+    cfg_conditioning_input: Option<String>,
+    dataflow: Vec<DataflowEdge>,
+    /// The declared scheduler config, kept so a per-request `num_steps` override
+    /// can rebuild the scheduler (whose schedule may be baked at build time).
+    scheduler_spec: Option<SchedulerSpec>,
+    /// The scheduler registry, kept for the same per-request rebuild.
+    scheduler_registry: SchedulerRegistry,
+}
+
+/// A loop-carried transform applied to a denoiser's output at each iterative
+/// step. **Implement this trait to plug in a custom scheduler** and register it
+/// with a [`SchedulerRegistry`]; the built-in `ddim` (continuous latents) and
+/// `masked_diffusion` (discrete tokens) are just implementations.
+///
+/// `sample` is the value currently fed to the loop-carried input; `model_output`
+/// is the denoiser's output this step. Return the next loop-carried value.
+pub trait Scheduler: Send + Sync + std::fmt::Debug {
+    fn step(
+        &self,
+        step: usize,
+        num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value>;
+
+    /// Reset any per-loop internal state (e.g. a multistep scheduler's previous
+    /// prediction). Called once before each denoise loop. Default no-op.
+    fn reset(&self) {}
+
+    /// Whether this scheduler consumes fresh Gaussian noise each step (ancestral /
+    /// stochastic samplers). When `true`, the loop supplies per-step noise via
+    /// [`Scheduler::step_with_noise`]. Default `false` (deterministic).
+    fn needs_noise(&self) -> bool {
+        false
+    }
+
+    /// Like [`Scheduler::step`] but with the per-step noise an ancestral sampler
+    /// needs. The default ignores `noise` and delegates to `step`, so existing
+    /// deterministic schedulers are unaffected.
+    fn step_with_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+        _noise: Option<&Value>,
+    ) -> anyhow::Result<Value> {
+        self.step(step, num_steps, sample, model_output)
+    }
+
+    /// Per-step transform applied to the loop-carried input BEFORE the denoiser
+    /// (e.g. Euler's `sample / sqrt(sigma^2 + 1)`). `Ok(None)` = identity (the
+    /// denoiser sees the raw loop-carried value, as DDIM requires).
+    fn scale_input(
+        &self,
+        _step: usize,
+        _num_steps: usize,
+        _sample: &Value,
+    ) -> anyhow::Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// The factor by which the caller must scale the initial random latent so it
+    /// lives in this scheduler's sigma space. Sigma-space samplers (Euler,
+    /// Euler-Ancestral) return their maximum sigma (`sigmas[0]`); DDIM and
+    /// DPM-Solver++ leave the seed unscaled and return `1.0` (the default).
+    fn init_noise_sigma(&self) -> f32 {
+        1.0
+    }
+
+    /// The per-step denoiser timesteps this scheduler feeds to the model, matching
+    /// the diffusers scheduler it emulates (e.g. `[999.0, 966.0, ..., 33.0]` for a
+    /// 30-step DPM-Solver++ linspace schedule). Length equals the loop step count.
+    ///
+    /// The pipeline uses these when the plan does not carry an explicit
+    /// `strategy.timesteps` schedule, so from-scratch packages that omit the
+    /// timestep table still drive the denoiser with the correct diffusion
+    /// timesteps rather than the raw `0..num_steps` step index. Returns `None`
+    /// for schedulers with no meaningful timestep (e.g. discrete token diffusion),
+    /// leaving the pipeline to fall back to the step index.
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Build the unconditional loop-carried sample for classifier-free guidance
+    /// from the current (conditional) one, when the guidance direction is a
+    /// transform of the loop state rather than a separate conditioning input.
+    ///
+    /// Discrete language diffusion (LLaDA) forms its unconditional pass by
+    /// re-masking the prompt tokens of the current sequence (`un_x[prompt] =
+    /// mask_id`); the pipeline feeds the returned value as the denoiser's
+    /// loop-carried input on the unconditional pass. Continuous (image)
+    /// schedulers return `None` (their unconditional direction comes from a
+    /// zeroed / `.uncond` conditioning input instead).
+    fn cfg_uncond_sample(&self, _sample: &Value) -> anyhow::Result<Option<Value>> {
+        Ok(None)
+    }
+}
+
+/// Builds a [`Scheduler`] from a declared [`SchedulerSpec`] and the loop length.
+pub type SchedulerFactory =
+    Arc<dyn Fn(&SchedulerSpec, usize) -> anyhow::Result<Arc<dyn Scheduler>> + Send + Sync>;
+
+/// Registry mapping a `scheduler_config.kind` string to a factory. Users extend
+/// it with [`register`](Self::register) to support their own schedulers, then
+/// load a pipeline via [`PipelineEngine::from_pipeline_dir_with_schedulers`].
+#[derive(Clone)]
+pub struct SchedulerRegistry {
+    factories: HashMap<String, SchedulerFactory>,
+}
+
+impl std::fmt::Debug for SchedulerRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulerRegistry")
+            .field("kinds", &self.factories.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SchedulerRegistry {
+    /// Registry with the built-in `ddim`, `euler`, `dpmpp_2m` and `masked_diffusion` schedulers.
+    pub fn builtin() -> Self {
+        let mut factories: HashMap<String, SchedulerFactory> = HashMap::new();
+        factories.insert(
+            "ddim".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported ddim prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = DdimSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("linear"),
+                    num_steps,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "euler".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported euler prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = EulerSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
+                    num_steps,
+                    sigma_spacing(cfg)?,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "euler_ancestral".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported euler_ancestral prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = EulerAncestral::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
+                    num_steps,
+                    sigma_spacing(cfg)?,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "dpmpp_2m".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && prediction != "epsilon"
+                {
+                    anyhow::bail!(
+                        "unsupported dpmpp_2m prediction_type '{prediction}' (only 'epsilon')"
+                    );
+                }
+                let sched = Dpmpp2m::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.00085),
+                    cfg.beta_end.unwrap_or(0.012),
+                    cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
+                    num_steps,
+                    sigma_spacing(cfg)?,
+                )?;
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "masked_diffusion".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, _num_steps: usize| {
+                let mask_token_id = cfg
+                    .mask_token_id
+                    .context("masked_diffusion scheduler requires 'mask_token_id'")?;
+                let temperature = cfg.temperature.unwrap_or(0.0);
+                if temperature < 0.0 {
+                    anyhow::bail!("masked_diffusion temperature must be >= 0");
+                }
+                if let Some(block_length) = cfg.block_length
+                    && block_length == 0
+                {
+                    anyhow::bail!("masked_diffusion block_length must be >= 1");
+                }
+                let remasking = match cfg.remasking.as_deref() {
+                    None | Some("low_confidence") => Remasking::LowConfidence,
+                    Some("random") => Remasking::Random,
+                    Some(other) => anyhow::bail!(
+                        "masked_diffusion remasking must be 'low_confidence' or 'random', \
+                         got '{other}'"
+                    ),
+                };
+                Ok(Arc::new(MaskedDiffusion {
+                    mask_token_id,
+                    temperature,
+                    block_length: cfg.block_length,
+                    remasking,
+                    generation_start: Mutex::new(None),
+                }) as Arc<dyn Scheduler>)
+            }),
+        );
+        Self { factories }
+    }
+
+    /// Register (or override) a scheduler kind with a factory.
+    pub fn register(&mut self, kind: impl Into<String>, factory: SchedulerFactory) {
+        self.factories.insert(kind.into(), factory);
+    }
+
+    fn build(&self, spec: &SchedulerSpec, num_steps: usize) -> anyhow::Result<Arc<dyn Scheduler>> {
+        let factory = self.factories.get(&spec.kind).with_context(|| {
+            format!(
+                "unknown scheduler kind '{}' (registered: {:?})",
+                spec.kind,
+                self.factories.keys().collect::<Vec<_>>()
+            )
+        })?;
+        factory(spec, num_steps)
+    }
+}
+
+impl Default for SchedulerRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+/// Masked (discrete) language diffusion with two unmasking strategies, selected
+/// by the scheduler config's `remasking` field.
+///
+/// The loop-carried tensor is an int64 token sequence `[B, S]` (prompt tokens
+/// plus a masked generation region), the denoiser emits `[B, S, V]` logits, and
+/// each step unmasks a growing subset of the still-masked positions until all
+/// are filled by the final step.
+///
+/// **`remasking = "low_confidence"` (default)** — faithful to `ML-GSAI/LLaDA`'s
+/// `generate` (`cfg_scale = 0`):
+///   * the chosen token per position is the argmax of the (optionally
+///     Gumbel-noised) logits (`add_gumbel_noise`; identity at `temperature = 0`);
+///   * the confidence that ranks positions for remasking is the clean-softmax
+///     probability of that chosen token (`remasking = "low_confidence"`);
+///   * each step commits the highest-confidence still-masked positions, split
+///     evenly across steps (`ceil(remaining / remaining_steps)`).
+///
+/// **`remasking = "random"`** — MDLM-style ancestral sampling (Sahoo et al.):
+///   * each still-masked position unmasks *independently* with the schedule
+///     probability `1/(steps_remaining_in_block)` (so the expected unmasked
+///     fraction matches the log-linear absorbing schedule, and the final step
+///     unmasks everything);
+///   * on unmasking, the token is *sampled* from the model's categorical
+///     distribution via the Gumbel-max trick (`temperature = 1.0` is a true
+///     categorical sample; `0` is greedy argmax). The mask token id is never
+///     emitted (SUBS parameterization). This per-position stochastic unmasking
+///     avoids the degenerate repetition confidence-ranked greedy decoding
+///     produces on non-LLaDA checkpoints such as MDLM.
+///
+/// With `block_length` set, the generation region is split into contiguous
+/// left-to-right blocks; the total `num_steps` is divided evenly across the
+/// `num_blocks`, and each step only unmasks tokens inside the current block
+/// (semi-autoregressive remasking). A single block (the default) spans the
+/// whole masked region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remasking {
+    /// LLaDA confidence-ranked commit (default).
+    LowConfidence,
+    /// MDLM-style per-position stochastic ancestral unmasking.
+    Random,
+}
+
+#[derive(Debug)]
+struct MaskedDiffusion {
+    mask_token_id: i64,
+    temperature: f32,
+    block_length: Option<usize>,
+    /// Unmasking strategy (see [`Remasking`]).
+    remasking: Remasking,
+    /// Per-sequence generation-region start (prompt length), captured on the
+    /// first step of a loop and cleared by [`Scheduler::reset`]. This lets the
+    /// semi-autoregressive block boundaries be derived without threading the
+    /// prompt length through the [`Scheduler`] trait.
+    generation_start: Mutex<Option<Vec<usize>>>,
+}
+
+impl MaskedDiffusion {
+    /// Capture each sequence's generation-region start (prompt length) on the
+    /// first use of a loop — the index of its first mask token. Cleared by
+    /// [`Scheduler::reset`]. Called from both `step` and `cfg_uncond_sample`, so
+    /// whichever runs first in a loop iteration records it from the seed.
+    fn ensure_generation_start(&self, tokens: &[i64], batch: usize, sequence_length: usize) {
+        let mut guard = self.generation_start.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let mut starts = Vec::with_capacity(batch);
+        for row_index in 0..batch {
+            let start = row_index * sequence_length;
+            let first_mask = tokens[start..start + sequence_length]
+                .iter()
+                .position(|&token| token == self.mask_token_id)
+                .unwrap_or(sequence_length);
+            starts.push(first_mask);
+        }
+        *guard = Some(starts);
+    }
+
+    /// Argmax token id and its clean-softmax confidence for one logit row.
+    ///
+    /// `gumbel` supplies one uniform sample in `(0, 1)` per vocab entry when
+    /// `temperature > 0`; it is ignored (and may be empty) at `temperature = 0`.
+    fn predict_row(&self, row: &[f32], gumbel: &[f64]) -> (i64, f32) {
+        // Clean-softmax denominator (numerically stable) for the confidence.
+        let max_logit = row.iter().copied().fold(f32::MIN, f32::max);
+        let sum_exp: f32 = row.iter().map(|&x| (x - max_logit).exp()).sum();
+
+        // Chosen token: argmax of the (optionally Gumbel-noised) logits.
+        // LLaDA: logits.exp() / (-log u)^temperature, i.e. argmax of
+        // `logit - temperature * ln(-ln u)`.
+        let mut best_index = 0usize;
+        let mut best_score = f32::MIN;
+        for (j, &logit) in row.iter().enumerate() {
+            let score = if self.temperature > 0.0 {
+                let u = gumbel[j];
+                logit - self.temperature * (-u.ln()).ln() as f32
+            } else {
+                logit
+            };
+            if score > best_score {
+                best_score = score;
+                best_index = j;
+            }
+        }
+        let confidence = (row[best_index] - max_logit).exp() / sum_exp;
+        (best_index as i64, confidence)
+    }
+
+    /// Sample one token from a logit row for MDLM-style ancestral unmasking.
+    ///
+    /// Uses the Gumbel-max trick so `temperature = 1.0` draws a true categorical
+    /// sample from `softmax(logits)`, while `temperature = 0` is greedy argmax
+    /// (matching [`predict_row`]'s token choice). The mask token id is excluded
+    /// (SUBS parameterization: an unmasked position is never re-set to mask).
+    fn sample_token(&self, row: &[f32], step: usize, position: usize, vocab: usize) -> i64 {
+        let gumbel = if self.temperature > 0.0 {
+            gumbel_uniforms(step, position, vocab)
+        } else {
+            Vec::new()
+        };
+        let mut best_index: Option<usize> = None;
+        let mut best_score = f32::MIN;
+        for (j, &logit) in row.iter().enumerate() {
+            if j as i64 == self.mask_token_id {
                 continue;
             }
-            match component_phase(spec, &component, &decoder) {
-                PhaseRunOn::PromptOnly => prompt_components.push(component),
-                PhaseRunOn::EveryStep | PhaseRunOn::OnDemand | PhaseRunOn::FinalOnly => {}
-                PhaseRunOn::Other(value) => {
-                    anyhow::bail!(
-                        "unsupported phase '{value}' for pipeline component '{component}'"
-                    )
+            let score = if self.temperature > 0.0 {
+                logit - self.temperature * (-gumbel[j].ln()).ln() as f32
+            } else {
+                logit
+            };
+            if best_index.is_none() || score > best_score {
+                best_score = score;
+                best_index = Some(j);
+            }
+        }
+        best_index.unwrap_or(0) as i64
+    }
+}
+
+impl Scheduler for MaskedDiffusion {
+    fn reset(&self) {
+        *self.generation_start.lock().unwrap() = None;
+    }
+
+    /// LLaDA unconditional pass: re-mask the prompt tokens of the current
+    /// sequence (`un_x[prompt] = mask_id`), leaving the generation region as-is.
+    fn cfg_uncond_sample(&self, sample: &Value) -> anyhow::Result<Option<Value>> {
+        let shape = sample.shape().to_vec();
+        let tokens = sample.to_vec_i64()?;
+        let count = tokens.len();
+        let sequence_length = *shape.last().unwrap_or(&(count as i64)) as usize;
+        if sequence_length == 0 {
+            return Ok(None);
+        }
+        let batch = count.checked_div(sequence_length).unwrap_or(0).max(1);
+        self.ensure_generation_start(&tokens, batch, sequence_length);
+        let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
+
+        let mut output = tokens;
+        for (row_index, &prompt_length) in generation_start.iter().enumerate() {
+            let row_start = row_index * sequence_length;
+            for offset in 0..prompt_length.min(sequence_length) {
+                output[row_start + offset] = self.mask_token_id;
+            }
+        }
+        Value::from_slice_i64(&output, &shape).map(Some).map_err(Into::into)
+    }
+
+    fn step(
+        &self,
+        step: usize,
+        num_steps: usize,
+        tokens: &Value,
+        logits: &Value,
+    ) -> anyhow::Result<Value> {
+        let token_shape = tokens.shape().to_vec();
+        let tokens = tokens.to_vec_i64()?;
+        let sequence_count = tokens.len();
+        let logit_shape = logits.shape();
+        let vocab = *logit_shape
+            .last()
+            .context("masked_diffusion logits must be rank >= 1")? as usize;
+        if vocab == 0 || sequence_count == 0 || logits.numel() != sequence_count * vocab {
+            anyhow::bail!(
+                "masked_diffusion shape mismatch: tokens {token_shape:?}, logits {logit_shape:?}"
+            );
+        }
+        // Split the flat token buffer into per-sequence rows so top-k selection
+        // and the transfer schedule are computed independently per sequence
+        // (matching LLaDA's per-batch-row `topk`). Rank-1 inputs are one row.
+        let sequence_length = *token_shape.last().unwrap_or(&(sequence_count as i64)) as usize;
+        let batch = sequence_count.checked_div(sequence_length).unwrap_or(0).max(1);
+
+        // Capture each sequence's generation-region start on the first step.
+        self.ensure_generation_start(&tokens, batch, sequence_length);
+        let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
+
+        let all_logits = logits.to_vec_f32()?;
+        let mut output = tokens.clone();
+
+        for (row_index, &prompt_length) in generation_start.iter().enumerate() {
+            let row_start = row_index * sequence_length;
+            let generation_length = sequence_length.saturating_sub(prompt_length);
+            if generation_length == 0 {
+                continue;
+            }
+            let block_length = self
+                .block_length
+                .unwrap_or(generation_length)
+                .min(generation_length)
+                .max(1);
+            if !generation_length.is_multiple_of(block_length) {
+                anyhow::bail!(
+                    "masked_diffusion: generation length {generation_length} is not divisible \
+                     by block_length {block_length}"
+                );
+            }
+            let num_blocks = generation_length / block_length;
+            if !num_steps.is_multiple_of(num_blocks) {
+                anyhow::bail!(
+                    "masked_diffusion: num_steps {num_steps} is not divisible by num_blocks \
+                     {num_blocks} (generation_length {generation_length} / block_length \
+                     {block_length})"
+                );
+            }
+            let steps_per_block = num_steps / num_blocks;
+            let block_index = (step / steps_per_block).min(num_blocks - 1);
+            let step_in_block = step % steps_per_block;
+            let block_start = prompt_length + block_index * block_length;
+            let block_end = (block_start + block_length).min(sequence_length);
+            let remaining_steps_in_block = steps_per_block - step_in_block;
+
+            match self.remasking {
+                Remasking::LowConfidence => {
+                    // Predicted token + confidence for every still-masked position
+                    // inside the current block (only these are candidates).
+                    let mut candidates: Vec<(usize, i64, f32)> = Vec::new();
+                    for offset in block_start..block_end {
+                        let position = row_start + offset;
+                        if tokens[position] != self.mask_token_id {
+                            continue;
+                        }
+                        let logit_row = &all_logits[position * vocab..(position + 1) * vocab];
+                        let gumbel = if self.temperature > 0.0 {
+                            gumbel_uniforms(step, position, vocab)
+                        } else {
+                            Vec::new()
+                        };
+                        let (predicted, confidence) = self.predict_row(logit_row, &gumbel);
+                        candidates.push((position, predicted, confidence));
+                    }
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    // Commit the highest-confidence subset for this block-step. The
+                    // even split of the block's masked count across its remaining
+                    // steps equals ceil(remaining / remaining_steps_in_block).
+                    candidates
+                        .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    let commit = candidates.len().div_ceil(remaining_steps_in_block);
+                    for &(position, predicted, _) in candidates.iter().take(commit) {
+                        output[position] = predicted;
+                    }
+                }
+                Remasking::Random => {
+                    // MDLM ancestral update: each still-masked position in the block
+                    // unmasks independently with probability 1/(steps remaining), so
+                    // the expected unmasked fraction follows the log-linear schedule
+                    // and the block's final step unmasks everything. The token is
+                    // sampled from the model's categorical distribution.
+                    let last_step_in_block = remaining_steps_in_block <= 1;
+                    let unmask_prob = 1.0f64 / remaining_steps_in_block as f64;
+                    for offset in block_start..block_end {
+                        let position = row_start + offset;
+                        if tokens[position] != self.mask_token_id {
+                            continue;
+                        }
+                        if last_step_in_block || unmask_uniform(step, position) < unmask_prob {
+                            let logit_row =
+                                &all_logits[position * vocab..(position + 1) * vocab];
+                            output[position] = self.sample_token(logit_row, step, position, vocab);
+                        }
+                    }
                 }
             }
         }
+        Value::from_slice_i64(&output, &token_shape).map_err(Into::into)
+    }
+}
 
+/// One uniform sample in `(0, 1)` per vocab entry for Gumbel-max sampling,
+/// seeded deterministically from `(step, position)` so a run is reproducible.
+///
+/// Note: this is reproducible across onnx-genai runs but is NOT bit-identical to
+/// LLaDA's `torch.rand`-based sampling; parity tests exercise `temperature = 0`.
+fn gumbel_uniforms(step: usize, position: usize, vocab: usize) -> Vec<f64> {
+    use rand::{Rng, SeedableRng};
+    let seed = (step as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(position as u64);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    (0..vocab)
+        // Clamp away from 0 and 1 to keep -ln(-ln u) finite.
+        .map(|_| rng.random::<f64>().clamp(1e-9, 1.0 - 1e-9))
+        .collect()
+}
+
+/// One uniform sample in `[0, 1)` per `(step, position)` for the MDLM ancestral
+/// per-position unmask decision, seeded deterministically (so a run is
+/// reproducible) but with a distinct mix from [`gumbel_uniforms`] so the unmask
+/// decision is independent of the token-sampling noise at the same position.
+fn unmask_uniform(step: usize, position: usize) -> f64 {
+    use rand::{Rng, SeedableRng};
+    let seed = (step as u64)
+        .wrapping_mul(0x2545_F491_4F6C_DD1D)
+        .wrapping_add((position as u64).wrapping_mul(0xD1B5_4A32_D192_ED03))
+        .wrapping_add(0xA0761_D6478_BD642F);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    rng.random::<f64>()
+}
+
+/// DDIM (η = 0, epsilon-prediction) noise schedule, precomputed per inference
+/// step as `(alpha_cumprod_t, alpha_cumprod_prev)`.
+///
+/// Diffusion-standard update for a model that predicts noise `eps`:
+///   `x0_hat = (x_t - sqrt(1 - a_t) * eps) / sqrt(a_t)`
+///   `x_prev = sqrt(a_prev) * x0_hat + sqrt(1 - a_prev) * eps`
+#[derive(Debug, Clone)]
+struct DdimSchedule {
+    steps: Vec<(f32, f32)>,
+    timesteps: Vec<f32>,
+}
+
+impl DdimSchedule {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+    ) -> anyhow::Result<Self> {
+        if num_train_timesteps < 2 {
+            anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+        }
+        if num_steps == 0 || num_steps > num_train_timesteps {
+            anyhow::bail!(
+                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
+            );
+        }
+        // Beta schedule -> cumulative product of alphas.
+        //   linear:        beta_i = lerp(beta_start, beta_end)
+        //   scaled_linear: beta_i = lerp(sqrt(beta_start), sqrt(beta_end))^2  (Stable Diffusion)
+        let denom = (num_train_timesteps - 1) as f32;
+        let (lo, hi, square) = match beta_schedule {
+            "linear" => (beta_start, beta_end, false),
+            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+            other => anyhow::bail!(
+                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+            ),
+        };
+        let mut alpha_cumprod = Vec::with_capacity(num_train_timesteps);
+        let mut prod = 1.0f32;
+        for i in 0..num_train_timesteps {
+            let mut beta = lo + (hi - lo) * (i as f32) / denom;
+            if square {
+                beta *= beta;
+            }
+            prod *= 1.0 - beta;
+            alpha_cumprod.push(prod);
+        }
+        // Evenly spaced inference timesteps, descending (diffusers convention).
+        let step_ratio = num_train_timesteps / num_steps;
+        let ascending: Vec<usize> = (0..num_steps).map(|i| i * step_ratio).collect();
+        let mut steps = Vec::with_capacity(num_steps);
+        let mut timesteps = Vec::with_capacity(num_steps);
+        for k in 0..num_steps {
+            let t = ascending[num_steps - 1 - k];
+            timesteps.push(t as f32);
+            let a_t = alpha_cumprod[t];
+            let a_prev = if k + 1 < num_steps {
+                alpha_cumprod[ascending[num_steps - 1 - (k + 1)]]
+            } else {
+                1.0
+            };
+            steps.push((a_t, a_prev));
+        }
+        Ok(Self { steps, timesteps })
+    }
+
+    /// Apply one DDIM step to `sample` given the model's noise prediction `eps`.
+    fn step(&self, k: usize, sample: &[f32], eps: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if sample.len() != eps.len() {
+            anyhow::bail!(
+                "scheduler sample/eps length mismatch: {} vs {}",
+                sample.len(),
+                eps.len()
+            );
+        }
+        let (a_t, a_prev) = self.steps[k];
+        let sqrt_a_t = a_t.sqrt();
+        let sqrt_one_minus_a_t = (1.0 - a_t).sqrt();
+        let sqrt_a_prev = a_prev.sqrt();
+        let sqrt_one_minus_a_prev = (1.0 - a_prev).sqrt();
+        Ok(sample
+            .iter()
+            .zip(eps)
+            .map(|(&x, &e)| {
+                let x0_hat = (x - sqrt_one_minus_a_t * e) / sqrt_a_t;
+                sqrt_a_prev * x0_hat + sqrt_one_minus_a_prev * e
+            })
+            .collect())
+    }
+}
+
+impl Scheduler for DdimSchedule {
+    fn step(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let stepped =
+            DdimSchedule::step(self, step, &sample.to_vec_f32_lossy()?, &model_output.to_vec_f32_lossy()?)?;
+        Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
+    }
+}
+
+/// Euler (`EulerDiscreteScheduler`, epsilon prediction) — a sigma-space
+/// scheduler. Unlike DDIM it rescales the loop-carried sample before the
+/// denoiser (`x / sqrt(sigma^2 + 1)`), then advances the *raw* sample along the
+/// noise derivative: `x_next = x + eps * (sigma_next - sigma)`. Matches diffusers
+/// `EulerDiscreteScheduler(timestep_spacing="linspace", interpolation_type="linear")`.
+/// The initial seed must be pre-scaled by `init_noise_sigma` (= `sigmas[0]`).
+#[derive(Debug, Clone)]
+struct EulerSchedule {
+    /// Inference sigmas, descending, with a trailing `0.0`. Length `num_steps + 1`.
+    sigmas: Vec<f32>,
+    /// Per-step denoiser timesteps (fractional), length `num_steps`.
+    timesteps: Vec<f32>,
+}
+
+impl EulerSchedule {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+        spacing: &str,
+    ) -> anyhow::Result<Self> {
+        if num_train_timesteps < 2 {
+            anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+        }
+        if num_steps == 0 || num_steps > num_train_timesteps {
+            anyhow::bail!(
+                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
+            );
+        }
+        if let Some(sigmas) =
+            spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
+        {
+            let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+            let timesteps = sigmas[..num_steps].iter().map(|&s| sigma_to_t(&train, s)).collect();
+            return Ok(Self { sigmas, timesteps });
+        }
+        let denom = (num_train_timesteps - 1) as f32;
+        let (lo, hi, square) = match beta_schedule {
+            "linear" => (beta_start, beta_end, false),
+            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+            other => anyhow::bail!(
+                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+            ),
+        };
+        // Training sigmas: sigma_i = sqrt((1 - alpha_cumprod_i) / alpha_cumprod_i).
+        let mut train_sigmas = Vec::with_capacity(num_train_timesteps);
+        let mut prod = 1.0f32;
+        for i in 0..num_train_timesteps {
+            let mut beta = lo + (hi - lo) * (i as f32) / denom;
+            if square {
+                beta *= beta;
+            }
+            prod *= 1.0 - beta;
+            train_sigmas.push(((1.0 - prod) / prod).sqrt());
+        }
+        // "linspace" timesteps: evenly spaced over [0, N-1], taken descending,
+        // with sigmas linearly interpolated at each (fractional) timestep.
+        let ts_denom = if num_steps > 1 { (num_steps - 1) as f32 } else { 1.0 };
+        let interp = |t: f32| -> f32 {
+            let low = t.floor().max(0.0) as usize;
+            let high = (low + 1).min(num_train_timesteps - 1);
+            let frac = t - low as f32;
+            train_sigmas[low] * (1.0 - frac) + train_sigmas[high] * frac
+        };
+        let mut sigmas = Vec::with_capacity(num_steps + 1);
+        let mut timesteps = Vec::with_capacity(num_steps);
+        for k in 0..num_steps {
+            let idx = num_steps - 1 - k;
+            let t = idx as f32 * denom / ts_denom;
+            timesteps.push(t);
+            sigmas.push(interp(t));
+        }
+        sigmas.push(0.0);
+        Ok(Self { sigmas, timesteps })
+    }
+
+    /// `x / sqrt(sigma^2 + 1)` — scale the raw sample for the denoiser input.
+    fn scale(&self, step: usize, sample: &[f32]) -> Vec<f32> {
+        let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
+        sample.iter().map(|&x| x / factor).collect()
+    }
+
+    /// `x_next = x + eps * (sigma_next - sigma)` on the raw sample.
+    fn step_vec(&self, step: usize, sample: &[f32], eps: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if sample.len() != eps.len() {
+            anyhow::bail!(
+                "scheduler sample/eps length mismatch: {} vs {}",
+                sample.len(),
+                eps.len()
+            );
+        }
+        let dt = self.sigmas[step + 1] - self.sigmas[step];
+        Ok(sample.iter().zip(eps).map(|(&x, &e)| x + e * dt).collect())
+    }
+}
+
+impl Scheduler for EulerSchedule {
+    fn step(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let stepped = self.step_vec(
+            step,
+            &sample.to_vec_f32_lossy()?,
+            &model_output.to_vec_f32_lossy()?,
+        )?;
+        Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
+    }
+
+    fn scale_input(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+    ) -> anyhow::Result<Option<Value>> {
+        let shape = sample.shape().to_vec();
+        let scaled = self.scale(step, &sample.to_vec_f32_lossy()?);
+        Ok(Some(Value::from_slice_f32(&scaled, &shape)?))
+    }
+
+    fn init_noise_sigma(&self) -> f32 {
+        self.sigmas[0]
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
+    }
+}
+
+/// Euler Ancestral (`EulerAncestralDiscreteScheduler`, epsilon) — a *stochastic*
+/// sampler (one of the most-used in ComfyUI). Like Euler it scales the model
+/// input and seeds at `sigmas[0]`, but each step advances to an intermediate
+/// `sigma_down` and injects fresh noise scaled by `sigma_up`:
+///   `sigma_up   = sqrt(sigma_to^2 (sigma_from^2 - sigma_to^2) / sigma_from^2)`
+///   `sigma_down = sqrt(sigma_to^2 - sigma_up^2)`
+///   `x_next = x + eps*(sigma_down - sigma) + noise*sigma_up`.
+/// Matches diffusers when fed the same per-step noise sequence.
+#[derive(Debug, Clone)]
+struct EulerAncestral {
+    sigmas: Vec<f32>,
+    timesteps: Vec<f32>,
+}
+
+impl EulerAncestral {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+        spacing: &str,
+    ) -> anyhow::Result<Self> {
+        // Same sigma schedule as Euler (linspace interp / Karras / exponential).
+        let euler = EulerSchedule::with_schedule(
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule,
+            num_steps,
+            spacing,
+        )?;
+        Ok(Self { sigmas: euler.sigmas, timesteps: euler.timesteps })
+    }
+}
+
+impl Scheduler for EulerAncestral {
+    fn step(
+        &self,
+        _step: usize,
+        _num_steps: usize,
+        _sample: &Value,
+        _model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        anyhow::bail!("euler_ancestral is stochastic; the loop must call step_with_noise")
+    }
+
+    fn needs_noise(&self) -> bool {
+        true
+    }
+
+    fn step_with_noise(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+        noise: Option<&Value>,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let x = sample.to_vec_f32_lossy()?;
+        let eps = model_output.to_vec_f32_lossy()?;
+        let sigma_from = self.sigmas[step];
+        let sigma_to = self.sigmas[step + 1];
+        let sigma_up = (sigma_to * sigma_to * (sigma_from * sigma_from - sigma_to * sigma_to)
+            / (sigma_from * sigma_from))
+            .max(0.0)
+            .sqrt();
+        let sigma_down = (sigma_to * sigma_to - sigma_up * sigma_up).max(0.0).sqrt();
+        let dt = sigma_down - sigma_from;
+        let noise = noise.context("euler_ancestral requires per-step noise")?.to_vec_f32_lossy()?;
+        if noise.len() != x.len() {
+            anyhow::bail!("euler_ancestral noise length {} != sample {}", noise.len(), x.len());
+        }
+        let out: Vec<f32> = (0..x.len())
+            .map(|i| x[i] + eps[i] * dt + noise[i] * sigma_up)
+            .collect();
+        Value::from_slice_f32(&out, &shape).map_err(Into::into)
+    }
+
+    fn scale_input(
+        &self,
+        step: usize,
+        _num_steps: usize,
+        sample: &Value,
+    ) -> anyhow::Result<Option<Value>> {
+        let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
+        let scaled: Vec<f32> = sample.to_vec_f32_lossy()?.iter().map(|&x| x / factor).collect();
+        Ok(Some(Value::from_slice_f32(&scaled, sample.shape())?))
+    }
+
+    fn init_noise_sigma(&self) -> f32 {
+        self.sigmas[0]
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
+    }
+}
+
+/// DPM-Solver++ (2M) — a fast *multistep* deterministic scheduler and the default
+/// sampler in most Stable Diffusion / ComfyUI workflows. Order-2 in log-SNR (λ)
+/// space using the previous step's data prediction (`x0`), with a first-order step
+/// at the start and a first-order final step (when `<15` steps or the final sigma
+/// is zero, matching diffusers `final_sigmas_type="zero"`). Matches diffusers
+/// `DPMSolverMultistepScheduler(algorithm_type="dpmsolver++", solver_type="midpoint")`.
+/// Unlike Euler it does NOT scale the model input (`scale_model_input` is identity)
+/// and its `init_noise_sigma` is 1.0 (the seed is unscaled).
+#[derive(Debug)]
+struct Dpmpp2m {
+    /// Inference sigmas, descending, with a trailing `0.0`. Length `num_steps + 1`.
+    sigmas: Vec<f32>,
+    /// Per-step denoiser timesteps, length `num_steps`.
+    timesteps: Vec<f32>,
+    /// Previous step's data prediction (`x0`) for the multistep update. Reset at
+    /// step 0 of each denoise loop; interior-mutable so `step` keeps `&self`.
+    prev_x0: Mutex<Option<Vec<f32>>>,
+}
+
+impl Dpmpp2m {
+    fn with_schedule(
+        num_train_timesteps: usize,
+        beta_start: f32,
+        beta_end: f32,
+        beta_schedule: &str,
+        num_steps: usize,
+        spacing: &str,
+    ) -> anyhow::Result<Self> {
+        if num_train_timesteps < 2 {
+            anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+        }
+        if num_steps == 0 || num_steps > num_train_timesteps {
+            anyhow::bail!(
+                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
+            );
+        }
+        if let Some(sigmas) =
+            spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
+        {
+            let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+            let timesteps = sigmas[..num_steps].iter().map(|&s| sigma_to_t(&train, s)).collect();
+            return Ok(Self {
+                sigmas,
+                timesteps,
+                prev_x0: Mutex::new(None),
+            });
+        }
+        let denom = (num_train_timesteps - 1) as f32;
+        let (lo, hi, square) = match beta_schedule {
+            "linear" => (beta_start, beta_end, false),
+            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+            other => anyhow::bail!(
+                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+            ),
+        };
+        let mut train = Vec::with_capacity(num_train_timesteps);
+        let mut prod = 1.0f32;
+        for i in 0..num_train_timesteps {
+            let mut beta = lo + (hi - lo) * (i as f32) / denom;
+            if square {
+                beta *= beta;
+            }
+            prod *= 1.0 - beta;
+            train.push(((1.0 - prod) / prod).sqrt());
+        }
+        // Timesteps: linspace(0, num_train-1, num_steps+1) rounded to int, reversed,
+        // drop the last (the 0). Sigmas interpolate at those integer timesteps
+        // (integer => exact lookup). Trailing 0 for final_sigmas_type="zero".
+        let mut ts_int: Vec<usize> = (0..=num_steps)
+            .map(|j| (j as f32 * denom / num_steps as f32).round_ties_even() as usize)
+            .collect();
+        ts_int.reverse();
+        ts_int.pop();
+        let timesteps: Vec<f32> = ts_int.iter().map(|&t| t as f32).collect();
+        let mut sigmas: Vec<f32> = ts_int
+            .iter()
+            .map(|&t| train[t.min(num_train_timesteps - 1)])
+            .collect();
+        sigmas.push(0.0);
         Ok(Self {
+            sigmas,
+            timesteps,
+            prev_x0: Mutex::new(None),
+        })
+    }
+}
+
+/// `alpha_t = 1/sqrt(sigma^2+1)`, `sigma_t = sigma * alpha_t` (diffusers convention).
+fn dpm_alpha_sigma(sigma: f32) -> (f32, f32) {
+    let alpha_t = 1.0 / (sigma * sigma + 1.0).sqrt();
+    (alpha_t, sigma * alpha_t)
+}
+
+/// Training sigmas `((1-alpha_cumprod)/alpha_cumprod)^0.5` over the beta schedule.
+fn training_sigmas(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let denom = (num_train_timesteps - 1) as f32;
+    let (lo, hi, square) = match beta_schedule {
+        "linear" => (beta_start, beta_end, false),
+        "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
+        other => anyhow::bail!(
+            "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
+        ),
+    };
+    let mut out = Vec::with_capacity(num_train_timesteps);
+    let mut prod = 1.0f32;
+    for i in 0..num_train_timesteps {
+        let mut beta = lo + (hi - lo) * (i as f32) / denom;
+        if square {
+            beta *= beta;
+        }
+        prod *= 1.0 - beta;
+        out.push(((1.0 - prod) / prod).sqrt());
+    }
+    Ok(out)
+}
+
+/// Interpolate a diffusion timestep from a sigma, matching diffusers
+/// `SchedulerMixin._sigma_to_t`. `train` holds the ascending training sigmas
+/// (index = training timestep). Finds the bracketing training sigmas in log space
+/// and linearly interpolates the (fractional) timestep. Used to recover the
+/// denoiser timesteps for sigma-space schedules (Karras / exponential) where the
+/// timesteps are not the sigma indices.
+fn sigma_to_t(train: &[f32], sigma: f32) -> f32 {
+    let log_sigma = sigma.max(1e-10).ln();
+    let count = train.iter().filter(|&&s| s.max(1e-10).ln() <= log_sigma).count();
+    let low_idx = count.saturating_sub(1).min(train.len().saturating_sub(2));
+    let high_idx = low_idx + 1;
+    let low = train[low_idx].max(1e-10).ln();
+    let high = train[high_idx].max(1e-10).ln();
+    let weight = ((low - log_sigma) / (low - high)).clamp(0.0, 1.0);
+    (1.0 - weight) * low_idx as f32 + weight * high_idx as f32
+}
+
+/// Karras (rho=7) sigma schedule from the training sigma range, descending, with
+/// a trailing `0.0`. Length `num_steps + 1`. Matches diffusers `_convert_to_karras`
+/// (identical for Euler and DPM++ since both derive min/max from the full range).
+fn karras_sigmas(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+    num_steps: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const RHO: f32 = 7.0;
+    let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+    let sigma_min = train[0];
+    let sigma_max = train[num_train_timesteps - 1];
+    let min_inv = sigma_min.powf(1.0 / RHO);
+    let max_inv = sigma_max.powf(1.0 / RHO);
+    let mut sigmas = Vec::with_capacity(num_steps + 1);
+    for k in 0..num_steps {
+        let ramp = if num_steps > 1 {
+            k as f32 / (num_steps - 1) as f32
+        } else {
+            0.0
+        };
+        sigmas.push((max_inv + ramp * (min_inv - max_inv)).powf(RHO));
+    }
+    sigmas.push(0.0);
+    Ok(sigmas)
+}
+
+/// Exponential sigma schedule: `exp(linspace(log(sigma_max), log(sigma_min), n))`,
+/// descending, trailing `0.0`. Same training-sigma min/max as Karras. Matches
+/// diffusers `_convert_to_exponential`.
+fn exponential_sigmas(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+    num_steps: usize,
+) -> anyhow::Result<Vec<f32>> {
+    let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
+    let log_min = train[0].ln();
+    let log_max = train[num_train_timesteps - 1].ln();
+    let mut sigmas = Vec::with_capacity(num_steps + 1);
+    for k in 0..num_steps {
+        let ramp = if num_steps > 1 {
+            k as f32 / (num_steps - 1) as f32
+        } else {
+            0.0
+        };
+        sigmas.push((log_max + ramp * (log_min - log_max)).exp());
+    }
+    sigmas.push(0.0);
+    Ok(sigmas)
+}
+
+/// Select the sigma schedule the spec requests: `"karras"`, `"exponential"`, or
+/// the default `"linspace"`. Rejects the conflicting case where both Karras and
+/// exponential are requested.
+fn sigma_spacing(cfg: &SchedulerSpec) -> anyhow::Result<&'static str> {
+    let karras = cfg.use_karras_sigmas.unwrap_or(false);
+    let exponential = cfg.use_exponential_sigmas.unwrap_or(false);
+    if karras && exponential {
+        anyhow::bail!(
+            "scheduler cannot set both use_karras_sigmas and use_exponential_sigmas"
+        );
+    }
+    Ok(if karras {
+        "karras"
+    } else if exponential {
+        "exponential"
+    } else {
+        "linspace"
+    })
+}
+
+/// Precomputed sigmas for a non-linspace spacing (`karras`/`exponential`), or
+/// `None` for the default `linspace` (which each scheduler builds itself).
+fn spacing_sigmas(
+    spacing: &str,
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+    num_steps: usize,
+) -> anyhow::Result<Option<Vec<f32>>> {
+    match spacing {
+        "karras" => Ok(Some(karras_sigmas(
+            num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps,
+        )?)),
+        "exponential" => Ok(Some(exponential_sigmas(
+            num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps,
+        )?)),
+        "linspace" | "" => Ok(None),
+        other => anyhow::bail!("unsupported sigma spacing '{other}' (karras/exponential/linspace)"),
+    }
+}
+
+impl Scheduler for Dpmpp2m {
+    fn step(
+        &self,
+        step: usize,
+        num_steps: usize,
+        sample: &Value,
+        model_output: &Value,
+    ) -> anyhow::Result<Value> {
+        let shape = sample.shape().to_vec();
+        let x = sample.to_vec_f32_lossy()?;
+        let eps = model_output.to_vec_f32_lossy()?;
+        if x.len() != eps.len() {
+            anyhow::bail!("dpm++ sample/eps length mismatch: {} vs {}", x.len(), eps.len());
+        }
+
+        let sigma = self.sigmas[step];
+        let (alpha_t0, sigma_t0) = dpm_alpha_sigma(sigma);
+        // Data prediction (x0) from the epsilon output: (x - sigma_t*eps)/alpha_t.
+        let x0: Vec<f32> = x
+            .iter()
+            .zip(&eps)
+            .map(|(&xi, &ei)| (xi - sigma_t0 * ei) / alpha_t0)
+            .collect();
+
+        let s_next = self.sigmas[step + 1];
+        let (a_t, sig_t) = dpm_alpha_sigma(s_next);
+        let (a_s0, sig_s0) = dpm_alpha_sigma(sigma);
+        let lam_t = a_t.ln() - sig_t.ln(); // +inf at the final step (sig_t == 0)
+        let lam_s0 = a_s0.ln() - sig_s0.ln();
+        let h = lam_t - lam_s0;
+        let neg_expm1 = (-h).exp() - 1.0; // exp(-h) - 1  (== -1 at the final step)
+
+        let mut prev = self
+            .prev_x0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("dpm++ scheduler state poisoned"))?;
+        // Match diffusers `DPMSolverMultistepScheduler`: the final step drops to
+        // the first-order update when `lower_order_final` applies. diffusers sets
+        // that at the last step whenever `num_steps < 15` OR the final sigma is
+        // zero (`final_sigmas_type="zero"`, the default this schedule uses). The
+        // second-order update divides by the log-SNR step `h`, which is infinite
+        // when the final sigma is zero — so skipping it there also avoids the
+        // resulting non-finite latent.
+        let lower_order_final = step + 1 == num_steps && (num_steps < 15 || s_next <= 0.0);
+        // First step of the loop (prev cleared by reset) or the low-order final
+        // step both use the first-order update.
+        let first_order = lower_order_final || prev.is_none();
+
+        let out: Vec<f32> = if first_order {
+            x.iter()
+                .zip(&x0)
+                .map(|(&xi, &d0)| (sig_t / sig_s0) * xi - a_t * neg_expm1 * d0)
+                .collect()
+        } else {
+            let prev_x0 = prev.as_ref().unwrap();
+            let s_prev = self.sigmas[step - 1];
+            let (a_s1, sig_s1) = dpm_alpha_sigma(s_prev);
+            let lam_s1 = a_s1.ln() - sig_s1.ln();
+            let h0 = lam_s0 - lam_s1;
+            let r0 = h0 / h;
+            x.iter()
+                .enumerate()
+                .map(|(i, &xi)| {
+                    let d0 = x0[i];
+                    let d1 = (1.0 / r0) * (x0[i] - prev_x0[i]);
+                    (sig_t / sig_s0) * xi - a_t * neg_expm1 * d0 - 0.5 * a_t * neg_expm1 * d1
+                })
+                .collect()
+        };
+        *prev = Some(x0);
+        drop(prev);
+        Value::from_slice_f32(&out, &shape).map_err(Into::into)
+    }
+
+    fn reset(&self) {
+        if let Ok(mut prev) = self.prev_x0.lock() {
+            *prev = None;
+        }
+    }
+
+    fn timesteps(&self) -> Option<Vec<f32>> {
+        Some(self.timesteps.clone())
+    }
+}
+
+impl PipelinePlan {
+    fn from_spec(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
+        // A composite whose stages contain an autoregressive decoder is treated
+        // as an autoregressive text pipeline (unchanged legacy behavior). Pure
+        // iterative / single-pass composites are a follow-up.
+        if let Some(decoder) = autoregressive_decoder(&spec.strategy) {
+            return Self::autoregressive(spec, decoder);
+        }
+        match spec.strategy.kind {
+            PipelineStrategyKind::SinglePass => Self::single_pass(spec),
+            PipelineStrategyKind::Iterative => Self::iterative(spec, schedulers),
+            PipelineStrategyKind::Composite => anyhow::bail!(
+                "composite pipeline strategy without an autoregressive decoder is not yet \
+                 supported"
+            ),
+            PipelineStrategyKind::Autoregressive => {
+                anyhow::bail!("autoregressive strategy is missing its 'decoder' component")
+            }
+            PipelineStrategyKind::Other(ref value) => {
+                anyhow::bail!("unsupported pipeline strategy kind '{value}'")
+            }
+        }
+    }
+
+    fn autoregressive(spec: &PipelineSpec, decoder: String) -> anyhow::Result<Self> {
+        if !spec.models.contains_key(&decoder) {
+            anyhow::bail!("pipeline decoder '{decoder}' is not declared in models");
+        }
+        let prompt_components = prompt_phase_components(spec, &decoder)?;
+        Ok(Self::Autoregressive(AutoregressivePlan {
             decoder,
             prompt_components,
             dataflow: spec.dataflow.clone(),
-        })
+        }))
+    }
+
+    fn single_pass(spec: &PipelineSpec) -> anyhow::Result<Self> {
+        let model = spec
+            .strategy
+            .model
+            .clone()
+            .context("single_pass strategy is missing its 'model' component")?;
+        if !spec.models.contains_key(&model) {
+            anyhow::bail!("pipeline model '{model}' is not declared in models");
+        }
+        // Single-pass has no loop and no final stage, so `every_step` and
+        // `final_only` components would be silently dropped — reject them.
+        let mut prompt_components = Vec::new();
+        for component in topological_components(spec)? {
+            if component == model {
+                continue;
+            }
+            match component_phase(spec, &component, &model) {
+                PhaseRunOn::PromptOnly => prompt_components.push(component),
+                PhaseRunOn::OnDemand => {}
+                PhaseRunOn::EveryStep | PhaseRunOn::FinalOnly => anyhow::bail!(
+                    "component '{component}' declares a run_on phase unsupported by a single_pass \
+                     pipeline (only prompt_only / on_demand components are allowed)"
+                ),
+                PhaseRunOn::Other(value) => anyhow::bail!(
+                    "unsupported phase '{value}' for pipeline component '{component}'"
+                ),
+            }
+        }
+        Ok(Self::SinglePass(SinglePassPlan {
+            model,
+            prompt_components,
+            dataflow: spec.dataflow.clone(),
+        }))
+    }
+
+    fn iterative(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
+        let denoiser = spec
+            .strategy
+            .denoiser
+            .clone()
+            .context("iterative strategy is missing its 'denoiser' component")?;
+        if !spec.models.contains_key(&denoiser) {
+            anyhow::bail!("pipeline denoiser '{denoiser}' is not declared in models");
+        }
+        let num_steps = spec
+            .strategy
+            .num_steps
+            .context("iterative strategy is missing 'num_steps'")?;
+        if num_steps == 0 {
+            anyhow::bail!("iterative strategy 'num_steps' must be greater than zero");
+        }
+        let start_step = spec.strategy.start_step.unwrap_or(0);
+        if start_step >= num_steps {
+            anyhow::bail!(
+                "iterative strategy 'start_step' ({start_step}) must be less than 'num_steps' ({num_steps})"
+            );
+        }
+
+        // Classifier-free guidance normally requires a declared conditioning
+        // input to zero on the unconditional pass. Discrete language diffusion
+        // (`masked_diffusion`) is the exception: its unconditional pass re-masks
+        // the prompt of the loop-carried sample (via `Scheduler::cfg_uncond_sample`),
+        // so it needs no conditioning port.
+        let guidance_active = spec.strategy.guidance_scale.is_some_and(|s| s != 1.0);
+        let scheduler_supplies_uncond = spec
+            .strategy
+            .scheduler_config
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.kind == "masked_diffusion");
+        if guidance_active
+            && spec.strategy.cfg_conditioning_input.is_none()
+            && !scheduler_supplies_uncond
+        {
+            anyhow::bail!(
+                "classifier-free guidance (guidance_scale != 1.0) requires \
+                 'cfg_conditioning_input' naming the denoiser conditioning port to zero on the \
+                 unconditional pass"
+            );
+        }
+
+        // Loop-carried edges are the denoiser's self-referential dataflow edges.
+        let mut loop_edges = Vec::new();
+        for edge in &spec.dataflow {
+            let (from_component, from_port) = parse_endpoint(&edge.from)?;
+            let (to_component, to_port) = parse_endpoint(&edge.to)?;
+            if from_component == denoiser && to_component == denoiser {
+                loop_edges.push((from_port.to_string(), to_port.to_string()));
+            }
+        }
+
+        // The CFG conditioning port and the loop-carried sample port must be
+        // distinct: on the unconditional pass the conditioning is replaced, and
+        // a scheduler (e.g. Euler) may also override the loop input, so a shared
+        // port would make the two overrides clobber each other.
+        if let Some(cfg_port) = &spec.strategy.cfg_conditioning_input
+            && guidance_active
+            && loop_edges.iter().any(|(_, in_port)| in_port == cfg_port)
+        {
+            anyhow::bail!(
+                "cfg_conditioning_input '{cfg_port}' must not also be a loop-carried input \
+                 port: the unconditional conditioning override would clobber the loop sample"
+            );
+        }
+
+        // Non-decoder components: prompt-phase (run once before the loop) and
+        // final-phase (run once after the loop).
+        let mut prompt_components = Vec::new();
+        let mut final_components = Vec::new();
+        for component in topological_components(spec)? {
+            if component == denoiser {
+                continue;
+            }
+            match component_phase(spec, &component, &denoiser) {
+                PhaseRunOn::PromptOnly => prompt_components.push(component),
+                PhaseRunOn::FinalOnly => final_components.push(component),
+                PhaseRunOn::OnDemand => {}
+                PhaseRunOn::EveryStep => anyhow::bail!(
+                    "component '{component}' declares run_on: every_step, but running a \
+                     non-denoiser component inside the iterative loop is not yet supported"
+                ),
+                PhaseRunOn::Other(value) => anyhow::bail!(
+                    "unsupported phase '{value}' for pipeline component '{component}'"
+                ),
+            }
+        }
+
+        Ok(Self::Iterative(Box::new(IterativePlan {
+            denoiser,
+            num_steps,
+            guidance_scale: spec.strategy.guidance_scale,
+            prompt_components,
+            final_components,
+            loop_edges,
+            timestep_input: spec.strategy.timestep_input.clone(),
+            start_step,
+            timesteps: spec.strategy.timesteps.clone(),
+            scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps, schedulers)?,
+            cfg_conditioning_input: spec.strategy.cfg_conditioning_input.clone(),
+            dataflow: spec.dataflow.clone(),
+            scheduler_spec: spec.strategy.scheduler_config.clone(),
+            scheduler_registry: schedulers.clone(),
+        })))
+    }
+
+    fn autoregressive_plan(&self) -> anyhow::Result<&AutoregressivePlan> {
+        match self {
+            Self::Autoregressive(plan) => Ok(plan),
+            _ => anyhow::bail!("pipeline strategy is not autoregressive"),
+        }
+    }
+
+    fn dataflow(&self) -> &[DataflowEdge] {
+        match self {
+            Self::Autoregressive(plan) => &plan.dataflow,
+            Self::SinglePass(plan) => &plan.dataflow,
+            Self::Iterative(plan) => &plan.dataflow,
+        }
     }
 
     fn edges_to_component<'a>(
         &'a self,
         component: &'a str,
     ) -> impl Iterator<Item = &'a DataflowEdge> + 'a {
-        self.dataflow
+        self.dataflow()
             .iter()
             .filter(move |edge| endpoint_component(&edge.to) == Some(component))
     }
+}
+
+/// Collect the `prompt_only`-phase components (everything except `primary`
+/// defaults to prompt-phase), rejecting unsupported phase strings.
+fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result<Vec<String>> {
+    let mut prompt_components = Vec::new();
+    for component in topological_components(spec)? {
+        if component == primary {
+            continue;
+        }
+        match component_phase(spec, &component, primary) {
+            PhaseRunOn::PromptOnly => prompt_components.push(component),
+            PhaseRunOn::EveryStep | PhaseRunOn::OnDemand | PhaseRunOn::FinalOnly => {}
+            PhaseRunOn::Other(value) => {
+                anyhow::bail!("unsupported phase '{value}' for pipeline component '{component}'")
+            }
+        }
+    }
+    Ok(prompt_components)
+}
+
+/// Build a DDIM scheduler from the declared config, or `None` when no scheduler
+/// is configured. Delegates to the registry so custom scheduler kinds work.
+fn build_scheduler(
+    config: Option<&SchedulerSpec>,
+    num_steps: usize,
+    registry: &SchedulerRegistry,
+) -> anyhow::Result<Option<Arc<dyn Scheduler>>> {
+    let Some(cfg) = config else {
+        return Ok(None);
+    };
+    Ok(Some(registry.build(cfg, num_steps)?))
 }
 
 fn autoregressive_decoder(strategy: &PipelineStrategy) -> Option<String> {
@@ -547,9 +2703,15 @@ fn topological_components(spec: &PipelineSpec) -> anyhow::Result<Vec<String>> {
             .iter()
             .find(|component| {
                 spec.dataflow.iter().all(|edge| {
-                    endpoint_component(&edge.to) != Some(component.as_str())
-                        || endpoint_component(&edge.from)
-                            .is_some_and(|from| !remaining.contains(from))
+                    let to = endpoint_component(&edge.to);
+                    let from = endpoint_component(&edge.from);
+                    // The edge does not gate `component` when: it does not feed
+                    // `component`; it is a self-edge (loop-carried, resolved
+                    // temporally, not an ordering dependency); or its source is
+                    // already ordered.
+                    to != Some(component.as_str())
+                        || from == Some(component.as_str())
+                        || from.is_some_and(|f| !remaining.contains(f))
                 })
             })
             .cloned();
@@ -580,6 +2742,143 @@ mod tests {
     use super::*;
     use onnx_genai_metadata::{PhaseConfig, PipelineComponentSpec, PipelineStrategyStage};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn ddim_step_matches_hand_computed_closed_form() {
+        // num_train=2, beta_start=beta_end=0.5 => betas=[0.5,0.5],
+        // alphas=[0.5,0.5], alpha_cumprod=[0.5,0.25].
+        // num_steps=1 => timestep t=0 => a_t=0.5, a_prev=1.0 (final step).
+        //   x0_hat = (x - sqrt(0.5)*e) / sqrt(0.5)
+        //   next   = sqrt(1)*x0_hat + sqrt(0)*e = x0_hat
+        let sched = DdimSchedule::with_schedule(2, 0.5, 0.5, "linear", 1).expect("schedule builds");
+        // x=1, e=0 -> next = 1/sqrt(0.5) = sqrt(2) ~= 1.41421356
+        let n0 = sched.step(0, &[1.0], &[0.0]).unwrap();
+        assert!((n0[0] - std::f32::consts::SQRT_2).abs() < 1e-5, "{}", n0[0]);
+        // x=1, e=1 -> x0_hat = (1 - sqrt(0.5))/sqrt(0.5) = sqrt(2) - 1 ~= 0.41421356
+        let n1 = sched.step(0, &[1.0], &[1.0]).unwrap();
+        assert!((n1[0] - (std::f32::consts::SQRT_2 - 1.0)).abs() < 1e-5, "{}", n1[0]);
+    }
+
+    #[test]
+    fn ddim_new_rejects_invalid_step_counts() {
+        assert!(DdimSchedule::with_schedule(1, 0.1, 0.2, "linear", 1).is_err()); // num_train < 2
+        assert!(DdimSchedule::with_schedule(4, 0.1, 0.2, "linear", 0).is_err()); // num_steps == 0
+        assert!(DdimSchedule::with_schedule(4, 0.1, 0.2, "linear", 5).is_err()); // num_steps > num_train
+    }
+
+    #[test]
+    fn dpmpp_timesteps_match_diffusers_linspace() {
+        // Classic Stable Diffusion 1.x schedule (1000 train steps, scaled_linear).
+        // diffusers `DPMSolverMultistepScheduler(timestep_spacing="linspace")`
+        // uses `linspace(0, num_train-1, num_steps+1).round()[::-1][:-1]`.
+        let num_train = 1000usize;
+        let num_steps = 25usize;
+        let sched = Dpmpp2m::with_schedule(num_train, 0.00085, 0.012, "scaled_linear", num_steps, "")
+            .expect("schedule builds");
+        let timesteps = sched.timesteps().expect("dpm++ exposes timesteps");
+        let denom = (num_train - 1) as f32;
+        let mut expected: Vec<f32> = (0..=num_steps)
+            .map(|j| (j as f32 * denom / num_steps as f32).round_ties_even())
+            .collect();
+        expected.reverse();
+        expected.pop();
+        assert_eq!(timesteps.len(), num_steps);
+        assert!((timesteps[0] - 999.0).abs() < 1e-3, "first timestep {}", timesteps[0]);
+        for (got, want) in timesteps.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-3, "timestep {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn ddim_exposes_descending_integer_timesteps() {
+        let sched =
+            DdimSchedule::with_schedule(1000, 0.00085, 0.012, "scaled_linear", 4).expect("builds");
+        // step_ratio = 250, ascending = [0, 250, 500, 750], reversed for inference.
+        assert_eq!(sched.timesteps(), Some(vec![750.0, 500.0, 250.0, 0.0]));
+    }
+
+    #[test]
+    fn masked_diffusion_random_unmasks_all_and_never_emits_mask() {
+        // MDLM-style ancestral unmasking: by the final step every masked position
+        // must be filled, the mask token must never be emitted (even though it has
+        // the largest raw logit here), the prompt prefix is preserved, and the run
+        // is deterministic.
+        let vocab = 5usize;
+        let mask_id = 4i64;
+        let seq = 6usize;
+        let prompt_len = 2usize;
+        let num_steps = 4usize;
+
+        // Sharp logits: the mask token has the highest logit (must be excluded),
+        // and each position's highest *non-mask* logit is a distinct token.
+        let mut logits = vec![0f32; seq * vocab];
+        for pos in 0..seq {
+            logits[pos * vocab + mask_id as usize] = 100.0;
+            logits[pos * vocab + (pos % 4)] = 10.0;
+        }
+        let logits_value =
+            Value::from_slice_f32(&logits, &[1, seq as i64, vocab as i64]).expect("logits");
+
+        let sched = MaskedDiffusion {
+            mask_token_id: mask_id,
+            temperature: 0.0, // greedy token choice => deterministic, random unmask order
+            block_length: None,
+            remasking: Remasking::Random,
+            generation_start: Mutex::new(None),
+        };
+
+        let seed = vec![1i64, 2, mask_id, mask_id, mask_id, mask_id];
+        let run = |sched: &MaskedDiffusion| -> Vec<i64> {
+            sched.reset();
+            let mut value = Value::from_slice_i64(&seed, &[1, seq as i64]).expect("seed");
+            for step in 0..num_steps {
+                value = sched.step(step, num_steps, &value, &logits_value).expect("step");
+            }
+            value.to_vec_i64().expect("tokens")
+        };
+
+        let out = run(&sched);
+        assert_eq!(&out[..prompt_len], &[1, 2], "prompt prefix preserved");
+        for (pos, &tok) in out.iter().enumerate() {
+            assert_ne!(tok, mask_id, "position {pos} still masked / emitted the mask token");
+        }
+        for pos in prompt_len..seq {
+            assert_eq!(out[pos], (pos % 4) as i64, "position {pos} token");
+        }
+        assert_eq!(run(&sched), out, "ancestral sampling is deterministic");
+    }
+
+    #[test]
+    fn masked_diffusion_rejects_unknown_remasking() {
+        let registry = SchedulerRegistry::default();
+        let spec = SchedulerSpec {
+            kind: "masked_diffusion".to_string(),
+            mask_token_id: Some(4),
+            remasking: Some("nonsense".to_string()),
+            ..SchedulerSpec::default()
+        };
+        assert!(registry.build(&spec, 4).is_err());
+    }
+
+    #[test]
+    fn dpmpp_final_step_stays_finite_with_zero_final_sigma() {
+        // With >= 15 steps and a zero final sigma (final_sigmas_type="zero"), the
+        // last step must drop to the first-order update; the second-order update
+        // divides by an infinite log-SNR step at sigma=0 and would emit NaN/inf.
+        let num_steps = 20usize;
+        let sched = Dpmpp2m::with_schedule(1000, 0.00085, 0.012, "scaled_linear", num_steps, "")
+            .expect("schedule builds");
+        sched.reset();
+        let mut sample = Value::from_slice_f32(&[1.0, -0.5, 0.25], &[3]).unwrap();
+        for step in 0..num_steps {
+            let eps = Value::from_slice_f32(&[0.3, -0.2, 0.1], &[3]).unwrap();
+            sample = sched.step(step, num_steps, &sample, &eps).unwrap();
+        }
+        assert!(
+            sample.to_vec_f32().unwrap().iter().all(|value| value.is_finite()),
+            "final dpm++ sample must be finite"
+        );
+    }
 
     fn component(role: &str) -> PipelineComponentSpec {
         PipelineComponentSpec {
@@ -687,6 +2986,11 @@ pipeline:
                 denoiser: None,
                 scheduler: None,
                 num_steps: None,
+                timestep_input: None,
+                timesteps: None,
+                start_step: None,
+                scheduler_config: None,
+                cfg_conditioning_input: None,
                 guidance_scale: None,
                 state: None,
                 stages: vec![
@@ -704,6 +3008,11 @@ pipeline:
                             denoiser: None,
                             scheduler: None,
                             num_steps: None,
+                            timestep_input: None,
+                            timesteps: None,
+                            start_step: None,
+                            scheduler_config: None,
+                            cfg_conditioning_input: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
@@ -724,6 +3033,11 @@ pipeline:
                             denoiser: None,
                             scheduler: None,
                             num_steps: None,
+                            timestep_input: None,
+                            timesteps: None,
+                            start_step: None,
+                            scheduler_config: None,
+                            cfg_conditioning_input: None,
                             guidance_scale: None,
                             state: None,
                             stages: vec![],
@@ -749,9 +3063,10 @@ pipeline:
             vision: None,
         };
 
-        let plan = PipelinePlan::from_spec(&spec)?;
-        assert_eq!(plan.prompt_components, ["vision_encoder"]);
-        assert_eq!(plan.decoder, "decoder");
+        let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
+        let ar = plan.autoregressive_plan()?;
+        assert_eq!(ar.prompt_components, ["vision_encoder"]);
+        assert_eq!(ar.decoder, "decoder");
         let routed = plan.edges_to_component("decoder").collect::<Vec<_>>();
         assert_eq!(routed.len(), 1);
         assert_eq!(

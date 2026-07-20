@@ -190,6 +190,90 @@ fn pipeline_validation_rejects_cycles() {
 }
 
 #[test]
+fn pipeline_validation_accepts_iterative_denoiser_self_edge() {
+    // A denoiser fed its own previous-step output (`denoiser.x -> denoiser.y`)
+    // is a loop-carried temporal dependency, not a same-step DAG cycle, so it
+    // must validate cleanly.
+    let spec = load_pipeline_spec(&crate_fixture("pipeline_iterative_self_edge.yaml"))
+        .expect("iterative pipeline with a denoiser self-edge validates");
+
+    assert!(matches!(
+        spec.strategy.kind,
+        PipelineStrategyKind::Iterative
+    ));
+    assert_eq!(spec.strategy.denoiser.as_deref(), Some("denoiser"));
+    assert_eq!(spec.strategy.num_steps, Some(20));
+}
+
+#[test]
+fn pipeline_validation_rejects_self_edge_outside_iterative_denoiser() {
+    // A self-edge on a component that is NOT an iterative denoiser has no loop
+    // semantics and must be rejected as a cycle.
+    let yaml = "
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow:
+    - from: encoder.state
+      to: encoder.state
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("non-denoiser self-edge is rejected");
+    assert!(
+        err.errors.iter().any(|e| e.contains("contains a cycle")),
+        "unexpected errors: {:?}",
+        err.errors
+    );
+}
+
+#[test]
+fn pipeline_validation_rejects_duplicate_destination_edges() {
+    // Two producers feeding one destination port is ambiguous and rejected.
+    let yaml = "
+pipeline:
+  models:
+    encoder_a:
+      filename: a.onnx
+      type: encoder
+    encoder_b:
+      filename: b.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow:
+    - from: encoder_a.hidden
+      to: decoder.encoder_hidden_states
+    - from: encoder_b.hidden
+      to: decoder.encoder_hidden_states
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("duplicate destination is rejected");
+    assert!(
+        err.errors
+            .iter()
+            .any(|e| e.contains("multiple edges into the same destination")),
+        "unexpected errors: {:?}",
+        err.errors
+    );
+}
+
+#[test]
 fn pipeline_vision_config_round_trips_via_json() {
     use onnx_genai_metadata::PipelineVisionConfig;
 
@@ -252,5 +336,34 @@ pipeline:
             image_placeholder_token_id: Some(32000),
             tokens_per_tile: Some(256),
         }
+    );
+}
+
+#[test]
+fn pipeline_validation_rejects_timesteps_length_mismatch() {
+    let yaml = "
+pipeline:
+  models:
+    denoiser:
+      filename: denoiser.onnx
+      type: denoiser
+  dataflow:
+    - from: denoiser.out
+      to: denoiser.sample
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    timestep_input: t
+    timesteps: [0.1, 0.2]
+";
+    let metadata: onnx_genai_metadata::InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("parses");
+    let spec = metadata.pipeline.expect("pipeline section");
+    let err = validate_pipeline_spec(&spec).expect_err("timesteps length mismatch is rejected");
+    assert!(
+        err.errors.iter().any(|e| e.contains("timesteps has 2 entries")),
+        "unexpected errors: {:?}",
+        err.errors
     );
 }

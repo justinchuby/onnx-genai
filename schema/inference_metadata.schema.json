@@ -1044,6 +1044,14 @@
         "batching": {
           "description": "Runtime-specific batching parameters."
         },
+        "cfg_conditioning_input": {
+          "description": "Denoiser conditioning input port zeroed for the unconditional pass of\nclassifier-free guidance. Required when `guidance_scale` != 1.0.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "decoder": {
           "description": "Autoregressive decoder component name.",
           "type": [
@@ -1106,6 +1114,17 @@
             "null"
           ]
         },
+        "scheduler_config": {
+          "description": "Optional diffusion scheduler applied to the denoiser's loop-carried\noutput (treating it as a noise prediction) each step.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchedulerSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "speculative": {
           "description": "Runtime-specific speculative execution parameters."
         },
@@ -1115,6 +1134,16 @@
           "items": {
             "$ref": "#/$defs/PipelineStrategyStage"
           }
+        },
+        "start_step": {
+          "description": "First step index for a partial (img2img) denoise loop.\n\nWhen set, the iterative loop runs `start_step..num_steps` instead of the\nfull `0..num_steps`, and the seed (`denoiser` sample input) is expected to\nalready be the encoded image noised to `timesteps[start_step]`. Matches\ndiffusers' img2img `get_timesteps(num_steps, strength)` skip. Default 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
         },
         "state": {
           "description": "Runtime-specific iterative state declaration."
@@ -1126,6 +1155,26 @@
             "null"
           ],
           "items": true
+        },
+        "timestep_input": {
+          "description": "Denoiser input port that receives the per-step timestep/sigma scalar.\n\nWhen set, the iterative loop feeds this input a rank-1 `float32` value\neach step (from `timesteps` when provided, otherwise the 0-based step\nindex), so a step-aware denoiser can condition on the current step.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "timesteps": {
+          "description": "Explicit per-step timestep/sigma schedule for an iterative strategy.\n\nWhen present its length must equal `num_steps`; when absent the loop\nuses the 0-based step index. Requires `timestep_input` to have any effect.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "number",
+            "format": "float"
+          }
         }
       },
       "required": [
@@ -1464,6 +1513,106 @@
       },
       "required": [
         "dtype"
+      ]
+    },
+    "SchedulerSpec": {
+      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\n(or, for `masked_diffusion`, as token logits) and applies one scheduler step\nper iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image\ndiffusion, with optional Karras/exponential sigmas) and `masked_diffusion`\n(discrete language diffusion).",
+      "type": "object",
+      "properties": {
+        "beta_end": {
+          "description": "Linear beta-schedule end (default 0.012).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "beta_schedule": {
+          "description": "Beta schedule shape: `\"linear\"` (default) or `\"scaled_linear\"` (Stable\nDiffusion).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "beta_start": {
+          "description": "Linear beta-schedule start (default 0.00085).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0
+        },
+        "block_length": {
+          "description": "Semi-autoregressive block length for a `masked_diffusion` scheduler, in\ntokens. When set (and smaller than the masked generation region), each\nstep only commits tokens inside the current left-to-right block, matching\nLLaDA's semi-autoregressive remasking. Defaults to a single block\nspanning the whole masked region.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "kind": {
+          "description": "Scheduler algorithm: `\"ddim\"`, `\"euler\"`, `\"dpmpp_2m\"`, or\n`\"masked_diffusion\"`.",
+          "type": "string"
+        },
+        "mask_token_id": {
+          "description": "Mask token id for a `masked_diffusion` (language-diffusion) scheduler:\neach step commits the highest-confidence still-masked positions.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "num_train_timesteps": {
+          "description": "Training timesteps the noise schedule was defined over (default 1000).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 2
+        },
+        "prediction_type": {
+          "description": "Model output parameterization; `\"epsilon\"` is supported (default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remasking": {
+          "description": "Unmasking strategy for a `masked_diffusion` scheduler:\n  * `\"low_confidence\"` (default) — LLaDA: each step commits the\n    highest-confidence still-masked positions (confidence-ranked). Best\n    for LLaDA checkpoints, but greedy/confidence-ranked decoding of other\n    masked-diffusion LMs (e.g. MDLM) collapses into repetitive text.\n  * `\"random\"` — MDLM-style ancestral: each still-masked position unmasks\n    independently with the schedule probability `1/(steps_remaining)`,\n    sampling its token from the model's categorical distribution (use\n    `temperature: 1.0` for a true categorical sample). This per-position\n    stochastic unmasking avoids the degenerate loops that confidence\n    ranking produces. The mask token is never emitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature for a `masked_diffusion` scheduler. `0` (default)\nselects each masked position's argmax token deterministically; a positive\nvalue applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before\nthe argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for\nremasking is always the clean-softmax probability of the chosen token.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "use_exponential_sigmas": {
+          "description": "Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)\ninstead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive\nwith `use_karras_sigmas` (Karras takes precedence).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "use_karras_sigmas": {
+          "description": "Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the\ndefault linspace spacing. Applies to sigma-space schedulers (`euler`,\n`dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
       ]
     },
     "SharedKvGroup": {

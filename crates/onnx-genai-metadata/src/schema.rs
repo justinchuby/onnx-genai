@@ -655,6 +655,40 @@ pub struct PipelineStrategy {
     #[schemars(range(min = 1))]
     pub num_steps: Option<usize>,
 
+    /// Denoiser input port that receives the per-step timestep/sigma scalar.
+    ///
+    /// When set, the iterative loop feeds this input a rank-1 `float32` value
+    /// each step (from `timesteps` when provided, otherwise the 0-based step
+    /// index), so a step-aware denoiser can condition on the current step.
+    #[serde(default)]
+    pub timestep_input: Option<String>,
+
+    /// Explicit per-step timestep/sigma schedule for an iterative strategy.
+    ///
+    /// When present its length must equal `num_steps`; when absent the loop
+    /// uses the 0-based step index. Requires `timestep_input` to have any effect.
+    #[serde(default)]
+    pub timesteps: Option<Vec<f32>>,
+
+    /// First step index for a partial (img2img) denoise loop.
+    ///
+    /// When set, the iterative loop runs `start_step..num_steps` instead of the
+    /// full `0..num_steps`, and the seed (`denoiser` sample input) is expected to
+    /// already be the encoded image noised to `timesteps[start_step]`. Matches
+    /// diffusers' img2img `get_timesteps(num_steps, strength)` skip. Default 0.
+    #[serde(default)]
+    pub start_step: Option<usize>,
+
+    /// Optional diffusion scheduler applied to the denoiser's loop-carried
+    /// output (treating it as a noise prediction) each step.
+    #[serde(default)]
+    pub scheduler_config: Option<SchedulerSpec>,
+
+    /// Denoiser conditioning input port zeroed for the unconditional pass of
+    /// classifier-free guidance. Required when `guidance_scale` != 1.0.
+    #[serde(default)]
+    pub cfg_conditioning_input: Option<String>,
+
     /// Classifier-free guidance scale or equivalent strategy-specific multiplier.
     #[schemars(range(min = 0.0))]
     pub guidance_scale: Option<f32>,
@@ -679,6 +713,80 @@ pub struct PipelineStrategyStage {
 
     /// Optional phase gate for the stage.
     pub run_on: Option<PhaseRunOn>,
+}
+
+/// Diffusion scheduler configuration for an iterative strategy.
+///
+/// The runtime treats the denoiser's loop-carried output as a noise prediction
+/// (or, for `masked_diffusion`, as token logits) and applies one scheduler step
+/// per iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image
+/// diffusion, with optional Karras/exponential sigmas) and `masked_diffusion`
+/// (discrete language diffusion).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
+pub struct SchedulerSpec {
+    /// Scheduler algorithm: `"ddim"`, `"euler"`, `"dpmpp_2m"`, or
+    /// `"masked_diffusion"`.
+    pub kind: String,
+
+    /// Training timesteps the noise schedule was defined over (default 1000).
+    #[schemars(range(min = 2))]
+    pub num_train_timesteps: Option<usize>,
+
+    /// Linear beta-schedule start (default 0.00085).
+    #[schemars(range(min = 0.0))]
+    pub beta_start: Option<f32>,
+
+    /// Linear beta-schedule end (default 0.012).
+    #[schemars(range(min = 0.0))]
+    pub beta_end: Option<f32>,
+
+    /// Beta schedule shape: `"linear"` (default) or `"scaled_linear"` (Stable
+    /// Diffusion).
+    pub beta_schedule: Option<String>,
+
+    /// Model output parameterization; `"epsilon"` is supported (default).
+    pub prediction_type: Option<String>,
+
+    /// Mask token id for a `masked_diffusion` (language-diffusion) scheduler:
+    /// each step commits the highest-confidence still-masked positions.
+    pub mask_token_id: Option<i64>,
+
+    /// Sampling temperature for a `masked_diffusion` scheduler. `0` (default)
+    /// selects each masked position's argmax token deterministically; a positive
+    /// value applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before
+    /// the argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for
+    /// remasking is always the clean-softmax probability of the chosen token.
+    pub temperature: Option<f32>,
+
+    /// Semi-autoregressive block length for a `masked_diffusion` scheduler, in
+    /// tokens. When set (and smaller than the masked generation region), each
+    /// step only commits tokens inside the current left-to-right block, matching
+    /// LLaDA's semi-autoregressive remasking. Defaults to a single block
+    /// spanning the whole masked region.
+    pub block_length: Option<usize>,
+
+    /// Unmasking strategy for a `masked_diffusion` scheduler:
+    ///   * `"low_confidence"` (default) — LLaDA: each step commits the
+    ///     highest-confidence still-masked positions (confidence-ranked). Best
+    ///     for LLaDA checkpoints, but greedy/confidence-ranked decoding of other
+    ///     masked-diffusion LMs (e.g. MDLM) collapses into repetitive text.
+    ///   * `"random"` — MDLM-style ancestral: each still-masked position unmasks
+    ///     independently with the schedule probability `1/(steps_remaining)`,
+    ///     sampling its token from the model's categorical distribution (use
+    ///     `temperature: 1.0` for a true categorical sample). This per-position
+    ///     stochastic unmasking avoids the degenerate loops that confidence
+    ///     ranking produces. The mask token is never emitted.
+    pub remasking: Option<String>,
+
+    /// Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the
+    /// default linspace spacing. Applies to sigma-space schedulers (`euler`,
+    /// `dpmpp_2m`); the most popular ComfyUI scheduler for those samplers.
+    pub use_karras_sigmas: Option<bool>,
+
+    /// Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)
+    /// instead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive
+    /// with `use_karras_sigmas` (Karras takes precedence).
+    pub use_exponential_sigmas: Option<bool>,
 }
 
 /// Pipeline execution strategy family.
