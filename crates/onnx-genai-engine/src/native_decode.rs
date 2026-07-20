@@ -1634,14 +1634,10 @@ mod tests {
             DeviceBindingTransferStats::default()
         );
         assert!(captured_after.graph.enabled);
-        assert_eq!(captured_after.graph.captures, 0);
-        assert_eq!(captured_after.graph.replays, 0);
-        assert_eq!(captured_after.graph.fallbacks, 1);
-        let fallback_reason = captured
-            .cuda_graph_fallback_reason()
-            .context("Qwen graph fallback must expose its diagnostic")?;
-        assert!(fallback_reason.contains("GroupQueryAttention"));
-        assert!(fallback_reason.contains("data-dependent output shape"));
+        assert_eq!(captured_after.graph.captures, 1);
+        assert_eq!(captured_after.graph.replays, HORIZON as u64 - 2);
+        assert_eq!(captured_after.graph.fallbacks, 0);
+        assert!(captured.cuda_graph_fallback_reason().is_none());
 
         let eager_us = eager_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
         let captured_us = captured_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
