@@ -1324,6 +1324,35 @@ The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
 mechanism with a closed form. This path does not affect the single-AR-decoder TTS
 path or any other modality.
 
+**Gap to a real Qwen3-TTS export (not yet closed).** The fixture above exercises
+the nested-loop *mechanism*, but a real Qwen3-TTS package (Mobius `TTSTask`,
+`src/mobius/tasks/_tts.py`) differs materially and is **not** yet emittable/runnable
+end to end:
+
+- **Components:** `embedding` (`text_ids + codec_ids -> text_embeds + codec_embeds`),
+  `talker`, `code_predictor`, and an optional `speaker_encoder`. There is **no
+  vocoder** in the package — the codes are decoded to a waveform by a *separate*
+  codec model (e.g. Mimi / `qwen3_tts_tokenizer_12hz`), so the `final_only` vocoder
+  stage in the fixture would instead be a second, externally-supplied package.
+- **The talker input is loop-constructed, not a dataflow edge.** The talker's
+  `inputs_embeds` is assembled *inside the generation loop* per step, mixing text,
+  codec, and speaker embeddings in "talker-hidden space" (see `_tts.py`
+  `_build_code_predictor` docstring). The current `nested_autoregressive` seeds the
+  talker directly and only threads the *inner* decoder's per-code embedding; it does
+  **not** model the outer talker's per-step embedding construction. Closing this
+  needs either an engine extension (a per-outer-step embedding builder) or a Mobius
+  pre-embedding component that materializes the talker `inputs_embeds` sequence.
+- **Build path:** the 1.7B model builds only via the custom `examples/qwen3_tts.py`
+  pipeline (not the standard `mobius build` CLI), which does not currently call
+  `write_onnx_genai_config`. So `write_onnx_genai_config` deliberately **fails
+  loudly** on a `talker + code_predictor` package (`_looks_like_multi_decoder_tts`)
+  rather than emit speculative metadata.
+
+Completing real Qwen3-TTS is therefore a focused, monitored effort: build the 1.7B
+model, validate/extend the outer-loop embedding path against its real I/O, then add
+the `build_tts_pipeline_metadata` emitter — in that order, since the exact wiring
+must be confirmed against a real export.
+
 #### Speech-to-Text (ASR / Whisper-style)
 
 ```yaml
