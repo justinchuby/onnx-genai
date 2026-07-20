@@ -5,6 +5,8 @@
 //! quantized caches, attention bias, smooth softmax/head sink, and QK capture
 //! are rejected.
 
+use std::borrow::Cow;
+
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
@@ -154,22 +156,6 @@ impl Bhsd {
         })
     }
 
-    fn from_cache(view: &TensorView, heads: usize, name: &str) -> Result<Self> {
-        if view.shape.len() != 4 || view.shape[1] != heads {
-            return Err(EpError::KernelFailed(format!(
-                "GroupQueryAttention: {name} must use BNSH layout [B,{heads},S,D], got {:?}",
-                view.shape
-            )));
-        }
-        Ok(Self {
-            data: to_dense_f32_widen("GroupQueryAttention", view)?.into_owned(),
-            batch: view.shape[0],
-            heads,
-            seq: view.shape[2],
-            dim: view.shape[3],
-        })
-    }
-
     fn from_packed_qkv(
         view: &TensorView,
         num_heads: usize,
@@ -247,6 +233,36 @@ impl Bhsd {
     #[inline]
     fn at(&self, b: usize, h: usize, s: usize, d: usize) -> f32 {
         self.data[((b * self.heads + h) * self.seq + s) * self.dim + d]
+    }
+}
+
+/// Borrowed, dense-widened view of a BNSH KV cache input.
+///
+/// Unlike [`Bhsd`], this does not force an owned clone of the past cache: when
+/// the input is already contiguous `f32` the dense data is borrowed directly
+/// (see [`to_dense_f32_widen`]), so the past K/V is materialized at most once
+/// on the way into `present_k`/`present_v` rather than twice.
+struct PastCache<'a> {
+    data: Cow<'a, [f32]>,
+    seq: usize,
+    dim: usize,
+    batch: usize,
+}
+
+impl<'a> PastCache<'a> {
+    fn from_cache(view: &'a TensorView<'a>, heads: usize, name: &str) -> Result<Self> {
+        if view.shape.len() != 4 || view.shape[1] != heads {
+            return Err(EpError::KernelFailed(format!(
+                "GroupQueryAttention: {name} must use BNSH layout [B,{heads},S,D], got {:?}",
+                view.shape
+            )));
+        }
+        Ok(Self {
+            data: to_dense_f32_widen("GroupQueryAttention", view)?,
+            seq: view.shape[2],
+            dim: view.shape[3],
+            batch: view.shape[0],
+        })
     }
 }
 
@@ -395,10 +411,10 @@ impl Kernel for GroupQueryAttentionKernel {
             ));
         }
         let past_key = has_past_key
-            .then(|| Bhsd::from_cache(&inputs[3], self.kv_num_heads, "past_key"))
+            .then(|| PastCache::from_cache(&inputs[3], self.kv_num_heads, "past_key"))
             .transpose()?;
         let past_value = has_past_value
-            .then(|| Bhsd::from_cache(&inputs[4], self.kv_num_heads, "past_value"))
+            .then(|| PastCache::from_cache(&inputs[4], self.kv_num_heads, "past_value"))
             .transpose()?;
         if let (Some(pk), Some(pv)) = (&past_key, &past_value)
             && (pk.batch != q.batch
@@ -533,26 +549,28 @@ impl Kernel for GroupQueryAttentionKernel {
         let mut present_v = vec![0.0; present_k.len()];
         for b in 0..q.batch {
             for h in 0..self.kv_num_heads {
-                for s in 0..past_lengths[b] {
-                    for d in 0..cache_dim {
-                        let dst = ((b * self.kv_num_heads + h) * present_sequence_length + s)
-                            * cache_dim
-                            + d;
-                        present_k[dst] = past_key.as_ref().unwrap().at(b, h, s, d);
-                        present_v[dst] = past_value.as_ref().unwrap().at(b, h, s, d);
-                    }
+                let head = b * self.kv_num_heads + h;
+                let dst_base = head * present_sequence_length * cache_dim;
+                let past_len = past_lengths[b];
+                // `present_k`/`present_v` and the dense past caches are both
+                // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is a
+                // single contiguous run in each: copy the whole past prefix at
+                // once instead of per-element scalar `.at()` loads.
+                if past_len > 0 {
+                    let copy = past_len * cache_dim;
+                    let pk = past_key.as_ref().unwrap();
+                    let pv = past_value.as_ref().unwrap();
+                    let src = head * pk.seq * cache_dim;
+                    present_k[dst_base..dst_base + copy].copy_from_slice(&pk.data[src..src + copy]);
+                    present_v[dst_base..dst_base + copy].copy_from_slice(&pv.data[src..src + copy]);
                 }
-                for s in 0..k.seq {
-                    for d in 0..cache_dim {
-                        let dst = ((b * self.kv_num_heads + h) * present_sequence_length
-                            + past_lengths[b]
-                            + s)
-                            * cache_dim
-                            + d;
-                        present_k[dst] = k.at(b, h, s, d);
-                        present_v[dst] = v.at(b, h, s, d);
-                    }
-                }
+                // Append the current token(s) directly after the past prefix;
+                // the current K/V blocks are contiguous in `[s, d]` as well.
+                let cur = k.seq * cache_dim;
+                let dst_cur = dst_base + past_len * cache_dim;
+                let src_cur = head * k.seq * cache_dim;
+                present_k[dst_cur..dst_cur + cur].copy_from_slice(&k.data[src_cur..src_cur + cur]);
+                present_v[dst_cur..dst_cur + cur].copy_from_slice(&v.data[src_cur..src_cur + cur]);
             }
         }
 
