@@ -1039,10 +1039,9 @@ impl Kernel for StandardAttentionKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // Setup uploads small per-batch control arrays (and reads back
-        // `nonpad_kv_seqlen`) via synchronous copies, so this kernel is not
-        // capturable as-is. The bulk Q/K/V/score tensors stay on the device.
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "setup synchronously uploads per-batch control arrays and reads nonpad_kv_seqlen D2H",
+        )
     }
 }

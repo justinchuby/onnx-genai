@@ -832,11 +832,8 @@ impl Kernel for AttentionKernel {
         true
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // §13.3 binding value. NOTE (Phase 2b): real capture additionally needs
-        // the per-call scratch/workspace `alloc_raw`/`free_raw` replaced by a
-        // pooled, stream-ordered allocator (same follow-up as the MatMul path).
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 

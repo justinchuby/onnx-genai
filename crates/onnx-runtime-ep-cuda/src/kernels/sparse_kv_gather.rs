@@ -244,11 +244,10 @@ impl Kernel for SparseKvGatherKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // Host-side index validation copies the index tensor D2H, and execution
-        // synchronizes the stream before returning. Neither is legal during CUDA
-        // graph capture.
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "host-side index validation copies indices D2H and synchronizes the stream",
+        )
     }
 }
 

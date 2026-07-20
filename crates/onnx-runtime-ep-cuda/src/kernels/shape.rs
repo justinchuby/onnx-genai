@@ -87,7 +87,13 @@ impl Kernel for ShapeKernel {
         true
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        self.warmed.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.warmed.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Shape output metadata must be warmed into its stable device buffer before capture",
+            )
+        }
     }
 }

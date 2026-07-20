@@ -1707,13 +1707,19 @@ impl Kernel for GroupQueryAttentionKernel {
         true
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Eligibility is tied to the exact f32 one-token, fixed-capacity,
         // in-place device-KV reference-attention signature warmed by the most
         // recent successful call.
-        self.last_capture_safe_signature
-            .lock()
-            .is_ok_and(|signature| signature.is_some())
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed f32 q_seq==1 k_seq==1 fixed-capacity device-KV reference path; the current signature was not warmed as capture-safe",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "GroupQueryAttention capture signature is unavailable because its state lock was poisoned",
+            ),
+        }
     }
 }
 

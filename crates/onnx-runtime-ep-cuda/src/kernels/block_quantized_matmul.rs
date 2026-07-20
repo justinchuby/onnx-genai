@@ -685,8 +685,10 @@ impl Kernel for BlockQuantizedMatMulKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "block-quantized MatMul performs a trailing host stream synchronization",
+        )
     }
 }
 

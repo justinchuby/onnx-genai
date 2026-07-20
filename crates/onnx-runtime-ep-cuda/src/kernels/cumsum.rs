@@ -167,7 +167,9 @@ impl Kernel for CumSumKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "CumSum reads the axis D2H and performs a trailing host stream synchronization",
+        )
     }
 }

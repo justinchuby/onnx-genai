@@ -24,7 +24,8 @@ pub use epcontext::{
 };
 pub use error::SessionError;
 pub use executor::{
-    CacheStats, ControlFlowStats, DeviceAllocationCounts, DeviceGraphCaptureResult,
+    CacheStats, CaptureDecline, CaptureDeclineReport, ControlFlowStats, DeviceAllocationCounts,
+    DeviceGraphCaptureResult,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,

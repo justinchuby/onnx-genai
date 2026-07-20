@@ -410,9 +410,9 @@ impl Kernel for RotaryEmbeddingKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // Input validation copies a device error flag to the host. A capturable
-        // validated-input design needs deferred device-side error propagation.
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "input validation copies a device error flag to the host",
+        )
     }
 }

@@ -1746,6 +1746,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "onnx-runtime-session",
+ "onnx-runtime-tracer",
  "prost",
  "rand 0.9.5",
  "serde",

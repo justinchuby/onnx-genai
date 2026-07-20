@@ -30,7 +30,7 @@
 //! the host-resident staging keeps state correct across steps (device-resident
 //! state is the Phase-B optimization).
 //!
-//! ## `cuda_graph_compatible` = false
+//! ## Capture support
 //!
 //! Like the correctness-first `standard_attention` / `sparse_kv_gather`
 //! kernels, execution round-trips through host memory and synchronizes the
@@ -970,7 +970,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // ratio-128 FP8 records remain host-staged this slice; ratio-4 B5
         // dequantizes packed candidate records directly on device, including
         // optional attention bias. Compression/writeback and B4's index readback
-        // keep `cuda_graph_compatible()` false.
+        // keep capture support declined.
         let cache_format = node
             .attr("cache_format")
             .and_then(|attribute| attribute.as_str())
@@ -995,7 +995,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // with the optional `selected_indices` present (6 outputs). Every output
         // is produced by a device kernel reading device-resident cursors — no
         // host round trip, no per-call alloc/free/sync — so the decode is
-        // capture-clean. All other configs keep `cuda_graph_compatible()==false`.
+        // capture-clean. All other configs return an actionable capture decline.
         let capturable = device_main_compression
             && device_index_compression
             && device_index_scoring
@@ -1101,10 +1101,10 @@ struct CompressedSparseAttentionKernel {
     /// B6: the whole ratio-4 fp8 6-output decode is device-resident and
     /// capture-clean. When set, `execute` takes the device-only path (no host
     /// staging, no per-call alloc/free, cursor-driven launch) and
-    /// `cuda_graph_compatible()` returns `true`.
+    /// `capture_support()` returns `Supported`.
     capturable: bool,
     /// D7 diagnostic override: when set, `execute` takes the host-staged oracle
-    /// path even for the capturable config, and `cuda_graph_compatible()` reports
+    /// path even for the capturable config, and `capture_support()` reports
     /// `false`. Read once from `ONNX_GENAI_CSA_FORCE_HOST` at construction.
     force_host: bool,
     /// Shared §8 telemetry surface (per-layer mode, bytes avoided, cursor
@@ -2167,7 +2167,7 @@ impl Kernel for CompressedSparseAttentionKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // B6/B7: the ratio-4 fp8 6-output config runs a fully device-resident,
         // cursor-driven pipeline with pre-reserved stable-address scratch and no
         // per-call alloc/free/sync, so it is capture-clean and the default path.
@@ -2175,7 +2175,17 @@ impl Kernel for CompressedSparseAttentionKernel {
         // host-stages (D2H inputs, H2D outputs, per-copy syncs) — illegal during
         // capture — so it must report non-capturable. Every other config also
         // stays non-capturable.
-        self.capturable && !self.force_host
+        if !self.capturable {
+            return onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires the ratio-4 fp8 six-output device-resident compressed-attention path",
+            );
+        }
+        if self.force_host {
+            return onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "ONNX_GENAI_CSA_FORCE_HOST selects a host-staged path with D2H/H2D copies and synchronization",
+            );
+        }
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 

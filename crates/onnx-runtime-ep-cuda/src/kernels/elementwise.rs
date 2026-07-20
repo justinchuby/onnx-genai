@@ -414,12 +414,20 @@ impl Kernel for UnaryKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Eligibility is tied to the exact dtype and shape warmed by the most
         // recent successful call, not a reusable boolean.
-        self.last_capture_safe_signature
-            .lock()
-            .is_ok_and(|signature| signature.is_some())
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} shape/dtype signature does not match the warmed fixed-decode capture signature",
+                self.op.op_name()
+            )),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} capture signature is unavailable because its state lock was poisoned",
+                self.op.op_name()
+            )),
+        }
     }
 }
 
@@ -650,12 +658,20 @@ impl Kernel for BinaryKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Only the exact fixed-row signature recorded by the most recent
         // successful call may enter capture, including integer metadata ops.
-        self.last_capture_safe_signature
-            .lock()
-            .is_ok_and(|signature| signature.is_some())
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} broadcast shape/dtype signature does not match the warmed capture signature",
+                self.op.op_name()
+            )),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} capture signature is unavailable because its state lock was poisoned",
+                self.op.op_name()
+            )),
+        }
     }
 }
 

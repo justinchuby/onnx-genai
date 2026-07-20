@@ -8,9 +8,10 @@ use anyhow::{Context, bail};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim};
 use onnx_runtime_session::{
-    DeviceAllocationCounts, DeviceBindingTransferStats, DeviceGraphCaptureResult, DeviceIoBinding,
-    DevicePreference, InferenceSession, Tensor,
+    CaptureDeclineReport, DeviceAllocationCounts, DeviceBindingTransferStats,
+    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
+use onnx_runtime_tracer::{TraceContext, capture_rejected};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,13 +43,15 @@ pub struct CudaKvDebugStats {
     pub graph: CudaGraphDebugStats,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CudaGraphDebugStats {
     pub enabled: bool,
     pub captures: u64,
     pub replays: u64,
     pub fallbacks: u64,
     pub allocation_counts: DeviceAllocationCounts,
+    /// Structured reasons from the most recent capture fallback.
+    pub fallback_report: Option<CaptureDeclineReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +78,7 @@ struct DecodeCudaState {
     graph_replays: u64,
     graph_fallbacks: u64,
     graph_fallback_reason: Option<String>,
+    graph_fallback_report: Option<CaptureDeclineReport>,
 }
 
 struct DecodeCudaIo<'a> {
@@ -82,6 +86,20 @@ struct DecodeCudaIo<'a> {
     attention_mask: &'a str,
     position_ids: Option<&'a str>,
     logits: &'a str,
+}
+
+fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
+    for decline in &report.entries {
+        if let Some(node_id) = decline.node_id {
+            capture_rejected(
+                trace,
+                node_id,
+                decline.op_type.as_str(),
+                decline.domain.as_str(),
+                decline.reason.as_str(),
+            );
+        }
+    }
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
@@ -95,6 +113,7 @@ pub struct NativeDecodeSession {
     present_to_past: HashMap<String, String>,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
+    trace: TraceContext,
     current_len: usize,
 }
 
@@ -273,6 +292,7 @@ impl NativeDecodeSession {
             present_to_past,
             past: HashMap::new(),
             cuda,
+            trace: TraceContext::noop(),
             current_len: 0,
         })
     }
@@ -295,6 +315,18 @@ impl NativeDecodeSession {
         self.cuda
             .as_ref()
             .and_then(|state| state.graph_fallback_reason.as_deref())
+    }
+
+    /// Structured reasons from the most recent CUDA graph fallback.
+    pub fn cuda_graph_fallback_report(&self) -> Option<&CaptureDeclineReport> {
+        self.cuda
+            .as_ref()
+            .and_then(|state| state.graph_fallback_report.as_ref())
+    }
+
+    /// Attach the shared runtime trace context used for capture-fallback events.
+    pub fn set_trace_context(&mut self, trace: TraceContext) {
+        self.trace = trace;
     }
 
     pub fn decode(
@@ -415,7 +447,7 @@ impl NativeDecodeSession {
 
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
-            if let Err(error) = state.run_one_token(&mut self.session) {
+            if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                 bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
             }
@@ -635,6 +667,7 @@ impl DecodeCudaState {
             graph_replays: 0,
             graph_fallbacks: 0,
             graph_fallback_reason: None,
+            graph_fallback_report: None,
         })
     }
 
@@ -681,7 +714,11 @@ impl DecodeCudaState {
         Ok(())
     }
 
-    fn run_one_token(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
+    fn run_one_token(
+        &mut self,
+        session: &mut InferenceSession,
+        trace: &TraceContext,
+    ) -> anyhow::Result<()> {
         if !self.graph_enabled {
             session.run_with_device_bindings(&[], &mut self.bindings)?;
             return Ok(());
@@ -701,10 +738,13 @@ impl DecodeCudaState {
                         self.graph_captures += 1;
                         self.graph_phase = DecodeCudaGraphPhase::Ready;
                     }
-                    DeviceGraphCaptureResult::NotCapturable(reason) => {
+                    DeviceGraphCaptureResult::NotCapturable(report) => {
                         self.graph_fallbacks += 1;
                         self.graph_phase = DecodeCudaGraphPhase::Unsupported;
+                        trace_capture_declines(trace, &report);
+                        let reason = report.to_string();
                         self.graph_fallback_reason = Some(reason.clone());
+                        self.graph_fallback_report = Some(report);
                         tracing::warn!(
                             "native CUDA decode graph capture disabled for this generation: {reason}"
                         );
@@ -759,6 +799,7 @@ impl DecodeCudaState {
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+                fallback_report: self.graph_fallback_report.clone(),
             },
         }
     }
@@ -1091,6 +1132,36 @@ fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, TensorData};
+
+    #[test]
+    fn capture_fallback_emits_each_structured_decline_to_tracer() {
+        let report = CaptureDeclineReport {
+            entries: vec![onnx_runtime_session::CaptureDecline {
+                node_id: Some(12),
+                op_type: "GroupQueryAttention".to_string(),
+                domain: "com.microsoft".to_string(),
+                reason:
+                    "requires warmed f32 q_seq==1 k_seq==1 fixed-capacity device-KV reference path"
+                        .to_string(),
+            }],
+        };
+        let (trace, events) = TraceContext::in_memory();
+
+        trace_capture_declines(&trace, &report);
+
+        let events = events.events();
+        assert_eq!(events.len(), 1);
+        let args = events[0].args.as_ref().unwrap();
+        assert_eq!(args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_NODE], 12);
+        assert_eq!(
+            args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_OP],
+            "GroupQueryAttention"
+        );
+        assert_eq!(
+            args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_REASON],
+            report.entries[0].reason
+        );
+    }
 
     fn insert_op(
         graph: &mut Graph,

@@ -888,8 +888,14 @@ impl Kernel for ReduceKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-shape ReduceSum path with stable device-resident axes metadata",
+            )
+        }
     }
 }
 

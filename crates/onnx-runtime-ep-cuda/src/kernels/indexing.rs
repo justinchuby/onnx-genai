@@ -286,8 +286,10 @@ impl Kernel for GatherElementsKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "GatherElements allocates/uploads/frees per-call indexing metadata and synchronizes the stream",
+        )
     }
 }
 
@@ -441,7 +443,9 @@ impl Kernel for ScatterElementsKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "ScatterElements allocates/uploads/frees per-call indexing metadata and synchronizes the stream",
+        )
     }
 }

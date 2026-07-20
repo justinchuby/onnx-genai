@@ -37,6 +37,18 @@ pub const ARG_FASTPATH_REJECTED_REASON: &str = "fastpath_rejected_reason";
 /// was rejected (§46.6). See [`Args::missed_fastpath`].
 pub const ARG_CHOSEN_KERNEL: &str = "chosen_kernel";
 
+/// Trace-arg key carrying the numeric graph node id that rejected capture.
+pub const ARG_CAPTURE_REJECTED_NODE: &str = "capture_rejected_node";
+
+/// Trace-arg key carrying the rejected node's operator type.
+pub const ARG_CAPTURE_REJECTED_OP: &str = "capture_rejected_op";
+
+/// Trace-arg key carrying the rejected node's canonical operator domain.
+pub const ARG_CAPTURE_REJECTED_DOMAIN: &str = "capture_rejected_domain";
+
+/// Trace-arg key carrying **why** the node could not participate in capture.
+pub const ARG_CAPTURE_REJECTED_REASON: &str = "capture_rejected_reason";
+
 /// A builder for the JSON `args` object attached to a trace event.
 ///
 /// Cheap to construct (`Args::new` allocates an empty map) and cheap to move.
@@ -141,6 +153,21 @@ impl Args {
         self.with(ARG_CHOSEN_KERNEL, chosen.into())
     }
 
+    /// Record the structured device-graph capture-decline contract.
+    #[must_use]
+    pub fn capture_rejected(
+        self,
+        node_id: u32,
+        op_type: impl Into<String>,
+        domain: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.with(ARG_CAPTURE_REJECTED_NODE, u64::from(node_id))
+            .with(ARG_CAPTURE_REJECTED_OP, op_type.into())
+            .with(ARG_CAPTURE_REJECTED_DOMAIN, domain.into())
+            .with(ARG_CAPTURE_REJECTED_REASON, reason.into())
+    }
+
     /// Record the source endpoint of a transfer, e.g. `"cuda:0"`.
     #[must_use]
     pub fn src(self, src: impl Into<String>) -> Self {
@@ -199,5 +226,55 @@ impl std::ops::Index<&str> for Args {
     /// absent, matching [`serde_json::Value`]'s own indexing contract.
     fn index(&self, key: &str) -> &Self::Output {
         &self.0[key]
+    }
+}
+
+/// Emit one instant event for a node that forced device-graph fallback.
+///
+/// No allocation or clock read occurs when `ctx` is disabled.
+pub fn capture_rejected(
+    ctx: &crate::TraceContext,
+    node_id: u32,
+    op_type: impl Into<String>,
+    domain: impl Into<String>,
+    reason: impl Into<String>,
+) {
+    if !ctx.is_enabled() {
+        return;
+    }
+    let op_type = op_type.into();
+    let domain = domain.into();
+    let name = format!("{domain}::{op_type} node#{node_id}");
+    let args = Args::new().capture_rejected(node_id, op_type, domain, reason);
+    ctx.instant(name, "graph_capture", Some(args));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_rejected_emits_structured_reason() {
+        let (ctx, events) = crate::TraceContext::in_memory();
+
+        capture_rejected(
+            &ctx,
+            7,
+            "MatMulNBits",
+            "com.microsoft",
+            "requires M==1 decode GEMV without group_indices",
+        );
+
+        let events = events.events();
+        assert_eq!(events.len(), 1);
+        let args = events[0].args.as_ref().unwrap();
+        assert_eq!(events[0].cat, "graph_capture");
+        assert_eq!(args[ARG_CAPTURE_REJECTED_NODE], 7);
+        assert_eq!(args[ARG_CAPTURE_REJECTED_OP], "MatMulNBits");
+        assert_eq!(args[ARG_CAPTURE_REJECTED_DOMAIN], "com.microsoft");
+        assert_eq!(
+            args[ARG_CAPTURE_REJECTED_REASON],
+            "requires M==1 decode GEMV without group_indices"
+        );
     }
 }

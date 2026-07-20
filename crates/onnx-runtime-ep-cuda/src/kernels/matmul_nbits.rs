@@ -759,11 +759,17 @@ impl Kernel for MatMulNBitsKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // The m=1 no-g_idx GEMV is allocation-, D2H-, and synchronization-free.
         // Prefill GEMM allocates/frees scratch buffers and synchronizes, while
         // g_idx validation performs D2H, so those paths must report false.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires M==1 decode GEMV without group_indices; prefill allocates scratch and group_indices validation reads D2H",
+            )
+        }
     }
 }
 

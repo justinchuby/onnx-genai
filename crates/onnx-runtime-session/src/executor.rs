@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion,
+    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion, Kernel,
     KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking,
     TensorMut, TensorView, WeightHandle,
 };
@@ -163,14 +163,100 @@ pub struct DeviceAllocationCounts {
     pub frees: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// One actionable reason a device-graph capture attempt was rejected.
+pub struct CaptureDecline {
+    /// Graph node id, or `None` for graph/capture-lifecycle requirements.
+    pub node_id: Option<u32>,
+    /// ONNX operator type, or `"<graph>"` for graph-level requirements.
+    pub op_type: String,
+    /// Canonical ONNX domain (`"ai.onnx"` by default), or `"nxrt"` graph-level.
+    pub domain: String,
+    /// Failed precondition and, where applicable, how to reach the capture path.
+    pub reason: String,
+}
+
+impl CaptureDecline {
+    fn node(node_id: NodeId, node: &Node, reason: impl Into<String>) -> Self {
+        Self {
+            node_id: Some(node_id.0),
+            op_type: node.op_type.clone(),
+            domain: canonical_domain(node),
+            reason: reason.into(),
+        }
+    }
+
+    fn graph(reason: impl Into<String>) -> Self {
+        Self {
+            node_id: None,
+            op_type: "<graph>".to_string(),
+            domain: "nxrt".to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Structured reasons a device graph could not be captured.
+pub struct CaptureDeclineReport {
+    /// All graph- and node-level declines found by the pre-capture audit.
+    pub entries: Vec<CaptureDecline>,
+}
+
+impl CaptureDeclineReport {
+    fn one(decline: CaptureDecline) -> Self {
+        Self {
+            entries: vec![decline],
+        }
+    }
+
+    /// Whether the capture audit found no declines.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl std::fmt::Display for CaptureDeclineReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CUDA graph capture rejected")?;
+        for (index, decline) in self.entries.iter().enumerate() {
+            if index == 0 {
+                write!(f, ": ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+            match decline.node_id {
+                Some(node_id) => write!(
+                    f,
+                    "node {node_id} ({}::{}) — {}",
+                    decline.domain, decline.op_type, decline.reason
+                )?,
+                None => write!(f, "{} — {}", decline.op_type, decline.reason)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 pub enum DeviceGraphCaptureResult {
     Captured(Vec<Option<Tensor>>),
-    NotCapturable(String),
+    NotCapturable(CaptureDeclineReport),
 }
 
 enum ScopedRunResult {
     Executed(Vec<Option<Tensor>>),
-    NotCapturable(String),
+    NotCapturable(CaptureDeclineReport),
+}
+
+fn kernel_capture_decline(
+    node_id: NodeId,
+    node: &Node,
+    kernel: &dyn Kernel,
+) -> Option<CaptureDecline> {
+    kernel
+        .capture_support()
+        .reason()
+        .map(|reason| CaptureDecline::node(node_id, node, reason))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1862,14 +1948,16 @@ impl Executor {
             if let Err(error) = execution {
                 let _ = end;
                 let _ = self.ep.reset_device_graph();
-                return Ok(ScopedRunResult::NotCapturable(format!(
-                    "kernel execution rejected CUDA graph capture: {error}"
+                return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                    CaptureDecline::graph(format!(
+                        "kernel execution rejected CUDA graph capture: {error}"
+                    )),
                 )));
             }
             if let Err(error) = end {
                 let _ = self.ep.reset_device_graph();
-                return Ok(ScopedRunResult::NotCapturable(format!(
-                    "ending CUDA graph capture failed: {error}"
+                return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                    CaptureDecline::graph(format!("ending CUDA graph capture failed: {error}")),
                 )));
             }
             if let Err(error) = self.ep.replay_device_graph() {
@@ -1923,51 +2011,45 @@ impl Executor {
         &self,
         resolved: &HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
-    ) -> std::result::Result<(), String> {
-        if self.plan.iter().any(|plan| {
-            let node = self.graph.node(plan.node_id);
-            is_control_flow_op(&node.op_type, &node.domain)
-                || is_sequence_op(&node.op_type, &node.domain)
-        }) {
-            return Err("control-flow and sequence nodes are not device-graph capturable".into());
-        }
+    ) -> std::result::Result<(), CaptureDeclineReport> {
+        let mut report = CaptureDeclineReport::default();
         if self
             .graph
             .outputs
             .iter()
             .any(|output| !external.outputs.contains_key(output))
         {
-            return Err(
-                "every graph output must use a persistent device binding during capture".into(),
-            );
+            report.entries.push(CaptureDecline::graph(
+                "every graph output must use a persistent device binding during capture",
+            ));
         }
 
         let mut kernels = Vec::<&dyn onnx_runtime_ep_api::Kernel>::with_capacity(self.plan.len());
-        let mut incompatible = Vec::new();
         for plan in &self.plan {
+            let node = self.graph.node(plan.node_id);
+            if is_control_flow_op(&node.op_type, &node.domain)
+                || is_sequence_op(&node.op_type, &node.domain)
+            {
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "control-flow and sequence nodes are not device-graph capturable",
+                ));
+                continue;
+            }
             if plan
                 .outputs
                 .iter()
                 .any(|output| !resolved.contains_key(output))
             {
-                let node = self.graph.node(plan.node_id);
-                let domain = if node.domain.is_empty() {
-                    "ai.onnx"
-                } else {
-                    node.domain.as_str()
-                };
-                let name = if node.name.is_empty() {
-                    "<unnamed>"
-                } else {
-                    node.name.as_str()
-                };
-                return Err(format!(
-                    "node {} {name:?} ({domain}::{}) has a data-dependent output shape that was \
-                     unresolved before capture",
-                    plan.node_id.0, node.op_type
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "data-dependent output shape was unresolved before capture",
                 ));
+                continue;
             }
-            let input_shapes = plan
+            let Some(input_shapes) = plan
                 .inputs
                 .iter()
                 .map(|input| {
@@ -1976,50 +2058,42 @@ impl Executor {
                         .unwrap_or(Some(Vec::new()))
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    format!(
-                        "node {} has a data-dependent shape that was unresolved before capture",
-                        plan.node_id.0
-                    )
-                })?;
+            else {
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "data-dependent input shape was unresolved before capture",
+                ));
+                continue;
+            };
             let key = KernelKey {
                 node: plan.node_id.0,
                 shapes: input_shapes,
             };
-            let kernel = self.cache.entries.get(&key).ok_or_else(|| {
-                format!(
-                    "node {} has not been warmed for the requested capture shape",
-                    plan.node_id.0
-                )
-            })?;
-            if !kernel.cuda_graph_compatible() {
-                let node = self.graph.node(plan.node_id);
-                let domain = if node.domain.is_empty() {
-                    "ai.onnx"
-                } else {
-                    node.domain.as_str()
-                };
-                let name = if node.name.is_empty() {
-                    "<unnamed>"
-                } else {
-                    node.name.as_str()
-                };
-                incompatible.push(format!(
-                    "node {} {name:?} ({domain}::{})",
-                    plan.node_id.0, node.op_type
+            let Some(kernel) = self.cache.entries.get(&key) else {
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "kernel has not been warmed for the requested capture shape",
                 ));
+                continue;
+            };
+            if let Some(decline) = kernel_capture_decline(plan.node_id, node, kernel.as_ref()) {
+                report.entries.push(decline);
+                continue;
             }
             kernels.push(kernel.as_ref());
         }
-        if !incompatible.is_empty() {
-            return Err(format!(
-                "CUDA graph capture rejected before begin_capture: incompatible kernels: {}",
-                incompatible.join(", ")
-            ));
+        if !report.is_empty() {
+            return Err(report);
         }
         self.ep
             .begin_device_graph_capture(&kernels)
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                CaptureDeclineReport::one(CaptureDecline::graph(format!(
+                    "execution provider rejected begin_capture: {error}"
+                )))
+            })
     }
 
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
@@ -4628,10 +4702,55 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use onnx_runtime_ep_api::{
-        Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel, NegotiatedWeight,
+        CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
+        NegotiatedWeight,
     };
 
     use super::*;
+
+    struct CaptureDecliningKernel;
+
+    impl Kernel for CaptureDecliningKernel {
+        fn execute(
+            &self,
+            _inputs: &[TensorView],
+            _outputs: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::unsupported(
+                "requires M==1 decode GEMV without group_indices; got a prefill signature",
+            )
+        }
+    }
+
+    #[test]
+    fn kernel_capture_reason_propagates_into_structured_report() {
+        let mut node = Node::new(NodeId(9), "MatMulNBits", vec![], vec![]);
+        node.domain = "com.microsoft".to_string();
+        let decline =
+            kernel_capture_decline(node.id, &node, &CaptureDecliningKernel).expect("decline");
+        let report = CaptureDeclineReport::one(decline);
+
+        assert_eq!(
+            report.entries,
+            vec![CaptureDecline {
+                node_id: Some(9),
+                op_type: "MatMulNBits".to_string(),
+                domain: "com.microsoft".to_string(),
+                reason: "requires M==1 decode GEMV without group_indices; got a prefill signature"
+                    .to_string(),
+            }]
+        );
+        assert!(report.to_string().contains("node 9"));
+        assert!(
+            report
+                .to_string()
+                .contains("requires M==1 decode GEMV without group_indices")
+        );
+    }
 
     #[test]
     fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_shapes() {

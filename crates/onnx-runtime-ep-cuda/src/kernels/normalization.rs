@@ -487,10 +487,14 @@ impl Kernel for LayerNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        // Only a successfully warmed single-group decode has compiled its NVRTC
-        // module and proven the next fixed-shape call launch-only.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "LayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -640,10 +644,14 @@ impl Kernel for RmsNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        // Only a successfully warmed single-group decode has compiled its NVRTC
-        // module and proven the next fixed-shape call launch-only.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SimplifiedLayerNormalization/RMSNorm shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -888,10 +896,14 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        // True only after a single-group decode warmed the NVRTC module and the
-        // shape-keyed metadata allocation/upload; prefill and unwarmed calls stay false.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SkipSimplifiedLayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -1070,10 +1082,14 @@ impl Kernel for SkipLayerNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        // Only a successfully warmed single-group decode has compiled its NVRTC
-        // module and proven the next fixed-shape call launch-only.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SkipLayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 

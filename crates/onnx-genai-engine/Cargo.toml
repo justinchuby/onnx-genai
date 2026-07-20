@@ -13,6 +13,7 @@ default = []
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "dep:onnx-runtime-session",
+    "dep:onnx-runtime-tracer",
 ]
 mlas = [
     "native-backend",
@@ -47,6 +48,7 @@ onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
+onnx-runtime-tracer = { workspace = true, optional = true }
 prost = { version = "0.13" }
 memmap2 = "0.9"
 tokio = { workspace = true }

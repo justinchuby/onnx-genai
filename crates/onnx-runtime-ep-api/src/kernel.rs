@@ -117,6 +117,67 @@ impl KernelMatch {
     }
 }
 
+/// Whether a compiled kernel can participate in device-graph capture.
+///
+/// As with [`KernelMatch`], a decline reason travels with the decision that
+/// produced it. EPs must not maintain a separate reason table: capture
+/// eligibility is often shape-, dtype-, warmup-, or implementation-dependent,
+/// so separating the reason from the predicate would let diagnostics drift.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureSupport {
+    /// The kernel's warmed execution path satisfies the device-graph contract.
+    Supported,
+    /// The kernel cannot currently be captured.
+    Unsupported {
+        /// Actionable explanation of the failed capture precondition.
+        reason: Cow<'static, str>,
+    },
+}
+
+impl CaptureSupport {
+    /// Construct an unsupported result with its actionable decline reason.
+    pub fn unsupported(reason: impl Into<Cow<'static, str>>) -> Self {
+        Self::Unsupported {
+            reason: reason.into(),
+        }
+    }
+
+    /// Whether the kernel can currently participate in device-graph capture.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// The kernel's capture-decline reason, or `None` when capture is supported.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Decline the current capture-support query with an actionable reason.
+///
+/// Formatting is evaluated only on the decline path.
+#[macro_export]
+macro_rules! decline_capture {
+    ($($arg:tt)+) => {
+        return $crate::CaptureSupport::unsupported(format!($($arg)+))
+    };
+}
+
+/// Require a capture precondition, declining with an actionable reason when false.
+///
+/// Formatting is evaluated only when the condition fails.
+#[macro_export]
+macro_rules! require_capture {
+    ($condition:expr, $($arg:tt)+) => {
+        if !$condition {
+            $crate::decline_capture!($($arg)+);
+        }
+    };
+}
+
 /// Decline the current `supports_op` call with an actionable reason.
 ///
 /// Formatting is evaluated only on the decline path.
@@ -259,9 +320,21 @@ pub trait Kernel: Send {
         None
     }
 
-    /// Whether this kernel can be captured inside a CUDA graph.
+    /// Whether this kernel can participate in device-graph capture.
+    ///
+    /// The provided default is supported because capture is a runtime/EP
+    /// capability: kernels that need restrictions override this method and
+    /// return the exact failed precondition.
+    fn capture_support(&self) -> CaptureSupport {
+        CaptureSupport::Supported
+    }
+
+    /// Compatibility shim for existing CUDA-graph callers.
+    ///
+    /// New capture gates must use [`Kernel::capture_support`] so a decline
+    /// reason is never discarded.
     fn cuda_graph_compatible(&self) -> bool {
-        false
+        self.capture_support().is_supported()
     }
 }
 
@@ -321,6 +394,39 @@ mod tests {
         let rejected = require_positive(-2);
         assert_eq!(rejected.reason(), Some("value must be positive, got -2"));
         assert!(require_positive(2).is_supported());
+    }
+
+    struct DecliningCaptureKernel;
+
+    impl Kernel for DecliningCaptureKernel {
+        fn execute(&self, _inputs: &[TensorView], _outputs: &mut [TensorMut]) -> Result<()> {
+            Ok(())
+        }
+
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::unsupported("per-call workspace allocation is not capturable")
+        }
+    }
+
+    #[test]
+    fn cuda_graph_compatible_shim_matches_capture_support() {
+        let supported = LegacyKernel {
+            called: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            supported.cuda_graph_compatible(),
+            supported.capture_support().is_supported()
+        );
+
+        let unsupported = DecliningCaptureKernel;
+        assert_eq!(
+            unsupported.cuda_graph_compatible(),
+            unsupported.capture_support().is_supported()
+        );
+        assert_eq!(
+            unsupported.capture_support().reason(),
+            Some("per-call workspace allocation is not capturable")
+        );
     }
 
     struct LegacyKernel {

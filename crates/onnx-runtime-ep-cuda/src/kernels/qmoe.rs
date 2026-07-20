@@ -1275,8 +1275,10 @@ impl Kernel for QMoEKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "QMoE performs data-dependent expert routing and per-call workspace management",
+        )
     }
 }
 

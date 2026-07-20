@@ -244,7 +244,13 @@ impl Kernel for GatherKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-shape int64-index Gather path with device-side bounds validation",
+            )
+        }
     }
 }

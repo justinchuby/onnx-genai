@@ -125,7 +125,11 @@ pub mod cupti;
 #[cfg(feature = "perfetto")]
 pub mod perfetto;
 
-pub use args::{ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON, ARG_OPTIMIZED_CANDIDATE, Args};
+pub use args::{
+    ARG_CAPTURE_REJECTED_DOMAIN, ARG_CAPTURE_REJECTED_NODE, ARG_CAPTURE_REJECTED_OP,
+    ARG_CAPTURE_REJECTED_REASON, ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON,
+    ARG_OPTIMIZED_CANDIDATE, Args, capture_rejected,
+};
 pub use clock::{TraceClock, TraceSessionId};
 pub use collector::{
     CompositeCollector, DEFAULT_MAX_EVENTS, FileCollector, MemoryCollector, NoopCollector,
