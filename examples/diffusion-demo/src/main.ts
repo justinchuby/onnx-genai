@@ -571,6 +571,11 @@ function render() {
     .then((r) => r.json())
     .then((s) => {
       if (s && s.metadata && !loadedMeta) showViz(s.metadata as Metadata);
+      // Also prefill the "Load config" box with the active package's native
+      // config so it is visible and editable on load (not just the DAG view).
+      if (s && s.metadata && !ta.value.trim()) {
+        ta.value = JSON.stringify(s.metadata, null, 2);
+      }
       const st = s?.settings;
       if (st) {
         const set = (k: string, v: unknown) => {
