@@ -17,6 +17,7 @@ pub use onnx_genai_engine::{
     GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
     GenerateTokenCallback, GreedySampler, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, Sampler, SessionId,
-    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
-    StopSequence, TokenId,
+    SpeculativeAcceptContext, SpeculativeGenerationTrace, SpeculativeIterationTrace,
+    SpeculativeMode, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
+    SpeculativeTraceFamily, StopSequence, TokenId,
 };
