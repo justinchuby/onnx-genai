@@ -37,6 +37,7 @@ mod flash_attention;
 pub mod fused_gemm;
 pub mod gather;
 pub mod gemm;
+mod gqa_decode;
 pub mod group_query_attention;
 pub mod indexing;
 pub mod matmul;
