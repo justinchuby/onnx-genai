@@ -35,6 +35,8 @@ pub struct MatMulNBitsKernel {
     weight_nk: OnceLock<Vec<f32>>,
     int8_weight: OnceLock<Int8Weight>,
     packed_int4_weight: OnceLock<PackedInt4Weight>,
+    #[cfg(feature = "mlas")]
+    mlas_packed: OnceLock<Option<mlas_sys::SQNBitPackedB>>,
 }
 
 struct Int8Weight {
@@ -88,6 +90,8 @@ impl KernelFactory for MatMulNBitsFactory {
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
+            #[cfg(feature = "mlas")]
+            mlas_packed: OnceLock::new(),
         }))
     }
 }
@@ -161,6 +165,22 @@ impl Kernel for MatMulNBitsKernel {
         let m = numel(&a_shape[..a_shape.len() - 1]);
         let mut result = vec![0.0f32; m * self.n];
         let dot_kernel = selected_dot_kernel();
+        #[cfg(feature = "mlas")]
+        {
+            if let Some(()) = self.try_mlas_sqnbit(
+                &inputs[1],
+                &inputs[2],
+                zero_points,
+                group_indices,
+                can_prepack,
+                &activations,
+                m,
+                bias.as_deref(),
+                &mut result,
+            )? {
+                return write_dense_f32(&mut outputs[0], &result);
+            }
+        }
         if self.bits == 4
             && self.accuracy_level == 4
             && m == 1
@@ -290,6 +310,98 @@ impl Kernel for MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
+    /// Route the blockwise-quantized MatMul through MLAS's `MlasQNBitGemmBatch`
+    /// when the `mlas` feature is on, the backend resolves to
+    /// [`CpuBackend::Mlas`], and the case is one MLAS supports. Returns
+    /// `Ok(Some(()))` when it filled `result` (the caller writes output and
+    /// returns), or `Ok(None)` to signal a fall back to the hand-written paths.
+    ///
+    /// Fallback cases (return `Ok(None)`): backend is not MLAS, `bits != 4`
+    /// (2-bit is left to the existing correctness path), `g_idx` is present
+    /// (MLAS SQNBit has no per-row group indices), or MLAS reports no kernel is
+    /// available for this shape on the host. Bias, when present, is added by
+    /// MLAS itself, so the caller's post-loop bias add is skipped on this path.
+    #[cfg(feature = "mlas")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_mlas_sqnbit(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        can_prepack: bool,
+        activations: &[f32],
+        m: usize,
+        bias: Option<&[f32]>,
+        result: &mut [f32],
+    ) -> Result<Option<()>> {
+        use crate::backend::CpuBackend;
+
+        if self.bits != 4
+            || group_indices.is_some()
+            || CpuBackend::auto_detect() != CpuBackend::Mlas
+        {
+            return Ok(None);
+        }
+
+        let comp = if self.accuracy_level == 4 {
+            mlas_sys::SQNBitComputeType::Int8
+        } else {
+            mlas_sys::SQNBitComputeType::Fp32
+        };
+
+        let owned;
+        let packed_ref: Option<&mlas_sys::SQNBitPackedB> = if can_prepack {
+            if let Some(cached) = self.mlas_packed.get() {
+                cached.as_ref()
+            } else {
+                let built = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+                let _ = self.mlas_packed.set(built);
+                self.mlas_packed
+                    .get()
+                    .expect("constant MatMulNBits MLAS weight was just initialized")
+                    .as_ref()
+            }
+        } else {
+            owned = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+            owned.as_ref()
+        };
+
+        let Some(packed_weight) = packed_ref else {
+            return Ok(None);
+        };
+
+        mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true);
+        Ok(Some(()))
+    }
+
+    /// Pack the constant int4 weight into MLAS's SQNBit layout, or `None` when
+    /// MLAS has no kernel for this `(bits, block_size, compute_type)` on the
+    /// host. The ONNX `B`/scales/zero-point bytes map directly onto MLAS's pack
+    /// inputs; an absent zero point defaults to the shared int4 midpoint (8).
+    #[cfg(feature = "mlas")]
+    fn build_mlas_packed(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Result<Option<mlas_sys::SQNBitPackedB>> {
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_f32(scales)?;
+        let zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        Ok(mlas_sys::SQNBitPackedB::new(
+            self.n,
+            self.k,
+            self.bits,
+            self.block_size,
+            comp,
+            &packed,
+            &scales,
+            zero_points.as_deref(),
+        ))
+    }
+
     fn prepack_int8_weight(
         &self,
         packed: &TensorView,
@@ -1092,6 +1204,8 @@ mod tests {
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
+            #[cfg(feature = "mlas")]
+            mlas_packed: OnceLock::new(),
         }
     }
 
@@ -2023,5 +2137,270 @@ mod tests {
         let message = format!("{error}");
         assert!(message.contains("weight_prepacked=1"));
         assert!(message.contains("standard (non-prepacked) layout"));
+    }
+
+    #[cfg(feature = "mlas")]
+    fn mlas_close(actual: &[f32], expected: &[f32], tol: f32, ctx: &str) {
+        assert_eq!(actual.len(), expected.len());
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            let diff = (a - e).abs();
+            let rel = diff / e.abs().max(1.0);
+            assert!(
+                diff <= tol || rel <= tol,
+                "{ctx}: index {i} mlas={a} ref={e} diff={diff}"
+            );
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn pseudo(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 * 0.017 + seed).sin()) * 1.5)
+            .collect()
+    }
+
+    /// The MLAS SQNBit path (`build_mlas_packed` + `mlas_sys::sqnbit_gemm`, the
+    /// exact code `execute` runs when the backend is MLAS) must match the
+    /// existing dequantize-then-GEMM oracle across block sizes, symmetric and
+    /// asymmetric zero points, decode (M=1) and prefill (M>1), both compute
+    /// types (`accuracy_level` 0 → CompFp32, 4 → CompInt8), and bias.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_mlas_matches_dequant_reference() {
+        let (n, k) = (96usize, 256usize);
+        for &block_size in &[32usize, 64, 128] {
+            let k_blocks = k.div_ceil(block_size);
+            let blob = block_size / 2;
+            let weights_nk = pseudo(n * k, 0.3);
+            for &asymmetric in &[false, true] {
+                let (packed, scales, zps, _dq) =
+                    quantize(&weights_nk, n, k, block_size, asymmetric);
+                let ref_weights =
+                    dequantize_reference(&packed, &scales, zps.as_deref(), n, k, block_size);
+                let b = Owned::u8(&[n, k_blocks, blob], &packed);
+                let scales_t = Owned::f32(&[n, k_blocks], &scales);
+                let zp_owned = zps
+                    .as_ref()
+                    .map(|z| Owned::u8(&[n, k_blocks.div_ceil(2)], z));
+
+                for &accuracy_level in &[0i64, 4] {
+                    let comp = if accuracy_level == 4 {
+                        mlas_sys::SQNBitComputeType::Int8
+                    } else {
+                        mlas_sys::SQNBitComputeType::Fp32
+                    };
+                    let kernel = MatMulNBitsKernel {
+                        accuracy_level,
+                        ..test_kernel(k, n, block_size)
+                    };
+                    let zp_view = zp_owned.as_ref().map(|z| z.view());
+                    let Some(packed_weight) = kernel
+                        .build_mlas_packed(&b.view(), &scales_t.view(), zp_view.as_ref(), comp)
+                        .unwrap()
+                    else {
+                        eprintln!(
+                            "MLAS SQNBit int4 blk={block_size} {comp:?} unavailable; skipping"
+                        );
+                        continue;
+                    };
+                    for &m in &[1usize, 5] {
+                        let a = pseudo(m * k, 0.8);
+                        for bias in [None, Some(pseudo(n, 0.1))] {
+                            let mut out = vec![0.0f32; m * n];
+                            mlas_sys::sqnbit_gemm(
+                                &packed_weight,
+                                m,
+                                &a,
+                                bias.as_deref(),
+                                &mut out,
+                                true,
+                            );
+                            let mut expected = reference(&a, &ref_weights, m, k, n);
+                            if let Some(bias) = &bias {
+                                for row in expected.chunks_exact_mut(n) {
+                                    for (v, b) in row.iter_mut().zip(bias) {
+                                        *v += b;
+                                    }
+                                }
+                            }
+                            // CompInt8 quantizes A to int8, so it needs a looser
+                            // tolerance than the near-exact CompFp32 dequant.
+                            let tol = if accuracy_level == 4 { 6e-2 } else { 2e-3 };
+                            mlas_close(
+                                &out,
+                                &expected,
+                                tol,
+                                &format!(
+                                    "blk{block_size} asym{asymmetric} acc{accuracy_level} m{m} bias{}",
+                                    bias.is_some()
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `try_mlas_sqnbit` must fall back (return `Ok(None)`) for cases MLAS
+    /// SQNBit cannot serve: `g_idx` present (no per-row group indices) and
+    /// `bits == 2` (left to the correctness path). These guards short-circuit
+    /// ahead of backend detection, so the decision is deterministic.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_try_mlas_falls_back_for_gidx_and_bits2() {
+        let (n, k, block_size) = (2usize, 32usize, 32usize);
+        let k_blocks = k.div_ceil(block_size);
+        let a = vec![0.5f32; k];
+        let mut result = vec![0.0f32; n];
+
+        // int4 with g_idx present → fall back.
+        let kernel = test_kernel(k, n, block_size);
+        let b = Owned::u8(
+            &[n, k_blocks, block_size / 2],
+            &vec![0x88; n * k_blocks * block_size / 2],
+        );
+        let scales = Owned::f32(&[n, k_blocks], &vec![1.0; n * k_blocks]);
+        let g_idx: Vec<i32> = (0..k).map(|i| (i / block_size) as i32).collect();
+        let g_idx = Owned::i32(&[k], &g_idx);
+        assert_eq!(
+            kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales.view(),
+                    None,
+                    Some(&g_idx.view()),
+                    false,
+                    &a,
+                    1,
+                    None,
+                    &mut result,
+                )
+                .unwrap(),
+            None,
+            "g_idx present must fall back",
+        );
+
+        // bits == 2 → fall back.
+        let blob2 = block_size / 4;
+        let kernel2 = MatMulNBitsKernel {
+            bits: 2,
+            ..test_kernel(k, n, block_size)
+        };
+        let b2 = Owned::u8(&[n, k_blocks, blob2], &vec![0x55; n * k_blocks * blob2]);
+        assert_eq!(
+            kernel2
+                .try_mlas_sqnbit(
+                    &b2.view(),
+                    &scales.view(),
+                    None,
+                    None,
+                    false,
+                    &a,
+                    1,
+                    None,
+                    &mut result,
+                )
+                .unwrap(),
+            None,
+            "bits==2 must fall back",
+        );
+    }
+
+    /// Before/after perf for int4 MatMulNBits: the existing hand-written VNNI
+    /// path (`int4_matmul_m1` for M=1 decode, `int8_matmul` for M>1 prefill,
+    /// both `accuracy_level=4`) vs the MLAS SQNBit CompInt8 path, at 1 and 8
+    /// threads, for representative LLM shapes. Ignored by default; run with:
+    ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
+    ///     matmulnbits_mlas_perf -- --ignored --nocapture
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn matmulnbits_mlas_perf() {
+        use std::time::Instant;
+
+        fn time<F: FnMut() + Send>(threads: usize, mut run: F) -> f64 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for _ in 0..20 {
+                    run();
+                }
+                let iters = 200u32;
+                let start = Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                start.elapsed().as_secs_f64() * 1e6 / iters as f64
+            })
+        }
+
+        let block_size = 32usize;
+        let dot_kernel = selected_dot_kernel();
+        for &(k, n) in &[(2048usize, 2048usize), (4096, 11008)] {
+            let k_blocks = k.div_ceil(block_size);
+            let blob = block_size / 2;
+            let weights_nk = pseudo(n * k, 0.3);
+            let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let b = Owned::u8(&[n, k_blocks, blob], &packed_bytes);
+            let scales_t = Owned::f32(&[n, k_blocks], &scales);
+            let int8_weight = kernel
+                .prepack_int8_weight(&b.view(), &scales_t.view(), None)
+                .unwrap();
+            let int4_weight = PackedInt4Weight {
+                values: packed_bytes.clone(),
+                scales: scales.clone(),
+            };
+            let mlas_packed = mlas_sys::SQNBitPackedB::new(
+                n,
+                k,
+                4,
+                block_size,
+                mlas_sys::SQNBitComputeType::Int8,
+                &packed_bytes,
+                &scales,
+                None,
+            )
+            .expect("MLAS SQNBit int4 must be available for the perf probe");
+
+            for &m in &[1usize, 32] {
+                let a = pseudo(m * k, 0.8);
+                for threads in [1usize, 8] {
+                    let hand_us = if m == 1 {
+                        time(threads, || {
+                            let mut out = vec![0.0f32; n];
+                            int4_matmul_m1(&a, &int4_weight, &mut out, k, n, dot_kernel);
+                        })
+                    } else {
+                        time(threads, || {
+                            let mut out = vec![0.0f32; m * n];
+                            int8_matmul(
+                                &a,
+                                &int8_weight,
+                                &mut out,
+                                m,
+                                k,
+                                n,
+                                block_size,
+                                dot_kernel,
+                            );
+                        })
+                    };
+                    let mlas_us = time(threads, || {
+                        let mut out = vec![0.0f32; m * n];
+                        mlas_sys::sqnbit_gemm(&mlas_packed, m, &a, None, &mut out, true);
+                    });
+                    eprintln!(
+                        "int4 K={k} N={n} M={m} {threads}t: hand={hand_us:.1}us mlas={mlas_us:.1}us \
+                         speedup={:.2}x",
+                        hand_us / mlas_us
+                    );
+                }
+            }
+        }
     }
 }

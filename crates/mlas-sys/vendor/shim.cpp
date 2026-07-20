@@ -18,6 +18,7 @@
 // Licensed under the MIT License.
 
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/inc/mlas_qnbit.h"
 
 #include <cstddef>
 #include <functional>
@@ -151,6 +152,123 @@ extern "C" void mlas_sgemm_pack_b(
         transA ? CblasTrans : CblasNoTrans,
         transB ? CblasTrans : CblasNoTrans,
         N, K, B, ldb, packed_b, nullptr);
+}
+
+// ---- Blocked n-bit quantized GEMM (SQNBitGemm) ------------------------------
+//
+// Plain-C wrappers over MLAS's templated `MlasQNBitGemmBatch<float>` and its
+// pack/query helpers so Rust can drive the int4/int8 blockwise-quantized
+// MatMulNBits decode path without binding the C++ template/struct directly.
+//
+// `comp_type` is the raw `MLAS_QNBIT_GEMM_COMPUTE_TYPE` value:
+//   0 = SQNBIT_CompFp32 (fp32 activation, fp32 accumulate)
+//   3 = SQNBIT_CompInt8 (int8 activation, int32 accumulate) -- accuracy_level=4.
+//
+// Threading: like the SGEMM shim, MLAS's own N/M tile partitioning is routed
+// through the registered Rust/Rayon parallel-for backend (`MlasStandalone*`
+// hooks above). `MlasQNBitGemmBatch` only takes its parallel branch when
+// `ThreadPool != nullptr`, so pass a non-null sentinel (the pointer is never
+// dereferenced in the standalone build -- `MlasGetMaximumThreadCount` and
+// `MlasTrySimpleParallel` both ignore it) to enable multi-threading.
+
+extern "C" int mlas_qnbit_gemm_available(size_t bits, size_t blk_len, int comp_type)
+{
+    return MlasIsQNBitGemmAvailable(
+               bits, blk_len, static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type))
+               ? 1
+               : 0;
+}
+
+extern "C" size_t mlas_qnbit_gemm_pack_b_size(
+    size_t n, size_t k, size_t bits, size_t blk_len, int has_zp, int comp_type)
+{
+    return MlasQNBitGemmPackQuantBDataSize(
+        n, k, bits, blk_len, has_zp != 0,
+        static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type),
+        /*BackendKernelSelectorConfig=*/nullptr);
+}
+
+extern "C" void mlas_qnbit_gemm_pack_b(
+    size_t n,
+    size_t k,
+    size_t bits,
+    size_t blk_len,
+    int comp_type,
+    const void* quant_b_data,
+    void* packed_b,
+    const void* quant_b_scale,
+    int has_zp,
+    const void* quant_b_zero_point)
+{
+    MlasQNBitGemmPackQuantBData(
+        n, k, bits, blk_len,
+        static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type),
+        quant_b_data,
+        packed_b,
+        quant_b_scale,
+        has_zp != 0,
+        quant_b_zero_point,
+        /*ThreadPool=*/nullptr,
+        /*BackendKernelSelectorConfig=*/nullptr);
+}
+
+extern "C" size_t mlas_qnbit_gemm_workspace_size(
+    size_t m, size_t n, size_t k, size_t bits, size_t blk_len, int has_zp, int comp_type)
+{
+    return MlasQNBitGemmBatchWorkspaceSize(
+        m, n, k, /*BatchN=*/1, bits, blk_len, has_zp != 0,
+        static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type),
+        /*BackendKernelSelectorConfig=*/nullptr);
+}
+
+extern "C" void mlas_qnbit_gemm(
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t bits,
+    size_t blk_len,
+    int comp_type,
+    const float* a,
+    size_t lda,
+    const void* packed_b,
+    const float* quant_b_scale,
+    int has_zp,
+    const void* quant_b_zero_point,
+    const float* bias,
+    float* c,
+    size_t ldc,
+    void* workspace,
+    int multithread)
+{
+    MLAS_QNBIT_GEMM_DATA_PARAMS<float> params;
+    params.A = a;
+    params.lda = lda;
+    params.Bias = bias;
+    params.C = c;
+    params.ldc = ldc;
+
+    const auto ct = static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type);
+    if (ct == SQNBIT_CompInt8) {
+        // The int8-compute path derives PackedQuantBData / QuantBScale /
+        // QuantBBlkSum from the combined workspace produced by
+        // MlasQNBitGemmPackQuantBData (which baked scale + zero point into the
+        // block sums), so only the workspace pointer is needed here.
+        params.QuantBDataWorkspace = packed_b;
+    } else {
+        // The fp32-compute path repacks only the quantized nibbles; scales and
+        // (optional) zero points are consumed at compute time in their original
+        // ONNX layout.
+        params.PackedQuantBData = static_cast<const std::byte*>(packed_b);
+        params.QuantBScale = quant_b_scale;
+        params.QuantBZeroPoint = has_zp != 0 ? quant_b_zero_point : nullptr;
+    }
+
+    MLAS_THREADPOOL* thread_pool =
+        multithread != 0 ? reinterpret_cast<MLAS_THREADPOOL*>(1) : nullptr;
+
+    MlasQNBitGemmBatch<float>(
+        m, n, k, /*BatchN=*/1, bits, blk_len, ct, &params, workspace, thread_pool,
+        /*BackendKernelSelectorConfig=*/nullptr);
 }
 
 extern "C" void mlas_sgemm_packed(
