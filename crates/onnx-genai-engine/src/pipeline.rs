@@ -4,7 +4,9 @@ use crate::decode::{
     DecodeState, clone_value, extract_next_token_logits, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
-use crate::engine::{Engine, EngineConfig, model_requires_native_backend};
+use crate::engine::{
+    Engine, EngineConfig, model_requires_native_backend, requested_decode_backend,
+};
 use crate::kv_bridge::infer_kv_model_info;
 use crate::logits::TokenId;
 use crate::processors::build_processor_chain;
@@ -149,10 +151,14 @@ impl PipelineEngine {
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
     ) -> anyhow::Result<Self> {
-        if config.decode_backend == EngineDecodeBackend::Native {
-            anyhow::bail!("native backend not supported for pipeline models");
+        let decode_backend = requested_decode_backend(config.decode_backend)?;
+        if decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!(
+                "native backend not supported for pipeline models; \
+                 set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort)"
+            );
         }
-        if config.decode_backend == EngineDecodeBackend::Auto {
+        if decode_backend == EngineDecodeBackend::Auto {
             let directory = PipelineModelDirectory::load(pipeline_dir)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
             for (component, model_path) in &directory.model_paths {

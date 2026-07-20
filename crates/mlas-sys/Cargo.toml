@@ -1,0 +1,17 @@
+[package]
+name = "mlas-sys"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "FEASIBILITY SPIKE: FFI bindings to a vendored subset of ONNX Runtime's MLAS f32 SGEMM. Not wired into the workspace."
+
+# Intentionally NOT a workspace member (see docs/MLAS_SYS_SPIKE.md). Kept
+# isolated so the spike cannot affect the default build.
+[lints]
+
+[dependencies]
+rayon = "1"
+
+[build-dependencies]
+cc = "1"

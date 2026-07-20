@@ -74,7 +74,7 @@ The optimization roadmap is:
 1. Prepack and cache weights to eliminate per-token weight re-densification.
 2. Add N-dimension-parallel GEMV for M=1 decode.
 3. Implement the quantized `MatMulNBits` path.
-4. Optionally add a BLAS/oneDNN backend.
+4. Continue improving the built-in SIMD GEMM backend.
 
 Comparisons with llama.cpp or vLLM are deferred until the native path is
 quantized and threaded; comparing today's fp32 scalar-oriented path would not be
@@ -82,8 +82,8 @@ representative.
 
 ## Perf pass 1 (2026-07-15)
 
-This pass added an initializer-only prepack seam and enabled the existing
-oneDNN GEMM backend in the native benchmark:
+This historical pass added an initializer-only prepack seam and benchmarked the
+now-removed oneDNN GEMM backend:
 
 - The session marks each kernel input as constant only when its `ValueId` is in
   `Graph::initializers`. `MatMul`, `FusedMatMulBias`, and `FusedGemm` may cache
@@ -92,10 +92,9 @@ oneDNN GEMM backend in the native benchmark:
 - Contiguous fp32 tensors are borrowed as `Cow<[f32]>` instead of copied.
   Non-f32 or strided constant operands are materialized once in a per-kernel
   `OnceLock<Vec<f32>>`.
-- `onnx-genai-bench` now has an `onednn` passthrough feature. Build with
-  `--features bench-native,onednn`; `CpuBackend::auto_detect()` then selects
-  `dnnl_sgemm`. Without that feature the pure-Rust Generic backend remains the
-  default/offline fallback.
+- The former native backend has since been removed because its benchmark
+  results did not justify its source-build dependencies. `SimdX86` is now the
+  default x86 fast path, with Generic as the portable fallback.
 
 The requested one-token, zero-warmup command was measured on the same 96-core
 host. The established earlier baseline was 29,500-30,438 ms/step; host load
@@ -105,7 +104,7 @@ during this pass made a same-session unmodified baseline slower:
 |---|---:|---:|
 | Unmodified Generic baseline | 36,673.970 | 1.00x |
 | Prepack/zero-copy, Generic | 40,134.062 | 0.91x |
-| Prepack/zero-copy + oneDNN | 32,044.370 | 1.14x |
+| Prepack/zero-copy + historical oneDNN | 32,044.370 | 1.14x |
 
 A two-token check (one prefill plus one decode continuation) measured
 36,564.846 ms/step for Generic and 31,487.407 ms/step for oneDNN, a 1.16x
@@ -114,9 +113,9 @@ oneDNN speedup. Generated token IDs stayed deterministic (`[7001]` and
 
 The code now removes the diagnosed repeated dense-copy path safely, but this
 host run did not show a standalone prepack speedup and the combined result did
-not reach the expected large gain. oneDNN verbose output confirmed
+not reach the expected large gain. Historical oneDNN verbose output confirmed
 `gemm_api` execution for all MatMuls, including the `5x1536 @ 1536x262144`
 head. Remaining work is to profile time outside primitive execution (including
-`dnnl_sgemm` setup and other tensor movement), implement quantized
+native GEMM setup and other tensor movement), implement quantized
 `MatMulNBits`, reduce attention cost, and investigate further threading where
-oneDNN is unavailable.
+the removed native backend is unavailable.

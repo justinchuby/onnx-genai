@@ -398,7 +398,10 @@ impl Engine {
         let decode_backend =
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?;
         if decode_backend == EngineDecodeBackend::Native {
-            return Self::from_native_model_directory(model_directory, config, &session_options);
+            return augment_backend_error(
+                Self::from_native_model_directory(model_directory, config, &session_options),
+                EngineDecodeBackend::Native,
+            );
         }
 
         // Auto-enable CUDA graph capture for models that will run the shared-KV
@@ -413,12 +416,15 @@ impl Engine {
 
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
-        let session = Session::new(
-            &environment,
-            &model_directory.model_path,
-            session_options.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e))?;
+        let session = augment_backend_error(
+            Session::new(
+                &environment,
+                &model_directory.model_path,
+                session_options.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e)),
+            EngineDecodeBackend::Ort,
+        )?;
 
         // Resolve inference metadata. Our own `inference_metadata.yaml` is the
         // canonical source of truth. When a model ships without it (e.g. the
@@ -1043,12 +1049,15 @@ impl Engine {
             .native_session
             .as_mut()
             .context("native decoder session is unavailable")?;
-        native_session.generate_with_callback(
-            &prompt_tokens,
-            &options,
-            &chain,
-            &self.tokenizer,
-            callback,
+        augment_backend_error(
+            native_session.generate_with_callback(
+                &prompt_tokens,
+                &options,
+                &chain,
+                &self.tokenizer,
+                callback,
+            ),
+            EngineDecodeBackend::Native,
         )
     }
 
@@ -2186,6 +2195,7 @@ fn resolve_decode_backend(
     model_path: &Path,
     requested: EngineDecodeBackend,
 ) -> anyhow::Result<EngineDecodeBackend> {
+    let requested = requested_decode_backend(requested)?;
     match requested {
         EngineDecodeBackend::Ort => Ok(EngineDecodeBackend::Ort),
         EngineDecodeBackend::Native => {
@@ -2197,7 +2207,9 @@ fn resolve_decode_backend(
             {
                 let _ = model_path;
                 anyhow::bail!(
-                    "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
+                    "native decoder backend requires building onnx-genai-engine with the \
+                     'native-backend' feature; set decode_backend = EngineDecodeBackend::Ort \
+                     (or ONNX_GENAI_BACKEND=ort) to run this model on ONNX Runtime"
                 )
             }
         }
@@ -2210,13 +2222,74 @@ fn resolve_decode_backend(
                 #[cfg(not(feature = "native-backend"))]
                 {
                     anyhow::bail!(
-                        "model contains native-only BlockQuantizedMatMul operators; rebuild with the 'native-backend' feature"
+                        "model contains native-only operators (pkg.nxrt::BlockQuantizedMatMul); \
+                         rebuild with the 'native-backend' feature and select \
+                         decode_backend = EngineDecodeBackend::Native \
+                         (or ONNX_GENAI_BACKEND=native)"
                     );
                 }
             }
             Ok(EngineDecodeBackend::Ort)
         }
     }
+}
+
+fn parse_backend_env(value: &str) -> anyhow::Result<EngineDecodeBackend> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(EngineDecodeBackend::Auto),
+        "ort" => Ok(EngineDecodeBackend::Ort),
+        "native" => Ok(EngineDecodeBackend::Native),
+        _ => anyhow::bail!(
+            "invalid ONNX_GENAI_BACKEND={value:?}; expected one of: auto, ort, native"
+        ),
+    }
+}
+
+fn requested_decode_backend_with_env(
+    requested: EngineDecodeBackend,
+    env_lookup: impl FnOnce() -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<EngineDecodeBackend> {
+    if requested != EngineDecodeBackend::Auto {
+        return Ok(requested);
+    }
+    env_lookup()?.map_or(Ok(EngineDecodeBackend::Auto), |value| {
+        parse_backend_env(&value)
+    })
+}
+
+pub(crate) fn requested_decode_backend(
+    requested: EngineDecodeBackend,
+) -> anyhow::Result<EngineDecodeBackend> {
+    requested_decode_backend_with_env(requested, || match std::env::var("ONNX_GENAI_BACKEND") {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to read ONNX_GENAI_BACKEND: {error}"
+        )),
+    })
+}
+
+fn ort_to_native_hint() -> &'static str {
+    "ONNX Runtime could not load this model; if it requires native execution, \
+     set decode_backend = EngineDecodeBackend::Native (or ONNX_GENAI_BACKEND=native)"
+}
+
+fn native_to_ort_hint() -> &'static str {
+    "if this model uses operators unsupported by the native backend, \
+     set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) \
+     to run this model on ONNX Runtime"
+}
+
+fn augment_backend_error<T>(
+    result: anyhow::Result<T>,
+    backend: EngineDecodeBackend,
+) -> anyhow::Result<T> {
+    let hint = match backend {
+        EngineDecodeBackend::Ort => ort_to_native_hint(),
+        EngineDecodeBackend::Native => native_to_ort_hint(),
+        EngineDecodeBackend::Auto => unreachable!("the selected backend cannot be Auto"),
+    };
+    result.with_context(|| hint)
 }
 
 pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result<bool> {
@@ -2372,35 +2445,6 @@ fn maybe_enable_cuda_graph(options: &mut SessionOptions, model_directory: &Model
     }
 }
 
-/// Models larger than this likely embed initializer data inline. Decoding them
-/// solely to inspect their graph would be needlessly expensive.
-const MAX_CONTROL_FLOW_SCAN_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Minimal protobuf views used to scan an ONNX graph's node `op_type`s without
-/// pulling in the full model proto (which lives behind the `native-backend`
-/// feature). prost silently ignores unknown fields, so only the traversed tags
-/// need declaring: `ModelProto.graph = 7`, `GraphProto.node = 1`,
-/// `NodeProto.op_type = 4`, and `NodeProto.domain = 7`.
-#[derive(Clone, PartialEq, prost::Message)]
-struct ScanModel {
-    #[prost(message, optional, tag = "7")]
-    graph: Option<ScanGraph>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ScanGraph {
-    #[prost(message, repeated, tag = "1")]
-    node: Vec<ScanNode>,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-struct ScanNode {
-    #[prost(string, tag = "4")]
-    op_type: String,
-    #[prost(string, tag = "7")]
-    domain: String,
-}
-
 /// Whether the ONNX model at `model_path` contains top-level control-flow nodes
 /// (`If`/`Loop`/`Scan`). ORT cannot capture a CUDA graph for such models, and
 /// requesting capture anyway (via the `enable_cuda_graph` provider option)
@@ -2411,30 +2455,80 @@ struct ScanNode {
 /// an optional optimization, so uncertain models conservatively skip it rather
 /// than risking ORT's pathological uncaptured per-Run path.
 fn model_has_control_flow_nodes(model_path: &Path) -> bool {
-    const CONTROL_FLOW_OPS: [&str; 3] = ["If", "Loop", "Scan"];
+    scan_top_level_control_flow(model_path).unwrap_or(true)
+}
 
-    match std::fs::metadata(model_path) {
-        // onnxruntime-genai / Foundry models keep weights in an external
-        // `model.onnx.data`, so the graph proto itself is small (a few MB).
-        // Avoid decoding an inline-weight model, but conservatively leave graph
-        // capture off because it may still contain control flow.
-        Ok(meta) if meta.len() > MAX_CONTROL_FLOW_SCAN_BYTES => return true,
-        Ok(_) => {}
-        Err(_) => return true,
-    }
-    let Ok(bytes) = std::fs::read(model_path) else {
-        return true;
-    };
+/// Control-flow op names that block CUDA graph capture, in the default ONNX
+/// domain (`""`/`ai.onnx`).
+const CONTROL_FLOW_OPS: [&str; 3] = ["If", "Loop", "Scan"];
+
+/// A deliberately minimal view of an ONNX `ModelProto` carrying only the fields
+/// needed to reach each top-level node's `op_type`/`domain`.
+///
+/// Every other field is *absent* from these structs — crucially
+/// `GraphProto.initializer` and its `TensorProto.raw_data`, which hold the
+/// multi-gigabyte inline weights of models like the qwen3 exports (whose
+/// `model.onnx` is over 1 GB). prost's decoder skips any field not declared here
+/// with `Buf::advance` (pointer arithmetic), so those weight bytes are never
+/// copied — and, when decoding from a memory map, never even faulted in. This
+/// keeps the scan cheap regardless of weight size while reusing prost's
+/// well-tested wire parser instead of a bespoke byte walker.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ScanModelProto {
+    /// `ModelProto.graph`. Repeated occurrences merge per protobuf semantics, so
+    /// nodes from every graph field accumulate here.
+    #[prost(message, optional, tag = "7")]
+    graph: Option<ScanGraphProto>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ScanGraphProto {
+    /// `GraphProto.node`. `initializer` (tag 5) and every other field is skipped.
+    #[prost(message, repeated, tag = "1")]
+    node: Vec<ScanNodeProto>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ScanNodeProto {
+    /// `NodeProto.op_type`.
+    #[prost(string, tag = "4")]
+    op_type: String,
+    /// `NodeProto.domain`. `attribute` (tag 5), which carries subgraph bodies, is
+    /// skipped, so only top-level nodes are inspected (matching ORT's capture
+    /// eligibility, which only cares about the top-level graph).
+    #[prost(string, tag = "7")]
+    domain: String,
+}
+
+/// Scan for top-level control-flow ops in the ONNX model at `model_path`.
+///
+/// Returns `Some(true)`/`Some(false)` when the model's graph could be parsed, or
+/// `None` when the file cannot be opened, memory-mapped, or decoded, or when it
+/// carries no graph at all. The caller treats every `None` conservatively as
+/// "has control flow".
+///
+/// The file is memory-mapped and decoded into [`ScanModelProto`], whose minimal
+/// field set makes prost skip the inline weight tensors without reading them, so
+/// only the pages holding the node region (and the field headers walked to reach
+/// it) are ever faulted in — cheap even for a multi-gigabyte inline-weight
+/// `model.onnx`. An earlier revision gave up on any file over 512 MB and
+/// conservatively reported "has control flow", which wrongly disabled CUDA graph
+/// capture for large inline-weight models (a ~20% decode-throughput loss).
+fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
     use prost::Message;
-    let Ok(model) = ScanModel::decode(bytes.as_slice()) else {
-        return true;
-    };
-    model.graph.is_some_and(|graph| {
-        graph.node.iter().any(|node| {
-            matches!(node.domain.as_str(), "" | "ai.onnx")
-                && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
-        })
-    })
+
+    let file = std::fs::File::open(model_path).ok()?;
+    // SAFETY: the model file is treated as immutable for the brief lifetime of
+    // this scan. Model files are not rewritten in place while their directory is
+    // in use, so no concurrent truncation (which could raise SIGBUS) is expected.
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+
+    let model = ScanModelProto::decode(&mmap[..]).ok()?;
+    let graph = model.graph?;
+    Some(graph.node.iter().any(|node| {
+        matches!(node.domain.as_str(), "" | "ai.onnx")
+            && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
+    }))
 }
 
 /// Whether the model at `model_directory` declares the shared-KV (SharedBuffer)
@@ -2641,7 +2735,18 @@ mod tests {
     }
 
     fn write_scan_model(nodes: &[(&str, &str)]) -> std::path::PathBuf {
-        use onnx::ir::{DataType, Graph, Node, NodeId, static_shape};
+        write_scan_model_with_weights(nodes, 0)
+    }
+
+    /// Build a valid ONNX model whose graph has the given `(domain, op_type)`
+    /// nodes, plus `weight_floats` f32 elements of inline initializer data to
+    /// simulate an inline-weight export (the qwen3 case). The prost scan must
+    /// skip past this initializer (via `Buf::advance`) rather than reading it.
+    fn write_scan_model_with_weights(
+        nodes: &[(&str, &str)],
+        weight_floats: usize,
+    ) -> std::path::PathBuf {
+        use onnx::ir::{DataType, Dim, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
         use onnx_rs as onnx;
         use prost::Message;
 
@@ -2657,6 +2762,23 @@ mod tests {
             node.domain = domain.to_string();
             graph.insert_node(node);
             graph.add_output(output);
+        }
+
+        if weight_floats > 0 {
+            let weight = graph.create_named_value(
+                "inline_weight",
+                DataType::Float32,
+                vec![Dim::from(weight_floats)],
+            );
+            let bytes = vec![0u8; weight_floats * std::mem::size_of::<f32>()];
+            graph.set_initializer(
+                weight,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![weight_floats],
+                    bytes,
+                )),
+            );
         }
 
         let path = test_model_path("control-flow");
@@ -2716,14 +2838,54 @@ mod tests {
     }
 
     #[test]
-    fn control_flow_scan_conservatively_skips_large_models() {
-        let path = test_model_path("large-control-flow");
-        std::fs::File::create(&path)
-            .expect("create large test model")
-            .set_len(MAX_CONTROL_FLOW_SCAN_BYTES + 1)
-            .expect("make sparse large test model");
-        assert!(model_has_control_flow_nodes(&path));
-        std::fs::remove_file(&path).ok();
+    fn control_flow_scan_reads_nodes_past_large_inline_weights() {
+        // Simulate an inline-weight export (like the qwen3 models, whose
+        // `model.onnx` embeds >1 GB of weights): the graph carries a large
+        // initializer alongside its nodes. The prost scan must still find
+        // the control-flow op — and, for a plain graph, must NOT be fooled into
+        // conservatively reporting control flow just because the file is large.
+        // 4 Mi f32 elements = 16 MiB of inline initializer data.
+        let weight_floats = 4 * 1024 * 1024;
+
+        let with_control_flow =
+            write_scan_model_with_weights(&[("", "MatMul"), ("", "If")], weight_floats);
+        assert!(
+            model_has_control_flow_nodes(&with_control_flow),
+            "control-flow op must be detected even behind a large inline initializer"
+        );
+        std::fs::remove_file(&with_control_flow).ok();
+
+        let plain =
+            write_scan_model_with_weights(&[("", "MatMul"), ("", "GroupQueryAttention")], weight_floats);
+        assert!(
+            !model_has_control_flow_nodes(&plain),
+            "a large inline-weight model without control flow must remain capture-eligible"
+        );
+        std::fs::remove_file(&plain).ok();
+    }
+
+    #[test]
+    fn control_flow_scan_conservatively_handles_truncated_control_flow_model() {
+        // A control-flow model whose bytes are truncated anywhere must never
+        // parse cleanly into a "no control flow" verdict (which would wrongly
+        // enable CUDA graph capture and trigger ORT's ~6x slower per-Run path).
+        // Truncation either cuts the graph payload (its length header points past
+        // EOF -> None) or stops before the graph is ever seen (no-graph -> None),
+        // so every prefix (including the empty file) must fall back to
+        // conservative `true`.
+        let full = write_scan_model(&[("", "MatMul"), ("", "If")]);
+        let bytes = std::fs::read(&full).expect("read full model");
+        std::fs::remove_file(&full).ok();
+
+        for truncated_len in 0..bytes.len() {
+            let truncated = test_model_path(&format!("truncated-{truncated_len}"));
+            std::fs::write(&truncated, &bytes[..truncated_len]).expect("write truncated model");
+            assert!(
+                model_has_control_flow_nodes(&truncated),
+                "a truncated control-flow model (len {truncated_len}) must stay conservative"
+            );
+            std::fs::remove_file(&truncated).ok();
+        }
     }
 
     #[cfg(feature = "native-backend")]
@@ -2758,6 +2920,94 @@ mod tests {
         model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt".to_string();
         model.opset_import[0].version = 2;
         assert!(!model_proto_requires_native_backend(&model));
+    }
+
+    #[test]
+    fn backend_env_values_are_case_insensitive_and_reject_unknown_values() {
+        assert_eq!(
+            parse_backend_env("AuTo").unwrap(),
+            EngineDecodeBackend::Auto
+        );
+        assert_eq!(parse_backend_env("ORT").unwrap(), EngineDecodeBackend::Ort);
+        assert_eq!(
+            parse_backend_env("native").unwrap(),
+            EngineDecodeBackend::Native
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Auto, || {
+                Ok(Some("nAtIvE".to_owned()))
+            })
+            .unwrap(),
+            EngineDecodeBackend::Native
+        );
+
+        let error = parse_backend_env("cuda").unwrap_err().to_string();
+        assert!(error.contains("ONNX_GENAI_BACKEND"), "{error}");
+        assert!(error.contains("auto, ort, native"), "{error}");
+    }
+
+    #[test]
+    fn explicit_backend_ignores_env_and_auto_honors_it() {
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Ort, || {
+                Err(anyhow::anyhow!("unreadable environment value"))
+            })
+            .unwrap(),
+            EngineDecodeBackend::Ort
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Native, || {
+                panic!("explicit backend must not read ONNX_GENAI_BACKEND")
+            })
+            .unwrap(),
+            EngineDecodeBackend::Native
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Auto, || {
+                Ok(Some("ort".to_owned()))
+            })
+            .unwrap(),
+            EngineDecodeBackend::Ort
+        );
+        assert_eq!(
+            requested_decode_backend_with_env(EngineDecodeBackend::Auto, || Ok(None)).unwrap(),
+            EngineDecodeBackend::Auto
+        );
+    }
+
+    #[test]
+    fn forced_ort_load_failure_includes_native_switch_hint() {
+        let error = augment_backend_error::<()>(
+            Err(anyhow::anyhow!("simulated native-only model load failure")),
+            EngineDecodeBackend::Ort,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("EngineDecodeBackend::Native"), "{error}");
+        assert!(error.contains("ONNX_GENAI_BACKEND=native"), "{error}");
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn forced_native_load_or_run_failure_includes_ort_switch_hint() {
+        let error = augment_backend_error::<()>(
+            Err(anyhow::anyhow!("simulated native decoder load/run failure")),
+            EngineDecodeBackend::Native,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
+        assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
+    }
+
+    #[cfg(not(feature = "native-backend"))]
+    #[test]
+    fn forced_native_without_feature_reports_how_to_switch() {
+        let error = resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
+        assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
     }
 
     fn test_capacities() -> CapacityProviders {

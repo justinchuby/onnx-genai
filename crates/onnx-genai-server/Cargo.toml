@@ -23,6 +23,7 @@ cuda-12090 = ["onnx-genai-ort/cuda-12090", "onnx-genai-engine/cuda-12090"]
 cuda-13000 = ["onnx-genai-ort/cuda-13000", "onnx-genai-engine/cuda-13000"]
 # Enables native decoder execution for models containing native-only operators.
 native-backend = ["onnx-genai-engine/native-backend"]
+mlas = ["native-backend", "onnx-genai-engine/mlas"]
 
 [dependencies]
 onnx-genai = { workspace = true }

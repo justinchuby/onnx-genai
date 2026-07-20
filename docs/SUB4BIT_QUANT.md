@@ -173,7 +173,7 @@ Before this increment, our CPU EP only accepted `bits=4`. Its optimized
 symmetric block-32 decode path interprets each nibble as
 `w=(q-8)*scale`, optionally quantizes the activation to int8 for
 `accuracy_level=4`, and uses VNNI where available. Batched f32 work reaches the
-shared GEMM seam and can use oneDNN.
+shared GEMM seam and can use the built-in SIMD backend.
 
 This increment adds the standard **linear** `bits=2` layout:
 
@@ -212,7 +212,7 @@ interpretation would not be portable.
 
 For performance, use ORT/MLAS packing and kernels as the reference. In our CPU
 EP, the current f32 dequant path is the oracle. Prefill can feed the existing
-oneDNN f32 GEMM after dequantization; decode ultimately needs a direct packed
+the built-in f32 GEMM after dequantization; decode ultimately needs a direct packed
 2-bit GEMV because materializing f32 weights is memory-bandwidth hostile.
 
 ### 4.2 Native path: `BlockQuantizedMatMul`
@@ -310,7 +310,7 @@ Execution for one admitted token batch is:
 
 For decode, grouped GEMV over selected experts is the primary kernel. For
 prefill or a continuous batch with many rows per expert, dequantized panels may
-feed oneDNN grouped/batched GEMM on CPU; ORT's QMoE and MLAS kernels should be
+feed grouped/batched CPU GEMM; ORT's QMoE and MLAS kernels should be
 the implementation reference. CUDA should stage selected block ranges into a
 stream-ordered expert cache and use a direct IQ/MXFP4 kernel, not expand entire
 experts to fp16/f32.
@@ -369,7 +369,7 @@ variant before allocating hundreds of gigabytes.
    numeric/reference tests.
 4. Add GGUF-to-ORT MXFP4 layout parity.
 5. Add fused CPU `BlockQuantizedMoE`, expert-major external-data slicing, and
-   grouped decode GEMV; use oneDNN for sufficiently large dequantized GEMMs.
+   grouped decode GEMV; use the built-in SIMD GEMM for sufficiently large dequantized GEMMs.
 6. Add direct CUDA IQ/MXFP4 kernels and a stream-ordered expert residency cache.
 7. Upstream the schema/kernels to ONNX Runtime and wire Mobius's GLM-5.2 and
    DeepSeek-V4-Flash exports.
@@ -424,7 +424,7 @@ Proposed direction:
 
 We can contribute byte-exact llama.cpp reference vectors, exporter fixtures,
 and a correctness-first CPU implementation. ORT's MLAS `MatMulNBits` and QMoE
-kernels should remain the performance reference; oneDNN is applicable to
+kernels should remain the performance reference; the built-in SIMD GEMM is applicable to
 larger CPU GEMMs, while decode requires direct compressed GEMV.
 
 ### Suggested acceptance criteria

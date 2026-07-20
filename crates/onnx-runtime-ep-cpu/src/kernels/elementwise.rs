@@ -245,6 +245,9 @@ impl Kernel for BinaryKernel {
             return Ok(());
         }
         match op {
+            BinOp::Pow => {
+                dispatch_arith!(inputs[0].dtype, op.name(), T => pow_typed::<T>(inputs, outputs))
+            }
             BinOp::Sum | BinOp::Mean => {
                 dispatch_float!(inputs[0].dtype, op.name(), T => binary_typed::<T>(op, inputs, outputs))
             }
@@ -294,6 +297,95 @@ fn multiply_contiguous_f32(inputs: &[TensorView], output: &mut TensorMut) -> boo
         *output = lhs * rhs;
     }
     true
+}
+
+/// Base-storage behavior for ONNX Pow.  The exponent is allowed to have a
+/// different numeric storage type, while the result always uses this base type.
+trait PowBase: NumericElem {
+    fn pow_exponent(self, exponent: f64) -> Self;
+}
+
+// Implement explicitly so f16/bf16 retain their normal f32 compute-and-round path.
+impl PowBase for f32 {
+    fn pow_exponent(self, exponent: f64) -> Self {
+        self.powf(exponent as f32)
+    }
+}
+impl PowBase for f64 {
+    fn pow_exponent(self, exponent: f64) -> Self {
+        self.powf(exponent)
+    }
+}
+impl PowBase for half::f16 {
+    fn pow_exponent(self, exponent: f64) -> Self {
+        half::f16::from_f32(self.to_f32().powf(exponent as f32))
+    }
+}
+impl PowBase for half::bf16 {
+    fn pow_exponent(self, exponent: f64) -> Self {
+        half::bf16::from_f32(self.to_f32().powf(exponent as f32))
+    }
+}
+macro_rules! impl_pow_int {
+    ($($t:ty),* $(,)?) => {$(
+        impl PowBase for $t {
+            fn pow_exponent(self, exponent: f64) -> Self { (self as f64).powf(exponent) as Self }
+        }
+    )*};
+}
+impl_pow_int!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+fn exponents_as_f64(input: &TensorView) -> Result<Vec<f64>> {
+    macro_rules! dense {
+        ($t:ty) => {
+            to_dense::<$t>(input)?
+                .into_iter()
+                .map(|v| v as f64)
+                .collect()
+        };
+    }
+    match input.dtype {
+        DataType::Float32 => Ok(dense!(f32)),
+        DataType::Float64 => Ok(dense!(f64)),
+        DataType::Float16 => Ok(to_dense::<half::f16>(input)?
+            .into_iter()
+            .map(|v| v.to_f32() as f64)
+            .collect()),
+        DataType::BFloat16 => Ok(to_dense::<half::bf16>(input)?
+            .into_iter()
+            .map(|v| v.to_f32() as f64)
+            .collect()),
+        DataType::Int8 => Ok(dense!(i8)),
+        DataType::Int16 => Ok(dense!(i16)),
+        DataType::Int32 => Ok(dense!(i32)),
+        DataType::Int64 => Ok(dense!(i64)),
+        DataType::Uint8 => Ok(dense!(u8)),
+        DataType::Uint16 => Ok(dense!(u16)),
+        DataType::Uint32 => Ok(dense!(u32)),
+        DataType::Uint64 => Ok(dense!(u64)),
+        dtype => Err(EpError::KernelFailed(format!(
+            "Pow: unsupported exponent dtype {dtype:?}"
+        ))),
+    }
+}
+
+fn pow_typed<T: PowBase>(inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    if outputs[0].dtype != T::DTYPE {
+        return Err(EpError::KernelFailed(
+            "Pow: output dtype must match base dtype".into(),
+        ));
+    }
+    let base = to_dense::<T>(&inputs[0])?;
+    let exponent = exponents_as_f64(&inputs[1])?;
+    let out_shape = outputs[0].shape.to_vec();
+    let mut values = vec![T::from_f32_scalar(0.0); numel(&out_shape)];
+    broadcast_apply(&base, inputs[0].shape, &out_shape, |i, value| {
+        values[i] = value
+    })?;
+    broadcast_apply(&exponent, inputs[1].shape, &out_shape, |i, value| {
+        values[i] = values[i].pow_exponent(value)
+    })?;
+    write_dense::<T>(&mut outputs[0], &values)
 }
 
 /// Dtype-generic binary/variadic fold: seed from the first operand, then fold
@@ -591,6 +683,55 @@ mod tests {
     }
 
     #[test]
+    fn pow_accepts_mixed_base_and_exponent_types() {
+        let base = Owned::f32(&[2], &[2., 3.]);
+        let exponent = Owned::i64(&[2], &[3, 2]);
+        let mut out = Owned::zeros_f32(&[2]);
+        BinaryKernel { op: BinOp::Pow }
+            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![8., 9.]);
+
+        let base = Owned::i32(&[2], &[2, 3]);
+        let exponent = Owned::f32(&[2], &[3., 2.]);
+        let mut out = Owned::zeros(DataType::Int32, &[2]);
+        BinaryKernel { op: BinOp::Pow }
+            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i32(), vec![8, 9]);
+    }
+
+    #[test]
+    fn pow_covers_integer_base_and_exponent_combinations() {
+        let base = Owned::i32(&[2], &[2, 3]);
+        let exponent = Owned::i32(&[2], &[3, 2]);
+        let mut out = Owned::zeros(DataType::Int32, &[2]);
+        BinaryKernel { op: BinOp::Pow }
+            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i32(), vec![8, 9]);
+
+        let base = Owned::i64(&[3], &[2, -3, 4]);
+        let exponent = Owned::i64(&[3], &[3, 2, 0]);
+        let mut out = Owned::zeros(DataType::Int64, &[3]);
+        BinaryKernel { op: BinOp::Pow }
+            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i64(), vec![8, 9, 1]);
+    }
+
+    #[test]
+    fn pow_accepts_float_exponents_for_i64_base() {
+        let base = Owned::i64(&[2], &[2, 3]);
+        let exponent = Owned::f32(&[2], &[3., 2.]);
+        let mut out = Owned::zeros(DataType::Int64, &[2]);
+        BinaryKernel { op: BinOp::Pow }
+            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_i64(), vec![8, 9]);
+    }
+
+    #[test]
     fn min_variadic_three_inputs_with_broadcast() {
         let a = Owned::f32(&[2, 2], &[5., 1., 8., 2.]);
         let b = Owned::f32(&[2, 2], &[3., 3., 3., 3.]);
@@ -683,9 +824,11 @@ mod tests {
         let error = BinaryKernel { op: BinOp::Sum }
             .execute(&[input.view()], &mut [out.view_mut()])
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Sum: unsupported element type Int32"));
+        assert!(
+            error
+                .to_string()
+                .contains("Sum: unsupported element type Int32")
+        );
     }
 
     #[test]

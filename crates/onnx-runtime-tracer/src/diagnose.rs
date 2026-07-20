@@ -1120,7 +1120,7 @@ fn fastpath_fix(reason: &str, candidate: &str) -> (Severity, String) {
 ///   FlashAttention/fused-SDPA fast path as rejected with reason
 ///   `"unsupported dtype"`.
 /// * `onnx-runtime-ep-cpu` MatMul/GEMM backend selection (`CpuBackend`) — when
-///   it falls back from a `oneDNN`/vendor GEMM to the `Generic` blocked kernel.
+///   it falls back from the SIMD GEMM to the `Generic` blocked kernel.
 /// * `onnx-runtime-ep-cuda` attention selection — when a masked/odd-shaped
 ///   attention cannot use the fused cuBLAS/flash path.
 pub fn report_missed_fastpath(
@@ -1617,7 +1617,7 @@ mod tests {
     fn missed_fastpath_below_threshold_is_info() {
         let events = vec![fastpath_ev(
             "MatMul_1",
-            "oneDNN GEMM",
+            "SIMD GEMM",
             "shape too small — below fast-path threshold",
             "generic blocked GEMM",
         )];

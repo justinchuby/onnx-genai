@@ -27,11 +27,32 @@ The device-resident fused path is Phase B and remains planned, not implemented
 The principal remaining roadmap gaps are therefore custom contracts and
 production paths, not standard-op registration:
 
-- `pkg.nxrt::BlockQuantizedMoE` remains design-only;
+- Mobius has no fused quantized-expert emitter for `com.microsoft::QMoE` or
+  `pkg.nxrt::BlockQuantizedMoE`, so existing runtime kernels are not exercised
+  by exported GLM/DeepSeek graphs;
 - GLM IndexShare selected-token attention has no frozen private-op ABI;
 - CUDA CSA needs its device-resident Phase B;
 - Mobius must provide pinned export artifacts and the explicit recurrent
   `mtp_state` required for `hc_mult > 1`.
+
+## 2026-07-19 E2E bring-up update
+
+GLM-5.2 now runs end-to-end through the onnx-genai runtime interface in both
+fp32 and int4-quantized forms using the tiny synthetic `glm_moe_dsa` harness.
+The fp32 graph completes prefill plus eight decode steps. The quantized graph
+does the same while executing 34 asymmetric block-32
+`com.microsoft::MatMulNBits` nodes across the full graph, including every MoE
+expert. DeepSeek-V2 likewise completes prefill plus eight decode steps through
+the shared MLA + MoE path.
+
+These are random-weight structural bring-up results, not claims of semantic
+correctness for production weights. The emitted GLM/DeepSeek MoE remains a
+per-expert decomposition: Mobius emits `MatMulNBits`, not fused `QMoE` or
+`pkg.nxrt::BlockQuantizedMoE`. Consequently the existing CPU/CUDA QMoE kernel
+and CPU BlockQuantizedMoE kernel have not yet been exercised E2E by these
+harnesses. The primary exporter gap is a Mobius fused-quantized-expert path
+with the required routing/layout contract. DeepSeek-V4 E2E remains blocked
+upstream by the absence of a usable reference configuration/export artifact.
 
 ## Two milestones must remain distinct
 
@@ -113,7 +134,7 @@ weakening wrong-dtype rejection.
 
 | Boundary | Current status | Consequence |
 |---|---:|---|
-| `pkg.nxrt::BlockQuantizedMoE` | ❌ design-only | No CPU/CUDA kernel or registration. The eight ABI decisions in [`BLOCKQUANTIZEDMOE_DESIGN.md`](BLOCKQUANTIZEDMOE_DESIGN.md#L381-L430) require sign-off before implementation. |
+| Fused quantized experts (`com.microsoft::QMoE` / `pkg.nxrt::BlockQuantizedMoE`) | ◐ runtime kernels exist, exporter missing | CPU and CUDA QMoE kernels and the CPU BlockQuantizedMoE parity kernel are registered, but Mobius emits per-expert `MatMulNBits` for GLM/DeepSeek. A fused quantized-expert emitter and routing/layout validation are required for E2E coverage. |
 | GLM IndexShare selected-token attention | ❌ contract-blocked | Mobius #404's dense additive-mask fallback is a correctness oracle but scans full K/V. Op boundary, index order/sentinels, deterministic parity, and cache/mask semantics are unfrozen ([team decision](../.squad/decisions.md#L916-L932)). |
 | CUDA `CompressedSparseAttention` | ◐ Phase A landed | Correct host-staged CUDA execution delegates to the CPU oracle. Device-resident compression, selection, sparse attention, state, capture, and rollback are Phase B; seven user decisions remain ([plan](CUDA_CSA_PHASE_B_PLAN.md#L22-L96)). |
 | CUDA `SparseKvGather` | ✅ native | Device byte-copy gather is registered; small index/valid-length tensors are host-read for deterministic range validation. This primitive does not itself define GLM IndexShare. |
@@ -157,7 +178,10 @@ Mobius must export the official recurrent state; correction-token
 
 ### P0 — unblock model contracts and end-to-end artifacts
 
-1. Sign off and implement `pkg.nxrt::BlockQuantizedMoE` on CPU then CUDA.
+1. Add a Mobius fused quantized-expert emitter for GLM/DeepSeek, targeting
+   `com.microsoft::QMoE` and/or `pkg.nxrt::BlockQuantizedMoE`, and validate it
+   E2E against the existing runtime kernels. Add a CUDA BlockQuantizedMoE path
+   if that private ABI is selected for production.
 2. Freeze the GLM IndexShare selected-token operator ABI and parity rules, then
    preserve the dense additive-mask path as its oracle.
 3. Resolve the seven CUDA CSA Phase-B decisions and implement B0–B7.
@@ -176,12 +200,15 @@ Mobius must export the official recurrent state; correction-token
 
 ## Shortest verified path
 
-- **GLM correctness:** use Mobius #404's f32 portable graph, standard GPU-native
-  Attention/RoPE, dense IndexShare mask, and portable expert fallback after
-  every emitted node is checked against the CUDA contracts.
+- **GLM correctness:** the tiny synthetic fp32 and int4 graphs now establish
+  structural prefill/decode execution. Production correctness still requires
+  real weights, pinned artifacts, and numerical comparison; use standard
+  Attention/RoPE, the dense IndexShare oracle, and the portable/per-expert
+  expert path until a fused quantized-expert exporter is validated.
 - **DeepSeek correctness:** use CUDA CSA Phase A and native SparseKvGather
   against a pinned #405 artifact.
-- **Smooth execution:** replace portable experts with BlockQuantizedMoE,
+- **Smooth execution:** replace portable/per-expert experts with an exported
+  QMoE or BlockQuantizedMoE path,
   dense IndexShare with a frozen selected-token boundary, and CSA Phase A with
   device-resident Phase B.
 

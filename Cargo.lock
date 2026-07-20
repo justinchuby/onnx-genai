@@ -1479,6 +1479,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja-contrib"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85342f6fac0be8ccd5bd00d9066be538f34f393f577b75d81b17c8398a6b43bb"
+dependencies = [
+ "minijinja",
+ "serde",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1503,6 +1513,14 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mlas-sys"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "rayon",
 ]
 
 [[package]]
@@ -1714,6 +1732,7 @@ dependencies = [
  "async-trait",
  "half",
  "llguidance",
+ "memmap2",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
  "onnx-genai-metadata",
@@ -1779,6 +1798,7 @@ dependencies = [
  "half",
  "libloading 0.8.9",
  "minijinja",
+ "minijinja-contrib",
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
@@ -1946,10 +1966,10 @@ dependencies = [
 name = "onnx-runtime-ep-cpu"
 version = "0.1.0-dev.2"
 dependencies = [
- "bindgen",
- "cmake",
+ "criterion",
  "half",
  "libm",
+ "mlas-sys",
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "onnx-runtime-loader",

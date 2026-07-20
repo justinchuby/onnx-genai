@@ -48,7 +48,7 @@ Two independent moves make this safe:
 
 - **Strangler-fig, never big-bang.** The system is shippable and ORT-compatible at every step. We
   replace one seam at a time, each behind a conformance gate.
-- **Keep the kernels.** MLAS, CUDA/cuDNN, oneDNN, fused attention — reused through FFI. We rewrite a
+- **Keep the kernels.** MLAS, CUDA/cuDNN, fused attention — reused through FFI. We rewrite a
   kernel only on measured evidence, or where none exists (e.g. Apple/MLX).
 - **Contracts first, agents implement, the machine verifies.** Humans (the OGA/ORT experts) own the
   interfaces, the invariants, and the acceptance oracles; agents fill in implementations; build +

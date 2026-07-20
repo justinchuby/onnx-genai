@@ -1,6 +1,6 @@
 [package]
 name = "onnx-runtime-ep-cpu"
-description = "CPU execution provider for the ORT 2.0 runtime (skeleton; oneDNN-backed kernels land in Phase 1)"
+description = "CPU execution provider for the ORT 2.0 runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,16 @@ repository.workspace = true
 keywords = ["onnx", "cpu", "execution-provider", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
+[features]
+# Opt-in vendored MLAS f32 SGEMM. Kept off by default because it builds C++/asm.
+mlas = ["dep:mlas-sys"]
+
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
+mlas-sys = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
 thiserror = { workspace = true }
 half = "2"
@@ -22,17 +27,9 @@ rayon = "1"
 # off near zero and failed the upstream conformance suite's tight tolerance.
 libm = "0.2"
 
-[features]
-# oneDNN CPU GEMM backend (docs/ORT2.md §25.2). NON-default: it requires the
-# `third_party/onednn` git submodule and a cmake+bindgen source build, so it is
-# excluded from the default (pure-Rust, offline) published surface. Enabling it
-# also pulls in the cmake/bindgen build-dependencies, keeping the default build
-# fully offline.
-default = []
-onednn = ["dep:cmake", "dep:bindgen"]
+[dev-dependencies]
+criterion = "0.5"
 
-[build-dependencies]
-# Optional so the default (offline) build never fetches or compiles them; only
-# the `onednn` feature activates the cmake+bindgen source build in build.rs.
-cmake = { version = "0.1", optional = true }
-bindgen = { version = "0.72", optional = true }
+[[bench]]
+name = "kernels"
+harness = false

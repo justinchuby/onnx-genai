@@ -41,7 +41,7 @@ See [`docs/PROGRESS.md`](docs/PROGRESS.md) and [`docs/CRATE_RESERVATION.md`](doc
 
 **Reuse battle-tested libraries for established primitives; write custom kernels only where they provide a measured, necessary advantage.**
 
-- CPU uses oneDNN for optimized production paths.
+- CPU uses the built-in SIMD backend for optimized production paths.
 - CUDA uses cuBLAS/cuBLASLt and cuDNN for vendor-optimized paths; CuTe/CUTLASS is for custom fusions those libraries do not provide.
 - Profile before replacing a proven implementation. Keep thin seams so reference and optimized implementations remain testable.
 

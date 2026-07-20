@@ -93,7 +93,7 @@ impl Args {
     /// selected (the "missed fast path" contract, §46.6).
     ///
     /// `candidate` names the optimized kernel that *could* have run (e.g.
-    /// `"FlashAttention"`, `"FusedSDPA"`, `"oneDNN GEMM"`); `reason` says **why**
+    /// `"FlashAttention"`, `"FusedSDPA"`, `"SIMD GEMM"`); `reason` says **why**
     /// it was skipped (e.g. `"unsupported dtype fp16"`,
     /// `"head_dim=100 not a multiple of 8"`, `"EP not enabled"`,
     /// `"shape too small — below fast-path threshold"`); `chosen` names the

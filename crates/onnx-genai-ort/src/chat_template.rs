@@ -203,6 +203,12 @@ impl ChatTemplate {
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
+        // Hugging Face chat templates are authored for Jinja2 on Python, so they
+        // freely call Python string methods (`startswith`, `endswith`, `split`,
+        // `strip`/`lstrip`/`rstrip`, `title`, ...) that minijinja does not expose
+        // natively. `minijinja-contrib`'s pycompat callback resolves those method
+        // calls; without it real-world templates (e.g. qwen3) fail to render.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_filter("tojson", minijinja::filters::tojson);
         env.add_function("raise_exception", raise_exception);
         env.add_template("chat", &self.template)
@@ -311,6 +317,29 @@ mod tests {
             .unwrap();
         assert_eq!(rendered, "<bos>|<eos>");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn render_supports_python_string_methods_used_by_hf_templates() {
+        // Real HF templates (qwen3, etc.) call Python str methods that minijinja
+        // lacks natively; the pycompat callback must resolve them.
+        let template = ChatTemplate {
+            template: concat!(
+                "{{ 'hello world' is string }}",
+                "|{{ '<tool_response>x</tool_response>'.startswith('<tool_response>') }}",
+                "|{{ '<tool_response>x</tool_response>'.endswith('</tool_response>') }}",
+                "|{{ 'a</think>b'.split('</think>')[-1] }}",
+                "|{{ '\n keep \n'.strip('\n') }}"
+            )
+            .to_string(),
+            bos_token: None,
+            eos_token: None,
+        };
+
+        assert_eq!(
+            template.render(&[], None, false).unwrap(),
+            "true|true|true|b| keep "
+        );
     }
 
     #[test]

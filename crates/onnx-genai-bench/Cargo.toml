@@ -18,7 +18,11 @@ bench-native = [
     "dep:onnx-runtime-loader",
     "dep:onnx-runtime-session",
 ]
-onednn = ["onnx-runtime-ep-cpu/onednn"]
+mlas = [
+    "bench-native",
+    "onnx-genai-engine/mlas",
+    "onnx-runtime-ep-cpu/mlas",
+]
 cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
 # Device-sampler-only CUDA: enables the ORT built-in CUDA EP path plus the
 # on-device argmax/sampler in `onnx-genai-ort` WITHOUT the pure-Rust
