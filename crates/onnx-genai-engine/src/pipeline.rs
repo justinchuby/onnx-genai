@@ -32,6 +32,22 @@ use std::path::Path;
 /// `component.output_name`.
 pub type PipelineTensors = HashMap<String, Value>;
 
+/// The result of a post-decode (text-to-speech-shaped) pipeline run: the
+/// autoregressive decoder's generated code tokens plus the final tensor pool
+/// produced by the post-decode single-pass stages (e.g. a vocoder waveform).
+///
+/// Returned by [`PipelineEngine::synthesize`]. The `generation` field carries
+/// the code token ids (as [`generate`](PipelineEngine::generate) would return),
+/// while `tensors` holds every stage output keyed by `component.output` —
+/// including the synthetic `{decoder}.output_ids` codes tensor and the vocoder's
+/// waveform (e.g. `vocoder.audio`).
+pub struct PipelineSynthesis {
+    /// The AR decoder's generated code tokens and finish metadata.
+    pub generation: GenerateResult,
+    /// The shared tensor pool after the post-decode stages ran.
+    pub tensors: PipelineTensors,
+}
+
 /// Per-request overrides for an iterative (diffusion) pipeline's loop
 /// parameters. This enables ComfyUI-style *live* editing — re-driving the same
 /// already-loaded models with different dynamics, with no re-export or reload.
@@ -228,6 +244,65 @@ impl PipelineEngine {
         pipeline_request: PipelineGenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
+        self.run_autoregressive(pipeline_request, callback)
+            .map(|(result, _pool)| result)
+    }
+
+    /// Run a **text-to-speech**-shaped pipeline: prompt-phase encoders, then the
+    /// AR decode loop (which emits audio *code* tokens), then the post-decode
+    /// `final_only` single-pass stages (a vocoder) that turn the collected codes
+    /// into a waveform. Returns both the generated codes ([`GenerateResult`]) and
+    /// the final tensor pool ([`PipelineTensors`], keyed by `component.output`),
+    /// which holds the vocoder waveform (e.g. `vocoder.audio`).
+    ///
+    /// This is the post-decode-stage counterpart to [`generate`](Self::generate)
+    /// (codes only) and [`run_pipeline`](Self::run_pipeline) (no AR loop). The AR
+    /// decoder's generated code sequence is published into the shared pool as the
+    /// synthetic tensor `{decoder}.output_ids` of shape `[1, num_generated]`
+    /// (int64), so a post-decode stage consumes it via a dataflow edge such as
+    /// `decoder.output_ids -> vocoder.codes`.
+    pub fn synthesize(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineSynthesis> {
+        let (generation, mut tensors) = self.run_autoregressive(pipeline_request, None)?;
+        let ar = self.plan.autoregressive_plan()?.clone();
+
+        // Publish the AR decoder's generated code sequence into the shared pool
+        // as `{decoder}.output_ids` [1, num_generated] (int64) so a post-decode
+        // single-pass stage can consume it via a dataflow edge.
+        let codes: Vec<i64> = generation.token_ids.iter().map(|&t| i64::from(t)).collect();
+        let codes_endpoint = format!("{}.output_ids", ar.decoder);
+        let codes_value =
+            Value::from_slice_i64(&codes, &[1, codes.len() as i64]).with_context(|| {
+                format!("failed to build generated-codes tensor '{codes_endpoint}'")
+            })?;
+        tensors.insert(codes_endpoint, codes_value);
+
+        // Run the post-decode `final_only` stages once, in declared order, over
+        // the shared pool (codes + prompt-phase tensors), so the vocoder reads
+        // the routed codes and writes its waveform back into the pool.
+        self.run_prompt_phase_components(
+            &ar.post_decode_components,
+            &mut tensors,
+            "postlogue",
+            None,
+        )?;
+        Ok(PipelineSynthesis {
+            generation,
+            tensors,
+        })
+    }
+
+    /// Core autoregressive execution shared by [`generate_with_callback`] and
+    /// [`synthesize`]: run the prompt-phase components, drive the decode loop,
+    /// and return the generated tokens alongside the shared tensor pool (external
+    /// inputs + prompt-phase outputs) so a caller can run post-decode stages.
+    fn run_autoregressive(
+        &mut self,
+        pipeline_request: PipelineGenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<(GenerateResult, PipelineTensors)> {
         // Guard first: a non-autoregressive pipeline (single-pass / iterative
         // diffusion) has no token decode loop, so surface the actionable error
         // before touching the tokenizer or options.
@@ -325,7 +400,7 @@ impl PipelineEngine {
         };
         backend.prompt_len = backend.context_tokens.len();
         let mut loop_state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
-        run_decode_loop(
+        let result = run_decode_loop(
             &mut backend,
             &mut loop_state,
             &options,
@@ -333,7 +408,8 @@ impl PipelineEngine {
             tokenizer,
             None,
             callback,
-        )
+        )?;
+        Ok((result, tensors))
     }
 
     pub fn spec(&self) -> &PipelineSpec {
@@ -1403,11 +1479,24 @@ enum CompositeStageKind {
     SinglePass { model: String },
 }
 
-/// Token-by-token decoder pipeline (optionally with prompt-phase encoders).
+/// Token-by-token decoder pipeline (optionally with prompt-phase encoders and
+/// post-decode single-pass stages).
+///
+/// The TTS shape (DESIGN.md §20) is `[encoders] -> AR decode -> vocoder`: the
+/// decode loop emits audio *code* tokens, then one or more `final_only`
+/// single-pass stages (a vocoder) run once over the shared pool to turn the
+/// collected codes into a waveform. The generated code sequence is exposed to
+/// those stages as the synthetic pool tensor `{decoder}.output_ids` of shape
+/// `[1, num_generated]` (int64), routed to a stage input by a dataflow edge
+/// (e.g. `decoder.output_ids -> vocoder.codes`).
 #[derive(Debug, Clone)]
 struct AutoregressivePlan {
     decoder: String,
     prompt_components: Vec<String>,
+    /// Single-pass components declared `final_only`: run once, in declared
+    /// order, after the decode loop completes (e.g. a TTS vocoder). Empty for a
+    /// conventional text decoder or a Whisper-style ASR pipeline.
+    post_decode_components: Vec<String>,
     dataflow: Vec<DataflowEdge>,
 }
 
@@ -2790,9 +2879,11 @@ impl PipelinePlan {
             anyhow::bail!("pipeline decoder '{decoder}' is not declared in models");
         }
         let prompt_components = prompt_phase_components(spec, &decoder)?;
+        let post_decode_components = post_decode_components(spec, &decoder)?;
         Ok(Self::Autoregressive(AutoregressivePlan {
             decoder,
             prompt_components,
+            post_decode_components,
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -3038,6 +3129,24 @@ fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result
         }
     }
     Ok(prompt_components)
+}
+
+/// Collect the `final_only`-phase components in dataflow order: single-pass
+/// stages that run **once after** the AR decode loop completes (the TTS vocoder
+/// shape from DESIGN.md §20). Kept separate from [`prompt_phase_components`] so
+/// the decode loop's generated code tokens (exposed as `{decoder}.output_ids`)
+/// can be routed into them before they run.
+fn post_decode_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<Vec<String>> {
+    let mut post = Vec::new();
+    for component in topological_components(spec)? {
+        if component == decoder {
+            continue;
+        }
+        if let PhaseRunOn::FinalOnly = component_phase(spec, &component, decoder) {
+            post.push(component);
+        }
+    }
+    Ok(post)
 }
 
 /// Build a DDIM scheduler from the declared config, or `None` when no scheduler

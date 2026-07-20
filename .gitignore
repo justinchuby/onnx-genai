@@ -21,6 +21,8 @@ models/
 !tests/fixtures/tiny-gemma4-vlm/vision_encoder.onnx
 !tests/fixtures/tiny-gemma4-vlm/embedding.onnx
 !tests/fixtures/tiny-gemma4-vlm/decoder.onnx
+!tests/fixtures/tiny-tts/decoder.onnx
+!tests/fixtures/tiny-tts/vocoder.onnx
 !crates/onnx-runtime-session/tests/fixtures/bert_toy/model.onnx
 *.safetensors
 .DS_Store

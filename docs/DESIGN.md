@@ -1229,6 +1229,28 @@ pipeline:
     vocoder: { run_on: final_only }
 ```
 
+**Post-decode stages & the generated-codes tensor contract.** The vocoder above
+is a `final_only` single_pass stage that runs **once, after** the AR decode loop
+completes — the one composite structure that is neither a prompt-phase encoder
+nor a per-step decoder. The engine wires it up as follows:
+
+- After `generate` finishes, the AR decoder's generated code sequence is
+  published into the shared tensor pool as the synthetic tensor
+  **`{decoder}.output_ids`** of shape `[1, num_generated]` (int64). This is the
+  canonical "the AR decoder's generated codes as a tensor" contract.
+- A post-decode stage consumes those codes via a normal `dataflow` edge, e.g.
+  `decoder.output_ids -> vocoder.codes`, and writes its waveform back into the
+  pool (e.g. `vocoder.audio`).
+- `final_only` components are collected (in dataflow order) into
+  `AutoregressivePlan::post_decode_components` and run once over the shared pool
+  after the loop, exactly like a prompt-phase stage but *downstream* of decode.
+
+The caller retrieves the waveform with `PipelineEngine::synthesize`, which
+composes prompt-stages → AR decode → post-decode stages and returns both the
+generated codes and the final tensor pool (see §20.4). `generate` still works on
+a TTS pipeline — it drives the AR loop and returns the code tokens only, without
+running the post-decode stages.
+
 #### Speech-to-Text (ASR / Whisper-style)
 
 ```yaml
@@ -1452,6 +1474,26 @@ impl Engine {
 
     // --- Generic (any pipeline) ---
     pub fn run_pipeline(&self, inputs: PipelineInputs) -> PipelineOutputStream;
+}
+```
+
+The implemented TTS entry point on `PipelineEngine` is:
+
+```rust
+/// prompt-stages -> AR decode (emits code tokens) -> post-decode single_pass
+/// stages (vocoder). The generated codes are published into the shared pool as
+/// `{decoder}.output_ids` [1, num_generated] (int64) and routed to a stage input
+/// by a dataflow edge (e.g. `decoder.output_ids -> vocoder.codes`).
+pub fn synthesize(
+    &mut self,
+    request: PipelineGenerateRequest,
+) -> anyhow::Result<PipelineSynthesis>;
+
+/// The generated codes plus the final tensor pool (holding the vocoder waveform,
+/// e.g. `vocoder.audio`, keyed by `component.output`).
+pub struct PipelineSynthesis {
+    pub generation: GenerateResult,   // the AR code tokens
+    pub tensors: PipelineTensors,     // post-decode stage outputs (waveform)
 }
 ```
 
