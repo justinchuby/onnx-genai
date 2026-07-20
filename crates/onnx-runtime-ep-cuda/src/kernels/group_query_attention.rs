@@ -7,7 +7,7 @@
 //! Present key/value outputs remain BNSH and preserve a fixed cache capacity.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -414,6 +414,18 @@ DEFINE_GQA_HALF_KERNELS(__nv_bfloat16, bf16)
 const PREP_MODULE: &str = "group_query_attention_prep";
 const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v1";
 const BLOCK: u32 = 256;
+const WS_TOTALS: usize = 0;
+const WS_PAST_LENGTHS: usize = 1;
+const WS_QUERY_STARTS: usize = 2;
+const WS_PACKED_Q: usize = 3;
+const WS_PACKED_K: usize = 4;
+const WS_PACKED_V: usize = 5;
+const WS_Q_BNSH: usize = 6;
+const WS_OUT_BNSH: usize = 7;
+const WS_PRESENT_K: usize = 8;
+const WS_PRESENT_V: usize = 9;
+const WS_SCORES: usize = 10;
+const WS_COUNT: usize = 11;
 
 pub struct GroupQueryAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
@@ -508,26 +520,73 @@ pub struct GroupQueryAttentionKernel {
     local_window_size: i64,
     softcap: f32,
     backend: GroupQueryAttentionBackend,
+    workspace: Mutex<GqaWorkspace>,
 }
 
-struct Scratch<'a> {
-    runtime: &'a CudaRuntime,
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkspaceSlot {
     ptr: CUdeviceptr,
+    bytes: usize,
 }
 
-impl<'a> Scratch<'a> {
-    fn new(runtime: &'a CudaRuntime, bytes: usize) -> Result<Self> {
-        Ok(Self {
+#[derive(Debug)]
+struct GqaWorkspace {
+    runtime: Arc<CudaRuntime>,
+    slots: [WorkspaceSlot; WS_COUNT],
+}
+
+impl GqaWorkspace {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
             runtime,
-            ptr: runtime.alloc_raw(bytes)?,
-        })
+            slots: [WorkspaceSlot::default(); WS_COUNT],
+        }
+    }
+
+    fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        let bytes = bytes.max(1);
+        let slot = self.slots[index];
+        if slot.bytes >= bytes {
+            return Ok(slot.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep GroupQueryAttention: workspace slot {index} requires {bytes} bytes during CUDA graph capture; warm the fixed decode shape before capture"
+            )));
+        }
+        let ptr = self.runtime.alloc_raw(bytes)?;
+        if slot.ptr != 0 {
+            // Dynamic prefill/growing-cache shapes may outgrow a slot. Preserve
+            // the fixed-capacity decode fast path (which never reaches here),
+            // but wait before replacing storage that queued work may still use.
+            if let Err(error) = self.runtime.synchronize() {
+                // SAFETY: `ptr` was allocated above and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+            // SAFETY: synchronization completed all prior users of `slot.ptr`,
+            // which is still exclusively owned by this workspace.
+            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
+                // SAFETY: `ptr` was allocated above and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.slots[index] = WorkspaceSlot { ptr, bytes };
+        Ok(ptr)
     }
 }
 
-impl Drop for Scratch<'_> {
+impl Drop for GqaWorkspace {
     fn drop(&mut self) {
-        // SAFETY: `ptr` is uniquely owned by this guard.
-        let _ = unsafe { self.runtime.free_raw(self.ptr) };
+        for slot in self.slots.iter_mut().rev() {
+            if slot.ptr != 0 {
+                // SAFETY: every live slot pointer was allocated by this runtime
+                // and remains exclusively owned by this workspace.
+                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
+                slot.ptr = 0;
+            }
+        }
     }
 }
 
@@ -596,7 +655,8 @@ macro_rules! launch_1d {
         let mut $builder = $runtime.stream().launch_builder(&function);
         $args
         // SAFETY: each invocation supplies the argument ABI for its entry point;
-        // buffers and scalar arguments remain live through synchronization.
+        // input/output buffers outlive execution, and workspace buffers remain
+        // owned by the kernel while stream-ordered work is pending.
         unsafe {
             $builder.launch(LaunchConfig {
                 grid_dim: (grid, 1, 1),
@@ -632,6 +692,7 @@ impl GroupQueryAttentionKernel {
             ));
         }
         Ok(Self {
+            workspace: Mutex::new(GqaWorkspace::new(runtime.clone())),
             runtime,
             num_heads,
             kv_num_heads,
@@ -1010,40 +1071,43 @@ impl GroupQueryAttentionKernel {
             (0, 0, 0, 0)
         };
 
-        let totals_gpu = Scratch::new(&self.runtime, totals.len() * 4)?;
-        let past_lengths_gpu = Scratch::new(&self.runtime, past_lengths.len() * 4)?;
-        let query_starts_gpu = Scratch::new(&self.runtime, query_starts.len() * 4)?;
+        let mut workspace = self.workspace.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
+        })?;
+        let totals_gpu = workspace.reserve(WS_TOTALS, totals.len() * 4)?;
+        let past_lengths_gpu = workspace.reserve(WS_PAST_LENGTHS, past_lengths.len() * 4)?;
+        let query_starts_gpu = workspace.reserve(WS_QUERY_STARTS, query_starts.len() * 4)?;
         // SAFETY: scratch allocations exactly match the uploaded slices.
         unsafe {
-            self.runtime.htod(bytes_of_i32(&totals), totals_gpu.ptr)?;
+            self.runtime.htod(bytes_of_i32(&totals), totals_gpu)?;
             self.runtime
-                .htod(bytes_of_i32(&past_lengths), past_lengths_gpu.ptr)?;
+                .htod(bytes_of_i32(&past_lengths), past_lengths_gpu)?;
             self.runtime
-                .htod(bytes_of_i32(&query_starts), query_starts_gpu.ptr)?;
+                .htod(bytes_of_i32(&query_starts), query_starts_gpu)?;
         }
         let packed_q = packed_qkv
-            .then(|| Scratch::new(&self.runtime, batch * q_seq * q_hidden * element_size))
+            .then(|| workspace.reserve(WS_PACKED_Q, batch * q_seq * q_hidden * element_size))
             .transpose()?;
         let packed_k = packed_qkv
-            .then(|| Scratch::new(&self.runtime, batch * k_seq * k_hidden * element_size))
+            .then(|| workspace.reserve(WS_PACKED_K, batch * k_seq * k_hidden * element_size))
             .transpose()?;
         let packed_v = packed_qkv
-            .then(|| Scratch::new(&self.runtime, batch * k_seq * k_hidden * element_size))
+            .then(|| workspace.reserve(WS_PACKED_V, batch * k_seq * k_hidden * element_size))
             .transpose()?;
-        let q_bnsh = Scratch::new(&self.runtime, batch * q_seq * q_hidden * element_size)?;
-        let out_bnsh = Scratch::new(&self.runtime, outputs[0].numel() * element_size)?;
+        let q_bnsh = workspace.reserve(WS_Q_BNSH, batch * q_seq * q_hidden * element_size)?;
+        let out_bnsh = workspace.reserve(WS_OUT_BNSH, outputs[0].numel() * element_size)?;
         let owned_present_k = (outputs.len() < 2)
             .then(|| {
-                Scratch::new(
-                    &self.runtime,
+                workspace.reserve(
+                    WS_PRESENT_K,
                     expected_cache_shape.iter().product::<usize>() * element_size,
                 )
             })
             .transpose()?;
         let owned_present_v = (outputs.len() < 3)
             .then(|| {
-                Scratch::new(
-                    &self.runtime,
+                workspace.reserve(
+                    WS_PRESENT_V,
                     expected_cache_shape.iter().product::<usize>() * element_size,
                 )
             })
@@ -1051,28 +1115,20 @@ impl GroupQueryAttentionKernel {
         let present_k_ptr = if let Some(output) = outputs.get_mut(1) {
             cuptr(output.data_ptr_mut::<u8>() as *const c_void)
         } else {
-            owned_present_k
-                .as_ref()
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: internal present-key allocation missing"
-                            .into(),
-                    )
-                })?
-                .ptr
+            *owned_present_k.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal present-key allocation missing".into(),
+                )
+            })?
         };
         let present_v_ptr = if let Some(output) = outputs.get_mut(2) {
             cuptr(output.data_ptr_mut::<u8>() as *const c_void)
         } else {
-            owned_present_v
-                .as_ref()
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: internal present-value allocation missing"
-                            .into(),
-                    )
-                })?
-                .ptr
+            *owned_present_v.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal present-value allocation missing".into(),
+                )
+            })?
         };
 
         let batch_i = checked_i32(batch, "batch")?;
@@ -1116,9 +1172,9 @@ impl GroupQueryAttentionKernel {
                 {
                     builder
                         .arg(&input_q_ptr)
-                        .arg(&q_scratch.ptr)
-                        .arg(&k_scratch.ptr)
-                        .arg(&v_scratch.ptr)
+                        .arg(q_scratch)
+                        .arg(k_scratch)
+                        .arg(v_scratch)
                         .arg(&batch_i)
                         .arg(&q_seq_i)
                         .arg(&heads_i)
@@ -1126,7 +1182,7 @@ impl GroupQueryAttentionKernel {
                         .arg(&dim_i);
                 }
             );
-            (q_scratch.ptr, k_scratch.ptr, v_scratch.ptr)
+            (*q_scratch, *k_scratch, *v_scratch)
         } else {
             (
                 input_q_ptr,
@@ -1144,7 +1200,7 @@ impl GroupQueryAttentionKernel {
             {
                 builder
                     .arg(&q_ptr)
-                    .arg(&q_bnsh.ptr)
+                    .arg(&q_bnsh)
                     .arg(&batch_i)
                     .arg(&q_seq_i)
                     .arg(&heads_i)
@@ -1178,7 +1234,7 @@ impl GroupQueryAttentionKernel {
                         builder
                             .arg(&current)
                             .arg(&present)
-                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&past_lengths_gpu)
                             .arg(&batch_i)
                             .arg(&k_seq_i)
                             .arg(&kv_heads_i)
@@ -1199,7 +1255,7 @@ impl GroupQueryAttentionKernel {
                             .arg(&current)
                             .arg(&past)
                             .arg(&present)
-                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&past_lengths_gpu)
                             .arg(&batch_i)
                             .arg(&k_seq_i)
                             .arg(&kv_heads_i)
@@ -1214,7 +1270,7 @@ impl GroupQueryAttentionKernel {
         if self.do_rotary {
             let interleaved_i: i32 = self.rotary_interleaved.into();
             for (tensor, seq_i, heads, capacity, current_offset) in [
-                (q_bnsh.ptr, q_seq_i, heads_i, q_seq_i, 0i32),
+                (q_bnsh, q_seq_i, heads_i, q_seq_i, 0i32),
                 (present_k_ptr, k_seq_i, kv_heads_i, present_capacity_i, 1i32),
             ] {
                 let count = batch * (heads as usize) * (seq_i as usize) * (dim / 2);
@@ -1231,7 +1287,7 @@ impl GroupQueryAttentionKernel {
                             .arg(&cos_ptr)
                             .arg(&sin_ptr)
                             .arg(&positions_ptr)
-                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&past_lengths_gpu)
                             .arg(&batch_i)
                             .arg(&seq_i)
                             .arg(&heads)
@@ -1265,14 +1321,14 @@ impl GroupQueryAttentionKernel {
                 dim,
                 self.num_heads / self.kv_num_heads,
                 scale,
-                q_bnsh.ptr,
+                q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh.ptr,
+                out_bnsh,
                 0,
                 0,
-                totals_gpu.ptr,
-                query_starts_gpu.ptr,
+                totals_gpu,
+                query_starts_gpu,
                 local_window_i,
                 self.softcap,
             )?;
@@ -1292,7 +1348,7 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: score scratch size overflow".into(),
                     )
                 })?;
-            let score_scratch = Scratch::new(&self.runtime, score_count.max(1) * 4)?;
+            let score_scratch = workspace.reserve(WS_SCORES, score_count.max(1) * 4)?;
             let attention_rows_u32 = u32::try_from(attention_rows).map_err(|_| {
                 EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: attention row count exceeds u32".into(),
@@ -1310,12 +1366,12 @@ impl GroupQueryAttentionKernel {
             )?;
             let mut builder = self.runtime.stream().launch_builder(&func);
             builder
-                .arg(&q_bnsh.ptr)
+                .arg(&q_bnsh)
                 .arg(&present_k_ptr)
                 .arg(&present_v_ptr)
-                .arg(&out_bnsh.ptr)
-                .arg(&score_scratch.ptr)
-                .arg(&totals_gpu.ptr)
+                .arg(&out_bnsh)
+                .arg(&score_scratch)
+                .arg(&totals_gpu)
                 .arg(&batch_i)
                 .arg(&heads_i)
                 .arg(&kv_heads_i)
@@ -1350,14 +1406,14 @@ impl GroupQueryAttentionKernel {
                 present_capacity,
                 self.num_heads / self.kv_num_heads,
                 scale,
-                q_bnsh.ptr,
+                q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh.ptr,
+                out_bnsh,
                 0,
                 0,
-                totals_gpu.ptr,
-                query_starts_gpu.ptr,
+                totals_gpu,
+                query_starts_gpu,
                 local_window_i,
                 self.softcap,
             )?;
@@ -1373,7 +1429,7 @@ impl GroupQueryAttentionKernel {
             builder,
             {
                 builder
-                    .arg(&out_bnsh.ptr)
+                    .arg(&out_bnsh)
                     .arg(&output_ptr)
                     .arg(&batch_i)
                     .arg(&q_seq_i)
@@ -1381,7 +1437,7 @@ impl GroupQueryAttentionKernel {
                     .arg(&dim_i);
             }
         );
-        self.runtime.synchronize()
+        Ok(())
     }
 }
 
@@ -1392,5 +1448,57 @@ impl Kernel for GroupQueryAttentionKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn cuda_graph_compatible(&self) -> bool {
+        // Decode scratch has stable persistent addresses and execution no longer
+        // synchronizes after launch, but seqlens/total/position validation still
+        // performs synchronous D2H reads before each launch.
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> Option<Arc<CudaRuntime>> {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous_hook);
+        runtime
+    }
+
+    #[test]
+    fn persistent_workspace_reuses_fixed_shape_allocation() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA workspace test: CUDA runtime unavailable");
+            return;
+        };
+        let before = runtime.allocation_counts();
+        let mut workspace = GqaWorkspace::new(runtime.clone());
+
+        let first = workspace.reserve(WS_Q_BNSH, 4096).unwrap();
+        let allocated = runtime.allocation_counts();
+        assert_eq!(allocated.allocations, before.allocations + 1);
+        assert_eq!(allocated.frees, before.frees);
+
+        assert_eq!(workspace.reserve(WS_Q_BNSH, 4096).unwrap(), first);
+        assert_eq!(workspace.reserve(WS_Q_BNSH, 2048).unwrap(), first);
+        assert_eq!(runtime.allocation_counts(), allocated);
+
+        let grown = workspace.reserve(WS_Q_BNSH, 8192).unwrap();
+        assert_ne!(grown, first);
+        let grown_counts = runtime.allocation_counts();
+        assert_eq!(grown_counts.allocations, before.allocations + 2);
+        assert_eq!(grown_counts.frees, before.frees + 1);
+
+        drop(workspace);
+        let after = runtime.allocation_counts();
+        assert_eq!(after.allocations, before.allocations + 2);
+        assert_eq!(after.frees, before.frees + 2);
     }
 }
