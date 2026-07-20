@@ -186,6 +186,18 @@ impl PipelineEngine {
             }
             PipelinePlan::SinglePass(sp) => (None, sp.model.clone()),
             PipelinePlan::Iterative(it) => (None, it.denoiser.clone()),
+            // A pure composite produces tensors (run_pipeline), not text; it has
+            // no autoregressive decode state. Use the last stage's model as the
+            // nominal tokenizer component (unused unless a tokenizer is queried).
+            PipelinePlan::Composite(c) => (
+                None,
+                c.stages
+                    .last()
+                    .map(|stage| match &stage.kind {
+                        CompositeStageKind::SinglePass { model } => model.clone(),
+                    })
+                    .unwrap_or_default(),
+            ),
         };
         Ok(Self {
             models,
@@ -332,6 +344,7 @@ impl PipelineEngine {
         match &self.plan {
             PipelinePlan::Iterative(_) => self.run_iterative(request),
             PipelinePlan::SinglePass(_) => self.run_single_pass(request),
+            PipelinePlan::Composite(_) => self.run_composite(request),
             PipelinePlan::Autoregressive(_) => anyhow::bail!(
                 "run_pipeline() runs single-pass or iterative pipelines; use generate() for \
                  autoregressive text pipelines"
@@ -775,6 +788,33 @@ impl PipelineEngine {
 
     /// Run a single-pass pipeline: prompt-phase components once, then one
     /// forward invocation of the strategy `model`.
+    /// Execute a multi-stage composite pipeline (DESIGN.md §20): run each stage
+    /// once, in declared order, over a shared tensor pool. A stage's model reads
+    /// its inputs from the pool (routed by the pipeline dataflow) and writes its
+    /// outputs back, so an earlier stage's outputs feed later stages.
+    fn run_composite(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
+        let PipelinePlan::Composite(plan) = &self.plan else {
+            anyhow::bail!("internal error: run_composite on a non-composite plan");
+        };
+        let mut tensors = request.inputs;
+        for stage in &plan.stages {
+            match &stage.kind {
+                CompositeStageKind::SinglePass { model } => {
+                    self.run_prompt_phase_components(
+                        std::slice::from_ref(model),
+                        &mut tensors,
+                        &stage.name,
+                        None,
+                    )?;
+                }
+            }
+        }
+        Ok(tensors)
+    }
+
     fn run_single_pass(
         &self,
         request: PipelineGenerateRequest,
@@ -1069,6 +1109,35 @@ enum PipelinePlan {
     Autoregressive(AutoregressivePlan),
     SinglePass(SinglePassPlan),
     Iterative(Box<IterativePlan>),
+    /// Multi-stage pipeline (DESIGN.md §20): ordered stages run over a shared
+    /// tensor pool, with dataflow edges routing tensors between them (e.g.
+    /// audio-to-audio codec: encoder -> decoder; ASR/TTS encoders + vocoder).
+    Composite(CompositePlan),
+}
+
+/// An ordered multi-stage pipeline. Each stage runs one or more component
+/// sessions once, in declared order, over a shared tensor pool; the top-level
+/// `dataflow` routes each stage's outputs into later stages' inputs.
+#[derive(Debug, Clone)]
+struct CompositePlan {
+    stages: Vec<CompositeStage>,
+    dataflow: Vec<DataflowEdge>,
+}
+
+/// One stage of a [`CompositePlan`].
+#[derive(Debug, Clone)]
+struct CompositeStage {
+    /// Stage name (for diagnostics/timing), unique within the composite.
+    name: String,
+    kind: CompositeStageKind,
+}
+
+/// The execution strategy of a single composite stage.
+#[derive(Debug, Clone)]
+enum CompositeStageKind {
+    /// Run one model once over the shared pool (encoder, codec, vocoder,
+    /// embedder). Inputs are routed from the pool via the pipeline dataflow.
+    SinglePass { model: String },
 }
 
 /// Token-by-token decoder pipeline (optionally with prompt-phase encoders).
@@ -2443,10 +2512,7 @@ impl PipelinePlan {
         match spec.strategy.kind {
             PipelineStrategyKind::SinglePass => Self::single_pass(spec),
             PipelineStrategyKind::Iterative => Self::iterative(spec, schedulers),
-            PipelineStrategyKind::Composite => anyhow::bail!(
-                "composite pipeline strategy without an autoregressive decoder is not yet \
-                 supported"
-            ),
+            PipelineStrategyKind::Composite => Self::composite(spec),
             PipelineStrategyKind::Autoregressive => {
                 anyhow::bail!("autoregressive strategy is missing its 'decoder' component")
             }
@@ -2499,6 +2565,60 @@ impl PipelinePlan {
         Ok(Self::SinglePass(SinglePassPlan {
             model,
             prompt_components,
+            dataflow: spec.dataflow.clone(),
+        }))
+    }
+
+    /// Build a multi-stage composite plan (DESIGN.md §20). Reached only for a
+    /// `kind: composite` strategy that has no autoregressive decoder stage (those
+    /// route to [`Self::autoregressive`]); i.e. pure single-pass stage chains such
+    /// as audio-to-audio codecs, encoder chains, and vocoder post-processing.
+    fn composite(spec: &PipelineSpec) -> anyhow::Result<Self> {
+        if spec.strategy.stages.is_empty() {
+            anyhow::bail!("composite pipeline strategy declares no stages");
+        }
+        let mut stages = Vec::with_capacity(spec.strategy.stages.len());
+        let mut seen_names = BTreeSet::new();
+        for stage in &spec.strategy.stages {
+            if !seen_names.insert(stage.name.clone()) {
+                anyhow::bail!("composite stage name '{}' is not unique", stage.name);
+            }
+            let kind = match stage.strategy.kind {
+                PipelineStrategyKind::SinglePass => {
+                    let model = stage.strategy.model.clone().with_context(|| {
+                        format!("composite stage '{}' (single_pass) is missing 'model'", stage.name)
+                    })?;
+                    if !spec.models.contains_key(&model) {
+                        anyhow::bail!(
+                            "composite stage '{}' model '{model}' is not declared in models",
+                            stage.name
+                        );
+                    }
+                    CompositeStageKind::SinglePass { model }
+                }
+                PipelineStrategyKind::Iterative => anyhow::bail!(
+                    "composite iterative stage '{}' is not yet supported (single-pass stages only)",
+                    stage.name
+                ),
+                PipelineStrategyKind::Autoregressive | PipelineStrategyKind::Composite => {
+                    anyhow::bail!(
+                        "composite stage '{}' has an unsupported nested strategy kind for a \
+                         non-autoregressive composite",
+                        stage.name
+                    )
+                }
+                PipelineStrategyKind::Other(ref value) => anyhow::bail!(
+                    "composite stage '{}' has unsupported strategy kind '{value}'",
+                    stage.name
+                ),
+            };
+            stages.push(CompositeStage {
+                name: stage.name.clone(),
+                kind,
+            });
+        }
+        Ok(Self::Composite(CompositePlan {
+            stages,
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -2624,6 +2744,7 @@ impl PipelinePlan {
             Self::Autoregressive(plan) => &plan.dataflow,
             Self::SinglePass(plan) => &plan.dataflow,
             Self::Iterative(plan) => &plan.dataflow,
+            Self::Composite(plan) => &plan.dataflow,
         }
     }
 
@@ -3075,6 +3196,116 @@ pipeline:
         );
         assert_eq!(routed[0].from, "vision_encoder.image_features");
         Ok(())
+    }
+
+    fn bare_strategy(kind: PipelineStrategyKind) -> PipelineStrategy {
+        PipelineStrategy {
+            kind,
+            decoder: None,
+            max_tokens: None,
+            stop_conditions: None,
+            kv_cache: None,
+            speculative: None,
+            model: None,
+            batching: None,
+            denoiser: None,
+            scheduler: None,
+            num_steps: None,
+            timestep_input: None,
+            timesteps: None,
+            start_step: None,
+            scheduler_config: None,
+            cfg_conditioning_input: None,
+            guidance_scale: None,
+            state: None,
+            stages: vec![],
+        }
+    }
+
+    fn single_pass_stage(name: &str, model: &str) -> PipelineStrategyStage {
+        PipelineStrategyStage {
+            name: name.to_string(),
+            strategy: Box::new(PipelineStrategy {
+                model: Some(model.to_string()),
+                ..bare_strategy(PipelineStrategyKind::SinglePass)
+            }),
+            run_on: None,
+        }
+    }
+
+    #[test]
+    fn plan_builds_composite_single_pass_stages() -> anyhow::Result<()> {
+        // Audio-to-audio codec: encoder -> decoder, both single-pass stages.
+        let spec = PipelineSpec {
+            models: BTreeMap::from([
+                ("encoder".to_string(), component("encoder")),
+                ("decoder".to_string(), component("decoder")),
+            ]),
+            dataflow: vec![DataflowEdge {
+                from: "encoder.codes".to_string(),
+                to: "decoder.codes".to_string(),
+                dtype: Some("int64".to_string()),
+                device_transfer: Some(false),
+            }],
+            strategy: PipelineStrategy {
+                stages: vec![
+                    single_pass_stage("encode", "encoder"),
+                    single_pass_stage("decode", "decoder"),
+                ],
+                ..bare_strategy(PipelineStrategyKind::Composite)
+            },
+            phases: BTreeMap::new(),
+            vision: None,
+        };
+
+        let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
+        match &plan {
+            PipelinePlan::Composite(composite) => {
+                assert_eq!(composite.stages.len(), 2);
+                assert_eq!(composite.stages[0].name, "encode");
+                assert_eq!(composite.stages[1].name, "decode");
+                assert!(matches!(
+                    &composite.stages[0].kind,
+                    CompositeStageKind::SinglePass { model } if model == "encoder"
+                ));
+                assert!(matches!(
+                    &composite.stages[1].kind,
+                    CompositeStageKind::SinglePass { model } if model == "decoder"
+                ));
+            }
+            other => panic!("expected a Composite plan, got {other:?}"),
+        }
+        // Dataflow is preserved so the decoder stage reads the encoder's output.
+        let routed = plan.edges_to_component("decoder").collect::<Vec<_>>();
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].from, "encoder.codes");
+        Ok(())
+    }
+
+    #[test]
+    fn composite_iterative_stage_is_rejected_for_now() {
+        let spec = PipelineSpec {
+            models: BTreeMap::from([("encoder".to_string(), component("encoder"))]),
+            dataflow: vec![],
+            strategy: PipelineStrategy {
+                stages: vec![PipelineStrategyStage {
+                    name: "loop".to_string(),
+                    strategy: Box::new(PipelineStrategy {
+                        denoiser: Some("encoder".to_string()),
+                        ..bare_strategy(PipelineStrategyKind::Iterative)
+                    }),
+                    run_on: None,
+                }],
+                ..bare_strategy(PipelineStrategyKind::Composite)
+            },
+            phases: BTreeMap::new(),
+            vision: None,
+        };
+        let error = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin()).unwrap_err();
+        assert!(
+            error.to_string().contains("iterative stage"),
+            "unexpected error: {error}"
+        );
     }
 
     fn vision_config(placeholder_id: i64, tpt: usize) -> PipelineVisionConfig {
