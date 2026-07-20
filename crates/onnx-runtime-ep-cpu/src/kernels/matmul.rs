@@ -379,12 +379,10 @@ fn output_is_direct_f32_eligible(a: &TensorView, b: &TensorView, out: &TensorMut
         return false;
     }
 
-    let out_start = out.data.0 as usize;
     // Row-major-contiguous Float32: the whole logical extent is one dense range
     // starting at the element origin.
     let out_origin = (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize;
     let out_end = out_origin.saturating_add(out.byte_size());
-    let _ = out_start;
 
     !std::iter::once(a)
         .chain(std::iter::once(b))
@@ -1308,7 +1306,7 @@ mod tests {
             &strides,
             DeviceId::cpu(),
         );
-        let mut c = TensorMut::new(
+        let c = TensorMut::new(
             DevicePtrMut(c_ptr),
             DataType::Float32,
             &shape,
