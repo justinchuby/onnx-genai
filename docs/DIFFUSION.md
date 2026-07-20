@@ -285,4 +285,6 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
   (`scripts/controlnet_e2e.py`): a fused export matches diffusers to 5.8e-6 and differs from base by
   0.45 (ControlNet takes effect). *Remaining:* native `run_comfyui` rendering of ControlNet / LoRA /
   SDXL ControlNet / inpaint workflows (conversion via `mobius convert-comfyui` already supports them).
-- **img2img** is supported; inpainting (mask) is not.
+- **img2img** is supported. **Inpainting** (9-channel UNet) runs through the declarative pipeline
+  engine, but native `run_comfyui` rendering of inpaint (mask) workflows is not yet wired up
+  (conversion via `mobius convert-comfyui` already supports them).

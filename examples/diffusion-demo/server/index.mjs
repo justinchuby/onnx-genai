@@ -15,6 +15,15 @@ import YAML from "yaml";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..", "..");
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
+// Bind to loopback by default so the demo (which spawns local binaries and can
+// trigger heavy compute) is not exposed to other machines on the network. Set
+// HOST=0.0.0.0 to opt into exposing it deliberately.
+const HOST = process.env.HOST || "127.0.0.1";
+// CORS: default to reflecting only localhost/127.0.0.1 origins (the Vite dev
+// server and same-machine callers) to reduce the risk of drive-by requests from
+// arbitrary web pages. Set ONNX_GENAI_DEMO_CORS_ORIGIN to a fixed origin, or to
+// "*" to restore the previous permissive behavior.
+const CORS_ORIGIN = process.env.ONNX_GENAI_DEMO_CORS_ORIGIN || "";
 
 function findBinary(name) {
   // Prefer the optimized release build; only fall back to debug (much slower
@@ -87,12 +96,25 @@ function readBody(req) {
   });
 }
 
+// Resolve the Access-Control-Allow-Origin value for a request. When
+// ONNX_GENAI_DEMO_CORS_ORIGIN is set it wins (including "*"); otherwise only
+// localhost/127.0.0.1 origins are reflected back, and anything else is denied.
+function allowedOrigin(req) {
+  if (CORS_ORIGIN) return CORS_ORIGIN;
+  const origin = req?.headers?.origin;
+  if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    return origin;
+  }
+  return "";
+}
+
 function json(res, code, obj) {
-  res.writeHead(code, {
+  const headers = {
     "content-type": "application/json",
-    "access-control-allow-origin": "*",
     "access-control-allow-headers": "content-type",
-  });
+  };
+  if (res._corsOrigin) headers["access-control-allow-origin"] = res._corsOrigin;
+  res.writeHead(code, headers);
   res.end(JSON.stringify(obj));
 }
 
@@ -509,6 +531,7 @@ function clampFloat(value, min, max, fallback) {
 }
 
 const server = createServer(async (req, res) => {
+  res._corsOrigin = allowedOrigin(req);
   if (req.method === "OPTIONS") return json(res, 204, {});
   try {
     if (req.url === "/api/translate-comfyui" && req.method === "POST") {
@@ -580,4 +603,4 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`[diffusion-demo] API on http://localhost:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`[diffusion-demo] API on http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`));

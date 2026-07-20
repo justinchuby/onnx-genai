@@ -4,8 +4,8 @@ pipeline:
       filename: denoiser.onnx
       type: denoiser
   dataflow:
-  - from: denoiser.noise_pred
-    to: denoiser.sample
+    - from: denoiser.noise_pred
+      to: denoiser.sample
   strategy:
     kind: iterative
     denoiser: denoiser

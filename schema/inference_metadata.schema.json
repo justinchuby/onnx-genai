@@ -1581,6 +1581,13 @@
             "null"
           ]
         },
+        "remasking": {
+          "description": "Unmasking strategy for a `masked_diffusion` scheduler:\n  * `\"low_confidence\"` (default) — LLaDA: each step commits the\n    highest-confidence still-masked positions (confidence-ranked). Best\n    for LLaDA checkpoints, but greedy/confidence-ranked decoding of other\n    masked-diffusion LMs (e.g. MDLM) collapses into repetitive text.\n  * `\"random\"` — MDLM-style ancestral: each still-masked position unmasks\n    independently with the schedule probability `1/(steps_remaining)`,\n    sampling its token from the model's categorical distribution (use\n    `temperature: 1.0` for a true categorical sample). This per-position\n    stochastic unmasking avoids the degenerate loops that confidence\n    ranking produces. The mask token is never emitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "temperature": {
           "description": "Sampling temperature for a `masked_diffusion` scheduler. `0` (default)\nselects each masked position's argmax token deterministically; a positive\nvalue applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before\nthe argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for\nremasking is always the clean-softmax probability of the chosen token.",
           "type": [
