@@ -64,9 +64,9 @@ use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
 use crate::error::{Result, SessionError};
 use crate::sequence::{
-    SeqTensor, SequenceError, SequenceValue, SplitSpec, concat, split, stack_new_axis,
+    SeqTensor, SequenceError, SequenceValue, SplitSpec, concat, split_tensor, stack_new_axis,
 };
-use crate::tensor::{DeviceIoBinding, Tensor};
+use crate::tensor::{DeviceIoBinding, SharedTensorBuffer, Tensor};
 
 fn profile_ops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -425,6 +425,12 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     sequence_values: HashSet<ValueId>,
+    /// Allocation owners promoted into ref-counted storage when a tensor enters
+    /// an ONNX Sequence. `buffers` retains a non-owning dispatch alias, while
+    /// sequence elements clone the owner Arc. At the next run boundary, after
+    /// all sequence handles are cleared, the unique owner is restored to
+    /// `buffers` before any input/output can be mutated.
+    shared_buffers: HashMap<ValueId, Arc<SharedTensorBuffer>>,
     /// Run-scoped storage for sequence values: `value id → SequenceValue`. A
     /// [`SequenceValue`] holds its elements as `Arc`-shared immutable tensors,
     /// so a sequence op that inserts/erases/etc. shares element `Arc`s with the
@@ -1301,6 +1307,7 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            shared_buffers: HashMap::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
         };
@@ -1327,6 +1334,7 @@ impl Executor {
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
         }
+        self.shared_buffers.remove(&vid);
         let numel = checked_numel(dims, || format!("value#{}", vid.0))?;
         let size = checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), dims)?;
         let buf = self
@@ -1825,6 +1833,7 @@ impl Executor {
         // run-scoped (element Arcs from a prior run must not leak in).
         self.sequences.clear();
         self.seq_elem_values.clear();
+        self.restore_shared_buffers()?;
 
         // --- Resolve shapes from the actual bound inputs --------------------
         let bindings = self.bind_symbols(inputs, external)?;
@@ -1877,6 +1886,7 @@ impl Executor {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
+            self.shared_buffers.remove(&vid);
             self.buffer_shapes.remove(&vid);
         }
         self.size_buffers_excluding(&resolved, &external_values)?;
@@ -2210,24 +2220,28 @@ impl Executor {
                 continue;
             }
             // A tensor input backed by a shared sequence element (SequenceAt
-            // output) owns no DeviceBuffer: read it zero-copy through a
-            // contiguous view over the element's immutable `Arc` bytes. The Arc
-            // is held live in `self.seq_elem_values` for the whole run, so the
-            // pointer stays valid across this kernel dispatch.
+            // output) owns no DeviceBuffer: read its possibly-strided view
+            // directly over the immutable shared allocation.
             if let Some(elem) = self.seq_elem_values.get(&vid) {
                 let shape = input_shapes[i].clone();
-                let strides = compute_contiguous_strides(&shape);
-                let root_len = elem.as_bytes().len();
+                let strides = elem.layout.resolved_strides(&shape);
+                let root_len = elem.root_len();
                 let base_ptr = elem.as_ptr() as *const std::ffi::c_void;
-                view_bounds(&shape, &strides, 0, input_dtypes[i], root_len)?;
+                view_bounds(
+                    &shape,
+                    &strides,
+                    elem.byte_offset(),
+                    input_dtypes[i],
+                    root_len,
+                )?;
                 in_infos.push(InInfo {
                     present: true,
                     dtype: input_dtypes[i],
                     shape,
                     strides,
-                    byte_offset: 0,
+                    byte_offset: elem.byte_offset(),
                     base_ptr,
-                    device: onnx_runtime_ir::DeviceId::cpu(),
+                    device: elem.device(),
                     backing: TensorBacking::Opaque,
                     root_len,
                 });
@@ -2303,6 +2317,7 @@ impl Executor {
         let weight_handles = &self.weight_handles;
         let buffers = &mut self.buffers;
         let buffer_shapes = &mut self.buffer_shapes;
+        let shared_buffers = &mut self.shared_buffers;
         let views_meta = &mut self.views;
         let pinned = &mut self.pinned;
 
@@ -2401,6 +2416,7 @@ impl Executor {
                 if let Some(old) = buffers.remove(&ovid) {
                     ep.deallocate(old)?;
                 }
+                shared_buffers.remove(&ovid);
                 buffer_shapes.remove(&ovid);
                 views_meta.insert(
                     ovid,
@@ -2453,6 +2469,7 @@ impl Executor {
                 if let Some(old) = buffers.remove(&ovid) {
                     ep.deallocate(old)?;
                 }
+                shared_buffers.remove(&ovid);
                 let buf = ep.allocate(need, TensorLayout::contiguous().alignment)?;
                 buffers.insert(ovid, buf);
             }
@@ -2670,12 +2687,11 @@ impl Executor {
 // bytes, are cloned. `SequenceAt` yields the shared element `Arc` and backs its
 // output tensor value with that same allocation (`seq_elem_values`), so a
 // downstream kernel reads it through a zero-copy [`TensorView`] and no bytes are
-// copied out of the sequence until the graph-output boundary. The only copies
-// are unavoidable boundary crossings: a *tensor → sequence* entry (a produced
-// `DeviceBuffer`, reused across runs, cannot be aliased so its bytes are moved
-// into the element `Arc` exactly once) and the single-alloc `Split`/`Concat`
-// data movement. On a non-host EP, `SequenceAt` uploads the selected element to
-// an EP-owned buffer before any device kernel consumes it.
+// copied out of the sequence until the graph-output boundary. Tensor→sequence
+// entry promotes the existing `DeviceBuffer` into an Arc owner and leaves a
+// non-owning dispatch alias in the executor. `SplitToSequence` creates
+// shape/stride/offset views over that same owner. `ConcatFromSequence` is the
+// only sequence data op that materializes a new contiguous tensor.
 //
 // ## No-race design
 //
@@ -2810,21 +2826,20 @@ impl Executor {
         outputs: &[ValueId],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
-        let node = self.graph.node(node_id);
-        let axis_attr = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0);
-        let keepdims = node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0;
+        let (axis_attr, keepdims) = {
+            let node = self.graph.node(node_id);
+            (
+                node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0),
+                node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0,
+            )
+        };
 
         let ivid = inputs
             .first()
             .copied()
             .flatten()
             .ok_or_else(|| self.seq_missing_input(op))?;
-        let dtype = self.value_dtypes[&ivid];
-        let shape = resolved
-            .get(&ivid)
-            .cloned()
-            .ok_or_else(|| self.seq_unresolved(op, ivid))?;
-        let bytes = self.contiguous_bytes(ivid, &shape, dtype)?;
+        let input = self.read_seq_element(ivid, resolved)?;
 
         let split_input = match inputs.get(1).copied().flatten() {
             None => None,
@@ -2863,8 +2878,7 @@ impl Executor {
                 });
             }
         };
-        let sequence =
-            split(&bytes, dtype, &shape, axis_attr, split_spec, keepdims).map_err(seq_err)?;
+        let sequence = split_tensor(&input, axis_attr, split_spec, keepdims).map_err(seq_err)?;
         self.sequences.insert(outputs[0], sequence);
         Ok(())
     }
@@ -2902,13 +2916,12 @@ impl Executor {
         )
     }
 
-    /// Build (or share) a `SeqTensor` for a tensor value entering a
-    /// sequence. If the value is already a shared sequence element (a
-    /// `SequenceAt` result), its `Arc` is **shared** with no copy; otherwise its
-    /// contiguous bytes are moved into a fresh element once (the tensor→sequence
-    /// entry boundary).
+    /// Build (or share) a `SeqTensor` for a tensor value entering a sequence.
+    /// Existing sequence elements clone their Arc. Ordinary tensors promote the
+    /// existing allocation into a shared owner and keep a non-owning executor
+    /// alias, so no element bytes move.
     fn read_seq_element(
-        &self,
+        &mut self,
         vid: ValueId,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Result<SeqTensor> {
@@ -2929,8 +2942,52 @@ impl Executor {
             .get(&vid)
             .cloned()
             .ok_or_else(|| self.seq_unresolved("Sequence", vid))?;
-        let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-        SeqTensor::from_raw(dtype, shape, &bytes).map_err(SessionError::from)
+        let (root, layout, byte_offset) = match self.views.get(&vid) {
+            Some(view) => (
+                view.source,
+                TensorLayout::strided(view.strides.clone()),
+                view.byte_offset,
+            ),
+            None => (vid, TensorLayout::contiguous(), 0),
+        };
+        if !self.shared_buffers.contains_key(&root) {
+            let buffer = self
+                .buffers
+                .remove(&root)
+                .ok_or_else(|| SessionError::SequenceOp {
+                    op: "Sequence".to_string(),
+                    reason: format!("tensor value#{} has no live backing buffer", vid.0),
+                })?;
+            let storage = SharedTensorBuffer::new(Arc::clone(&self.ep), buffer);
+            self.buffers.insert(root, storage.alias());
+            self.shared_buffers.insert(root, storage);
+        }
+        self.pinned.insert(root);
+        SeqTensor::from_shared(
+            Arc::clone(&self.shared_buffers[&root]),
+            dtype,
+            shape,
+            layout,
+            byte_offset,
+        )
+        .map_err(SessionError::from)
+    }
+
+    fn restore_shared_buffers(&mut self) -> Result<()> {
+        for (vid, storage) in self.shared_buffers.drain() {
+            if let Some(alias) = self.buffers.remove(&vid) {
+                self.ep.deallocate(alias)?;
+            }
+            let storage = Arc::try_unwrap(storage).map_err(|storage| {
+                SessionError::Internal(format!(
+                    "shared sequence buffer value#{} still has {} live handles at the next run boundary",
+                    vid.0,
+                    Arc::strong_count(&storage)
+                ))
+            })?;
+            self.buffers.insert(vid, storage.into_buffer());
+        }
+        Ok(())
     }
 
     /// Fetch (clone) the sequence value bound to `vid` (cheap — `Arc` handle
@@ -3005,26 +3062,27 @@ impl Executor {
     }
 
     /// Back a tensor *output* value with a shared sequence element (SequenceAt).
-    /// Host EPs retain the zero-copy `Arc` alias. Non-host EPs upload the bytes
-    /// into an EP-owned buffer so device kernels never receive a host pointer.
+    /// The element retains its original device allocation and view metadata.
     fn store_seq_element_output(
         &mut self,
         vid: ValueId,
         elem: SeqTensor,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
-        if !self.ep.device_id().is_host_accessible() {
-            return self.store_raw_tensor_output(
-                vid,
-                elem.dtype,
-                elem.shape.clone(),
-                elem.as_bytes(),
-                resolved,
-            );
+        if elem.device() != self.ep.device_id() {
+            return Err(SessionError::SequenceOp {
+                op: "SequenceAt".to_string(),
+                reason: format!(
+                    "sequence element is on {:?}, but the active execution provider is on {:?}",
+                    elem.device(),
+                    self.ep.device_id()
+                ),
+            });
         }
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
         }
+        self.shared_buffers.remove(&vid);
         self.buffer_shapes.remove(&vid);
         self.views.remove(&vid);
         resolved.insert(vid, elem.shape.clone());
@@ -3058,6 +3116,7 @@ impl Executor {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
+            self.shared_buffers.remove(&vid);
             let buf = self
                 .ep
                 .allocate(need, TensorLayout::contiguous().alignment)?;
@@ -3502,7 +3561,7 @@ impl Executor {
         // the one materialization point where they are copied out (the boundary
         // back into owned tensors); the compute path reads them zero-copy.
         if let Some(elem) = self.seq_elem_values.get(&vid) {
-            let bytes = elem.as_bytes();
+            let bytes = elem.contiguous_bytes().map_err(SessionError::from)?;
             return Ok(bytes[..n.min(bytes.len())].to_vec());
         }
         if let Some(view) = self.views.get(&vid) {
@@ -3582,6 +3641,7 @@ impl Executor {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
+            self.shared_buffers.remove(&vid);
             let buf = self
                 .ep
                 .allocate(need, TensorLayout::contiguous().alignment)?;
@@ -4685,6 +4745,7 @@ impl Drop for Executor {
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
         }
+        self.shared_buffers.clear();
     }
 }
 
@@ -5450,13 +5511,14 @@ mod tests {
         let output = executor.run(&[]).unwrap();
         assert_eq!(output[0].to_vec_f32(), vec![7.0, 8.0]);
 
-        let original = executor.sequences[&first_sequence].elements()[0].shared_tensor();
-        let first_at_arc = executor.seq_elem_values[&first_at].shared_tensor();
-        let inserted = executor.sequences[&inserted_sequence].elements()[1].shared_tensor();
-        let second_at_arc = executor.seq_elem_values[&second_at].shared_tensor();
-        assert!(Arc::ptr_eq(original, first_at_arc));
-        assert!(Arc::ptr_eq(original, inserted));
-        assert!(Arc::ptr_eq(original, second_at_arc));
+        let original = &executor.sequences[&first_sequence].elements()[0];
+        let first_at_arc = &executor.seq_elem_values[&first_at];
+        let inserted = &executor.sequences[&inserted_sequence].elements()[1];
+        let second_at_arc = &executor.seq_elem_values[&second_at];
+        assert!(original.shares_storage_with(first_at_arc));
+        assert!(original.shares_storage_with(inserted));
+        assert!(original.shares_storage_with(second_at_arc));
+        assert_eq!(original.as_ptr(), executor.buffers[&input].as_ptr());
     }
 
     #[test]

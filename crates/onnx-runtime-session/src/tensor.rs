@@ -55,6 +55,108 @@ pub fn cpu_allocator() -> Arc<dyn ExecutionProvider> {
     shared_cpu_ep()
 }
 
+/// Ref-counted owner for one device allocation shared by immutable runtime
+/// tensor values such as ONNX Sequence elements.
+///
+/// The executor may keep a non-owning [`DeviceBuffer`] alias for ordinary
+/// kernel dispatch while sequence handles retain this owner. The allocation is
+/// released exactly once when the last owner drops.
+pub(crate) struct SharedTensorBuffer {
+    buffer: Option<DeviceBuffer>,
+    allocator: Arc<dyn ExecutionProvider>,
+    import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
+}
+
+impl SharedTensorBuffer {
+    pub(crate) fn new(allocator: Arc<dyn ExecutionProvider>, buffer: DeviceBuffer) -> Arc<Self> {
+        Arc::new(Self {
+            buffer: Some(buffer),
+            allocator,
+            import_guard: None,
+        })
+    }
+
+    fn with_guard(
+        allocator: Arc<dyn ExecutionProvider>,
+        buffer: DeviceBuffer,
+        import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            buffer: Some(buffer),
+            allocator,
+            import_guard,
+        })
+    }
+
+    pub(crate) fn allocate_cpu(bytes: usize) -> Result<Arc<Self>> {
+        let allocator: Arc<dyn ExecutionProvider> = shared_cpu_ep();
+        let buffer = allocator.allocate(bytes.max(1), TensorLayout::contiguous().alignment)?;
+        Ok(Self::new(allocator, buffer))
+    }
+
+    pub(crate) fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("SharedTensorBuffer buffer taken only in Drop")
+    }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        self.buffer
+            .as_mut()
+            .expect("SharedTensorBuffer buffer taken only in Drop")
+    }
+
+    pub(crate) fn allocator(&self) -> &Arc<dyn ExecutionProvider> {
+        &self.allocator
+    }
+
+    /// Create a non-owning alias suitable for the executor's existing
+    /// `DeviceBuffer` dispatch path. The returned handle must not outlive `self`.
+    pub(crate) fn alias(&self) -> DeviceBuffer {
+        let buffer = self.buffer();
+        // SAFETY: `self` owns the allocation and the executor keeps an Arc<Self>
+        // alive for at least as long as this alias. The alias is never freed by
+        // the EP because it is marked borrowed.
+        unsafe {
+            DeviceBuffer::from_borrowed_parts(
+                buffer.as_ptr() as *mut std::ffi::c_void,
+                buffer.device(),
+                buffer.len(),
+                buffer.alignment(),
+            )
+        }
+    }
+
+    pub(crate) fn into_buffer(mut self) -> DeviceBuffer {
+        debug_assert!(
+            self.import_guard.is_none(),
+            "executor-promoted buffers never carry a foreign import guard"
+        );
+        self.buffer
+            .take()
+            .expect("SharedTensorBuffer buffer taken only by into_buffer or Drop")
+    }
+}
+
+impl std::fmt::Debug for SharedTensorBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedTensorBuffer")
+            .field("device", &self.buffer().device())
+            .field("len", &self.buffer().len())
+            .field("ptr", &self.buffer().as_ptr())
+            .finish()
+    }
+}
+
+impl Drop for SharedTensorBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.allocator.deallocate(buffer);
+        }
+        let _ = self.import_guard.take();
+    }
+}
+
 /// Borrow the raw bytes of a host-accessible device buffer.
 ///
 /// # Safety
@@ -331,6 +433,24 @@ impl Tensor {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         Self::from_raw(DataType::Int64, shape.to_vec(), &bytes)
+    }
+
+    pub(crate) fn into_shared_parts(
+        mut self,
+    ) -> (Arc<SharedTensorBuffer>, DataType, Vec<usize>, TensorLayout) {
+        let buffer = self
+            .buffer
+            .take()
+            .expect("Tensor buffer taken only by into_shared_parts or Drop");
+        let storage = SharedTensorBuffer::with_guard(
+            Arc::clone(&self.allocator),
+            buffer,
+            self.import_guard.take(),
+        );
+        let dtype = self.dtype;
+        let shape = std::mem::take(&mut self.shape);
+        let layout = std::mem::take(&mut self.layout);
+        (storage, dtype, shape, layout)
     }
 
     /// The device this tensor lives on.
