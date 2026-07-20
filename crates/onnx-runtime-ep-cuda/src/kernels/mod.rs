@@ -39,6 +39,7 @@ pub mod fused_gemm;
 pub mod gather;
 pub mod gemm;
 mod gqa_decode;
+mod gqa_decode_fp16;
 pub mod group_query_attention;
 pub mod indexing;
 pub mod matmul;
