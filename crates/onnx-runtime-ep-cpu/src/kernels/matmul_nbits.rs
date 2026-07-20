@@ -25,6 +25,41 @@ const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
 
+/// Env knob for the MLAS SQNBit int4 prefill/decode crossover (`m` row count).
+/// MatMulNBits with `m < NXRT_SQNBIT_PREFILL_MIN` falls back to the specialized
+/// hand-written int4 GEMV path (`int4_matmul_m1`/`int8_matmul`), which wins the
+/// bandwidth-bound M=1 decode; MLAS `MlasQNBitGemmBatch` is only used once `m`
+/// reaches the threshold, where its cache-tiled kernels win prefill.
+#[cfg(feature = "mlas")]
+const SQNBIT_PREFILL_MIN_ENV: &str = "NXRT_SQNBIT_PREFILL_MIN";
+
+/// Default MLAS SQNBit int4 prefill threshold. Measured on Sapphire Rapids
+/// (Xeon 8480C): the hand int4 path leads for small `m` and MLAS overtakes it
+/// around `m` in the mid-teens, so decode (`m == 1`) keeps the hand path while
+/// prefill batches route to MLAS. Override with `NXRT_SQNBIT_PREFILL_MIN`.
+#[cfg(feature = "mlas")]
+const DEFAULT_SQNBIT_PREFILL_MIN: usize = 16;
+
+#[cfg(feature = "mlas")]
+static SQNBIT_PREFILL_MIN: OnceLock<usize> = OnceLock::new();
+
+/// Smallest `m` (batch·seq row count) that routes MatMulNBits int4 to MLAS
+/// SQNBit; smaller `m` falls back to the hand int4 path. Parsed once from
+/// `NXRT_SQNBIT_PREFILL_MIN`, defaulting to [`DEFAULT_SQNBIT_PREFILL_MIN`].
+#[cfg(feature = "mlas")]
+fn sqnbit_prefill_min() -> usize {
+    *SQNBIT_PREFILL_MIN
+        .get_or_init(|| resolve_prefill_min(std::env::var(SQNBIT_PREFILL_MIN_ENV).ok().as_deref()))
+}
+
+/// Parse the SQNBit prefill threshold, falling back to
+/// [`DEFAULT_SQNBIT_PREFILL_MIN`] for absent, empty, or malformed values.
+#[cfg(feature = "mlas")]
+fn resolve_prefill_min(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SQNBIT_PREFILL_MIN)
+}
+
 pub struct MatMulNBitsKernel {
     k: usize,
     n: usize,
@@ -316,11 +351,13 @@ impl MatMulNBitsKernel {
     /// `Ok(Some(()))` when it filled `result` (the caller writes output and
     /// returns), or `Ok(None)` to signal a fall back to the hand-written paths.
     ///
-    /// Fallback cases (return `Ok(None)`): backend is not MLAS, `bits != 4`
-    /// (2-bit is left to the existing correctness path), `g_idx` is present
-    /// (MLAS SQNBit has no per-row group indices), or MLAS reports no kernel is
-    /// available for this shape on the host. Bias, when present, is added by
-    /// MLAS itself, so the caller's post-loop bias add is skipped on this path.
+    /// Fallback cases (return `Ok(None)`): `m` is below the SQNBit prefill
+    /// threshold ([`sqnbit_prefill_min`]) so decode keeps the fast hand int4
+    /// path, backend is not MLAS, `bits != 4` (2-bit is left to the existing
+    /// correctness path), `g_idx` is present (MLAS SQNBit has no per-row group
+    /// indices), or MLAS reports no kernel is available for this shape on the
+    /// host. Bias, when present, is added by MLAS itself, so the caller's
+    /// post-loop bias add is skipped on this path.
     #[cfg(feature = "mlas")]
     #[allow(clippy::too_many_arguments)]
     fn try_mlas_sqnbit(
@@ -336,6 +373,12 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
     ) -> Result<Option<()>> {
         use crate::backend::CpuBackend;
+
+        // Cheapest gate first: small `m` (decode/GEMV) is bandwidth-bound and the
+        // hand int4 path beats MLAS there, so fall back before any weight packing.
+        if m < sqnbit_prefill_min() {
+            return Ok(None);
+        }
 
         if self.bits != 4
             || group_indices.is_some()
@@ -2304,6 +2347,112 @@ mod tests {
                 .unwrap(),
             None,
             "bits==2 must fall back",
+        );
+    }
+
+    /// The SQNBit prefill threshold parses `NXRT_SQNBIT_PREFILL_MIN`, falling
+    /// back to the measured default for absent, empty, or malformed values.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_resolve_prefill_min_parses_or_defaults() {
+        assert_eq!(resolve_prefill_min(None), DEFAULT_SQNBIT_PREFILL_MIN);
+        assert_eq!(resolve_prefill_min(Some("")), DEFAULT_SQNBIT_PREFILL_MIN);
+        assert_eq!(resolve_prefill_min(Some("abc")), DEFAULT_SQNBIT_PREFILL_MIN);
+        assert_eq!(resolve_prefill_min(Some("32")), 32);
+        assert_eq!(resolve_prefill_min(Some("  8 ")), 8);
+        assert_eq!(resolve_prefill_min(Some("1")), 1);
+    }
+
+    /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global
+    /// backend override does not race concurrent test threads.
+    #[cfg(feature = "mlas")]
+    fn backend_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// M-based hybrid routing gate: with an otherwise-eligible int4 case and the
+    /// MLAS backend selected, `try_mlas_sqnbit` must still fall back
+    /// (`Ok(None)`) for `m` below the prefill threshold (decode keeps the hand
+    /// path) and serve MLAS (`Ok(Some(()))`) for `m` at/above it (prefill). This
+    /// regression-locks the decode/prefill split. Uses the default threshold
+    /// ([`DEFAULT_SQNBIT_PREFILL_MIN`]); the host must have an MLAS SQNBit int4
+    /// kernel or the assertions are skipped.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_try_mlas_gates_decode_by_m_threshold() {
+        let (n, k, block_size) = (32usize, 64usize, 32usize);
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let weights_nk = pseudo(n * k, 0.3);
+        let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+
+        // Skip when the host has no MLAS SQNBit int4 kernel for this shape.
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Int8,
+            &packed_bytes,
+            &scales,
+            None,
+        )
+        .is_none()
+        {
+            eprintln!("MLAS SQNBit int4 kernel unavailable; skipping M-gate test");
+            return;
+        }
+
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let b = Owned::u8(&[n, k_blocks, blob], &packed_bytes);
+        let scales_t = Owned::f32(&[n, k_blocks], &scales);
+
+        let below = DEFAULT_SQNBIT_PREFILL_MIN - 1;
+        let at = DEFAULT_SQNBIT_PREFILL_MIN;
+
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var.
+        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+
+        let call = |m: usize| {
+            let a = pseudo(m * k, 0.8);
+            let mut result = vec![0.0f32; m * n];
+            kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    None,
+                    None,
+                    false,
+                    &a,
+                    m,
+                    None,
+                    &mut result,
+                )
+                .unwrap()
+        };
+
+        let decode = call(below);
+        let prefill = call(at);
+
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+            }
+        }
+
+        assert_eq!(
+            decode, None,
+            "m={below} (< {DEFAULT_SQNBIT_PREFILL_MIN}) must fall back to the hand int4 path",
+        );
+        assert_eq!(
+            prefill,
+            Some(()),
+            "m={at} (>= {DEFAULT_SQNBIT_PREFILL_MIN}) must route to MLAS SQNBit",
         );
     }
 
