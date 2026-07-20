@@ -1865,6 +1865,7 @@ version = "0.1.0-dev.2"
 dependencies = [
  "onnx-genai-kv",
  "onnx-runtime-protocol-trace",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]

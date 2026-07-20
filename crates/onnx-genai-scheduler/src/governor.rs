@@ -244,6 +244,12 @@ pub enum ResourceError {
         reclaimable_budget_bytes: u64,
     },
 
+    #[error(
+        "host pressure mailbox is full: all {capacity} cancellation slots are reserved; \
+         retry after an outstanding ticket resolves"
+    )]
+    HostMailboxBackpressure { capacity: usize },
+
     #[error("host pressure ticket {request_id} timed out before it could be granted or claimed")]
     HostPressureTimeout { request_id: u64 },
 

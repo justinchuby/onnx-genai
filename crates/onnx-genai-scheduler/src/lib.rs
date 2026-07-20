@@ -23,7 +23,8 @@ pub use governor::{
 pub use policy::FairSharePolicy;
 pub use pressure::{
     HostAllocation, HostGovernor, HostGovernorConfig, HostLedgerSnapshot, HostPageRequest,
-    HostPriority, PressureState, PressureTicket, TicketPoll, TimeoutOutcome,
+    HostPriority, NullPressureTraceSink, PressureState, PressureTicket, PressureTraceSink,
+    TicketPoll, TimeoutOutcome,
 };
 
 use onnx_genai_kv::SequenceId;

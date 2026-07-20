@@ -18,3 +18,4 @@ tracing = { workspace = true }
 # Enables the test-only independent replay-checker harness for the pressure
 # protocol conformance campaigns.
 onnx-runtime-protocol-trace = { workspace = true, features = ["conformance"] }
+serde_json = { workspace = true }
