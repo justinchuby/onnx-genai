@@ -203,7 +203,8 @@ fn main() -> Result<()> {
     let prompt = workflow.prompt.clone().unwrap_or_default();
     let negative_prompt = workflow.negative_prompt.clone().unwrap_or_default();
     let latent_channels = latent_channels(&arguments.pipeline_dir);
-    let latent_size = (workflow.height / 8) as usize;
+    let latent_height = (workflow.height / 8) as usize;
+    let latent_width = (workflow.width / 8) as usize;
     let batch_size = workflow.batch_size.max(1) as usize;
     let num_steps = workflow.steps as usize;
     let uses_cfg = (workflow.cfg - 1.0).abs() > f64::EPSILON;
@@ -257,7 +258,7 @@ fn main() -> Result<()> {
             (replay_ids, sample, Some(uncond), per_step_noise)
         } else {
             let mut rng = StdRng::seed_from_u64(workflow.seed as u64);
-            let sample_len = batch_size * latent_channels * latent_size * latent_size;
+            let sample_len = batch_size * latent_channels * latent_height * latent_width;
             let sample: Vec<f32> = (0..sample_len)
                 .map(|_| {
                     let normal: f32 = StandardNormal.sample(&mut rng);
@@ -276,7 +277,8 @@ fn main() -> Result<()> {
                 None
             };
             let per_step_noise = if is_ancestral {
-                let noise_len = num_steps * batch_size * latent_channels * latent_size * latent_size;
+                let noise_len =
+                    num_steps * batch_size * latent_channels * latent_height * latent_width;
                 Some(
                     (0..noise_len)
                         .map(|_| StandardNormal.sample(&mut rng))
@@ -304,8 +306,8 @@ fn main() -> Result<()> {
             &[
                 batch_size as i64,
                 latent_channels as i64,
-                latent_size as i64,
-                latent_size as i64,
+                latent_height as i64,
+                latent_width as i64,
             ],
         )?,
     );
@@ -326,8 +328,8 @@ fn main() -> Result<()> {
                     num_steps as i64,
                     batch_size as i64,
                     latent_channels as i64,
-                    latent_size as i64,
-                    latent_size as i64,
+                    latent_height as i64,
+                    latent_width as i64,
                 ],
             )?,
         );

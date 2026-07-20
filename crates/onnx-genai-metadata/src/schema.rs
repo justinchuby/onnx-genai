@@ -718,11 +718,14 @@ pub struct PipelineStrategyStage {
 /// Diffusion scheduler configuration for an iterative strategy.
 ///
 /// The runtime treats the denoiser's loop-carried output as a noise prediction
-/// and applies one scheduler step per iteration. Currently only `ddim`
-/// (η = 0, epsilon-prediction) with a linear beta schedule is supported.
+/// (or, for `masked_diffusion`, as token logits) and applies one scheduler step
+/// per iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image
+/// diffusion, with optional Karras/exponential sigmas) and `masked_diffusion`
+/// (discrete language diffusion).
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct SchedulerSpec {
-    /// Scheduler algorithm; `"ddim"` is supported.
+    /// Scheduler algorithm: `"ddim"`, `"euler"`, `"dpmpp_2m"`, or
+    /// `"masked_diffusion"`.
     pub kind: String,
 
     /// Training timesteps the noise schedule was defined over (default 1000).

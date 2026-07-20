@@ -20,4 +20,3 @@ pipeline:
     scheduler_config:
       kind: masked_diffusion
       mask_token_id: 1
-      num_steps: 4

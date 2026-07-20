@@ -18,7 +18,6 @@ pipeline:
     kind: iterative
     denoiser: denoiser
     num_steps: 20
-    guidance_scale: 7.5
   phases:
     vae:
       run_on: final_only

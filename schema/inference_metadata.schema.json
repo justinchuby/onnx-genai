@@ -1516,7 +1516,7 @@
       ]
     },
     "SchedulerSpec": {
-      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\nand applies one scheduler step per iteration. Currently only `ddim`\n(η = 0, epsilon-prediction) with a linear beta schedule is supported.",
+      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\n(or, for `masked_diffusion`, as token logits) and applies one scheduler step\nper iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image\ndiffusion, with optional Karras/exponential sigmas) and `masked_diffusion`\n(discrete language diffusion).",
       "type": "object",
       "properties": {
         "beta_end": {
@@ -1554,7 +1554,7 @@
           "minimum": 0
         },
         "kind": {
-          "description": "Scheduler algorithm; `\"ddim\"` is supported.",
+          "description": "Scheduler algorithm: `\"ddim\"`, `\"euler\"`, `\"dpmpp_2m\"`, or\n`\"masked_diffusion\"`.",
           "type": "string"
         },
         "mask_token_id": {

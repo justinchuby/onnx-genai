@@ -137,11 +137,12 @@ fn main() -> Result<()> {
         .get(output_endpoint)
         .with_context(|| format!("output endpoint '{output_endpoint}' not produced"))?;
     let shape = value.shape().to_vec();
-    // Integer outputs (e.g. the final token sequence of a masked-diffusion loop)
-    // are written as little-endian i64; everything else as little-endian f32.
+    // The final token sequence of a masked-diffusion loop is written as
+    // little-endian i64; float latents/samples as little-endian f32. Only these
+    // output dtypes are supported (this is a minimal validation driver).
     use onnx_genai::ort::DataType;
     match value.dtype() {
-        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+        DataType::Int64 => {
             let data = value.to_vec_i64()?;
             write_i64(out_path, &data)?;
             eprintln!(
@@ -149,14 +150,18 @@ fn main() -> Result<()> {
                 data.len()
             );
         }
-        _ => {
-            let data = value.to_vec_f32()?;
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16 => {
+            let data = value.to_vec_f32_lossy()?;
             write_f32(out_path, &data)?;
             eprintln!(
                 "wrote {output_endpoint} shape {shape:?} ({} f32 elems) -> {out_path}",
                 data.len()
             );
         }
+        other => bail!(
+            "unsupported output dtype {other:?} for '{output_endpoint}' \
+             (only Int64 and fp32/fp16/bf16 outputs are written)"
+        ),
     }
     Ok(())
 }

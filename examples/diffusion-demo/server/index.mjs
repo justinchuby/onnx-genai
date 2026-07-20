@@ -51,6 +51,17 @@ function ortLibDir() {
   return collect("release") ?? collect("debug") ?? "";
 }
 
+// Env for spawning the ORT-linked binaries: prepend the ORT lib dir to the
+// platform's dynamic-loader search path (DYLD_LIBRARY_PATH on macOS,
+// LD_LIBRARY_PATH on Linux) so the demo works on both.
+function ortLibPathEnv() {
+  const dir = ortLibDir();
+  return {
+    DYLD_LIBRARY_PATH: `${dir}:${process.env.DYLD_LIBRARY_PATH || ""}`,
+    LD_LIBRARY_PATH: `${dir}:${process.env.LD_LIBRARY_PATH || ""}`,
+  };
+}
+
 function safeReaddir(dir) {
   try {
     return readdirSync(dir).filter((e) => {
@@ -103,7 +114,7 @@ function runPipelineWithDump(packageDir, outputEndpoint, inputs) {
   const r = spawnSync(bin, args, {
     encoding: "utf8",
     maxBuffer: 256 << 20,
-    env: { ...process.env, ONNX_GENAI_STEP_DUMP_DIR: dump, DYLD_LIBRARY_PATH: `${ortLibDir()}:${process.env.DYLD_LIBRARY_PATH || ""}` },
+    env: { ...process.env, ONNX_GENAI_STEP_DUMP_DIR: dump, ...ortLibPathEnv() },
   });
   if (r.status !== 0) throw new Error(r.stderr || "run_diffusion failed");
   const frames = readdirSync(dump)
@@ -389,7 +400,7 @@ function runImage(options) {
       env: {
         ...process.env,
         ONNX_GENAI_STEP_DUMP_DIR: dump,
-        DYLD_LIBRARY_PATH: `${ortLibDir()}:${process.env.DYLD_LIBRARY_PATH || ""}`,
+        ...ortLibPathEnv(),
       },
     }
   );
