@@ -7,7 +7,6 @@
 //! Present key/value outputs remain BNSH and preserve a fixed cache capacity.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -59,21 +58,40 @@ extern "C" __global__ void gqa_split_packed_qkv(
 extern "C" __global__ void gqa_prepare_metadata(
     const int* seqlens_k, int* total_lengths, int* past_lengths,
     int* query_starts, int batch, int current_key_length, int query_length,
-    int past_capacity, int present_capacity)
+    int past_capacity, int present_capacity, const long long* position_ids,
+    int validate_positions, int cache_rows, int* error_flag)
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= batch) return;
-    long long total = (long long)seqlens_k[b] + 1;
-    const int minimum = current_key_length > query_length
-        ? current_key_length
-        : query_length;
-    if (total < minimum) total = minimum;
-    if (total > present_capacity) total = present_capacity;
-    long long past = total - current_key_length;
-    if (past > past_capacity) past = past_capacity;
+    const long long total = (long long)seqlens_k[b] + 1;
+    const long long past = total - current_key_length;
+    const long long query_start = total - query_length;
+    int error = 0;
+    if (total > 2147483647LL) error |= 1;
+    if (past < 0) error |= 2;
+    if (query_start < 0) error |= 4;
+    if (past > past_capacity) error |= 8;
+    if (total > present_capacity) error |= 16;
+    if (validate_positions) {
+        for (int s = 0; s < query_length; ++s) {
+            const long long position = position_ids
+                ? position_ids[b * query_length + s]
+                : past + s;
+            if (position < 0 || position >= (long long)cache_rows) {
+                error |= 32;
+            }
+        }
+    }
+    if (error) {
+        if (error_flag) atomicOr(error_flag, error);
+        total_lengths[b] = -1;
+        past_lengths[b] = -1;
+        query_starts[b] = -1;
+        return;
+    }
     total_lengths[b] = (int)total;
     past_lengths[b] = (int)past;
-    query_starts[b] = (int)total - query_length;
+    query_starts[b] = (int)query_start;
 }
 
 extern "C" __global__ void gqa_build_cache(
@@ -89,6 +107,7 @@ extern "C" __global__ void gqa_build_cache(
     const int s = x % present_capacity; x /= present_capacity;
     const int h = x % heads; const int b = x / heads;
     const int past_len = past_lengths[b];
+    if (past_len < 0) return;
     float value = 0.0f;
     if (s < past_len && past) {
         value = past[((b * heads + h) * past_capacity + s) * dim + d];
@@ -111,6 +130,7 @@ extern "C" __global__ void gqa_append_cache(
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
     const int target_s = past_lengths[b] + s;
+    if (target_s < 0 || target_s >= present_capacity) return;
     present[((b * heads + h) * present_capacity + target_s) * dim + d] =
         current[((b * seq + s) * heads + h) * dim + d];
 }
@@ -129,10 +149,13 @@ extern "C" __global__ void gqa_rope_bnsh(
     const int k = x % half; x /= half;
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
-    const int pos = position_ids
-        ? (int)position_ids[b * seq + s]
-        : past_lengths[b] + s;
-    if (pos < 0 || pos >= cache_rows) return;
+    const int past = past_lengths[b];
+    if (past < 0) return;
+    const long long position = position_ids
+        ? position_ids[b * seq + s]
+        : (long long)past + s;
+    if (position < 0 || position >= (long long)cache_rows) return;
+    const int pos = (int)position;
     const int d0 = interleaved ? 2 * k : k;
     const int d1 = interleaved ? 2 * k + 1 : k + half;
     const int tensor_s = current_offset ? past_lengths[b] + s : s;
@@ -318,6 +341,7 @@ __device__ void gqa_build_cache_body(
     const int s = x % present_capacity; x /= present_capacity;
     const int h = x % heads; const int b = x / heads;
     const int past_len = past_lengths[b];
+    if (past_len < 0) return;
     T result = gqa_store<T>(0.0f);
     if (s < past_len && past) {
         result = past[((b * heads + h) * past_capacity + s) * dim + d];
@@ -341,6 +365,7 @@ __device__ void gqa_append_cache_body(
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
     const int target_s = past_lengths[b] + s;
+    if (target_s < 0 || target_s >= present_capacity) return;
     present[((b * heads + h) * present_capacity + target_s) * dim + d] =
         current[((b * seq + s) * heads + h) * dim + d];
 }
@@ -360,10 +385,13 @@ __device__ void gqa_rope_bnsh_body(
     const int k = x % half; x /= half;
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
-    const int pos = position_ids
-        ? (int)position_ids[b * seq + s]
-        : past_lengths[b] + s;
-    if (pos < 0 || pos >= cache_rows) return;
+    const int past = past_lengths[b];
+    if (past < 0) return;
+    const long long position = position_ids
+        ? position_ids[b * seq + s]
+        : (long long)past + s;
+    if (position < 0 || position >= (long long)cache_rows) return;
+    const int pos = (int)position;
     const int d0 = interleaved ? 2 * k : k;
     const int d1 = interleaved ? 2 * k + 1 : k + half;
     const int tensor_s = current_offset ? past_lengths[b] + s : s;
@@ -446,7 +474,15 @@ const WS_OUT_BNSH: usize = 7;
 const WS_PRESENT_K: usize = 8;
 const WS_PRESENT_V: usize = 9;
 const WS_SCORES: usize = 10;
-const WS_COUNT: usize = 11;
+const WS_METADATA_ERROR: usize = 11;
+const WS_COUNT: usize = 12;
+
+const METADATA_ERROR_TOTAL_OVERFLOW: u32 = 1;
+const METADATA_ERROR_PAST_NEGATIVE: u32 = 2;
+const METADATA_ERROR_QUERY_NEGATIVE: u32 = 4;
+const METADATA_ERROR_PAST_CAPACITY: u32 = 8;
+const METADATA_ERROR_PRESENT_CAPACITY: u32 = 16;
+const METADATA_ERROR_POSITION: u32 = 32;
 
 pub struct GroupQueryAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
@@ -542,13 +578,15 @@ pub struct GroupQueryAttentionKernel {
     softcap: f32,
     backend: GroupQueryAttentionBackend,
     workspace: Mutex<GqaWorkspace>,
-    capture_config: Mutex<Option<GqaCaptureConfig>>,
-    last_call_capture_safe: AtomicBool,
+    last_capture_safe_signature: Mutex<Option<GqaCaptureSignature>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GqaCaptureConfig {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GqaCaptureSignature {
+    dtype: DataType,
     batch: usize,
+    query_sequence_length: usize,
+    key_sequence_length: usize,
     q_hidden: usize,
     k_hidden: usize,
     dim: usize,
@@ -557,6 +595,9 @@ struct GqaCaptureConfig {
     packed_qkv: bool,
     explicit_positions: bool,
     cache_rows: usize,
+    input_shapes: Vec<Option<Vec<usize>>>,
+    output_shapes: Vec<Vec<usize>>,
+    backend: GroupQueryAttentionBackend,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -569,6 +610,7 @@ struct WorkspaceSlot {
 struct GqaWorkspace {
     runtime: Arc<CudaRuntime>,
     slots: [WorkspaceSlot; WS_COUNT],
+    metadata_error_initialized: bool,
 }
 
 impl GqaWorkspace {
@@ -576,6 +618,7 @@ impl GqaWorkspace {
         Self {
             runtime,
             slots: [WorkspaceSlot::default(); WS_COUNT],
+            metadata_error_initialized: false,
         }
     }
 
@@ -611,6 +654,32 @@ impl GqaWorkspace {
         self.slots[index] = WorkspaceSlot { ptr, bytes };
         Ok(ptr)
     }
+
+    fn metadata_error_flag(&mut self) -> Result<CUdeviceptr> {
+        let ptr = self.reserve(WS_METADATA_ERROR, std::mem::size_of::<u32>())?;
+        if !self.metadata_error_initialized {
+            // SAFETY: the metadata error slot is a live four-byte allocation.
+            unsafe { self.runtime.htod(&0_u32.to_ne_bytes(), ptr) }?;
+            self.metadata_error_initialized = true;
+        }
+        Ok(ptr)
+    }
+
+    fn take_metadata_error(&mut self) -> Result<u32> {
+        if !self.metadata_error_initialized {
+            return Ok(0);
+        }
+        let ptr = self.slots[WS_METADATA_ERROR].ptr;
+        let mut bytes = [0_u8; std::mem::size_of::<u32>()];
+        // SAFETY: the initialized metadata error slot contains one u32.
+        unsafe { self.runtime.dtoh(&mut bytes, ptr) }?;
+        let error = u32::from_ne_bytes(bytes);
+        if error != 0 {
+            // SAFETY: the metadata error slot remains a live four-byte allocation.
+            unsafe { self.runtime.htod(&0_u32.to_ne_bytes(), ptr) }?;
+        }
+        Ok(error)
+    }
 }
 
 impl Drop for GqaWorkspace {
@@ -632,6 +701,45 @@ fn checked_i32(value: usize, name: &str) -> Result<i32> {
             "cuda_ep GroupQueryAttention: {name} {value} exceeds i32"
         ))
     })
+}
+
+fn require_matching_capture_signature(
+    runtime: &CudaRuntime,
+    warmed: Option<&GqaCaptureSignature>,
+    current: Option<&GqaCaptureSignature>,
+) -> Result<()> {
+    if runtime.is_capturing()? && (current.is_none() || warmed != current) {
+        return Err(EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: dtype, decode mode, or shape changed during CUDA graph capture; warm the exact f32 one-token fixed device-KV signature before capture".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn metadata_error_to_ep_error(error: u32) -> EpError {
+    let mut violations = Vec::new();
+    if error & METADATA_ERROR_TOTAL_OVERFLOW != 0 {
+        violations.push("seqlens_k + 1 overflows int32");
+    }
+    if error & METADATA_ERROR_PAST_NEGATIVE != 0 {
+        violations.push("seqlens_k + 1 is shorter than current key sequence");
+    }
+    if error & METADATA_ERROR_QUERY_NEGATIVE != 0 {
+        violations.push("seqlens_k + 1 is shorter than current query sequence");
+    }
+    if error & METADATA_ERROR_PAST_CAPACITY != 0 {
+        violations.push("effective past length exceeds past cache extent");
+    }
+    if error & METADATA_ERROR_PRESENT_CAPACITY != 0 {
+        violations.push("valid sequence length exceeds present cache capacity");
+    }
+    if error & METADATA_ERROR_POSITION != 0 {
+        violations.push("position_ids or implicit rotary position exceeds cache rows");
+    }
+    EpError::KernelFailed(format!(
+        "cuda_ep GroupQueryAttention: deferred device metadata validation failed: {}",
+        violations.join("; ")
+    ))
 }
 
 fn require_dense(view: &TensorView, name: &str, dtype: DataType) -> Result<()> {
@@ -731,8 +839,7 @@ impl GroupQueryAttentionKernel {
             local_window_size,
             softcap,
             backend: GroupQueryAttentionBackend::Auto,
-            capture_config: Mutex::new(None),
-            last_call_capture_safe: AtomicBool::new(false),
+            last_capture_safe_signature: Mutex::new(None),
         })
     }
 
@@ -766,7 +873,27 @@ impl GroupQueryAttentionKernel {
     }
 
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: capture signature lock poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
+        let capturing = self.runtime.is_capturing()?;
+        if !capturing {
+            let metadata_error = self
+                .workspace
+                .lock()
+                .map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: workspace lock poisoned".into(),
+                    )
+                })?
+                .take_metadata_error()?;
+            if metadata_error != 0 {
+                return Err(metadata_error_to_ep_error(metadata_error));
+            }
+        }
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep GroupQueryAttention: expected 7..14 inputs and 1..3 outputs, got {} and {}",
@@ -1056,9 +1183,14 @@ impl GroupQueryAttentionKernel {
                     && present_capacity >= 1
                     && past_capacity == present_capacity
                     && aliased_device_kv
+                    && self.selected_backend_for_shape(q.dtype, q_seq, present_capacity, dim)
+                        == GroupQueryAttentionBackend::Phase2a
             })
-            .map(|present_capacity| GqaCaptureConfig {
+            .map(|present_capacity| GqaCaptureSignature {
+                dtype: q.dtype,
                 batch,
+                query_sequence_length: q_seq,
+                key_sequence_length: k_seq,
                 q_hidden,
                 k_hidden,
                 dim,
@@ -1067,15 +1199,21 @@ impl GroupQueryAttentionKernel {
                 packed_qkv,
                 explicit_positions: explicit_positions.is_some(),
                 cache_rows: cache_rows_usize,
+                input_shapes: inputs
+                    .iter()
+                    .map(|input| (!input.is_absent()).then(|| input.shape.to_vec()))
+                    .collect(),
+                output_shapes: outputs.iter().map(|output| output.shape.to_vec()).collect(),
+                backend: GroupQueryAttentionBackend::Phase2a,
             });
-        let capture_safe_decode = {
-            let config = self.capture_config.lock().map_err(|_| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: capture config lock poisoned".into(),
-                )
-            })?;
-            capture_candidate.is_some_and(|candidate| config.as_ref() == Some(&candidate))
-        };
+        require_matching_capture_signature(
+            &self.runtime,
+            warmed_signature.as_ref(),
+            capture_candidate.as_ref(),
+        )?;
+        let capture_safe_decode = capture_candidate
+            .as_ref()
+            .is_some_and(|candidate| warmed_signature.as_ref() == Some(candidate));
 
         let mut valid_sequence_length = None;
         let mut validated_past_lengths = None;
@@ -1141,9 +1279,10 @@ impl GroupQueryAttentionKernel {
         if !capture_safe_decode && self.do_rotary {
             if let Some(position_ids) = explicit_positions {
                 let ids = read_i64(&self.runtime, position_ids, "position_ids")?;
+                let cache_rows_i64 = i64::from(cache_rows);
                 if ids
                     .iter()
-                    .any(|&position| position < 0 || position as usize >= cache_rows_usize)
+                    .any(|&position| position < 0 || position >= cache_rows_i64)
                 {
                     return Err(EpError::KernelFailed(
                         "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
@@ -1189,6 +1328,11 @@ impl GroupQueryAttentionKernel {
         let totals_gpu = workspace.reserve(WS_TOTALS, metadata_bytes)?;
         let past_lengths_gpu = workspace.reserve(WS_PAST_LENGTHS, metadata_bytes)?;
         let query_starts_gpu = workspace.reserve(WS_QUERY_STARTS, metadata_bytes)?;
+        let metadata_error_gpu = if capture_candidate.is_some() {
+            workspace.metadata_error_flag()?
+        } else {
+            0
+        };
         let packed_q = packed_qkv
             .then(|| workspace.reserve(WS_PACKED_Q, batch * q_seq * q_hidden * element_size))
             .transpose()?;
@@ -1249,6 +1393,7 @@ impl GroupQueryAttentionKernel {
             )
         })?;
         let seqlens_ptr = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
+        let validate_positions_i: i32 = self.do_rotary.into();
         launch_1d!(
             self.runtime,
             PREP_MODULE,
@@ -1266,7 +1411,11 @@ impl GroupQueryAttentionKernel {
                     .arg(&current_key_length)
                     .arg(&query_length)
                     .arg(&past_capacity_i)
-                    .arg(&present_capacity_i);
+                    .arg(&present_capacity_i)
+                    .arg(&positions_ptr)
+                    .arg(&validate_positions_i)
+                    .arg(&cache_rows)
+                    .arg(&metadata_error_gpu);
             }
         );
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
@@ -1564,17 +1713,7 @@ impl GroupQueryAttentionKernel {
                     .arg(&dim_i);
             }
         );
-        if let Some(candidate) = capture_candidate {
-            if !capture_safe_decode {
-                let mut config = self.capture_config.lock().map_err(|_| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: capture config lock poisoned".into(),
-                    )
-                })?;
-                *config = Some(candidate);
-            }
-            self.last_call_capture_safe.store(true, Ordering::Relaxed);
-        }
+        *last_signature = capture_candidate;
         Ok(())
     }
 }
@@ -1589,10 +1728,12 @@ impl Kernel for GroupQueryAttentionKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // Warmed f32 one-token decode with fixed-capacity in-place device KV uses
-        // persistent scratch, on-device metadata prep, static reference-attention
-        // launches, and no per-step D2H validation or stream synchronization.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+        // Eligibility is tied to the exact f32 one-token, fixed-capacity,
+        // in-place device-KV reference-attention signature warmed by the most
+        // recent successful call.
+        self.last_capture_safe_signature
+            .lock()
+            .is_ok_and(|signature| signature.is_some())
     }
 }
 

@@ -317,6 +317,26 @@ fn upload(
     Ok(buffer)
 }
 
+fn overwrite(
+    ep: &CudaExecutionProvider,
+    buffer: &DeviceBuffer,
+    tensor: &HostTensor,
+) -> onnx_runtime_ep_api::Result<()> {
+    // SAFETY: callers provide a persistent allocation large enough for `tensor`.
+    unsafe { ep.runtime().htod(&tensor.bytes, cuptr(buffer.as_ptr())) }
+}
+
+fn read_bytes(
+    ep: &CudaExecutionProvider,
+    buffer: &DeviceBuffer,
+    bytes: usize,
+) -> onnx_runtime_ep_api::Result<Vec<u8>> {
+    let mut host = vec![0_u8; bytes];
+    // SAFETY: callers request no more bytes than the live allocation contains.
+    unsafe { ep.runtime().dtoh(&mut host, cuptr(buffer.as_ptr())) }?;
+    Ok(host)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_in_place_packed_f32_gqa(
     kernel: &GroupQueryAttentionKernel,
@@ -1569,6 +1589,8 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let runtime = ep.runtime();
     let kernel =
         GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+    let eager_kernel =
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
     assert!(!kernel.cuda_graph_compatible());
 
     let packed_host = f32_tensor(
@@ -1591,11 +1613,11 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
             65., 66.,
         ],
     );
-    let seqlens_host = i32_tensor(&[1], &[2]);
-    let total_host = i32_tensor(&[1], &[3]);
-    let cos_host = f32_tensor(&[5, 1], &[1.; 5]);
-    let sin_host = f32_tensor(&[5, 1], &[0.; 5]);
-    let positions_host = i64_tensor(&[1, 2], &[2, 0]);
+    let seqlens_host = i32_tensor(&[1], &[1]);
+    let total_host = i32_tensor(&[1], &[5]);
+    let cos_host = f32_tensor(&[5, 1], &[1.0, 0.0, -1.0, 0.5, -0.5]);
+    let sin_host = f32_tensor(&[5, 1], &[0.0, 1.0, 0.0, 0.866_025_4, 0.866_025_4]);
+    let positions_host = i64_tensor(&[1, 2], &[1, 0]);
     let packed = upload(&ep, &packed_host).unwrap();
     let mut cache_k = upload(&ep, &cache_k_host).unwrap();
     let mut cache_v = upload(&ep, &cache_v_host).unwrap();
@@ -1606,6 +1628,11 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let positions = upload(&ep, &positions_host).unwrap();
     let output_bytes = 8 * std::mem::size_of::<f32>();
     let mut output = ep.allocate(output_bytes, 256).unwrap();
+    let mut eager_cache_k = upload(&ep, &cache_k_host).unwrap();
+    let mut eager_cache_v = upload(&ep, &cache_v_host).unwrap();
+    let eager_seqlens = upload(&ep, &seqlens_host).unwrap();
+    let eager_positions = upload(&ep, &positions_host).unwrap();
+    let mut eager_output = ep.allocate(output_bytes, 256).unwrap();
 
     execute_in_place_packed_f32_gqa(
         &kernel,
@@ -1622,10 +1649,25 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         1,
     )
     .unwrap();
-    runtime.synchronize().unwrap();
-    let mut eager = vec![0u8; output_bytes];
-    // SAFETY: output contains one complete [1,1,8] f32 tensor.
-    unsafe { runtime.dtoh(&mut eager, cuptr(output.as_ptr())) }.unwrap();
+    execute_in_place_packed_f32_gqa(
+        &eager_kernel,
+        &ep,
+        &packed,
+        &mut eager_cache_k,
+        &mut eager_cache_v,
+        &eager_seqlens,
+        &total,
+        &cos,
+        &sin,
+        &eager_positions,
+        &mut eager_output,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        read_bytes(&ep, &output, output_bytes).unwrap(),
+        read_bytes(&ep, &eager_output, output_bytes).unwrap()
+    );
     assert!(kernel.cuda_graph_compatible());
 
     let allocation_counts = runtime.allocation_counts();
@@ -1647,12 +1689,44 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     )
     .unwrap();
     runtime.end_graph_capture().unwrap();
-    runtime.replay_graph().unwrap();
-    runtime.synchronize().unwrap();
-    let mut replayed = vec![0u8; eager.len()];
-    // SAFETY: output remains the fixed allocation captured by the graph.
-    unsafe { runtime.dtoh(&mut replayed, cuptr(output.as_ptr())) }.unwrap();
-    assert_eq!(replayed, eager);
+
+    let mut previous = read_bytes(&ep, &output, output_bytes).unwrap();
+    for step in 2_i32..=4 {
+        let seqlens_step = i32_tensor(&[1], &[step]);
+        let positions_step = i64_tensor(&[1], &[i64::from(step)]);
+        overwrite(&ep, &seqlens, &seqlens_step).unwrap();
+        overwrite(&ep, &positions, &positions_step).unwrap();
+        overwrite(&ep, &eager_seqlens, &seqlens_step).unwrap();
+        overwrite(&ep, &eager_positions, &positions_step).unwrap();
+
+        execute_in_place_packed_f32_gqa(
+            &eager_kernel,
+            &ep,
+            &packed,
+            &mut eager_cache_k,
+            &mut eager_cache_v,
+            &eager_seqlens,
+            &total,
+            &cos,
+            &sin,
+            &eager_positions,
+            &mut eager_output,
+            1,
+        )
+        .unwrap();
+        runtime.replay_graph().unwrap();
+        let replayed = read_bytes(&ep, &output, output_bytes).unwrap();
+        let eager = read_bytes(&ep, &eager_output, output_bytes).unwrap();
+        assert_eq!(
+            replayed, eager,
+            "capture replay diverged at decode step {step}"
+        );
+        assert_ne!(
+            replayed, previous,
+            "attention output did not change when the valid window grew at step {step}"
+        );
+        previous = replayed;
+    }
     assert_eq!(runtime.allocation_counts(), allocation_counts);
     assert!(runtime.reset_graph().unwrap());
 
@@ -1661,20 +1735,13 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let prefill_total_host = i32_tensor(&[1], &[2]);
     let prefill_positions_host = i64_tensor(&[1, 2], &[0, 1]);
     let prefill_packed = upload(&ep, &prefill_packed_host).unwrap();
-    // SAFETY: the persistent scalar buffers exactly match these host tensors.
-    unsafe {
-        runtime
-            .htod(&prefill_seqlens_host.bytes, cuptr(seqlens.as_ptr()))
-            .unwrap();
-        runtime
-            .htod(&prefill_total_host.bytes, cuptr(total.as_ptr()))
-            .unwrap();
-        runtime
-            .htod(&prefill_positions_host.bytes, cuptr(positions.as_ptr()))
-            .unwrap();
-    }
+    overwrite(&ep, &seqlens, &prefill_seqlens_host).unwrap();
+    overwrite(&ep, &total, &prefill_total_host).unwrap();
+    overwrite(&ep, &positions, &prefill_positions_host).unwrap();
     let mut prefill_output = ep.allocate(2 * output_bytes, 256).unwrap();
-    execute_in_place_packed_f32_gqa(
+    let kernels: [&dyn Kernel; 1] = [&kernel];
+    runtime.begin_graph_capture(&kernels).unwrap();
+    let error = execute_in_place_packed_f32_gqa(
         &kernel,
         &ep,
         &prefill_packed,
@@ -1688,12 +1755,19 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         &mut prefill_output,
         2,
     )
-    .unwrap();
+    .unwrap_err();
+    assert!(format!("{error}").contains("dtype, decode mode, or shape changed"));
+    let _ = runtime.end_graph_capture();
     assert!(!kernel.cuda_graph_compatible());
 
     for buffer in [
         prefill_output,
         prefill_packed,
+        eager_output,
+        eager_positions,
+        eager_seqlens,
+        eager_cache_v,
+        eager_cache_k,
         output,
         positions,
         sin,
@@ -1703,6 +1777,134 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         cache_v,
         cache_k,
         packed,
+    ] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+#[test]
+fn gqa_gpu_capture_detects_invalid_decode_metadata() {
+    let Some(ep) = gpu() else { return };
+    let runtime = ep.runtime();
+    let kernel =
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+    let packed_host = f32_tensor(
+        &[1, 1, 16],
+        &[
+            1., 0., 1., 0., 0., 1., 0., 1., 1., 1., 10., 10., 5., 6., 50., 60.,
+        ],
+    );
+    let cache_k_host = f32_tensor(&[1, 2, 5, 2], &[0.0; 20]);
+    let cache_v_host = f32_tensor(&[1, 2, 5, 2], &[0.0; 20]);
+    let valid_seqlens = i32_tensor(&[1], &[2]);
+    let total_host = i32_tensor(&[1], &[5]);
+    let cos_host = f32_tensor(&[5, 1], &[1.0; 5]);
+    let sin_host = f32_tensor(&[5, 1], &[0.0; 5]);
+    let valid_positions = i64_tensor(&[1, 2], &[2, 0]);
+    let packed = upload(&ep, &packed_host).unwrap();
+    let mut cache_k = upload(&ep, &cache_k_host).unwrap();
+    let mut cache_v = upload(&ep, &cache_v_host).unwrap();
+    let seqlens = upload(&ep, &valid_seqlens).unwrap();
+    let total = upload(&ep, &total_host).unwrap();
+    let cos = upload(&ep, &cos_host).unwrap();
+    let sin = upload(&ep, &sin_host).unwrap();
+    let positions = upload(&ep, &valid_positions).unwrap();
+    let mut output = ep.allocate(8 * std::mem::size_of::<f32>(), 256).unwrap();
+
+    let mut capture_invalid = |bad_seqlens: Option<i32>,
+                               bad_position: Option<i64>|
+     -> onnx_runtime_ep_api::EpError {
+        overwrite(&ep, &seqlens, &valid_seqlens).unwrap();
+        overwrite(&ep, &positions, &valid_positions).unwrap();
+        execute_in_place_packed_f32_gqa(
+            &kernel,
+            &ep,
+            &packed,
+            &mut cache_k,
+            &mut cache_v,
+            &seqlens,
+            &total,
+            &cos,
+            &sin,
+            &positions,
+            &mut output,
+            1,
+        )
+        .unwrap();
+        let kernels: [&dyn Kernel; 1] = [&kernel];
+        runtime.begin_graph_capture(&kernels).unwrap();
+        execute_in_place_packed_f32_gqa(
+            &kernel,
+            &ep,
+            &packed,
+            &mut cache_k,
+            &mut cache_v,
+            &seqlens,
+            &total,
+            &cos,
+            &sin,
+            &positions,
+            &mut output,
+            1,
+        )
+        .unwrap();
+        runtime.end_graph_capture().unwrap();
+        let cache_k_before = read_bytes(&ep, &cache_k, 20 * std::mem::size_of::<f32>()).unwrap();
+        let cache_v_before = read_bytes(&ep, &cache_v, 20 * std::mem::size_of::<f32>()).unwrap();
+
+        if let Some(value) = bad_seqlens {
+            overwrite(&ep, &seqlens, &i32_tensor(&[1], &[value])).unwrap();
+        }
+        if let Some(value) = bad_position {
+            overwrite(&ep, &positions, &i64_tensor(&[1], &[value])).unwrap();
+        }
+        runtime.replay_graph().unwrap();
+        runtime.synchronize().unwrap();
+        assert_eq!(
+            read_bytes(&ep, &cache_k, cache_k_before.len()).unwrap(),
+            cache_k_before
+        );
+        assert_eq!(
+            read_bytes(&ep, &cache_v, cache_v_before.len()).unwrap(),
+            cache_v_before
+        );
+        assert!(runtime.reset_graph().unwrap());
+
+        overwrite(&ep, &seqlens, &valid_seqlens).unwrap();
+        overwrite(&ep, &positions, &valid_positions).unwrap();
+        execute_in_place_packed_f32_gqa(
+            &kernel,
+            &ep,
+            &packed,
+            &mut cache_k,
+            &mut cache_v,
+            &seqlens,
+            &total,
+            &cos,
+            &sin,
+            &positions,
+            &mut output,
+            1,
+        )
+        .unwrap_err()
+    };
+
+    let overflow = capture_invalid(Some(i32::MAX), None);
+    assert!(format!("{overflow}").contains("seqlens_k + 1 overflows int32"));
+
+    let negative = capture_invalid(Some(-1), None);
+    let negative = format!("{negative}");
+    assert!(negative.contains("shorter than current key sequence"));
+    assert!(negative.contains("shorter than current query sequence"));
+
+    let capacity = capture_invalid(Some(6), None);
+    assert!(format!("{capacity}").contains("effective past length exceeds past cache extent"));
+
+    let position = capture_invalid(None, Some(i64::MAX));
+    assert!(format!("{position}").contains("rotary position exceeds cache rows"));
+
+    for buffer in [
+        output, positions, sin, cos, total, seqlens, cache_v, cache_k, packed,
     ] {
         ep.deallocate(buffer).unwrap();
     }
