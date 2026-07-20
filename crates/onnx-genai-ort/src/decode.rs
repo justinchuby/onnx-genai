@@ -534,6 +534,7 @@ impl CaptureState {
         self.mask_valid_len = valid_len;
         // Order the host->device input copies above before ORT's non-blocking
         // captured-graph replay reads these buffers (see the doc comment).
+        let _sync_span = crate::prof_span!("ort.write_step_inputs.device_sync");
         let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
         crate::cuda_rt::device_synchronize()?;
         Ok(())
@@ -968,6 +969,7 @@ impl<'a> DecodeSession<'a> {
         // host->device copy (the captured graph reads them directly on replay);
         // host inputs are updated with a plain memcpy and ORT re-copies them on
         // the re-bind below.
+        let write_span = crate::prof_span!("ort.write_step_inputs");
         if cap.inputs_on_device {
             #[cfg(feature = "cuda")]
             {
@@ -978,6 +980,7 @@ impl<'a> DecodeSession<'a> {
             cap.write_step_inputs_host(token, position, valid_len)
                 .map_err(CapturedStepError::PreRun)?;
         }
+        drop(write_span);
 
         // On the first step under this capture id (and after any reset/rewind/KV
         // grow that calls `invalidate_captured_graph`), bind every input and
