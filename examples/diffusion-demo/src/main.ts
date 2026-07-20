@@ -563,13 +563,16 @@ function render() {
   const bakedNote = el("div", "note");
   runPanel.appendChild(bakedNote);
 
-  // Prefill image properties from the exported package's workflow.json.
-  if (currentTab === "image") {
-    fetch("/api/image/settings")
-      .then((r) => r.json())
-      .then((s) => {
-        const st = s.settings;
-        if (!st) return;
+  // Prefill properties from the active package and render the pipeline config
+  // ("ComfyUI-style") on load — for both tabs — so the graph and editable
+  // fields are populated before the first run.
+  const settingsUrl = currentTab === "image" ? "/api/image/settings" : "/api/language/settings";
+  fetch(settingsUrl)
+    .then((r) => r.json())
+    .then((s) => {
+      if (s && s.metadata && !loadedMeta) showViz(s.metadata as Metadata);
+      const st = s?.settings;
+      if (st) {
         const set = (k: string, v: unknown) => {
           if (v !== undefined && v !== null && inputs[k]) inputs[k].value = String(v);
         };
@@ -579,14 +582,20 @@ function render() {
         set("guidance", st.guidance);
         set("seed", st.seed);
         set("size", st.size);
-        bakedNote.textContent = `package: ${s.package ?? "?"} · from-scratch Mobius SD 1.x`;
-      })
-      .catch(() => {
-        bakedNote.textContent = "set ONNX_GENAI_SD_PACKAGE to a package with a workflow.json (see README)";
-      });
-  } else {
-    bakedNote.textContent = "mask-token un-masking · scheduler baked at export";
-  }
+        set("seqLen", st.seqLen);
+      }
+      if (currentTab === "image") {
+        bakedNote.textContent = `package: ${s?.package ?? "?"} · from-scratch Mobius SD 1.x`;
+      } else {
+        bakedNote.textContent = `package: ${s?.package ?? "?"} · mask-token un-masking · scheduler baked at export`;
+      }
+    })
+    .catch(() => {
+      bakedNote.textContent =
+        currentTab === "image"
+          ? "set ONNX_GENAI_SD_PACKAGE to a from-scratch Mobius SD package (see README)"
+          : "mask-token un-masking · scheduler baked at export";
+    });
 
   const runRow = el("div", "row");
   const runBtn = el("button", undefined, currentTab === "language" ? "Run language diffusion" : "Run image diffusion") as HTMLButtonElement;

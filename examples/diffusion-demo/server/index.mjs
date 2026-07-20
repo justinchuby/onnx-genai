@@ -467,6 +467,20 @@ function runImage(options) {
   };
 }
 
+// Parse a package's inference_metadata.yaml (native onnx-genai pipeline config)
+// into a plain object, or return null when the package has none. Used to
+// prefill the UI's "Pipeline config" panel on load.
+function readPackageMetadata(pkgDir) {
+  if (!pkgDir) return null;
+  const metaPath = join(pkgDir, "inference_metadata.yaml");
+  if (!existsSync(metaPath)) return null;
+  try {
+    return YAML.parse(readFileSync(metaPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 // Parse and clamp an integer request field, falling back to `fallback` when the
 // value is absent or not a finite number.
 function clampInt(value, min, max, fallback) {
@@ -506,7 +520,8 @@ const server = createServer(async (req, res) => {
     if (req.url === "/api/image/settings" && req.method === "GET") {
       if (!SD_PACKAGE) return json(res, 400, { error: "no Stable Diffusion package configured; set ONNX_GENAI_SD_PACKAGE (see README)" });
       // render_sd takes its parameters directly (no workflow.json), so expose
-      // sensible defaults for the UI to prefill.
+      // sensible defaults for the UI to prefill, plus the package's parsed
+      // inference_metadata so the UI can render the pipeline config on load.
       return json(res, 200, {
         package: SD_PACKAGE,
         settings: {
@@ -517,6 +532,19 @@ const server = createServer(async (req, res) => {
           seed: 0,
           size: 512,
         },
+        metadata: readPackageMetadata(SD_PACKAGE),
+      });
+    }
+    if (req.url === "/api/language/settings" && req.method === "GET") {
+      // The masked-diffusion LM package always exists (bundled fixture default),
+      // so expose its defaults + parsed inference_metadata for prefill on load.
+      return json(res, 200, {
+        package: LM_PACKAGE,
+        settings: {
+          prompt: "",
+          seqLen: Number(process.env.ONNX_GENAI_LM_SEQ_LEN || 32),
+        },
+        metadata: readPackageMetadata(LM_PACKAGE),
       });
     }
     if (req.url === "/api/run/image" && req.method === "POST") {
