@@ -722,7 +722,7 @@ pub struct PipelineStrategyStage {
 /// per iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image
 /// diffusion, with optional Karras/exponential sigmas) and `masked_diffusion`
 /// (discrete language diffusion).
-#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 pub struct SchedulerSpec {
     /// Scheduler algorithm: `"ddim"`, `"euler"`, `"dpmpp_2m"`, or
     /// `"masked_diffusion"`.
@@ -764,6 +764,19 @@ pub struct SchedulerSpec {
     /// LLaDA's semi-autoregressive remasking. Defaults to a single block
     /// spanning the whole masked region.
     pub block_length: Option<usize>,
+
+    /// Unmasking strategy for a `masked_diffusion` scheduler:
+    ///   * `"low_confidence"` (default) — LLaDA: each step commits the
+    ///     highest-confidence still-masked positions (confidence-ranked). Best
+    ///     for LLaDA checkpoints, but greedy/confidence-ranked decoding of other
+    ///     masked-diffusion LMs (e.g. MDLM) collapses into repetitive text.
+    ///   * `"random"` — MDLM-style ancestral: each still-masked position unmasks
+    ///     independently with the schedule probability `1/(steps_remaining)`,
+    ///     sampling its token from the model's categorical distribution (use
+    ///     `temperature: 1.0` for a true categorical sample). This per-position
+    ///     stochastic unmasking avoids the degenerate loops that confidence
+    ///     ranking produces. The mask token is never emitted.
+    pub remasking: Option<String>,
 
     /// Use the Karras (arXiv:2206.00364, rho=7) sigma spacing instead of the
     /// default linspace spacing. Applies to sigma-space schedulers (`euler`,

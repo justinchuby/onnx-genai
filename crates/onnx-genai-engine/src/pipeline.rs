@@ -1394,10 +1394,19 @@ impl SchedulerRegistry {
                 {
                     anyhow::bail!("masked_diffusion block_length must be >= 1");
                 }
+                let remasking = match cfg.remasking.as_deref() {
+                    None | Some("low_confidence") => Remasking::LowConfidence,
+                    Some("random") => Remasking::Random,
+                    Some(other) => anyhow::bail!(
+                        "masked_diffusion remasking must be 'low_confidence' or 'random', \
+                         got '{other}'"
+                    ),
+                };
                 Ok(Arc::new(MaskedDiffusion {
                     mask_token_id,
                     temperature,
                     block_length: cfg.block_length,
+                    remasking,
                     generation_start: Mutex::new(None),
                 }) as Arc<dyn Scheduler>)
             }),
@@ -1428,33 +1437,55 @@ impl Default for SchedulerRegistry {
     }
 }
 
-/// Masked (discrete) language diffusion — LLaDA-style low-confidence remasking,
-/// with optional semi-autoregressive block decoding.
+/// Masked (discrete) language diffusion with two unmasking strategies, selected
+/// by the scheduler config's `remasking` field.
 ///
 /// The loop-carried tensor is an int64 token sequence `[B, S]` (prompt tokens
 /// plus a masked generation region), the denoiser emits `[B, S, V]` logits, and
-/// each step commits a scheduled number of the highest-confidence still-masked
-/// positions per sequence, unmasking progressively so all masked positions are
-/// filled by the final step.
+/// each step unmasks a growing subset of the still-masked positions until all
+/// are filled by the final step.
 ///
-/// Faithful to `ML-GSAI/LLaDA`'s `generate` (`cfg_scale = 0`):
+/// **`remasking = "low_confidence"` (default)** — faithful to `ML-GSAI/LLaDA`'s
+/// `generate` (`cfg_scale = 0`):
 ///   * the chosen token per position is the argmax of the (optionally
 ///     Gumbel-noised) logits (`add_gumbel_noise`; identity at `temperature = 0`);
 ///   * the confidence that ranks positions for remasking is the clean-softmax
 ///     probability of that chosen token (`remasking = "low_confidence"`);
-///   * with `block_length` set, the generation region is split into contiguous
-///     left-to-right blocks; the total `num_steps` is divided evenly across the
-///     `num_blocks`, and each step only commits tokens inside the current block
-///     (semi-autoregressive remasking). A single block (the default) spans the
-///     whole masked region;
-///   * the number of tokens committed at a block's step follows the even split
-///     of that block's masked count across its steps, which
-///     `ceil(remaining / remaining_steps_in_block)` reproduces exactly.
+///   * each step commits the highest-confidence still-masked positions, split
+///     evenly across steps (`ceil(remaining / remaining_steps)`).
+///
+/// **`remasking = "random"`** — MDLM-style ancestral sampling (Sahoo et al.):
+///   * each still-masked position unmasks *independently* with the schedule
+///     probability `1/(steps_remaining_in_block)` (so the expected unmasked
+///     fraction matches the log-linear absorbing schedule, and the final step
+///     unmasks everything);
+///   * on unmasking, the token is *sampled* from the model's categorical
+///     distribution via the Gumbel-max trick (`temperature = 1.0` is a true
+///     categorical sample; `0` is greedy argmax). The mask token id is never
+///     emitted (SUBS parameterization). This per-position stochastic unmasking
+///     avoids the degenerate repetition confidence-ranked greedy decoding
+///     produces on non-LLaDA checkpoints such as MDLM.
+///
+/// With `block_length` set, the generation region is split into contiguous
+/// left-to-right blocks; the total `num_steps` is divided evenly across the
+/// `num_blocks`, and each step only unmasks tokens inside the current block
+/// (semi-autoregressive remasking). A single block (the default) spans the
+/// whole masked region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remasking {
+    /// LLaDA confidence-ranked commit (default).
+    LowConfidence,
+    /// MDLM-style per-position stochastic ancestral unmasking.
+    Random,
+}
+
 #[derive(Debug)]
 struct MaskedDiffusion {
     mask_token_id: i64,
     temperature: f32,
     block_length: Option<usize>,
+    /// Unmasking strategy (see [`Remasking`]).
+    remasking: Remasking,
     /// Per-sequence generation-region start (prompt length), captured on the
     /// first step of a loop and cleared by [`Scheduler::reset`]. This lets the
     /// semi-autoregressive block boundaries be derived without threading the
@@ -1512,6 +1543,37 @@ impl MaskedDiffusion {
         }
         let confidence = (row[best_index] - max_logit).exp() / sum_exp;
         (best_index as i64, confidence)
+    }
+
+    /// Sample one token from a logit row for MDLM-style ancestral unmasking.
+    ///
+    /// Uses the Gumbel-max trick so `temperature = 1.0` draws a true categorical
+    /// sample from `softmax(logits)`, while `temperature = 0` is greedy argmax
+    /// (matching [`predict_row`]'s token choice). The mask token id is excluded
+    /// (SUBS parameterization: an unmasked position is never re-set to mask).
+    fn sample_token(&self, row: &[f32], step: usize, position: usize, vocab: usize) -> i64 {
+        let gumbel = if self.temperature > 0.0 {
+            gumbel_uniforms(step, position, vocab)
+        } else {
+            Vec::new()
+        };
+        let mut best_index: Option<usize> = None;
+        let mut best_score = f32::MIN;
+        for (j, &logit) in row.iter().enumerate() {
+            if j as i64 == self.mask_token_id {
+                continue;
+            }
+            let score = if self.temperature > 0.0 {
+                logit - self.temperature * (-gumbel[j].ln()).ln() as f32
+            } else {
+                logit
+            };
+            if best_index.is_none() || score > best_score {
+                best_score = score;
+                best_index = Some(j);
+            }
+        }
+        best_index.unwrap_or(0) as i64
     }
 }
 
@@ -1606,35 +1668,60 @@ impl Scheduler for MaskedDiffusion {
             let step_in_block = step % steps_per_block;
             let block_start = prompt_length + block_index * block_length;
             let block_end = (block_start + block_length).min(sequence_length);
-
-            // Predicted token + confidence for every still-masked position inside
-            // the current block (only these are candidates for this step).
-            let mut candidates: Vec<(usize, i64, f32)> = Vec::new();
-            for offset in block_start..block_end {
-                let position = row_start + offset;
-                if tokens[position] != self.mask_token_id {
-                    continue;
-                }
-                let logit_row = &all_logits[position * vocab..(position + 1) * vocab];
-                let gumbel = if self.temperature > 0.0 {
-                    gumbel_uniforms(step, position, vocab)
-                } else {
-                    Vec::new()
-                };
-                let (predicted, confidence) = self.predict_row(logit_row, &gumbel);
-                candidates.push((position, predicted, confidence));
-            }
-            if candidates.is_empty() {
-                continue;
-            }
-            // Commit the highest-confidence subset for this block-step. The even
-            // split of the block's masked count across its remaining steps equals
-            // ceil(remaining / remaining_steps_in_block).
-            candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             let remaining_steps_in_block = steps_per_block - step_in_block;
-            let commit = candidates.len().div_ceil(remaining_steps_in_block);
-            for &(position, predicted, _) in candidates.iter().take(commit) {
-                output[position] = predicted;
+
+            match self.remasking {
+                Remasking::LowConfidence => {
+                    // Predicted token + confidence for every still-masked position
+                    // inside the current block (only these are candidates).
+                    let mut candidates: Vec<(usize, i64, f32)> = Vec::new();
+                    for offset in block_start..block_end {
+                        let position = row_start + offset;
+                        if tokens[position] != self.mask_token_id {
+                            continue;
+                        }
+                        let logit_row = &all_logits[position * vocab..(position + 1) * vocab];
+                        let gumbel = if self.temperature > 0.0 {
+                            gumbel_uniforms(step, position, vocab)
+                        } else {
+                            Vec::new()
+                        };
+                        let (predicted, confidence) = self.predict_row(logit_row, &gumbel);
+                        candidates.push((position, predicted, confidence));
+                    }
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    // Commit the highest-confidence subset for this block-step. The
+                    // even split of the block's masked count across its remaining
+                    // steps equals ceil(remaining / remaining_steps_in_block).
+                    candidates
+                        .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    let commit = candidates.len().div_ceil(remaining_steps_in_block);
+                    for &(position, predicted, _) in candidates.iter().take(commit) {
+                        output[position] = predicted;
+                    }
+                }
+                Remasking::Random => {
+                    // MDLM ancestral update: each still-masked position in the block
+                    // unmasks independently with probability 1/(steps remaining), so
+                    // the expected unmasked fraction follows the log-linear schedule
+                    // and the block's final step unmasks everything. The token is
+                    // sampled from the model's categorical distribution.
+                    let last_step_in_block = remaining_steps_in_block <= 1;
+                    let unmask_prob = 1.0f64 / remaining_steps_in_block as f64;
+                    for offset in block_start..block_end {
+                        let position = row_start + offset;
+                        if tokens[position] != self.mask_token_id {
+                            continue;
+                        }
+                        if last_step_in_block || unmask_uniform(step, position) < unmask_prob {
+                            let logit_row =
+                                &all_logits[position * vocab..(position + 1) * vocab];
+                            output[position] = self.sample_token(logit_row, step, position, vocab);
+                        }
+                    }
+                }
             }
         }
         Value::from_slice_i64(&output, &token_shape).map_err(Into::into)
@@ -1656,6 +1743,20 @@ fn gumbel_uniforms(step: usize, position: usize, vocab: usize) -> Vec<f64> {
         // Clamp away from 0 and 1 to keep -ln(-ln u) finite.
         .map(|_| rng.random::<f64>().clamp(1e-9, 1.0 - 1e-9))
         .collect()
+}
+
+/// One uniform sample in `[0, 1)` per `(step, position)` for the MDLM ancestral
+/// per-position unmask decision, seeded deterministically (so a run is
+/// reproducible) but with a distinct mix from [`gumbel_uniforms`] so the unmask
+/// decision is independent of the token-sampling noise at the same position.
+fn unmask_uniform(step: usize, position: usize) -> f64 {
+    use rand::{Rng, SeedableRng};
+    let seed = (step as u64)
+        .wrapping_mul(0x2545_F491_4F6C_DD1D)
+        .wrapping_add((position as u64).wrapping_mul(0xD1B5_4A32_D192_ED03))
+        .wrapping_add(0xA0761_D6478_BD642F);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    rng.random::<f64>()
 }
 
 /// DDIM (η = 0, epsilon-prediction) noise schedule, precomputed per inference
@@ -2688,6 +2789,69 @@ mod tests {
             DdimSchedule::with_schedule(1000, 0.00085, 0.012, "scaled_linear", 4).expect("builds");
         // step_ratio = 250, ascending = [0, 250, 500, 750], reversed for inference.
         assert_eq!(sched.timesteps(), Some(vec![750.0, 500.0, 250.0, 0.0]));
+    }
+
+    #[test]
+    fn masked_diffusion_random_unmasks_all_and_never_emits_mask() {
+        // MDLM-style ancestral unmasking: by the final step every masked position
+        // must be filled, the mask token must never be emitted (even though it has
+        // the largest raw logit here), the prompt prefix is preserved, and the run
+        // is deterministic.
+        let vocab = 5usize;
+        let mask_id = 4i64;
+        let seq = 6usize;
+        let prompt_len = 2usize;
+        let num_steps = 4usize;
+
+        // Sharp logits: the mask token has the highest logit (must be excluded),
+        // and each position's highest *non-mask* logit is a distinct token.
+        let mut logits = vec![0f32; seq * vocab];
+        for pos in 0..seq {
+            logits[pos * vocab + mask_id as usize] = 100.0;
+            logits[pos * vocab + (pos % 4)] = 10.0;
+        }
+        let logits_value =
+            Value::from_slice_f32(&logits, &[1, seq as i64, vocab as i64]).expect("logits");
+
+        let sched = MaskedDiffusion {
+            mask_token_id: mask_id,
+            temperature: 0.0, // greedy token choice => deterministic, random unmask order
+            block_length: None,
+            remasking: Remasking::Random,
+            generation_start: Mutex::new(None),
+        };
+
+        let seed = vec![1i64, 2, mask_id, mask_id, mask_id, mask_id];
+        let run = |sched: &MaskedDiffusion| -> Vec<i64> {
+            sched.reset();
+            let mut value = Value::from_slice_i64(&seed, &[1, seq as i64]).expect("seed");
+            for step in 0..num_steps {
+                value = sched.step(step, num_steps, &value, &logits_value).expect("step");
+            }
+            value.to_vec_i64().expect("tokens")
+        };
+
+        let out = run(&sched);
+        assert_eq!(&out[..prompt_len], &[1, 2], "prompt prefix preserved");
+        for (pos, &tok) in out.iter().enumerate() {
+            assert_ne!(tok, mask_id, "position {pos} still masked / emitted the mask token");
+        }
+        for pos in prompt_len..seq {
+            assert_eq!(out[pos], (pos % 4) as i64, "position {pos} token");
+        }
+        assert_eq!(run(&sched), out, "ancestral sampling is deterministic");
+    }
+
+    #[test]
+    fn masked_diffusion_rejects_unknown_remasking() {
+        let registry = SchedulerRegistry::default();
+        let spec = SchedulerSpec {
+            kind: "masked_diffusion".to_string(),
+            mask_token_id: Some(4),
+            remasking: Some("nonsense".to_string()),
+            ..SchedulerSpec::default()
+        };
+        assert!(registry.build(&spec, 4).is_err());
     }
 
     #[test]
