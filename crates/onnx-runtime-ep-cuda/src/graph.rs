@@ -3,8 +3,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
-use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus};
-use cudarc::driver::{CudaGraph, CudaStream};
+use cudarc::driver::sys::{
+    CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
+};
+use cudarc::driver::{CudaStream, result};
 use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
@@ -12,12 +14,94 @@ use crate::error::driver_err;
 enum GraphState {
     Idle,
     Capturing(ThreadId),
-    Ready(CudaGraph),
+    Ready(CapturedGraph),
 }
 
 /// Owns the graph and graph-exec handles created from one runtime stream.
 ///
-/// `CudaGraph` is intentionally neither `Send` nor `Sync`. CUDA permits graph
+/// CUDA graph handles may cross threads only when every access is externally
+/// serialized. This wrapper owns both handles and destroys each exactly once.
+struct CapturedGraph {
+    graph: CUgraph,
+    graph_exec: CUgraphExec,
+    stream: Arc<CudaStream>,
+}
+
+impl CapturedGraph {
+    fn end_capture(
+        stream: &Arc<CudaStream>,
+        flags: CUgraphInstantiate_flags,
+    ) -> std::result::Result<Option<Self>, cudarc::driver::DriverError> {
+        stream.context().bind_to_thread()?;
+        // SAFETY: this lifecycle holds the state mutex and `stream` is currently
+        // capturing on the calling thread.
+        let graph = unsafe { result::stream::end_capture(stream.cu_stream()) }?;
+        if graph.is_null() {
+            return Ok(None);
+        }
+
+        // SAFETY: `graph` is the fresh non-null handle returned by end_capture.
+        let graph_exec = match unsafe { result::graph::instantiate(graph, flags) } {
+            Ok(graph_exec) => graph_exec,
+            Err(error) => {
+                // cudarc's combined end_capture helper cannot represent ownership
+                // between these calls. Destroy the intermediate graph before
+                // returning an instantiate error so that path cannot leak it.
+                // SAFETY: instantiation failed, so this function exclusively owns
+                // the fresh graph handle and destroys it exactly once here.
+                stream
+                    .context()
+                    .record_err(unsafe { result::graph::destroy(graph) });
+                return Err(error);
+            }
+        };
+
+        Ok(Some(Self {
+            graph,
+            graph_exec,
+            stream: stream.clone(),
+        }))
+    }
+
+    fn upload(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
+        self.stream.context().bind_to_thread()?;
+        // SAFETY: this wrapper owns `graph_exec`, and the lifecycle mutex
+        // serializes access on its owning stream.
+        unsafe { result::graph::upload(self.graph_exec, self.stream.cu_stream()) }
+    }
+
+    fn launch(&self) -> std::result::Result<(), cudarc::driver::DriverError> {
+        self.stream.context().bind_to_thread()?;
+        // SAFETY: this wrapper owns `graph_exec`, and the lifecycle mutex
+        // serializes access on its owning stream.
+        unsafe { result::graph::launch(self.graph_exec, self.stream.cu_stream()) }
+    }
+}
+
+impl Drop for CapturedGraph {
+    fn drop(&mut self) {
+        let context = self.stream.context();
+        context.record_err(context.bind_to_thread());
+
+        let graph_exec = std::mem::replace(&mut self.graph_exec, std::ptr::null_mut());
+        if !graph_exec.is_null() {
+            // SAFETY: this wrapper exclusively owns the non-null executable and
+            // replaces it with null before destroying it.
+            context.record_err(unsafe { result::graph::exec_destroy(graph_exec) });
+        }
+
+        let graph = std::mem::replace(&mut self.graph, std::ptr::null_mut());
+        if !graph.is_null() {
+            // SAFETY: this wrapper exclusively owns the non-null graph and
+            // replaces it with null before destroying it.
+            context.record_err(unsafe { result::graph::destroy(graph) });
+        }
+    }
+}
+
+/// Owns the captured graph installed on one EP runtime stream.
+///
+/// `CapturedGraph` is intentionally neither `Send` nor `Sync`. CUDA permits graph
 /// objects to cross threads only when every access is externally serialized.
 /// This wrapper enforces that rule with one mutex and never exposes a graph
 /// handle or performs graph work without holding its guard.
@@ -94,15 +178,16 @@ impl CudaGraphLifecycle {
         // Return to Idle even when end/instantiate fails. CUDA has ended or
         // invalidated the capture at that point, and no executable is usable.
         *state = GraphState::Idle;
-        let graph = self
-            .stream
-            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY)
-            .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
-            .ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep: CUDA graph capture ended without producing a graph".into(),
-                )
-            })?;
+        let graph = CapturedGraph::end_capture(
+            &self.stream,
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+        )
+        .map_err(|error| driver_err("end and instantiate CUDA graph capture", error))?
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep: CUDA graph capture ended without producing a graph".into(),
+            )
+        })?;
         graph
             .upload()
             .map_err(|error| driver_err("upload CUDA graph executable", error))?;
