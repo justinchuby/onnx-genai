@@ -18,7 +18,6 @@
 //! trivially bandwidth-bound and matches a PyTorch pointwise kernel's shape.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
@@ -307,7 +306,7 @@ impl KernelFactory for UnaryFactory {
         Ok(Box::new(UnaryKernel {
             op: self.op,
             runtime: self.runtime.clone(),
-            last_call_capture_safe: AtomicBool::new(false),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -317,12 +316,23 @@ impl KernelFactory for UnaryFactory {
 pub struct UnaryKernel {
     op: UnaryOp,
     runtime: Arc<CudaRuntime>,
-    last_call_capture_safe: AtomicBool,
+    last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnaryCaptureSignature {
+    dtype: FloatDtype,
+    shape: Vec<usize>,
 }
 
 impl UnaryKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep unary elementwise capture signature lock was poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
         let op = self.op.op_name();
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -365,6 +375,16 @@ impl UnaryKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let entry = self.op.entry(dtype);
+        let current_signature = is_fixed_decode_shape(x.shape).then(|| UnaryCaptureSignature {
+            dtype,
+            shape: x.shape.to_vec(),
+        });
+        require_matching_capture_signature(
+            &self.runtime,
+            op,
+            warmed_signature.as_ref(),
+            current_signature.as_ref(),
+        )?;
 
         let func = self
             .runtime
@@ -380,8 +400,7 @@ impl UnaryKernel {
         // SAFETY: the entry's pointer types match the validated dtype and both
         // allocations cover `n` elements.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        self.last_call_capture_safe
-            .store(is_fixed_decode_shape(x.shape), Ordering::Relaxed);
+        *last_signature = current_signature;
         Ok(())
     }
 }
@@ -396,9 +415,11 @@ impl Kernel for UnaryKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // Warmed fixed-row decode is a pure launch. Prefill and unwarmed calls
-        // stay in eager mode so NVRTC compilation cannot enter capture.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+        // Eligibility is tied to the exact dtype and shape warmed by the most
+        // recent successful call, not a reusable boolean.
+        self.last_capture_safe_signature
+            .lock()
+            .is_ok_and(|signature| signature.is_some())
     }
 }
 
@@ -414,7 +435,7 @@ impl KernelFactory for BinaryFactory {
             op: self.op,
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
-            last_call_capture_safe: AtomicBool::new(false),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -425,7 +446,7 @@ pub struct BinaryKernel {
     op: BinaryOp,
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<BroadcastMetadataCache>,
-    last_call_capture_safe: AtomicBool,
+    last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,6 +454,12 @@ struct BroadcastMetadataKey {
     a_shape: Vec<usize>,
     b_shape: Vec<usize>,
     out_shape: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BinaryCaptureSignature {
+    dtype: FloatDtype,
+    shapes: BroadcastMetadataKey,
 }
 
 #[derive(Debug)]
@@ -511,7 +538,12 @@ impl Drop for BroadcastMetadataCache {
 
 impl BinaryKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep binary elementwise capture signature lock was poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
         let op = self.op.op_name();
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -563,6 +595,22 @@ impl BinaryKernel {
             Some(dtype) => self.op.entry(dtype),
             None => format!("{}_i64", self.op.stem()),
         };
+        let current_signature = float_dtype
+            .filter(|_| is_fixed_decode_shape(&out_shape))
+            .map(|dtype| BinaryCaptureSignature {
+                dtype,
+                shapes: BroadcastMetadataKey {
+                    a_shape: a.shape.to_vec(),
+                    b_shape: b.shape.to_vec(),
+                    out_shape: out_shape.clone(),
+                },
+            });
+        require_matching_capture_signature(
+            &self.runtime,
+            op,
+            warmed_signature.as_ref(),
+            current_signature.as_ref(),
+        )?;
         let func = self
             .runtime
             .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
@@ -590,10 +638,7 @@ impl BinaryKernel {
         // SAFETY: pointer types match the dtype; metadata contains three
         // rank-length u64 arrays; broadcast strides keep all reads in bounds.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        self.last_call_capture_safe.store(
-            float_dtype.is_some() && is_fixed_decode_shape(&out_shape),
-            Ordering::Relaxed,
-        );
+        *last_signature = current_signature;
         Ok(())
     }
 }
@@ -608,11 +653,26 @@ impl Kernel for BinaryKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // Only a warmed floating-point fixed-row decode shape reuses persistent
-        // metadata and consists solely of a kernel launch. Prefill, i64, and
-        // unwarmed/shape-changing calls remain eager.
-        self.last_call_capture_safe.load(Ordering::Relaxed)
+        // Only the exact floating-point fixed-row signature recorded by the
+        // most recent successful call may enter capture.
+        self.last_capture_safe_signature
+            .lock()
+            .is_ok_and(|signature| signature.is_some())
     }
+}
+
+fn require_matching_capture_signature<T: PartialEq>(
+    runtime: &CudaRuntime,
+    op: &str,
+    warmed: Option<&T>,
+    current: Option<&T>,
+) -> Result<()> {
+    if runtime.is_capturing()? && (current.is_none() || warmed != current) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: dtype or shape changed during CUDA graph capture; warm the exact fixed decode signature before capture"
+        )));
+    }
+    Ok(())
 }
 
 fn is_fixed_decode_shape(shape: &[usize]) -> bool {
