@@ -41,9 +41,8 @@ use onnx_runtime_protocol_trace::{
 
 use crate::governor::ResourceError;
 
-/// Bounded-aging cap: an older satisfiable request's effective priority rises by
-/// at most this many levels, so continuous high-priority arrivals cannot starve
-/// it indefinitely (§5.3.1 rule 3).
+/// Arbitration rounds before a waiting request becomes mature and is ordered
+/// ahead of non-matured work (§5.3.1 rule 3).
 const AGING_CAP: u64 = 8;
 const DEFAULT_MAILBOX_CAPACITY: usize = 1024;
 
@@ -122,8 +121,9 @@ pub enum PressureState {
     Pending(HostPageRequest),
     /// The allocation is already charged before the ticket is woken.
     Granted(HostAllocation),
-    /// The ticket claimed the allocation; ticket drop is now a no-op.
-    Claimed,
+    /// The ticket claimed the allocation; the ledger retains its authoritative
+    /// identity until release and ticket drop is now a no-op.
+    Claimed(HostAllocation),
     /// The ticket was cancelled (dropped) before it claimed a grant.
     Cancelled,
     /// The request failed (timeout or reconfiguration).
@@ -301,16 +301,6 @@ impl CancelMailbox {
         Ok(())
     }
 
-    /// Posts a cancellation into a pre-reserved slot. Never blocks, allocates,
-    /// or drops.
-    fn send(&mut self, command: CancelCommand) -> bool {
-        if self.queue.len() >= self.reserved {
-            return false;
-        }
-        self.queue.push_back(command);
-        true
-    }
-
     /// Releases a reserved slot for a ticket that resolved without cancelling.
     fn release_slot(&mut self) {
         self.reserved = self.reserved.saturating_sub(1);
@@ -353,7 +343,7 @@ impl LedgerEntry {
 
     fn claimed_bytes(&self) -> u64 {
         match self.state {
-            PressureState::Claimed => self.bytes,
+            PressureState::Claimed(_) => self.bytes,
             _ => 0,
         }
     }
@@ -617,8 +607,22 @@ impl HostGovernor {
         let mut ledger = self.inner.lock_ledger();
         let mut wakeups = self.drain_cancellations_locked(&mut ledger)?;
 
-        let entry = match ledger.entries.get(&allocation.request_id) {
-            Some(entry) => entry,
+        let recorded = match ledger.entries.get(&allocation.request_id) {
+            Some(LedgerEntry {
+                state: PressureState::Claimed(recorded),
+                ..
+            }) => recorded.clone(),
+            Some(_) => {
+                drop(ledger);
+                Self::wake_all(wakeups);
+                return Err(ResourceError::HostLedgerInvariant {
+                    operation: "release",
+                    reason: format!(
+                        "request {} is not in the Claimed state",
+                        allocation.request_id
+                    ),
+                });
+            }
             None => {
                 drop(ledger);
                 Self::wake_all(wakeups);
@@ -628,27 +632,17 @@ impl HostGovernor {
                 });
             }
         };
-        if !matches!(entry.state, PressureState::Claimed) {
+        if allocation != recorded {
             drop(ledger);
             Self::wake_all(wakeups);
             return Err(ResourceError::HostLedgerInvariant {
                 operation: "release",
-                reason: format!(
-                    "request {} is not in the Claimed state",
-                    allocation.request_id
-                ),
-            });
-        }
-        if entry.bytes != allocation.bytes {
-            drop(ledger);
-            Self::wake_all(wakeups);
-            return Err(ResourceError::HostLedgerInvariant {
-                operation: "release",
-                reason: "released extent does not match the claimed extent".to_string(),
+                reason: "released allocation does not match the authoritative ledger charge"
+                    .to_string(),
             });
         }
 
-        let bytes = allocation.bytes;
+        let bytes = recorded.bytes;
         match checked_add(ledger.free, bytes, "release credit") {
             Ok(free) => ledger.free = free,
             Err(err) => {
@@ -660,12 +654,12 @@ impl HostGovernor {
         self.inner.emit_locked(
             &mut ledger,
             PressureEvent::Release {
-                request: allocation.request_id,
-                allocation: allocation.id,
+                request: recorded.request_id,
+                allocation: recorded.id,
                 extent: bytes,
             },
         );
-        ledger.entries.remove(&allocation.request_id);
+        ledger.entries.remove(&recorded.request_id);
 
         match self.arbitrate_locked(&mut ledger) {
             Ok(mut arbitrated) => wakeups.append(&mut arbitrated),
@@ -1014,7 +1008,7 @@ impl HostGovernor {
                 },
                 // A claimed ticket owns its allocation (grant-wins); it is live
                 // and is reaped only when the claim is released.
-                PressureState::Claimed => CancelKind::NoOp,
+                PressureState::Claimed(_) => CancelKind::NoOp,
                 // Already-terminal (timed-out / reconfiguration-failed) entries
                 // linger only until observed. A cancel-drop is that observation:
                 // reap them so recomputation stays O(live). This emits no new
@@ -1073,7 +1067,7 @@ impl HostGovernor {
         ledger.entries.remove(&request_id);
     }
 
-    /// Deterministic priority/FIFO arbitration with bounded aging. Reserves
+    /// Deterministic priority/FIFO arbitration with starvation-free aging. Reserves
     /// bytes and publishes `Granted` under the ledger lock BEFORE returning the
     /// tickets to wake.
     fn arbitrate_locked(
@@ -1089,20 +1083,27 @@ impl HostGovernor {
             }
         }
 
-        // Order candidates by effective priority (with aging), then FIFO.
-        let mut candidates: Vec<(PressureRequestId, u64, u64)> = ledger
+        // Mature requests are always considered before non-matured requests and
+        // remain FIFO among themselves. This bounds starvation even under a
+        // continuous stream of maximum-priority arrivals.
+        let mut candidates: Vec<(PressureRequestId, bool, HostPriority, u64)> = ledger
             .entries
             .iter()
             .filter(|(_, e)| e.is_pending() && e.generation == current_gen)
-            .map(|(id, e)| {
-                let effective = e.priority as u64 + e.age.min(AGING_CAP);
-                (*id, effective, e.submit_seq)
-            })
+            .map(|(id, e)| (*id, e.age >= AGING_CAP, e.priority, e.submit_seq))
             .collect();
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        candidates.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                if a.1 {
+                    a.3.cmp(&b.3)
+                } else {
+                    b.2.cmp(&a.2).then_with(|| a.3.cmp(&b.3))
+                }
+            })
+        });
 
         let mut wakeups = Vec::new();
-        for (request_id, _, _) in candidates {
+        for (request_id, matured, _, _) in candidates {
             let Some(bytes) = ledger.entries.get(&request_id).map(|entry| entry.bytes) else {
                 return Err(ResourceError::HostLedgerInvariant {
                     operation: "grant",
@@ -1110,6 +1111,12 @@ impl HostGovernor {
                 });
             };
             if ledger.free < bytes {
+                if matured {
+                    // Preserve newly returned capacity for the oldest matured
+                    // request instead of letting younger work repeatedly steal
+                    // partial headroom before the full extent accumulates.
+                    break;
+                }
                 continue;
             }
             // Reserve bytes first so a fresh request cannot steal them.
@@ -1172,7 +1179,7 @@ impl HostGovernor {
             Some(entry) => match &entry.state {
                 PressureState::Pending(_) => Claimable::Pending,
                 PressureState::Granted(allocation) => Claimable::Granted(allocation.clone()),
-                PressureState::Claimed => Claimable::AlreadyClaimed,
+                PressureState::Claimed(_) => Claimable::AlreadyClaimed,
                 PressureState::Cancelled => Claimable::Cancelled,
                 PressureState::Failed(err) => Claimable::Failed(err.clone()),
             },
@@ -1191,7 +1198,7 @@ impl HostGovernor {
                         reason: format!("request {request_id} disappeared before claim"),
                     });
                 };
-                entry.state = PressureState::Claimed;
+                entry.state = PressureState::Claimed(allocation.clone());
                 self.inner.emit_locked(
                     &mut ledger,
                     PressureEvent::Claim {
@@ -1421,6 +1428,20 @@ impl HostGovernorInner {
         }));
     }
 
+    fn publish_cancel(&self, command: CancelCommand) -> bool {
+        let mut mailbox = lock_recover(&self.mailbox);
+        if mailbox.queue.len() >= mailbox.reserved {
+            return false;
+        }
+
+        // Keep the mailbox locked until the send envelope is recorded and the
+        // command is queued. A drainer therefore cannot apply cancellation
+        // before the corresponding send is visible in the total trace order.
+        self.emit_mailbox_send(command.request_id);
+        mailbox.queue.push_back(command);
+        true
+    }
+
     fn enqueue_reclaim_notices_locked(&self, ledger: &mut Ledger) {
         // Non-blocking: record whether any pending request is unsatisfiable at
         // the current free level. Reclaim workers evict at their own pace and
@@ -1508,13 +1529,10 @@ impl Drop for PressureTicket {
         self.resolved = true;
         // Post a lossless cancellation into the pre-reserved slot. Never blocks
         // on a long-held lock, never allocates, never drops.
-        let sent = lock_recover(&self.inner.mailbox).send(CancelCommand {
+        self.inner.publish_cancel(CancelCommand {
             request_id: self.request_id,
             generation: self.generation,
         });
-        if sent {
-            self.inner.emit_mailbox_send(self.request_id);
-        }
     }
 }
 
@@ -1524,6 +1542,9 @@ mod tests {
     use onnx_runtime_protocol_trace::{
         InvariantViolation, ReplayHarness, ReplayReducer, ReplayViolation,
     };
+    use std::sync::{TryLockError, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct TraceCollector {
@@ -1539,6 +1560,37 @@ mod tests {
     impl PressureTraceSink for TraceCollector {
         fn record(&self, event: EventEnvelope) {
             lock_recover(&self.events).push(event);
+        }
+    }
+
+    struct BlockingMailboxSendSink {
+        collector: Arc<TraceCollector>,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl PressureTraceSink for BlockingMailboxSendSink {
+        fn record(&self, event: EventEnvelope) {
+            if matches!(&event.payload, PressurePayload::MailboxSend(_)) {
+                self.entered.send(()).unwrap();
+                lock_recover(&self.resume).recv().unwrap();
+            }
+            self.collector.record(event);
+        }
+    }
+
+    struct CancelObserver(mpsc::Sender<()>);
+
+    impl ProtocolTraceSink for CancelObserver {
+        fn record(&self, event: ProtocolTraceEvent) {
+            if matches!(
+                event.kind,
+                ProtocolEvent::Pressure(
+                    PressureEvent::CancelPending { .. } | PressureEvent::CancelGranted { .. }
+                )
+            ) {
+                self.0.send(()).unwrap();
+            }
         }
     }
 
@@ -1581,6 +1633,57 @@ mod tests {
         assert_eq!(released.free_bytes, 16);
         assert_eq!(released.claimed_bytes, 0);
         assert_eq!(released.host_ram_used, 0);
+    }
+
+    #[test]
+    fn forged_release_cannot_refund_or_double_release_authoritative_charge() {
+        let governor = HostGovernor::new(HostGovernorConfig::new(8)).unwrap();
+        let mut ticket = governor
+            .request_host_pages(HostPageRequest::pageable(LocalDeviceId::new(0), 6, 1))
+            .unwrap();
+        let allocation = match ticket.try_claim() {
+            TicketPoll::Granted(allocation) => allocation,
+            other => panic!("expected grant, got {other:?}"),
+        };
+        let mut queued = governor
+            .request_host_pages(HostPageRequest::pageable(LocalDeviceId::new(1), 3, 1))
+            .unwrap();
+        assert!(matches!(queued.try_claim(), TicketPoll::Pending));
+
+        let charged = governor.snapshot().unwrap();
+        let forged = HostAllocation {
+            id: PhysicalAllocationId::new(allocation.id.get() + 100),
+            request_id: allocation.request_id,
+            owner: LocalDeviceId::new(allocation.owner.get() + 1),
+            bytes: allocation.bytes,
+            generation: PressureGeneration::new(allocation.generation.get() + 1),
+            pinned: !allocation.pinned,
+        };
+        assert!(matches!(
+            governor.release_host_pages(forged),
+            Err(ResourceError::HostLedgerInvariant {
+                operation: "release",
+                ..
+            })
+        ));
+        assert_eq!(governor.snapshot().unwrap(), charged);
+        assert!(matches!(queued.try_claim(), TicketPoll::Pending));
+
+        governor.release_host_pages(allocation.clone()).unwrap();
+        let queued_allocation = match queued.try_claim() {
+            TicketPoll::Granted(allocation) => allocation,
+            other => panic!("expected queued grant, got {other:?}"),
+        };
+        let after_release = governor.snapshot().unwrap();
+        assert!(matches!(
+            governor.release_host_pages(allocation),
+            Err(ResourceError::HostLedgerInvariant {
+                operation: "release",
+                ..
+            })
+        ));
+        assert_eq!(governor.snapshot().unwrap(), after_release);
+        governor.release_host_pages(queued_allocation).unwrap();
     }
 
     #[test]
@@ -1629,6 +1732,138 @@ mod tests {
         drop(ticket);
         governor.process_cancellations().unwrap();
         assert_eq!(governor.snapshot().unwrap().free_bytes, 16);
+    }
+
+    #[test]
+    fn cancellation_delivery_waits_for_its_mailbox_send_envelope() {
+        let collector = Arc::new(TraceCollector::default());
+        let (cancel_applied, cancel_applied_rx) = mpsc::channel();
+        let (send_entered, send_entered_rx) = mpsc::channel();
+        let (resume_send, resume_send_rx) = mpsc::channel();
+        let governor = HostGovernor::with_sinks(
+            HostGovernorConfig::new(1),
+            Arc::new(CancelObserver(cancel_applied)),
+            Arc::new(BlockingMailboxSendSink {
+                collector: collector.clone(),
+                entered: send_entered,
+                resume: Mutex::new(resume_send_rx),
+            }),
+        )
+        .unwrap();
+        let ticket = governor
+            .request_host_pages(HostPageRequest::pageable(LocalDeviceId::new(0), 1, 1))
+            .unwrap();
+        let request_id = ticket.request_id();
+
+        // Stop MailboxSend publication inside the trace sink. Once the sink has
+        // been entered, fixed code must still hold the mailbox lock; the old
+        // queue-before-send order has already exposed the cancellation.
+        let drop_thread = thread::spawn(move || drop(ticket));
+        send_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        match governor.inner.mailbox.try_lock() {
+            Err(TryLockError::WouldBlock) => {}
+            Ok(mailbox) => panic!(
+                "mailbox unlocked with {} queued cancellations before MailboxSend completed",
+                mailbox.queue.len()
+            ),
+            Err(TryLockError::Poisoned(_)) => panic!("mailbox poisoned"),
+        }
+
+        let process_governor = governor.clone();
+        let process_thread = thread::spawn(move || {
+            process_governor.process_cancellations().unwrap();
+        });
+        assert!(
+            cancel_applied_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "cancellation was applied before MailboxSend could be recorded"
+        );
+
+        resume_send.send(()).unwrap();
+        drop_thread.join().unwrap();
+        cancel_applied_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        process_thread.join().unwrap();
+
+        let events = collector.snapshot();
+        let send_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    PressurePayload::MailboxSend(MailboxSend {
+                        message: MailboxMessage::Cancel {
+                            request_id: sent_request
+                        },
+                        ..
+                    }) if *sent_request == request_id
+                )
+            })
+            .unwrap();
+        let cancel_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    PressurePayload::LedgerOperation(operation)
+                        if operation.kind == LedgerOperationKind::Cancel
+                            && operation.request_id == Some(request_id)
+                )
+            })
+            .unwrap();
+        assert!(send_index < cancel_index);
+        assert!(events[send_index].sequence.get() < events[cancel_index].sequence.get());
+        assert_eq!(governor.snapshot().unwrap().free_bytes, 1);
+    }
+
+    #[test]
+    fn matured_low_priority_ticket_accumulates_capacity_despite_recurring_high_priority_arrivals() {
+        let governor = HostGovernor::new(HostGovernorConfig::new(3)).unwrap();
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            let mut blocker = governor
+                .request_host_pages(HostPageRequest::pageable(LocalDeviceId::new(0), 1, u8::MAX))
+                .unwrap();
+            holders.push(match blocker.try_claim() {
+                TicketPoll::Granted(allocation) => allocation,
+                other => panic!("expected blocker grant, got {other:?}"),
+            });
+        }
+        let mut waiting = governor
+            .request_host_pages(HostPageRequest::pageable(LocalDeviceId::new(1), 3, 0))
+            .unwrap();
+        let mut pending_newcomers = Vec::new();
+
+        for round in 0..(AGING_CAP + 3) {
+            let mut newcomer = governor
+                .request_host_pages(HostPageRequest::pageable(LocalDeviceId::new(2), 1, u8::MAX))
+                .unwrap();
+            governor.release_host_pages(holders.remove(0)).unwrap();
+
+            match waiting.try_claim() {
+                TicketPoll::Granted(allocation) => {
+                    assert!(round < AGING_CAP);
+                    pending_newcomers.push(newcomer);
+                    drop(pending_newcomers);
+                    governor.process_cancellations().unwrap();
+                    governor.release_host_pages(allocation).unwrap();
+                    assert_eq!(governor.snapshot().unwrap().free_bytes, 3);
+                    return;
+                }
+                TicketPoll::Pending => match newcomer.try_claim() {
+                    TicketPoll::Granted(allocation) => holders.push(allocation),
+                    TicketPoll::Pending => pending_newcomers.push(newcomer),
+                    other => panic!("high-priority ticket unexpectedly resolved: {other:?}"),
+                },
+                other => panic!("waiting ticket unexpectedly resolved: {other:?}"),
+            }
+        }
+
+        panic!("low-priority ticket starved beyond the aging bound");
     }
 
     #[test]
