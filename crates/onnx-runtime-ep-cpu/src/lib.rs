@@ -56,3 +56,5 @@ pub use weight_offload::{
 };
 
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
+
+pub use kernels::matmul_nbits::with_decode_pool_scope;

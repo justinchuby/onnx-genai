@@ -578,7 +578,17 @@ impl DecodeBackend for NativeDecodeSession {
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
             .collect::<Vec<_>>();
-        let outputs = match self.session.run(&bindings) {
+        // Single-token CPU decode: run the whole forward inside one decode-pool
+        // installation so the ~121 per-op `MatMulNBits` projections execute
+        // inline on resident workers instead of each re-installing the pool
+        // (eliminating the per-op fork-join crossing). Prefill (M>1) and the CUDA
+        // path (handled above) must keep using the global pool, so gate on M==1.
+        let run_result = if token_ids.len() == 1 {
+            onnx_runtime_ep_cpu::with_decode_pool_scope(|| self.session.run(&bindings))
+        } else {
+            self.session.run(&bindings)
+        };
+        let outputs = match run_result {
             Ok(outputs) => outputs,
             Err(error) => {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());

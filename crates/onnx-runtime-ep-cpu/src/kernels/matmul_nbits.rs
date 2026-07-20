@@ -11,6 +11,7 @@
 //! int4 path dequantize to f32; batched shapes then use the shared CPU GEMM,
 //! including its SIMD backend.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -661,10 +662,79 @@ fn build_decode_pool(
 }
 
 fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
+    // If we are already resident inside a `with_decode_pool_scope` installation
+    // on this worker thread, run inline: the enclosing `pool.install(...)` already
+    // put us on a decode-pool worker, so a fresh `install` here would only add a
+    // redundant external-thread-to-pool crossing (task publication + wakeup +
+    // join) per projection -- exactly the per-op fork-join fragmentation the
+    // whole-forward residency scope eliminates. Inline `operation()` still
+    // fans out via rayon's work-stealing on the current (decode) pool.
+    if IN_DECODE_POOL.with(Cell::get) {
+        return Ok(operation());
+    }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => Ok(pool.install(operation)),
         Ok(None) => Ok(operation()),
         Err(message) => Err(error(message.clone())),
+    }
+}
+
+thread_local! {
+    /// Per-worker-thread flag marking that the current thread is executing
+    /// inside a [`with_decode_pool_scope`] installation. Set on the decode-pool
+    /// worker that runs the wrapped forward pass so the inner [`with_decode_pool`]
+    /// calls run inline instead of re-installing.
+    static IN_DECODE_POOL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that marks the current thread as resident inside the decode pool
+/// and restores the previous state on drop -- including during panic unwinding,
+/// so a panicking forward pass cannot leak a stale `true` onto a pooled worker.
+struct DecodeResidencyGuard {
+    previous: bool,
+}
+
+impl DecodeResidencyGuard {
+    fn enter() -> Self {
+        let previous = IN_DECODE_POOL.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for DecodeResidencyGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        IN_DECODE_POOL.with(|flag| flag.set(previous));
+    }
+}
+
+/// Run `f` with the whole call tree resident inside the bounded M=1 decode pool.
+///
+/// Wrapping an entire single-token CPU decode forward in one installation lets
+/// the many inner `MatMulNBits` projections execute inline on already-woken
+/// decode-pool workers (see [`with_decode_pool`]), eliminating the per-op
+/// external-thread-to-pool crossing that fragments end-to-end decode throughput.
+///
+/// Behaviour by pool state:
+/// * `Ok(Some(pool))` -- install `f` on the decode pool; the residency flag is
+///   set *inside* the installed closure (on the worker thread that actually runs
+///   `f`, not the caller) and cleared by the RAII guard on exit or panic.
+/// * `Ok(None)` -- decode pool opted out (`ONNX_GENAI_CPU_DECODE_THREADS=0`); run
+///   `f` inline on the global rayon pool with the flag left `false`, so inner
+///   `with_decode_pool` calls keep their existing global-pool behaviour.
+/// * `Err(_)` -- pool construction failed; run `f` inline with the flag `false`.
+///   The inner `with_decode_pool` calls surface the same error and the forward
+///   fails identically to the un-scoped path.
+///
+/// Callers should enter this scope only for the M=1 CPU decode case; prefill
+/// (M>1) and non-CPU paths must keep using the global pool.
+pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
+        Ok(Some(pool)) => pool.install(move || {
+            let _guard = DecodeResidencyGuard::enter();
+            f()
+        }),
+        _ => f(),
     }
 }
 
@@ -1804,6 +1874,78 @@ mod tests {
         assert!(build_decode_pool(None).unwrap().is_none());
         let pool = build_decode_pool(Some(3)).unwrap().unwrap();
         assert_eq!(pool.install(rayon::current_num_threads), 3);
+    }
+
+    #[test]
+    fn decode_residency_guard_sets_and_restores_flag() {
+        assert!(!IN_DECODE_POOL.with(Cell::get));
+        {
+            let _outer = DecodeResidencyGuard::enter();
+            assert!(IN_DECODE_POOL.with(Cell::get));
+            {
+                let _inner = DecodeResidencyGuard::enter();
+                assert!(IN_DECODE_POOL.with(Cell::get));
+            }
+            // Nested drop restores the previous (still-resident) state.
+            assert!(IN_DECODE_POOL.with(Cell::get));
+        }
+        assert!(!IN_DECODE_POOL.with(Cell::get));
+    }
+
+    #[test]
+    fn decode_residency_guard_clears_on_panic() {
+        assert!(!IN_DECODE_POOL.with(Cell::get));
+        let result = std::panic::catch_unwind(|| {
+            let _guard = DecodeResidencyGuard::enter();
+            assert!(IN_DECODE_POOL.with(Cell::get));
+            panic!("decode forward panicked");
+        });
+        assert!(result.is_err());
+        assert!(
+            !IN_DECODE_POOL.with(Cell::get),
+            "residency flag must be cleared after a panicking forward unwinds"
+        );
+    }
+
+    #[test]
+    fn with_decode_pool_runs_inline_when_resident() {
+        // With the residency flag set, `with_decode_pool` must NOT re-install the
+        // pool: it runs `operation` inline on the current thread. Observing the
+        // running thread id proves no external-thread-to-pool crossing happened.
+        let _guard = DecodeResidencyGuard::enter();
+        let caller = std::thread::current().id();
+        let ran_on = with_decode_pool(|| std::thread::current().id()).unwrap();
+        assert_eq!(
+            ran_on, caller,
+            "resident with_decode_pool must run inline on the caller thread"
+        );
+    }
+
+    #[test]
+    fn with_decode_pool_scope_marks_residency_when_pool_active() {
+        // When a bounded decode pool exists, the scope must set the residency
+        // flag on the worker thread that runs the closure, and inner
+        // `with_decode_pool` calls must then run inline on that same worker.
+        let pool_active = DECODE_POOL
+            .get_or_init(|| build_decode_pool(configured_decode_threads()))
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some();
+        let (flag_inside, inline_same_thread) = with_decode_pool_scope(|| {
+            let worker = std::thread::current().id();
+            let inner = with_decode_pool(|| std::thread::current().id()).unwrap();
+            (IN_DECODE_POOL.with(Cell::get), inner == worker)
+        });
+        if pool_active {
+            assert!(flag_inside, "scope must set residency flag inside the pool");
+            assert!(
+                inline_same_thread,
+                "inner with_decode_pool must run inline on the scope worker"
+            );
+        }
+        // The calling thread never observes the flag set (it is set on the worker).
+        assert!(!IN_DECODE_POOL.with(Cell::get));
     }
 
     #[test]
