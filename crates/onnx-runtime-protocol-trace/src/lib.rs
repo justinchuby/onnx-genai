@@ -20,19 +20,29 @@
 
 #![forbid(unsafe_code)]
 
+pub mod envelope;
 pub mod event;
 pub mod ids;
+pub mod replay;
 
 #[cfg(any(test, feature = "conformance"))]
 pub mod checker;
 
+pub use envelope::{
+    EventEnvelope, LedgerOperation, LedgerOperationKind, MailboxMessage, MailboxSend,
+    PressurePayload, PressureSnapshot, TicketGrant,
+};
 pub use event::{
     BufferOwnershipEvent, CollectiveDecision, CollectiveKind, CollectiveOrderingEvent,
     NullTraceSink, PressureEvent, ProtocolEvent, ProtocolTraceEvent, ProtocolTraceSink,
 };
 pub use ids::{
-    LocalDeviceId, OperationId, PhysicalAllocationId, PressureGeneration, PressureRequestId,
-    ProtocolSourceId,
+    ActorId, EventId, EventSequence, HostId, LocalDeviceId, LogicalTimestamp, MailboxId,
+    OperationId, PhysicalAllocationId, PressureGeneration, PressureRequestId, ProtocolSourceId,
+};
+pub use replay::{
+    InvariantViolation, ReplayHarness, ReplayReducer, ReplayReport, ReplayViolation,
+    ReplayViolationKind,
 };
 
 /// The protocol contract revision this crate implements.

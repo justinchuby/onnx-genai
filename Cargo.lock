@@ -2044,6 +2044,10 @@ dependencies = [
 [[package]]
 name = "onnx-runtime-protocol-trace"
 version = "0.1.0-dev.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "onnx-runtime-python"

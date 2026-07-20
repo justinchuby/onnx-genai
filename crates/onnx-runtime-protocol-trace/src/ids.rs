@@ -5,10 +5,24 @@
 //! Envelope"). These newtypes are deliberately small, `Copy`, and totally
 //! ordered so they can key ledgers and be compared in an independent checker.
 
+use serde::{Deserialize, Serialize};
+
 macro_rules! id_newtype {
     ($(#[$meta:meta])* $name:ident, $inner:ty) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            Serialize,
+            Deserialize,
+        )]
+        #[serde(transparent)]
         pub struct $name($inner);
 
         impl $name {
@@ -39,6 +53,42 @@ macro_rules! id_newtype {
         }
     };
 }
+
+id_newtype!(
+    /// Globally stable identity for one recorded event.
+    EventId,
+    u128
+);
+
+id_newtype!(
+    /// Identifies a host participating in a pressure-protocol trace.
+    HostId,
+    u64
+);
+
+id_newtype!(
+    /// Identifies an actor within a host.
+    ActorId,
+    u64
+);
+
+id_newtype!(
+    /// Monotonic event sequence within an actor.
+    EventSequence,
+    u64
+);
+
+id_newtype!(
+    /// Logical (Lamport-style) timestamp assigned by the producing actor.
+    LogicalTimestamp,
+    u64
+);
+
+id_newtype!(
+    /// Stable identity of a pressure-protocol mailbox.
+    MailboxId,
+    u64
+);
 
 id_newtype!(
     /// Identifies the producer of a trace event stream. `source_sequence` is
