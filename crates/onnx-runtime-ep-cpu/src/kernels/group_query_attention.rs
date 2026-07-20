@@ -9,9 +9,14 @@ use std::borrow::Cow;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
+use rayon::prelude::*;
 
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+
+// Below this many row × key × head-dimension elements, Rayon synchronization
+// costs more than the attention work on the decode pool.
+const MIN_PARALLEL_ATTENTION_WORK: usize = 160 * 1024;
 
 pub struct GroupQueryAttentionKernel {
     num_heads: usize,
@@ -49,12 +54,12 @@ impl KernelFactory for GroupQueryAttentionFactory {
         }
 
         for name in ["k_quant_type", "v_quant_type"] {
-            if let Some(value) = node.attr(name) {
-                if value.as_str() != Some("NONE") {
-                    return Err(EpError::KernelFailed(format!(
-                        "GroupQueryAttention: `{name}` other than NONE is not yet supported by the f32 CPU kernel"
-                    )));
-                }
+            if let Some(value) = node.attr(name)
+                && value.as_str() != Some("NONE")
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "GroupQueryAttention: `{name}` other than NONE is not yet supported by the f32 CPU kernel"
+                )));
             }
         }
         if node
@@ -547,11 +552,10 @@ impl Kernel for GroupQueryAttentionKernel {
         let mut present_k =
             vec![0.0; q.batch * self.kv_num_heads * present_sequence_length * cache_dim];
         let mut present_v = vec![0.0; present_k.len()];
-        for b in 0..q.batch {
+        for (b, &past_len) in past_lengths.iter().enumerate() {
             for h in 0..self.kv_num_heads {
                 let head = b * self.kv_num_heads + h;
                 let dst_base = head * present_sequence_length * cache_dim;
-                let past_len = past_lengths[b];
                 // `present_k`/`present_v` and the dense past caches are both
                 // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is a
                 // single contiguous run in each: copy the whole past prefix at
@@ -579,58 +583,87 @@ impl Kernel for GroupQueryAttentionKernel {
             .filter(|&scale| scale != 0.0)
             .unwrap_or_else(|| 1.0 / (cache_dim as f32).sqrt());
         let group = self.num_heads / self.kv_num_heads;
-        let mut y_bhsd = vec![0.0; q.batch * self.num_heads * q.seq * v.dim];
-        for b in 0..q.batch {
-            for qh in 0..self.num_heads {
-                let kvh = qh / group;
-                for qs in 0..q.seq {
-                    let causal_limit = query_starts[b] + qs;
-                    let local_start = if self.local_window_size > 0 {
-                        (causal_limit + 1).saturating_sub(self.local_window_size as usize)
-                    } else {
-                        0
-                    };
-                    let mut scores = vec![f32::NEG_INFINITY; total_sequence_length];
-                    for ks in local_start..=causal_limit {
-                        let mut score = 0.0;
-                        for d in 0..cache_dim {
-                            let ki = ((b * self.kv_num_heads + kvh) * present_sequence_length + ks)
-                                * cache_dim
-                                + d;
-                            score += q.at(b, qh, qs, d) * present_k[ki];
-                        }
-                        score *= scale;
-                        if self.softcap != 0.0 {
-                            score = self.softcap * (score / self.softcap).tanh();
-                        }
-                        scores[ks] = score;
-                    }
-                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0;
-                    for score in &mut scores {
-                        if score.is_finite() {
-                            // Match CUDA's f64 device exp followed by one f32
-                            // rounding before the serial softmax reduction.
-                            *score = ((*score - max) as f64).exp() as f32;
-                            sum += *score;
-                        } else {
-                            *score = 0.0;
-                        }
-                    }
-                    for d in 0..v.dim {
-                        let mut value = 0.0;
-                        for (ks, probability) in scores.iter().enumerate() {
-                            let vi = ((b * self.kv_num_heads + kvh) * present_sequence_length + ks)
-                                * v.dim
-                                + d;
-                            value += (*probability / sum) * present_v[vi];
-                        }
-                        y_bhsd[((b * self.num_heads + qh) * q.seq + qs) * v.dim + d] = value;
+        let attention_rows = q.batch * q.seq * self.num_heads;
+        let mut y_bhsd = vec![0.0; attention_rows * v.dim];
+        let compute_row = |b: usize, qh: usize, qs: usize, output_row: &mut [f32]| {
+            let kvh = qh / group;
+            let causal_limit = query_starts[b] + qs;
+            let local_start = if self.local_window_size > 0 {
+                (causal_limit + 1).saturating_sub(self.local_window_size as usize)
+            } else {
+                0
+            };
+            let mut scores = vec![f32::NEG_INFINITY; total_sequence_length];
+            for (ks, score_slot) in scores
+                .iter_mut()
+                .enumerate()
+                .take(causal_limit + 1)
+                .skip(local_start)
+            {
+                let mut score = 0.0;
+                for d in 0..cache_dim {
+                    let ki = ((b * self.kv_num_heads + kvh) * present_sequence_length + ks)
+                        * cache_dim
+                        + d;
+                    score += q.at(b, qh, qs, d) * present_k[ki];
+                }
+                score *= scale;
+                if self.softcap != 0.0 {
+                    score = self.softcap * (score / self.softcap).tanh();
+                }
+                *score_slot = score;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0;
+            for score in &mut scores {
+                if score.is_finite() {
+                    // Match CUDA's f64 device exp followed by one f32
+                    // rounding before the serial softmax reduction.
+                    *score = ((*score - max) as f64).exp() as f32;
+                    sum += *score;
+                } else {
+                    *score = 0.0;
+                }
+            }
+            for (d, output) in output_row.iter_mut().enumerate() {
+                let mut value = 0.0;
+                for (ks, probability) in scores.iter().enumerate() {
+                    let vi =
+                        ((b * self.kv_num_heads + kvh) * present_sequence_length + ks) * v.dim + d;
+                    value += (*probability / sum) * present_v[vi];
+                }
+                *output = value;
+            }
+        };
+        let attention_work = attention_rows
+            .saturating_mul(total_sequence_length)
+            .saturating_mul(cache_dim);
+        if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
+            y_bhsd
+                .par_chunks_mut(v.dim)
+                .enumerate()
+                .for_each(|(row_index, output_row)| {
+                    let b = row_index / (self.num_heads * q.seq);
+                    let row_in_batch = row_index % (self.num_heads * q.seq);
+                    let qh = row_in_batch / q.seq;
+                    let qs = row_in_batch % q.seq;
+                    compute_row(b, qh, qs, output_row);
+                });
+        } else {
+            for b in 0..q.batch {
+                for qh in 0..self.num_heads {
+                    for qs in 0..q.seq {
+                        let row_index = (b * self.num_heads + qh) * q.seq + qs;
+                        compute_row(
+                            b,
+                            qh,
+                            qs,
+                            &mut y_bhsd[row_index * v.dim..(row_index + 1) * v.dim],
+                        );
                     }
                 }
             }
         }
-
         let mut output = vec![0.0; y_bhsd.len()];
         for b in 0..q.batch {
             for s in 0..q.seq {
@@ -845,6 +878,40 @@ mod tests {
         assert_eq!(pk.shape, vec![1, 2, 3, 2]);
         close(&pk.to_f32(), &k_bnsh);
         close(&pv.to_f32(), &v_bnsh);
+    }
+
+    #[test]
+    fn large_prefill_parallel_path_matches_reference() {
+        let seq = 160;
+        let q = (0..seq * 8)
+            .map(|i| ((i % 17) as f32 - 8.0) / 8.0)
+            .collect::<Vec<_>>();
+        let k_bsh = (0..seq * 4)
+            .map(|i| ((i % 13) as f32 - 6.0) / 7.0)
+            .collect::<Vec<_>>();
+        let v_bsh = (0..seq * 4)
+            .map(|i| ((i % 19) as f32 - 9.0) / 9.0)
+            .collect::<Vec<_>>();
+        let k_bnsh = bsh_to_bnsh(&k_bsh, seq, 2);
+        let v_bnsh = bsh_to_bnsh(&v_bsh, seq, 2);
+        let mut out = Owned::zeros_f32(&[1, seq, 8]);
+
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[1, seq, 8], &q).view(),
+                    Owned::f32(&[1, seq, 4], &k_bsh).view(),
+                    Owned::f32(&[1, seq, 4], &v_bsh).view(),
+                    absent(),
+                    absent(),
+                    Owned::i32(&[1], &[(seq - 1) as i32]).view(),
+                    Owned::i32(&[], &[seq as i32]).view(),
+                ],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+
+        close(&out.to_f32(), &reference(&q, &k_bnsh, &v_bnsh, seq, seq, 0));
     }
 
     #[test]
