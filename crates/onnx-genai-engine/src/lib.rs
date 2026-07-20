@@ -55,6 +55,7 @@ pub use pipeline::{
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
     Eagle3Proposer, LinearEmbedder, LinearLmHead, LmHead, MtpProposer, NgramProposer,
-    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
-    SpeculativeStats, TokenEmbedder, argmax,
+    SpeculativeAcceptContext, SpeculativeGenerationTrace, SpeculativeIterationTrace,
+    SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext, SpeculativeStats,
+    SpeculativeTraceFamily, TokenEmbedder, argmax,
 };

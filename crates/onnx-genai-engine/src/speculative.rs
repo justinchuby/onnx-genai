@@ -493,6 +493,56 @@ pub struct SpeculativeStats {
     pub multi_token_accepts: usize,
 }
 
+/// Observable token decisions from one speculative verification iteration.
+///
+/// Target tokens stop at the first mismatch. A fully accepted proposal has one
+/// additional target token only when the engine actually selected a bonus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculativeIterationTrace {
+    /// Generated-output offset before this iteration committed any tokens.
+    pub output_offset: usize,
+    /// Complete family-specific proposal sent to target verification.
+    pub proposal_token_ids: Vec<TokenId>,
+    /// Tokens actually selected from target logits along the executed path.
+    pub target_token_ids: Vec<TokenId>,
+    /// Tokens actually emitted before this iteration completed or terminated.
+    pub committed_token_ids: Vec<TokenId>,
+}
+
+/// Proposer family that actually entered the speculative verification loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeTraceFamily {
+    DraftModel,
+    PromptLookup,
+    Mtp,
+    Eagle3,
+    SharedKv,
+}
+
+/// Opt-in token-level evidence from one generation call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeculativeGenerationTrace {
+    /// Tokenized prompt used by the generation call.
+    pub prompt_token_ids: Vec<TokenId>,
+    /// Final generated output, excluding prompt tokens.
+    pub output_token_ids: Vec<TokenId>,
+    /// Generation terminal condition.
+    pub finish_reason: FinishReason,
+    /// Proposer family used by the request, or `None` for target-only decode.
+    pub family: Option<SpeculativeTraceFamily>,
+    /// Configured proposal width excluding any guaranteed target prefix.
+    pub max_additional_tokens: Option<usize>,
+    /// Speculative iterations. Empty when the request used target-only decode.
+    pub iterations: Vec<SpeculativeIterationTrace>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SpeculativeTraceCaptureState {
+    pub family: Option<SpeculativeTraceFamily>,
+    pub max_additional_tokens: Option<usize>,
+    pub iterations: Vec<SpeculativeIterationTrace>,
+}
+
 /// Candidate tokens proposed for a target-model verification pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeculativeProposal {
@@ -1161,6 +1211,23 @@ impl Engine {
                 .unwrap_or(self.num_speculative_tokens),
         }
         .max(1);
+        if let Some(capture) = self.speculative_trace_capture.as_mut() {
+            let (family, guaranteed_target_prefix) = match &speculative_mode {
+                SpeculativeMode::DraftModel => (SpeculativeTraceFamily::DraftModel, 0),
+                SpeculativeMode::PromptLookup { .. } => {
+                    (SpeculativeTraceFamily::PromptLookup, 0)
+                }
+                SpeculativeMode::Mtp(_) => (SpeculativeTraceFamily::Mtp, 1),
+                SpeculativeMode::Eagle3(_) => (SpeculativeTraceFamily::Eagle3, 1),
+                SpeculativeMode::SharedKv(_) => (SpeculativeTraceFamily::SharedKv, 1),
+                SpeculativeMode::None => unreachable!(
+                    "target-only mode must not enter the speculative generation loop"
+                ),
+            };
+            capture.family = Some(family);
+            capture.max_additional_tokens =
+                Some(draft_width.saturating_sub(guaranteed_target_prefix));
+        }
         let mut mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
             let mtp = self
                 .mtp
@@ -1442,6 +1509,10 @@ impl Engine {
 
             let mut accepted = 0;
             let mut replacement = None;
+            let mut selected_target_tokens = self
+                .speculative_trace_capture
+                .as_ref()
+                .map(|_| Vec::with_capacity(draft_tokens.len() + 1));
             let mut candidate_logprobs = options.top_logprobs.map(|_| Vec::new());
             for idx in 0..draft_tokens.len() {
                 let mut context = ProcessorContext {
@@ -1472,6 +1543,9 @@ impl Engine {
                     chain,
                     rng,
                 );
+                if let Some(tokens) = selected_target_tokens.as_mut() {
+                    tokens.push(target_token);
+                }
                 if let (Some(top_logprobs), Some(logprobs)) =
                     (options.top_logprobs, candidate_logprobs.as_mut())
                 {
@@ -1550,6 +1624,9 @@ impl Engine {
                     chain,
                     rng,
                 );
+                if let Some(tokens) = selected_target_tokens.as_mut() {
+                    tokens.push(token);
+                }
                 if let (Some(top_logprobs), Some(logprobs)) =
                     (options.top_logprobs, commit_logprobs.as_mut())
                 {
@@ -1575,6 +1652,9 @@ impl Engine {
                 })?;
             }
 
+            let mut captured_commits = selected_target_tokens
+                .as_ref()
+                .map(|_| Vec::with_capacity(commit_tokens.len()));
             for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
                 if generated_tokens.len() >= options.max_new_tokens
                     || (commit_idx >= accepted
@@ -1614,6 +1694,9 @@ impl Engine {
                 *generated_text = commit_state.generated_text;
                 *generated_logprobs = commit_state.logprobs;
                 step = commit_state.step;
+                if let Some(tokens) = captured_commits.as_mut() {
+                    tokens.push(token_id);
+                }
                 if let Some(finish_reason) = finish_reason {
                     trim_overmaterialized_target_kv(
                         self.session
@@ -1627,6 +1710,12 @@ impl Engine {
                     if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
                         self.sync_draft_to_target(state)?;
                     }
+                    self.record_speculative_iteration(
+                        base_generated_len,
+                        &draft_tokens,
+                        selected_target_tokens.take(),
+                        captured_commits.take(),
+                    );
                     return self.finish_result(
                         generated_tokens,
                         finish_reason,
@@ -1643,7 +1732,33 @@ impl Engine {
             if generated_tokens.len() == base_generated_len {
                 anyhow::bail!("speculative decoding made no progress");
             }
+            self.record_speculative_iteration(
+                base_generated_len,
+                &draft_tokens,
+                selected_target_tokens,
+                captured_commits,
+            );
         }
+    }
+
+    fn record_speculative_iteration(
+        &mut self,
+        output_offset: usize,
+        proposal_token_ids: &[TokenId],
+        target_token_ids: Option<Vec<TokenId>>,
+        committed_token_ids: Option<Vec<TokenId>>,
+    ) {
+        let Some(capture) = self.speculative_trace_capture.as_mut() else {
+            return;
+        };
+        capture.iterations.push(SpeculativeIterationTrace {
+            output_offset,
+            proposal_token_ids: proposal_token_ids.to_vec(),
+            target_token_ids: target_token_ids
+                .expect("active speculative trace must collect target tokens"),
+            committed_token_ids: committed_token_ids
+                .expect("active speculative trace must collect committed tokens"),
+        });
     }
 
     /// Slice the target model's paged KV cache into per-group `shared_kv.*`

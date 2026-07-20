@@ -48,8 +48,8 @@ pub use crate::config::{
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 use crate::speculative::{
-    LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeStats,
-    load_target_initializer_adapters,
+    LinearEmbedder, LinearLmHead, MtpEmbedder, MtpLmHead, SpeculativeGenerationTrace,
+    SpeculativeStats, SpeculativeTraceCaptureState, load_target_initializer_adapters,
 };
 
 #[cfg(feature = "native-backend")]
@@ -331,6 +331,8 @@ pub struct Engine {
     pub(crate) speculative_mode: SpeculativeMode,
     /// Diagnostics from the most recent generation call.
     pub(crate) last_speculative_stats: SpeculativeStats,
+    /// Token-level conformance evidence, allocated only by the explicit capture API.
+    pub(crate) speculative_trace_capture: Option<SpeculativeTraceCaptureState>,
     /// Optional distributed KV connector bridge (DESIGN §38, K3). Inert when
     /// configured as `Null` (the default), preserving in-process-only behavior.
     pub(crate) connector: ConnectorBridge,
@@ -920,6 +922,7 @@ impl Engine {
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
             last_speculative_stats: SpeculativeStats::default(),
+            speculative_trace_capture: None,
             connector,
         })
     }
@@ -1010,6 +1013,7 @@ impl Engine {
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode: SpeculativeMode::None,
             last_speculative_stats: SpeculativeStats::default(),
+            speculative_trace_capture: None,
             connector,
             _environment: environment,
         })
@@ -1085,6 +1089,36 @@ impl Engine {
     ///
     pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
         self.generate_with_callback(request, None)
+    }
+
+    /// Generate while capturing token-level speculative conformance evidence.
+    ///
+    /// Capture is explicit because token ids may be sensitive and cloning them
+    /// adds overhead. The ordinary generation APIs do not allocate this trace.
+    pub fn generate_with_speculative_trace(
+        &mut self,
+        request: GenerateRequest,
+    ) -> anyhow::Result<(GenerateResult, SpeculativeGenerationTrace)> {
+        if self.speculative_trace_capture.is_some() {
+            anyhow::bail!("a speculative trace capture is already active");
+        }
+        let prompt_token_ids = self.tokenize_prompt(&request.prompt)?;
+        self.speculative_trace_capture = Some(SpeculativeTraceCaptureState::default());
+        let result = self.generate(request);
+        let capture = self
+            .speculative_trace_capture
+            .take()
+            .expect("speculative trace capture was initialized");
+        let result = result?;
+        let trace = SpeculativeGenerationTrace {
+            prompt_token_ids,
+            output_token_ids: result.token_ids.clone(),
+            finish_reason: result.finish_reason.clone(),
+            family: capture.family,
+            max_additional_tokens: capture.max_additional_tokens,
+            iterations: capture.iterations,
+        };
+        Ok((result, trace))
     }
 
     /// Generate text using a caller-supplied [`Sampler`] for final token
