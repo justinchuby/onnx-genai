@@ -952,6 +952,101 @@ mod tests {
     }
 
     #[test]
+    fn decode_widens_f16_past_cache_before_materializing_present_cache() {
+        let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
+        let past_k = vec![1., 0., 0., 1., 10., 0., 0., 10.];
+        let past_v = vec![1., 2., 3., 4., 10., 20., 30., 40.];
+        let cur_k = vec![1., 1., 10., 10.];
+        let cur_v = vec![5., 6., 50., 60.];
+        let expected_k = vec![1., 0., 0., 1., 1., 1., 10., 0., 0., 10., 10., 10.];
+        let expected_v = vec![1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60.];
+        let mut out = Owned::zeros_f32(&[1, 1, 8]);
+        let mut pk = Owned::zeros_f32(&[1, 2, 3, 2]);
+        let mut pv = Owned::zeros_f32(&[1, 2, 3, 2]);
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[1, 1, 8], &q).view(),
+                    Owned::f32(&[1, 1, 4], &cur_k).view(),
+                    Owned::f32(&[1, 1, 4], &cur_v).view(),
+                    Owned::f16(&[1, 2, 2, 2], &past_k).view(),
+                    Owned::f16(&[1, 2, 2, 2], &past_v).view(),
+                    Owned::i32(&[1], &[2]).view(),
+                    Owned::i32(&[], &[3]).view(),
+                ],
+                &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
+            )
+            .unwrap();
+        close(&pk.to_f32(), &expected_k);
+        close(&pv.to_f32(), &expected_v);
+        close(
+            &out.to_f32(),
+            &reference(&q, &expected_k, &expected_v, 1, 3, 2),
+        );
+    }
+
+    #[test]
+    fn decode_batch_ragged_past_lengths_materialize_independently() {
+        let q = vec![
+            1., 0., 1., 0., 0., 1., 0., 1., 1., 1., 1., -1., -1., 1., -1., -1.,
+        ];
+        let past_k = vec![
+            1., 0., 91., 92., 93., 94., 0., 1., 95., 96., 97., 98., 2., 0., 3., 0., 4., 0., 5., 0.,
+            6., 0., 7., 0.,
+        ];
+        let past_v = vec![
+            1., 2., 71., 72., 73., 74., 3., 4., 75., 76., 77., 78., 10., 20., 30., 40., 50., 60.,
+            70., 80., 90., 100., 110., 120.,
+        ];
+        let cur_k = vec![1., 1., 10., 10., 8., 0., 9., 0.];
+        let cur_v = vec![5., 6., 50., 60., 130., 140., 150., 160.];
+        let expected_k = vec![
+            1., 0., 1., 1., 0., 0., 0., 0., 0., 1., 10., 10., 0., 0., 0., 0., 2., 0., 3., 0., 4.,
+            0., 8., 0., 5., 0., 6., 0., 7., 0., 9., 0.,
+        ];
+        let expected_v = vec![
+            1., 2., 5., 6., 0., 0., 0., 0., 3., 4., 50., 60., 0., 0., 0., 0., 10., 20., 30., 40.,
+            50., 60., 130., 140., 70., 80., 90., 100., 110., 120., 150., 160.,
+        ];
+        let mut out = Owned::zeros_f32(&[2, 1, 8]);
+        let mut pk = Owned::zeros_f32(&[2, 2, 4, 2]);
+        let mut pv = Owned::zeros_f32(&[2, 2, 4, 2]);
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[2, 1, 8], &q).view(),
+                    Owned::f32(&[2, 1, 4], &cur_k).view(),
+                    Owned::f32(&[2, 1, 4], &cur_v).view(),
+                    Owned::f32(&[2, 2, 3, 2], &past_k).view(),
+                    Owned::f32(&[2, 2, 3, 2], &past_v).view(),
+                    Owned::i32(&[2], &[1, 3]).view(),
+                    Owned::i32(&[], &[4]).view(),
+                ],
+                &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
+            )
+            .unwrap();
+        close(&pk.to_f32(), &expected_k);
+        close(&pv.to_f32(), &expected_v);
+        let mut want = reference(
+            &q[..8],
+            &[1., 0., 1., 1., 0., 1., 10., 10.],
+            &[1., 2., 5., 6., 3., 4., 50., 60.],
+            1,
+            2,
+            1,
+        );
+        want.extend(reference(
+            &q[8..],
+            &expected_k[16..],
+            &expected_v[16..],
+            1,
+            4,
+            3,
+        ));
+        close(&out.to_f32(), &want);
+    }
+
+    #[test]
     fn decode_preserves_fixed_cache_capacity_and_appends_at_logical_length() {
         let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
         let past_k = vec![
