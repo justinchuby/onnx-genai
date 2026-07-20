@@ -14,6 +14,11 @@ native-backend = [
     "dep:onnx-runtime-ep-cpu",
     "dep:onnx-runtime-session",
 ]
+mlas = [
+    "native-backend",
+    "onnx-runtime-ep-cpu/mlas",
+    "onnx-runtime-session/mlas",
+]
 # The native CUDA EP is pinned to CUDA 13.0, so select the same cudarc bindings
 # in `onnx-genai-ort`. Runtime EP selection still goes through `ONNX_GENAI_EP`;
 # without this feature a `cuda` request silently falls back to CPU.
