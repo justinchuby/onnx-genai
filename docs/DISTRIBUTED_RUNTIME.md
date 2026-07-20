@@ -29,7 +29,8 @@
 11. [Phased Implementation](#11-phased-implementation)
 12. [Cross-Session Memory Coordination](#12-cross-session-memory-coordination)
 13. [Open Questions](#13-open-questions)
-14. [References](#14-references)
+14. [Deferred Workload Validation](#14-deferred-workload-validation)
+15. [References](#15-references)
 
 ---
 
@@ -132,98 +133,175 @@ with Communicator collectives.
 pub trait Communicator: Send + Sync {
     // ── Identity ──
 
-    /// This participant's rank in the communication group.
-    fn rank(&self) -> Rank;
+    /// This participant's immutable world-rank identity.
+    fn rank(&self) -> RankId;
 
-    /// Total number of participants.
-    fn world_size(&self) -> usize;
+    /// Identity of this communicator's pre-compiled group.
+    fn group_id(&self) -> GroupId;
+
+    /// Group members in the frozen peer-vector order.
+    fn members(&self) -> &[RankId];
+
+    fn group_size(&self) -> usize { self.members().len() }
 
     /// Human-readable backend name (e.g., "nccl", "gloo", "thunderbolt").
     fn backend_name(&self) -> &str;
 
     // ── Collective operations ──
+    //
+    // Data-transfer and synchronization operations return a `CommHandle`
+    // representing an asynchronous, rank-local completion fence.
+    // `exchange_counts` completes its small preparatory phase before returning
+    // a ticket, and `abort` is a terminal control-plane operation.
+    //
+    //   - "Enqueued":  the call returns `Ok(CommHandle)` once the operation
+    //                  has been submitted to the transport. Device work may
+    //                  still be in-flight.
+    //   - "Terminal":  awaiting the handle returns `Ok(())` when this rank's
+    //                  output is visible and all local input/output buffers are
+    //                  safe to reuse. It does NOT prove that every remote rank
+    //                  has retired its local operation.
+    //
+    // **Buffer reuse rule:** the caller MUST NOT reuse, free, or mutate
+    // input buffers until the handle reaches a terminal state. The handle
+    // retains buffer leases in the communicator's outstanding-operation
+    // registry. That registry owns transport progress and leases until terminal,
+    // so dropping the Rust handle cannot stop progress or release storage.
+    //
+    // **Cancellation:** dropping a handle detaches the caller; it NEVER cancels
+    // a collective. Cancellation would let ranks diverge in collective order.
+    // Abort is an explicit communicator-wide operation owned by the request
+    // failure state machine.
+    //
+    // **Error propagation:** argument/enqueue errors are returned by the method.
+    // Asynchronous transport errors are returned by the handle Future. On a
+    // collective failure, the executor aborts the communicator before retiring
+    // any dependent step.
 
     /// In-place all-reduce: every rank ends with the element-wise reduction
     /// of all inputs. Default op is sum.
     async fn all_reduce(
         &self,
+        instance: CommInstanceId,
         tensor: &mut DeviceBuffer,
         len: usize,
         dtype: DType,
         op: ReduceOp,
-    ) -> Result<()>;
+    ) -> Result<CommHandle>;
 
     /// All-to-all: each rank sends a distinct chunk to every other rank and
     /// receives a distinct chunk from every other rank.
     ///
-    /// `send_bufs[i]` is sent to rank `i`; `recv_bufs[i]` receives from rank `i`.
+    /// `send_bufs[i]` is sent to `members()[i]`; `recv_bufs[i]` receives from
+    /// that world rank. All per-peer vectors use this frozen member order.
     async fn all_to_all(
         &self,
+        instance: CommInstanceId,
         send_bufs: &[&DeviceBuffer],
         recv_bufs: &mut [&mut DeviceBuffer],
         chunk_sizes: &[usize],
         dtype: DType,
-    ) -> Result<()>;
+    ) -> Result<CommHandle>;
+
+    /// Prepare one variable-size all-to-all invocation.
+    ///
+    /// Counts are logical elements per peer. The returned ticket binds the
+    /// exchanged peer counts, wire codec, group, and collective sequence
+    /// instance. It is consumed exactly once by `all_to_all_v`.
+    async fn exchange_counts(
+        &self,
+        instance: CommInstanceId,
+        send_counts: &[usize],
+        spec: &WireTensorSpec,
+    ) -> Result<AllToAllVTicket>;
+
+    /// Variable-size all-to-all data transfer.
+    ///
+    /// `send_offsets` and `recv_offsets` are byte offsets. For every peer, the
+    /// implementation computes `offset.checked_add(spec.encoded_bytes(count)?)`
+    /// and rejects overflow, out-of-bounds extents, invalid codec alignment,
+    /// and overlapping receive spans. The ticket proves that each local receive
+    /// count equals the corresponding remote send count. It also validates that
+    /// both offset vectors have `group_size()` entries and that ticket group,
+    /// instance, and frozen wire spec match this plan operation.
+    async fn all_to_all_v(
+        &self,
+        send_buf: &DeviceBuffer,
+        send_offsets: &[usize],
+        recv_buf: &mut DeviceBuffer,
+        recv_offsets: &[usize],
+        ticket: AllToAllVTicket,
+    ) -> Result<CommHandle>;
 
     /// All-gather: each rank contributes a chunk; every rank receives the
     /// concatenation of all chunks.
     async fn all_gather(
         &self,
+        instance: CommInstanceId,
         send_buf: &DeviceBuffer,
         recv_buf: &mut DeviceBuffer,
         count: usize,
         dtype: DType,
-    ) -> Result<()>;
+    ) -> Result<CommHandle>;
 
     /// Broadcast: rank `root` sends; all other ranks receive.
     async fn broadcast(
         &self,
+        instance: CommInstanceId,
         buffer: &mut DeviceBuffer,
         len: usize,
         dtype: DType,
-        root: Rank,
-    ) -> Result<()>;
+        root: RankId,
+    ) -> Result<CommHandle>;
 
     /// Reduce-scatter: reduce + scatter in one step. Each rank ends with
-    /// 1/world_size of the reduced result.
+    /// 1/group_size of the reduced result.
     async fn reduce_scatter(
         &self,
+        instance: CommInstanceId,
         send_buf: &DeviceBuffer,
         recv_buf: &mut DeviceBuffer,
         count: usize,
         dtype: DType,
         op: ReduceOp,
-    ) -> Result<()>;
+    ) -> Result<CommHandle>;
 
     // ── Point-to-point ──
 
     /// Send a buffer to a specific rank.
     async fn send(
         &self,
+        instance: CommInstanceId,
         buffer: &DeviceBuffer,
         len: usize,
         dtype: DType,
-        dest: Rank,
-    ) -> Result<()>;
+        dest: RankId,
+    ) -> Result<CommHandle>;
 
     /// Receive a buffer from a specific rank.
     async fn recv(
         &self,
+        instance: CommInstanceId,
         buffer: &mut DeviceBuffer,
         len: usize,
         dtype: DType,
-        source: Rank,
-    ) -> Result<()>;
+        source: RankId,
+    ) -> Result<CommHandle>;
 
     // ── Synchronization ──
 
-    /// Barrier: block until all ranks reach this point.
-    async fn barrier(&self) -> Result<()>;
+    /// Asynchronous barrier. Its local handle becomes terminal only after every
+    /// rank in this communicator has entered the same barrier instance.
+    async fn barrier(&self, instance: CommInstanceId) -> Result<CommHandle>;
+
+    /// Abort all outstanding operations on this communicator. This is idempotent
+    /// and transitions every outstanding handle to a terminal error.
+    async fn abort(&self, cause: CommError) -> Result<()>;
 }
 
-/// Rank within a communication group.
+/// Immutable world-rank identity. Group-local vector positions are not ranks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Rank(pub u32);
+pub struct RankId(pub u32);
 
 /// Reduction operation for collective reduce.
 #[derive(Clone, Copy, Debug)]
@@ -233,12 +311,118 @@ pub enum ReduceOp {
     Min,
     Max,
 }
+
+/// Completion handle for one rank's asynchronous operation.
+/// Implements `Future<Output = Result<()>>`; polling returns transport errors.
+pub struct CommHandle {
+    inner: Pin<Box<dyn CommCompletion>>,
+}
+
+pub trait CommCompletion: Future<Output = Result<()>> + Send {
+    /// Attach as a dependency on a device stream/queue.
+    /// The stream will not proceed past this point until the comm is complete.
+    fn attach_to_stream(&self, stream: &dyn DeviceStream) -> Result<()>;
+}
+
+/// Monotonic execution identity. It is not reused while any operation from the
+/// execution is outstanding.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub struct ExecutionId(pub u64);
+
+/// Frozen, group-local submission position assigned by the plan compiler.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub struct CommSequenceId(pub u32);
+
+/// Runtime identity for one communication operation. The pair is unique within
+/// a GroupId and also acts as the send/recv message tag.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub struct CommInstanceId {
+    pub execution: ExecutionId,
+    pub sequence: CommSequenceId,
+}
+
+/// Opaque, single-use result of count exchange.
+pub struct AllToAllVTicket {
+    group: GroupId,
+    instance: CommInstanceId,
+    send_counts: Vec<usize>,
+    recv_counts: Vec<usize>,
+    spec: WireTensorSpec,
+}
+
+/// Wire codec negotiated and frozen at plan compilation.
+pub struct WireTensorSpec {
+    pub logical_dtype: DType,
+    pub wire_dtype: DType,
+    pub codec: WireCodec,
+    pub error_bound: f64,
+}
+
+impl WireTensorSpec {
+    /// Checked encoded byte length, including codec block metadata/padding.
+    pub fn encoded_bytes(&self, logical_elements: usize) -> Result<usize>;
+    pub fn validate_segment_alignment(&self, byte_offset: usize) -> Result<()>;
+}
+
+pub enum WireCodec {
+    Identity,
+    BlockQuantized {
+        block_size: usize,
+        scale_dtype: DType,
+    },
+}
 ```
+
+`WireTensorSpec` is a transport projection produced by the plan compiler from
+the negotiated boundary `TensorFormat`; callers do not construct an unrelated
+spec at execution time. Plan validation requires its logical/wire dtypes and
+codec to agree with the source converter, destination converter, and reserved
+buffer capacities. Reduction collectives use identity/full-precision wire
+format in Phases 1-2; codec-aware reduction semantics are a separate Phase 3+
+capability and must not be inferred from payload-only quantization support.
+
+`all_to_all_v` preserves order within each peer segment. MoE token-order
+reconstruction is not a transport concern: the immutable expert-routing plan
+owns the forward permutation and inverse permutation, and the combine step
+applies the inverse after the receive completes.
+
+Count exchange does not authorize unbudgeted allocation. The frozen buffer plan
+reserves a maximum encoded send/receive workspace for each all-to-all-v step.
+`exchange_counts` rejects any peer or total count whose checked encoded extent
+exceeds that reservation; only then may the data phase consume the ticket.
+Count exchange plus data transfer form one composite `CommInstanceId` for
+ordering and failure purposes.
+
+Before enqueue, the backend normalizes every buffer argument into one operation
+lease set:
+
+```rust
+pub struct CommLeaseSet {
+    /// Allocations that the backend may read until local terminal completion.
+    pub reads: Vec<PhysicalAllocationId>,
+    /// Allocations that the backend may write until local terminal completion.
+    pub writes: Vec<PhysicalAllocationId>,
+}
+```
+
+Read/read aliasing is legal. A write lease conflicts with every other read or
+write lease on the same physical allocation; an in-place collective lists its
+allocation in both sets and therefore acquires it exclusively. The outstanding
+operation registry owns the complete set before transport enqueue and releases
+it only at success or abort quiescence. `DeviceBuffer` views with different
+addresses or ranges do not bypass conflict detection when they share a
+`PhysicalAllocationId`.
+
+The transport-held lease and detach/abort lifetime are modeled in
+[`BufferOwnership.tla`](../specs/tla/BufferOwnership.tla). Any implementation
+optimization must preserve its registry-ownership and terminal-release
+invariants.
 
 ### 3.2 Communication Groups
 
-Not all ranks need to participate in every collective. Sub-groups enable
-hybrid strategies (e.g., TP within a node, EP across nodes):
+Not all ranks need to participate in every collective. Groups are compiled
+from the execution plan before any collective operation begins, ensuring all
+ranks create groups in the same deterministic order:
 
 ```rust
 /// A subset of ranks that participate in a collective.
@@ -247,18 +431,67 @@ hybrid strategies (e.g., TP within a node, EP across nodes):
 /// "TP within node" (ranks 0-3 on node A) + "EP across nodes" (rank 0
 /// from each node).
 pub struct CommGroup {
-    pub id: CommGroupId,
+    pub id: GroupId,
     /// Ranks in this group (world-rank space).
-    pub members: Vec<Rank>,
+    pub members: Vec<RankId>,
 }
 
-impl dyn Communicator {
-    /// Create a sub-communicator scoped to `group`.
-    /// Returns a new Communicator whose rank() and world_size() are
-    /// relative to the group.
-    fn sub_group(&self, group: &CommGroup) -> Result<Box<dyn Communicator>>;
+/// Communication group registry. All groups must be registered before
+/// any collective operation begins. Registration order must be
+/// deterministic across all ranks.
+pub struct GroupRegistry {
+    groups: HashMap<GroupId, Arc<dyn Communicator>>,
 }
+
+impl GroupRegistry {
+    /// Register all groups in a deterministic order derived from the execution plan.
+    /// Called once during plan compilation, before execution begins.
+    /// All ranks must call with the same group table.
+    pub fn compile(world: &dyn Communicator, plan: &[GroupSpec]) -> Result<Self>;
+
+    /// Look up a pre-compiled sub-communicator by group ID.
+    pub fn get(&self, id: GroupId) -> Option<&Arc<dyn Communicator>>;
+}
+
+pub struct GroupSpec {
+    pub id: GroupId,
+    /// Sorted, unique world ranks; this order defines all peer-vector indices.
+    pub ranks: Vec<RankId>,
+}
+
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct GroupId(pub u32);
 ```
+
+Groups are **not** created lazily at runtime. The plan compiler derives all
+required groups from the parallel strategy, validates membership, and compiles
+them in a single globally-ordered pass. This prevents deadlocks from ranks
+creating groups in different orders.
+
+### 3.2.1 Runtime Collective Ordering
+
+Collective transports such as NCCL do not match operations by application tag.
+Each `CommGroup` therefore owns a submit sequencer:
+
+- The request coordinator assigns globally monotonic `ExecutionId`s and
+  announces admitted executions to every participating rank.
+- Within a group, collective enqueue is released in lexicographic
+  `(ExecutionId, CommSequenceId)` order. Multiple collectives may remain
+  in-flight, but every member submits them in the same order.
+- A rank that reaches a later execution early waits in the submit sequencer; it
+  does not call the transport out of order.
+- Admission failure or cancellation before submission is a coordinator-issued
+  skip record observed by all group members. Failure after any member submits
+  triggers communicator abort. A rank never silently omits an instance.
+- Point-to-point operations use `CommInstanceId` as an actual message tag and
+  are validated by the frozen `message_pairs` table.
+
+The sequencer is control-plane state. It never holds device, buffer, or governor
+locks while waiting for the next admitted instance.
+
+The overlapping-execution, skip, abort, and rank-local completion contract is
+modeled in
+[`CollectiveOrdering.tla`](../specs/tla/CollectiveOrdering.tla).
 
 ### 3.3 Buffer Location Awareness
 
@@ -274,7 +507,7 @@ pub struct TransportCapability {
     pub recv_into: Vec<DeviceType>,
     /// If a device type is not in the above lists, the runtime must stage
     /// through a supported device (e.g., host memory).
-    pub staging_device: DeviceId,
+    pub staging_device: GlobalDeviceId,
 }
 ```
 
@@ -321,8 +554,11 @@ pub struct NcclCommunicator {
     comm: NcclComm,
     /// CUDA stream dedicated to communication (overlaps with compute).
     stream: CudaStream,
-    rank: Rank,
-    world_size: usize,
+    group_id: GroupId,
+    members: Arc<[RankId]>,
+    /// Backend ordinal derived from `members`, never exposed as RankId.
+    transport_ordinal: u32,
+    rank: RankId,
 }
 
 impl NcclCommunicator {
@@ -330,7 +566,11 @@ impl NcclCommunicator {
     ///
     /// Rank 0 generates the ID; other ranks receive it via a rendezvous
     /// mechanism (e.g., shared file, TCP socket, environment variable).
-    pub fn new(unique_id: NcclUniqueId, rank: Rank, world_size: usize) -> Result<Self>;
+    pub fn new(
+        unique_id: NcclUniqueId,
+        group: &GroupSpec,
+        rank: RankId,
+    ) -> Result<Self>;
 }
 ```
 
@@ -344,8 +584,9 @@ impl NcclCommunicator {
 /// coordination (e.g., broadcasting the dispatch plan to all nodes).
 pub struct GlooCommunicator {
     context: GlooContext,
-    rank: Rank,
-    world_size: usize,
+    group_id: GroupId,
+    members: Arc<[RankId]>,
+    rank: RankId,
 }
 ```
 
@@ -354,7 +595,8 @@ pub struct GlooCommunicator {
 ```rust
 /// Thunderbolt 5 communicator for Mac Studio clusters.
 ///
-/// Uses RDMA semantics over TB5 (~12 GB/s bilateral per link).
+/// Uses an RDMA-capable transport over TB5 when the deployed stack supports it.
+/// Effective bandwidth/latency are measured at startup, not hard-coded.
 /// Operates on host-accessible unified memory (MLX tensors live in
 /// unified memory on Apple Silicon, so no staging is needed).
 ///
@@ -366,15 +608,16 @@ pub struct ThunderboltCommunicator {
     peers: Vec<TbPeerConnection>,
     /// Topology graph for optimal collective routing.
     topology: TbTopology,
-    rank: Rank,
-    world_size: usize,
+    group_id: GroupId,
+    members: Arc<[RankId]>,
+    rank: RankId,
 }
 
 /// TB5 topology types affect collective algorithm selection.
 pub enum TbTopology {
     /// Direct daisy-chain: Mac0 ↔ Mac1 ↔ Mac2 ↔ Mac3
     /// Best for ring all-reduce.
-    DaisyChain { order: Vec<Rank> },
+    DaisyChain { order: Vec<RankId> },
     /// Star through a TB5 hub: all nodes connect to a central switch.
     /// Best for tree-based collectives.
     Star { hub_id: String },
@@ -393,8 +636,9 @@ pub enum TbTopology {
 pub struct RdmaCommunicator {
     /// ibverbs queue pairs, one per peer.
     qps: Vec<IbvQueuePair>,
-    rank: Rank,
-    world_size: usize,
+    group_id: GroupId,
+    members: Arc<[RankId]>,
+    rank: RankId,
     /// Whether GPUDirect RDMA is available (CUDA buffers → NIC directly).
     gpu_direct: bool,
 }
@@ -413,14 +657,15 @@ pub struct RdmaCommunicator {
 pub struct InProcessCommunicator {
     /// Shared state across all simulated ranks.
     shared: Arc<InProcessSharedState>,
-    rank: Rank,
-    world_size: usize,
+    group_id: GroupId,
+    members: Arc<[RankId]>,
+    rank: RankId,
 }
 
 struct InProcessSharedState {
-    /// Barrier counter + condvar.
-    barrier: (Mutex<usize>, Condvar),
-    /// Mailboxes for point-to-point: mailbox[src][dst] = Option<Vec<u8>>
+    /// Async barrier keyed by the runtime operation instance.
+    barriers: HashMap<CommInstanceId, AsyncBarrier>,
+    /// Mailboxes indexed by frozen member-vector positions, not RankId values.
     mailboxes: Vec<Vec<Mutex<Option<Vec<u8>>>>>,
 }
 ```
@@ -462,25 +707,47 @@ Different EPs may use different tensor layouts:
 
 ```rust
 /// Tensor format descriptor for cross-EP communication.
+///
+/// Self-describing: either peer can validate allocation size, layout,
+/// and alignment from this descriptor alone.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TensorFormat {
-    pub dtype: DType,
-    pub layout: TensorLayout,      // Contiguous, ChannelLast, etc.
-    pub quantization: Option<QuantFormat>,  // FP4, INT8, etc.
+    pub shape: Vec<usize>,
+    pub strides: Vec<usize>,
+    pub logical_dtype: DType,
+    pub wire_dtype: DType,  // may differ if quantized for transfer
+    pub quantization: Option<QuantizationParams>,
+    pub alignment: usize,   // byte alignment requirement
+    pub ownership: BufferOwnership,
 }
 
-/// Inserted by the runtime at EP boundaries when formats differ.
+pub struct QuantizationParams {
+    pub scale: f64,
+    pub zero_point: i64,
+    pub block_size: Option<usize>,
+}
+
+pub enum BufferOwnership {
+    /// Caller owns, callee borrows for the duration of the operation.
+    Borrowed,
+    /// Ownership transfers to the callee.
+    Transferred,
+}
+
+/// Inserted by the plan compiler at EP boundaries when formats differ.
+/// Conversion is selected and compiled into the immutable execution plan,
+/// not inserted dynamically after plan freeze.
 pub struct FormatConverter {
     pub source: TensorFormat,
     pub target: TensorFormat,
     /// Which device to run the conversion on (prefer the faster one).
-    pub convert_on: DeviceId,
+    pub convert_on: GlobalDeviceId,
 }
 ```
 
-The runtime inserts format conversion nodes at boundaries automatically.
-For example, CUDA EP producing row-major FP16 → MLX EP expecting column-major
-FP16: the converter transposes on whichever device is cheaper.
+The plan compiler inserts format conversion steps at boundaries during
+compilation. Conversion workspace is budgeted as part of the plan's memory
+allocation. Unsupported conversions fail at plan compilation time.
 
 ### 5.3 Heterogeneous Mixing Scenarios
 
@@ -508,12 +775,11 @@ pub struct DeviceTopology {
 }
 
 pub struct DeviceInfo {
-    pub id: DeviceId,
-    pub rank: Rank,
+    pub id: GlobalDeviceId,
+    pub rank: RankId,
     pub ep_type: String,           // "cuda_ep", "mlx_ep", "cpu_ep"
     pub memory_bytes: u64,         // Total device memory
     pub compute_tflops: f32,       // Peak compute throughput
-    pub node_id: NodeId,           // Physical machine
 }
 ```
 
@@ -740,6 +1006,37 @@ pub struct DistributedCostModel {
     pub compute: Box<dyn ComputeCostModel>,
     /// Topology for bandwidth/latency between devices.
     pub topology: DeviceTopology,
+    /// Dense index map: GlobalDeviceId → matrix index.
+    pub topo_index: HashMap<GlobalDeviceId, usize>,
+}
+
+/// Globally unique device identifier across a distributed cluster.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct GlobalDeviceId {
+    pub node: ClusterNodeId,
+    pub local: LocalDeviceId,
+}
+
+/// Opaque cluster-machine identifier assigned during rendezvous.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct ClusterNodeId(pub u32);
+
+/// Local device ordinal within a node (e.g., CUDA:0, CUDA:1).
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct LocalDeviceId {
+    pub kind: DeviceKind,
+    pub ordinal: u32,
+}
+
+impl LocalDeviceId {
+    pub const fn cpu() -> Self {
+        Self { kind: DeviceKind::Cpu, ordinal: 0 }
+    }
+}
+
+impl GlobalDeviceId {
+    /// Extract the local device ID for rank-local EP dispatch.
+    pub fn local(&self) -> LocalDeviceId { self.local.clone() }
 }
 
 impl DistributedCostModel {
@@ -748,14 +1045,17 @@ impl DistributedCostModel {
     /// cost = tensor_size_bytes / bandwidth[src][dst] + latency[src][dst]
     ///
     /// This becomes an edge weight in the ILP objective.
+    /// All matrix lookups are validated through `topo_index`.
     pub fn comm_cost(
         &self,
         tensor_bytes: usize,
-        src_device: DeviceId,
-        dst_device: DeviceId,
+        src_device: &GlobalDeviceId,
+        dst_device: &GlobalDeviceId,
     ) -> f64 {
-        let bw = self.topology.bandwidth[src_device.index()][dst_device.index()] as f64;
-        let lat = self.topology.latency[src_device.index()][dst_device.index()] as f64;
+        let src = self.topo_index[src_device];
+        let dst = self.topo_index[dst_device];
+        let bw = self.topology.bandwidth[src][dst] as f64;
+        let lat = self.topology.latency[src][dst] as f64;
         if bw == 0.0 {
             return f64::INFINITY; // Devices cannot communicate
         }
@@ -763,6 +1063,10 @@ impl DistributedCostModel {
     }
 }
 ```
+
+Note: Two nodes may both contain `CUDA:0` without identity collision because
+`GlobalDeviceId` includes the `ClusterNodeId`. The `topo_index` map provides validated
+dense indices for all bandwidth/latency matrix lookups.
 
 ### 7.2 Bandwidth Reference
 
@@ -777,6 +1081,11 @@ impl DistributedCostModel {
 | 100GbE | 12.5 GB/s | ~10 μs | Ethernet cross-node |
 | 10GbE | 1.25 GB/s | ~50 μs | Commodity ethernet |
 
+These are orientation values, not planner constants or acceptance claims. The
+runtime cost model uses topology-specific startup measurements (with an
+explicit configured fallback when probing is unavailable) and records the
+measurement method alongside the frozen plan.
+
 ### 7.3 Placement Constraints
 
 The ILP must respect:
@@ -785,11 +1094,11 @@ The ILP must respect:
 /// Constraints the graph partitioner respects during distributed placement.
 pub struct PlacementConstraints {
     /// Memory budget per device (bytes). Placement must not exceed.
-    pub memory_budgets: Vec<u64>,
+    pub memory_budgets: HashMap<GlobalDeviceId, u64>,
     /// Nodes that MUST be on the same device (e.g., attention Q/K/V).
-    pub colocate: Vec<Vec<NodeId>>,
+    pub colocate: Vec<Vec<onnx_runtime_ir::NodeId>>,
     /// Nodes that MUST be on a specific device (e.g., EP claims).
-    pub pin: Vec<(NodeId, DeviceId)>,
+    pub pin: Vec<(onnx_runtime_ir::NodeId, GlobalDeviceId)>,
     /// Maximum allowed communication volume (bytes) across a boundary
     /// class (e.g., "cross-node" < 1 GB per step).
     pub max_cross_boundary_bytes: Option<u64>,
@@ -800,58 +1109,108 @@ pub struct PlacementConstraints {
 
 ## 8. Distributed Execution Plan
 
-### 8.1 Compilation
+### 8.1 Compilation — One FrozenPlan
 
-The runtime compiles a distributed execution plan from the model graph,
-parallel strategy, and device topology:
+Distributed compilation preserves the graph/partition ownership model from
+[GRAPHVIEW_LENS_DESIGN.md](./GRAPHVIEW_LENS_DESIGN.md), but does not bolt on a
+second dependency graph. **This section is canonical for `FrozenPlan` execution
+fields and supersedes the earlier `execution_order: Vec<PlanStep>` sketch in
+that document.** The common `PlanStep` enum admits compute and communication
+steps, and one dense `StepId` domain indexes the final DAG:
 
 ```rust
-/// A compiled distributed execution plan.
-///
-/// The plan is a sequence of steps executed by the runtime. Each step is
-/// either a local EP execution or a communication collective. The runtime
-/// executes steps in order, with parallelism expressed by concurrent steps
-/// that are independent.
-pub struct DistributedPlan {
-    /// Ordered steps. Steps within the same `stage` may execute concurrently.
-    pub steps: Vec<PlanStep>,
-    /// Per-rank subplans (each rank only executes its own steps).
-    pub rank_plans: Vec<RankPlan>,
+pub struct FrozenPlan {
+    frozen: Arc<FrozenGraph>,
+    node_placement: Vec<Option<PartitionTarget>>,
+    value_placement: Vec<Option<PartitionTarget>>,
+    partitions: Vec<PartitionDescriptor>,
+    /// The sole authoritative execution DAG. `StepId` is the dense index.
+    steps: Vec<PlanStep>,
+    distributed: Option<DistributedMetadata>,
 }
 
-pub enum PlanStep {
-    /// Execute a subgraph on a specific EP.
-    Compute {
-        rank: Rank,
-        ep: EpId,
-        subgraph: SubgraphId,
-        inputs: Vec<TensorRef>,
-        outputs: Vec<TensorRef>,
-    },
-    /// Collective communication.
-    Collective {
-        op: CollectiveOp,
-        inputs: Vec<TensorRef>,
-        outputs: Vec<TensorRef>,
-    },
-    /// Format conversion at EP boundary.
-    Convert {
-        rank: Rank,
-        converter: FormatConverter,
-        input: TensorRef,
-        output: TensorRef,
-    },
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub struct StepId(pub u32);
+
+pub struct PlanStep {
+    pub id: StepId,
+    /// Exactly the ranks that execute this step.
+    pub participants: RankSet,
+    pub deps: Vec<StepId>,
+    pub kind: PlanStepKind,
 }
 
-/// Per-rank view of the distributed plan.
-pub struct RankPlan {
-    pub rank: Rank,
-    pub ep: EpId,
-    pub device: DeviceId,
-    /// This rank's steps (indexes into DistributedPlan.steps).
-    pub step_indices: Vec<usize>,
+pub enum PlanStepKind {
+    /// `PartitionId` is opaque and is resolved through `FrozenPlan::partition`.
+    Compute { partition: PartitionId, stream: StreamId },
+    Communication(CommunicationStep),
 }
+
+pub struct CommunicationStep {
+    pub op: CommunicationOp,
+    pub group: GroupId,
+    /// Frozen sequence; executor combines it with the current ExecutionId.
+    pub sequence: CommSequenceId,
+    pub stream: StreamId,
+    pub reads: Vec<BufferId>,
+    pub writes: Vec<BufferId>,
+}
+
+pub enum CommunicationOp {
+    Collective(CollectiveOp),
+    Send { destination: RankId },
+    Recv { source: RankId },
+    Barrier,
+}
+
+pub struct DistributedMetadata {
+    pub groups: Vec<GroupSpec>,
+    /// Expected collective submission order for every full group.
+    pub collective_sequences: HashMap<GroupId, Vec<StepId>>,
+    /// Exactly one send step and one recv step for each point-to-point tag.
+    pub message_pairs: HashMap<(GroupId, CommSequenceId), (StepId, StepId)>,
+}
+
+pub struct RankSet(BitVec);
+
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub struct StreamId(pub u32);
+
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
+pub struct BufferId(pub u32);
 ```
+
+The plan compiler assigns dense `StepId`s only after partition and communication
+insertion. `PartitionId`, graph `NodeId`, and `StepId` are separate opaque
+identity domains and are never cast into one another.
+
+Before freeze, release-mode validation proves:
+
+- Every `PlanStep.id` equals its dense index and every dependency exists.
+- The DAG is acyclic; a pending step with no possible predecessor completion is
+  an invalid plan, not successful execution.
+- For every participating rank, every dependency also participates on that rank.
+  Cross-rank dependencies must be represented by a communication step.
+- A compute step participates only on ranks selected by its
+  `PartitionTarget`; non-members never dispatch the partition.
+- For each collective `GroupId`, every member rank submits the same
+  `CommSequenceId` sequence. At execution, every rank combines it with the same
+  `ExecutionId`; non-members submit none of those collectives.
+- Every point-to-point `(GroupId, CommSequenceId)` has exactly one send and one
+  receive with matching source, destination, byte extent, and wire format.
+- Every read/write buffer has a plan-owned lease covering the step's terminal
+  completion, and output collection references only rank-local terminal steps.
+
+This single DAG enables:
+
+- **Overlap:** Independent compute partitions on different streams execute
+  concurrently with communication on the comm stream.
+- **Correctness:** one validated rank-local view and one collective sequence
+  derive from the same frozen steps.
+- **Buffer safety:** buffer leases retire only when all reader/writer steps are
+  terminal.
+- **No duplicate authority:** placement, dependencies, communication, and
+  execution order are all fields of the same frozen plan.
 
 ### 8.2 Example: TP Attention + EP MoE (One Transformer Block)
 
@@ -883,48 +1242,249 @@ Step  Rank 0 (GPU 0)         Rank 1 (GPU 1)         Rank 2 (GPU 2)         Rank 
 ─────┴──────────────────────┴──────────────────────┴──────────────────────┴──────────────────────
 ```
 
-### 8.3 Execution Engine
+### 8.3 Async DAG Scheduler
+
+The executor derives an immutable rank-local view from `FrozenPlan`, launches
+each ready `Pending` step exactly once, and waits for any compute or
+communication completion. Enqueue is not completion: compute kernels return a
+device event just as communication returns a `CommHandle`.
+
+For a communication step, `ExecutionContext::enqueue` constructs
+`CommInstanceId { execution: ctx.execution_id, sequence: step.sequence }`.
+Collectives use it for ordering; point-to-point send/recv use the same pair as
+their message tag.
 
 ```rust
-/// Executes a distributed plan across ranks.
-pub struct DistributedExecutor {
-    /// One EP per rank (or multiple if hybrid).
-    eps: Vec<Arc<dyn ExecutionProvider>>,
-    /// Communicator for this execution group.
-    comm: Arc<dyn Communicator>,
-    /// Sub-communicators for strategy groups (TP groups, EP groups).
-    sub_comms: HashMap<CommGroupId, Arc<dyn Communicator>>,
-    /// The compiled plan.
-    plan: DistributedPlan,
+enum StepState {
+    Pending,
+    InFlight,
+    Terminal,
 }
 
-impl DistributedExecutor {
-    /// Execute one forward pass (one token or one micro-batch).
-    pub async fn forward(
-        &self,
-        rank: Rank,
-        inputs: &[Tensor],
-    ) -> Result<Vec<Tensor>> {
-        let rank_plan = &self.plan.rank_plans[rank.0 as usize];
+/// Both variants provide the terminal fence after transport/device enqueue.
+enum StepCompletion {
+    Compute(DeviceEvent),
+    Communication(CommHandle),
+}
 
-        for &step_idx in &rank_plan.step_indices {
-            match &self.plan.steps[step_idx] {
-                PlanStep::Compute { ep, subgraph, inputs, outputs, .. } => {
-                    self.eps[ep.0 as usize].execute_subgraph(subgraph, inputs, outputs)?;
+pub struct DagScheduler<'plan> {
+    plan: &'plan FrozenPlan,
+    rank: RankId,
+    local_steps: Vec<StepId>, // sorted by StepId
+    states: Vec<StepState>,   // StepId-indexed
+}
+
+impl DagScheduler<'_> {
+    pub async fn execute(&mut self, ctx: &ExecutionContext) -> Result<()> {
+        let mut in_flight = FuturesUnordered::new();
+        let mut terminal_count = 0usize;
+
+        loop {
+            let ready: Vec<StepId> = self.local_steps.iter().copied()
+                .filter(|id| matches!(self.states[id.0 as usize], StepState::Pending))
+                .filter(|id| self.plan.step(*id).deps.iter()
+                    .all(|dep| matches!(
+                        self.states[dep.0 as usize],
+                        StepState::Terminal
+                    )))
+                .collect();
+
+            for id in ready {
+                // Transition before polling so this step cannot be relaunched.
+                self.states[id.0 as usize] = StepState::InFlight;
+                let step = self.plan.step(id);
+                in_flight.push(async move {
+                    // Includes submit-sequencer wait, enqueue, and terminal
+                    // device/transport completion. Waiting here does not block
+                    // polling of any other ready step.
+                    (id, ctx.run_to_terminal(step).await)
+                });
+            }
+
+            if terminal_count == self.local_steps.len() {
+                return Ok(());
+            }
+
+            match in_flight.next().await {
+                Some((id, Ok(()))) => {
+                    self.states[id.0 as usize] = StepState::Terminal;
+                    terminal_count += 1;
                 }
-                PlanStep::Collective { op, inputs, outputs } => {
-                    self.execute_collective(op, inputs, outputs).await?;
+                Some((_id, Err(error))) => {
+                    // Abort preserves collective ordering: no rank continues
+                    // submitting after one rank observes a terminal failure.
+                    let abort_error = ctx.abort_communicators(&error).await.err();
+                    // Device work may be non-cancellable. Wait for every local
+                    // step registry entry to become terminal before releasing
+                    // its leases or returning the failed request.
+                    let quiesce_error = ctx.quiesce_outstanding_steps().await.err();
+                    return Err(error.with_cleanup_context(
+                        abort_error,
+                        quiesce_error,
+                    ));
                 }
-                PlanStep::Convert { converter, input, output, .. } => {
-                    converter.convert(input, output)?;
+                None => {
+                    return Err(Error::InvalidPlan(
+                        "rank-local DAG is cyclic or has an unsatisfied dependency"
+                    ));
                 }
             }
         }
-
-        Ok(self.collect_outputs(rank))
     }
 }
 ```
+
+`FuturesUnordered` polls terminal results, including transport errors; the
+scheduler never busy-spins on a boolean. `ExecutionContext` also registers every
+submitted compute and communication step independently of these Rust Futures,
+so error cleanup can quiesce work even after the scheduler drops its local
+future set. A future optimization may attach a dependency fence directly to a
+consumer stream and submit that consumer before host observation, but it must
+preserve the same state transition and buffer lease rules.
+
+### 8.4 Executor Entry Point
+
+```rust
+/// Executes a distributed plan across ranks.
+///
+/// Distributed execution reuses the same `FrozenPlan` / `PartitionTarget` /
+/// `PartitionId` model as single-device execution. Each compute step
+/// references a compiled partition artifact. Communication steps select
+/// their sub-communicator via `GroupId` from the pre-compiled `GroupRegistry`.
+pub struct DistributedExecutor {
+    frozen_plan: Arc<FrozenPlan>,
+    group_registry: GroupRegistry,
+}
+
+impl DistributedExecutor {
+    /// Execute one forward pass using async DAG scheduling.
+    pub async fn forward(
+        &self,
+        execution: ExecutionId,
+        rank: RankId,
+        inputs: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
+        let ctx = ExecutionContext::new(
+            &self.frozen_plan,
+            &self.group_registry,
+            execution,
+            rank,
+            inputs,
+        )?;
+
+        let mut scheduler = DagScheduler::for_rank(&self.frozen_plan, rank)?;
+
+        scheduler.execute(&ctx).await?;
+        Ok(ctx.collect_outputs(rank))
+    }
+}
+```
+
+The request coordinator allocates one `ExecutionId` and distributes it to all
+participating ranks before any rank submits the first step. A rank never derives
+it from a local counter: retries, admission failure, and overlapping requests
+would otherwise produce different message tags. The ID remains live until all
+rank-local operations are terminal or communicator abort has drained them.
+
+### 8.5 Failure State Machine
+
+The request coordinator is the sole owner of distributed execution failure:
+
+```text
+Running
+  ├─ local enqueue/completion error ─► Aborting
+  ├─ rank heartbeat/transport loss ──► Aborting
+  └─ success on every rank ──────────► Complete
+
+Aborting ─► Quiescing ─► Failed ─► Restarting(new topology epoch)
+```
+
+1. The first observer reports `(ExecutionId, rank, cause, topology_epoch)`.
+   The coordinator atomically transitions `Running -> Aborting`; later reports
+   attach diagnostics but do not create another recovery owner.
+2. Every reachable rank stops new submission for that execution and its later
+   queued executions, aborts affected communicators, and quiesces local compute,
+   transport progress, and allocation leases.
+3. Each reachable rank acknowledges `Quiesced`. A crashed rank cannot
+   acknowledge; transport timeout destroys the old communicator/process group
+   and fences its topology epoch.
+4. The coordinator fails the user request exactly once. No output or cache
+   mutation from the failed execution is committed after `Aborting`.
+5. Phase 1-3 recovery recreates the full rank group with a new topology epoch
+   and new `ExecutionId`s. It may reuse coordinator-owned immutable host weight
+   mappings, but never device state or allocations owned by the failed group.
+   Later queued executions from the fenced epoch are re-admitted with new IDs
+   or failed; they are never resumed under their old communication instances.
+
+Partial rank replacement and degraded execution are Phase 4+ work. Until then,
+no backend may continue a surviving subset after collective failure.
+
+### 8.6 Implementation Refinement and Conformance
+
+The TLA+ modules are normative protocol specifications, but TLC proves only the
+abstract models. An implementation is accepted only when it satisfies the
+action-to-linearization-point and trace-replay contract in
+[`specs/tla/REFINEMENT.md`](../specs/tla/REFINEMENT.md).
+
+Every protocol-changing implementation provides a lossless test trace with:
+
+- contract revision and topology epoch;
+- stable group, execution, sequence, rank, operation, request, and physical
+  allocation identities;
+- an ordered-membership hash for every communicator event;
+- complete read and write allocation lease sets; and
+- a monotonic per-source sequence assigned at the authoritative state mutation.
+
+Wall-clock timestamps never establish correctness order. The replay checker
+merges events using coordinator decision order, per-group submit order, and
+per-source sequence. Events from different communicator groups remain
+independently ordered.
+
+Trace insertion is part of the test-visible atomic transition. Test builds use
+preallocated, lossless owner-local journals: a journal append cannot allocate,
+block while holding a protocol lock, or be dropped under backpressure. Export
+and serialization happen after the critical section. Sampled production
+telemetry is diagnostic and cannot satisfy conformance.
+
+The replay checker is independent:
+
+```rust
+pub trait ProtocolConformanceChecker {
+    /// Applies exactly one enabled abstract action or returns the shortest
+    /// offending trace prefix.
+    fn apply(&mut self, event: &ProtocolTraceEvent) -> Result<()>;
+
+    /// Recomputes invariants and rejects unmodeled live ownership at test end.
+    fn finish(self, boundary: TestBoundary) -> Result<ConformanceReport>;
+}
+```
+
+It may share event and identity types with the runtime, but it must not call the
+runtime's state-transition functions. Otherwise implementation and oracle can
+repeat the same bug.
+
+**Required verification gates for each protocol implementation PR:**
+
+1. The affected bounded TLC configurations complete exhaustive checking.
+2. The PR names the concrete source location of every affected linearization
+   point.
+3. Deterministic race and fault-injection campaigns produce traces accepted by
+   the independent checker.
+4. Debug/test snapshots recompute ordering and lease invariants from
+   authoritative registry entries rather than trusting incremental counters.
+5. Every backend validates its stated completion, stream-order, abort, and
+   buffer-lifetime assumptions.
+6. The scheduler records its seed and decision trace; a failing interleaving is
+   replayable without random retry.
+
+Small models and deterministic campaigns run on every protocol-changing PR.
+Larger model bounds, extended schedule campaigns, and hardware backend tests run
+nightly. A flaky protocol test is a correctness failure, not a candidate for
+retry-to-green.
+
+Passing these gates means "conforms under checked traces and stated backend
+assumptions." It must not be described as a proof of arbitrary Rust, CUDA, or
+transport execution.
 
 ---
 
@@ -951,35 +1511,44 @@ pub trait DispatchTransport: Send + Sync {
 // + all_gather, broadcast, reduce_scatter, barrier, sub-groups
 ```
 
-**Migration path:** `DispatchTransport` becomes a thin wrapper:
+**Migration path:** new MoE plans emit `PlanStepKind::Communication` directly.
+`DispatchTransport` is not a lossless abstraction: its `recv` allocates an
+unspecified tensor and its methods hide completion fences and wire format.
+During migration only, an adapter may wrap an already-resolved expert subgroup
+plus an allocator/format policy. It must await the `CommHandle` before returning
+the legacy `Result<()>`:
 
 ```rust
-/// Adapter: wraps a Communicator into the DispatchTransport interface
-/// expected by the MoE dispatch pipeline.
 pub struct CommunicatorDispatchTransport {
-    comm: Arc<dyn Communicator>,
-    /// The communication group used for expert dispatch.
-    ep_group: CommGroupId,
+    /// Resolved from GroupRegistry at construction; this is already the EP group.
+    subgroup: Arc<dyn Communicator>,
+    allocator: Arc<dyn ReceiveAllocator>,
+    wire_spec: WireTensorSpec,
+    gpu_to_rank: HashMap<GpuId, RankId>,
+    ids: Arc<dyn LegacyCommIdSource>,
 }
 
 #[async_trait]
 impl DispatchTransport for CommunicatorDispatchTransport {
     async fn send(&self, target: GpuId, data: &Tensor) -> Result<()> {
-        self.comm.send(&data.buffer, data.len(), data.dtype, Rank(target.0)).await
+        let rank = *self.gpu_to_rank.get(&target)
+            .ok_or(Error::UnknownLegacyGpu(target))?;
+        let instance = self.ids.next_send(target)?;
+        let completion = self.subgroup
+            .send(instance, &data.buffer, data.len(), data.dtype, rank)
+            .await?;
+        completion.await
     }
 
-    async fn all_to_all(
-        &self,
-        send_bufs: &[Tensor],
-        recv_bufs: &mut [Tensor],
-    ) -> Result<()> {
-        // Delegate to Communicator with the EP sub-group
-        self.comm.all_to_all(/* ... */).await
-    }
-
-    // ... etc
+    // recv/all_to_all perform explicit allocation and format validation,
+    // then await their completion handle before satisfying the legacy API.
 }
 ```
+
+The adapter is deleted once the old MoE call sites move to frozen plan steps;
+it is not a second production communication contract. `LegacyCommIdSource`
+receives coordinator-issued execution IDs and a frozen dispatch sequence; it
+must not generate tags from an unsynchronized local counter.
 
 ### 9.2 Control Plane / Data Plane Preservation
 
@@ -989,19 +1558,29 @@ maps directly to this design:
 | MoE Doc Concept | Distributed Runtime Equivalent |
 |---|---|
 | Control plane (expert placement, rebalancing) | `HybridStrategy` + `ExpertPlacement` |
-| Data plane (NCCL collectives in GPU graph) | `DistributedPlan` steps |
+| Data plane (NCCL collectives in GPU graph) | `FrozenPlan` communication steps |
 | Dispatch plan table | `ExpertParallel.placement` |
-| `MoeDispatchOp` (custom ONNX op) | `PlanStep::Collective(AllToAll)` |
+| `MoeDispatchOp` (custom ONNX op) | `PlanStepKind::Communication` |
 | `ExpertSession` trait | `ExecutionProvider` + rank-specific subgraph |
 
 ### 9.3 GPU-Native Mode
 
-For maximum performance (MOE_EXPERT_PARALLELISM.md §5.3 Mode 1), the Communicator
-collectives can be **baked into the ONNX graph** as custom ops that internally call
-NCCL. The `DistributedPlan` in this case is just: "fire rank 0's session, read
-output." All communication happens inside the graph without returning to Rust.
+For maximum performance (MOE_EXPERT_PARALLELISM.md §5.3 Mode 1), the runtime
+**lowers** communication plan ops into rank-local CUDA graph segments. Each rank
+launches its own rank-local plan in the validated collective order.
 
-The `DistributedPlan`/`DistributedExecutor` approach (explicit interleaving) is
+- GPU-native mode = the runtime compiles plan ops into CUDA-graph-capturable
+  communication calls that execute alongside EP compute kernels in the same
+  captured graph.
+- CUDA graph capture captures both compute kernels and communication calls as
+  a single graph per rank.
+- The EP never creates its own communication — it executes compiled plan
+  fragments that include both compute and comm operations.
+- Every rank launches independently; collective ordering is guaranteed by
+  the plan's `collective_sequences`.
+- The communicator completion/error contract is the same as orchestrated mode.
+
+The `FrozenPlan`/`DistributedExecutor` approach (explicit interleaving) is
 the **orchestrated mode** (Mode 2) — more flexible, inspectable, and required
 for heterogeneous EP mixing where collectives can't live inside any single EP.
 
@@ -1023,9 +1602,6 @@ for heterogeneous EP mixing where collectives can't live inside any single EP.
 │  - MLX EP (unified memory, zero-copy compute)                   │
 │  - genai-server rank (Rust async runtime)                       │
 │  - ThunderboltCommunicator                                      │
-│                                                                  │
-│  Total: 2 TB unified memory → fits K3-class 2.8T model (FP4)   │
-│         + ~500 GB headroom for KV cache                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1048,9 +1624,9 @@ Bottleneck       │  Compute-bound       │  Interconnect-bound
 ### 10.3 Why No TP on Mac Studio
 
 Apple Silicon unified memory means a single Mac can hold the full attention
-layers alongside its expert shard. With 512 GB per node and ~350 GB of expert
-weights per node (2.8T / 4 / 2 for FP4), there's ~160 GB left — more than
-enough for attention weights (~15-20 GB for a 2.8T MoE's dense layers).
+layers alongside its expert shard. For released open-weight MoE models
+(e.g., Mixtral 8x22B, DeepSeek-V2), the attention weights easily fit within
+512 GB alongside the expert shard.
 
 This eliminates AllReduce for attention entirely. Only expert All-to-All crosses
 TB5 — a massive simplification:
@@ -1065,29 +1641,11 @@ Mac Studio execution per transformer block:
   6. combine()                          ← local
 ```
 
-### 10.4 Latency Analysis
+### 10.4 Performance Validation
 
-For a K3-class model (896 experts, top-16, 4096 hidden dim, BF16):
-
-```
-Per MoE layer All-to-All:
-  Dispatch: 16 experts × batch × 4096 × 2 bytes = ~131 KB per token
-  At 12 GB/s (TB5): 131 KB / 12 GB/s ≈ 11 μs
-  Round-trip (dispatch + gather): ~22 μs
-
-For 100 MoE layers:
-  Total comm overhead: 100 × 22 μs = 2.2 ms per token
-
-Compute per token (local experts):
-  ~50B active params × 2 FLOPs/param = 100 GFLOPS
-  At 22 TFLOPS (M3 Ultra): ~4.5 ms per token (compute-bound on Mac)
-
-Total per-token latency: ~4.5 ms compute + ~2.2 ms comm ≈ 6.7 ms
-  → ~150 tokens/sec (acceptable for interactive use)
-```
-
-The Mac Studio cluster is **compute-bound, not interconnect-bound** — the TB5
-bandwidth is sufficient because expert dispatch volumes are modest.
+Latency analysis for this cluster target uses released open-weight MoE models
+(e.g., Mixtral 8x22B, DeepSeek-V2) as benchmarks. K3-class hypothetical
+workloads are deferred to [§14](#14-deferred-workload-validation).
 
 ---
 
@@ -1098,10 +1656,27 @@ bandwidth is sufficient because expert dispatch volumes are modest.
 **Goal:** Validate the abstraction without real hardware.
 
 - Implement `Communicator` trait and `InProcessCommunicator`
+- Implement contract-revisioned, lossless protocol traces and the independent
+  replay checker before adding a hardware transport.
 - Implement `TensorParallel` and `ExpertParallel` strategy structs
-- Implement `DistributedPlan` compilation from strategy + graph
+- Compile compute and communication into one validated `FrozenPlan`
 - Test with multiple CPU EPs in one process simulating multi-device
 - Verify correctness: distributed execution matches single-device results
+- Verify each rank executes only its `participants` steps and non-members never
+  submit a subgroup collective.
+- Verify an in-flight step is enqueued exactly once, downstream steps wait for
+  terminal compute/communication fences, and invalid/cyclic rank-local DAGs fail.
+- Inject enqueue and asynchronous completion errors; assert communicator abort,
+  local-step quiescence, lease release, and no subsequent collective submission.
+- Run overlapping executions of the same frozen plan and assert
+  `CommInstanceId` prevents cross-request send/recv or collective matching.
+- Replay deterministic schedules across overlapping communicator groups and
+  require every trace to satisfy `CollectiveOrdering` and `BufferOwnership`.
+- Run `specs/tla/check.sh`; record the concrete source location for each
+  linearization point listed in `specs/tla/REFINEMENT.md`.
+- Property-test `all_to_all_v` checked extents, offset overflow, overlapping
+  receive ranges, mismatched peer counts, ticket reuse, and token permutation
+  round-trips.
 - **No real multi-GPU or networking code.**
 
 ```rust
@@ -1138,8 +1713,11 @@ fn distributed_matches_single_device() {
 - Implement `RdmaCommunicator` for InfiniBand
 - Implement `GlooCommunicator` as TCP fallback
 - Process rendezvous and rank assignment
-- Fault detection and recovery (node failure)
-- **Target:** K3-class 2.8T on 4× Mac Studio M3 Ultra
+- Fault detection: abort all ranks and restart (consistent with MEMORY_ARCHITECTURE.md decision). Partial recovery/degraded execution deferred to Phase 4+.
+- **Target:** Released open-weight MoE model (e.g., Mixtral 8x22B, DeepSeek-V2). K3-class workloads are deferred to [§14](#14-deferred-workload-validation) pending reproducible artifacts.
+
+- **Acceptance criteria:** both documents use one failure-state machine and
+  define communicator abort, request failure, cleanup, and restart ownership.
 
 ### Phase 4: Heterogeneous EP Mixing
 
@@ -1157,80 +1735,91 @@ fn distributed_matches_single_device() {
 ## 12. Cross-Session Memory Coordination
 
 > **Consolidated.** See [MEMORY_ARCHITECTURE.md §4-5](./MEMORY_ARCHITECTURE.md).
-> Cross-session memory coordination, the `MemoryCoordinator` trait, budget
+> Cross-session memory coordination, the `ClusterCoordinator` trait, budget
 > arbitration, shared weight deduplication, and the relationship between
 > governors and coordinators are consolidated there.
+>
+> For memory pressure protocol (eviction signaling across ranks), see
+> MEMORY_ARCHITECTURE.md §6 (canonical definition).
 
 
 ## 13. Open Questions
 
-> Renumbered from §12; previous items 1-10 preserved, new items 11-13 added.
+> Renumbered from §12. Questions resolved in MEMORY_ARCHITECTURE.md are marked
+> as such; only genuinely open questions remain.
 
-1. **Rendezvous mechanism.** How do distributed ranks discover each other?
-   Options: (a) environment variables like `MASTER_ADDR`/`MASTER_PORT` (PyTorch
-   convention), (b) shared file on NFS, (c) built-in TCP rendezvous server in
-   genai-server, (d) mDNS/Bonjour for Mac Studio cluster. Likely need multiple
-   backends.
+1. **Rendezvous mechanism.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q1.
 
-2. **Fault tolerance.** What happens when a rank crashes mid-collective?
-   NCCL aborts all ranks. Do we need checkpointing, or is restart-from-scratch
-   acceptable for inference? (Training needs checkpoints; inference can restart
-   a request.)
+2. **Fault tolerance.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q2.
+   (Abort all ranks and restart; partial recovery deferred to Phase 4+.)
 
-3. **Dynamic rank membership.** Can ranks join/leave a live session? Useful for
-   scaling up/down based on load. NCCL doesn't support this; would require
-   session rebuild. Gloo/custom backends could support it.
+3. **Dynamic rank membership.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q3.
 
-4. **Communicator selection.** When multiple backends are available (e.g., both
-   NCCL and RDMA for GPU-to-GPU across nodes), who picks? Should the runtime
-   auto-select based on topology, or is it user-configured?
+4. **Communicator selection.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q4.
 
-5. **Async overlap.** How to overlap communication with computation? NCCL supports
-   CUDA stream-based overlap. For TB5/RDMA, can we overlap host-side communication
-   with MLX compute? This is critical for hiding the TB5 latency.
+5. **Async overlap strategy.** How to maximize compute/communication overlap in
+   the plan compiler? NCCL supports CUDA stream-based overlap. For TB5/RDMA,
+   can we overlap host-side communication with MLX compute? This is critical
+   for hiding the TB5 latency.
+   *Decision owner: runtime team. Target: Phase 2.*
 
-6. **AllReduce algorithm selection.** Ring vs tree vs recursive-halving depends
-   on topology and message size. Should the Communicator auto-select, or should
-   the strategy layer hint?
+6. **Collective algorithm selection.** Should the runtime auto-select ring vs
+   tree vs direct based on message size and topology, or should the strategy
+   layer hint?
+   *Decision owner: communicator backend. Target: Phase 2-3.*
 
-7. **Quantized communication.** Can we reduce communication volume by sending
-   FP8/INT8 and up-casting at the receiver? Lossy but could halve bandwidth
-   requirements on TB5.
+7. **Quantized communication.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q7.
 
-8. **Interaction with speculative decoding.** Multiple draft tokens route to
-   different experts. Do we batch all draft token dispatches into one AllToAll,
-   or dispatch per-token? Batched is more efficient but increases latency for
-   the first draft.
+8. **Speculative dispatch batching.** Can expert dispatch be batched across
+   multiple decode steps? Multiple draft tokens route to different experts.
+   Batched AllToAll is more efficient but increases latency for the first draft.
+   *Decision owner: MoE strategy layer. Target: Phase 3.*
 
 9. **HETEROGENEOUS_PLACEMENT.md integration.** The ON HOLD single-machine
    CPU+CUDA fallback design should eventually compose with distributed placement.
    When a remote node has an unsupported op, does it fall back locally (CPU on
    that node) or route to another node? Likely local fallback first.
+   *Decision owner: partitioner. Target: Phase 4.*
 
 10. **Memory pressure across ranks.** If one rank runs out of KV cache memory,
     should it signal other ranks to evict sequences cooperatively? Or does the
-    control plane manage this centrally?
+    ClusterCoordinator manage this centrally?
+    *Decision owner: ClusterCoordinator. Target: Phase 3-4.*
 
-11. **CUDA IPC ownership semantics.** When session 0 allocates shared weights
-    and sessions 1-7 map them via IPC, who owns the allocation lifecycle? If
-    session 0 crashes, all other sessions lose access. Options: (a) dedicated
-    "weight server" process that outlives sessions, (b) shared mmap-backed
-    allocations that survive process death, (c) accept the coupling and restart
-    all sessions on any crash.
+11. **CUDA IPC ownership semantics.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q11.
 
-12. **KV cache sharing granularity.** Global KV pool enables prefix sharing, but
-    different sessions may quantize KV differently (FP16 vs FP8). Do we enforce
-    uniform KV format across sessions, or support format conversion at share
-    boundaries?
+12. **KV cache sharing granularity.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q12.
 
-13. **MemoryCoordinator placement.** Should it run in the genai-server process,
-    or as a separate daemon? In-process is simpler; separate daemon survives
-    server restarts but adds IPC complexity. Related to the "weight server"
-    question in item 11.
+13. **ClusterCoordinator placement.** **Resolved.** See MEMORY_ARCHITECTURE.md §12, Q13.
 
 ---
 
-## 14. References
+## 14. Deferred Workload Validation
+
+### 14.1 K3-Class Workload
+
+K3-class capacity and throughput analysis is deferred. This document makes no
+fit, bandwidth-sufficiency, latency, bottleneck, or tokens-per-second claim for
+an unreleased or non-reproducible workload.
+
+The evaluation may be reopened only after all of the following are available:
+
+- released model artifacts and authoritative architecture/packing metadata;
+- measured resident bytes including codec metadata, runtime workspace, KV
+  cache, allocator fragmentation, and duplicated/non-sharded regions;
+- measured payload throughput and latency for the selected TB5 topology and
+  collective implementation, including concurrent-link contention;
+- achieved kernel throughput for the released operators and dtypes, not peak
+  device FLOPS;
+- end-to-end prefill and decode measurements across representative batch,
+  context, routing-skew, and failure/restart scenarios.
+
+Any future result belongs in a dated benchmark report. It does not become a
+phase acceptance target merely by being copied into this appendix.
+
+---
+
+## 15. References
 
 - [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md) — Three-tier weight residency, `ExpertStore`, `ResourceGovernor`
 - [MOE_EXPERT_PARALLELISM.md](./MOE_EXPERT_PARALLELISM.md) — Session-per-GPU MoE architecture, `DispatchTransport` trait
