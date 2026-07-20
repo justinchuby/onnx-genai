@@ -4,7 +4,10 @@ use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ep_cuda::{CudaExecutionProvider, subgraph_graph_capturable};
+use onnx_runtime_ep_cuda::{
+    CudaExecutionProvider, GATHER_CAPTURE_ERROR_INDEX, REDUCE_CAPTURE_ERROR_AXES,
+    subgraph_graph_capturable,
+};
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, compute_contiguous_strides, static_shape,
 };
@@ -186,6 +189,167 @@ fn gather_gpu_two_dimensional_indices_exact() {
     let expected = vec![6., 7., 0., 1., 4., 5., 2., 3.];
     assert_eq!(got, expected);
     eprintln!("Gather GPU executed: exact match (max abs error 0)");
+}
+
+#[test]
+fn captured_gather_and_reduce_axes_latch_dynamic_bounds_changes() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+
+    let mut gather_graph = Graph::new();
+    gather_graph.opset_imports.insert(String::new(), 13);
+    let data = gather_graph.create_named_value("data", DataType::Float32, static_shape([4]));
+    let indices = gather_graph.create_named_value("indices", DataType::Int64, static_shape([1]));
+    let gathered =
+        gather_graph.create_named_value("gathered", DataType::Float32, static_shape([1]));
+    let gather_node = gather_graph.insert_node(Node::new(
+        NodeId(0),
+        "Gather",
+        vec![Some(data), Some(indices)],
+        vec![gathered],
+    ));
+    let gather_model = Model::new(&gather_graph);
+    let gather = ep
+        .get_kernel(gather_model.graph.node(gather_node), &[], 13)
+        .unwrap();
+    let data_buffer = upload(&ep, &bytes(&[1.0_f32, 2.0, 3.0, 4.0]));
+    let mut index_buffer = upload(&ep, &bytes(&[1_i64]));
+    let mut gather_output = ep.allocate(4, 256).unwrap();
+    let data_shape = [4];
+    let index_shape = [1];
+    let strides = [1];
+    let gather_inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &data_shape,
+            &strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(index_buffer.as_ptr()),
+            DataType::Int64,
+            &index_shape,
+            &strides,
+            device,
+        ),
+    ];
+    let output = TensorMut::new(
+        DevicePtrMut(gather_output.as_mut_ptr()),
+        DataType::Float32,
+        &index_shape,
+        &strides,
+        device,
+    );
+    gather.execute(&gather_inputs, &mut [output]).unwrap();
+    assert!(gather.cuda_graph_compatible());
+    runtime.begin_graph_capture(&[gather.as_ref()]).unwrap();
+    let output = TensorMut::new(
+        DevicePtrMut(gather_output.as_mut_ptr()),
+        DataType::Float32,
+        &index_shape,
+        &strides,
+        device,
+    );
+    gather.execute(&gather_inputs, &mut [output]).unwrap();
+    runtime.end_graph_capture().unwrap();
+    unsafe {
+        runtime
+            .htod(&9_i64.to_ne_bytes(), cuptr(index_buffer.as_mut_ptr()))
+            .unwrap()
+    };
+    runtime.replay_graph().unwrap();
+    assert_ne!(
+        runtime.check_capture_error().unwrap() & GATHER_CAPTURE_ERROR_INDEX,
+        0
+    );
+    assert!(runtime.reset_graph().unwrap());
+    runtime.reset_capture_error().unwrap();
+
+    let mut reduce_graph = Graph::new();
+    reduce_graph.opset_imports.insert(String::new(), 13);
+    let reduce_data =
+        reduce_graph.create_named_value("data", DataType::Int64, static_shape([1, 4]));
+    let axes = reduce_graph.create_named_value("axes", DataType::Int64, static_shape([1]));
+    let reduced = reduce_graph.create_named_value("reduced", DataType::Int64, static_shape([1]));
+    let mut reduce_node = Node::new(
+        NodeId(0),
+        "ReduceSum",
+        vec![Some(reduce_data), Some(axes)],
+        vec![reduced],
+    );
+    reduce_node
+        .attributes
+        .insert("keepdims".into(), Attribute::Int(0));
+    let reduce_node = reduce_graph.insert_node(reduce_node);
+    let reduce_model = Model::new(&reduce_graph);
+    let reduce = ep
+        .get_kernel(reduce_model.graph.node(reduce_node), &[], 13)
+        .unwrap();
+    let reduce_data_buffer = upload(&ep, &bytes(&[1_i64, 2, 3, 4]));
+    let mut axes_buffer = upload(&ep, &bytes(&[1_i64]));
+    let mut reduce_output = ep.allocate(8, 256).unwrap();
+    let reduce_data_shape = [1, 4];
+    let reduce_data_strides = [4, 1];
+    let reduce_inputs = [
+        TensorView::new(
+            DevicePtr(reduce_data_buffer.as_ptr()),
+            DataType::Int64,
+            &reduce_data_shape,
+            &reduce_data_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(axes_buffer.as_ptr()),
+            DataType::Int64,
+            &index_shape,
+            &strides,
+            device,
+        ),
+    ];
+    let output = TensorMut::new(
+        DevicePtrMut(reduce_output.as_mut_ptr()),
+        DataType::Int64,
+        &index_shape,
+        &strides,
+        device,
+    );
+    reduce.execute(&reduce_inputs, &mut [output]).unwrap();
+    assert!(reduce.cuda_graph_compatible());
+    runtime.begin_graph_capture(&[reduce.as_ref()]).unwrap();
+    let output = TensorMut::new(
+        DevicePtrMut(reduce_output.as_mut_ptr()),
+        DataType::Int64,
+        &index_shape,
+        &strides,
+        device,
+    );
+    reduce.execute(&reduce_inputs, &mut [output]).unwrap();
+    runtime.end_graph_capture().unwrap();
+    unsafe {
+        runtime
+            .htod(&0_i64.to_ne_bytes(), cuptr(axes_buffer.as_mut_ptr()))
+            .unwrap()
+    };
+    runtime.replay_graph().unwrap();
+    assert_ne!(
+        runtime.check_capture_error().unwrap() & REDUCE_CAPTURE_ERROR_AXES,
+        0
+    );
+    assert!(runtime.reset_graph().unwrap());
+    runtime.reset_capture_error().unwrap();
+
+    for buffer in [
+        data_buffer,
+        index_buffer,
+        gather_output,
+        reduce_data_buffer,
+        axes_buffer,
+        reduce_output,
+    ] {
+        ep.deallocate(buffer).unwrap();
+    }
 }
 
 fn run_shape(ep: &CudaExecutionProvider, start: i64, end: Option<i64>) -> Vec<i64> {

@@ -40,7 +40,8 @@
 //! * an axis out of `[-rank, rank)` → rejected, naming the axis.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
@@ -57,6 +58,18 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// `op`: 0 = sum, 1 = max, 2 = min. `is_mean` divides a sum by the group size.
 /// `Max`/`Min` propagate NaN (numpy / CPU-EP semantics).
 const REDUCE_SRC: &str = r#"
+extern "C" __global__ void validate_reduce_axes_i64(
+    const long long* actual,
+    const long long* expected,
+    const int count,
+    unsigned int* capture_error)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += blockDim.x * gridDim.x) {
+        if (actual[i] != expected[i]) atomicOr(capture_error, 128u);
+    }
+}
+
 extern "C" __global__ void reduce_f32(
     const float*     x,
     float*           y,
@@ -65,8 +78,10 @@ extern "C" __global__ void reduce_f32(
     const int        out_count,
     const int        reduce_count,
     const int        op,           // 0 sum, 1 max, 2 min
-    const int        is_mean)
+    const int        is_mean,
+    const unsigned int* capture_error)
 {
+    if (capture_error && *capture_error) return;
     const int o = blockIdx.x;
     if (o >= out_count) return;
 
@@ -110,8 +125,10 @@ extern "C" __global__ void reduce_i64_sum(
     const long long* base_off,
     const long long* delta_off,
     const int        out_count,
-    const int        reduce_count)
+    const int        reduce_count,
+    const unsigned int* capture_error)
 {
+    if (capture_error && *capture_error) return;
     const int o = blockIdx.x;
     if (o >= out_count) return;
 
@@ -137,6 +154,8 @@ extern "C" __global__ void reduce_i64_sum(
 const REDUCE_MODULE: &str = "reduce_f32";
 const REDUCE_ENTRY: &str = "reduce_f32";
 const REDUCE_I64_SUM_ENTRY: &str = "reduce_i64_sum";
+const REDUCE_VALIDATE_AXES_ENTRY: &str = "validate_reduce_axes_i64";
+pub const REDUCE_CAPTURE_ERROR_AXES: u32 = 128;
 
 /// Threads per block for the reduction (power of two → exact tree reduce).
 const REDUCE_BLOCK: u32 = 256;
@@ -333,6 +352,8 @@ macro_rules! reduce_factory {
                     keepdims,
                     noop_with_empty_axes,
                     runtime: self.runtime.clone(),
+                    int64_metadata: Mutex::new(ReductionMetadataCache::new(self.runtime.clone())),
+                    last_call_capture_safe: AtomicBool::new(false),
                 }))
             }
         }
@@ -353,6 +374,138 @@ pub struct ReduceKernel {
     keepdims: bool,
     noop_with_empty_axes: bool,
     runtime: Arc<CudaRuntime>,
+    int64_metadata: Mutex<ReductionMetadataCache>,
+    last_call_capture_safe: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReductionMetadataKey {
+    input_shape: Vec<usize>,
+    reduce: Vec<bool>,
+    keepdims: bool,
+    axes: Vec<i64>,
+}
+
+#[derive(Debug)]
+struct ReductionMetadataCache {
+    runtime: Arc<CudaRuntime>,
+    key: Option<ReductionMetadataKey>,
+    base: CUdeviceptr,
+    delta: CUdeviceptr,
+    axes: CUdeviceptr,
+}
+
+impl ReductionMetadataCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            key: None,
+            base: 0,
+            delta: 0,
+            axes: 0,
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        input_shape: &[usize],
+        reduce: &[bool],
+        keepdims: bool,
+        axes: &[i64],
+        plan: &ReductionPlan,
+    ) -> Result<(CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
+        let key = ReductionMetadataKey {
+            input_shape: input_shape.to_vec(),
+            reduce: reduce.to_vec(),
+            keepdims,
+            axes: axes.to_vec(),
+        };
+        if self.key.as_ref() == Some(&key) {
+            return Ok((self.base, self.delta, self.axes));
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ReduceSum: int64 reduction metadata changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
+            ));
+        }
+        if self.base != 0 || self.delta != 0 || self.axes != 0 {
+            self.runtime.synchronize()?;
+        }
+
+        let base_bytes = as_i64_bytes(&plan.base);
+        let delta_bytes = as_i64_bytes(&plan.delta);
+        let axes_bytes = as_i64_bytes(axes);
+        let base = self.runtime.alloc_raw(base_bytes.len().max(1))?;
+        let delta = match self.runtime.alloc_raw(delta_bytes.len().max(1)) {
+            Ok(delta) => delta,
+            Err(error) => {
+                // SAFETY: `base` is fresh and has not escaped this cache.
+                let _ = unsafe { self.runtime.free_raw(base) };
+                return Err(error);
+            }
+        };
+        let axes_ptr = match self.runtime.alloc_raw(axes_bytes.len().max(1)) {
+            Ok(axes_ptr) => axes_ptr,
+            Err(error) => {
+                // SAFETY: both pointers are fresh and have not escaped.
+                let _ = unsafe { self.runtime.free_raw(base) };
+                let _ = unsafe { self.runtime.free_raw(delta) };
+                return Err(error);
+            }
+        };
+        let upload = (|| {
+            // SAFETY: all fresh allocations cover their corresponding slices.
+            unsafe { self.runtime.htod(&base_bytes, base) }?;
+            unsafe { self.runtime.htod(&delta_bytes, delta) }?;
+            unsafe { self.runtime.htod(&axes_bytes, axes_ptr) }
+        })();
+        if let Err(error) = upload {
+            // SAFETY: none of the fresh pointers escaped or were launched.
+            let _ = unsafe { self.runtime.free_raw(base) };
+            let _ = unsafe { self.runtime.free_raw(delta) };
+            let _ = unsafe { self.runtime.free_raw(axes_ptr) };
+            return Err(error);
+        }
+
+        if self.base != 0 {
+            // SAFETY: synchronization above completed every prior launch using
+            // these cache-owned pointers.
+            unsafe { self.runtime.free_raw(self.base) }?;
+        }
+        if self.delta != 0 {
+            // SAFETY: same ownership and synchronization invariant as `base`.
+            unsafe { self.runtime.free_raw(self.delta) }?;
+        }
+        if self.axes != 0 {
+            // SAFETY: same ownership and synchronization invariant as `base`.
+            unsafe { self.runtime.free_raw(self.axes) }?;
+        }
+        self.key = Some(key);
+        self.base = base;
+        self.delta = delta;
+        self.axes = axes_ptr;
+        Ok((base, delta, axes_ptr))
+    }
+}
+
+impl Drop for ReductionMetadataCache {
+    fn drop(&mut self) {
+        if self.base != 0 {
+            // SAFETY: this cache exclusively owns the live pointer.
+            let _ = unsafe { self.runtime.free_raw(self.base) };
+            self.base = 0;
+        }
+        if self.delta != 0 {
+            // SAFETY: this cache exclusively owns the live pointer.
+            let _ = unsafe { self.runtime.free_raw(self.delta) };
+            self.delta = 0;
+        }
+        if self.axes != 0 {
+            // SAFETY: this cache exclusively owns the live pointer.
+            let _ = unsafe { self.runtime.free_raw(self.axes) };
+            self.axes = 0;
+        }
+    }
 }
 
 /// Resolve the reduced-axis mask from the raw axes list (input or attribute),
@@ -470,7 +623,33 @@ impl ReduceKernel {
 
         // Resolve axes: input 1 (opset 13/18+) beats the attribute; both absent
         // means reduce-all (unless noop_with_empty_axes selects identity).
-        let axes_raw: Option<Vec<i64>> = if inputs.len() == 2 {
+        let capturing = self.runtime.is_capturing()?;
+        let axes_raw: Option<Vec<i64>> = if inputs.len() == 2 && capturing {
+            if inputs[1].dtype != DataType::Int64 {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep ReduceSum: captured axes input must be Int64".into(),
+                ));
+            }
+            Some(
+                self.int64_metadata
+                    .lock()
+                    .map_err(|_| {
+                        EpError::KernelFailed(
+                            "cuda_ep ReduceSum: metadata cache lock was poisoned".into(),
+                        )
+                    })?
+                    .key
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep ReduceSum: axes were not warmed before CUDA graph capture"
+                                .into(),
+                        )
+                    })?
+                    .axes
+                    .clone(),
+            )
+        } else if inputs.len() == 2 {
             Some(self.read_axes_input(op, &inputs[1])?)
         } else {
             self.axes_attr.clone()
@@ -535,22 +714,49 @@ impl ReduceKernel {
             return Ok(());
         }
 
+        if x.dtype == DataType::Int64 && (inputs.len() == 1 || inputs[1].dtype == DataType::Int64) {
+            let axes = axes_raw.as_deref().unwrap_or(&[]);
+            let mut metadata = self.int64_metadata.lock().map_err(|_| {
+                EpError::KernelFailed("cuda_ep ReduceSum: metadata cache lock was poisoned".into())
+            })?;
+            let (base_buf, delta_buf, expected_axes) =
+                metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+            if capturing && inputs.len() == 2 {
+                self.validate_captured_axes(&inputs[1], expected_axes)?;
+            }
+            self.launch(
+                x,
+                outputs,
+                base_buf,
+                delta_buf,
+                out_count,
+                reduce_count,
+                capturing,
+            )?;
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
         // Upload the base/delta offset tables (i64).
         let base_bytes = as_i64_bytes(&plan.base);
         let delta_bytes = as_i64_bytes(&plan.delta);
         let base_buf = self.runtime.alloc_raw(base_bytes.len())?;
         let delta_buf = self.runtime.alloc_raw(delta_bytes.len())?;
 
-        let result = self.launch(
-            x,
-            outputs,
-            base_buf,
-            delta_buf,
-            &base_bytes,
-            &delta_bytes,
-            out_count,
-            reduce_count,
-        );
+        let result = (|| {
+            // SAFETY: both fresh allocations cover their corresponding slices.
+            unsafe { self.runtime.htod(&base_bytes, base_buf) }?;
+            unsafe { self.runtime.htod(&delta_bytes, delta_buf) }?;
+            self.launch(
+                x,
+                outputs,
+                base_buf,
+                delta_buf,
+                out_count,
+                reduce_count,
+                false,
+            )
+        })();
 
         // Always release the scratch tables, even on failure.
         // SAFETY: both pointers came from the `alloc_raw` calls above and are
@@ -560,6 +766,34 @@ impl ReduceKernel {
         result.and(free_base).and(free_delta)
     }
 
+    fn validate_captured_axes(&self, actual: &TensorView, expected: CUdeviceptr) -> Result<()> {
+        let count = i32::try_from(actual.numel()).map_err(|_| {
+            EpError::KernelFailed("cuda_ep ReduceSum: axes count exceeds i32".into())
+        })?;
+        let actual = cuptr(actual.data_ptr::<u8>() as *const c_void);
+        let capture_error = self.runtime.capture_error_ptr();
+        let func =
+            self.runtime
+                .nvrtc_function(REDUCE_MODULE, REDUCE_SRC, REDUCE_VALIDATE_AXES_ENTRY)?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&actual)
+            .arg(&expected)
+            .arg(&count)
+            .arg(&capture_error);
+        // SAFETY: both axis buffers contain `count` i64 values, and the error
+        // pointer names the runtime-owned four-byte latch.
+        unsafe {
+            builder.launch(cudarc::driver::LaunchConfig {
+                grid_dim: ((count as u32).div_ceil(REDUCE_BLOCK).max(1), 1, 1),
+                block_dim: (REDUCE_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch validate_reduce_axes_i64", error))?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
@@ -567,15 +801,11 @@ impl ReduceKernel {
         outputs: &mut [TensorMut],
         base_buf: CUdeviceptr,
         delta_buf: CUdeviceptr,
-        base_bytes: &[u8],
-        delta_bytes: &[u8],
         out_count: usize,
         reduce_count: usize,
+        capturing: bool,
     ) -> Result<()> {
         let op = self.op.name();
-        // SAFETY: `*_buf` are live device allocations sized to `*_bytes`.
-        unsafe { self.runtime.htod(base_bytes, base_buf) }?;
-        unsafe { self.runtime.htod(delta_bytes, delta_buf) }?;
 
         let out_i = i32::try_from(out_count).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep {op}: {out_count} outputs exceed i32"))
@@ -592,6 +822,11 @@ impl ReduceKernel {
 
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let capture_error = if capturing {
+            self.runtime.capture_error_ptr()
+        } else {
+            0
+        };
 
         let entry = if x.dtype == DataType::Int64 {
             REDUCE_I64_SUM_ENTRY
@@ -619,13 +854,19 @@ impl ReduceKernel {
             .arg(&out_i)
             .arg(&red_i);
         if x.dtype != DataType::Int64 {
-            builder.arg(&op_tag).arg(&is_mean);
+            builder.arg(&op_tag).arg(&is_mean).arg(&capture_error);
+        } else {
+            builder.arg(&capture_error);
         }
         // SAFETY: `func` is the compiled reduce entry; the argument list/ABI
         // match its signature; `x_ptr`/`y_ptr` and the base/delta buffers are
         // live device allocations sized as validated above.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        self.runtime.synchronize()
+        if capturing {
+            Ok(())
+        } else {
+            self.runtime.synchronize()
+        }
     }
 }
 
@@ -648,10 +889,7 @@ impl Kernel for ReduceKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // Per-call alloc/free of the offset tables is not capturable; a pooled
-        // stream-ordered allocator (the same MatMul/Attention follow-up) makes
-        // this capturable later.
-        false
+        self.last_call_capture_safe.load(Ordering::Relaxed)
     }
 }
 

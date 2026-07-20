@@ -401,6 +401,14 @@ struct ExternalBindings {
     outputs: HashMap<ValueId, ExternalValue>,
 }
 
+impl ExternalBindings {
+    fn seed_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
+        for (&vid, value) in self.inputs.iter().chain(&self.outputs) {
+            resolved.entry(vid).or_insert_with(|| value.shape.clone());
+        }
+    }
+}
+
 /// Concrete child plan cached for one external-input dtype/shape signature.
 struct CompiledChildPlan {
     exec: Executor,
@@ -1767,6 +1775,12 @@ impl Executor {
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
         let mut resolved = self.resolve_soft(&bindings);
+        if capture {
+            // Persistent bindings expose the physical geometry the captured
+            // kernels will actually read and write. Seed only unresolved values:
+            // statically/symbolically resolved shapes remain authoritative.
+            external.seed_capture_shapes(&mut resolved);
+        }
         let external_values = external
             .inputs
             .keys()
@@ -4618,6 +4632,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_shapes() {
+        let external_value = |shape| ExternalValue {
+            dtype: DataType::Float32,
+            shape,
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            device: onnx_runtime_ir::DeviceId::cpu(),
+        };
+        let mut external = ExternalBindings::default();
+        external
+            .inputs
+            .insert(ValueId(0), external_value(vec![1, 2]));
+        external
+            .outputs
+            .insert(ValueId(1), external_value(vec![1, 4, 128, 64]));
+        external
+            .outputs
+            .insert(ValueId(2), external_value(vec![1, 4, 128, 64]));
+
+        let mut resolved = HashMap::from([(ValueId(0), vec![1, 1])]);
+        external.seed_capture_shapes(&mut resolved);
+
+        assert_eq!(resolved[&ValueId(0)], vec![1, 1]);
+        assert_eq!(resolved[&ValueId(1)], vec![1, 4, 128, 64]);
+        assert_eq!(resolved[&ValueId(2)], vec![1, 4, 128, 64]);
+    }
 
     struct WeightDeliveryKernel {
         deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,

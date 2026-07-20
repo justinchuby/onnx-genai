@@ -458,7 +458,7 @@ struct BroadcastMetadataKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BinaryCaptureSignature {
-    dtype: FloatDtype,
+    dtype: DataType,
     shapes: BroadcastMetadataKey,
 }
 
@@ -595,16 +595,14 @@ impl BinaryKernel {
             Some(dtype) => self.op.entry(dtype),
             None => format!("{}_i64", self.op.stem()),
         };
-        let current_signature = float_dtype
-            .filter(|_| is_fixed_decode_shape(&out_shape))
-            .map(|dtype| BinaryCaptureSignature {
-                dtype,
-                shapes: BroadcastMetadataKey {
-                    a_shape: a.shape.to_vec(),
-                    b_shape: b.shape.to_vec(),
-                    out_shape: out_shape.clone(),
-                },
-            });
+        let current_signature = is_fixed_decode_shape(&out_shape).then(|| BinaryCaptureSignature {
+            dtype: a.dtype,
+            shapes: BroadcastMetadataKey {
+                a_shape: a.shape.to_vec(),
+                b_shape: b.shape.to_vec(),
+                out_shape: out_shape.clone(),
+            },
+        });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -653,8 +651,8 @@ impl Kernel for BinaryKernel {
     }
 
     fn cuda_graph_compatible(&self) -> bool {
-        // Only the exact floating-point fixed-row signature recorded by the
-        // most recent successful call may enter capture.
+        // Only the exact fixed-row signature recorded by the most recent
+        // successful call may enter capture, including integer metadata ops.
         self.last_capture_safe_signature
             .lock()
             .is_ok_and(|signature| signature.is_some())

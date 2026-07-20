@@ -718,7 +718,32 @@ fn binary_fixed_decode_shape_captures_replays_and_gates_other_paths() {
         device,
     );
     kernel.execute(&i64_inputs, &mut [i64_output]).unwrap();
-    assert!(!kernel.cuda_graph_compatible());
+    assert!(kernel.cuda_graph_compatible());
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let i64_output = TensorMut::new(
+        DevicePtrMut(i64_y.as_mut_ptr()),
+        DataType::Int64,
+        &decode_shape,
+        &decode_strides,
+        device,
+    );
+    kernel.execute(&i64_inputs, &mut [i64_output]).unwrap();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+    let mut i64_replay = vec![0_u8; std::mem::size_of_val(&i64_values)];
+    unsafe {
+        runtime
+            .dtoh(&mut i64_replay, cuptr(i64_y.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(
+        i64_replay
+            .chunks_exact(8)
+            .map(|value| i64::from_ne_bytes(value.try_into().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4, 5]
+    );
+    assert!(runtime.reset_graph().unwrap());
 
     let prefill_shape = [1, 2, 4];
     let prefill_strides = compute_contiguous_strides(&prefill_shape);

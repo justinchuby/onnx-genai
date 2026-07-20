@@ -1,6 +1,7 @@
 //! `Constant`: decode an ONNX value attribute once, then upload it to the GPU.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, Node};
@@ -16,6 +17,7 @@ impl KernelFactory for ConstantFactory {
         Ok(Box::new(ConstantKernel {
             runtime: self.runtime.clone(),
             bytes: decode_value(node),
+            warmed: AtomicBool::new(false),
         }))
     }
 }
@@ -24,6 +26,7 @@ impl KernelFactory for ConstantFactory {
 pub struct ConstantKernel {
     runtime: Arc<CudaRuntime>,
     bytes: Option<Vec<u8>>,
+    warmed: AtomicBool,
 }
 
 fn decode_value(node: &Node) -> Option<Vec<u8>> {
@@ -81,6 +84,11 @@ impl Kernel for ConstantKernel {
                 output.dtype.storage_bytes(output.numel())
             )));
         }
+        if self.runtime.is_capturing()? {
+            // Constants were populated by the warm-up run. Their executor
+            // buffers and contents are stable for the captured graph lifetime.
+            return Ok(());
+        }
         if !bytes.is_empty() {
             // SAFETY: the output allocation is live and exactly `bytes.len()` long.
             unsafe {
@@ -88,7 +96,12 @@ impl Kernel for ConstantKernel {
                     .htod(bytes, cuptr(output.data_ptr_mut::<u8>() as *const u8 as _))?
             };
         }
+        self.warmed.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn cuda_graph_compatible(&self) -> bool {
+        self.warmed.load(Ordering::Relaxed)
     }
 }
 

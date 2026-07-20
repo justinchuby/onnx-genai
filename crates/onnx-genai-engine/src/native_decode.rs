@@ -421,16 +421,15 @@ impl NativeDecodeSession {
             }
             let logits = state.read_logits()?;
             // Detection-before-consumption: the logits read above is the single
-            // per-step device→host sync. Piggyback on it to poll the latching GQA
+            // per-step device→host sync. Piggyback on it to poll the shared
             // capture-error word (no extra synchronize). If a captured replay
-            // stepped out of range, the flag is set, KV writes were skipped, and
-            // the logits are silently wrong — so fail hard before the token is
-            // consumed and re-arm the graph so the poison cannot resume.
+            // violates a device-side bound, kernels latch the flag and avoid the
+            // unsafe access, so fail hard before consuming the produced token.
             let capture_error = self.session.check_device_capture_error()?;
             if capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
                 bail!(
-                    "native CUDA decoder aborted: GQA capture bounds violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
+                    "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
                 );
             }
             if logits.iter().flatten().any(|value| !value.is_finite()) {
