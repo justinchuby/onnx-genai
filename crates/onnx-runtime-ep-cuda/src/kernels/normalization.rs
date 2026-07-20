@@ -32,7 +32,8 @@
 //! * non-contiguous (strided) operands → "materialise first" error.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
@@ -354,6 +355,7 @@ impl KernelFactory for LayerNormFactory {
             axis,
             epsilon,
             runtime: self.runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -364,10 +366,12 @@ pub struct LayerNormKernel {
     axis: i64,
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    last_call_capture_safe: AtomicBool,
 }
 
 impl LayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         if !(2..=3).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 3 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep LayerNormalization: expected 2-3 inputs (X, Scale[, B]) and \
@@ -470,7 +474,9 @@ impl LayerNormKernel {
         // allocation sized as validated above (X/Y: num_groups·norm_size;
         // scale/bias: norm_size; mean/invstd: num_groups).
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch layernorm_f32", e))?;
-        self.runtime.synchronize()
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -482,7 +488,9 @@ impl Kernel for LayerNormKernel {
         false
     }
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        // Only a successfully warmed single-group decode has compiled its NVRTC
+        // module and proven the next fixed-shape call launch-only.
+        self.last_call_capture_safe.load(Ordering::Relaxed)
     }
 }
 
@@ -512,6 +520,7 @@ impl KernelFactory for RmsNormFactory {
             axis,
             epsilon,
             runtime: self.runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -522,10 +531,12 @@ pub struct RmsNormKernel {
     axis: i64,
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    last_call_capture_safe: AtomicBool,
 }
 
 impl RmsNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "RMSNormalization";
         if inputs.len() != 2 || outputs.is_empty() || outputs.len() > 2 {
             return Err(EpError::KernelFailed(format!(
@@ -616,7 +627,9 @@ impl RmsNormKernel {
         // SAFETY: `func` is the compiled rmsnorm entry; the argument list/ABI
         // match; pointers are live device allocations sized as validated.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch rmsnorm_f32", e))?;
-        self.runtime.synchronize()
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -628,7 +641,9 @@ impl Kernel for RmsNormKernel {
         false
     }
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        // Only a successfully warmed single-group decode has compiled its NVRTC
+        // module and proven the next fixed-shape call launch-only.
+        self.last_call_capture_safe.load(Ordering::Relaxed)
     }
 }
 
@@ -648,6 +663,8 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
         Ok(Box::new(SkipSimplifiedLayerNormKernel {
             epsilon,
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(SkipBroadcastMetadataCache::new(self.runtime.clone())),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -657,10 +674,87 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
 pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    metadata: Mutex<SkipBroadcastMetadataCache>,
+    last_call_capture_safe: AtomicBool,
+}
+
+#[derive(Debug)]
+struct SkipBroadcastMetadataCache {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    input_shape: Vec<usize>,
+    skip_shape: Vec<usize>,
+}
+
+impl SkipBroadcastMetadataCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            input_shape: Vec::new(),
+            skip_shape: Vec::new(),
+        }
+    }
+
+    fn reserve(&mut self, input_shape: &[usize], skip_shape: &[usize]) -> Result<CUdeviceptr> {
+        if self.ptr != 0 && self.input_shape == input_shape && self.skip_shape == skip_shape {
+            return Ok(self.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep SkipSimplifiedLayerNormalization: broadcast metadata shape changed \
+                 during CUDA graph capture; warm the fixed decode shape before capture"
+                    .into(),
+            ));
+        }
+
+        let metadata = skip_broadcast_metadata(input_shape, skip_shape);
+        let metadata_bytes = u64_bytes(&metadata);
+        let ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        // SAFETY: `ptr` exactly covers the metadata byte slice.
+        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, ptr) } {
+            // SAFETY: `ptr` is still exclusively owned and no launch used it.
+            let _ = unsafe { self.runtime.free_raw(ptr) };
+            return Err(error);
+        }
+        if self.ptr != 0 {
+            // A dynamic shape change may replace metadata still referenced by
+            // queued work. Fixed-shape decode always takes the cache-hit path.
+            if let Err(error) = self.runtime.synchronize() {
+                // SAFETY: `ptr` is still exclusively owned and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+            // SAFETY: synchronization completed all prior users of `self.ptr`.
+            if let Err(error) = unsafe { self.runtime.free_raw(self.ptr) } {
+                // SAFETY: `ptr` is still exclusively owned and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.ptr = ptr;
+        self.input_shape.clear();
+        self.input_shape.extend_from_slice(input_shape);
+        self.skip_shape.clear();
+        self.skip_shape.extend_from_slice(skip_shape);
+        Ok(ptr)
+    }
+}
+
+impl Drop for SkipBroadcastMetadataCache {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            let _ = self.runtime.synchronize();
+            // SAFETY: this cache exclusively owns the persistent allocation.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
 }
 
 impl SkipSimplifiedLayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "SkipSimplifiedLayerNormalization";
         if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
@@ -734,64 +828,56 @@ impl SkipSimplifiedLayerNormKernel {
                 cuptr(t.data_ptr_mut::<u8>() as *const c_void)
             }
         };
-        let metadata = skip_broadcast_metadata(input.shape, skip.shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
-            // SAFETY: metadata_ptr is still owned by this call and no launch occurred.
-            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
-            return Err(error);
-        }
-
-        let launch = (|| {
-            let (groups_u, norm_i) = (
-                u32::try_from(num_groups)
-                    .map_err(|_| dim_overflow(op, "num_groups", num_groups))?,
-                i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
-            );
-            let rank_i = i32::try_from(rank).map_err(|_| dim_overflow(op, "rank", rank))?;
-            let has_bias = i32::from(bias_ptr != 0);
-            let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
-            let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
-            let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
-            let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-            let func = self.runtime.nvrtc_function(
-                SKIP_RMSNORM_MODULE,
-                SKIP_RMSNORM_SRC,
-                "skip_rmsnorm_f32",
-            )?;
-            let stream = self.runtime.stream();
-            let mut builder = stream.launch_builder(&func);
-            let groups_i = groups_u_i32(groups_u);
-            builder
-                .arg(&input_ptr)
-                .arg(&skip_ptr)
-                .arg(&gamma_ptr)
-                .arg(&bias_ptr)
-                .arg(&y_ptr)
-                .arg(&sum_ptr)
-                .arg(&mean_ptr)
-                .arg(&invstd_ptr)
-                .arg(&metadata_ptr)
-                .arg(&rank_i)
-                .arg(&groups_i)
-                .arg(&norm_i)
-                .arg(&has_bias)
-                .arg(&self.epsilon);
-            // SAFETY: all pointers reference validated device buffers; metadata has
-            // two rank-length u64 arrays describing the output shape and skip strides.
-            let cfg = self.runtime.reduction_launch_config(
-                &func,
-                groups_u,
-                NORM_BLOCK,
-                std::mem::size_of::<f32>() as u32,
-            )?;
-            unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
-            self.runtime.synchronize()
-        })();
-        // SAFETY: the launch is synchronized before freeing this per-invocation metadata.
-        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
-        launch.and(free)
+        let (groups_u, norm_i) = (
+            u32::try_from(num_groups).map_err(|_| dim_overflow(op, "num_groups", num_groups))?,
+            i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
+        );
+        let rank_i = i32::try_from(rank).map_err(|_| dim_overflow(op, "rank", rank))?;
+        let has_bias = i32::from(bias_ptr != 0);
+        let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+        let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let mut metadata = self
+            .metadata
+            .lock()
+            .expect("cuda_ep skip normalization metadata cache poisoned");
+        let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
+        let func = self.runtime.nvrtc_function(
+            SKIP_RMSNORM_MODULE,
+            SKIP_RMSNORM_SRC,
+            "skip_rmsnorm_f32",
+        )?;
+        let stream = self.runtime.stream();
+        let mut builder = stream.launch_builder(&func);
+        let groups_i = groups_u_i32(groups_u);
+        builder
+            .arg(&input_ptr)
+            .arg(&skip_ptr)
+            .arg(&gamma_ptr)
+            .arg(&bias_ptr)
+            .arg(&y_ptr)
+            .arg(&sum_ptr)
+            .arg(&mean_ptr)
+            .arg(&invstd_ptr)
+            .arg(&metadata_ptr)
+            .arg(&rank_i)
+            .arg(&groups_i)
+            .arg(&norm_i)
+            .arg(&has_bias)
+            .arg(&self.epsilon);
+        // SAFETY: all pointers reference validated device buffers; metadata has
+        // two rank-length u64 arrays describing the output shape and skip strides.
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            NORM_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -803,7 +889,9 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         false
     }
     fn cuda_graph_compatible(&self) -> bool {
-        false
+        // True only after a single-group decode warmed the NVRTC module and the
+        // shape-keyed metadata allocation/upload; prefill and unwarmed calls stay false.
+        self.last_call_capture_safe.load(Ordering::Relaxed)
     }
 }
 
@@ -824,6 +912,7 @@ impl KernelFactory for SkipLayerNormFactory {
         Ok(Box::new(SkipLayerNormKernel {
             epsilon,
             runtime: self.runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -837,10 +926,12 @@ impl KernelFactory for SkipLayerNormFactory {
 pub struct SkipLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    last_call_capture_safe: AtomicBool,
 }
 
 impl SkipLayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "SkipLayerNormalization";
         if !(3..=5).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
@@ -966,7 +1057,9 @@ impl SkipLayerNormKernel {
         // validated (input/skip/output/sum: num_groups·norm_size; gamma/beta/
         // bias: norm_size; mean/invstd: num_groups).
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_layernorm_f32", e))?;
-        self.runtime.synchronize()
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -978,7 +1071,9 @@ impl Kernel for SkipLayerNormKernel {
         false
     }
     fn cuda_graph_compatible(&self) -> bool {
-        true
+        // Only a successfully warmed single-group decode has compiled its NVRTC
+        // module and proven the next fixed-shape call launch-only.
+        self.last_call_capture_safe.load(Ordering::Relaxed)
     }
 }
 

@@ -10,6 +10,8 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn f32_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: f32 is plain data and the byte slice retains the input lifetime.
     unsafe {
@@ -262,6 +264,7 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32]) {
 
 #[test]
 fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
+    let _guard = GPU_SERIAL.lock().unwrap();
     let Some(ep) = cuda_ep() else {
         return;
     };
@@ -308,6 +311,7 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
 
 #[test]
 fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
+    let _guard = GPU_SERIAL.lock().unwrap();
     let Some(ep) = cuda_ep() else {
         return;
     };
@@ -325,4 +329,204 @@ fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
     assert_eq!(got[0], expected_y);
     assert_eq!(got[2], expected_invstd);
     assert_eq!(got[3], expected_sum);
+}
+
+#[test]
+fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
+    let _guard = GPU_SERIAL.lock().unwrap();
+    let Some(ep) = cuda_ep() else {
+        return;
+    };
+    let input_shape = [1, 1, 4];
+    let skip_shape = [1, 4];
+    let output_shape = input_shape;
+    let initial = [1.0f32, -2.0, 3.0, -4.0];
+    let mutated = [-0.5f32, 1.5, -2.5, 3.5];
+    let skip = [0.25f32, -0.5, 0.75, -1.0];
+    let gamma = [1.0f32, 0.5, 1.5, 2.0];
+    let bias = [0.125f32, -0.25, 0.375, -0.5];
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let input_id = graph.create_named_value("input", DataType::Float32, static_shape(input_shape));
+    let skip_id = graph.create_named_value("skip", DataType::Float32, static_shape(skip_shape));
+    let gamma_id = graph.create_named_value("gamma", DataType::Float32, static_shape([4]));
+    let bias_id = graph.create_named_value("bias", DataType::Float32, static_shape([4]));
+    for value in [input_id, skip_id, gamma_id, bias_id] {
+        graph.add_input(value);
+    }
+    let output_id =
+        graph.create_named_value("output", DataType::Float32, static_shape(output_shape));
+    let mut node = Node::new(
+        NodeId(0),
+        "SkipSimplifiedLayerNormalization",
+        vec![Some(input_id), Some(skip_id), Some(gamma_id), Some(bias_id)],
+        vec![output_id],
+    );
+    node.domain = "com.microsoft".into();
+    let node_id = graph.insert_node(node);
+    graph.add_output(output_id);
+    let model = Model::new(&graph);
+    let kernel = ep.get_kernel(model.graph.node(node_id), &[], 1).unwrap();
+    assert!(
+        !kernel.cuda_graph_compatible(),
+        "an unwarmed normalization kernel must not be capture eligible"
+    );
+
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let input_values: [&[f32]; 4] = [&initial, &skip, &gamma, &bias];
+    let input_shapes: [&[usize]; 4] = [&input_shape, &skip_shape, &[4], &[4]];
+    let mut input_buffers = Vec::<DeviceBuffer>::new();
+    for values in input_values {
+        let buffer = ep.allocate(std::mem::size_of_val(values), 256).unwrap();
+        // SAFETY: allocation exactly covers the source byte slice.
+        unsafe {
+            runtime
+                .htod(f32_bytes(values), cuptr(buffer.as_ptr()))
+                .unwrap()
+        };
+        input_buffers.push(buffer);
+    }
+    let input_strides = input_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let input_views = input_buffers
+        .iter()
+        .zip(input_shapes)
+        .zip(&input_strides)
+        .map(|((buffer, shape), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                DataType::Float32,
+                shape,
+                strides,
+                device,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut output_buffer = ep.allocate(std::mem::size_of_val(&initial), 256).unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    macro_rules! execute {
+        () => {{
+            let output = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                device,
+            );
+            kernel.execute(&input_views, &mut [output]).unwrap();
+        }};
+    }
+
+    execute!();
+    assert!(
+        kernel.cuda_graph_compatible(),
+        "warmed single-group decode must be capture eligible"
+    );
+    // SAFETY: the input allocation exactly covers the replacement activation.
+    unsafe {
+        runtime
+            .htod(f32_bytes(&mutated), cuptr(input_buffers[0].as_ptr()))
+            .unwrap()
+    };
+    execute!();
+    let mut eager = vec![0u8; std::mem::size_of_val(&mutated)];
+    // SAFETY: destination exactly covers the output allocation.
+    unsafe {
+        runtime
+            .dtoh(&mut eager, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+
+    // SAFETY: the input allocation exactly covers the replacement activation.
+    unsafe {
+        runtime
+            .htod(f32_bytes(&initial), cuptr(input_buffers[0].as_ptr()))
+            .unwrap()
+    };
+    let allocation_counts = runtime.allocation_counts();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute!();
+    runtime.end_graph_capture().unwrap();
+    // SAFETY: the input allocation exactly covers the replacement activation.
+    unsafe {
+        runtime
+            .htod(f32_bytes(&mutated), cuptr(input_buffers[0].as_ptr()))
+            .unwrap()
+    };
+    runtime.replay_graph().unwrap();
+    let mut replayed = vec![0u8; eager.len()];
+    // SAFETY: destination exactly covers the output allocation.
+    unsafe {
+        runtime
+            .dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(replayed, eager);
+    assert_eq!(runtime.allocation_counts(), allocation_counts);
+    assert!(runtime.reset_graph().unwrap());
+
+    drop(input_views);
+    for buffer in input_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output_buffer).unwrap();
+
+    let prefill_input = [0.5f32; 8];
+    let prefill_shape = [1, 2, 4];
+    let prefill_values: [&[f32]; 4] = [&prefill_input, &skip, &gamma, &bias];
+    let prefill_shapes: [&[usize]; 4] = [&prefill_shape, &skip_shape, &[4], &[4]];
+    let mut prefill_buffers = Vec::<DeviceBuffer>::new();
+    for values in prefill_values {
+        let buffer = ep.allocate(std::mem::size_of_val(values), 256).unwrap();
+        // SAFETY: allocation exactly covers the source byte slice.
+        unsafe {
+            runtime
+                .htod(f32_bytes(values), cuptr(buffer.as_ptr()))
+                .unwrap()
+        };
+        prefill_buffers.push(buffer);
+    }
+    let prefill_strides = prefill_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let prefill_views = prefill_buffers
+        .iter()
+        .zip(prefill_shapes)
+        .zip(&prefill_strides)
+        .map(|((buffer, shape), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                DataType::Float32,
+                shape,
+                strides,
+                device,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut prefill_output = ep
+        .allocate(std::mem::size_of_val(&prefill_input), 256)
+        .unwrap();
+    let prefill_output_strides = compute_contiguous_strides(&prefill_shape);
+    let output = TensorMut::new(
+        DevicePtrMut(prefill_output.as_mut_ptr()),
+        DataType::Float32,
+        &prefill_shape,
+        &prefill_output_strides,
+        device,
+    );
+    kernel.execute(&prefill_views, &mut [output]).unwrap();
+    assert!(
+        !kernel.cuda_graph_compatible(),
+        "multi-group prefill must not be capture eligible"
+    );
+    drop(prefill_views);
+    for buffer in prefill_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(prefill_output).unwrap();
 }
