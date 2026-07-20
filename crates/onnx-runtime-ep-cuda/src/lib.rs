@@ -18,15 +18,15 @@
 //!   `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`) via runtime-compiled (NVRTC) f32
 //!   pointwise kernels — kept as our own kernels so they can later fuse into a
 //!   GEMM epilogue or an elementwise chain (RULES.md #4).
-//! * **Attention** — the scaled-dot-product / grouped-query attention baseline
-//!   (`Attention`, `com.microsoft`) built from cuBLAS batched GEMMs around a
-//!   runtime-compiled fused softmax — the §13.3 `Kernel` binding a cuDNN-fused
-//!   SDPA / FlashAttention-3 shim drops in behind later.
+//! * **Attention** — tiled online-softmax prefill (`Attention`,
+//!   `com.microsoft`) compiled by NVRTC, with an f16 tensor-core specialization
+//!   and the retained cuBLASLt Phase-2a path for decode/unsupported shapes.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
 //! prioritised custom-kernel candidate list live in `docs/CUDA_COVERAGE.md`.
 //! Roadmap ops not yet wired (cuDNN softmax/norm, cub reductions, data-movement,
-//! FP8, FlashAttention-3) return an actionable [`onnx_runtime_ep_api::EpError`].
+//! FP8 and remaining fusion-node lowering return an actionable
+//! [`onnx_runtime_ep_api::EpError`].
 //!
 //! No `.cu` sources and no `nvcc`/`build.rs` compile step exist in this crate:
 //! `cudarc` is used in its **dynamic-loading** configuration, so `cargo build`

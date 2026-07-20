@@ -20,6 +20,7 @@ use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{AttentionKernel, CudaExecutionProvider};
 use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 use std::sync::Arc;
+use std::time::Instant;
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
     // SAFETY: `f32` is `Copy` with no padding; same lifetime, 4x length.
@@ -153,6 +154,13 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 
 struct Buf(onnx_runtime_ep_api::DeviceBuffer);
 
+#[derive(Clone, Copy)]
+enum AttentionTestBackend {
+    Auto,
+    Fused,
+    Phase2a,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_gpu_attention(
     ep: &CudaExecutionProvider,
@@ -171,6 +179,47 @@ fn run_gpu_attention(
     causal: bool,
     scale: Option<f32>,
     dtype: DataType,
+) -> Vec<f32> {
+    run_gpu_attention_with_backend(
+        ep,
+        runtime,
+        q,
+        k,
+        v,
+        mask,
+        q_shape,
+        k_shape,
+        v_shape,
+        mask_shape,
+        out_shape,
+        num_heads,
+        num_kv_heads,
+        causal,
+        scale,
+        dtype,
+        AttentionTestBackend::Auto,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gpu_attention_with_backend(
+    ep: &CudaExecutionProvider,
+    runtime: &Arc<onnx_runtime_ep_cuda::CudaRuntime>,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    mask: Option<&[f32]>,
+    q_shape: &[usize],
+    k_shape: &[usize],
+    v_shape: &[usize],
+    mask_shape: Option<&[usize]>,
+    out_shape: &[usize],
+    num_heads: usize,
+    num_kv_heads: usize,
+    causal: bool,
+    scale: Option<f32>,
+    dtype: DataType,
+    backend: AttentionTestBackend,
 ) -> Vec<f32> {
     let dev: DeviceId = ep.device_id();
     let element_size = match dtype {
@@ -226,8 +275,18 @@ fn run_gpu_attention(
         dev,
     );
 
-    let kernel =
-        AttentionKernel::new(runtime.clone(), causal, num_heads, num_kv_heads, scale).unwrap();
+    let kernel = match backend {
+        AttentionTestBackend::Auto => {
+            AttentionKernel::new(runtime.clone(), causal, num_heads, num_kv_heads, scale)
+        }
+        AttentionTestBackend::Fused => {
+            AttentionKernel::new_fused(runtime.clone(), causal, num_heads, num_kv_heads, scale)
+        }
+        AttentionTestBackend::Phase2a => {
+            AttentionKernel::new_phase2a(runtime.clone(), causal, num_heads, num_kv_heads, scale)
+        }
+    }
+    .unwrap();
     if let Err(error) = kernel.execute(&inputs, &mut [ov]) {
         let message = format!("{error}");
         ep.deallocate(q_buf.0).unwrap();
@@ -499,6 +558,282 @@ fn attention_bf16_on_gpu_matches_f32_reference() {
     // bf16 has a 7-bit mantissa (8x fp16 epsilon), so its bound is correspondingly
     // wider while still catching incorrect accumulation or dtype dispatch.
     attention_half_matches_f32_reference(DataType::BFloat16, 2e-2, 2e-2);
+}
+
+#[test]
+fn fused_attention_matches_phase2a_baseline() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+    let runtime = ep.runtime().clone();
+
+    for (dtype, atol, rtol) in [
+        (DataType::Float32, 1e-4, 1e-5),
+        (DataType::Float16, 5e-3, 5e-3),
+        (DataType::BFloat16, 3e-2, 3e-2),
+    ] {
+        // Small non-causal MHA without a mask.
+        let (b, h, s, d) = (1usize, 4usize, 17usize, 64usize);
+        let scale = 1.0 / (d as f32).sqrt();
+        let q = quantize(&fill(b * h * s * d, 501), dtype);
+        let k = quantize(&fill(b * h * s * d, 502), dtype);
+        let v = quantize(&fill(b * h * s * d, 503), dtype);
+        let fused = run_gpu_attention_with_backend(
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            None,
+            &[b, h, s, d],
+            &[b, h, s, d],
+            &[b, h, s, d],
+            None,
+            &[b, h, s, d],
+            h,
+            h,
+            false,
+            Some(scale),
+            dtype,
+            AttentionTestBackend::Fused,
+        );
+        let baseline = run_gpu_attention_with_backend(
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            None,
+            &[b, h, s, d],
+            &[b, h, s, d],
+            &[b, h, s, d],
+            None,
+            &[b, h, s, d],
+            h,
+            h,
+            false,
+            Some(scale),
+            dtype,
+            AttentionTestBackend::Phase2a,
+        );
+        assert_close(&fused, &baseline, atol, rtol);
+
+        // Non-trivial causal GQA with a shared additive mask.
+        let (b, hq, hkv, s, d) = (1usize, 8usize, 2usize, 129usize, 128usize);
+        let scale = 1.0 / (d as f32).sqrt();
+        let q = quantize(&fill(b * hq * s * d, 511), dtype);
+        let k = quantize(&fill(b * hkv * s * d, 512), dtype);
+        let v = quantize(&fill(b * hkv * s * d, 513), dtype);
+        let mask = quantize(
+            &(0..s * s)
+                .map(|index| if index % 11 == 0 { -8.0 } else { 0.0 })
+                .collect::<Vec<_>>(),
+            dtype,
+        );
+        let fused = run_gpu_attention_with_backend(
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            Some(&mask),
+            &[b, hq, s, d],
+            &[b, hkv, s, d],
+            &[b, hkv, s, d],
+            Some(&[s, s]),
+            &[b, hq, s, d],
+            hq,
+            hkv,
+            true,
+            Some(scale),
+            dtype,
+            AttentionTestBackend::Fused,
+        );
+        let baseline = run_gpu_attention_with_backend(
+            &ep,
+            &runtime,
+            &q,
+            &k,
+            &v,
+            Some(&mask),
+            &[b, hq, s, d],
+            &[b, hkv, s, d],
+            &[b, hkv, s, d],
+            Some(&[s, s]),
+            &[b, hq, s, d],
+            hq,
+            hkv,
+            true,
+            Some(scale),
+            dtype,
+            AttentionTestBackend::Phase2a,
+        );
+        println!(
+            "fused parity dtype={dtype:?} GQA causal+mask S={s} D={d}: max_abs_err={:e}",
+            max_abs_err(&fused, &baseline)
+        );
+        assert_close(&fused, &baseline, atol, rtol);
+    }
+
+    // Large-magnitude f32 scores exercise running-max rescaling. A naive
+    // online exp(score) implementation overflows here.
+    let (b, h, s, d) = (1usize, 2usize, 65usize, 64usize);
+    let q = fill(b * h * s * d, 521)
+        .into_iter()
+        .map(|value| value * 40.0)
+        .collect::<Vec<_>>();
+    let k = fill(b * h * s * d, 522)
+        .into_iter()
+        .map(|value| value * 40.0)
+        .collect::<Vec<_>>();
+    let v = fill(b * h * s * d, 523);
+    let fused = run_gpu_attention_with_backend(
+        &ep,
+        &runtime,
+        &q,
+        &k,
+        &v,
+        None,
+        &[b, h, s, d],
+        &[b, h, s, d],
+        &[b, h, s, d],
+        None,
+        &[b, h, s, d],
+        h,
+        h,
+        false,
+        Some(1.0),
+        DataType::Float32,
+        AttentionTestBackend::Fused,
+    );
+    let baseline = run_gpu_attention_with_backend(
+        &ep,
+        &runtime,
+        &q,
+        &k,
+        &v,
+        None,
+        &[b, h, s, d],
+        &[b, h, s, d],
+        &[b, h, s, d],
+        None,
+        &[b, h, s, d],
+        h,
+        h,
+        false,
+        Some(1.0),
+        DataType::Float32,
+        AttentionTestBackend::Phase2a,
+    );
+    assert!(fused.iter().all(|value| value.is_finite()));
+    assert_close(&fused, &baseline, 2e-4, 1e-5);
+}
+
+#[test]
+#[ignore = "H200 performance benchmark; run explicitly with --ignored --nocapture"]
+fn attention_prefill_h200_benchmark() {
+    let ep = CudaExecutionProvider::new_default().expect("benchmark requires a CUDA GPU");
+    let runtime = ep.runtime().clone();
+    let dev = ep.device_id();
+
+    for (s, iterations) in [(512usize, 10usize), (2048usize, 3usize)] {
+        let (b, h, d) = (1usize, 32usize, 128usize);
+        let shape = [b, h, s, d];
+        let strides = compute_contiguous_strides(&shape);
+        let scale = 1.0 / (d as f32).sqrt();
+        let upload = |values: Vec<f32>| {
+            let bytes = encode(&values, DataType::Float16);
+            let buffer = ep.allocate(bytes.len(), 256).unwrap();
+            unsafe {
+                runtime.htod(&bytes, cuptr(buffer.as_ptr())).unwrap();
+            }
+            buffer
+        };
+        let q = upload(fill(b * h * s * d, 601 + s as u64));
+        let k = upload(fill(b * h * s * d, 602 + s as u64));
+        let v = upload(fill(b * h * s * d, 603 + s as u64));
+        let mut fused_out = ep.allocate(b * h * s * d * 2, 256).unwrap();
+        let mut baseline_out = ep.allocate(b * h * s * d * 2, 256).unwrap();
+        let fused = AttentionKernel::new_fused(runtime.clone(), true, h, h, Some(scale)).unwrap();
+        let baseline =
+            AttentionKernel::new_phase2a(runtime.clone(), true, h, h, Some(scale)).unwrap();
+
+        let mut run = |kernel: &AttentionKernel, output: &mut onnx_runtime_ep_api::DeviceBuffer| {
+            let inputs = [
+                TensorView::new(
+                    DevicePtr(q.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    dev,
+                ),
+                TensorView::new(
+                    DevicePtr(k.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    dev,
+                ),
+                TensorView::new(
+                    DevicePtr(v.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    dev,
+                ),
+            ];
+            let output = TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float16,
+                &shape,
+                &strides,
+                dev,
+            );
+            kernel.execute(&inputs, &mut [output]).unwrap();
+        };
+
+        // Compile NVRTC and warm allocator/library state before timing.
+        run(&fused, &mut fused_out);
+        run(&baseline, &mut baseline_out);
+
+        let measure = |kernel: &AttentionKernel,
+                       output: &mut onnx_runtime_ep_api::DeviceBuffer,
+                       run: &mut dyn FnMut(
+            &AttentionKernel,
+            &mut onnx_runtime_ep_api::DeviceBuffer,
+        )| {
+            let mut samples = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                let start = Instant::now();
+                run(kernel, output);
+                samples.push(start.elapsed().as_secs_f64() * 1_000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        let fused_ms = measure(&fused, &mut fused_out, &mut run);
+        let baseline_ms = measure(&baseline, &mut baseline_out, &mut run);
+        let score_bytes = b * h * s * s * 2;
+        let baseline_scratch = score_bytes + 32 * 1024 * 1024;
+        println!(
+            "H200 f16 causal prefill B={b} H={h} S={s} D={d}: \
+             fused={fused_ms:.3} ms baseline={baseline_ms:.3} ms speedup={:.2}x; \
+             global scratch fused=0 MiB baseline={:.1} MiB (score={:.1} MiB + cuBLASLt=32 MiB)",
+            baseline_ms / fused_ms,
+            baseline_scratch as f64 / (1024.0 * 1024.0),
+            score_bytes as f64 / (1024.0 * 1024.0),
+        );
+
+        ep.deallocate(q).unwrap();
+        ep.deallocate(k).unwrap();
+        ep.deallocate(v).unwrap();
+        ep.deallocate(fused_out).unwrap();
+        ep.deallocate(baseline_out).unwrap();
+    }
 }
 
 #[test]

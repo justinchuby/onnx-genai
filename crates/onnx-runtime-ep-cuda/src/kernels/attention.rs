@@ -1,13 +1,11 @@
-//! Phase-2a scaled-dot-product / grouped-query **attention** on the GPU
+//! Phase-2b scaled-dot-product / grouped-query **attention** on the GPU
 //! (`docs/ORT2.md` §13 + §15.5).
 //!
-//! This is the **clean baseline** the roadmap calls for ("Phase 2a cuDNN fused
-//! SDPA → Phase 2b FlashAttention-3"): a correct, mergeable attention kernel
-//! that establishes the [`Kernel`] wiring — the exact §13.3 binding shape
-//! (`causal`, `num_heads`, `head_dim`, `scale`, plus `num_kv_heads` for GQA) —
-//! so a cuDNN-fused SDPA or an FA3 shim can drop in behind the same interface
-//! later without touching callers. It is deliberately **not** a FlashAttention
-//! kernel.
+//! Multi-token prefill uses an NVRTC-compiled tiled online-softmax kernel that
+//! keeps score tiles and softmax state in SRAM/registers. It does not allocate
+//! the `[B,H,Sq,Sk]` score tensor. Single-token decode and head dimensions above
+//! 128 retain the Phase-2a cuBLASLt → softmax → cuBLASLt baseline as a transparent
+//! fallback and correctness oracle.
 //!
 //! ## What it computes
 //!
@@ -18,7 +16,7 @@
 //! with `Q : [B, num_heads, Sq, D]`, `K,V : [B, num_kv_heads, Sk, D]`, and
 //! `O : [B, num_heads, Sq, D]`, all row-major f32/f16/bf16.
 //!
-//! ## Design — two batched cuBLAS GEMMs around one NVRTC softmax
+//! ## Phase-2a fallback — two batched cuBLAS GEMMs around one NVRTC softmax
 //!
 //! 1. **Scores** `S = scale·Q·Kᵀ` via [`blas::gemm_ex`]. cuBLAS is
 //!    column-major; a row-major `X[r,c]` (ld=c) is byte-identically the
@@ -46,7 +44,7 @@
 //! `h / group`, so the KV broadcast costs no extra memory (no materialised
 //! expansion). Per-`(b,h)` GEMMs keep the GQA pointer mapping trivially correct;
 //! collapsing them into a single strided-batch call (KV stride 0 within a group)
-//! is a Phase-2b throughput optimisation.
+//! remains a fallback-path throughput optimisation.
 //!
 //! ## Phase-2a limits (all actionable errors, never panics)
 //!
@@ -66,6 +64,8 @@ use onnx_runtime_ir::{DataType, Node};
 use crate::blas::{GemmDtype, GemmEx, WORKSPACE_BYTES, gemm_ex};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::flash_attention;
 
 /// NVRTC source for the fused, numerically-stable softmax over the last (keys)
 /// axis of the score matrix, with `causal` + optional additive `mask` folded in.
@@ -376,7 +376,7 @@ impl KernelFactory for AttentionFactory {
     }
 }
 
-/// Phase-2a SDPA/GQA attention kernel (cuBLAS batched GEMM + NVRTC softmax).
+/// Phase-2b SDPA/GQA attention with a fused prefill path and Phase-2a fallback.
 #[derive(Debug)]
 pub struct AttentionKernel {
     runtime: Arc<CudaRuntime>,
@@ -386,6 +386,14 @@ pub struct AttentionKernel {
     /// Softmax scale; `None` means the default `1/sqrt(head_dim)`, resolved once
     /// `head_dim` is known from the Q shape at execute time.
     scale: Option<f32>,
+    mode: AttentionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttentionMode {
+    Auto,
+    Fused,
+    Phase2a,
 }
 
 impl AttentionKernel {
@@ -415,7 +423,42 @@ impl AttentionKernel {
             num_heads,
             num_kv_heads,
             scale,
+            mode: AttentionMode::Auto,
         })
+    }
+
+    /// Construct the memory-efficient fused implementation directly.
+    ///
+    /// The normal [`Self::new`] constructor applies a measured performance
+    /// heuristic and can choose Phase-2a for long shapes where this first NVRTC
+    /// implementation is not yet faster. This constructor is used by parity and
+    /// memory benchmarks; unsupported shapes still fall back safely.
+    pub fn new_fused(
+        runtime: Arc<CudaRuntime>,
+        causal: bool,
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: Option<f32>,
+    ) -> Result<Self> {
+        let mut kernel = Self::new(runtime, causal, num_heads, num_kv_heads, scale)?;
+        kernel.mode = AttentionMode::Fused;
+        Ok(kernel)
+    }
+
+    /// Construct the retained Phase-2a implementation directly.
+    ///
+    /// This is primarily a parity/benchmark oracle. Production callers should
+    /// use [`Self::new`], which selects fused prefill when supported.
+    pub fn new_phase2a(
+        runtime: Arc<CudaRuntime>,
+        causal: bool,
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: Option<f32>,
+    ) -> Result<Self> {
+        let mut kernel = Self::new(runtime, causal, num_heads, num_kv_heads, scale)?;
+        kernel.mode = AttentionMode::Phase2a;
+        Ok(kernel)
     }
 
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -554,30 +597,64 @@ impl AttentionKernel {
         let v_base = cuptr(v.data_ptr::<u8>() as *const c_void);
         let o_base = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        run_attention(
-            &self.runtime,
-            dtype,
-            self.num_heads,
-            self.num_kv_heads,
-            self.causal,
-            batch,
-            sq,
-            sk,
-            d,
-            sk,
-            group,
-            scale,
-            q_base,
-            k_base,
-            v_base,
-            o_base,
-            mask_ptr,
-            mask_planes,
-            0,
-            0,
-            0,
-            0.0,
-        )
+        let fused_supported = flash_attention::supported(sq, d);
+        let measured_fused_win = sq.max(sk) <= 128
+            || (q.dtype == DataType::Float16
+                && d.is_multiple_of(16)
+                && sq.max(sk) <= 512
+                && self.runtime.capabilities().compute_capability().0 >= 7);
+        let use_fused = match self.mode {
+            AttentionMode::Auto => fused_supported && measured_fused_win,
+            AttentionMode::Fused => fused_supported,
+            AttentionMode::Phase2a => false,
+        };
+        if use_fused {
+            flash_attention::run(
+                &self.runtime,
+                q.dtype,
+                self.num_heads,
+                self.num_kv_heads,
+                self.causal,
+                batch,
+                sq,
+                sk,
+                d,
+                group,
+                scale,
+                q_base,
+                k_base,
+                v_base,
+                o_base,
+                mask_ptr,
+                mask_planes,
+                0.0,
+            )
+        } else {
+            run_attention_phase2a(
+                &self.runtime,
+                dtype,
+                self.num_heads,
+                self.num_kv_heads,
+                self.causal,
+                batch,
+                sq,
+                sk,
+                d,
+                sk,
+                group,
+                scale,
+                q_base,
+                k_base,
+                v_base,
+                o_base,
+                mask_ptr,
+                mask_planes,
+                0,
+                0,
+                0,
+                0.0,
+            )
+        }
     }
 }
 
@@ -585,7 +662,7 @@ impl AttentionKernel {
 /// always accumulates GEMMs in fp32; the softmax kernel likewise widens every
 /// reduction value to fp32 before narrowing probabilities to the IO dtype.
 #[allow(clippy::too_many_arguments)]
-fn run_attention(
+fn run_attention_phase2a(
     runtime: &CudaRuntime,
     dtype: AttentionDtype,
     num_heads: usize,

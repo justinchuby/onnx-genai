@@ -33,6 +33,7 @@ pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumsum;
 pub mod elementwise;
+mod flash_attention;
 pub mod fused_gemm;
 pub mod gather;
 pub mod gemm;
@@ -448,7 +449,7 @@ pub fn build_cuda_registry_with_metrics(
         );
     }
 
-    // Attention (SDPA/GQA baseline).
+    // Attention (Phase-2b fused prefill with a Phase-2a fallback).
     reg.register(
         OpKey::new("Attention", "com.microsoft", 1),
         Box::new(attention::AttentionFactory {

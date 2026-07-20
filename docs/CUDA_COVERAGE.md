@@ -119,10 +119,10 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Attention` | `com.microsoft` | ✅ | **cuBLAS GEMM + NVRTC softmax** | SDPA/GQA baseline (`attention.rs`); §13.3 binding. |
+| `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + Phase-2a fallback** | Phase-2b fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
 | `Attention` (opset 23/24) | `` | ✅ | **deterministic CUDA EP fallback** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and in-op KV cache. f32. |
 | `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
-| `FusedAttention` | `com.microsoft` | 🔬 | **cuDNN SDPA / FlashAttention-3** | Fused flash-attention behind the same binding — the top perf item. |
+| `FusedAttention` | `com.microsoft` | 🔬 | **fusion rewrite to `Attention`** | The fused kernel exists behind `AttentionKernel`; registering/lowering this op name remains. |
 
 ### Shape / data-movement / misc
 
@@ -228,12 +228,11 @@ Ops that justify a **custom fused NVRTC / CUTLASS kernel** — either no library
 covers them, or fusion measurably beats calling a library op-by-op. Ordered by
 expected impact for transformer inference.
 
-1. **`FusedAttention` → FlashAttention-3 / cuDNN SDPA** *(highest impact)* —
-   the current baseline materialises the full `[B,H,Sq,Sk]` score matrix
-   (O(S²) memory + two GEMM round-trips through HBM). Flash-attention keeps
-   scores in SRAM and is the single biggest latency/throughput win. Drop in
-   behind the existing §13.3 `AttentionKernel` binding (`supports_strided_input`
-   / `cuda_graph_compatible` already advertise the target shape).
+1. **`FusedAttention` → fused `AttentionKernel` lowering** *(Phase-2b kernel
+   implemented)* — tiled online-softmax now removes the `[B,H,Sq,Sk]` HBM tensor
+   for f32/f16/bf16 prefill and is 1.53x faster for H200 f16 S=512. Long-context
+   tuning and the `FusedAttention` graph rewrite remain; automatic dispatch keeps
+   Phase-2a at measured slower shapes. See `CUDA_FLASH_ATTENTION.md`.
 2. **`LayerNormalization` / RMSNorm (fused)** — mean+variance reduction, the
    normalize, and the affine (`γ·x̂+β`) in **one** kernel over one HBM read.
    A library path is a reduction + several pointwise passes; the fused kernel
