@@ -6,8 +6,10 @@
 //!
 //! ## Prompt token expansion seam
 //!
-//! After image preprocessing and prompt tokenization, callers can pass
-//! [`image::ImageTensor::tiling_summary`] to
+//! Image preprocessing returns an [`image::ImageTensorBundle`] containing every
+//! metadata-declared named tensor and one expansion summary per source image.
+//! After prompt tokenization, callers can pass
+//! [`image::ImageTensorBundle::tiling_summary`] to
 //! [`image::expand_image_placeholders`]. This replaces one placeholder per image
 //! before the engine computes sequence length and allocates KV cache pages.
 
