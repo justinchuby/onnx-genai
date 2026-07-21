@@ -5,10 +5,11 @@ use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, Result, TensorMut,
     TensorView,
 };
+use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -228,7 +229,7 @@ fn run_result_core(
         .map(|(i, input)| {
             input.map(|input| {
                 let value = graph.create_named_value(
-                    &format!("input_{i}"),
+                    format!("input_{i}"),
                     input.dtype,
                     static_shape(input.shape.iter().copied()),
                 );
@@ -242,7 +243,7 @@ fn run_result_core(
         .enumerate()
         .map(|(i, (dtype, shape))| {
             graph.create_named_value(
-                &format!("output_{i}"),
+                format!("output_{i}"),
                 *dtype,
                 static_shape(shape.iter().copied()),
             )
@@ -303,7 +304,7 @@ fn run_result_core(
     let mut output_buffers = outputs
         .iter()
         .map(|(dtype, shape)| -> Result<DeviceBuffer> {
-            Ok(ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)?)
+            ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)
         })
         .collect::<Result<Vec<DeviceBuffer>>>()?;
     let output_strides = outputs
@@ -365,6 +366,110 @@ fn run_result_core(
     }
     Ok(result)
 }
+
+fn run_cpu_opt(
+    op: &str,
+    opset: u64,
+    inputs: &[Option<Tensor>],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Vec<Vec<u8>> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), opset);
+    let input_values = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input.as_ref().map(|input| {
+                let value = graph.create_named_value(
+                    format!("input_{i}"),
+                    input.dtype,
+                    static_shape(input.shape.iter().copied()),
+                );
+                graph.add_input(value);
+                value
+            })
+        })
+        .collect::<Vec<_>>();
+    let output_values = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, (dtype, shape))| {
+            graph.create_named_value(
+                format!("output_{i}"),
+                *dtype,
+                static_shape(shape.iter().copied()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut node = Node::new(
+        NodeId(0),
+        op,
+        input_values.into_iter().collect(),
+        output_values.clone(),
+    );
+    for (name, value) in attrs {
+        node.attributes.insert((*name).into(), value.clone());
+    }
+    let node_id = graph.insert_node(node);
+    for output in output_values {
+        graph.add_output(output);
+    }
+    let model = Model::new(&graph);
+    let kernel = CpuExecutionProvider::new()
+        .get_kernel(model.graph.node(node_id), &[], opset)
+        .unwrap();
+
+    let input_strides = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let input_views = inputs
+        .iter()
+        .zip(&input_strides)
+        .map(|(input, strides)| match input {
+            Some(input) => TensorView::new(
+                DevicePtr(input.bytes.as_ptr().cast()),
+                input.dtype,
+                &input.shape,
+                strides,
+                DeviceId::cpu(),
+            ),
+            None => TensorView::absent(DataType::Float32),
+        })
+        .collect::<Vec<_>>();
+    let mut output_buffers = outputs
+        .iter()
+        .map(|(dtype, shape)| vec![0; dtype.storage_bytes(shape.iter().product())])
+        .collect::<Vec<_>>();
+    let output_strides = outputs
+        .iter()
+        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let mut output_views = outputs
+        .iter()
+        .zip(output_buffers.iter_mut())
+        .zip(&output_strides)
+        .map(|(((dtype, shape), bytes), strides)| {
+            TensorMut::new(
+                DevicePtrMut(bytes.as_mut_ptr().cast()),
+                *dtype,
+                shape,
+                strides,
+                DeviceId::cpu(),
+            )
+        })
+        .collect::<Vec<_>>();
+    kernel.execute(&input_views, &mut output_views).unwrap();
+    drop(output_views);
+    output_buffers
+}
+
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -412,6 +517,7 @@ fn assert_close(got: &[f32], expected: &[f32]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rotary_embedding_reference_4d(
     x: &[f32],
     batch: usize,
@@ -441,6 +547,7 @@ fn rotary_embedding_reference_4d(
     y
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rotary_embedding_reference_fp16(
     x: &[f32],
     batch: usize,
@@ -940,6 +1047,170 @@ fn sdpa_ref_with_pad_limit(
 
 fn seq_f32(n: usize) -> Vec<f32> {
     (0..n).map(|v| ((v % 13) as f32) * 0.25 - 1.0).collect()
+}
+
+fn conformance_values(len: usize, salt: usize) -> Vec<f32> {
+    (0..len)
+        .map(|i| (((i * 17 + salt * 29) % 97) as f32 - 48.0) / 128.0)
+        .collect()
+}
+
+fn asymmetric_3d_prefill_decode_cpu_cuda_case(kv_heads: usize) {
+    let (batch, q_heads, prefill_seq, decode_seq) = (1usize, 4usize, 3usize, 1usize);
+    let (qk_head_dim, v_head_dim) = (192usize, 128usize);
+    let attrs = [
+        ("is_causal", Attribute::Int(1)),
+        ("q_num_heads", Attribute::Int(q_heads as i64)),
+        ("kv_num_heads", Attribute::Int(kv_heads as i64)),
+    ];
+
+    let q_prefill = conformance_values(batch * prefill_seq * q_heads * qk_head_dim, 1 + kv_heads);
+    let k_prefill = conformance_values(batch * prefill_seq * kv_heads * qk_head_dim, 3 + kv_heads);
+    let v_prefill = conformance_values(batch * prefill_seq * kv_heads * v_head_dim, 5 + kv_heads);
+    let prefill_inputs = vec![
+        Some(tensor(
+            DataType::Float32,
+            &[batch, prefill_seq, q_heads * qk_head_dim],
+            &q_prefill,
+        )),
+        Some(tensor(
+            DataType::Float32,
+            &[batch, prefill_seq, kv_heads * qk_head_dim],
+            &k_prefill,
+        )),
+        Some(tensor(
+            DataType::Float32,
+            &[batch, prefill_seq, kv_heads * v_head_dim],
+            &v_prefill,
+        )),
+    ];
+    let prefill_outputs = vec![
+        (
+            DataType::Float32,
+            vec![batch, prefill_seq, q_heads * v_head_dim],
+        ),
+        (
+            DataType::Float32,
+            vec![batch, kv_heads, prefill_seq, qk_head_dim],
+        ),
+        (
+            DataType::Float32,
+            vec![batch, kv_heads, prefill_seq, v_head_dim],
+        ),
+    ];
+    assert_eq!(
+        prefill_outputs[0].1,
+        [batch, prefill_seq, q_heads * v_head_dim],
+        "3D Attention output hidden width must use V head width"
+    );
+    assert_eq!(
+        prefill_outputs[1].1,
+        [batch, kv_heads, prefill_seq, qk_head_dim],
+        "present_key must preserve Q/K head width"
+    );
+    assert_eq!(
+        prefill_outputs[2].1,
+        [batch, kv_heads, prefill_seq, v_head_dim],
+        "present_value must preserve V head width"
+    );
+    let prefill_cpu = run_cpu_opt("Attention", 23, &prefill_inputs, &prefill_outputs, &attrs);
+    let prefill_gpu = run_opt("Attention", 23, &prefill_inputs, &prefill_outputs, &attrs);
+    for (name, gpu, cpu) in [
+        ("prefill Y", &prefill_gpu[0], &prefill_cpu[0]),
+        ("prefill present_key", &prefill_gpu[1], &prefill_cpu[1]),
+        ("prefill present_value", &prefill_gpu[2], &prefill_cpu[2]),
+    ] {
+        let gpu = f32s(gpu);
+        let cpu = f32s(cpu);
+        assert_close(&gpu, &cpu);
+        assert!(gpu.iter().all(|value| value.is_finite()), "{name}");
+    }
+
+    let q_decode = conformance_values(batch * decode_seq * q_heads * qk_head_dim, 7 + kv_heads);
+    let k_decode = conformance_values(batch * decode_seq * kv_heads * qk_head_dim, 9 + kv_heads);
+    let v_decode = conformance_values(batch * decode_seq * kv_heads * v_head_dim, 11 + kv_heads);
+    let total_seq = prefill_seq + decode_seq;
+    let decode_outputs = vec![
+        (
+            DataType::Float32,
+            vec![batch, decode_seq, q_heads * v_head_dim],
+        ),
+        (
+            DataType::Float32,
+            vec![batch, kv_heads, total_seq, qk_head_dim],
+        ),
+        (
+            DataType::Float32,
+            vec![batch, kv_heads, total_seq, v_head_dim],
+        ),
+    ];
+    assert_eq!(
+        decode_outputs[0].1,
+        [batch, decode_seq, q_heads * v_head_dim]
+    );
+    assert_eq!(
+        decode_outputs[1].1,
+        [batch, kv_heads, total_seq, qk_head_dim]
+    );
+    assert_eq!(
+        decode_outputs[2].1,
+        [batch, kv_heads, total_seq, v_head_dim]
+    );
+
+    let decode_inputs = |present_key: &[u8], present_value: &[u8]| {
+        vec![
+            Some(tensor(
+                DataType::Float32,
+                &[batch, decode_seq, q_heads * qk_head_dim],
+                &q_decode,
+            )),
+            Some(tensor(
+                DataType::Float32,
+                &[batch, decode_seq, kv_heads * qk_head_dim],
+                &k_decode,
+            )),
+            Some(tensor(
+                DataType::Float32,
+                &[batch, decode_seq, kv_heads * v_head_dim],
+                &v_decode,
+            )),
+            None,
+            Some(Tensor {
+                dtype: DataType::Float32,
+                shape: vec![batch, kv_heads, prefill_seq, qk_head_dim],
+                bytes: present_key.to_vec(),
+            }),
+            Some(Tensor {
+                dtype: DataType::Float32,
+                shape: vec![batch, kv_heads, prefill_seq, v_head_dim],
+                bytes: present_value.to_vec(),
+            }),
+        ]
+    };
+    let decode_cpu_inputs = decode_inputs(&prefill_cpu[1], &prefill_cpu[2]);
+    let decode_gpu_inputs = decode_inputs(&prefill_gpu[1], &prefill_gpu[2]);
+    let decode_cpu = run_cpu_opt("Attention", 23, &decode_cpu_inputs, &decode_outputs, &attrs);
+    let decode_gpu = run_opt("Attention", 23, &decode_gpu_inputs, &decode_outputs, &attrs);
+    for (name, gpu, cpu) in [
+        ("decode Y", &decode_gpu[0], &decode_cpu[0]),
+        ("decode present_key", &decode_gpu[1], &decode_cpu[1]),
+        ("decode present_value", &decode_gpu[2], &decode_cpu[2]),
+    ] {
+        let gpu = f32s(gpu);
+        let cpu = f32s(cpu);
+        assert_close(&gpu, &cpu);
+        assert!(gpu.iter().all(|value| value.is_finite()), "{name}");
+    }
+}
+
+#[test]
+fn standard_attention_asymmetric_3d_prefill_decode_gqa_matches_cpu() {
+    asymmetric_3d_prefill_decode_cpu_cuda_case(2);
+}
+
+#[test]
+fn standard_attention_asymmetric_3d_prefill_decode_mqa_matches_cpu() {
+    asymmetric_3d_prefill_decode_cpu_cuda_case(1);
 }
 
 #[test]

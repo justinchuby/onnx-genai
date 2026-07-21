@@ -720,6 +720,71 @@ mod tests {
         }
     }
 
+    fn bsh_to_bhsd(src: &[f32], batch: usize, seq: usize, heads: usize, dim: usize) -> Vec<f32> {
+        let mut dst = vec![0.0; src.len()];
+        for b in 0..batch {
+            for s in 0..seq {
+                for h in 0..heads {
+                    for d in 0..dim {
+                        dst[((b * heads + h) * seq + s) * dim + d] =
+                            src[((b * seq + s) * heads + h) * dim + d];
+                    }
+                }
+            }
+        }
+        dst
+    }
+
+    fn bhsd_to_bsh(src: &[f32], batch: usize, heads: usize, seq: usize, dim: usize) -> Vec<f32> {
+        let mut dst = vec![0.0; src.len()];
+        for b in 0..batch {
+            for h in 0..heads {
+                for s in 0..seq {
+                    for d in 0..dim {
+                        dst[((b * seq + s) * heads + h) * dim + d] =
+                            src[((b * heads + h) * seq + s) * dim + d];
+                    }
+                }
+            }
+        }
+        dst
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn concat_bhsd(
+        past: &[f32],
+        current: &[f32],
+        batch: usize,
+        heads: usize,
+        past_seq: usize,
+        current_seq: usize,
+        dim: usize,
+    ) -> Vec<f32> {
+        let total_seq = past_seq + current_seq;
+        let mut dst = vec![0.0; batch * heads * total_seq * dim];
+        for b in 0..batch {
+            for h in 0..heads {
+                for s in 0..past_seq {
+                    let src = ((b * heads + h) * past_seq + s) * dim;
+                    let out = ((b * heads + h) * total_seq + s) * dim;
+                    dst[out..out + dim].copy_from_slice(&past[src..src + dim]);
+                }
+                for s in 0..current_seq {
+                    let src = ((b * heads + h) * current_seq + s) * dim;
+                    let out = ((b * heads + h) * total_seq + past_seq + s) * dim;
+                    dst[out..out + dim].copy_from_slice(&current[src..src + dim]);
+                }
+            }
+        }
+        dst
+    }
+
+    fn conformance_values(len: usize, salt: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (((i * 17 + salt * 29) % 97) as f32 - 48.0) / 128.0)
+            .collect()
+    }
+
     fn kernel(
         scale: Option<f32>,
         is_causal: bool,
@@ -862,6 +927,172 @@ mod tests {
             )
             .unwrap();
         approx(&out.to_f32(), &want3, 1e-5);
+    }
+
+    fn asymmetric_3d_prefill_decode_case(kv_heads: usize) {
+        let (batch, q_heads, prefill_seq, decode_seq) = (1usize, 4usize, 3usize, 1usize);
+        let (qk_head_dim, v_head_dim) = (192usize, 128usize);
+
+        let q_prefill =
+            conformance_values(batch * prefill_seq * q_heads * qk_head_dim, 1 + kv_heads);
+        let k_prefill =
+            conformance_values(batch * prefill_seq * kv_heads * qk_head_dim, 3 + kv_heads);
+        let v_prefill =
+            conformance_values(batch * prefill_seq * kv_heads * v_head_dim, 5 + kv_heads);
+        let q_prefill_bhsd = bsh_to_bhsd(&q_prefill, batch, prefill_seq, q_heads, qk_head_dim);
+        let k_prefill_bhsd = bsh_to_bhsd(&k_prefill, batch, prefill_seq, kv_heads, qk_head_dim);
+        let v_prefill_bhsd = bsh_to_bhsd(&v_prefill, batch, prefill_seq, kv_heads, v_head_dim);
+        let scale = 1.0 / (qk_head_dim as f32).sqrt();
+        let prefill_oracle_bhsd = reference(
+            &q_prefill_bhsd,
+            &k_prefill_bhsd,
+            &v_prefill_bhsd,
+            batch,
+            q_heads,
+            kv_heads,
+            prefill_seq,
+            prefill_seq,
+            qk_head_dim,
+            v_head_dim,
+            scale,
+            true,
+            0,
+            |_, _, _, _| 0.0,
+        );
+        let prefill_oracle = bhsd_to_bsh(
+            &prefill_oracle_bhsd,
+            batch,
+            q_heads,
+            prefill_seq,
+            v_head_dim,
+        );
+
+        let mut prefill_y = Owned::zeros_f32(&[batch, prefill_seq, q_heads * v_head_dim]);
+        let mut present_key = Owned::zeros_f32(&[batch, kv_heads, prefill_seq, qk_head_dim]);
+        let mut present_value = Owned::zeros_f32(&[batch, kv_heads, prefill_seq, v_head_dim]);
+        kernel(None, true, Some(q_heads), Some(kv_heads), 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[batch, prefill_seq, q_heads * qk_head_dim], &q_prefill).view(),
+                    Owned::f32(&[batch, prefill_seq, kv_heads * qk_head_dim], &k_prefill).view(),
+                    Owned::f32(&[batch, prefill_seq, kv_heads * v_head_dim], &v_prefill).view(),
+                ],
+                &mut [
+                    prefill_y.view_mut(),
+                    present_key.view_mut(),
+                    present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            prefill_y.shape,
+            [batch, prefill_seq, q_heads * v_head_dim],
+            "3D Attention output hidden width must use V head width"
+        );
+        assert_eq!(
+            present_key.shape,
+            [batch, kv_heads, prefill_seq, qk_head_dim],
+            "present_key must preserve Q/K head width"
+        );
+        assert_eq!(
+            present_value.shape,
+            [batch, kv_heads, prefill_seq, v_head_dim],
+            "present_value must preserve V head width"
+        );
+        approx(&prefill_y.to_f32(), &prefill_oracle, 1e-5);
+        assert_eq!(present_key.to_f32(), k_prefill_bhsd);
+        assert_eq!(present_value.to_f32(), v_prefill_bhsd);
+
+        let q_decode = conformance_values(batch * decode_seq * q_heads * qk_head_dim, 7 + kv_heads);
+        let k_decode =
+            conformance_values(batch * decode_seq * kv_heads * qk_head_dim, 9 + kv_heads);
+        let v_decode =
+            conformance_values(batch * decode_seq * kv_heads * v_head_dim, 11 + kv_heads);
+        let q_decode_bhsd = bsh_to_bhsd(&q_decode, batch, decode_seq, q_heads, qk_head_dim);
+        let k_decode_bhsd = bsh_to_bhsd(&k_decode, batch, decode_seq, kv_heads, qk_head_dim);
+        let v_decode_bhsd = bsh_to_bhsd(&v_decode, batch, decode_seq, kv_heads, v_head_dim);
+        let full_key = concat_bhsd(
+            &k_prefill_bhsd,
+            &k_decode_bhsd,
+            batch,
+            kv_heads,
+            prefill_seq,
+            decode_seq,
+            qk_head_dim,
+        );
+        let full_value = concat_bhsd(
+            &v_prefill_bhsd,
+            &v_decode_bhsd,
+            batch,
+            kv_heads,
+            prefill_seq,
+            decode_seq,
+            v_head_dim,
+        );
+        let total_seq = prefill_seq + decode_seq;
+        let decode_oracle_bhsd = reference(
+            &q_decode_bhsd,
+            &full_key,
+            &full_value,
+            batch,
+            q_heads,
+            kv_heads,
+            decode_seq,
+            total_seq,
+            qk_head_dim,
+            v_head_dim,
+            scale,
+            true,
+            prefill_seq as i64,
+            |_, _, _, _| 0.0,
+        );
+        let decode_oracle =
+            bhsd_to_bsh(&decode_oracle_bhsd, batch, q_heads, decode_seq, v_head_dim);
+
+        let mut decode_y = Owned::zeros_f32(&[batch, decode_seq, q_heads * v_head_dim]);
+        let mut decode_present_key = Owned::zeros_f32(&[batch, kv_heads, total_seq, qk_head_dim]);
+        let mut decode_present_value = Owned::zeros_f32(&[batch, kv_heads, total_seq, v_head_dim]);
+        kernel(None, true, Some(q_heads), Some(kv_heads), 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[batch, decode_seq, q_heads * qk_head_dim], &q_decode).view(),
+                    Owned::f32(&[batch, decode_seq, kv_heads * qk_head_dim], &k_decode).view(),
+                    Owned::f32(&[batch, decode_seq, kv_heads * v_head_dim], &v_decode).view(),
+                    absent(),
+                    present_key.view(),
+                    present_value.view(),
+                ],
+                &mut [
+                    decode_y.view_mut(),
+                    decode_present_key.view_mut(),
+                    decode_present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(decode_y.shape, [batch, decode_seq, q_heads * v_head_dim]);
+        assert_eq!(
+            decode_present_key.shape,
+            [batch, kv_heads, total_seq, qk_head_dim]
+        );
+        assert_eq!(
+            decode_present_value.shape,
+            [batch, kv_heads, total_seq, v_head_dim]
+        );
+        approx(&decode_y.to_f32(), &decode_oracle, 1e-5);
+        assert_eq!(decode_present_key.to_f32(), full_key);
+        assert_eq!(decode_present_value.to_f32(), full_value);
+    }
+
+    #[test]
+    fn asymmetric_3d_prefill_decode_gqa_matches_scalar_oracle() {
+        asymmetric_3d_prefill_decode_case(2);
+    }
+
+    #[test]
+    fn asymmetric_3d_prefill_decode_mqa_matches_scalar_oracle() {
+        asymmetric_3d_prefill_decode_case(1);
     }
 
     #[test]
