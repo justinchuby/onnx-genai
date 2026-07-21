@@ -40,7 +40,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-kv = { workspace = true }
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.2", default-features = false, optional = true }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false, optional = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }

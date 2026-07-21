@@ -38,7 +38,7 @@ onnx-genai-metadata = { workspace = true }
 # is NOT unified in. Otherwise enabling `ort-cuda` (which adds `cuda-13000`) would
 # activate BOTH cudarc CUDA-version feature sets and fail to compile (cudarc's
 # generated bindings allow exactly one). Matches onnx-genai-engine / onnx-genai.
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.2", default-features = false }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false }
 onnx-genai-preprocess = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
