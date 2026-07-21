@@ -111,3 +111,5 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 
 - Hardened CUDA GLM standard-op claim gates in `030faa1`, fixing claim-then-fail dtype/attribute gaps across RMSNorm, RoPE, TopK, CumSum, Gather, GatherElements, ScatterElements, Where, and Expand.
 - Added shared `standard_claims.rs` validation and reported CUDA EP suite success: 238 passed, 0 failed.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

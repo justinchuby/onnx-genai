@@ -89,3 +89,5 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 
 ## 2026-07-21T03:15:00Z — CUDA graph M4 validated
 - Landed the serialized CUDA graph runtime/decode foundation and on-device GQA metadata path, then completed real Qwen capture via persistent external-shape seeding (`13c094a`): zero fallbacks, token-exact parity, +251.8% tok/s at 256 and +106.7% at 1024.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

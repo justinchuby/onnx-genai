@@ -128,3 +128,5 @@ Recorded MLAS ep-cpu integration (`d696b7a`) and the provenance README correctio
 
 ## 2026-07-21T03:15:00Z — CUDA graph M4 validated
 - Made supported unary/binary elementwise decode paths capture-safe with persistent broadcast metadata; Deckard's exact-signature hardening completed the landed artifact (`85b6f4e`).
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

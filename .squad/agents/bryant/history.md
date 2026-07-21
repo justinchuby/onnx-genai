@@ -73,3 +73,5 @@
 
 ## 2026-07-21T03:15:00Z — CUDA graph M4 validated
 - Made MatMulNBits M=1 decode capture-safe (`a210703`) and closed GQA's final safety blocker with a sticky detect-before-consume error latch (`ca50bae`).
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

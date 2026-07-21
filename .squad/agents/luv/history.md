@@ -43,3 +43,5 @@ Cross-agent update: vendored MLAS is now the opt-in CPU-GEMM parity path; follow
 ## 2026-07-20T13:35:00Z — Multistream performance and issue #40
 
 - Approved Sapper’s decode-pool residency and Roy’s guarded GQA parallelism after concurrency, numerical-order, opt-out, feature-gate, and E2E parity checks.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

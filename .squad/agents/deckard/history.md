@@ -69,3 +69,5 @@ Recorded the MLAS vendoring spike (`556b0d8`) and multi-threaded Rayon hook (`87
 
 ## 2026-07-21T03:15:00Z — CUDA graph M4 validated
 - Fixed CUDA graph handle ownership, persisted GQA decode scratch, hardened replay metadata bounds, and replaced elementwise boolean capture gates with exact warmed signatures (`5470c01`, `dcb4f1b`, `82c249d`, `85b6f4e`).
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

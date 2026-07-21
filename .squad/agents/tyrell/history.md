@@ -20,3 +20,5 @@
 ## 2026-07-20T13:35:00Z — Multistream performance and issue #40
 
 - Landed issue #40 Phase-1 slice 1a (`0d1d265`: shared protocol trace + ticketed pressure) and 1b (`e4d2883`: Communicator + BufferOwnership); slice 1c collectives/order remains in progress.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

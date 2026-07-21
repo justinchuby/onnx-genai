@@ -90,3 +90,5 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-19T07:42:20Z — Mobius-head E2E harness landed
 
 - Landed `3d47ea9`: pinned GLM-5.2 and DeepSeek-V4-Flash manifest plus ignored, environment-gated real-engine E2E smoke. Gaff approved; absent artifacts skip cleanly and no download path was added.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

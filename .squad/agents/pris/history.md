@@ -105,3 +105,5 @@ Reviewed Gather/Shape/Constant through three resolved rejection cycles.
 
 ## 2026-07-21T03:15:00Z — CUDA graph M4 validated
 - Added native decode replay integration coverage and corrected the real-Qwen H200 smoke to assert capture success: 1 capture, 62 replays, zero fallbacks (`4755575`, `42b71f7`).
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

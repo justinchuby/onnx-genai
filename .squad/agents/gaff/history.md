@@ -114,3 +114,5 @@ Recorded approvals for the vendoring spike, corrected integration, and corrected
 ## 2026-07-20T13:35:00Z — Multistream performance and issue #40
 
 - Reviewed issue #40 Phase-1 slices: 1a 🟡 approved with two non-blocking pressure follow-ups; 1b 🟢 approved after those fixes and full BufferOwnership/concurrency conformance audit.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

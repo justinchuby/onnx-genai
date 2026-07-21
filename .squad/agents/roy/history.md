@@ -118,3 +118,5 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 
 ## 2026-07-21T03:15:00Z — CUDA graph M4 validated
 - Made all four normalization decode variants capture-safe with persistent shape-keyed SkipSimplified metadata; Chew approved and `6184d82` landed.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

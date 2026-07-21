@@ -59,3 +59,5 @@
 ## 2026-07-18T04-55-00Z — Scribe session update
 
 - Fixed session EP claim planning to preserve omitted optional inputs as `DataType::Undefined` (`848ad87`) and added regression coverage; Mariette found a downstream CUDA Attention claim regression for reassignment.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

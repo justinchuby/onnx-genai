@@ -18,3 +18,5 @@
 ## 2026-07-17T02:24:32Z — Standard shape-inference expansion
 
 - Landed `98ee7a6`: added OneHot, Trilu, DepthToSpace, SpaceToDepth, and Compress inference with safe symbolic and checked-arithmetic behavior; 140 tests passed.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

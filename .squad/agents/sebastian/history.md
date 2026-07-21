@@ -70,3 +70,5 @@ Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a send
 ## 2026-07-16T15:39:27Z — Scribe session update
 
 - Fixed `onnx-runtime-python` `onnx_type_string` exhaustiveness for Undefined/Complex64/Complex128 (`f058594`); this main commit includes the completed onnx-rs full-spec merge.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
