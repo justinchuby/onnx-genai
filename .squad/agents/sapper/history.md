@@ -130,3 +130,7 @@ Recorded MLAS ep-cpu integration (`d696b7a`) and the provenance README correctio
 - Made supported unary/binary elementwise decode paths capture-safe with persistent broadcast metadata; Deckard's exact-signature hardening completed the landed artifact (`85b6f4e`).
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+
+## 2026-07-21 — Wave-2 and CI milestone
+CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.

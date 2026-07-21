@@ -95,3 +95,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 ## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
 
 - Added per-op logical bytes and documented FLOP estimates to major CPU kernel trace emit-sites; after zero-overhead and feature-propagation revisions, the combined work landed as `61f4d2c`.
+
+
+## 2026-07-21 — Wave-2 and CI milestone
+CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
