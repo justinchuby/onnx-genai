@@ -35,8 +35,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -349,6 +349,108 @@ extern "C" __global__ void skip_rmsnorm_f32(
         y[base + j] = (y[base + j] * inv_std) * gamma[j];
 }
 
+union SkipHalf4 {
+    unsigned long long raw;
+    __half2 pair[2];
+};
+
+// 896 halves form exactly seven aligned half4 chunks per lane. Keeping those
+// residuals in registers removes the scratch write/read from the hot decode path.
+extern "C" __global__ void skip_rmsnorm_f16_warp_896(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * 896;
+    const int lane = threadIdx.x;
+    const unsigned long long* input4 =
+        (const unsigned long long*)(input + base);
+    const unsigned long long* skip4 =
+        (const unsigned long long*)(skip + base);
+    const unsigned long long* gamma4 =
+        (const unsigned long long*)gamma;
+    unsigned long long* y4 = (unsigned long long*)(y + base);
+    unsigned long long* sum4 =
+        sum_out ? (unsigned long long*)(sum_out + base) : 0;
+    SkipHalf4 residual[7];
+    float ss0 = 0.0f;
+    float ss1 = 0.0f;
+    float ss2 = 0.0f;
+    float ss3 = 0.0f;
+
+    #pragma unroll
+    for (int item = 0; item < 7; ++item) {
+        const int chunk = lane + item * 32;
+        SkipHalf4 input_v;
+        SkipHalf4 skip_v;
+        input_v.raw = input4[chunk];
+        skip_v.raw = skip4[chunk];
+        residual[item].pair[0] = __hadd2(input_v.pair[0], skip_v.pair[0]);
+        residual[item].pair[1] = __hadd2(input_v.pair[1], skip_v.pair[1]);
+        if (sum4) sum4[chunk] = residual[item].raw;
+        const float2 rounded0 = __half22float2(residual[item].pair[0]);
+        const float2 rounded1 = __half22float2(residual[item].pair[1]);
+        ss0 += rounded0.x * rounded0.x;
+        ss1 += rounded0.y * rounded0.y;
+        ss2 += rounded1.x * rounded1.x;
+        ss3 += rounded1.y * rounded1.y;
+    }
+
+    float ss = (ss0 + ss1) + (ss2 + ss3);
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+    float inv_std = 0.0f;
+    if (lane == 0) {
+        inv_std = 1.0f / sqrtf(ss / 896.0f + epsilon);
+        if (mean_out) {
+            if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
+            else ((float*)mean_out)[g] = 0.0f;
+        }
+        if (invstd_out) {
+            if (stat_is_half) ((__half*)invstd_out)[g] = __float2half_rn(inv_std);
+            else ((float*)invstd_out)[g] = inv_std;
+        }
+    }
+    inv_std = __shfl_sync(0xffffffffu, inv_std, 0);
+
+    #pragma unroll
+    for (int item = 0; item < 7; ++item) {
+        const int chunk = lane + item * 32;
+        SkipHalf4 scale;
+        SkipHalf4 output;
+        scale.raw = gamma4[chunk];
+        const float2 value0 = __half22float2(residual[item].pair[0]);
+        const float2 value1 = __half22float2(residual[item].pair[1]);
+        const float2 scale0 = __half22float2(scale.pair[0]);
+        const float2 scale1 = __half22float2(scale.pair[1]);
+        output.pair[0] = __floats2half2_rn(
+            value0.x * inv_std * scale0.x,
+            value0.y * inv_std * scale0.y);
+        output.pair[1] = __floats2half2_rn(
+            value1.x * inv_std * scale1.x,
+            value1.y * inv_std * scale1.y);
+        y4[chunk] = output.raw;
+    }
+}
+
 extern "C" __global__ void skip_rmsnorm_f16(
     const __half* input,
     const __half* skip,
@@ -363,6 +465,7 @@ extern "C" __global__ void skip_rmsnorm_f16(
     const int     num_groups,
     const int     norm_size,
     const int     has_bias,
+    const int     dense_skip,
     const int     gamma_is_half,
     const int     bias_is_half,
     const int     stat_is_half,
@@ -374,37 +477,72 @@ extern "C" __global__ void skip_rmsnorm_f16(
     const unsigned long long* shape = metadata;
     const unsigned long long* skip_strides = metadata + rank;
 
-    extern __shared__ float red[];
-    const int tid = threadIdx.x;
-    const int nt  = blockDim.x;
+    const int lane = threadIdx.x;
 
     // fp32 accumulate over the fp16-rounded residual so the RMS matches the
     // residual value stored into `sum_out` and reused by the next layer.
     float ss = 0.0f;
-    for (int j = tid; j < norm_size; j += nt) {
-        unsigned long long linear = (unsigned long long)base + j;
-        unsigned long long skip_index = 0;
-        for (int d = rank - 1; d >= 0; --d) {
-            const unsigned long long coord = linear % shape[d];
-            linear /= shape[d];
-            skip_index += coord * skip_strides[d];
+    const bool vectorized = dense_skip && ((base & 1) == 0);
+    if (vectorized) {
+        const int pairs = norm_size >> 1;
+        const __half2* input2 = (const __half2*)(input + base);
+        const __half2* skip2 = (const __half2*)(skip + base);
+        __half2* y2 = (__half2*)(y + base);
+        __half2* sum2 = sum_out ? (__half2*)(sum_out + base) : 0;
+        for (int pair = lane; pair < pairs; pair += 32) {
+            const float2 input_v = __half22float2(input2[pair]);
+            const float2 skip_v = __half22float2(skip2[pair]);
+            const int j = pair << 1;
+            float sv0 = input_v.x + skip_v.x;
+            float sv1 = input_v.y + skip_v.y;
+            if (has_bias) {
+                sv0 += load_skip_val(bias, bias_is_half, j);
+                sv1 += load_skip_val(bias, bias_is_half, j + 1);
+            }
+            const __half svh0 = __float2half_rn(sv0);
+            const __half svh1 = __float2half_rn(sv1);
+            const __half2 svh = __halves2half2(svh0, svh1);
+            y2[pair] = svh;
+            if (sum2) sum2[pair] = svh;
+            const float2 rounded = __half22float2(svh);
+            ss += rounded.x * rounded.x;
+            ss += rounded.y * rounded.y;
         }
-        float sv = __half2float(input[base + j]) + __half2float(skip[skip_index]);
-        if (has_bias) sv += load_skip_val(bias, bias_is_half, j);
-        const __half svh = __float2half_rn(sv);
-        y[base + j] = svh;
-        if (sum_out) sum_out[base + j] = svh;
-        const float svr = __half2float(svh);
-        ss += svr * svr;
+        if ((norm_size & 1) && lane == 0) {
+            const int j = norm_size - 1;
+            float sv = __half2float(input[base + j]) + __half2float(skip[base + j]);
+            if (has_bias) sv += load_skip_val(bias, bias_is_half, j);
+            const __half svh = __float2half_rn(sv);
+            y[base + j] = svh;
+            if (sum_out) sum_out[base + j] = svh;
+            const float rounded = __half2float(svh);
+            ss += rounded * rounded;
+        }
+    } else {
+        for (int j = lane; j < norm_size; j += 32) {
+            unsigned long long linear = (unsigned long long)base + j;
+            unsigned long long skip_index = 0;
+            for (int d = rank - 1; d >= 0; --d) {
+                const unsigned long long coord = linear % shape[d];
+                linear /= shape[d];
+                skip_index += coord * skip_strides[d];
+            }
+            float sv = __half2float(input[base + j]) + __half2float(skip[skip_index]);
+            if (has_bias) sv += load_skip_val(bias, bias_is_half, j);
+            const __half svh = __float2half_rn(sv);
+            y[base + j] = svh;
+            if (sum_out) sum_out[base + j] = svh;
+            const float rounded = __half2float(svh);
+            ss += rounded * rounded;
+        }
     }
-    red[tid] = ss;
-    __syncthreads();
-    for (int off = nt >> 1; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        __syncthreads();
+    __syncwarp();
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
     }
-    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
-    if (tid == 0) {
+    float inv_std = 0.0f;
+    if (lane == 0) {
+        inv_std = 1.0f / sqrtf(ss / (float)norm_size + epsilon);
         if (mean_out) {
             if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
             else ((float*)mean_out)[g] = 0.0f;
@@ -414,11 +552,31 @@ extern "C" __global__ void skip_rmsnorm_f16(
             else ((float*)invstd_out)[g] = inv_std;
         }
     }
-    __syncthreads();
-    for (int j = tid; j < norm_size; j += nt) {
-        const float v = __half2float(y[base + j]) * inv_std
-            * load_skip_val(gamma, gamma_is_half, j);
-        y[base + j] = __float2half_rn(v);
+    inv_std = __shfl_sync(0xffffffffu, inv_std, 0);
+    if (vectorized) {
+        const int pairs = norm_size >> 1;
+        __half2* y2 = (__half2*)(y + base);
+        for (int pair = lane; pair < pairs; pair += 32) {
+            const float2 residual = __half22float2(y2[pair]);
+            const int j = pair << 1;
+            const float out0 = residual.x * inv_std
+                * load_skip_val(gamma, gamma_is_half, j);
+            const float out1 = residual.y * inv_std
+                * load_skip_val(gamma, gamma_is_half, j + 1);
+            y2[pair] = __floats2half2_rn(out0, out1);
+        }
+        if ((norm_size & 1) && lane == 0) {
+            const int j = norm_size - 1;
+            const float v = __half2float(y[base + j]) * inv_std
+                * load_skip_val(gamma, gamma_is_half, j);
+            y[base + j] = __float2half_rn(v);
+        }
+    } else {
+        for (int j = lane; j < norm_size; j += 32) {
+            const float v = __half2float(y[base + j]) * inv_std
+                * load_skip_val(gamma, gamma_is_half, j);
+            y[base + j] = __float2half_rn(v);
+        }
     }
 }
 "#;
@@ -505,7 +663,7 @@ extern "C" __global__ void skip_layernorm_f32(
 
 const LAYERNORM_MODULE: &str = "layernorm_f16_v1";
 const RMSNORM_MODULE: &str = "rmsnorm_f16_v1";
-const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f32";
+const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v3";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
@@ -1206,7 +1364,15 @@ impl SkipSimplifiedLayerNormKernel {
             .lock()
             .expect("cuda_ep skip normalization metadata cache poisoned");
         let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
-        let entry = if is_half {
+        let dense_skip = i32::from(skip.numel() == input.numel());
+        let entry = if is_half
+            && dense_skip != 0
+            && norm_size == 896
+            && bias_ptr == 0
+            && gamma_is_half != 0
+        {
+            "skip_rmsnorm_f16_warp_896"
+        } else if is_half {
             "skip_rmsnorm_f16"
         } else {
             "skip_rmsnorm_f32"
@@ -1233,6 +1399,7 @@ impl SkipSimplifiedLayerNormKernel {
             .arg(&has_bias);
         if is_half {
             builder
+                .arg(&dense_skip)
                 .arg(&gamma_is_half)
                 .arg(&bias_is_half)
                 .arg(&stat_is_half)
@@ -1242,12 +1409,20 @@ impl SkipSimplifiedLayerNormKernel {
         }
         // SAFETY: all pointers reference validated device buffers; metadata has
         // two rank-length u64 arrays describing the output shape and skip strides.
-        let cfg = self.runtime.reduction_launch_config(
-            &func,
-            groups_u,
-            NORM_BLOCK,
-            std::mem::size_of::<f32>() as u32,
-        )?;
+        let cfg = if is_half {
+            LaunchConfig {
+                grid_dim: (groups_u, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            self.runtime.reduction_launch_config(
+                &func,
+                groups_u,
+                NORM_BLOCK,
+                std::mem::size_of::<f32>() as u32,
+            )?
+        };
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         self.last_call_capture_safe
             .store(num_groups == 1, Ordering::Relaxed);
@@ -1601,6 +1776,8 @@ fn optional_half_stat_ptr(
 
 #[cfg(test)]
 mod tests {
+    use half::f16;
+
     use super::*;
 
     #[test]
@@ -1611,6 +1788,106 @@ mod tests {
         assert!(RMSNORM_SRC.contains("rmsnorm_f16"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_896"));
+    }
+
+    fn skip_rmsnorm_residuals(hidden: usize) -> (Vec<f16>, Vec<f16>) {
+        let residual = (0..hidden)
+            .map(|index| {
+                let input = f16::from_f32(((index * 37 % 101) as f32 - 50.0) / 31.0);
+                let skip = f16::from_f32(((index * 17 % 67) as f32 - 33.0) / 47.0);
+                let bias = f16::from_f32(((index * 11 % 29) as f32 - 14.0) / 113.0);
+                f16::from_f32(input.to_f32() + skip.to_f32() + bias.to_f32())
+            })
+            .collect();
+        let gamma = (0..hidden)
+            .map(|index| f16::from_f32(0.75 + (index * 13 % 41) as f32 / 64.0))
+            .collect();
+        (residual, gamma)
+    }
+
+    fn normalize_f16(residual: &[f16], gamma: &[f16], sum_squares: f32) -> Vec<f16> {
+        let inv_std = 1.0 / (sum_squares / residual.len() as f32 + 1e-5).sqrt();
+        residual
+            .iter()
+            .zip(gamma)
+            .map(|(residual, gamma)| f16::from_f32(residual.to_f32() * inv_std * gamma.to_f32()))
+            .collect()
+    }
+
+    fn previous_shared_tree_skip_rmsnorm(residual: &[f16], gamma: &[f16]) -> Vec<f16> {
+        let mut lanes = [0.0f32; NORM_BLOCK as usize];
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            for value in residual.iter().skip(lane).step_by(NORM_BLOCK as usize) {
+                let value = value.to_f32();
+                *sum += value * value;
+            }
+        }
+        let mut offset = lanes.len() / 2;
+        while offset > 0 {
+            for lane in 0..offset {
+                lanes[lane] += lanes[lane + offset];
+            }
+            offset /= 2;
+        }
+        normalize_f16(residual, gamma, lanes[0])
+    }
+
+    fn warp_shuffle_skip_rmsnorm(residual: &[f16], gamma: &[f16]) -> Vec<f16> {
+        let mut lanes = [0.0f32; 32];
+        let pairs = residual.len() / 2;
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            for pair in (lane..pairs).step_by(32) {
+                let first = residual[pair * 2].to_f32();
+                let second = residual[pair * 2 + 1].to_f32();
+                *sum += first * first;
+                *sum += second * second;
+            }
+        }
+        if residual.len() % 2 != 0 {
+            let tail = residual[residual.len() - 1].to_f32();
+            lanes[0] += tail * tail;
+        }
+        let mut offset = 16;
+        while offset > 0 {
+            let previous = lanes;
+            for lane in 0..(32 - offset) {
+                lanes[lane] += previous[lane + offset];
+            }
+            offset /= 2;
+        }
+        normalize_f16(residual, gamma, lanes[0])
+    }
+
+    #[test]
+    fn warp_shuffle_skip_rmsnorm_matches_shared_tree_for_hidden_and_tail_sizes() {
+        for hidden in [896, 899] {
+            let (residual, gamma) = skip_rmsnorm_residuals(hidden);
+            let previous = previous_shared_tree_skip_rmsnorm(&residual, &gamma);
+            let warp = warp_shuffle_skip_rmsnorm(&residual, &gamma);
+            let max_error = previous
+                .iter()
+                .zip(&warp)
+                .map(|(previous, warp)| (previous.to_f32() - warp.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 2.0e-3,
+                "hidden={hidden} shared-tree/warp max fp16 error {max_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp16_skip_rmsnorm_source_uses_one_warp_without_shared_reduction() {
+        let start = SKIP_RMSNORM_SRC
+            .find("extern \"C\" __global__ void skip_rmsnorm_f16")
+            .unwrap();
+        let source = &SKIP_RMSNORM_SRC[start..];
+        assert!(source.contains("__half2"));
+        assert!(source.contains("__shfl_down_sync"));
+        assert!(!source.contains("extern __shared__"));
+        assert!(!source.contains("__syncthreads"));
     }
 
     #[test]
