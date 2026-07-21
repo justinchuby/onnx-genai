@@ -213,8 +213,7 @@ impl Kernel for SparseKvGatherKernel {
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
         let grid = (output_bytes as u64)
             .div_ceil(BLOCK as u64)
-            .min(65_535)
-            .max(1) as u32;
+            .clamp(1, 65_535) as u32;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder
@@ -316,18 +315,10 @@ fn validate_index(
     cache_len: usize,
     valid_lengths: &Option<Vec<usize>>,
 ) -> Result<()> {
-    let bg = if records_per_bg == 0 {
-        0
-    } else {
-        record / records_per_bg
-    };
-    let b = if groups == 0 { 0 } else { bg / groups };
-    let g = if groups == 0 { 0 } else { bg % groups };
-    let within = if records_per_bg == 0 {
-        0
-    } else {
-        record % records_per_bg
-    };
+    let bg = record.checked_div(records_per_bg).unwrap_or(0);
+    let b = bg.checked_div(groups).unwrap_or(0);
+    let g = bg.checked_rem(groups).unwrap_or(0);
+    let within = record.checked_rem(records_per_bg).unwrap_or(0);
     let valid_length = valid_lengths
         .as_ref()
         .map_or(cache_len, |lengths| lengths[b]);

@@ -631,7 +631,7 @@ impl StandardAttentionKernel {
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (
-                    elements.div_ceil(BLOCK as u64).min(65_535).max(1) as u32,
+                    elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
                     1,
                     1,
                 ),
@@ -681,23 +681,23 @@ impl Kernel for StandardAttentionKernel {
         let value_past_seq = past_value.as_ref().map(|p| p.seq).unwrap_or(0);
 
         // Preserve the concat compatibility checks (past vs current dims).
-        if let Some(past) = &past_key {
-            if past.batch != k_cur.batch || past.heads != k_cur.heads || past.dim != k_cur.dim {
-                return Err(EpError::KernelFailed(format!(
-                    "Attention: past_key dims (b={},h={},d={}) incompatible with current \
-                     (b={},h={},d={})",
-                    past.batch, past.heads, past.dim, k_cur.batch, k_cur.heads, k_cur.dim
-                )));
-            }
+        if let Some(past) = &past_key
+            && (past.batch != k_cur.batch || past.heads != k_cur.heads || past.dim != k_cur.dim)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: past_key dims (b={},h={},d={}) incompatible with current \
+                 (b={},h={},d={})",
+                past.batch, past.heads, past.dim, k_cur.batch, k_cur.heads, k_cur.dim
+            )));
         }
-        if let Some(past) = &past_value {
-            if past.batch != v_cur.batch || past.heads != v_cur.heads || past.dim != v_cur.dim {
-                return Err(EpError::KernelFailed(format!(
-                    "Attention: past_value dims (b={},h={},d={}) incompatible with current \
-                     (b={},h={},d={})",
-                    past.batch, past.heads, past.dim, v_cur.batch, v_cur.heads, v_cur.dim
-                )));
-            }
+        if let Some(past) = &past_value
+            && (past.batch != v_cur.batch || past.heads != v_cur.heads || past.dim != v_cur.dim)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: past_value dims (b={},h={},d={}) incompatible with current \
+                 (b={},h={},d={})",
+                past.batch, past.heads, past.dim, v_cur.batch, v_cur.heads, v_cur.dim
+            )));
         }
 
         // `nonpad_kv_seqlen` (7th input, opset 24+): per-batch count of valid

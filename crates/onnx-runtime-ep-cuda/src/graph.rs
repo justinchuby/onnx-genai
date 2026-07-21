@@ -275,12 +275,11 @@ impl CudaGraphLifecycle {
         // A mid-capture failure invalidates the capture, so end_capture may
         // report an error — but it still takes the stream out of capture mode,
         // which is the whole point, so that outcome is swallowed here.
-        match CapturedGraph::end_capture(
+        if let Ok(Some(graph)) = CapturedGraph::end_capture(
             &self.stream,
             CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
         ) {
-            Ok(Some(graph)) => drop(graph),
-            Ok(None) | Err(_) => {}
+            drop(graph);
         }
         Ok(())
     }

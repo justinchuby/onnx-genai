@@ -195,9 +195,7 @@ extern "C" __global__ void rotary_embedding_f16(
 
 /// Return the claim-time dtype denial for RoPE's floating-point inputs.
 pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
-    let Some(&dtype) = input_dtypes.first() else {
-        return None;
-    };
+    let &dtype = input_dtypes.first()?;
     if !matches!(dtype, DataType::Float16 | DataType::Float32) {
         let dtype = match dtype {
             DataType::BFloat16 => "bf16".into(),
@@ -491,7 +489,7 @@ impl Kernel for RotaryEmbeddingKernel {
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (
-                    elements.div_ceil(BLOCK as u64).min(65_535).max(1) as u32,
+                    elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
                     1,
                     1,
                 ),

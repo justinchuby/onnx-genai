@@ -102,7 +102,7 @@ impl ConvKernel {
                 x[1], w[1]
             )));
         }
-        if w[0] % groups != 0 {
+        if !w[0].is_multiple_of(groups) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Conv: output channels {} must be divisible by group {groups}",
                 w[0]

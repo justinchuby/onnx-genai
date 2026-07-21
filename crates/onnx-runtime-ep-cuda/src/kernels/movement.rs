@@ -172,7 +172,7 @@ fn product(dims: &[usize], op: &str) -> Result<usize> {
 }
 
 fn grid(elements: usize) -> u32 {
-    (elements as u64).div_ceil(BLOCK as u64).min(65_535).max(1) as u32
+    (elements as u64).div_ceil(BLOCK as u64).clamp(1, 65_535) as u32
 }
 
 fn host_ints(runtime: &CudaRuntime, view: &TensorView, op: &str) -> Result<Vec<i64>> {

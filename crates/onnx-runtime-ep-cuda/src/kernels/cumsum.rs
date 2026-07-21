@@ -151,11 +151,7 @@ impl Kernel for CumSumKernel {
             .arg(&reverse);
         unsafe {
             builder.launch(LaunchConfig {
-                grid_dim: (
-                    (lanes.div_ceil(BLOCK as u64).min(65_535).max(1) as u32),
-                    1,
-                    1,
-                ),
+                grid_dim: ((lanes.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32), 1, 1),
                 block_dim: (BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })

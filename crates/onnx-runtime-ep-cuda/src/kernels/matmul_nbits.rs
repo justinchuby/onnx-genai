@@ -1958,7 +1958,6 @@ mod tests {
         };
         kernel.run(&inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
-        drop(outputs);
 
         assert!(
             kernel.last_call_capture_safe.load(Ordering::Relaxed),
@@ -2125,7 +2124,6 @@ mod tests {
             )
             .unwrap();
         runtime.synchronize().unwrap();
-        drop((general_output, down_output));
 
         let mut general = vec![f16::ZERO; n];
         let mut down = vec![f16::ZERO; n];

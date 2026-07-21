@@ -73,7 +73,7 @@ pub(super) const MAX_SPLITS: usize = 16;
 /// (`Sq=1`) with an **even** `head_dim` within [`MAX_HEAD_DIM`] (the `half2`
 /// vectorization requires an even head size).
 pub(super) fn supported(query_seq: usize, head_dim: usize) -> bool {
-    query_seq == 1 && head_dim % 2 == 0 && (1..=MAX_HEAD_DIM).contains(&head_dim)
+    query_seq == 1 && head_dim.is_multiple_of(2) && (1..=MAX_HEAD_DIM).contains(&head_dim)
 }
 
 const DECODE_SRC: &str = r#"

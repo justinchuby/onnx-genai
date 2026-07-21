@@ -130,7 +130,7 @@ impl Kernel for WhereKernel {
         let launch = unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (
-                    (elements as u64).div_ceil(BLOCK as u64).min(65_535).max(1) as u32,
+                    (elements as u64).div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
                     1,
                     1,
                 ),

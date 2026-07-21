@@ -90,12 +90,10 @@ fn parse_activation(activation: &str) -> Result<GemmEpilogueKind> {
         "" | "none" | "identity" => Ok(GemmEpilogueKind::Bias),
         "relu" => Ok(GemmEpilogueKind::ReluBias),
         "gelu" => Ok(GemmEpilogueKind::GeluBias),
-        other => {
-            return Err(not_implemented(format!(
-                "FusedGemm activation {other:?}; supported activations are Relu, Gelu, \
+        other => Err(not_implemented(format!(
+            "FusedGemm activation {other:?}; supported activations are Relu, Gelu, \
                      and an empty/Identity activation"
-            )));
-        }
+        ))),
     }
 }
 

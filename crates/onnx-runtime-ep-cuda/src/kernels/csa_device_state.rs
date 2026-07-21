@@ -34,14 +34,14 @@ pub(crate) struct CsaBufferLayout {
 impl CsaBufferLayout {
     pub(crate) fn from_claim(node: &Node, shapes: &[Shape], ratio: usize) -> Result<Option<Self>> {
         let Some(batch) = shapes
-            .get(0)
+            .first()
             .and_then(|shape| shape.first())
             .and_then(|dim| dim.as_static())
         else {
             return Ok(None);
         };
         let sequence = shapes
-            .get(0)
+            .first()
             .and_then(|shape| shape.get(1))
             .and_then(|dim| dim.as_static());
         let past_records = shapes

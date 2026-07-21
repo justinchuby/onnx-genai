@@ -1615,19 +1615,20 @@ impl CompressedSparseAttentionKernel {
         let sequence = inputs.first().map(|q| q.shape[1]).unwrap_or(0) as u64;
         // Input 8 is the 0-based past position scalar; total = past_position + 1
         // for a single-token decode, or `sequence` for a from-empty prefill.
-        if let Some(view) = inputs.get(8) {
-            if !view.is_absent() && view.byte_size() >= 4 {
-                let mut raw = [0u8; 4];
-                // SAFETY: input 8 is a live i32 device scalar of at least 4 bytes.
-                if unsafe {
-                    self.runtime
-                        .dtoh(&mut raw, cuptr(view.data_ptr::<u8>() as *const c_void))
-                }
-                .is_ok()
-                {
-                    let past = i32::from_ne_bytes(raw).max(0) as u64;
-                    return past + sequence;
-                }
+        if let Some(view) = inputs.get(8)
+            && !view.is_absent()
+            && view.byte_size() >= 4
+        {
+            let mut raw = [0u8; 4];
+            // SAFETY: input 8 is a live i32 device scalar of at least 4 bytes.
+            if unsafe {
+                self.runtime
+                    .dtoh(&mut raw, cuptr(view.data_ptr::<u8>() as *const c_void))
+            }
+            .is_ok()
+            {
+                let past = i32::from_ne_bytes(raw).max(0) as u64;
+                return past + sequence;
             }
         }
         sequence

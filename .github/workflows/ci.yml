@@ -273,3 +273,6 @@ jobs:
           -p onnx-runtime-ep-cuda
           -p onnx-runtime-python
           --features onnx-runtime-python/cuda
+
+      - name: Clippy CUDA execution provider
+        run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings

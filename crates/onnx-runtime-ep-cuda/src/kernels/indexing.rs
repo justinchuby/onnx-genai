@@ -165,11 +165,11 @@ fn upload_meta(
         )
     };
     let ptr = runtime.alloc_raw(bytes.len().max(1))?;
-    if !bytes.is_empty() {
-        if let Err(error) = unsafe { runtime.htod(bytes, ptr) } {
-            let _ = unsafe { runtime.free_raw(ptr) };
-            return Err(error);
-        }
+    if !bytes.is_empty()
+        && let Err(error) = unsafe { runtime.htod(bytes, ptr) }
+    {
+        let _ = unsafe { runtime.free_raw(ptr) };
+        return Err(error);
     }
     Ok(ptr)
 }
@@ -268,7 +268,7 @@ impl Kernel for GatherElementsKernel {
             unsafe {
                 builder.launch(LaunchConfig {
                     grid_dim: (
-                        (elements.div_ceil(BLOCK as u64).min(65_535).max(1) as u32),
+                        (elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32),
                         1,
                         1,
                     ),
