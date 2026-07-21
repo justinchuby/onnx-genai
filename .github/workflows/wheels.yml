@@ -130,11 +130,11 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             archs: x86_64
-            config_settings: "build-args=--features cuda"
+            config_settings: "build-args=--features build-args=cuda"
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
-            config_settings: "build-args=--features cuda"
+            config_settings: "build-args=--features build-args=cuda"
           # macos-15-intel is GitHub's final hosted Intel runner line.
           - name: macOS x86_64
             os: macos-15-intel
