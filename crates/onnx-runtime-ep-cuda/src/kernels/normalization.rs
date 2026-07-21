@@ -354,9 +354,10 @@ union SkipHalf4 {
     __half2 pair[2];
 };
 
-// 896 halves form exactly seven aligned half4 chunks per lane. Keeping those
-// residuals in registers removes the scratch write/read from the hot decode path.
-extern "C" __global__ void skip_rmsnorm_f16_warp_896(
+// One warp covers aligned half4 chunks. The launch predicate guarantees that
+// norm_size is divisible by 32 lanes * 4 halves, so every lane owns the same
+// number of complete chunks and no tail handling is needed.
+extern "C" __global__ void skip_rmsnorm_f16_warp_half4(
     const __half* input,
     const __half* skip,
     const void*   gamma,
@@ -378,8 +379,9 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_896(
 {
     const int g = blockIdx.x;
     if (g >= num_groups) return;
-    const size_t base = (size_t)g * 896;
+    const size_t base = (size_t)g * norm_size;
     const int lane = threadIdx.x;
+    const int chunks_per_lane = norm_size / (32 * 4);
     const unsigned long long* input4 =
         (const unsigned long long*)(input + base);
     const unsigned long long* skip4 =
@@ -389,24 +391,24 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_896(
     unsigned long long* y4 = (unsigned long long*)(y + base);
     unsigned long long* sum4 =
         sum_out ? (unsigned long long*)(sum_out + base) : 0;
-    SkipHalf4 residual[7];
     float ss0 = 0.0f;
     float ss1 = 0.0f;
     float ss2 = 0.0f;
     float ss3 = 0.0f;
 
-    #pragma unroll
-    for (int item = 0; item < 7; ++item) {
+    for (int item = 0; item < chunks_per_lane; ++item) {
         const int chunk = lane + item * 32;
         SkipHalf4 input_v;
         SkipHalf4 skip_v;
+        SkipHalf4 residual;
         input_v.raw = input4[chunk];
         skip_v.raw = skip4[chunk];
-        residual[item].pair[0] = __hadd2(input_v.pair[0], skip_v.pair[0]);
-        residual[item].pair[1] = __hadd2(input_v.pair[1], skip_v.pair[1]);
-        if (sum4) sum4[chunk] = residual[item].raw;
-        const float2 rounded0 = __half22float2(residual[item].pair[0]);
-        const float2 rounded1 = __half22float2(residual[item].pair[1]);
+        residual.pair[0] = __hadd2(input_v.pair[0], skip_v.pair[0]);
+        residual.pair[1] = __hadd2(input_v.pair[1], skip_v.pair[1]);
+        y4[chunk] = residual.raw;
+        if (sum4) sum4[chunk] = residual.raw;
+        const float2 rounded0 = __half22float2(residual.pair[0]);
+        const float2 rounded1 = __half22float2(residual.pair[1]);
         ss0 += rounded0.x * rounded0.x;
         ss1 += rounded0.y * rounded0.y;
         ss2 += rounded1.x * rounded1.x;
@@ -419,7 +421,7 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_896(
     }
     float inv_std = 0.0f;
     if (lane == 0) {
-        inv_std = 1.0f / sqrtf(ss / 896.0f + epsilon);
+        inv_std = 1.0f / sqrtf(ss / (float)norm_size + epsilon);
         if (mean_out) {
             if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
             else ((float*)mean_out)[g] = 0.0f;
@@ -431,14 +433,15 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_896(
     }
     inv_std = __shfl_sync(0xffffffffu, inv_std, 0);
 
-    #pragma unroll
-    for (int item = 0; item < 7; ++item) {
+    for (int item = 0; item < chunks_per_lane; ++item) {
         const int chunk = lane + item * 32;
+        SkipHalf4 residual;
         SkipHalf4 scale;
         SkipHalf4 output;
+        residual.raw = y4[chunk];
         scale.raw = gamma4[chunk];
-        const float2 value0 = __half22float2(residual[item].pair[0]);
-        const float2 value1 = __half22float2(residual[item].pair[1]);
+        const float2 value0 = __half22float2(residual.pair[0]);
+        const float2 value1 = __half22float2(residual.pair[1]);
         const float2 scale0 = __half22float2(scale.pair[0]);
         const float2 scale1 = __half22float2(scale.pair[1]);
         output.pair[0] = __floats2half2_rn(
@@ -663,11 +666,63 @@ extern "C" __global__ void skip_layernorm_f32(
 
 const LAYERNORM_MODULE: &str = "layernorm_f16_v1";
 const RMSNORM_MODULE: &str = "rmsnorm_f16_v1";
-const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v3";
+const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v4";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
 const NORM_BLOCK: u32 = 256;
+const SKIP_RMSNORM_WARP_HALF4_MULTIPLE: usize = 32 * 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipRmsnormVariant {
+    F32,
+    F16Generic,
+    F16WarpHalf4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SkipRmsnormSelection {
+    variant: SkipRmsnormVariant,
+    entry: &'static str,
+    reason: &'static str,
+}
+
+/// Select the one-warp half4 path by its actual data-layout capabilities, never
+/// by a model-specific hidden dimension.
+fn select_skip_rmsnorm_variant(
+    is_half: bool,
+    dense_skip: bool,
+    norm_size: usize,
+    has_bias: bool,
+    gamma_is_half: bool,
+) -> SkipRmsnormSelection {
+    if is_half
+        && dense_skip
+        && norm_size.is_multiple_of(SKIP_RMSNORM_WARP_HALF4_MULTIPLE)
+        && !has_bias
+        && gamma_is_half
+    {
+        SkipRmsnormSelection {
+            variant: SkipRmsnormVariant::F16WarpHalf4,
+            entry: "skip_rmsnorm_f16_warp_half4",
+            reason: "variant=warp_half4;dtype=fp16;dense_skip;bias=none;gamma=fp16;\
+                     hidden%128==0;one_warp",
+        }
+    } else if is_half {
+        SkipRmsnormSelection {
+            variant: SkipRmsnormVariant::F16Generic,
+            entry: "skip_rmsnorm_f16",
+            reason: "variant=generic;dtype=fp16;not(dense_skip & bias=none & gamma=fp16 & \
+                     hidden%128==0)",
+        }
+    } else {
+        SkipRmsnormSelection {
+            variant: SkipRmsnormVariant::F32,
+            entry: "skip_rmsnorm_f32",
+            reason: "variant=generic;dtype=fp32",
+        }
+    }
+}
 
 /// Reject any non-f32 tensor with an actionable, op-named error (RULES.md #1).
 fn require_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
@@ -1365,21 +1420,26 @@ impl SkipSimplifiedLayerNormKernel {
             .expect("cuda_ep skip normalization metadata cache poisoned");
         let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
         let dense_skip = i32::from(skip.numel() == input.numel());
-        let entry = if is_half
-            && dense_skip != 0
-            && norm_size == 896
-            && bias_ptr == 0
-            && gamma_is_half != 0
-        {
-            "skip_rmsnorm_f16_warp_896"
-        } else if is_half {
-            "skip_rmsnorm_f16"
-        } else {
-            "skip_rmsnorm_f32"
+        let selection = select_skip_rmsnorm_variant(
+            is_half,
+            dense_skip != 0,
+            norm_size,
+            bias_ptr != 0,
+            gamma_is_half != 0,
+        );
+        let variant_name = match selection.variant {
+            SkipRmsnormVariant::F32 => "skip_rmsnorm_f32",
+            SkipRmsnormVariant::F16Generic => "skip_rmsnorm_f16_generic",
+            SkipRmsnormVariant::F16WarpHalf4 => "skip_rmsnorm_f16_warp_half4",
         };
-        let func = self
-            .runtime
-            .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, entry)?;
+        onnx_runtime_ep_api::record_kernel_variant!(
+            variant_name,
+            "SkipSimplifiedLayerNormalization hidden={norm_size}: {}",
+            selection.reason
+        );
+        let func =
+            self.runtime
+                .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, selection.entry)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -1423,7 +1483,8 @@ impl SkipSimplifiedLayerNormKernel {
                 std::mem::size_of::<f32>() as u32,
             )?
         };
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| driver_err(&format!("launch {}", selection.entry), e))?;
         self.last_call_capture_safe
             .store(num_groups == 1, Ordering::Relaxed);
         Ok(())
@@ -1777,8 +1838,11 @@ fn optional_half_stat_ptr(
 #[cfg(test)]
 mod tests {
     use half::f16;
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider};
+    use onnx_runtime_ir::compute_contiguous_strides;
 
     use super::*;
+    use crate::CudaExecutionProvider;
 
     #[test]
     fn sources_expose_their_entry_points() {
@@ -1789,7 +1853,7 @@ mod tests {
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
-        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_896"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_half4"));
     }
 
     fn skip_rmsnorm_residuals(hidden: usize) -> (Vec<f16>, Vec<f16>) {
@@ -1834,7 +1898,7 @@ mod tests {
         normalize_f16(residual, gamma, lanes[0])
     }
 
-    fn warp_shuffle_skip_rmsnorm(residual: &[f16], gamma: &[f16]) -> Vec<f16> {
+    fn generic_warp_shuffle_skip_rmsnorm(residual: &[f16], gamma: &[f16]) -> Vec<f16> {
         let mut lanes = [0.0f32; 32];
         let pairs = residual.len() / 2;
         for (lane, sum) in lanes.iter_mut().enumerate() {
@@ -1860,12 +1924,80 @@ mod tests {
         normalize_f16(residual, gamma, lanes[0])
     }
 
+    fn half4_warp_skip_rmsnorm(residual: &[f16], gamma: &[f16]) -> Vec<f16> {
+        assert!(
+            residual
+                .len()
+                .is_multiple_of(SKIP_RMSNORM_WARP_HALF4_MULTIPLE)
+        );
+        let mut lanes = [0.0f32; 32];
+        let chunks_per_lane = residual.len() / SKIP_RMSNORM_WARP_HALF4_MULTIPLE;
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            let mut ss0 = 0.0f32;
+            let mut ss1 = 0.0f32;
+            let mut ss2 = 0.0f32;
+            let mut ss3 = 0.0f32;
+            for item in 0..chunks_per_lane {
+                let base = (lane + item * 32) * 4;
+                let value0 = residual[base].to_f32();
+                let value1 = residual[base + 1].to_f32();
+                let value2 = residual[base + 2].to_f32();
+                let value3 = residual[base + 3].to_f32();
+                ss0 += value0 * value0;
+                ss1 += value1 * value1;
+                ss2 += value2 * value2;
+                ss3 += value3 * value3;
+            }
+            *sum = (ss0 + ss1) + (ss2 + ss3);
+        }
+        let mut offset = 16;
+        while offset > 0 {
+            let previous = lanes;
+            for lane in 0..(32 - offset) {
+                lanes[lane] += previous[lane + offset];
+            }
+            offset /= 2;
+        }
+        normalize_f16(residual, gamma, lanes[0])
+    }
+
+    fn fixed_seven_half4_warp_skip_rmsnorm(residual: &[f16; 896], gamma: &[f16; 896]) -> Vec<f16> {
+        let mut lanes = [0.0f32; 32];
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            let mut ss0 = 0.0f32;
+            let mut ss1 = 0.0f32;
+            let mut ss2 = 0.0f32;
+            let mut ss3 = 0.0f32;
+            for item in 0..7 {
+                let base = (lane + item * 32) * 4;
+                let value0 = residual[base].to_f32();
+                let value1 = residual[base + 1].to_f32();
+                let value2 = residual[base + 2].to_f32();
+                let value3 = residual[base + 3].to_f32();
+                ss0 += value0 * value0;
+                ss1 += value1 * value1;
+                ss2 += value2 * value2;
+                ss3 += value3 * value3;
+            }
+            *sum = (ss0 + ss1) + (ss2 + ss3);
+        }
+        let mut offset = 16;
+        while offset > 0 {
+            let previous = lanes;
+            for lane in 0..(32 - offset) {
+                lanes[lane] += previous[lane + offset];
+            }
+            offset /= 2;
+        }
+        normalize_f16(residual, gamma, lanes[0])
+    }
+
     #[test]
     fn warp_shuffle_skip_rmsnorm_matches_shared_tree_for_hidden_and_tail_sizes() {
-        for hidden in [896, 899] {
+        for hidden in [896, 1024, 2048, 4096, 5120] {
             let (residual, gamma) = skip_rmsnorm_residuals(hidden);
             let previous = previous_shared_tree_skip_rmsnorm(&residual, &gamma);
-            let warp = warp_shuffle_skip_rmsnorm(&residual, &gamma);
+            let warp = half4_warp_skip_rmsnorm(&residual, &gamma);
             let max_error = previous
                 .iter()
                 .zip(&warp)
@@ -1876,6 +2008,210 @@ mod tests {
                 "hidden={hidden} shared-tree/warp max fp16 error {max_error}"
             );
         }
+
+        let hidden = 900;
+        let (residual, gamma) = skip_rmsnorm_residuals(hidden);
+        let previous = previous_shared_tree_skip_rmsnorm(&residual, &gamma);
+        let generic = generic_warp_shuffle_skip_rmsnorm(&residual, &gamma);
+        let max_error = previous
+            .iter()
+            .zip(&generic)
+            .map(|(previous, generic)| (previous.to_f32() - generic.to_f32()).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error <= 2.0e-3,
+            "hidden={hidden} shared-tree/generic max fp16 error {max_error}"
+        );
+    }
+
+    #[test]
+    fn fp16_skip_rmsnorm_warp_selection_is_structural() {
+        for hidden in [128, 256, 512, 896, 1024, 2048, 4096, 5120] {
+            let selection = select_skip_rmsnorm_variant(true, true, hidden, false, true);
+            assert_eq!(
+                selection.variant,
+                SkipRmsnormVariant::F16WarpHalf4,
+                "hidden={hidden}: {}",
+                selection.reason
+            );
+            assert!(selection.reason.contains("hidden%128==0"));
+        }
+
+        let tail = select_skip_rmsnorm_variant(true, true, 900, false, true);
+        assert_eq!(tail.variant, SkipRmsnormVariant::F16Generic);
+        assert!(tail.reason.contains("hidden%128==0"));
+    }
+
+    #[test]
+    fn generalized_half4_warp_is_bit_identical_for_hidden_896() {
+        let (residual, gamma) = skip_rmsnorm_residuals(896);
+        let residual: [f16; 896] = residual.try_into().unwrap();
+        let gamma: [f16; 896] = gamma.try_into().unwrap();
+        let fixed = fixed_seven_half4_warp_skip_rmsnorm(&residual, &gamma);
+        let generalized = half4_warp_skip_rmsnorm(&residual, &gamma);
+        assert_eq!(
+            fixed
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            generalized
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn f16_bytes(values: &[f16]) -> &[u8] {
+        // SAFETY: f16 is plain two-byte data and the byte slice retains the input lifetime.
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn run_fp16_skip_rmsnorm_gpu(
+        ep: &CudaExecutionProvider,
+        hidden: usize,
+    ) -> (Vec<f16>, Vec<f16>, Vec<f16>) {
+        let shape = [1, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let gamma_shape = [hidden];
+        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let input = (0..hidden)
+            .map(|index| f16::from_f32(((index * 37 % 101) as f32 - 50.0) / 31.0))
+            .collect::<Vec<_>>();
+        let skip = (0..hidden)
+            .map(|index| f16::from_f32(((index * 17 % 67) as f32 - 33.0) / 47.0))
+            .collect::<Vec<_>>();
+        let gamma = (0..hidden)
+            .map(|index| f16::from_f32(0.75 + (index * 13 % 41) as f32 / 64.0))
+            .collect::<Vec<_>>();
+        let residual = input
+            .iter()
+            .zip(&skip)
+            .map(|(input, skip)| f16::from_f32(input.to_f32() + skip.to_f32()))
+            .collect::<Vec<_>>();
+
+        let input_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+        let skip_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+        let gamma_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+        let mut output_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(f16_bytes(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f16_bytes(&skip), cuptr(skip_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f16_bytes(&gamma), cuptr(gamma_buffer.as_ptr()))
+                .unwrap();
+        }
+
+        {
+            let inputs = [
+                TensorView::new(
+                    DevicePtr(input_buffer.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(skip_buffer.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(gamma_buffer.as_ptr()),
+                    DataType::Float16,
+                    &gamma_shape,
+                    &gamma_strides,
+                    ep.device_id(),
+                ),
+            ];
+            let output = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float16,
+                &shape,
+                &strides,
+                ep.device_id(),
+            );
+            let kernel = SkipSimplifiedLayerNormKernel {
+                epsilon: 1e-5,
+                runtime: runtime.clone(),
+                metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            kernel.run(&inputs, &mut [output]).unwrap();
+        }
+
+        let mut output_bytes = vec![0u8; hidden * std::mem::size_of::<f16>()];
+        unsafe {
+            runtime
+                .dtoh(&mut output_bytes, cuptr(output_buffer.as_ptr()))
+                .unwrap();
+        }
+        let output = output_bytes
+            .chunks_exact(2)
+            .map(|raw| f16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+        ep.deallocate(input_buffer).unwrap();
+        ep.deallocate(skip_buffer).unwrap();
+        ep.deallocate(gamma_buffer).unwrap();
+        ep.deallocate(output_buffer).unwrap();
+        (output, residual, gamma)
+    }
+
+    #[test]
+    fn fp16_skip_rmsnorm_gpu_is_generic_across_structural_hidden_sizes() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        for hidden in [896, 1024, 2048, 4096, 5120] {
+            let selection = select_skip_rmsnorm_variant(true, true, hidden, false, true);
+            assert_eq!(selection.variant, SkipRmsnormVariant::F16WarpHalf4);
+            let (output, residual, gamma) = run_fp16_skip_rmsnorm_gpu(&ep, hidden);
+            let reference = previous_shared_tree_skip_rmsnorm(&residual, &gamma);
+            let max_error = output
+                .iter()
+                .zip(&reference)
+                .map(|(output, reference)| (output.to_f32() - reference.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 2.0e-3,
+                "hidden={hidden} GPU half4/shared-tree max fp16 error {max_error}"
+            );
+        }
+
+        let hidden = 900;
+        let selection = select_skip_rmsnorm_variant(true, true, hidden, false, true);
+        assert_eq!(selection.variant, SkipRmsnormVariant::F16Generic);
+        let (output, residual, gamma) = run_fp16_skip_rmsnorm_gpu(&ep, hidden);
+        let reference = previous_shared_tree_skip_rmsnorm(&residual, &gamma);
+        let max_error = output
+            .iter()
+            .zip(&reference)
+            .map(|(output, reference)| (output.to_f32() - reference.to_f32()).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_error <= 2.0e-3,
+            "hidden={hidden} GPU generic/shared-tree max fp16 error {max_error}"
+        );
     }
 
     #[test]
