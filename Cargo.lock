@@ -1723,6 +1723,7 @@ dependencies = [
  "onnx-genai",
  "onnx-genai-engine",
  "onnx-genai-server",
+ "pyo3",
  "tokio",
  "tracing-subscriber",
 ]
