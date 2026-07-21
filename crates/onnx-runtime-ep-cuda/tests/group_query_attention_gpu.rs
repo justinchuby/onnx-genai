@@ -2742,7 +2742,8 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
     let output_bytes = 8 * std::mem::size_of::<f32>();
     let cache_bytes = 20 * std::mem::size_of::<f32>();
 
-    let run_once = |kernel: &GroupQueryAttentionKernel| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let run_once =
+        |kernel: &GroupQueryAttentionKernel| -> (Vec<u8>, Vec<u8>, Vec<u8>, (Vec<i32>, Vec<i32>, Vec<i32>)) {
         let mut cache_k = upload(&ep, &cache_k_host).unwrap();
         let mut cache_v = upload(&ep, &cache_v_host).unwrap();
         let mut output = ep.allocate(output_bytes, 256).unwrap();
@@ -2762,18 +2763,24 @@ fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
         )
         .unwrap();
         runtime.synchronize().unwrap();
+        let metadata = kernel.read_prepared_metadata_for_test(1).unwrap();
         let out = read_bytes(&ep, &output, output_bytes).unwrap();
         let ck = read_bytes(&ep, &cache_k, cache_bytes).unwrap();
         let cv = read_bytes(&ep, &cache_v, cache_bytes).unwrap();
         ep.deallocate(output).unwrap();
         ep.deallocate(cache_k).unwrap();
         ep.deallocate(cache_v).unwrap();
-        (out, ck, cv)
+        (out, ck, cv, metadata)
     };
 
-    let (fused_out, fused_k, fused_v) = run_once(&fused);
-    let (unfused_out, unfused_k, unfused_v) = run_once(&unfused);
+    let (fused_out, fused_k, fused_v, fused_metadata) = run_once(&fused);
+    let (unfused_out, unfused_k, unfused_v, separate_metadata) = run_once(&unfused);
 
+    assert_eq!(
+        fused_metadata, separate_metadata,
+        "metadata derived inside fused prep diverged from gqa_prepare_metadata"
+    );
+    assert_eq!(fused_metadata, (vec![2], vec![1], vec![1]));
     assert_eq!(
         fused_out, unfused_out,
         "fused decode output diverged from the unfused prep chain"

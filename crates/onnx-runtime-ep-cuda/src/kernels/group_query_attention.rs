@@ -108,6 +108,50 @@ extern "C" __global__ void gqa_prepare_metadata(
     query_starts[b] = (int)query_start;
 }
 
+__device__ __forceinline__ int gqa_prepare_metadata_batch1(
+    const int* seqlens_k, int* total_lengths, int* past_lengths,
+    int* query_starts, int past_capacity, int present_capacity,
+    const long long* position_ids, int validate_positions, int cache_rows,
+    int* error_flag, int write_metadata)
+{
+    if (error_flag && atomicOr(error_flag, 0) != 0) {
+        if (write_metadata) {
+            total_lengths[0] = -1;
+            past_lengths[0] = -1;
+            query_starts[0] = -1;
+        }
+        return -1;
+    }
+    const long long total = (long long)seqlens_k[0] + 1;
+    const long long past = total - 1;
+    const long long query_start = total - 1;
+    int error = 0;
+    if (total > 2147483647LL) error |= 1;
+    if (past < 0) error |= 2;
+    if (query_start < 0) error |= 4;
+    if (past > past_capacity) error |= 8;
+    if (total > present_capacity) error |= 16;
+    if (validate_positions) {
+        const long long position = position_ids ? position_ids[0] : past;
+        if (position < 0 || position >= (long long)cache_rows) error |= 32;
+    }
+    if (error) {
+        if (error_flag) atomicOr(error_flag, error);
+        if (write_metadata) {
+            total_lengths[0] = -1;
+            past_lengths[0] = -1;
+            query_starts[0] = -1;
+        }
+        return -1;
+    }
+    if (write_metadata) {
+        total_lengths[0] = (int)total;
+        past_lengths[0] = (int)past;
+        query_starts[0] = (int)query_start;
+    }
+    return (int)past;
+}
+
 extern "C" __global__ void gqa_build_cache(
     const float* current, const float* past, float* present,
     const int* past_lengths, int batch, int seq, int heads, int dim,
@@ -290,13 +334,16 @@ extern "C" __global__ void gqa_attention_reference_f32(
 // unpacked source directly), BSH->BNSH transpose (identity for Sq=1), in-place
 // KV cache append, and RoPE for Q and present-K -- all in one launch. Replaces
 // the split+transpose_in+append(K,V)+rope(Q,K) chain on the aliased device-KV
-// decode path. `past_lengths` is produced by the separate `gqa_prepare_metadata`
-// kernel (stream-ordered before this launch), so its poison/latch sentinel
-// (past < 0) still gates every cache write here identically to the unfused path.
+// decode path. For batch 1, metadata is derived independently by thread 0 of
+// every CTA and shared within that CTA; block 0 also writes the attention
+// metadata arrays. This avoids a cross-CTA dependency while preserving the
+// sticky error latch and sentinel-gated cache writes.
 extern "C" __global__ void gqa_fuse_decode_prep(
     const float* q_src, const float* k_src, const float* v_src, int packed,
     float* q_bnsh, float* present_k, float* present_v,
-    const int* past_lengths, const float* cos_cache, const float* sin_cache,
+    const int* seqlens_k, int* total_lengths, int* past_lengths,
+    int* query_starts, int past_capacity, int* error_flag, int derive_metadata,
+    const float* cos_cache, const float* sin_cache,
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
     int present_capacity, int cache_rows, int do_rotary, int interleaved,
     int cache_is_half)
@@ -307,10 +354,20 @@ extern "C" __global__ void gqa_fuse_decode_prep(
     const int kvN = kv_heads * half;
     const int per_batch = qN + 2 * kvN;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ int batch1_past;
+    if (derive_metadata) {
+        if (threadIdx.x == 0) {
+            batch1_past = gqa_prepare_metadata_batch1(
+                seqlens_k, total_lengths, past_lengths, query_starts,
+                past_capacity, present_capacity, position_ids, do_rotary,
+                cache_rows, error_flag, blockIdx.x == 0);
+        }
+        __syncthreads();
+    }
     if (idx >= batch * per_batch) return;
     const int b = idx / per_batch;
     int local = idx - b * per_batch;
-    const int past = past_lengths[b];
+    const int past = derive_metadata ? batch1_past : past_lengths[b];
     const int q_hidden = q_heads * dim;
     const int kv_hidden = kv_heads * dim;
     const int packed_hidden = q_hidden + 2 * kv_hidden;
@@ -367,6 +424,50 @@ extern "C" __global__ void gqa_fuse_decode_prep(
 const PREP_HALF_SRC: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+
+__device__ __forceinline__ int gqa_prepare_metadata_batch1(
+    const int* seqlens_k, int* total_lengths, int* past_lengths,
+    int* query_starts, int past_capacity, int present_capacity,
+    const long long* position_ids, int validate_positions, int cache_rows,
+    int* error_flag, int write_metadata)
+{
+    if (error_flag && atomicOr(error_flag, 0) != 0) {
+        if (write_metadata) {
+            total_lengths[0] = -1;
+            past_lengths[0] = -1;
+            query_starts[0] = -1;
+        }
+        return -1;
+    }
+    const long long total = (long long)seqlens_k[0] + 1;
+    const long long past = total - 1;
+    const long long query_start = total - 1;
+    int error = 0;
+    if (total > 2147483647LL) error |= 1;
+    if (past < 0) error |= 2;
+    if (query_start < 0) error |= 4;
+    if (past > past_capacity) error |= 8;
+    if (total > present_capacity) error |= 16;
+    if (validate_positions) {
+        const long long position = position_ids ? position_ids[0] : past;
+        if (position < 0 || position >= (long long)cache_rows) error |= 32;
+    }
+    if (error) {
+        if (error_flag) atomicOr(error_flag, error);
+        if (write_metadata) {
+            total_lengths[0] = -1;
+            past_lengths[0] = -1;
+            query_starts[0] = -1;
+        }
+        return -1;
+    }
+    if (write_metadata) {
+        total_lengths[0] = (int)total;
+        past_lengths[0] = (int)past;
+        query_starts[0] = (int)query_start;
+    }
+    return (int)past;
+}
 
 template <typename T> __device__ __forceinline__ float gqa_load(T value);
 template <> __device__ __forceinline__ float gqa_load<__half>(__half value) {
@@ -526,7 +627,9 @@ template <typename T>
 __device__ void gqa_fuse_decode_prep_body(
     const T* q_src, const T* k_src, const T* v_src, int packed,
     T* q_bnsh, T* present_k, T* present_v,
-    const int* past_lengths, const void* cos_cache, const void* sin_cache,
+    const int* seqlens_k, int* total_lengths, int* past_lengths,
+    int* query_starts, int past_capacity, int* error_flag, int derive_metadata,
+    const void* cos_cache, const void* sin_cache,
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
     int present_capacity, int cache_rows, int do_rotary, int interleaved,
     int cache_is_half)
@@ -536,10 +639,20 @@ __device__ void gqa_fuse_decode_prep_body(
     const int kvN = kv_heads * half;
     const int per_batch = qN + 2 * kvN;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ int batch1_past;
+    if (derive_metadata) {
+        if (threadIdx.x == 0) {
+            batch1_past = gqa_prepare_metadata_batch1(
+                seqlens_k, total_lengths, past_lengths, query_starts,
+                past_capacity, present_capacity, position_ids, do_rotary,
+                cache_rows, error_flag, blockIdx.x == 0);
+        }
+        __syncthreads();
+    }
     if (idx >= batch * per_batch) return;
     const int b = idx / per_batch;
     int local = idx - b * per_batch;
-    const int past = past_lengths[b];
+    const int past = derive_metadata ? batch1_past : past_lengths[b];
     const int q_hidden = q_heads * dim;
     const int kv_hidden = kv_heads * dim;
     const int packed_hidden = q_hidden + 2 * kv_hidden;
@@ -632,13 +745,17 @@ extern "C" __global__ void gqa_transpose_bnsh_to_bsh_##SUFFIX( \
 extern "C" __global__ void gqa_fuse_decode_prep_##SUFFIX( \
     const TYPE* q_src, const TYPE* k_src, const TYPE* v_src, int packed, \
     TYPE* q_bnsh, TYPE* present_k, TYPE* present_v, \
-    const int* past_lengths, const void* cos_cache, const void* sin_cache, \
+    const int* seqlens_k, int* total_lengths, int* past_lengths, \
+    int* query_starts, int past_capacity, int* error_flag, int derive_metadata, \
+    const void* cos_cache, const void* sin_cache, \
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim, \
     int present_capacity, int cache_rows, int do_rotary, int interleaved, \
     int cache_is_half) { \
     gqa_fuse_decode_prep_body<TYPE>(q_src, k_src, v_src, packed, q_bnsh, present_k, \
-        present_v, past_lengths, cos_cache, sin_cache, position_ids, batch, q_heads, \
-        kv_heads, dim, present_capacity, cache_rows, do_rotary, interleaved, cache_is_half); \
+        present_v, seqlens_k, total_lengths, past_lengths, query_starts, past_capacity, \
+        error_flag, derive_metadata, cos_cache, sin_cache, position_ids, batch, \
+        q_heads, kv_heads, dim, present_capacity, cache_rows, do_rotary, interleaved, \
+        cache_is_half); \
 }
 
 DEFINE_GQA_HALF_KERNELS(__half, f16)
@@ -1022,6 +1139,47 @@ impl GroupQueryAttentionKernel {
     pub fn with_prep_fusion_disabled(mut self, disabled: bool) -> Self {
         self.prep_fusion_disabled = disabled;
         self
+    }
+
+    /// Reads the internal metadata workspace for GPU parity tests.
+    #[doc(hidden)]
+    pub fn read_prepared_metadata_for_test(
+        &self,
+        batch: usize,
+    ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+        let workspace = self.workspace.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
+        })?;
+        let read_slot = |index: usize| -> Result<Vec<i32>> {
+            let slot = workspace.slots[index];
+            let bytes_len = batch
+                .checked_mul(std::mem::size_of::<i32>())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: test metadata size overflow".into(),
+                    )
+                })?;
+            if slot.ptr == 0 || slot.bytes < bytes_len {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: test metadata workspace is unavailable".into(),
+                ));
+            }
+            let mut bytes = vec![0u8; bytes_len];
+            // SAFETY: the workspace slot is live and was reserved for at least
+            // `bytes_len` bytes by the most recent successful execution.
+            unsafe {
+                self.runtime.dtoh(&mut bytes, slot.ptr)?;
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|x| i32::from_ne_bytes([x[0], x[1], x[2], x[3]]))
+                .collect())
+        };
+        Ok((
+            read_slot(WS_TOTALS)?,
+            read_slot(WS_PAST_LENGTHS)?,
+            read_slot(WS_QUERY_STARTS)?,
+        ))
     }
 
     /// Resolves the configured backend using the same shape gate as execution.
@@ -1519,6 +1677,7 @@ impl GroupQueryAttentionKernel {
             && aliased_device_kv
             && past_capacity == present_capacity
             && !self.prep_fusion_disabled;
+        let fuse_metadata = fuse_prep && batch == 1;
 
         let mut workspace = self.workspace.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
@@ -1612,46 +1771,68 @@ impl GroupQueryAttentionKernel {
         })?;
         let seqlens_ptr = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
         let validate_positions_i: i32 = self.do_rotary.into();
-        launch_1d!(
-            self.runtime,
-            PREP_MODULE,
-            PREP_SRC,
-            "gqa_prepare_metadata",
-            batch,
-            builder,
-            {
-                builder
-                    .arg(&seqlens_ptr)
-                    .arg(&totals_gpu)
-                    .arg(&past_lengths_gpu)
-                    .arg(&query_starts_gpu)
-                    .arg(&batch_i)
-                    .arg(&current_key_length)
-                    .arg(&query_length)
-                    .arg(&past_capacity_i)
-                    .arg(&present_capacity_i)
-                    .arg(&positions_ptr)
-                    .arg(&validate_positions_i)
-                    .arg(&cache_rows)
-                    .arg(&metadata_error_gpu);
-            }
-        );
+        if fuse_metadata {
+            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                "metadata",
+                "gqa_prep_fused_with_metadata",
+                "batch-1 fixed-capacity single-token decode derives past/total/query-start \
+                 metadata inside fused prep with device-side bounds and sticky error latching"
+            );
+        } else {
+            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                "metadata",
+                "metadata_separate",
+                "metadata remains a separate launch: batch={}, prep_fused={}; folding requires \
+                 batch==1 and the eligible fixed-capacity single-token fused prep path",
+                batch,
+                fuse_prep
+            );
+            launch_1d!(
+                self.runtime,
+                PREP_MODULE,
+                PREP_SRC,
+                "gqa_prepare_metadata",
+                batch,
+                builder,
+                {
+                    builder
+                        .arg(&seqlens_ptr)
+                        .arg(&totals_gpu)
+                        .arg(&past_lengths_gpu)
+                        .arg(&query_starts_gpu)
+                        .arg(&batch_i)
+                        .arg(&current_key_length)
+                        .arg(&query_length)
+                        .arg(&past_capacity_i)
+                        .arg(&present_capacity_i)
+                        .arg(&positions_ptr)
+                        .arg(&validate_positions_i)
+                        .arg(&cache_rows)
+                        .arg(&metadata_error_gpu);
+                }
+            );
+        }
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         if fuse_prep {
+            let prep_variant = if fuse_metadata {
+                "gqa_prep_fused_with_metadata"
+            } else {
+                "gqa_prep_fused"
+            };
             onnx_runtime_ep_api::record_kernel_variant_stage!(
                 "prep",
-                "gqa_prep_fused",
+                prep_variant,
                 "decode prep fused into one launch: Sq==1, k_seq==1, even head_dim={}, \
-                 aliased device-KV, past_capacity==present_capacity={}",
+                 aliased device-KV, past_capacity==present_capacity={}, metadata_fused={}",
                 dim,
-                present_capacity
+                present_capacity,
+                fuse_metadata
             );
             // Fused single-token decode prep. One launch subsumes the packed
             // split, BSH->BNSH query transpose, in-place K/V cache append, and
-            // Q/present-K RoPE that the branch below performs as six separate
-            // kernels. `past_lengths_gpu` (from `gqa_prepare_metadata` above)
-            // still gates every cache write, preserving the poison/latch and
-            // bounds semantics of the unfused append/rope kernels.
+            // Q/present-K RoPE that the branch below performs separately. Batch
+            // 1 also derives metadata per CTA, with block 0 writing the arrays;
+            // larger batches consume the stream-ordered separate metadata.
             let (q_src, k_src, v_src, packed_flag) = if packed_qkv {
                 (input_q_ptr, input_q_ptr, input_q_ptr, 1i32)
             } else {
@@ -1664,6 +1845,7 @@ impl GroupQueryAttentionKernel {
             };
             let interleaved_i: i32 = self.rotary_interleaved.into();
             let do_rotary_i: i32 = self.do_rotary.into();
+            let derive_metadata_i: i32 = fuse_metadata.into();
             let fused_count = batch * (self.num_heads + 2 * self.kv_num_heads) * (dim / 2);
             launch_1d!(
                 self.runtime,
@@ -1681,7 +1863,13 @@ impl GroupQueryAttentionKernel {
                         .arg(&q_bnsh)
                         .arg(&present_k_ptr)
                         .arg(&present_v_ptr)
+                        .arg(&seqlens_ptr)
+                        .arg(&totals_gpu)
                         .arg(&past_lengths_gpu)
+                        .arg(&query_starts_gpu)
+                        .arg(&past_capacity_i)
+                        .arg(&metadata_error_gpu)
+                        .arg(&derive_metadata_i)
                         .arg(&cos_ptr)
                         .arg(&sin_ptr)
                         .arg(&positions_ptr)
