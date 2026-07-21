@@ -396,7 +396,7 @@ pub fn build_cuda_registry_with_metrics(
     }
 
     // Elementwise unary activations (NVRTC pointwise). `Gelu` and `Silu` are
-    // `com.microsoft` contrib ops; Silu matches the CPU EP's f32-only coverage.
+    // `com.microsoft` contrib ops; all activations run f32/f16/bf16 on the EP.
     for (op_type, domain, op) in [
         ("Relu", "", UnaryOp::Relu),
         ("Sqrt", "", UnaryOp::Sqrt),

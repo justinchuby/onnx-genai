@@ -153,8 +153,9 @@ extern "C" __global__ void gqa_rope_bnsh(
     float* tensor, const float* cos_cache, const float* sin_cache,
     const long long* position_ids, const int* past_lengths,
     int batch, int seq, int heads, int dim, int tensor_capacity,
-    int current_offset, int cache_rows, int interleaved)
+    int current_offset, int cache_rows, int interleaved, int cache_is_half)
 {
+    (void)cache_is_half;
     const int half = dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = batch * heads * seq * half;
@@ -305,6 +306,13 @@ template <> __device__ __forceinline__ __nv_bfloat16 gqa_store<__nv_bfloat16>(fl
     return __float2bfloat16_rn(value);
 }
 
+__device__ __forceinline__ float gqa_load_cache(
+    const void* cache, int index, int cache_is_half) {
+    return cache_is_half
+        ? __half2float(reinterpret_cast<const __half*>(cache)[index])
+        : reinterpret_cast<const float*>(cache)[index];
+}
+
 template <typename T>
 __device__ void gqa_transpose_bsh_to_bnsh_body(
     const T* src, T* dst, int batch, int seq, int heads, int dim)
@@ -386,10 +394,10 @@ __device__ void gqa_append_cache_body(
 
 template <typename T>
 __device__ void gqa_rope_bnsh_body(
-    T* tensor, const float* cos_cache, const float* sin_cache,
+    T* tensor, const void* cos_cache, const void* sin_cache,
     const long long* position_ids, const int* past_lengths,
     int batch, int seq, int heads, int dim, int tensor_capacity,
-    int current_offset, int cache_rows, int interleaved)
+    int current_offset, int cache_rows, int interleaved, int cache_is_half)
 {
     const int half = dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -412,8 +420,8 @@ __device__ void gqa_rope_bnsh_body(
     const size_t base = ((size_t)(b * heads + h) * tensor_capacity + tensor_s) * dim;
     const float x0 = gqa_load<T>(tensor[base + d0]);
     const float x1 = gqa_load<T>(tensor[base + d1]);
-    const float c = cos_cache[pos * half + k];
-    const float sn = sin_cache[pos * half + k];
+    const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
+    const float sn = gqa_load_cache(sin_cache, pos * half + k, cache_is_half);
     tensor[base + d0] = gqa_store<T>(c * x0 - sn * x1);
     tensor[base + d1] = gqa_store<T>(sn * x0 + c * x1);
 }
@@ -457,13 +465,13 @@ extern "C" __global__ void gqa_append_cache_##SUFFIX( \
         current, present, past_lengths, batch, seq, heads, dim, present_capacity); \
 } \
 extern "C" __global__ void gqa_rope_bnsh_##SUFFIX( \
-    TYPE* tensor, const float* cos_cache, const float* sin_cache, \
+    TYPE* tensor, const void* cos_cache, const void* sin_cache, \
     const long long* position_ids, const int* past_lengths, \
     int batch, int seq, int heads, int dim, int tensor_capacity, \
-    int current_offset, int cache_rows, int interleaved) { \
+    int current_offset, int cache_rows, int interleaved, int cache_is_half) { \
     gqa_rope_bnsh_body<TYPE>(tensor, cos_cache, sin_cache, position_ids, past_lengths, \
                              batch, seq, heads, dim, tensor_capacity, current_offset, \
-                             cache_rows, interleaved); \
+                             cache_rows, interleaved, cache_is_half); \
 } \
 extern "C" __global__ void gqa_transpose_bnsh_to_bsh_##SUFFIX( \
     const TYPE* src, TYPE* dst, int batch, int seq, int heads, int dim) { \
@@ -1077,62 +1085,80 @@ impl GroupQueryAttentionKernel {
             .map(|output| output.shape.get(2).copied().unwrap_or(past_capacity));
 
         let explicit_positions = inputs.get(9).filter(|view| !view.is_absent());
-        let (cos_ptr, sin_ptr, positions_ptr, cache_rows, cache_rows_usize) = if self.do_rotary {
-            if !dim.is_multiple_of(2) {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: do_rotary requires an even head_size".into(),
-                ));
-            }
-            if q_seq != k_seq {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths".into(),
-                ));
-            }
-            let cos = inputs
-                .get(7)
-                .filter(|view| !view.is_absent())
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: do_rotary=1 requires cos_cache".into(),
-                    )
-                })?;
-            let sin = inputs
-                .get(8)
-                .filter(|view| !view.is_absent())
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: do_rotary=1 requires sin_cache".into(),
-                    )
-                })?;
-            require_dense(cos, "cos_cache", DataType::Float32)?;
-            require_dense(sin, "sin_cache", DataType::Float32)?;
-            if cos.shape.len() != 2 || sin.shape != cos.shape || cos.shape[1] != dim / 2 {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep GroupQueryAttention: cos_cache/sin_cache must have shape [max_sequence_length,{}]",
-                    dim / 2
-                )));
-            }
-            let position_ptr = if let Some(position_ids) = explicit_positions {
-                require_dense(position_ids, "position_ids", DataType::Int64)?;
-                if position_ids.shape != [batch, q_seq] {
+        let (cos_ptr, sin_ptr, positions_ptr, cache_rows, cache_rows_usize, rope_cache_is_half) =
+            if self.do_rotary {
+                if !dim.is_multiple_of(2) {
                     return Err(EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
+                        "cuda_ep GroupQueryAttention: do_rotary requires an even head_size".into(),
                     ));
                 }
-                cuptr(position_ids.data_ptr::<u8>() as *const c_void)
+                if q_seq != k_seq {
+                    return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths".into(),
+                ));
+                }
+                let cos = inputs
+                    .get(7)
+                    .filter(|view| !view.is_absent())
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep GroupQueryAttention: do_rotary=1 requires cos_cache".into(),
+                        )
+                    })?;
+                let sin = inputs
+                    .get(8)
+                    .filter(|view| !view.is_absent())
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep GroupQueryAttention: do_rotary=1 requires sin_cache".into(),
+                        )
+                    })?;
+                require_dense(cos, "cos_cache", DataType::Float32)
+                    .or_else(|_| require_dense(cos, "cos_cache", DataType::Float16))?;
+                let cache_dtype = cos.dtype;
+                let cache_is_half = match cache_dtype {
+                    DataType::Float32 => 0i32,
+                    DataType::Float16
+                        if matches!(q.dtype, DataType::Float16 | DataType::BFloat16) =>
+                    {
+                        1i32
+                    }
+                    other => {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep GroupQueryAttention: cos_cache/sin_cache dtype {other:?} unsupported for query dtype {:?}; expected Float32, or Float16 with half-precision queries",
+                            q.dtype
+                        )));
+                    }
+                };
+                require_dense(sin, "sin_cache", cache_dtype)?;
+                if cos.shape.len() != 2 || sin.shape != cos.shape || cos.shape[1] != dim / 2 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: cos_cache/sin_cache must have shape [max_sequence_length,{}]",
+                        dim / 2
+                    )));
+                }
+                let position_ptr = if let Some(position_ids) = explicit_positions {
+                    require_dense(position_ids, "position_ids", DataType::Int64)?;
+                    if position_ids.shape != [batch, q_seq] {
+                        return Err(EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
+                    ));
+                    }
+                    cuptr(position_ids.data_ptr::<u8>() as *const c_void)
+                } else {
+                    0
+                };
+                (
+                    cuptr(cos.data_ptr::<u8>() as *const c_void),
+                    cuptr(sin.data_ptr::<u8>() as *const c_void),
+                    position_ptr,
+                    checked_i32(cos.shape[0], "rotary cache rows")?,
+                    cos.shape[0],
+                    cache_is_half,
+                )
             } else {
-                0
+                (0, 0, 0, 0, 0, 0)
             };
-            (
-                cuptr(cos.data_ptr::<u8>() as *const c_void),
-                cuptr(sin.data_ptr::<u8>() as *const c_void),
-                position_ptr,
-                checked_i32(cos.shape[0], "rotary cache rows")?,
-                cos.shape[0],
-            )
-        } else {
-            (0, 0, 0, 0, 0)
-        };
 
         let structurally_valid_outputs = requested_present_capacity.is_some_and(|capacity| {
             let expected = [batch, self.kv_num_heads, capacity, dim];
@@ -1155,7 +1181,8 @@ impl GroupQueryAttentionKernel {
                 == inputs[4].data_ptr::<u8>();
         let capture_candidate = requested_present_capacity
             .filter(|&present_capacity| {
-                q.dtype == DataType::Float32
+                (q.dtype == DataType::Float32
+                    || (q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim)))
                     && q_seq == 1
                     && k_seq == 1
                     && has_past_key
@@ -1551,7 +1578,8 @@ impl GroupQueryAttentionKernel {
                             .arg(&capacity)
                             .arg(&current_offset)
                             .arg(&cache_rows)
-                            .arg(&interleaved_i);
+                            .arg(&interleaved_i)
+                            .arg(&rope_cache_is_half);
                     }
                 );
             }

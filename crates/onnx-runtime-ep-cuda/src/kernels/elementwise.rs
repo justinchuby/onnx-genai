@@ -155,6 +155,8 @@ DEFINE_BINARY_I64(mul, a[ai] * b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
+DEFINE_UNARY(silu, __half, f16)
+DEFINE_UNARY(silu, __nv_bfloat16, bf16)
 #endif
 "#;
 
@@ -343,12 +345,6 @@ impl UnaryKernel {
         }
         let x = &inputs[0];
         let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
-        if self.op == UnaryOp::Silu && dtype != FloatDtype::F32 {
-            return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (supported: Float32)",
-                x.dtype
-            )));
-        }
         if dtype != FloatDtype::F32 {
             self.runtime.require_nvrtc_half_headers(op)?;
         }

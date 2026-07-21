@@ -2,6 +2,7 @@
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{DeviceBuffer, EpError, Result};
+use onnx_runtime_ir::DataType;
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -10,8 +11,24 @@ const BLOCK: u32 = 256;
 const RESULT_BYTES: usize = 2 * std::mem::size_of::<u32>();
 
 const SOURCE: &str = r#"
-extern "C" __global__ void greedy_argmax_f32(
-    const float* logits,
+#include <cuda_fp16.h>
+
+template <typename T>
+__device__ __forceinline__ float argmax_load(T value);
+
+template <>
+__device__ __forceinline__ float argmax_load<float>(float value) {
+  return value;
+}
+
+template <>
+__device__ __forceinline__ float argmax_load<__half>(__half value) {
+  return __half2float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ void greedy_argmax_impl(
+    const T* logits,
     unsigned long long elements,
     const unsigned int* capture_error,
     unsigned int* result) {
@@ -23,7 +40,7 @@ extern "C" __global__ void greedy_argmax_f32(
   float best = -1.0f / 0.0f;
   unsigned int best_index = 0;
   for (unsigned long long i = threadIdx.x; i < elements; i += blockDim.x) {
-    float value = logits[i];
+    float value = argmax_load<T>(logits[i]);
     if (isnan(value)) continue;
     unsigned int index = static_cast<unsigned int>(i);
     if (value > best || (value == best && index < best_index)) {
@@ -56,12 +73,29 @@ extern "C" __global__ void greedy_argmax_f32(
     result[1] = *capture_error;
   }
 }
+
+extern "C" __global__ void greedy_argmax_f32(
+    const float* logits,
+    unsigned long long elements,
+    const unsigned int* capture_error,
+    unsigned int* result) {
+  greedy_argmax_impl<float>(logits, elements, capture_error, result);
+}
+
+extern "C" __global__ void greedy_argmax_f16(
+    const __half* logits,
+    unsigned long long elements,
+    const unsigned int* capture_error,
+    unsigned int* result) {
+  greedy_argmax_impl<__half>(logits, elements, capture_error, result);
+}
 "#;
 
 pub(crate) fn launch(
     runtime: &CudaRuntime,
     logits: &DeviceBuffer,
     elements: usize,
+    dtype: DataType,
     result: &mut DeviceBuffer,
 ) -> Result<()> {
     if elements == 0 {
@@ -74,14 +108,21 @@ pub(crate) fn launch(
             "cuda_ep device argmax: {elements} elements exceed the u32 token-id range"
         )));
     }
-    let logits_bytes = elements
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            EpError::KernelFailed("cuda_ep device argmax: logits byte size overflows".into())
-        })?;
+    let (entry, elem_size) = match dtype {
+        DataType::Float32 => ("greedy_argmax_f32", std::mem::size_of::<f32>()),
+        DataType::Float16 => ("greedy_argmax_f16", std::mem::size_of::<u16>()),
+        other => {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep device argmax: unsupported logits dtype {other:?}; expected Float32 or Float16"
+            )));
+        }
+    };
+    let logits_bytes = elements.checked_mul(elem_size).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep device argmax: logits byte size overflows".into())
+    })?;
     if logits_bytes > logits.len() {
         return Err(EpError::KernelFailed(format!(
-            "cuda_ep device argmax: {elements} f32 values require {logits_bytes} bytes, buffer has {}",
+            "cuda_ep device argmax: {elements} values require {logits_bytes} bytes, buffer has {}",
             logits.len()
         )));
     }
@@ -97,7 +138,10 @@ pub(crate) fn launch(
         ));
     }
 
-    let function = runtime.nvrtc_function("native_device_argmax", SOURCE, "greedy_argmax_f32")?;
+    if dtype == DataType::Float16 {
+        runtime.require_nvrtc_half_headers("device argmax")?;
+    }
+    let function = runtime.nvrtc_function("native_device_argmax", SOURCE, entry)?;
     let logits_ptr = cuptr(logits.as_ptr());
     let elements = elements as u64;
     let capture_error_ptr = runtime.capture_error_ptr();
@@ -152,7 +196,29 @@ mod tests {
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
         let mut output = ep.allocate(RESULT_BYTES, 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
-        ep.device_argmax(&input, logits.len(), &mut output).unwrap();
+        ep.device_argmax(&input, logits.len(), DataType::Float32, &mut output)
+            .unwrap();
+        let mut result = [0_u8; RESULT_BYTES];
+        ep.copy_to_host(&output, &mut result).unwrap();
+        let values = [
+            u32::from_ne_bytes(result[..4].try_into().unwrap()),
+            u32::from_ne_bytes(result[4..].try_into().unwrap()),
+        ];
+        ep.deallocate(input).unwrap();
+        ep.deallocate(output).unwrap();
+        values
+    }
+
+    fn run_case_f16(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
+        let bytes = logits
+            .iter()
+            .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        let mut input = ep.allocate(bytes.len(), 256).unwrap();
+        let mut output = ep.allocate(RESULT_BYTES, 256).unwrap();
+        ep.copy_from_host(&bytes, &mut input).unwrap();
+        ep.device_argmax(&input, logits.len(), DataType::Float16, &mut output)
+            .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
         let values = [
@@ -196,5 +262,26 @@ mod tests {
         let result = run_case(&ep, &[1.0, 5.0, 3.0]);
         assert_eq!(result, [1, capture_error]);
         ep.runtime().reset_capture_error().unwrap();
+    }
+
+    #[test]
+    fn device_argmax_f16_matches_host_for_finite_and_non_finite() {
+        let Some(ep) = gpu() else { return };
+        let mut logits = (0..4096)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.25)
+            .collect::<Vec<_>>();
+        logits[1234] = 9.5;
+        logits[77] = f32::NAN;
+        // Reference argmax over the fp16-rounded values, matching kernel input.
+        let rounded = logits
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        let result = run_case_f16(&ep, &logits);
+        assert_eq!(result, [host_argmax(&rounded), 0]);
+
+        let all_non_finite = [f32::NAN, f32::NEG_INFINITY, f32::NAN];
+        let result = run_case_f16(&ep, &all_non_finite);
+        assert_eq!(result, [host_argmax(&all_non_finite), 0]);
     }
 }

@@ -336,9 +336,11 @@ impl DeviceIoBinding {
     }
 
     pub fn device_argmax(&self, elements: usize, result: &mut DeviceIoBinding) -> Result<()> {
-        if self.dtype != DataType::Float32 || result.dtype != DataType::Uint32 {
+        if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
+            || result.dtype != DataType::Uint32
+        {
             return Err(SessionError::Internal(format!(
-                "device argmax requires f32 logits and u32 result, got {:?} and {:?}",
+                "device argmax requires f32/f16 logits and u32 result, got {:?} and {:?}",
                 self.dtype, result.dtype
             )));
         }
@@ -349,7 +351,7 @@ impl DeviceIoBinding {
         }
         Ok(self
             .allocator
-            .device_argmax(self.buffer(), elements, result.buffer_mut())?)
+            .device_argmax(self.buffer(), elements, self.dtype, result.buffer_mut())?)
     }
 
     pub(crate) fn buffer(&self) -> &DeviceBuffer {

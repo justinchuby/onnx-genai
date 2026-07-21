@@ -73,6 +73,7 @@ struct DecodeCudaState {
     position_ids_binding: Option<usize>,
     logits_binding: usize,
     logits_shape: Vec<usize>,
+    logits_dtype: DataType,
     greedy_result: DeviceIoBinding,
     graph_enabled: bool,
     graph_phase: DecodeCudaGraphPhase,
@@ -602,9 +603,10 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            if meta.dtype != DataType::Float32 || meta.shape.len() != 4 {
+            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
+            {
                 bail!(
-                    "CUDA KV input '{past}' must be rank-4 f32, got {:?} {:?}",
+                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
                     meta.dtype,
                     meta.shape
                 );
@@ -665,14 +667,17 @@ impl DecodeCudaState {
             .iter()
             .find(|meta| meta.name == io.logits)
             .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
-        if logits_meta.dtype != DataType::Float32 || logits_meta.shape.is_empty() {
+        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
+            || logits_meta.shape.is_empty()
+        {
             bail!(
-                "CUDA logits output '{}' must be non-scalar f32, got {:?} {:?}",
+                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
                 io.logits,
                 logits_meta.dtype,
                 logits_meta.shape
             );
         }
+        let logits_dtype = logits_meta.dtype;
         let logits_shape = logits_meta
             .shape
             .iter()
@@ -684,7 +689,7 @@ impl DecodeCudaState {
         let logits_binding = bindings.len();
         bindings.push(session.allocate_device_output_binding(
             io.logits,
-            DataType::Float32,
+            logits_dtype,
             logits_shape.clone(),
             logits_shape.clone(),
         )?);
@@ -705,6 +710,7 @@ impl DecodeCudaState {
             position_ids_binding,
             logits_binding,
             logits_shape,
+            logits_dtype,
             greedy_result,
             graph_enabled,
             graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
@@ -810,7 +816,7 @@ impl DecodeCudaState {
 
     fn read_logits(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
         let bytes = self.bindings[self.logits_binding].read_bytes()?;
-        let logits = Tensor::from_raw(DataType::Float32, self.logits_shape.clone(), &bytes)?;
+        let logits = Tensor::from_raw(self.logits_dtype, self.logits_shape.clone(), &bytes)?;
         extract_logits(&logits)
     }
 

@@ -280,6 +280,15 @@ extern "C" __global__ void rmsnorm_f16(
 /// NVRTC source for `com.microsoft::SkipSimplifiedLayerNormalization`.
 /// The residual sum supports right-aligned NumPy broadcasting for `skip`.
 const SKIP_RMSNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float load_skip_val(
+    const void* values, const int is_half, const int index) {
+    return is_half
+        ? __half2float(((const __half*)values)[index])
+        : ((const float*)values)[index];
+}
+
 extern "C" __global__ void skip_rmsnorm_f32(
     const float* input,
     const float* skip,
@@ -338,6 +347,79 @@ extern "C" __global__ void skip_rmsnorm_f32(
     __syncthreads();
     for (int j = tid; j < norm_size; j += nt)
         y[base + j] = (y[base + j] * inv_std) * gamma[j];
+}
+
+extern "C" __global__ void skip_rmsnorm_f16(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,         // null when absent
+    __half*       y,
+    __half*       sum_out,      // null when not requested
+    void*         mean_out,     // null when not requested (always zero)
+    void*         invstd_out,   // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const unsigned long long* shape = metadata;
+    const unsigned long long* skip_strides = metadata + rank;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+
+    // fp32 accumulate over the fp16-rounded residual so the RMS matches the
+    // residual value stored into `sum_out` and reused by the next layer.
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        unsigned long long linear = (unsigned long long)base + j;
+        unsigned long long skip_index = 0;
+        for (int d = rank - 1; d >= 0; --d) {
+            const unsigned long long coord = linear % shape[d];
+            linear /= shape[d];
+            skip_index += coord * skip_strides[d];
+        }
+        float sv = __half2float(input[base + j]) + __half2float(skip[skip_index]);
+        if (has_bias) sv += load_skip_val(bias, bias_is_half, j);
+        const __half svh = __float2half_rn(sv);
+        y[base + j] = svh;
+        if (sum_out) sum_out[base + j] = svh;
+        const float svr = __half2float(svh);
+        ss += svr * svr;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) {
+            if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
+            else ((float*)mean_out)[g] = 0.0f;
+        }
+        if (invstd_out) {
+            if (stat_is_half) ((__half*)invstd_out)[g] = __float2half_rn(inv_std);
+            else ((float*)invstd_out)[g] = inv_std;
+        }
+    }
+    __syncthreads();
+    for (int j = tid; j < norm_size; j += nt) {
+        const float v = __half2float(y[base + j]) * inv_std
+            * load_skip_val(gamma, gamma_is_half, j);
+        y[base + j] = __float2half_rn(v);
+    }
 }
 "#;
 
@@ -1010,14 +1092,32 @@ impl SkipSimplifiedLayerNormKernel {
         let skip = &inputs[1];
         let gamma = &inputs[2];
         let bias = inputs.get(3).filter(|bias| !bias.is_absent());
-        require_f32(op, "input", input.dtype)?;
-        require_f32(op, "skip", skip.dtype)?;
-        require_f32(op, "gamma", gamma.dtype)?;
-        require_f32(op, "output", outputs[0].dtype)?;
+        require_f16_or_f32(op, "input", input.dtype)?;
+        let is_half = input.dtype == DataType::Float16;
+        if skip.dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: skip dtype {:?} must match input dtype {:?}",
+                skip.dtype, input.dtype
+            )));
+        }
+        if outputs[0].dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must match input dtype {:?}",
+                outputs[0].dtype, input.dtype
+            )));
+        }
+        if is_half {
+            require_f16_or_f32(op, "gamma", gamma.dtype)?;
+        } else {
+            require_f32(op, "gamma", gamma.dtype)?;
+        }
         require_contiguous(op, "input", input.is_contiguous())?;
         require_contiguous(op, "skip", skip.is_contiguous())?;
         require_contiguous(op, "gamma", gamma.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
+        if is_half {
+            self.runtime.require_nvrtc_half_headers(op)?;
+        }
 
         let rank = input.shape.len();
         if rank == 0 {
@@ -1038,7 +1138,7 @@ impl SkipSimplifiedLayerNormKernel {
                 gamma.shape
             )));
         }
-        let bias_ptr = optional_vec_ptr(op, "bias", bias, norm_size)?;
+        let bias_ptr = optional_norm_vec_ptr(op, "bias", bias, norm_size, is_half)?;
         let broadcast =
             onnx_runtime_ir::broadcast_shapes(input.shape, skip.shape).map_err(EpError::Ir)?;
         if broadcast != input.shape {
@@ -1057,11 +1157,31 @@ impl SkipSimplifiedLayerNormKernel {
             return Ok(());
         }
 
-        let (mean_ptr, invstd_ptr) = optional_stat_ptrs(op, outputs, num_groups)?;
+        // Optional Mean/InvStdDev stat outputs may be f16 in a half graph (they
+        // are typically unused). Track their precision so the kernel narrows.
+        let gamma_is_half = i32::from(gamma.dtype == DataType::Float16);
+        let bias_is_half = i32::from(bias.is_some_and(|b| b.dtype == DataType::Float16));
+        let (mean_ptr, invstd_ptr, stat_is_half) = if is_half {
+            let mean = optional_half_stat_ptr(op, "Mean", outputs, 1, num_groups)?;
+            let invstd = optional_half_stat_ptr(op, "InvStdDev", outputs, 2, num_groups)?;
+            let stat_half = i32::from(
+                outputs.get(1).is_some_and(|t| t.dtype == DataType::Float16)
+                    || outputs.get(2).is_some_and(|t| t.dtype == DataType::Float16),
+            );
+            (mean, invstd, stat_half)
+        } else {
+            let (mean, invstd) = optional_stat_ptrs(op, outputs, num_groups)?;
+            (mean, invstd, 0)
+        };
         let sum_ptr = match outputs.get_mut(3) {
             None => 0u64,
             Some(t) => {
-                require_f32(op, "input_skip_bias_sum", t.dtype)?;
+                if t.dtype != input.dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: input_skip_bias_sum dtype {:?} must match input dtype {:?}",
+                        t.dtype, input.dtype
+                    )));
+                }
                 if t.shape != input.shape {
                     return Err(EpError::KernelFailed(format!(
                         "cuda_ep {op}: input_skip_bias_sum shape {:?} must equal input shape {:?}",
@@ -1086,11 +1206,14 @@ impl SkipSimplifiedLayerNormKernel {
             .lock()
             .expect("cuda_ep skip normalization metadata cache poisoned");
         let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
-        let func = self.runtime.nvrtc_function(
-            SKIP_RMSNORM_MODULE,
-            SKIP_RMSNORM_SRC,
-            "skip_rmsnorm_f32",
-        )?;
+        let entry = if is_half {
+            "skip_rmsnorm_f16"
+        } else {
+            "skip_rmsnorm_f32"
+        };
+        let func = self
+            .runtime
+            .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, entry)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -1107,8 +1230,16 @@ impl SkipSimplifiedLayerNormKernel {
             .arg(&rank_i)
             .arg(&groups_i)
             .arg(&norm_i)
-            .arg(&has_bias)
-            .arg(&self.epsilon);
+            .arg(&has_bias);
+        if is_half {
+            builder
+                .arg(&gamma_is_half)
+                .arg(&bias_is_half)
+                .arg(&stat_is_half)
+                .arg(&self.epsilon);
+        } else {
+            builder.arg(&self.epsilon);
+        }
         // SAFETY: all pointers reference validated device buffers; metadata has
         // two rank-length u64 arrays describing the output shape and skip strides.
         let cfg = self.runtime.reduction_launch_config(
@@ -1117,7 +1248,7 @@ impl SkipSimplifiedLayerNormKernel {
             NORM_BLOCK,
             std::mem::size_of::<f32>() as u32,
         )?;
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         self.last_call_capture_safe
             .store(num_groups == 1, Ordering::Relaxed);
         Ok(())
@@ -1410,6 +1541,60 @@ fn optional_vec_ptr(
                 )));
             }
             Ok(cuptr(v.data_ptr::<u8>() as *const c_void))
+        }
+    }
+}
+
+/// Optional length-`expect` input vector accepting either f16 or f32 (used by
+/// the half normalization paths, which pass a per-tensor `*_is_half` flag).
+fn optional_norm_vec_ptr(
+    op: &str,
+    name: &str,
+    t: Option<&TensorView>,
+    expect: usize,
+    allow_half: bool,
+) -> Result<CUdeviceptr> {
+    match t {
+        None => Ok(0),
+        Some(v) => {
+            if allow_half {
+                require_f16_or_f32(op, name, v.dtype)?;
+            } else {
+                require_f32(op, name, v.dtype)?;
+            }
+            require_contiguous(op, name, v.is_contiguous())?;
+            if v.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    v.numel()
+                )));
+            }
+            Ok(cuptr(v.data_ptr::<u8>() as *const c_void))
+        }
+    }
+}
+
+/// Optional per-group stat output (Mean/InvStdDev) accepting f16 or f32. Half
+/// graphs frequently declare these unused outputs in the model's activation
+/// dtype; the kernel narrows the stat write to match.
+fn optional_half_stat_ptr(
+    op: &str,
+    name: &str,
+    outputs: &mut [TensorMut],
+    idx: usize,
+    expect: usize,
+) -> Result<CUdeviceptr> {
+    match outputs.get_mut(idx) {
+        None => Ok(0),
+        Some(t) => {
+            require_f16_or_f32(op, name, t.dtype)?;
+            if t.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    t.numel()
+                )));
+            }
+            Ok(cuptr(t.data_ptr_mut::<u8>() as *const c_void))
         }
     }
 }

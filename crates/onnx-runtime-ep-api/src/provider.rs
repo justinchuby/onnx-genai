@@ -339,13 +339,14 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
-    /// Launch an allocation-free device argmax over `elements` contiguous f32
-    /// values. `result` receives two native-endian u32 values: token id, then
-    /// the latching device capture-error bitmask.
+    /// Launch an allocation-free device argmax over `elements` contiguous
+    /// `dtype` values (Float32 or Float16). `result` receives two native-endian
+    /// u32 values: token id, then the latching device capture-error bitmask.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
         _elements: usize,
+        _dtype: DataType,
         _result: &mut DeviceBuffer,
     ) -> Result<()> {
         Err(EpError::KernelFailed(format!(

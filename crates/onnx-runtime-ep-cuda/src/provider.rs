@@ -328,9 +328,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         logits: &DeviceBuffer,
         elements: usize,
+        dtype: DataType,
         result: &mut DeviceBuffer,
     ) -> Result<()> {
-        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, result)
+        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, dtype, result)
     }
 
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
