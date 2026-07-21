@@ -77,6 +77,11 @@ __device__ float op_silu(float x) {
 __device__ float op_gelu(float x) {
     return x * 0.5f * (1.0f + erff(x * 0.7071067811865475f));
 }
+__device__ float op_gelu_tanh(float x) {
+    const float cube = x * x * x;
+    const float inner = 0.7978845608028654f * (x + 0.044715f * cube);
+    return x * 0.5f * (1.0f + tanhf(inner));
+}
 
 __device__ float op_add(float a, float b) { return a + b; }
 __device__ float op_sub(float a, float b) { return a - b; }
@@ -149,6 +154,7 @@ DEFINE_UNARY(erf, TYPE, SUFFIX) \
 DEFINE_UNARY(tanh, TYPE, SUFFIX) \
 DEFINE_UNARY(sigmoid, TYPE, SUFFIX) \
 DEFINE_UNARY(gelu, TYPE, SUFFIX) \
+DEFINE_UNARY(gelu_tanh, TYPE, SUFFIX) \
 DEFINE_BINARY(add, TYPE, SUFFIX) \
 DEFINE_BINARY(sub, TYPE, SUFFIX) \
 DEFINE_BINARY(mul, TYPE, SUFFIX) \
@@ -248,6 +254,7 @@ pub enum UnaryOp {
     Sigmoid,
     Silu,
     Gelu,
+    GeluTanh,
 }
 
 impl UnaryOp {
@@ -260,6 +267,7 @@ impl UnaryOp {
             UnaryOp::Sigmoid => "sigmoid",
             UnaryOp::Silu => "silu",
             UnaryOp::Gelu => "gelu",
+            UnaryOp::GeluTanh => "gelu_tanh",
         }
     }
 
@@ -277,6 +285,7 @@ impl UnaryOp {
             UnaryOp::Sigmoid => "Sigmoid",
             UnaryOp::Silu => "Silu",
             UnaryOp::Gelu => "Gelu",
+            UnaryOp::GeluTanh => "Gelu",
         }
     }
 }
@@ -352,6 +361,34 @@ impl KernelFactory for UnaryFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(UnaryKernel {
             op: self.op,
+            runtime: self.runtime.clone(),
+            last_capture_safe_signature: Mutex::new(None),
+        }))
+    }
+}
+
+/// Factory for standard-domain `Gelu` (since opset 20), including its
+/// `approximate` attribute.
+pub struct StandardGeluFactory {
+    pub runtime: Arc<CudaRuntime>,
+}
+
+impl KernelFactory for StandardGeluFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let op = match node.attr("approximate") {
+            None => UnaryOp::Gelu,
+            Some(attribute) => match attribute.as_str() {
+                Some("none") => UnaryOp::Gelu,
+                Some("tanh") => UnaryOp::GeluTanh,
+                _ => {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep Gelu: approximate must be 'none' or 'tanh'".into(),
+                    ));
+                }
+            },
+        };
+        Ok(Box::new(UnaryKernel {
+            op,
             runtime: self.runtime.clone(),
             last_capture_safe_signature: Mutex::new(None),
         }))
@@ -916,6 +953,7 @@ mod tests {
             UnaryOp::Sigmoid,
             UnaryOp::Silu,
             UnaryOp::Gelu,
+            UnaryOp::GeluTanh,
         ];
         for op in ops {
             // Every advertised entry must be present verbatim in the NVRTC source.

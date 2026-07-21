@@ -28,6 +28,7 @@ pub mod block_quantized_matmul;
 pub mod cast;
 pub mod compressed_sparse_attention;
 pub mod constant;
+pub mod constant_of_shape;
 pub mod conv;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
@@ -46,6 +47,7 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod movement;
 pub mod normalization;
+pub mod onehot;
 pub mod pointwise;
 pub mod pooling;
 pub mod qmoe;
@@ -62,7 +64,7 @@ pub mod topk;
 pub mod where_op;
 
 use activations::ActivationFactory;
-use elementwise::{BinaryFactory, BinaryOp, UnaryFactory, UnaryOp};
+use elementwise::{BinaryFactory, BinaryOp, StandardGeluFactory, UnaryFactory, UnaryOp};
 use pointwise::{
     CmpFactory, CmpOp, LogicalFactory, LogicalOp, NotFactory, UnaryMathFactory, UnaryMathOp,
 };
@@ -71,9 +73,10 @@ use pointwise::{
 ///
 /// * **GEMM family** — `MatMul`, `Gemm`, `FusedMatMulBias`, and `FusedGemm`
 ///   (cuBLASLt; the fused ops use native bias/activation epilogues).
-/// * **Elementwise unary** — `Relu`, `Sqrt`, `Erf`, `Tanh` (+ `Sigmoid`) and the
-///   `com.microsoft` `Gelu`/`Silu`, via runtime-compiled NVRTC kernels (`Silu`
-///   matches the CPU EP's f32 coverage; the others support f32/f16/bf16).
+/// * **Elementwise unary** — `Relu`, `Sqrt`, `Erf`, `Tanh` (+ `Sigmoid`),
+///   standard and `com.microsoft` `Gelu`, and `com.microsoft` `Silu`, via
+///   runtime-compiled NVRTC kernels (`Silu` matches the CPU EP's f32 coverage;
+///   the others support f32/f16/bf16).
 /// * **Elementwise binary (NumPy broadcasting)** — `Add`, `Sub`, `Mul`, `Div`,
 ///   `Pow`, `Min`, `Max`, via f32/f16/bf16 NVRTC kernels.
 /// * **Attention** — the SDPA/GQA baseline (`com.microsoft` domain; cuBLAS
@@ -173,6 +176,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Gather",
     "Shape",
     "Constant",
+    "ConstantOfShape",
     "Concat",
     "Expand",
     "Reshape",
@@ -187,6 +191,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "CumSum",
     "GatherElements",
     "ScatterElements",
+    "OneHot",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -261,6 +266,21 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("ConstantOfShape", "", 9),
+        Box::new(constant_of_shape::ConstantOfShapeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for (opset, wrap_negative) in [(9, false), (11, true)] {
+        reg.register(
+            OpKey::new("OneHot", "", opset),
+            Box::new(onehot::OneHotFactory {
+                runtime: runtime.clone(),
+                wrap_negative,
+            }),
+        );
+    }
     for (op_type, factory) in [
         (
             "Concat",
@@ -395,8 +415,9 @@ pub fn build_cuda_registry_with_metrics(
         );
     }
 
-    // Elementwise unary activations (NVRTC pointwise). `Gelu` and `Silu` are
-    // `com.microsoft` contrib ops; all activations run f32/f16/bf16 on the EP.
+    // Elementwise unary activations (NVRTC pointwise). The loop includes the
+    // contrib Gelu/Silu forms; standard Gelu is registered separately below so
+    // its `approximate` attribute can select exact-erf or tanh semantics.
     for (op_type, domain, op) in [
         ("Relu", "", UnaryOp::Relu),
         ("Sqrt", "", UnaryOp::Sqrt),
@@ -414,6 +435,12 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    reg.register(
+        OpKey::new("Gelu", "", 20),
+        Box::new(StandardGeluFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // CUDA Wave 4 — attribute-driven f32/f16/bf16 activations.
     for op_type in [
@@ -676,18 +703,24 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 85);
+        assert_eq!(CUDA_COVERED_OPS.len(), 87);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
             assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
         }
+    }
 
-        #[test]
-        fn indexing_and_scan_ops_are_listed_in_coverage() {
-            for op in ["TopK", "CumSum", "GatherElements", "ScatterElements"] {
-                assert!(CUDA_COVERED_OPS.contains(&op));
-            }
+    #[test]
+    fn indexing_and_scan_ops_are_listed_in_coverage() {
+        for op in [
+            "TopK",
+            "CumSum",
+            "GatherElements",
+            "ScatterElements",
+            "OneHot",
+        ] {
+            assert!(CUDA_COVERED_OPS.contains(&op));
         }
     }
 

@@ -4,7 +4,7 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
     let result = match node.op_type.as_str() {
@@ -17,6 +17,9 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "ScatterElements" => scatter_elements(node, input_dtypes),
         "Where" => where_op(node, input_dtypes),
         "Expand" => expand(node, input_dtypes),
+        "ConstantOfShape" => constant_of_shape(node, input_dtypes),
+        "Gelu" => gelu(node, input_dtypes),
+        "OneHot" => one_hot(node, input_dtypes),
         _ => return None,
     };
     result
@@ -240,4 +243,58 @@ fn expand(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
     require_fixed_width(input_dtypes, 0, "input")?;
     require_dtype(input_dtypes, 1, DataType::Int64, "shape")
+}
+
+fn constant_of_shape(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_dtype(input_dtypes, 0, DataType::Int64, "input")?;
+    let Some(attribute) = node.attr("value") else {
+        return Ok(());
+    };
+    let Attribute::Tensor(tensor) = attribute else {
+        return Err("attribute 'value' must be a tensor".into());
+    };
+    if tensor.numel() != 1 {
+        return Err("attribute 'value' must contain exactly one element".into());
+    }
+    if tensor.dtype.is_float() || tensor.dtype.is_int() || tensor.dtype == DataType::Bool {
+        Ok(())
+    } else {
+        Err(format!(
+            "attribute 'value' dtype {:?} unsupported; expected numeric or bool",
+            tensor.dtype
+        ))
+    }
+}
+
+fn gelu(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float16, DataType::Float32, DataType::BFloat16],
+        "X",
+    )?;
+    match node.attr("approximate") {
+        None => Ok(()),
+        Some(attribute) if matches!(attribute.as_str(), Some("none" | "tanh")) => Ok(()),
+        Some(_) => Err("attribute 'approximate' must be 'none' or 'tanh'".into()),
+    }
+}
+
+fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 3, 1, 1)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Int32, DataType::Int64],
+        "indices",
+    )?;
+    require_one_of(
+        input_dtypes,
+        1,
+        &[DataType::Int32, DataType::Int64],
+        "depth",
+    )?;
+    require_fixed_width(input_dtypes, 2, "values")
 }
