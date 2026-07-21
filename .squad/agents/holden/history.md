@@ -123,3 +123,4 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T13:15:00Z — GQA metadata-fold review
 - 🟢 Approved Luv’s batch-1 metadata fold after verifying exact metadata parity, poison/latch safety, capture behavior, portability, zero fallbacks, and the independent throughput win.
+- 2026-07-21T23:55Z — Revised DS-1 with dtype/rank/element-cap materialization gates after Gaff rejection; Pris approved the landed path.

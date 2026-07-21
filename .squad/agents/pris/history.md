@@ -117,3 +117,4 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T13:15:00Z — MatMul fusion review
 - 🟢 Approved Rachael’s QKV-bias and paired gate/up+SwiGLU fusion after bit-exactness, misfire guards, portability, capture safety, and H200 performance checks; stacked throughput reached ~759 tok/s at 256 and ~789 at 1024.
+- 2026-07-21T23:55Z — Approved WP2 revised native image processor, DS-1 bounded shape propagation, and related dtype/opset reviews for the segment.

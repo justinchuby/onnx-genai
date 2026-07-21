@@ -105,3 +105,4 @@ Recorded the integration rejection and subsequent approval after dependency meta
 - Drove multi-round capture-safety review to final green: required real replay coverage, exact elementwise signatures, GQA detect-before-consume poisoning, and corrected Qwen smoke assertions before the zero-fallback M4 track landed.
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+- 2026-07-21T23:55Z — WP2 rejection/lockout and ScatterElements review were recorded; final WP2 acceptance came through Pris after Sapper revision.

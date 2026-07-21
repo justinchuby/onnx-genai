@@ -102,3 +102,4 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T13:15:00Z — MatMul-adjacent fusion landed
 - Added guarded QKV-bias folding and paired gate/up+SwiGLU with two-op-exact fp16 rounding. Pris approved; merged as `102fee9`, saving ~72 launches/token and stacking to ~759/~789 tok/s.
+- 2026-07-21T23:55Z — WP0 Default-derived hotfix restored downstream source compatibility after the typed multimodal metadata contract landed.
