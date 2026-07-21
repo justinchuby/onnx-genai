@@ -576,6 +576,75 @@ impl PipelineEngine {
             None => None,
         };
 
+        // Resolve the optional prefill embedder's pooled outputs (it ran as a
+        // prompt-phase component above, seeded with the tokenized prompt via
+        // `seed_prompt_token_inputs`). `prefill_embeds` [1, prefill_len, hidden]
+        // seeds the talker's frame-0 `inputs_embeds` DIRECTLY (multi-position
+        // PREFILL); `trailing_text_embeds` [1, trailing_len, hidden] supplies one
+        // `text_embed` vector per outer frame `k >= 1` (fed through the
+        // pre-embedder). Only valid alongside `pre_embedder`.
+        let prefill = match plan.prefill_embedder.as_ref() {
+            Some(component) => {
+                let pre = pre_embed.as_ref().with_context(|| {
+                    format!(
+                        "nested prefill_embedder '{component}' requires a pre_embedder to be set"
+                    )
+                })?;
+                let session = self.models.session(component).with_context(|| {
+                    format!("nested prefill_embedder '{component}' was not loaded")
+                })?;
+                // The prefill component exposes two float outputs: the
+                // multi-position prefill sequence and the trailing-text vectors.
+                // Resolve by name (`prefill_embeds` / `trailing_text_embeds`),
+                // falling back to declaration order for the unmatched port.
+                let prefill_name = resolve_prefill_output(session, "prefill", 0)?;
+                let trailing_name = resolve_prefill_output(session, "trailing", 1)?;
+                let prefill_value = tensors
+                    .get(&format!("{component}.{prefill_name}"))
+                    .with_context(|| {
+                        format!(
+                            "nested prefill_embedder '{component}' produced no pooled \
+                             '{prefill_name}' output (did it run in the prompt phase?)"
+                        )
+                    })?;
+                let prefill_len = match prefill_value.shape() {
+                    [1, p, _] if *p > 0 => *p as usize,
+                    other => anyhow::bail!(
+                        "nested prefill_embedder '{component}' '{prefill_name}' must be \
+                         [1, prefill_len, hidden]; got {other:?}"
+                    ),
+                };
+                let prefill_embeds = clone_value(prefill_value)?;
+                let trailing_value = tensors
+                    .get(&format!("{component}.{trailing_name}"))
+                    .with_context(|| {
+                        format!(
+                            "nested prefill_embedder '{component}' produced no pooled \
+                             '{trailing_name}' output (did it run in the prompt phase?)"
+                        )
+                    })?;
+                let trailing_len = match trailing_value.shape() {
+                    [1, t, h] if *h as usize == pre.hidden => *t as usize,
+                    other => anyhow::bail!(
+                        "nested prefill_embedder '{component}' '{trailing_name}' must be \
+                         [1, trailing_len, {}]; got {other:?}",
+                        pre.hidden
+                    ),
+                };
+                let trailing = trailing_value.to_vec_f32_lossy().map_err(|e| {
+                    anyhow::anyhow!("failed to read trailing_text_embeds tensor: {e}")
+                })?;
+                Some(ResolvedPrefill {
+                    prefill_embeds,
+                    prefill_len,
+                    trailing,
+                    trailing_len,
+                    hidden: pre.hidden,
+                })
+            }
+            None => None,
+        };
+
         // The inner decoder's per-code embedding output: its sole output that is
         // neither logits nor a present-KV tensor. Threaded into the next inner
         // step's seed input.
@@ -609,27 +678,60 @@ impl PipelineEngine {
         for _frame in 0..plan.max_frames {
             // --- Outer talker step: one audio frame. ---
             let outer_outputs = if let Some(pre) = &pre_embed {
-                // Build this frame's `frame_codes` from the previous frame's code
-                // tuple (frame 0 uses a zero seed — real prompt-embeds prefill is
-                // a follow-up), run the pre-embedder to materialize the talker's
-                // `inputs_embeds`, and feed it as a single-position extra input.
-                let frame_codes = prev_frame_codes
-                    .clone()
-                    .unwrap_or_else(|| vec![0i64; plan.num_code_groups]);
-                let inputs_embeds = run_pre_embedder(pre, &frame_codes)?;
+                // Build (or, on frame 0 with a prefill embedder, look up) the
+                // talker's per-step `inputs_embeds`.
+                let (inputs_embeds, positions) = if let Some(prefill) =
+                    prefill.as_ref().filter(|_| _frame == 0)
+                {
+                    // Frame 0 PREFILL: feed the prefill embedder's multi-position
+                    // `prefill_embeds` DIRECTLY to the talker (do NOT run the
+                    // pre-embedder), advancing the KV past by `prefill_len`.
+                    (clone_value(&prefill.prefill_embeds)?, prefill.prefill_len)
+                } else {
+                    // Build this frame's `frame_codes` from the previous frame's
+                    // code tuple (frame 0 without a prefill embedder uses a zero
+                    // seed), run the pre-embedder to materialize a single-position
+                    // `inputs_embeds`. With a prefill embedder, frames `k >= 1`
+                    // feed `text_embed = trailing_text_embeds[:, k-1, :]` (zeros
+                    // once the trailing text is exhausted — a close stand-in for
+                    // the reference's tts_pad embedding; exact tts_pad is a
+                    // documented refinement).
+                    let frame_codes = prev_frame_codes
+                        .clone()
+                        .unwrap_or_else(|| vec![0i64; plan.num_code_groups]);
+                    let text_embed = match prefill.as_ref() {
+                        Some(prefill) => {
+                            let idx = _frame - 1;
+                            let hidden = prefill.hidden;
+                            let slice = if idx < prefill.trailing_len {
+                                prefill.trailing[idx * hidden..(idx + 1) * hidden].to_vec()
+                            } else {
+                                vec![0.0f32; hidden]
+                            };
+                            Some(slice)
+                        }
+                        None => None,
+                    };
+                    (run_pre_embedder(pre, &frame_codes, text_embed.as_deref())?, 1)
+                };
                 let mut step_extras = Vec::with_capacity(outer_extras.len() + 1);
                 for (name, value) in &outer_extras {
                     step_extras.push((name.clone(), clone_value(value)?));
                 }
                 step_extras.push((pre.outer_input.clone(), inputs_embeds));
+                // Match the token-position count to the fed `inputs_embeds`
+                // sequence length so any position_ids/attention_mask the talker
+                // exposes stay consistent (the talker itself is embeds-driven and
+                // ignores the token ids).
+                let position_tokens = vec![0u32; positions];
                 let outputs = run_decode_step_with_extra(
                     outer_session,
                     &mut outer_state,
-                    &[0],
+                    &position_tokens,
                     outer_past_len,
                     &step_extras,
                 )?;
-                outer_past_len += 1;
+                outer_past_len += positions;
                 outputs
             } else {
                 let outputs = run_decode_step_with_extra(
@@ -1873,6 +1975,14 @@ struct NestedAutoregressivePlan {
     /// talker's per-step `inputs_embeds` from the PREVIOUS frame's codes through
     /// the named pre-embedder component (see [`PreEmbedderBinding`]).
     pre_embedder: Option<PreEmbedderBinding>,
+    /// Optional prefill-embedder component name (a declared model), driving the
+    /// talker's real frame-0 PREFILL sequence and per-frame trailing-text
+    /// conditioning. Only valid alongside `pre_embedder`. When `Some`, the driver
+    /// looks up this prompt-phase component's pooled `prefill_embeds` /
+    /// `trailing_text_embeds` outputs (see the runtime resolution in
+    /// [`PipelineEngine::run_nested_autoregressive`]). When `None`, frame 0 uses a
+    /// zero seed and every `text_embed` is zero (backward compatible).
+    prefill_embedder: Option<String>,
     dataflow: Vec<DataflowEdge>,
 }
 
@@ -3408,6 +3518,44 @@ impl PipelinePlan {
         };
         let pre_embedder_component = pre_embedder.as_ref().map(|p| p.component.clone());
 
+        // Optional prefill-embedder: supplies the talker's real frame-0 PREFILL
+        // sequence (`prefill_embeds`) and per-frame trailing-text conditioning
+        // (`trailing_text_embeds`), both materialized from the tokenized prompt.
+        // It runs as an ordinary prompt-phase component (`run_on: prompt_only` /
+        // `on_demand`); the driver reads its pooled outputs after the prompt
+        // phase. It must be a declared model distinct from the loop decoders and
+        // the pre-embedder, and only makes sense alongside a `pre_embedder` (the
+        // trailing-text vectors are threaded through it on frames >= 1).
+        let prefill_embedder = match nested.prefill_embedder.as_deref() {
+            Some(name) => {
+                if !spec.models.contains_key(name) {
+                    anyhow::bail!(
+                        "nested_autoregressive prefill_embedder '{name}' is not declared in models"
+                    );
+                }
+                if name == outer || name == inner {
+                    anyhow::bail!(
+                        "nested_autoregressive prefill_embedder '{name}' must be distinct from \
+                         the outer/inner decoders"
+                    );
+                }
+                if pre_embedder_component.as_deref() == Some(name) {
+                    anyhow::bail!(
+                        "nested_autoregressive prefill_embedder '{name}' must be distinct from \
+                         the pre_embedder"
+                    );
+                }
+                if pre_embedder.is_none() {
+                    anyhow::bail!(
+                        "nested_autoregressive prefill_embedder '{name}' requires a 'pre_embedder' \
+                         (frames >= 1 thread its trailing-text vectors through the pre-embedder)"
+                    );
+                }
+                Some(name.to_string())
+            }
+            None => None,
+        };
+
         // Prompt-phase (`prompt_only`) and post-decode (`final_only`) components,
         // treating both loop decoders as loop components (neither pre nor post).
         let mut prompt_components = Vec::new();
@@ -3445,6 +3593,7 @@ impl PipelinePlan {
             prompt_components,
             post_decode_components,
             pre_embedder,
+            prefill_embedder,
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -3894,21 +4043,80 @@ struct ResolvedPreEmbedder<'a> {
     outer_input: String,
     /// Pre-embedder input receiving the previous frame's codes (int64 `[1, G]`).
     frame_codes_input: String,
-    /// Optional trailing-text input; fed zeros for now (documented follow-up).
+    /// Optional trailing-text input. Fed the prefill embedder's per-frame
+    /// `trailing_text_embeds` slice when a `prefill_embedder` is set, else zeros.
     text_embed_input: Option<String>,
-    /// Embedding hidden size for the emitted `inputs_embeds` / zero `text_embed`.
+    /// Embedding hidden size for the emitted `inputs_embeds` / `text_embed`.
     hidden: usize,
+}
+
+/// The optional prefill embedder's resolved, pooled outputs: the talker's
+/// frame-0 multi-position PREFILL sequence and the per-frame trailing-text
+/// vectors consumed as the pre-embedder's `text_embed` on frames `k >= 1`.
+struct ResolvedPrefill {
+    /// `prefill_embeds` [1, prefill_len, hidden]: the talker's frame-0 seed.
+    prefill_embeds: Value,
+    /// Number of prefill positions (`prefill_embeds.shape()[1]`).
+    prefill_len: usize,
+    /// Flattened `trailing_text_embeds` [1, trailing_len, hidden] as row-major
+    /// f32 (`trailing[i*hidden..(i+1)*hidden]` is the vector for frame `i + 1`).
+    trailing: Vec<f32>,
+    /// Number of trailing-text vectors (`trailing_text_embeds.shape()[1]`).
+    trailing_len: usize,
+    /// Embedding hidden size (matches the pre-embedder's `hidden`).
+    hidden: usize,
+}
+
+/// Resolve one of the prefill embedder's two float outputs by name substring
+/// (`prefill` / `trailing`), falling back to declaration order (`fallback_idx`)
+/// among its float outputs.
+fn resolve_prefill_output(
+    session: &Session,
+    needle: &str,
+    fallback_idx: usize,
+) -> anyhow::Result<String> {
+    let float_outputs: Vec<&str> = session
+        .outputs()
+        .iter()
+        .filter(|info| {
+            matches!(
+                info.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            )
+        })
+        .map(|info| info.name.as_str())
+        .collect();
+    if let Some(name) = float_outputs
+        .iter()
+        .find(|name| name.to_ascii_lowercase().contains(needle))
+    {
+        return Ok((*name).to_string());
+    }
+    float_outputs
+        .get(fallback_idx)
+        .map(|name| (*name).to_string())
+        .with_context(|| {
+            format!(
+                "prefill embedder must expose a float '{needle}' output (or at least \
+                 {} float outputs); found {float_outputs:?}",
+                fallback_idx + 1
+            )
+        })
 }
 
 /// Build the outer talker's per-step `inputs_embeds` by running the codec-sum
 /// pre-embedder over one frame's `frame_codes` (`[outer_code_0, inner_code_1,
 /// ..., inner_code_{G-1}]`). Returns a `[1, 1, hidden]` embedding.
 ///
-/// TODO(any-to-any): the pre-embedder's `text_embed` (trailing-text
-/// conditioning) input is fed a zero `[1, 1, hidden]` tensor for now. Real
-/// trailing-text threading (and full prefill-embeds materialization on frame 0)
-/// is a deliberate follow-up.
-fn run_pre_embedder(pre: &ResolvedPreEmbedder<'_>, frame_codes: &[i64]) -> anyhow::Result<Value> {
+/// When `text_embed` is `Some`, that `[hidden]` slice is fed as the
+/// trailing-text conditioning input (the prefill embedder's per-frame
+/// `trailing_text_embeds` vector). When `None`, a zero `[1, 1, hidden]` tensor is
+/// fed (the backward-compatible no-prefill_embedder path).
+fn run_pre_embedder(
+    pre: &ResolvedPreEmbedder<'_>,
+    frame_codes: &[i64],
+    text_embed: Option<&[f32]>,
+) -> anyhow::Result<Value> {
     let mut inputs: Vec<(String, Value)> = Vec::with_capacity(2);
     inputs.push((
         pre.frame_codes_input.clone(),
@@ -3922,11 +4130,14 @@ fn run_pre_embedder(pre: &ResolvedPreEmbedder<'_>, frame_codes: &[i64]) -> anyho
             .find(|info| &info.name == name)
             .map(|info| info.dtype)
             .unwrap_or(DataType::Float32);
-        let zeros = vec![0.0f32; pre.hidden];
+        let data = match text_embed {
+            Some(slice) => slice.to_vec(),
+            None => vec![0.0f32; pre.hidden],
+        };
         inputs.push((
             name.clone(),
-            Value::from_f32_slice_as(&zeros, &[1, 1, pre.hidden as i64], dtype)
-                .map_err(|e| anyhow::anyhow!("failed to build zero text_embed: {e}"))?,
+            Value::from_f32_slice_as(&data, &[1, 1, pre.hidden as i64], dtype)
+                .map_err(|e| anyhow::anyhow!("failed to build text_embed: {e}"))?,
         ));
     }
     let refs = inputs
@@ -4215,6 +4426,7 @@ pipeline:
                 inner: None,
                 num_code_groups: None,
                 pre_embedder: None,
+                prefill_embedder: None,
                 stages: vec![
                     PipelineStrategyStage {
                         name: "encode".to_string(),
@@ -4241,6 +4453,7 @@ pipeline:
                             inner: None,
                             num_code_groups: None,
                             pre_embedder: None,
+                            prefill_embedder: None,
                             stages: vec![],
                         }),
                         run_on: Some(PhaseRunOn::PromptOnly),
@@ -4270,6 +4483,7 @@ pipeline:
                             inner: None,
                             num_code_groups: None,
                             pre_embedder: None,
+                            prefill_embedder: None,
                             stages: vec![],
                         }),
                         run_on: Some(PhaseRunOn::EveryStep),
@@ -4331,6 +4545,7 @@ pipeline:
             inner: None,
             num_code_groups: None,
             pre_embedder: None,
+            prefill_embedder: None,
             stages: vec![],
         }
     }

@@ -1613,8 +1613,10 @@ fn ensure_i64(info: &TensorInfo) -> anyhow::Result<()> {
 pub(crate) fn is_token_input_name(lower_name: &str) -> bool {
     lower_name == "input_ids"
         || lower_name == "decoder_input_ids"
+        || lower_name == "text_ids"
         || lower_name.ends_with(".input_ids")
         || lower_name.ends_with(".decoder_input_ids")
+        || lower_name.ends_with(".text_ids")
 }
 
 fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {

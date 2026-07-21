@@ -1,0 +1,72 @@
+# Tiny PREFILL + TRAILING-TEXT pre-embedder-driven nested-autoregressive
+# (multi-decoder TTS) fixture. Built by scripts/build_tiny_tts_nested_prefill.py;
+# exercises the OPTIONAL `prefill_embedder` extension of the nested_autoregressive
+# contract (DESIGN.md §20.3). A `talker_prefill_embedder` (prompt_only) maps the
+# tokenized prompt `text_ids` -> `prefill_embeds` (the talker's frame-0
+# multi-position PREFILL sequence, fed DIRECTLY on frame 0) + `trailing_text_embeds`
+# (one vector per outer frame k>=1, fed as the pre-embedder's `text_embed`). The
+# per-frame `talker_step_embedder` pre-embedder and the inner code_predictor loop
+# are unchanged from tiny-tts-nested-preembed.
+pipeline:
+  models:
+    talker:
+      filename: talker.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+    talker_prefill_embedder:
+      filename: talker_prefill_embedder.onnx.textproto
+      type: embedding
+    talker_step_embedder:
+      filename: talker_step_embedder.onnx.textproto
+      type: embedding
+    code_predictor:
+      filename: code_predictor.onnx.textproto
+      type: decoder
+    vocoder:
+      filename: vocoder.onnx.textproto
+      type: vocoder
+  dataflow:
+    # Per-step pre-embedder feed: the talker's inputs_embeds each frame (k>=1).
+    - from: talker_step_embedder.inputs_embeds
+      to: talker.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+    # Per-frame hidden binding: inner step 0 seed.
+    - from: talker.last_hidden_state
+      to: code_predictor.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+    # Assembled per-frame codes -> vocoder.
+    - from: talker.output_codes
+      to: vocoder.codes
+      dtype: int64
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: generate_codes
+        strategy:
+          kind: nested_autoregressive
+          outer: talker
+          inner: code_predictor
+          pre_embedder: talker_step_embedder
+          prefill_embedder: talker_prefill_embedder
+          num_code_groups: 4
+          max_tokens: 2
+        run_on: every_step
+      - name: vocode
+        strategy:
+          kind: single_pass
+          model: vocoder
+        run_on: final_only
+  phases:
+    talker:
+      run_on: every_step
+    talker_prefill_embedder:
+      run_on: prompt_only
+    talker_step_embedder:
+      run_on: on_demand
+    code_predictor:
+      run_on: every_step
+    vocoder:
+      run_on: final_only

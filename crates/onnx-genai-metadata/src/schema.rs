@@ -743,6 +743,27 @@ pub struct PipelineStrategy {
     /// When absent the outer loop is `input_ids`-driven (backward compatible).
     #[serde(default)]
     pub pre_embedder: Option<String>,
+
+    /// Optional prefill embedder component that supplies the outer decoder
+    /// (talker) with its real frame-0 PREFILL sequence and the per-frame
+    /// trailing-text conditioning of a `nested_autoregressive` stage.
+    ///
+    /// The real Qwen3-TTS talker is prefilled with a multi-position embedding
+    /// sequence built from the tokenized prompt, and each subsequent frame is
+    /// conditioned on one trailing-text embedding. This component materializes
+    /// both from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs
+    /// `prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the
+    /// talker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,
+    /// trailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`
+    /// as the pre-embedder's `text_embed`). It runs once in the prompt phase
+    /// (`run_on: prompt_only`); its `text_ids` input is auto-seeded from the
+    /// tokenized prompt.
+    ///
+    /// Only meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`
+    /// path feeds the trailing-text vectors through it). When absent, frame 0
+    /// uses a zero seed and every `text_embed` is zero (backward compatible).
+    #[serde(default)]
+    pub prefill_embedder: Option<String>,
 }
 
 /// Named child stage of a composite pipeline strategy.
