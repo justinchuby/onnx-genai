@@ -32,30 +32,50 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      - name: Run clippy on the portable runtime
+      # Keep every warning-producing pure/offline crate here so clippy still
+      # reports its debt without weakening the existing gate. Move a crate to
+      # the enforced step once this exact command passes with `-D warnings`.
+      - name: Run clippy (advisory) on warning-producing offline crates
         continue-on-error: true
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
           -p onnx-runtime-ep-cpu
+          -p onnx-runtime-optimizer
           -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
           -p onnx-runtime-session
-          -p onnx-runtime-tracer
+          -p onnx-rs
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-rs-python
           -- -D warnings
 
-      # Enforced (blocking) clippy for crates that are already warning-clean.
-      # These are the pure (no native-ORT) crates central to the GenAI layer —
-      # in particular onnx-genai-metadata carries the pipeline/inference-metadata
-      # schema + validation. Keep this list to crates that pass `-D warnings`;
-      # expand it as more crates are cleaned. (onnx-genai-engine/-ort still have
-      # transitive warnings — tracked with the repo-wide clippy cleanup above.)
-      - name: Run clippy (enforced) on clean GenAI crates
+      # Enforced clippy covers every warning-clean crate whose default dependency
+      # tree is offline (no onnx-genai-ort-sys and no CUDA runtime). Add a new
+      # offline crate here if its per-package `--all-targets -D warnings` run is
+      # clean; otherwise add it to the advisory step above. mlas-sys is Linux-only,
+      # which is fine in this ubuntu quality job.
+      - name: Run clippy (enforced) on clean offline crates
         run: >-
           cargo clippy --locked --all-targets
+          -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
           -p onnx-genai-kv
+          -p onnx-runtime-protocol-trace
+          -p mlas-sys
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ir
+          -p onnx-runtime-quantization
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
           -- -D warnings
 
   rust-portable:
@@ -87,17 +107,47 @@ jobs:
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
 
-      # Keep this list on the pure/offline runtime path. A workspace build also
-      # selects ort-sys, whose bootstrap downloads the native ORT distribution.
-      - name: Test portable CPU runtime
+      # Never replace these explicit packages with bare `cargo test` or
+      # `--workspace`: that selects onnx-genai-ort-sys, whose build script
+      # downloads a native ONNX Runtime distribution. Add a crate here only
+      # after `cargo tree -p <crate> -e normal,dev` confirms no ort-sys,
+      # onnx-runtime-ep-cuda, or cudarc dependency. CUDA tests stay compile-only
+      # below because GitHub-hosted runners have no GPU.
+      - name: Test cross-platform offline crates
         run: >-
           cargo test --locked
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
           -p onnx-runtime-ir
           -p onnx-runtime-ep-api
           -p onnx-runtime-ep-cpu
           -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
           -p onnx-runtime-session
           -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-rs
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-rs-python
+
+      # The vendored MLAS feasibility spike is offline, but its build script is
+      # intentionally x86_64 Linux-only (GAS assembly and Linux headers).
+      - name: Test Linux-only offline crates
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p mlas-sys
 
   coverage:
     name: Rust coverage
@@ -123,21 +173,34 @@ jobs:
       - name: Collect Rust coverage
         run: >-
           cargo llvm-cov --locked --codecov --output-path codecov.json
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
           -p onnx-runtime-ir
           -p onnx-runtime-ep-api
           -p onnx-runtime-ep-cpu
+          -p mlas-sys
           -p onnx-runtime-loader
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
           -p onnx-std
           -p onnx-runtime-shape-inference
           -p onnx-runtime-optimizer
           -p onnx-runtime-quantization
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-rs
+          -p onnx-genai-router
           -p onnx-runtime-memory
           -p onnx-runtime-cpuinfo
-          -p onnx-genai-genai-config
-          -p onnx-genai-metadata
-          -p onnx-genai-runtime-config
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-rs-python
 
       - name: Upload coverage to Codecov
         if: always()
@@ -168,8 +231,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit.
-      # This lane intentionally excludes macOS, where CUDA is unsupported.
+      # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit,
+      # but ep-cuda tests require a CUDA runtime/GPU and must not join the
+      # portable test lane. This lane intentionally excludes macOS, where CUDA
+      # is unsupported. ORT-linked crates also stay out of portable tests because
+      # onnx-genai-ort-sys downloads native ORT; onnx-runtime-python's feature
+      # check here provides compile coverage for that integration path.
       - name: Check CUDA execution provider and Python feature
         run: >-
           cargo check --locked
