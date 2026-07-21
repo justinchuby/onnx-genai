@@ -1256,7 +1256,7 @@ mod tests {
         use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
         use onnx_runtime_ir::{DataType, DeviceId, DeviceType};
 
-        let buf = vec![0.0f32; 8];
+        let buf = [0.0f32; 8];
         let shape = [2usize, 2];
         let strides = compute_contiguous_strides(&shape);
         let base = buf.as_ptr() as usize;
@@ -1313,7 +1313,7 @@ mod tests {
 
         // A = [[1,2],[3,4]] shared with C; B = column swap so C = [[2,1],[4,3]].
         let mut shared = vec![1.0f32, 2.0, 3.0, 4.0];
-        let b_buf = vec![0.0f32, 1.0, 1.0, 0.0];
+        let b_buf = [0.0f32, 1.0, 1.0, 0.0];
         let shape = vec![2usize, 2];
         let strides = compute_contiguous_strides(&shape);
         let a_ptr = shared.as_ptr() as *const std::ffi::c_void;

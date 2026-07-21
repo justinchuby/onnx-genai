@@ -195,7 +195,7 @@ impl Kernel for QMoEKernel {
                 self.attributes.k
             )));
         }
-        if hidden % self.block_size != 0 {
+        if !hidden.is_multiple_of(self.block_size) {
             return Err(error(format!(
                 "hidden_size {hidden} must be divisible by block_size {}",
                 self.block_size
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn route_first_preserves_exact_accumulation_order_for_top_k() {
         let _guard = metrics_test_lock().lock().expect("metrics test lock");
-        let input = pseudo_random_values(4 * 16, 0xa11c_e55);
+        let input = pseudo_random_values(4 * 16, 0x0a11_ce55);
         let router = pseudo_random_values(4 * 4, 0x5151_5151);
         let baseline = run_mmap_qmoe_with_k(false, false, &input, &router, 3);
         reset_offload_test_state(0);

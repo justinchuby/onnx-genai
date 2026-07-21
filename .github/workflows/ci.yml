@@ -25,57 +25,46 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      # TODO(xplat): flip to blocking after the repo-wide fmt sweep + clippy cleanup lands
-      # (tracked: repo-fmt-sweep todo). In-flight Rust branches make a global reformat
-      # conflict-heavy right now.
+      # Formatting is the one tracked quality-gate exception while the repo-wide
+      # fmt sweep is in flight; warnings are blocking below.
       - name: Check formatting
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      # Keep every warning-producing pure/offline crate here so clippy still
-      # reports its debt without weakening the existing gate. Move a crate to
-      # the enforced step once this exact command passes with `-D warnings`.
-      - name: Run clippy (advisory) on warning-producing offline crates
-        continue-on-error: true
-        run: >-
-          cargo clippy --locked --all-targets
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-session
-          -p onnx-rs
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-rs-python
-          -- -D warnings
-
-      # Enforced clippy covers every warning-clean crate whose default dependency
-      # tree is offline (no onnx-genai-ort-sys and no CUDA runtime). Add a new
-      # offline crate here if its per-package `--all-targets -D warnings` run is
-      # clean; otherwise add it to the advisory step above. mlas-sys is Linux-only,
-      # which is fine in this ubuntu quality job.
-      - name: Run clippy (enforced) on clean offline crates
+      # Rust warnings are errors: clippy is blocking for every pure/offline crate.
+      # To add a crate, first confirm its normal+dev dependency tree contains no
+      # ort-sys/CUDA dependency, then add it here and to the portable test lane.
+      # mlas-sys is Linux-only, which is fine in this ubuntu quality job.
+      - name: Run clippy on all offline crates
         run: >-
           cargo clippy --locked --all-targets
           -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
           -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
           -p onnx-runtime-protocol-trace
           -p mlas-sys
           -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
           -p onnx-runtime-ir
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
           -p onnx-runtime-quantization
           -p onnx-runtime-tracer
+          -p onnx-runtime-session
           -p onnx-genai-preprocess
+          -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory
           -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
+          -p onnx-std-python
           -- -D warnings
 
   rust-portable:
@@ -94,6 +83,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
+      # rustc warnings are errors on every portable test build, including the
+      # Linux-only mlas-sys step below.
+      RUSTFLAGS: "-D warnings"
 
     steps:
       - uses: actions/checkout@v5
@@ -133,7 +125,7 @@ jobs:
           -p onnx-runtime-session
           -p onnx-runtime-tracer
           -p onnx-genai-preprocess
-          -p onnx-rs
+          -p onnx-std
           -p onnx-genai-router
           -p onnx-runtime-memory
           -p onnx-runtime-cpuinfo
@@ -141,7 +133,7 @@ jobs:
           -p onnx-runtime-capi
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
-          -p onnx-rs-python
+          -p onnx-std-python
 
       # The vendored MLAS feasibility spike is offline, but its build script is
       # intentionally x86_64 Linux-only (GAS assembly and Linux headers).
@@ -192,7 +184,6 @@ jobs:
           -p onnx-runtime-session
           -p onnx-runtime-tracer
           -p onnx-genai-preprocess
-          -p onnx-rs
           -p onnx-genai-router
           -p onnx-runtime-memory
           -p onnx-runtime-cpuinfo
@@ -200,7 +191,7 @@ jobs:
           -p onnx-runtime-capi
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
-          -p onnx-rs-python
+          -p onnx-std-python
 
       - name: Upload coverage to Codecov
         if: always()

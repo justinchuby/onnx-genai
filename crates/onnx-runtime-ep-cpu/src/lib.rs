@@ -24,6 +24,10 @@
 //! all kernel arithmetic is safe Rust operating on
 //! dense `Vec<f32>` buffers produced by the two audited accessors in [`kernels`].
 
+// Kernel entry points mirror ONNX operator schemas, whose independent tensors and
+// dimensions often exceed Clippy's generic argument-count threshold.
+#![allow(clippy::too_many_arguments)]
+
 pub mod backend;
 pub mod dtype;
 pub mod kernels;

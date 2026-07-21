@@ -39,6 +39,7 @@ const IQ1_S_DELTA: f32 = 0.125;
 const IQ1_M_DELTA: f32 = 0.125;
 
 // SIMD decoder uses doubled E2M1 integers with half the shared E8M0 scale.
+#[cfg(target_arch = "x86_64")]
 const E2M1_DOUBLED: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 // llama.cpp commit b15ca938, ggml-common.h::kvalues_iq4nl.
@@ -324,6 +325,7 @@ fn decode_mxfp4_value(code: u8, scale: f32) -> f32 {
     if value == 0.0 { 0.0 } else { value * scale }
 }
 
+#[cfg(any(target_arch = "x86_64", test))]
 fn e8m0_half_scale(exponent: u8) -> f32 {
     decode_e8m0_scale(exponent) * 0.5
 }
@@ -558,8 +560,7 @@ fn decode_iq2_s_block(block: &[u8], output: &mut [f32]) {
     let high_bits = &block[66..74];
     let scales = &block[74..82];
 
-    for group32 in 0..8 {
-        let packed_scale = scales[group32];
+    for (group32, &packed_scale) in scales.iter().enumerate() {
         let qh = high_bits[group32];
         for vector in 0..4 {
             let subscale =
@@ -588,8 +589,7 @@ fn decode_iq2_xs_block(block: &[u8], output: &mut [f32]) {
     let quants = &block[2..66];
     let scales = &block[66..74];
 
-    for group32 in 0..8 {
-        let packed_scale = scales[group32];
+    for (group32, &packed_scale) in scales.iter().enumerate() {
         for vector in 0..4 {
             let quant_base = group32 * 8 + vector * 2;
             let quant = u16::from_le_bytes([quants[quant_base], quants[quant_base + 1]]);
@@ -1119,8 +1119,8 @@ mod tests {
         let mut expected = Vec::with_capacity(IQ_SUPER_QK);
         for _ in 0..8 {
             for (sign_mask, grid) in sign_masks.into_iter().zip(grids) {
-                for j in 0..8 {
-                    let value = grid[j] as f32 * 1.25;
+                for (j, magnitude) in grid.into_iter().enumerate() {
+                    let value = magnitude as f32 * 1.25;
                     expected.push(if sign_mask & (1 << j) != 0 {
                         -value
                     } else {

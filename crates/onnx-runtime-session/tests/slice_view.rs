@@ -11,6 +11,9 @@
 //! * buffer liveness — a source stays valid across a Slice→consumer chain;
 //! * the error path for an unsupported slice parameter (step == 0).
 
+// Test graph builders mirror operator schemas with independently meaningful inputs.
+#![allow(clippy::too_many_arguments)]
+
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };

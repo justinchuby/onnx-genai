@@ -887,7 +887,7 @@ mod tests {
         // The A&S 7.1.26 approximation was ~1e-9 off near zero; libm::erf is
         // correctly rounded. Check tight agreement against reference values
         // (erf(x) ≈ 2/√π · x for tiny x).
-        let two_over_sqrt_pi = 1.128_379_167_095_512_6_f64;
+        let two_over_sqrt_pi = std::f64::consts::FRAC_2_SQRT_PI;
         for &x in &[1e-3_f64, 1e-4, 1e-5, 1e-6, 1e-7, 1e-9] {
             let expected = two_over_sqrt_pi * x - two_over_sqrt_pi * x * x * x / 3.0;
             assert!(

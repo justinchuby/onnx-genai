@@ -3055,7 +3055,7 @@ fn tensor_i64_values(tensor: &TensorProto) -> Option<Vec<i64>> {
     if !tensor.int64_data.is_empty() {
         return Some(tensor.int64_data.clone());
     }
-    if tensor.raw_data.len() % 8 != 0 {
+    if !tensor.raw_data.len().is_multiple_of(8) {
         return None;
     }
     Some(

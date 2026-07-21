@@ -377,10 +377,10 @@ fn parse_execution_provider_entry(token: &str) -> ExecutionProviderEntry {
     // Detect an inline plugin (`plugin:<...>`) case-insensitively on the scheme
     // only, so the library path itself keeps its original case (important on
     // case-sensitive filesystems and for Windows drive letters).
-    if let Some((scheme, rest)) = token.split_once(':') {
-        if scheme.trim().eq_ignore_ascii_case("plugin") {
-            return ExecutionProviderEntry::Plugin(parse_inline_plugin_spec(rest));
-        }
+    if let Some((scheme, rest)) = token.split_once(':')
+        && scheme.trim().eq_ignore_ascii_case("plugin")
+    {
+        return ExecutionProviderEntry::Plugin(parse_inline_plugin_spec(rest));
     }
     ExecutionProviderEntry::Builtin(parse_execution_provider(token))
 }
@@ -417,10 +417,12 @@ fn parse_inline_plugin_spec(rest: &str) -> PluginSpec {
             if !val.is_empty() {
                 device = Some(val.to_owned());
             }
-        } else if let Some(option_key) = key_lc.starts_with("opt.").then(|| key[4..].trim()) {
-            if !option_key.is_empty() {
-                options.push((option_key.to_owned(), val.to_owned()));
-            }
+        } else if let Some(option_key) = key_lc
+            .starts_with("opt.")
+            .then(|| key[4..].trim())
+            .filter(|option_key| !option_key.is_empty())
+        {
+            options.push((option_key.to_owned(), val.to_owned()));
         }
     }
     PluginSpec {

@@ -182,7 +182,7 @@ mod tests {
     fn hann_periodic_and_symmetric_match_onnx_reference() {
         assert_close(
             &run(WindowKind::Hann, true),
-            &[0.0, 0.34549153, 0.90450853, 0.90450847, 0.34549144],
+            &[0.0, 0.34549153, 0.90450853, 0.904_508_5, 0.34549144],
         );
         assert_close(
             &run(WindowKind::Hann, false),

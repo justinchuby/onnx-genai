@@ -293,8 +293,8 @@ impl ConvTransposeKernel {
 
         if let Some(bias) = bias {
             for n in 0..x_shape[0] {
-                for output_channel in 0..output_channels {
-                    let value = bias[output_channel].to_acc();
+                for (output_channel, bias_value) in bias.iter().enumerate() {
+                    let value = bias_value.to_acc();
                     let start = (n * output_channels + output_channel) * output_spatial_size;
                     output[start..start + output_spatial_size].fill(value);
                 }
@@ -362,7 +362,7 @@ impl Kernel for ConvTransposeKernel {
                 "ConvTranspose: X and W must have equal rank between 3 and 5".into(),
             ));
         }
-        if w_shape[0] != x_shape[1] || x_shape[1] % self.group != 0 || w_shape[1] == 0 {
+        if w_shape[0] != x_shape[1] || !x_shape[1].is_multiple_of(self.group) || w_shape[1] == 0 {
             return Err(EpError::KernelFailed(
                 "ConvTranspose: W must be [C_in, C_out/group, kernel...] and C_in must be divisible by group"
                     .into(),

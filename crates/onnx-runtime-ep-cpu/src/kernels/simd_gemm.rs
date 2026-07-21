@@ -34,10 +34,13 @@
 use rayon::prelude::*;
 
 /// Register-tile rows.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const MR: usize = 6;
 /// Register-tile columns (two `__m256` lanes).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const NR: usize = 16;
 /// K-panel width kept L1-resident.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const KC: usize = 256;
 
 /// Raw pointer to C wrapped so Rayon can hand disjoint column strips to worker

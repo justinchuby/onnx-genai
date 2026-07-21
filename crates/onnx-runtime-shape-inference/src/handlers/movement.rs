@@ -857,8 +857,8 @@ pub fn slice(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
                 });
             }
             if axes_present && axes.is_none() {
-                for axis in 0..rank {
-                    out[axis] = ctx.fresh_dim();
+                for dim in &mut out {
+                    *dim = ctx.fresh_dim();
                 }
                 ctx.set_output(0, dtype, out);
                 return Ok(());

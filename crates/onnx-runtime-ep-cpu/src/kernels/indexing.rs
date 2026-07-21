@@ -377,15 +377,15 @@ impl Kernel for OneHotKernel {
             }
             let mut rem = index_linear;
             let mut output_linear = 0;
-            for d in 0..output_rank {
+            for (d, &output_stride) in output_strides.iter().enumerate() {
                 if d == axis {
-                    output_linear += index as usize * output_strides[d];
+                    output_linear += index as usize * output_stride;
                 } else {
                     let index_dimension = if d < axis { d } else { d - 1 };
                     let stride = index_strides[index_dimension];
                     let coordinate = rem / stride;
                     rem %= stride;
-                    output_linear += coordinate * output_strides[d];
+                    output_linear += coordinate * output_stride;
                 }
             }
             out[output_linear * element_size..(output_linear + 1) * element_size]

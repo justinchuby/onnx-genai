@@ -52,6 +52,8 @@ use onnx_runtime_ep_api::{
     KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking,
     TensorMut, TensorView, WeightHandle,
 };
+
+type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::{
@@ -88,7 +90,7 @@ fn host_dtype_alignment(dtype: DataType) -> usize {
 
 fn print_op_profile(total: Duration, timings: HashMap<String, (Duration, usize)>) {
     let mut timings = timings.into_iter().collect::<Vec<_>>();
-    timings.sort_unstable_by(|left, right| right.1.0.cmp(&left.1.0));
+    timings.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1.0));
     let total_ms = total.as_secs_f64() * 1_000.0;
     eprintln!("[onnx-genai-profile] node execution: {total_ms:.3} ms");
     eprintln!("[onnx-genai-profile] op_type,total_ms,percent,calls");
@@ -2742,7 +2744,7 @@ impl Executor {
                 let shape = input_shapes[i].clone();
                 let strides = elem.layout.resolved_strides(&shape);
                 let root_len = elem.root_len();
-                let base_ptr = elem.as_ptr() as *const std::ffi::c_void;
+                let base_ptr = elem.as_ptr();
                 view_bounds(
                     &shape,
                     &strides,
@@ -4489,7 +4491,7 @@ impl Executor {
         carried: &[Tensor],
         num_scan: usize,
         resolved: &HashMap<ValueId, Vec<usize>>,
-    ) -> Result<Vec<Option<(DataType, Vec<usize>)>>> {
+    ) -> Result<OptionalTensorSpecs> {
         let body = self
             .graph
             .subgraphs
@@ -4792,7 +4794,7 @@ impl Executor {
         num_scan_outputs: usize,
         output_axes: &[i64],
         resolved: &HashMap<ValueId, Vec<usize>>,
-    ) -> Result<Vec<Option<(DataType, Vec<usize>)>>> {
+    ) -> Result<OptionalTensorSpecs> {
         let body = self
             .graph
             .subgraphs

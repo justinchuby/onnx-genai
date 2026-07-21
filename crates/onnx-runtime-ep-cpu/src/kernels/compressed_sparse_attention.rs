@@ -1372,7 +1372,7 @@ impl StatefulCompressedSparseAttentionKernel {
         };
         let mut emitted_counts = fallible_filled(batch, 0usize, "per-batch emitted counts")?;
 
-        for b in 0..batch {
+        for (b, emitted_count) in emitted_counts.iter_mut().enumerate() {
             for s in 0..sequence {
                 let position = start
                     .checked_add(s)
@@ -1422,7 +1422,7 @@ impl StatefulCompressedSparseAttentionKernel {
                         block_start,
                         self.cache_format,
                     )?;
-                    let emitted_index = emitted_counts[b];
+                    let emitted_index = *emitted_count;
                     if emitted_index >= emitted_per_batch {
                         return Err(error("emitted more compressed records than expected"));
                     }
@@ -1454,7 +1454,7 @@ impl StatefulCompressedSparseAttentionKernel {
                             .ok_or_else(|| error("emitted packed record is out of bounds"))?
                             .copy_from_slice(source);
                     }
-                    emitted_counts[b] = emitted_index
+                    *emitted_count = emitted_index
                         .checked_add(1)
                         .ok_or_else(|| error("emitted record count overflow"))?;
                     reset_ratio128_row(&mut carry, b, self.compression_ratio, dim)?;
@@ -2033,11 +2033,12 @@ fn ratio4_attention(
                 .and_then(|value| value.checked_add(s))
                 .and_then(|value| value.checked_mul(topk_width))
                 .ok_or_else(|| error("ratio-4 selected attention row overflow"))?;
-            for h in 0..heads {
+            for (h, sink_value) in sink.iter().copied().enumerate().take(heads) {
                 scores.fill(f32::NEG_INFINITY);
                 let query_row = flat4([b, s, h, 0], query_shape, "ratio-4 query row")?;
                 let mut maximum = f32::NEG_INFINITY;
-                for candidate in 0..dense_candidates {
+                for (candidate, score_slot) in scores.iter_mut().enumerate().take(dense_candidates)
+                {
                     let absolute = dense_start
                         .checked_add(candidate)
                         .ok_or_else(|| error("ratio-4 dense candidate overflow"))?;
@@ -2055,7 +2056,7 @@ fn ratio4_attention(
                     if let Some(bias) = attention_bias {
                         score += bias.at(b, h, s, candidate)?;
                     }
-                    scores[candidate] = score;
+                    *score_slot = score;
                     maximum = maximum.max(score);
                 }
                 for slot in 0..topk_width {
@@ -2094,7 +2095,7 @@ fn ratio4_attention(
                     .filter(|&&score| score != f32::NEG_INFINITY)
                     .map(|&score| (score - maximum).exp())
                     .sum::<f32>()
-                    + (sink[h] - maximum).exp();
+                    + (sink_value - maximum).exp();
                 if denominator == 0.0 || !denominator.is_finite() {
                     return Err(error(format!(
                         "ratio-4 softmax denominator is invalid at [batch={b}, head={h}, query={s}]"
@@ -2640,11 +2641,12 @@ fn ratio128_attention(
                 .checked_add(1)
                 .ok_or_else(|| error("compressed attention position overflow"))?
                 / 128;
-            for h in 0..heads {
+            for (h, sink_value) in sink.iter().copied().enumerate().take(heads) {
                 scores.fill(f32::NEG_INFINITY);
                 let query_row = flat4([b, s, h, 0], query_shape, "stateful query row")?;
                 let mut maximum = f32::NEG_INFINITY;
-                for candidate in 0..dense_candidates {
+                for (candidate, score_slot) in scores.iter_mut().enumerate().take(dense_candidates)
+                {
                     let absolute = dense_start
                         .checked_add(candidate)
                         .ok_or_else(|| error("dense candidate position overflow"))?;
@@ -2667,7 +2669,7 @@ fn ratio128_attention(
                     if let Some(bias) = attention_bias {
                         score += bias.at(b, h, s, candidate)?;
                     }
-                    scores[candidate] = score;
+                    *score_slot = score;
                     maximum = maximum.max(score);
                 }
                 for record in 0..compressed_records.min(valid_compressed) {
@@ -2696,7 +2698,7 @@ fn ratio128_attention(
                         denominator += (score - maximum).exp();
                     }
                 }
-                denominator += (sink[h] - maximum).exp();
+                denominator += (sink_value - maximum).exp();
                 if denominator == 0.0 || !denominator.is_finite() {
                     return Err(error(format!(
                         "softmax denominator is invalid at [batch={b}, head={h}, query={s}]"
@@ -2974,7 +2976,7 @@ impl Kernel for CompressedSparseAttentionKernel {
         };
 
         for b in 0..batch {
-            for h in 0..heads {
+            for (h, sink_value) in sink.iter().copied().enumerate().take(heads) {
                 let group = if groups == 1 { 0 } else { h };
                 for s in 0..sequence {
                     let score_row = flat4(
@@ -3022,7 +3024,7 @@ impl Kernel for CompressedSparseAttentionKernel {
                             denominator += (score - maximum).exp();
                         }
                     }
-                    denominator += (sink[h] - maximum).exp();
+                    denominator += (sink_value - maximum).exp();
                     if denominator == 0.0 || denominator.is_nan() {
                         return Err(error(format!(
                             "softmax denominator is invalid at [batch={b}, head={h}, query={s}]"
@@ -3295,14 +3297,10 @@ impl AttentionBias {
     fn at(&self, b: usize, h: usize, s: usize, k: usize) -> Result<f32> {
         let target_index = [b, h, s, k];
         let mut offset = 0usize;
-        for axis in 0..4 {
-            let coordinate = if self.padded_shape[axis] == 1 {
-                0
-            } else {
-                target_index[axis]
-            };
+        for (&target_coordinate, &extent) in target_index.iter().zip(&self.padded_shape) {
+            let coordinate = if extent == 1 { 0 } else { target_coordinate };
             offset = offset
-                .checked_mul(self.padded_shape[axis])
+                .checked_mul(extent)
                 .and_then(|value| value.checked_add(coordinate))
                 .ok_or_else(|| error("attention_bias offset overflow"))?;
         }
@@ -4367,7 +4365,7 @@ mod tests {
             (packed, finalized, pre_fp8, pre_rope)
         }
 
-        let ape_values = rows(0, RATIO, |slot, d| ape_value(slot, d));
+        let ape_values = rows(0, RATIO, ape_value);
         let norm_values = (0..DIM)
             .map(|d| 0.75 + (d % 17) as f32 * 0.03125)
             .collect::<Vec<_>>();
@@ -4686,7 +4684,7 @@ mod tests {
             score: impl Fn(usize, usize, usize) -> f32,
         ) -> Vec<f32> {
             let mut pooled = vec![0.0f32; width];
-            for d in 0..width {
+            for (d, pooled_value) in pooled.iter_mut().enumerate() {
                 let mut candidates = Vec::with_capacity(8);
                 if block_start >= R {
                     for position in block_start - R..block_start {
@@ -4704,7 +4702,7 @@ mod tests {
                     .iter()
                     .map(|(_, score)| (*score - maximum).exp())
                     .sum::<f32>();
-                pooled[d] = candidates
+                *pooled_value = candidates
                     .iter()
                     .map(|(value, score)| value * (*score - maximum).exp())
                     .sum::<f32>()

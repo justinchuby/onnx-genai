@@ -60,12 +60,12 @@ fn clip_typed<T: NumericElem + PartialOrd>(
     } else {
         kernel.max.map(T::from_f32_scalar)
     };
-    if let (Some(min), Some(max)) = (min, max) {
-        if min > max {
-            return Err(EpError::KernelFailed(
-                "Clip: min must not exceed max".into(),
-            ));
-        }
+    if let (Some(min), Some(max)) = (min, max)
+        && min > max
+    {
+        return Err(EpError::KernelFailed(
+            "Clip: min must not exceed max".into(),
+        ));
     }
 
     let y = to_dense::<T>(&inputs[0])?

@@ -1,3 +1,6 @@
+// Preserve the session crate's structured error type at this CLI boundary.
+#![allow(clippy::result_large_err)]
+
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};

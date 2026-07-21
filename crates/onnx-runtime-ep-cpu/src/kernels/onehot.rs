@@ -84,12 +84,12 @@ impl Kernel for OneHotKernel {
             };
             let mut rem = index_linear;
             let mut output_linear = index * output_strides[axis];
-            for d in 0..output_rank {
+            for (d, &output_stride) in output_strides.iter().enumerate() {
                 if d != axis {
                     let index_axis = if d < axis { d } else { d - 1 };
                     let coordinate = rem / index_strides[index_axis];
                     rem %= index_strides[index_axis];
-                    output_linear += coordinate * output_strides[d];
+                    output_linear += coordinate * output_stride;
                 }
             }
             out[output_linear * element_size..(output_linear + 1) * element_size]

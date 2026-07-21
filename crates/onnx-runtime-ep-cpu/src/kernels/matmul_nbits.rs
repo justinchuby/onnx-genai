@@ -844,11 +844,11 @@ fn int4_dot_row(
     packed_weight: &[u8],
     scales: &[f32],
     activation_scale: f32,
-    kernel: DotKernel,
+    _kernel: DotKernel,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        match kernel {
+        match _kernel {
             DotKernel::AvxVnni => {
                 // SAFETY: selected_dot_kernel checked AVX2 and AVX-VNNI.
                 return unsafe {
@@ -1075,11 +1075,11 @@ fn int8_row(
     }
 }
 
-fn dot_u8_i8(activation: &[u8], weight: &[i8], kernel: DotKernel) -> i32 {
+fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     debug_assert_eq!(activation.len(), weight.len());
     #[cfg(target_arch = "x86_64")]
     {
-        match kernel {
+        match _kernel {
             DotKernel::AvxVnni => {
                 // SAFETY: selected_dot_kernel checked AVX-VNNI at runtime.
                 return unsafe { dot_u8_i8_avxvnni(activation, weight) };
@@ -2269,7 +2269,7 @@ mod tests {
         let mut activation = vec![1.0; k];
         activation[16..].fill(2.0);
         let a = Owned::f32(&[1, k], &activation);
-        let b = Owned::u8(&[1, 2, 8], &vec![0x99; 16]);
+        let b = Owned::u8(&[1, 2, 8], &[0x99; 16]);
         let scales = Owned::f32(&[1, 2], &[1.0, 2.0]);
         let groups: Vec<i32> = (0..k).map(|i| if i < 16 { 1 } else { 0 }).collect();
         let groups = Owned::i32(&[k], &groups);

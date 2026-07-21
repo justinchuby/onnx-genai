@@ -372,7 +372,10 @@ impl SeqTensor {
             bytes,
             &self.shape,
         )?;
-        if logical_end > logical_bytes || logical_offset % esize != 0 || bytes % esize != 0 {
+        if logical_end > logical_bytes
+            || !logical_offset.is_multiple_of(esize)
+            || !bytes.is_multiple_of(esize)
+        {
             return Err(SequenceError::ByteLengthMismatch {
                 op: OP,
                 dtype: self.dtype,

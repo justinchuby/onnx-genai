@@ -166,33 +166,34 @@ fn pool_list(
     }
 }
 
-fn checked_pool_extent(
-    op: &str,
-    input: i128,
+#[derive(Clone, Copy)]
+struct PoolParams {
     kernel: i64,
     stride: i64,
     dilation: i64,
     pad_begin: i64,
     pad_end: i64,
     ceil_mode: bool,
-) -> Result<i128, ShapeInferError> {
-    let effective_kernel = i128::from(dilation)
-        .checked_mul(i128::from(kernel) - 1)
+}
+
+fn checked_pool_extent(op: &str, input: i128, params: PoolParams) -> Result<i128, ShapeInferError> {
+    let effective_kernel = i128::from(params.dilation)
+        .checked_mul(i128::from(params.kernel) - 1)
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| ShapeInferError::Invalid {
             op: op.into(),
             detail: "effective kernel arithmetic overflowed".into(),
         })?;
     let numerator = input
-        .checked_add(i128::from(pad_begin))
-        .and_then(|value| value.checked_add(i128::from(pad_end)))
+        .checked_add(i128::from(params.pad_begin))
+        .and_then(|value| value.checked_add(i128::from(params.pad_end)))
         .and_then(|value| value.checked_sub(effective_kernel))
         .ok_or_else(|| ShapeInferError::Invalid {
             op: op.into(),
             detail: "pooling extent arithmetic overflowed".into(),
         })?;
-    let stride = i128::from(stride);
-    let quotient = if ceil_mode {
+    let stride = i128::from(params.stride);
+    let quotient = if params.ceil_mode {
         numerator.div_euclid(stride) + i128::from(numerator.rem_euclid(stride) != 0)
     } else {
         numerator.div_euclid(stride)
@@ -204,7 +205,7 @@ fn checked_pool_extent(
             detail: "pooling output arithmetic overflowed".into(),
         })?
         .max(0);
-    if ceil_mode && output > 0 {
+    if params.ceil_mode && output > 0 {
         let last_start =
             (output - 1)
                 .checked_mul(stride)
@@ -214,7 +215,7 @@ fn checked_pool_extent(
                 })?;
         let right_padding_start =
             input
-                .checked_add(i128::from(pad_begin))
+                .checked_add(i128::from(params.pad_begin))
                 .ok_or_else(|| ShapeInferError::Invalid {
                     op: op.into(),
                     detail: "pooling padding arithmetic overflowed".into(),
@@ -264,15 +265,10 @@ fn validate_pool_partial_extents(
 fn pool_spatial_dim(
     ctx: &mut InferenceContext,
     input: &DimExpr,
-    kernel: i64,
-    stride: i64,
-    dilation: i64,
-    pad_begin: i64,
-    pad_end: i64,
+    params: PoolParams,
     auto_pad: AutoPad,
-    ceil_mode: bool,
 ) -> Result<DimExpr, ShapeInferError> {
-    if kernel <= 0 || stride <= 0 || dilation <= 0 {
+    if params.kernel <= 0 || params.stride <= 0 || params.dilation <= 0 {
         return Err(ShapeInferError::Invalid {
             op: ctx.op().into(),
             detail: "kernel_shape, strides, and dilations must be positive".into(),
@@ -280,33 +276,37 @@ fn pool_spatial_dim(
     }
 
     let known = input.as_const();
-    validate_pool_partial_extents(ctx.op(), known, kernel, dilation, pad_begin, pad_end)?;
+    validate_pool_partial_extents(
+        ctx.op(),
+        known,
+        params.kernel,
+        params.dilation,
+        params.pad_begin,
+        params.pad_end,
+    )?;
     let output = match auto_pad {
         AutoPad::SameUpper | AutoPad::SameLower => known.map(|extent| {
             let extent = i128::from(extent);
-            extent.div_euclid(i128::from(stride))
-                + i128::from(extent.rem_euclid(i128::from(stride)) != 0)
+            extent.div_euclid(i128::from(params.stride))
+                + i128::from(extent.rem_euclid(i128::from(params.stride)) != 0)
         }),
         AutoPad::Valid => known
-            .map(i128::from)
-            .map(|extent| {
-                checked_pool_extent(ctx.op(), extent, kernel, stride, dilation, 0, 0, ceil_mode)
-            })
-            .transpose()?,
-        AutoPad::NotSet => known
             .map(i128::from)
             .map(|extent| {
                 checked_pool_extent(
                     ctx.op(),
                     extent,
-                    kernel,
-                    stride,
-                    dilation,
-                    pad_begin,
-                    pad_end,
-                    ceil_mode,
+                    PoolParams {
+                        pad_begin: 0,
+                        pad_end: 0,
+                        ..params
+                    },
                 )
             })
+            .transpose()?,
+        AutoPad::NotSet => known
+            .map(i128::from)
+            .map(|extent| checked_pool_extent(ctx.op(), extent, params))
             .transpose()?,
     };
 
@@ -321,16 +321,7 @@ fn pool_spatial_dim(
     }
 
     if auto_pad == AutoPad::NotSet {
-        let lower_bound = checked_pool_extent(
-            ctx.op(),
-            0,
-            kernel,
-            stride,
-            dilation,
-            pad_begin,
-            pad_end,
-            ceil_mode,
-        )?;
+        let lower_bound = checked_pool_extent(ctx.op(), 0, params)?;
         if lower_bound > isize::MAX as i128 {
             return Err(ShapeInferError::Invalid {
                 op: ctx.op().into(),
@@ -380,13 +371,15 @@ pub fn pool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         output.push(pool_spatial_dim(
             ctx,
             &input.shape[axis + 2],
-            kernels[axis],
-            strides[axis],
-            dilations[axis],
-            pads[axis],
-            pads[axis + spatial_rank],
+            PoolParams {
+                kernel: kernels[axis],
+                stride: strides[axis],
+                dilation: dilations[axis],
+                pad_begin: pads[axis],
+                pad_end: pads[axis + spatial_rank],
+                ceil_mode,
+            },
             auto_pad,
-            ceil_mode,
         )?);
     }
     ctx.set_output(0, input.dtype, output.clone());

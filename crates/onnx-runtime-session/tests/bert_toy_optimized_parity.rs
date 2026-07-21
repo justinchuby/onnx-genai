@@ -30,6 +30,8 @@
 //! Nothing here special-cases "bert" in library code — the model is a generic
 //! fixture and `"optimization"` is a generic, model-agnostic option.
 
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 
 use onnx_runtime_session::{InferenceSession, SessionError, Tensor};

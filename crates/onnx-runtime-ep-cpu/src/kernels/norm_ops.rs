@@ -340,7 +340,7 @@ where
     }
     require_x_output_shape("GroupNormalization", &inputs[0], &outputs[0])?;
     let channels = shape[1];
-    if channels == 0 || channels % num_groups != 0 {
+    if channels == 0 || !channels.is_multiple_of(num_groups) {
         return Err(EpError::KernelFailed(format!(
             "GroupNormalization: channel count {channels} must be non-zero and divisible by num_groups {num_groups}"
         )));

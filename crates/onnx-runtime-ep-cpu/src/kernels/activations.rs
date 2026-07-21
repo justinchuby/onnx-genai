@@ -251,7 +251,7 @@ impl Kernel for ActivationKernel {
             return write_dense_float::<f64>(&mut outputs[0], &y);
         }
         let y = to_dense_f32_widen(self.activation.name(), &inputs[0])?
-            .into_iter()
+            .iter()
             .map(|x| self.activation.apply(*x))
             .collect::<Vec<_>>();
         write_dense_f32_narrow(self.activation.name(), &mut outputs[0], &y)
@@ -485,7 +485,7 @@ mod tests {
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         let sig = |z: f32| 1.0 / (1.0 + (-z).exp());
-        let want = [-1.0 * sig(-1.0), 0.0, 2.0 * sig(2.0)];
+        let want = [-sig(-1.0), 0.0, 2.0 * sig(2.0)];
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
         }
@@ -495,7 +495,7 @@ mod tests {
         }
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
-        let want2 = [-1.0 * sig(-2.0), 0.0, 2.0 * sig(4.0)];
+        let want2 = [-sig(-2.0), 0.0, 2.0 * sig(4.0)];
         for (g, w) in out.to_f32().iter().zip(&want2) {
             assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
         }

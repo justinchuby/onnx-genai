@@ -73,8 +73,8 @@ impl FairSharePolicy {
         }
 
         let mut total_weight = 0_i128;
-        for index in 0..CLASS_COUNT {
-            if active[index] {
+        for (index, is_active) in active.iter().copied().enumerate() {
+            if is_active {
                 let weight = i128::from(self.weights[index]);
                 self.deficits[index] = self.deficits[index].saturating_add(weight);
                 total_weight = total_weight.saturating_add(weight);

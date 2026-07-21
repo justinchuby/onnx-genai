@@ -100,7 +100,7 @@ impl Kernel for Col2ImKernel {
             return Err(EpError::KernelFailed("Col2Im: dilations/strides must be positive and pads must contain 2 values per spatial axis".into()));
         }
         let block_elements = numel(&block);
-        if inputs[0].shape[1] % block_elements != 0 {
+        if !inputs[0].shape[1].is_multiple_of(block_elements) {
             return Err(EpError::KernelFailed(
                 "Col2Im: input channel-block dimension is not divisible by block_shape product"
                     .into(),

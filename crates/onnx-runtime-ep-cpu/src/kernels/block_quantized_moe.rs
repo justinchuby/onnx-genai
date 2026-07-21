@@ -228,7 +228,7 @@ fn validate_runtime_shapes(
     let inter = if attributes.swiglu_fusion == 0 {
         fc1_size
     } else {
-        if fc1_size % 2 != 0 {
+        if !fc1_size.is_multiple_of(2) {
             return Err(error(format!(
                 "fused SwiGLU fc1_out must be even, got {fc1_size}"
             )));
@@ -938,11 +938,19 @@ mod tests {
         const EXPERTS: usize = 3;
         let input: Vec<f32> = (0..H).map(|i| i as f32 / 8.0 - 1.0).collect();
         let fc1 = packed_matrix(EXPERTS, H, |expert, output, input| {
-            (output == input).then_some([2, 4, 6][expert]).unwrap_or(0)
+            if output == input {
+                [2, 4, 6][expert]
+            } else {
+                0
+            }
         });
-        let fc2 = packed_matrix(EXPERTS, H, |_, output, input| {
-            (output == input).then_some(2).unwrap_or(0)
-        });
+        let fc2 = packed_matrix(
+            EXPERTS,
+            H,
+            |_, output, input| {
+                if output == input { 2 } else { 0 }
+            },
+        );
         let actual = run_with_attrs_and_experts(
             &attrs("identity", 2, true, 0),
             EXPERTS,
@@ -1057,10 +1065,7 @@ mod tests {
             .iter()
             .map(|&value| {
                 0.5 * value
-                    * (1.0
-                        + (0.797_884_560_802_865_4_f32
-                            * (value + 0.044_715 * value * value * value))
-                            .tanh())
+                    * (1.0 + (0.797_884_6_f32 * (value + 0.044_715 * value * value * value)).tanh())
             })
             .collect();
         assert_close(&gelu, &expected);

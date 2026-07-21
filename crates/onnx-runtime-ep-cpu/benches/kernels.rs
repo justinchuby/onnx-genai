@@ -66,7 +66,7 @@ fn bench_reduce_mean(c: &mut Criterion) {
                 ("axes", Attribute::Ints(vec![1])),
                 ("keepdims", Attribute::Int(1)),
             ],
-            &[shape.clone()],
+            std::slice::from_ref(&shape),
             13,
         );
         group.bench_function(
@@ -154,11 +154,13 @@ fn with_gemm_backend<T>(backend: &str, f: impl FnOnce() -> T) -> T {
 
 fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul");
-    let mut backends = vec!["generic"];
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    backends.push("simd");
-    #[cfg(feature = "mlas")]
-    backends.push("mlas");
+    let backends = &[
+        "generic",
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        "simd",
+        #[cfg(feature = "mlas")]
+        "mlas",
+    ];
 
     for (size, m, k, n) in [
         ("small", 1, 256, 256),
@@ -166,7 +168,7 @@ fn bench_matmul(c: &mut Criterion) {
         ("large", 32, 1_024, 1_024),
     ] {
         group.throughput(Throughput::Elements((m * n) as u64));
-        for backend in &backends {
+        for backend in backends {
             for dtype in FLOAT_DTYPES {
                 for threads in MATCHED_THREAD_COUNTS {
                     let pool = thread_pool(threads);

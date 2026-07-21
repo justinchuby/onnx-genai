@@ -14,6 +14,12 @@
 //! let outputs = session.run(&[("input_ids", &tensor)])?;
 //! ```
 
+// SessionError intentionally preserves rich, structured diagnostics in the
+// public API; boxing it would be an API and behavior change rather than a lint fix.
+#![allow(clippy::result_large_err)]
+// Executor calls mirror graph/operator contracts with independently meaningful inputs.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -1037,7 +1043,9 @@ pub fn load(path: impl AsRef<Path>) -> Result<InferenceSession> {
 #[cfg(test)]
 mod device_binding_tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, static_shape};
+    #[cfg(feature = "cuda")]
+    use onnx_runtime_ir::Attribute;
+    use onnx_runtime_ir::{Graph, Node, NodeId, static_shape};
 
     #[test]
     fn persistent_binding_aliases_input_output_and_suppresses_materialization() {
