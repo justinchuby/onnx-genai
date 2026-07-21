@@ -77,14 +77,18 @@ jobs:
             os: ubuntu-latest
           - name: Windows x86_64
             os: windows-latest
+          # Native GitHub-hosted Windows 11 ARM64 runner.
+          - name: Windows ARM64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
           # macos-latest is the standard GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
             os: macos-latest
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
-      # rustc warnings are errors on every portable test build, including the
-      # Linux-only mlas-sys step below.
+      # rustc warnings are errors on every portable test build and the Windows
+      # ARM64 clippy gate, including the Linux-only mlas-sys step below.
       RUSTFLAGS: "-D warnings"
 
     steps:
@@ -92,6 +96,8 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -134,6 +140,39 @@ jobs:
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
           -p onnx-std-python
+
+      - name: Clippy Windows ARM64 offline crates
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: >-
+          cargo clippy --locked --all-targets
+          --target aarch64-pc-windows-msvc
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-std
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-std-python
+          -- -D warnings
 
       # The vendored MLAS feasibility spike is offline, but its build script is
       # intentionally x86_64 Linux-only (GAS assembly and Linux headers).
