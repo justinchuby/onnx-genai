@@ -28,13 +28,28 @@ pub(crate) const GATE_UP_SWIGLU_FUSION_ATTR: &str = "_cuda_gate_up_swiglu";
 
 const MICROSOFT_DOMAIN: &str = "com.microsoft";
 
-/// Exact validated decode shape for the paired gate/up SwiGLU fusion. Gating on
-/// these keeps the pass from misfiring on any other `Mul`/activation graph and
-/// guarantees the paired kernel only ever runs on dimensions it was verified
-/// against (block-32, fp16, M=1 decode).
-const GATE_UP_SWIGLU_K: usize = 896;
-const GATE_UP_SWIGLU_N: usize = 4864;
-const GATE_UP_SWIGLU_BLOCK_SIZE: usize = 32;
+/// Capability constraints of the paired gate/up SwiGLU kernel
+/// (`matmul_nbits_gemv_f16_gate_up_swiglu`), derived from the kernel itself —
+/// **not** from any model's dimensions. The kernel takes `K`, `N`, `k_blocks`
+/// and `blob_size` as runtime arguments and guards `column < n`, so it is
+/// generic over `K`/`N`. Its real limits are:
+///
+/// * `block_size == 32`: the scale index is computed as `column*k_blocks +
+///   (lane>>2)`, i.e. one scale per four lanes = per 32 activation elements, so
+///   only block-32 quantization maps scales correctly.
+/// * `bits == 4`: weights are unpacked as `>> (i*4) & 15` with a subtract-8
+///   zero point.
+/// * fp16 activation, scales and output: the epilogue rounds each projection to
+///   fp16 and evaluates `silu(gate)*up` in the exact term order of the two-op
+///   path, so the fused decode stays byte-identical.
+///
+/// `K` and `N` are unconstrained beyond block alignment: the kernel's 256-wide
+/// main loop plus `min(8, k - tail_depth)` tail handles any `K`, and the grid
+/// is `ceil(N / columns_per_block)` with a `column < n` guard, so any `N` is
+/// safe. This lets the fusion fire on every model that exhibits the paired
+/// gate/up → `Silu(gate)*up` structure, not just one architecture.
+const GATE_UP_SWIGLU_SUPPORTED_BLOCK_SIZE: usize = 32;
+const GATE_UP_SWIGLU_SUPPORTED_BITS: i64 = 4;
 
 /// Fuse `Mul(Silu(gate), up)` into CUDA's tagged two-input `Mul` variant.
 ///
@@ -300,16 +315,20 @@ impl OptimizationPass for CudaSwiGluFusion {
 ///
 /// Runs *after* [`CudaSwiGluFusion`], so the trailing multiply is already the
 /// tagged two-input `Mul[_cuda_silu_mul](gate, up)`. When `gate` and `up` are
-/// each produced by a plain `MatMulNBits` sharing the *same* activation and both
-/// match the exact validated decode shape (K=896, N=4864, block-32, fp16 scales,
-/// fp16 output), the three ops collapse into a single node marked
-/// [`GATE_UP_SWIGLU_FUSION_ATTR`] whose inputs are
+/// each produced by a plain three-input `MatMulNBits` sharing the *same*
+/// activation, structurally paired (`gate.N == up.N`, `gate.K == up.K`), and
+/// compatible with the paired kernel (block-32, 4-bit, fp16 activation/scales/
+/// output, persistent weights), the three ops collapse into a single node
+/// marked [`GATE_UP_SWIGLU_FUSION_ATTR`] whose inputs are
 /// `[x, W_gate, scales_gate, W_up, scales_up]`. The paired kernel reads the
 /// activation once, runs both GEMVs, and writes `silu(gate)*up` directly —
 /// reproducing the two-op fp16 rounding so greedy tokens stay byte-identical.
 ///
-/// Any shape/dtype/structure mismatch leaves the separate GEMVs + tagged
-/// `silu_mul` in place (the existing fallback path), so the pass never misfires.
+/// The gate is purely structural + capability: it detects the op/topology
+/// pattern and checks dtype/shape *compatibility*, never a specific model's
+/// `K`/`N`. Any shape/dtype/structure mismatch leaves the separate GEMVs +
+/// tagged `silu_mul` in place (the existing fallback path), so the pass never
+/// misfires.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaGateUpSwiGluFusion;
 
@@ -413,9 +432,12 @@ impl CudaGateUpSwiGluFusion {
         let gate = self.eligible_projection(graph, gate_matmul_id)?;
         let up = self.eligible_projection(graph, up_matmul_id)?;
 
-        // Both projections must consume the *same* activation and share the
-        // exact validated decode shape.
-        if gate.activation != up.activation {
+        // Structural pairing: both projections must consume the *same*
+        // activation and share output width (`N`) and contraction depth (`K`).
+        // Paired gate/up projections are structurally required to have equal
+        // `N` (they feed the same elementwise `Mul`) and equal `K` (same
+        // activation), independent of any specific model's dimensions.
+        if gate.activation != up.activation || gate.n != up.n || gate.k != up.k {
             return None;
         }
 
@@ -433,8 +455,9 @@ impl CudaGateUpSwiGluFusion {
         })
     }
 
-    /// Validate one projection `MatMulNBits` and return its `[x, W, scales]`
-    /// value ids if it matches the exact fused-kernel contract.
+    /// Validate one projection `MatMulNBits` against the paired kernel's
+    /// **capability** contract (not any model's dimensions) and return its
+    /// `[x, W, scales]` value ids plus its `N`/`K` for structural pairing.
     fn eligible_projection(&self, graph: &Graph, matmul_id: NodeId) -> Option<Projection> {
         let matmul = graph.try_node(matmul_id)?;
         // Plain A/B/scales form only: no zero-points, group index, or bias.
@@ -447,10 +470,13 @@ impl CudaGateUpSwiGluFusion {
         let k = matmul.attr("K").and_then(Attribute::as_int)? as usize;
         let block_size = matmul.attr("block_size").and_then(Attribute::as_int)? as usize;
         let bits = matmul.attr("bits").and_then(Attribute::as_int).unwrap_or(4);
-        if n != GATE_UP_SWIGLU_N
-            || k != GATE_UP_SWIGLU_K
-            || block_size != GATE_UP_SWIGLU_BLOCK_SIZE
-            || bits != 4
+        // Capability compatibility, derived from the paired kernel: block-32
+        // scale indexing and 4-bit weight unpacking. `K`/`N` are intentionally
+        // unconstrained (the kernel handles any block-aligned `K` via its tail
+        // and any `N` via a `column < n` guard), so the fusion generalizes
+        // across every model exhibiting the pattern.
+        if block_size != GATE_UP_SWIGLU_SUPPORTED_BLOCK_SIZE
+            || bits != GATE_UP_SWIGLU_SUPPORTED_BITS
         {
             return None;
         }
@@ -476,6 +502,8 @@ impl CudaGateUpSwiGluFusion {
             activation,
             weight,
             scales,
+            n,
+            k,
         })
     }
 
@@ -490,6 +518,8 @@ struct Projection {
     activation: ValueId,
     weight: ValueId,
     scales: ValueId,
+    n: usize,
+    k: usize,
 }
 
 #[cfg(test)]
@@ -717,20 +747,39 @@ mod tests {
 
     // === Paired gate/up + SwiGLU fusion ===
 
+    // Representative gate/up (K=hidden, N=intermediate) shapes. These are test
+    // fixtures only — the pass itself gates on structure + capability, never on
+    // these dimensions. `QWEN_*` is the 762 tok/s non-regression shape; the
+    // others exercise unrelated architectures to prove genericity.
+    const QWEN_GATE_UP_K: usize = 896;
+    const QWEN_GATE_UP_N: usize = 4864;
+    // (K, N) pairs from non-Qwen architectures, all block-32/4-bit/fp16.
+    const NON_QWEN_GATE_UP_SHAPES: [(usize, usize); 2] = [
+        (2048, 5632),  // Llama-ish: hidden 2048, intermediate 5632
+        (2048, 16384), // Gemma-ish: hidden 2048, intermediate 16384
+    ];
+
     fn projection(graph: &mut Graph, tag: &str, x: ValueId, k: usize, n: usize) -> ValueId {
+        projection_dtype(graph, tag, x, k, n, DataType::Float16)
+    }
+
+    fn projection_dtype(
+        graph: &mut Graph,
+        tag: &str,
+        x: ValueId,
+        k: usize,
+        n: usize,
+        dtype: DataType,
+    ) -> ValueId {
+        let scale_bytes = if dtype == DataType::Float16 { 2 } else { 4 };
         let packed = vec1d(
             graph,
             &format!("{tag}_packed"),
             DataType::Uint8,
             n * (k / 32) * 16,
         );
-        let scales = vec1d(
-            graph,
-            &format!("{tag}_scales"),
-            DataType::Float16,
-            n * (k / 32),
-        );
-        let out = value(graph, &format!("{tag}_out"), DataType::Float16, n);
+        let scales = vec1d(graph, &format!("{tag}_scales"), dtype, n * (k / 32));
+        let out = value(graph, &format!("{tag}_out"), dtype, n);
         graph.set_initializer(
             packed,
             WeightRef::Inline(TensorData::from_raw(
@@ -742,9 +791,9 @@ mod tests {
         graph.set_initializer(
             scales,
             WeightRef::Inline(TensorData::from_raw(
-                DataType::Float16,
+                dtype,
                 vec![n * (k / 32)],
-                vec![0u8; n * (k / 32) * 2],
+                vec![0u8; n * (k / 32) * scale_bytes],
             )),
         );
         graph.insert_node(matmul_nbits(
@@ -760,21 +809,54 @@ mod tests {
     /// feeding the tagged `Mul[_cuda_silu_mul](gate, up)`. When `shared` is false
     /// the up projection consumes a *different* activation.
     fn gate_up_graph(k: usize, n: usize, shared: bool) -> Graph {
+        gate_up_graph_dtype_impl(k, n, shared, DataType::Float16)
+    }
+
+    fn gate_up_graph_dtype(k: usize, n: usize, dtype: DataType) -> Graph {
+        gate_up_graph_dtype_impl(k, n, true, dtype)
+    }
+
+    fn gate_up_graph_dtype_impl(k: usize, n: usize, shared: bool, dtype: DataType) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+        let x = value(&mut graph, "x", dtype, k);
+        graph.add_input(x);
+        let up_x = if shared {
+            x
+        } else {
+            let x2 = value(&mut graph, "x2", dtype, k);
+            graph.add_input(x2);
+            x2
+        };
+        let gate_out = projection_dtype(&mut graph, "gate", x, k, n, dtype);
+        let up_out = projection_dtype(&mut graph, "up", up_x, k, n, dtype);
+        let out = value(&mut graph, "output", dtype, n);
+        let mut mul = Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(gate_out), Some(up_out)],
+            vec![out],
+        );
+        mul.attributes
+            .insert(SILU_MUL_FUSION_ATTR.into(), Attribute::Int(1));
+        graph.insert_node(mul);
+        graph.add_output(out);
+        graph
+    }
+
+    /// A gate/up graph where the two projections have *different* output widths
+    /// (`gate.N = n_gate`, `up.N = n_up`). Such a pair cannot feed one
+    /// elementwise `Mul`, so it must never fuse.
+    fn gate_up_graph_asymmetric(k: usize, n_gate: usize, n_up: usize) -> Graph {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 17);
         graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
         let x = value(&mut graph, "x", DataType::Float16, k);
         graph.add_input(x);
-        let up_x = if shared {
-            x
-        } else {
-            let x2 = value(&mut graph, "x2", DataType::Float16, k);
-            graph.add_input(x2);
-            x2
-        };
-        let gate_out = projection(&mut graph, "gate", x, k, n);
-        let up_out = projection(&mut graph, "up", up_x, k, n);
-        let out = value(&mut graph, "output", DataType::Float16, n);
+        let gate_out = projection(&mut graph, "gate", x, k, n_gate);
+        let up_out = projection(&mut graph, "up", x, k, n_up);
+        let out = value(&mut graph, "output", DataType::Float16, n_gate);
         let mut mul = Node::new(
             NodeId(0),
             "Mul",
@@ -790,7 +872,7 @@ mod tests {
 
     #[test]
     fn fuses_paired_gate_up_swiglu() {
-        let mut graph = gate_up_graph(GATE_UP_SWIGLU_K, GATE_UP_SWIGLU_N, true);
+        let mut graph = gate_up_graph(QWEN_GATE_UP_K, QWEN_GATE_UP_N, true);
         CudaGateUpSwiGluFusion
             .run(&mut graph, &PassContext::new())
             .unwrap();
@@ -821,7 +903,7 @@ mod tests {
         assert!(fused.inputs.iter().all(Option::is_some));
         assert_eq!(
             fused.attr("N").and_then(Attribute::as_int),
-            Some(GATE_UP_SWIGLU_N as i64)
+            Some(QWEN_GATE_UP_N as i64)
         );
         // The fused node keeps the Mul's output value, so downstream binding is
         // stable.
@@ -832,8 +914,37 @@ mod tests {
     }
 
     #[test]
+    fn fuses_paired_gate_up_swiglu_for_non_qwen_shapes() {
+        // Genericity proof: the identical structural + capability gate must fire
+        // on architectures with dimensions unrelated to Qwen, because it never
+        // looks at K/N magnitudes — only block-32/4-bit/fp16 compatibility and
+        // the paired op/topology.
+        for (k, n) in NON_QWEN_GATE_UP_SHAPES {
+            let mut graph = gate_up_graph(k, n, true);
+            CudaGateUpSwiGluFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+            assert_eq!(
+                graph.num_nodes(),
+                1,
+                "gate/up SwiGLU must fuse for non-Qwen shape K={k}, N={n}"
+            );
+            let fused = graph.nodes.values().next().unwrap();
+            assert_eq!(
+                fused
+                    .attr(GATE_UP_SWIGLU_FUSION_ATTR)
+                    .and_then(Attribute::as_int),
+                Some(1),
+                "fused marker missing for K={k}, N={n}"
+            );
+            assert_eq!(fused.attr("N").and_then(Attribute::as_int), Some(n as i64));
+            assert!(graph.validate().is_ok());
+        }
+    }
+
+    #[test]
     fn does_not_fuse_when_activation_differs() {
-        let mut graph = gate_up_graph(GATE_UP_SWIGLU_K, GATE_UP_SWIGLU_N, false);
+        let mut graph = gate_up_graph(QWEN_GATE_UP_K, QWEN_GATE_UP_N, false);
         CudaGateUpSwiGluFusion
             .run(&mut graph, &PassContext::new())
             .unwrap();
@@ -850,15 +961,80 @@ mod tests {
         );
     }
 
+    /// Set an integer attribute on every `MatMulNBits` in the graph.
+    fn set_matmul_attr(graph: &mut Graph, name: &str, value: i64) {
+        let ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| (node.op_type == "MatMulNBits").then_some(id))
+            .collect();
+        for id in ids {
+            graph
+                .node_mut(id)
+                .attributes
+                .insert(name.into(), Attribute::Int(value));
+        }
+    }
+
+    fn asserts_not_fused(graph: &Graph) {
+        assert_eq!(
+            graph.num_nodes(),
+            3,
+            "incompatible projections must stay separate"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_none())
+        );
+    }
+
     #[test]
-    fn does_not_fuse_unvalidated_shape() {
-        // Correct structure but the wrong K/N, so the paired kernel (validated
-        // only for K=896,N=4864) must not claim it.
-        let mut graph = gate_up_graph(512, 2048, true);
+    fn does_not_fuse_incompatible_block_size() {
+        // Correct structure but block_size != 32: the paired kernel's `lane>>2`
+        // scale indexing only maps for block-32 quantization.
+        let mut graph = gate_up_graph(QWEN_GATE_UP_K, QWEN_GATE_UP_N, true);
+        set_matmul_attr(&mut graph, "block_size", 64);
         CudaGateUpSwiGluFusion
             .run(&mut graph, &PassContext::new())
             .unwrap();
-        assert_eq!(graph.num_nodes(), 3, "off-shape projections stay separate");
+        asserts_not_fused(&graph);
+    }
+
+    #[test]
+    fn does_not_fuse_incompatible_bits() {
+        // Correct structure but bits != 4: the paired kernel unpacks 4-bit
+        // nibbles only.
+        let mut graph = gate_up_graph(QWEN_GATE_UP_K, QWEN_GATE_UP_N, true);
+        set_matmul_attr(&mut graph, "bits", 8);
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        asserts_not_fused(&graph);
+    }
+
+    #[test]
+    fn does_not_fuse_non_fp16_projection() {
+        // fp32 activation/scales/output: the paired kernel is fp16-only.
+        let mut graph = gate_up_graph_dtype(QWEN_GATE_UP_K, QWEN_GATE_UP_N, DataType::Float32);
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        asserts_not_fused(&graph);
+    }
+
+    #[test]
+    fn does_not_fuse_mismatched_output_width() {
+        // Structurally impossible pairing: gate.N != up.N. Paired projections
+        // feeding one elementwise Mul must share output width.
+        let mut graph =
+            gate_up_graph_asymmetric(QWEN_GATE_UP_K, QWEN_GATE_UP_N, QWEN_GATE_UP_N / 2);
+        CudaGateUpSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        // The mismatched-width Mul is not even a valid SwiGLU pairing, so the
+        // three nodes are untouched.
         assert!(
             graph
                 .nodes
@@ -869,7 +1045,7 @@ mod tests {
 
     #[test]
     fn does_not_fuse_untagged_mul() {
-        let mut graph = gate_up_graph(GATE_UP_SWIGLU_K, GATE_UP_SWIGLU_N, true);
+        let mut graph = gate_up_graph(QWEN_GATE_UP_K, QWEN_GATE_UP_N, true);
         // Strip the silu_mul marker: without it the multiply is an ordinary
         // elementwise op, not a SwiGLU, and must be left alone.
         let mul_id = graph
@@ -895,12 +1071,12 @@ mod tests {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 17);
         graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
-        let x = value(&mut graph, "x", DataType::Float16, GATE_UP_SWIGLU_K);
+        let x = value(&mut graph, "x", DataType::Float16, QWEN_GATE_UP_K);
         graph.add_input(x);
-        let gate_out = projection(&mut graph, "gate", x, GATE_UP_SWIGLU_K, GATE_UP_SWIGLU_N);
-        let up_out = projection(&mut graph, "up", x, GATE_UP_SWIGLU_K, GATE_UP_SWIGLU_N);
-        let silu_out = value(&mut graph, "silu", DataType::Float16, GATE_UP_SWIGLU_N);
-        let out = value(&mut graph, "output", DataType::Float16, GATE_UP_SWIGLU_N);
+        let gate_out = projection(&mut graph, "gate", x, QWEN_GATE_UP_K, QWEN_GATE_UP_N);
+        let up_out = projection(&mut graph, "up", x, QWEN_GATE_UP_K, QWEN_GATE_UP_N);
+        let silu_out = value(&mut graph, "silu", DataType::Float16, QWEN_GATE_UP_N);
+        let out = value(&mut graph, "output", DataType::Float16, QWEN_GATE_UP_N);
         let mut silu = Node::new(NodeId(0), "Silu", vec![Some(gate_out)], vec![silu_out]);
         silu.domain = MICROSOFT_DOMAIN.into();
         graph.insert_node(silu);

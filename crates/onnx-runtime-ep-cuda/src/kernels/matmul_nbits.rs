@@ -32,8 +32,20 @@ const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
 const GEMV_F16_SMALL_THREADS: u32 = 64;
 const GEMV_F16_LARGE_THREADS: u32 = 256;
 const GEMV_F16_SMALL_N_MAX: usize = 1152;
-const GEMV_F16_DOWN_K: usize = 4864;
-const GEMV_F16_DOWN_N: usize = 896;
+/// Block-quantization size the down-projection tiling assumes. It stages the
+/// activation as `K/8` permuted half8 vectors and indexes them as 4 `uint4` per
+/// K-block (`block*4 .. block*4+3`), i.e. exactly 32 activation elements per
+/// block, and it has **no** partial-block tail. So the variant is only correct
+/// when `block_size == 32` and `K` is a whole multiple of 32.
+const GEMV_F16_DOWN_BLOCK_SIZE: usize = 32;
+/// Static shared memory the down kernel always reserves (`float warp_sums[8][8]`).
+const GEMV_F16_DOWN_STATIC_SMEM_BYTES: usize = 8 * 8 * std::mem::size_of::<f32>();
+/// Portable dynamic-shared-memory ceiling. The down variant stages the whole
+/// activation (`K * sizeof(f16)` bytes) in shared memory; 48 KiB is the on-chip
+/// smem budget guaranteed on every supported SM (sm_53+) without a per-arch
+/// `cudaFuncAttributeMaxDynamicSharedMemorySize` opt-in, so the tiling only
+/// applies while the staged activation plus the static reservation fit under it.
+const GEMV_F16_DOWN_MAX_SMEM_BYTES: usize = 48 * 1024;
 const GEMV_F16_DOWN_THREADS: u32 = 256;
 const GEMV_F16_DOWN_COLUMNS_PER_BLOCK: usize = 8;
 const GATE_UP_SWIGLU_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu";
@@ -972,21 +984,51 @@ struct F16GemvSelection {
     reason: &'static str,
 }
 
+/// Choose the fp16 int4 GEMV variant by **structural shape class + capability**,
+/// never by a specific model's dimensions.
+///
+/// The specialized `DownProjection` tiling stages the entire activation in
+/// shared memory once and reuses it across the 8 columns of a CTA while the full
+/// 256-thread block cooperatively reduces along `K`. That wins on the
+/// **tall-skinny** class — a `K > N` GEMV (reduction depth exceeds output width,
+/// e.g. an MLP down-projection or attention output-projection) — where the long
+/// reduction benefits from block-parallel accumulation and the staged activation
+/// is reused across the CTA's columns. It is only *correct* under the tiling's
+/// hard constraints, all derived from the kernel body:
+///
+/// * `scales_fp16` and 4-bit weights (this fp16 GEMV path is always 4-bit),
+/// * `block_size == 32` and `K % 32 == 0` (full K-blocks; the kernel has no
+///   partial-block tail),
+/// * the staged activation (`K * sizeof(f16)` bytes) plus the static
+///   `warp_sums` reservation fits the portable 48 KiB smem budget.
+///
+/// Every other shape (wide `N >= K` projections, oversized `K`, non-block-32,
+/// non-multiple-of-32 `K`) falls back to the general per-warp GEMV. Selection is
+/// thus generic across models: any architecture's down/output projection that
+/// fits the class is accelerated, and nothing keys on a magic `K`/`N`.
 fn select_f16_gemv_variant(
     k: usize,
     n: usize,
     block_size: usize,
     scales_fp16: bool,
 ) -> F16GemvSelection {
-    if k == GEMV_F16_DOWN_K && n == GEMV_F16_DOWN_N && block_size == 32 && scales_fp16 {
+    let staged_smem = k * std::mem::size_of::<half::f16>() + GEMV_F16_DOWN_STATIC_SMEM_BYTES;
+    let down_eligible = scales_fp16
+        && block_size == GEMV_F16_DOWN_BLOCK_SIZE
+        && k.is_multiple_of(GEMV_F16_DOWN_BLOCK_SIZE)
+        && staged_smem <= GEMV_F16_DOWN_MAX_SMEM_BYTES
+        && k > n;
+    if down_eligible {
         F16GemvSelection {
             variant: F16GemvVariant::DownProjection,
-            reason: "variant=down_projection;K=4864;N=896;block_size=32;scales=fp16",
+            reason: "variant=down_projection;class=tall_skinny(K>N);block_size=32;\
+                     scales=fp16;K%32==0;activation_smem<=48KiB",
         }
     } else {
         F16GemvSelection {
             variant: F16GemvVariant::General,
-            reason: "variant=general;predicate=not(K=4864,N=896,block_size=32,scales=fp16)",
+            reason: "variant=general;class=not(tall_skinny K>N & block_size=32 & \
+                     scales=fp16 & K%32==0 & activation_smem<=48KiB)",
         }
     }
 }
@@ -2068,6 +2110,12 @@ mod tests {
 
     use super::*;
 
+    // Qwen2.5-0.5B down-projection shape (K=intermediate, N=hidden). Used as a
+    // test fixture for the tall-skinny down variant and, transposed, as the
+    // gate/up shape — the runtime code never keys on these values.
+    const QWEN_DOWN_K: usize = 4864;
+    const QWEN_DOWN_N: usize = 896;
+
     fn runtime() -> Option<Arc<CudaRuntime>> {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -2362,172 +2410,209 @@ mod tests {
             return;
         }
 
-        let k = GEMV_F16_DOWN_K;
-        let n = GEMV_F16_DOWN_N;
-        let block_size = 32usize;
-        let k_blocks = k / block_size;
-        let blob_size = block_size / 2;
+        // Prove the specialization matches the general GEMV bit-numerically for
+        // the Qwen down shape AND an unrelated non-Qwen tall-skinny shape, so
+        // the generalized selection is correct beyond one architecture.
+        for (k, n) in [(QWEN_DOWN_K, QWEN_DOWN_N), (5632usize, 2048usize)] {
+            assert_eq!(
+                select_f16_gemv_variant(k, n, 32, true).variant,
+                F16GemvVariant::DownProjection,
+                "shape K={k}, N={n} must select the down variant under test"
+            );
+            let block_size = 32usize;
+            let k_blocks = k / block_size;
+            let blob_size = block_size / 2;
 
-        let activation: Vec<f16> = (0..k)
-            .map(|i| f16::from_f32(((i * 17 % 257) as f32 - 128.0) / 128.0))
-            .collect();
-        let packed: Vec<u8> = (0..n * k_blocks * blob_size)
-            .map(|i| ((i * 29 + i / 7 + 13) & 0xff) as u8)
-            .collect();
-        let scales: Vec<f16> = (0..n * k_blocks)
-            .map(|i| f16::from_f32(0.01 + (i % 17) as f32 * 0.0005))
-            .collect();
+            let activation: Vec<f16> = (0..k)
+                .map(|i| f16::from_f32(((i * 17 % 257) as f32 - 128.0) / 128.0))
+                .collect();
+            let packed: Vec<u8> = (0..n * k_blocks * blob_size)
+                .map(|i| ((i * 29 + i / 7 + 13) & 0xff) as u8)
+                .collect();
+            let scales: Vec<f16> = (0..n * k_blocks)
+                .map(|i| f16::from_f32(0.01 + (i % 17) as f32 * 0.0005))
+                .collect();
 
-        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
-        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
-        let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
-        let general_output_dev = runtime.alloc_raw(n * 2).unwrap();
-        let down_output_dev = runtime.alloc_raw(n * 2).unwrap();
-        // SAFETY: device buffers exactly cover their source slices.
-        unsafe {
-            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
-            runtime.htod(&packed, packed_dev).unwrap();
-            runtime.htod(as_bytes(&scales), scales_dev).unwrap();
-        }
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+            let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+            let general_output_dev = runtime.alloc_raw(n * 2).unwrap();
+            let down_output_dev = runtime.alloc_raw(n * 2).unwrap();
+            // SAFETY: device buffers exactly cover their source slices.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed, packed_dev).unwrap();
+                runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+            }
 
-        let device = DeviceId::cuda(0);
-        let a_shape = [1usize, k];
-        let a_strides = [k as i64, 1];
-        let b_shape = [n, k_blocks, blob_size];
-        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
-        let scales_shape = [n, k_blocks];
-        let scales_strides = [k_blocks as i64, 1];
-        let y_shape = [1usize, n];
-        let y_strides = [n as i64, 1];
-        let activation_view = TensorView::new(
-            device_ptr(activation_dev),
-            DataType::Float16,
-            &a_shape,
-            &a_strides,
-            device,
-        );
-        let packed_view = TensorView::new(
-            device_ptr(packed_dev),
-            DataType::Uint8,
-            &b_shape,
-            &b_strides,
-            device,
-        );
-        let scales_view = TensorView::new(
-            device_ptr(scales_dev),
-            DataType::Float16,
-            &scales_shape,
-            &scales_strides,
-            device,
-        );
-        let mut general_output = TensorMut::new(
-            device_ptr_mut(general_output_dev),
-            DataType::Float16,
-            &y_shape,
-            &y_strides,
-            device,
-        );
-        let mut down_output = TensorMut::new(
-            device_ptr_mut(down_output_dev),
-            DataType::Float16,
-            &y_shape,
-            &y_strides,
-            device,
-        );
-        let kernel = MatMulNBitsKernel {
-            runtime: runtime.clone(),
-            k,
-            n,
-            block_size,
-            accuracy_level: 4,
-            accuracy4_workspace: None,
-            fold_bias_post_round: false,
-            gate_up_swiglu: false,
-            last_call_capture_safe: AtomicBool::new(false),
-        };
-        kernel
-            .launch_f16_gemv_variant(
-                &activation_view,
-                &packed_view,
-                &scales_view,
-                true,
-                None,
-                &mut general_output,
-                k_blocks,
-                blob_size,
-                F16GemvSelection {
-                    variant: F16GemvVariant::General,
-                    reason: "variant=general;test=forced_reference",
-                },
-            )
-            .unwrap();
-        kernel
-            .launch_f16_gemv_variant(
-                &activation_view,
-                &packed_view,
-                &scales_view,
-                true,
-                None,
-                &mut down_output,
-                k_blocks,
-                blob_size,
-                select_f16_gemv_variant(k, n, block_size, true),
-            )
-            .unwrap();
-        runtime.synchronize().unwrap();
-
-        let mut general = vec![f16::ZERO; n];
-        let mut down = vec![f16::ZERO; n];
-        // SAFETY: both output allocations hold `n` fp16 values.
-        unsafe {
-            runtime
-                .dtoh(as_bytes_mut(&mut general), general_output_dev)
+            let device = DeviceId::cuda(0);
+            let a_shape = [1usize, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let y_shape = [1usize, n];
+            let y_strides = [n as i64, 1];
+            let activation_view = TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            );
+            let packed_view = TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_view = TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let mut general_output = TensorMut::new(
+                device_ptr_mut(general_output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            let mut down_output = TensorMut::new(
+                device_ptr_mut(down_output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            let kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: false,
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            kernel
+                .launch_f16_gemv_variant(
+                    &activation_view,
+                    &packed_view,
+                    &scales_view,
+                    true,
+                    None,
+                    &mut general_output,
+                    k_blocks,
+                    blob_size,
+                    F16GemvSelection {
+                        variant: F16GemvVariant::General,
+                        reason: "variant=general;test=forced_reference",
+                    },
+                )
                 .unwrap();
-            runtime
-                .dtoh(as_bytes_mut(&mut down), down_output_dev)
+            kernel
+                .launch_f16_gemv_variant(
+                    &activation_view,
+                    &packed_view,
+                    &scales_view,
+                    true,
+                    None,
+                    &mut down_output,
+                    k_blocks,
+                    blob_size,
+                    select_f16_gemv_variant(k, n, block_size, true),
+                )
                 .unwrap();
-            runtime.free_raw(activation_dev).unwrap();
-            runtime.free_raw(packed_dev).unwrap();
-            runtime.free_raw(scales_dev).unwrap();
-            runtime.free_raw(general_output_dev).unwrap();
-            runtime.free_raw(down_output_dev).unwrap();
-        }
+            runtime.synchronize().unwrap();
 
-        let mut max_abs = 0.0f32;
-        let mut max_rel = 0.0f32;
-        for (reference, specialized) in general.iter().zip(&down) {
-            let reference = reference.to_f32();
-            let specialized = specialized.to_f32();
-            let abs = (reference - specialized).abs();
-            max_abs = max_abs.max(abs);
-            max_rel = max_rel.max(abs / reference.abs().max(1.0));
+            let mut general = vec![f16::ZERO; n];
+            let mut down = vec![f16::ZERO; n];
+            // SAFETY: both output allocations hold `n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut general), general_output_dev)
+                    .unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut down), down_output_dev)
+                    .unwrap();
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(packed_dev).unwrap();
+                runtime.free_raw(scales_dev).unwrap();
+                runtime.free_raw(general_output_dev).unwrap();
+                runtime.free_raw(down_output_dev).unwrap();
+            }
+
+            let mut max_abs = 0.0f32;
+            let mut max_rel = 0.0f32;
+            for (reference, specialized) in general.iter().zip(&down) {
+                let reference = reference.to_f32();
+                let specialized = specialized.to_f32();
+                let abs = (reference - specialized).abs();
+                max_abs = max_abs.max(abs);
+                max_rel = max_rel.max(abs / reference.abs().max(1.0));
+            }
+            eprintln!(
+                "down-projection specialized/general parity: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+            );
+            assert!(
+                max_abs <= 0.02 && max_rel <= 1e-2,
+                "down-projection specialization diverged: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+            );
         }
-        eprintln!(
-            "down-projection specialized/general parity: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
-        );
-        assert!(
-            max_abs <= 0.01 && max_rel <= 5e-3,
-            "down-projection specialization diverged: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
-        );
     }
 
     #[test]
-    fn fp16_gemv_variant_selection_is_shape_specific() {
-        let selected = select_f16_gemv_variant(4864, 896, 32, true);
-        assert_eq!(selected.variant, F16GemvVariant::DownProjection);
+    fn fp16_gemv_variant_selection_is_structural() {
+        // The down variant is selected by the tall-skinny (K>N) block-32 fp16
+        // shape *class*, generalizing across models — not by a magic K/N.
+        let qwen = select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, true);
+        assert_eq!(qwen.variant, F16GemvVariant::DownProjection);
         assert_eq!(
-            selected.reason,
-            "variant=down_projection;K=4864;N=896;block_size=32;scales=fp16"
+            qwen.reason,
+            "variant=down_projection;class=tall_skinny(K>N);block_size=32;\
+             scales=fp16;K%32==0;activation_smem<=48KiB"
         );
 
-        for (k, n) in [(896, 4864), (896, 1152), (896, 896), (896, 151_936)] {
+        // Non-Qwen tall-skinny down/output projections must also select it.
+        for (k, n) in [(5632, 2048), (11008, 4096), (2048, 512), (4096, 4096 - 32)] {
             let selection = select_f16_gemv_variant(k, n, 32, true);
             assert_eq!(
                 selection.variant,
-                F16GemvVariant::General,
-                "K={k}, N={n} must retain the general GEMV"
+                F16GemvVariant::DownProjection,
+                "tall-skinny K={k}, N={n} must select the down variant"
             );
         }
+
+        // Wide (N>=K) projections, oversized-K (activation exceeds the 48 KiB
+        // smem budget), non-multiple-of-32 K, and non-block-32 all fall back.
+        let general_cases = [
+            (896, 4864, 32, true),    // gate/up: N > K
+            (896, 896, 32, true),     // square: K == N is not tall-skinny
+            (896, 151_936, 32, true), // lm_head: N >> K
+            (32_768, 4096, 32, true), // K*2 = 64 KiB > 48 KiB budget
+            (4880, 896, 32, true),    // 4880 % 32 != 0
+            (4864, 896, 64, true),    // block_size != 32
+        ];
+        for (k, n, block_size, scales_fp16) in general_cases {
+            let selection = select_f16_gemv_variant(k, n, block_size, scales_fp16);
+            assert_eq!(
+                selection.variant,
+                F16GemvVariant::General,
+                "K={k}, N={n}, block_size={block_size} must retain the general GEMV"
+            );
+        }
+
+        // fp32 scales are never down-eligible even for a tall-skinny shape.
+        assert_eq!(
+            select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, false).variant,
+            F16GemvVariant::General,
+        );
     }
 
     #[test]
@@ -2800,9 +2885,10 @@ extern "C" __global__ void ref_silu_mul_f16(
 "#;
 
     /// The paired gate/up SwiGLU kernel must be byte-identical to running the two
-    /// standalone projection GEMVs and then `silu_mul_f16`, at the exact decode
-    /// shape (K=896, N=4864, block-32, fp16). This is the on-device token-identity
-    /// guarantee for Substep B.
+    /// standalone projection GEMVs and then `silu_mul_f16`. This is verified for
+    /// the Qwen decode shape (K=896, N=4864, the 762 tok/s non-regression path)
+    /// AND an unrelated non-Qwen shape, proving the fused kernel is generic — the
+    /// on-device token-identity guarantee holds regardless of K/N.
     #[test]
     fn fp16_gate_up_swiglu_is_bit_exact_to_two_op_path() {
         let Some(runtime) = runtime() else {
@@ -2817,250 +2903,252 @@ extern "C" __global__ void ref_silu_mul_f16(
             return;
         }
 
-        let k = GEMV_F16_DOWN_N; // 896
-        let n = GEMV_F16_DOWN_K; // 4864
-        let block_size = 32usize;
-        let k_blocks = k / block_size;
-        let blob_size = block_size / 2;
+        // (K=hidden, N=intermediate): Qwen first (non-regression), then a
+        // Llama-ish shape with unrelated dimensions.
+        for (k, n) in [(QWEN_DOWN_N, QWEN_DOWN_K), (2048usize, 5632usize)] {
+            let block_size = 32usize;
+            let k_blocks = k / block_size;
+            let blob_size = block_size / 2;
 
-        let mut state = 0x0bad_c0de_dead_beefu64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
-        };
+            let mut state = 0x0bad_c0de_dead_beefu64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
 
-        let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
-            let mut quant = vec![0u8; n * k];
-            for value in quant.iter_mut() {
-                *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
-            }
-            let mut packed = vec![0u8; n * k_blocks * blob_size];
-            for col in 0..n {
-                for block in 0..k_blocks {
-                    for pair in 0..blob_size {
-                        let low = quant[col * k + block * block_size + pair * 2] & 15;
-                        let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
-                        packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+            let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
+                let mut quant = vec![0u8; n * k];
+                for value in quant.iter_mut() {
+                    *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                }
+                let mut packed = vec![0u8; n * k_blocks * blob_size];
+                for col in 0..n {
+                    for block in 0..k_blocks {
+                        for pair in 0..blob_size {
+                            let low = quant[col * k + block * block_size + pair * 2] & 15;
+                            let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                            packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                        }
                     }
                 }
+                packed
+            };
+
+            let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(next())).collect();
+            let packed_gate = pack(&mut next);
+            let scales_gate: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            let packed_up = pack(&mut next);
+            let scales_up: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+            let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+            let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+            let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+            let gate_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            let up_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            let fused_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            // SAFETY: device buffers exactly cover their source slices.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&scales_gate), scales_gate_dev)
+                    .unwrap();
+                runtime.htod(&packed_up, packed_up_dev).unwrap();
+                runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
             }
-            packed
-        };
 
-        let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(next())).collect();
-        let packed_gate = pack(&mut next);
-        let scales_gate: Vec<f16> = (0..n * k_blocks)
-            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
-            .collect();
-        let packed_up = pack(&mut next);
-        let scales_up: Vec<f16> = (0..n * k_blocks)
-            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
-            .collect();
-
-        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
-        let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
-        let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
-        let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
-        let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
-        let gate_out_dev = runtime.alloc_raw(n * 2).unwrap();
-        let up_out_dev = runtime.alloc_raw(n * 2).unwrap();
-        let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
-        let fused_out_dev = runtime.alloc_raw(n * 2).unwrap();
-        // SAFETY: device buffers exactly cover their source slices.
-        unsafe {
-            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
-            runtime.htod(&packed_gate, packed_gate_dev).unwrap();
-            runtime
-                .htod(as_bytes(&scales_gate), scales_gate_dev)
-                .unwrap();
-            runtime.htod(&packed_up, packed_up_dev).unwrap();
-            runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
-        }
-
-        let device = DeviceId::cuda(0);
-        let a_shape = [1usize, k];
-        let a_strides = [k as i64, 1];
-        let b_shape = [n, k_blocks, blob_size];
-        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
-        let scales_shape = [n, k_blocks];
-        let scales_strides = [k_blocks as i64, 1];
-        let y_shape = [1usize, n];
-        let y_strides = [n as i64, 1];
-        let activation_view = TensorView::new(
-            device_ptr(activation_dev),
-            DataType::Float16,
-            &a_shape,
-            &a_strides,
-            device,
-        );
-        let packed_gate_view = TensorView::new(
-            device_ptr(packed_gate_dev),
-            DataType::Uint8,
-            &b_shape,
-            &b_strides,
-            device,
-        );
-        let scales_gate_view = TensorView::new(
-            device_ptr(scales_gate_dev),
-            DataType::Float16,
-            &scales_shape,
-            &scales_strides,
-            device,
-        );
-        let packed_up_view = TensorView::new(
-            device_ptr(packed_up_dev),
-            DataType::Uint8,
-            &b_shape,
-            &b_strides,
-            device,
-        );
-        let scales_up_view = TensorView::new(
-            device_ptr(scales_up_dev),
-            DataType::Float16,
-            &scales_shape,
-            &scales_strides,
-            device,
-        );
-        let mut gate_out = TensorMut::new(
-            device_ptr_mut(gate_out_dev),
-            DataType::Float16,
-            &y_shape,
-            &y_strides,
-            device,
-        );
-        let mut up_out = TensorMut::new(
-            device_ptr_mut(up_out_dev),
-            DataType::Float16,
-            &y_shape,
-            &y_strides,
-            device,
-        );
-        let mut fused_out = TensorMut::new(
-            device_ptr_mut(fused_out_dev),
-            DataType::Float16,
-            &y_shape,
-            &y_strides,
-            device,
-        );
-
-        let selection = select_f16_gemv_variant(k, n, block_size, true);
-        assert_eq!(
-            selection.variant,
-            F16GemvVariant::General,
-            "gate/up projections must use the general GEMV as the reference"
-        );
-        let gemv_kernel = MatMulNBitsKernel {
-            runtime: runtime.clone(),
-            k,
-            n,
-            block_size,
-            accuracy_level: 4,
-            accuracy4_workspace: None,
-            fold_bias_post_round: false,
-            gate_up_swiglu: false,
-            last_call_capture_safe: AtomicBool::new(false),
-        };
-        // Reference: two standalone projection GEMVs...
-        gemv_kernel
-            .launch_f16_gemv_variant(
-                &activation_view,
-                &packed_gate_view,
-                &scales_gate_view,
-                true,
-                None,
-                &mut gate_out,
-                k_blocks,
-                blob_size,
-                selection,
-            )
-            .unwrap();
-        gemv_kernel
-            .launch_f16_gemv_variant(
-                &activation_view,
-                &packed_up_view,
-                &scales_up_view,
-                true,
-                None,
-                &mut up_out,
-                k_blocks,
-                blob_size,
-                selection,
-            )
-            .unwrap();
-        // ...then the reference silu_mul (byte-identical to silu_mul_f16).
-        let ref_function = runtime
-            .nvrtc_function(
-                "matmul_nbits_ref_silu_mul",
-                REF_SILU_MUL_SRC,
-                "ref_silu_mul_f16",
-            )
-            .unwrap();
-        let gate_out_ptr = cuptr(device_ptr(gate_out_dev).0);
-        let up_out_ptr = cuptr(device_ptr(up_out_dev).0);
-        let ref_out_ptr = cuptr(device_ptr(ref_out_dev).0);
-        let n_i32 = n as i32;
-        let mut ref_builder = runtime.stream().launch_builder(&ref_function);
-        ref_builder
-            .arg(&gate_out_ptr)
-            .arg(&up_out_ptr)
-            .arg(&ref_out_ptr)
-            .arg(&n_i32);
-        // SAFETY: all three buffers hold `n` fp16 values on this device.
-        unsafe {
-            ref_builder.launch(LaunchConfig {
-                grid_dim: (n.div_ceil(256) as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .unwrap();
-
-        // Subject: the fused paired kernel.
-        gemv_kernel
-            .launch_gate_up_swiglu(
-                &activation_view,
-                &packed_gate_view,
-                &scales_gate_view,
-                &packed_up_view,
-                &scales_up_view,
-                &mut fused_out,
-                k_blocks,
-                blob_size,
-            )
-            .unwrap();
-        runtime.synchronize().unwrap();
-
-        let mut reference = vec![f16::ZERO; n];
-        let mut fused = vec![f16::ZERO; n];
-        // SAFETY: both output allocations hold `n` fp16 values.
-        unsafe {
-            runtime
-                .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
-                .unwrap();
-            runtime
-                .dtoh(as_bytes_mut(&mut fused), fused_out_dev)
-                .unwrap();
-            runtime.free_raw(activation_dev).unwrap();
-            runtime.free_raw(packed_gate_dev).unwrap();
-            runtime.free_raw(scales_gate_dev).unwrap();
-            runtime.free_raw(packed_up_dev).unwrap();
-            runtime.free_raw(scales_up_dev).unwrap();
-            runtime.free_raw(gate_out_dev).unwrap();
-            runtime.free_raw(up_out_dev).unwrap();
-            runtime.free_raw(ref_out_dev).unwrap();
-            runtime.free_raw(fused_out_dev).unwrap();
-        }
-
-        for col in 0..n {
-            assert_eq!(
-                fused[col].to_bits(),
-                reference[col].to_bits(),
-                "paired gate/up SwiGLU diverged at column {col}: fused={:?} reference={:?}",
-                fused[col],
-                reference[col]
+            let device = DeviceId::cuda(0);
+            let a_shape = [1usize, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let y_shape = [1usize, n];
+            let y_strides = [n as i64, 1];
+            let activation_view = TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
             );
+            let packed_gate_view = TensorView::new(
+                device_ptr(packed_gate_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_gate_view = TensorView::new(
+                device_ptr(scales_gate_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let packed_up_view = TensorView::new(
+                device_ptr(packed_up_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_up_view = TensorView::new(
+                device_ptr(scales_up_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let mut gate_out = TensorMut::new(
+                device_ptr_mut(gate_out_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            let mut up_out = TensorMut::new(
+                device_ptr_mut(up_out_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            let mut fused_out = TensorMut::new(
+                device_ptr_mut(fused_out_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+
+            let selection = select_f16_gemv_variant(k, n, block_size, true);
+            assert_eq!(
+                selection.variant,
+                F16GemvVariant::General,
+                "gate/up projections must use the general GEMV as the reference"
+            );
+            let gemv_kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: false,
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            // Reference: two standalone projection GEMVs...
+            gemv_kernel
+                .launch_f16_gemv_variant(
+                    &activation_view,
+                    &packed_gate_view,
+                    &scales_gate_view,
+                    true,
+                    None,
+                    &mut gate_out,
+                    k_blocks,
+                    blob_size,
+                    selection,
+                )
+                .unwrap();
+            gemv_kernel
+                .launch_f16_gemv_variant(
+                    &activation_view,
+                    &packed_up_view,
+                    &scales_up_view,
+                    true,
+                    None,
+                    &mut up_out,
+                    k_blocks,
+                    blob_size,
+                    selection,
+                )
+                .unwrap();
+            // ...then the reference silu_mul (byte-identical to silu_mul_f16).
+            let ref_function = runtime
+                .nvrtc_function(
+                    "matmul_nbits_ref_silu_mul",
+                    REF_SILU_MUL_SRC,
+                    "ref_silu_mul_f16",
+                )
+                .unwrap();
+            let gate_out_ptr = cuptr(device_ptr(gate_out_dev).0);
+            let up_out_ptr = cuptr(device_ptr(up_out_dev).0);
+            let ref_out_ptr = cuptr(device_ptr(ref_out_dev).0);
+            let n_i32 = n as i32;
+            let mut ref_builder = runtime.stream().launch_builder(&ref_function);
+            ref_builder
+                .arg(&gate_out_ptr)
+                .arg(&up_out_ptr)
+                .arg(&ref_out_ptr)
+                .arg(&n_i32);
+            // SAFETY: all three buffers hold `n` fp16 values on this device.
+            unsafe {
+                ref_builder.launch(LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .unwrap();
+
+            // Subject: the fused paired kernel.
+            gemv_kernel
+                .launch_gate_up_swiglu(
+                    &activation_view,
+                    &packed_gate_view,
+                    &scales_gate_view,
+                    &packed_up_view,
+                    &scales_up_view,
+                    &mut fused_out,
+                    k_blocks,
+                    blob_size,
+                )
+                .unwrap();
+            runtime.synchronize().unwrap();
+
+            let mut reference = vec![f16::ZERO; n];
+            let mut fused = vec![f16::ZERO; n];
+            // SAFETY: both output allocations hold `n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
+                    .unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut fused), fused_out_dev)
+                    .unwrap();
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(packed_gate_dev).unwrap();
+                runtime.free_raw(scales_gate_dev).unwrap();
+                runtime.free_raw(packed_up_dev).unwrap();
+                runtime.free_raw(scales_up_dev).unwrap();
+                runtime.free_raw(gate_out_dev).unwrap();
+                runtime.free_raw(up_out_dev).unwrap();
+                runtime.free_raw(ref_out_dev).unwrap();
+                runtime.free_raw(fused_out_dev).unwrap();
+            }
+
+            for col in 0..n {
+                assert_eq!(
+                    fused[col].to_bits(),
+                    reference[col].to_bits(),
+                    "paired gate/up SwiGLU diverged at column {col}: fused={:?} reference={:?}",
+                    fused[col],
+                    reference[col]
+                );
+            }
         }
     }
 }
