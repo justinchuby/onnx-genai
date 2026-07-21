@@ -1,0 +1,59 @@
+# Architecture-neutral VLM fixture: a rank-3 (multi-axis) position program, a
+# SPARSE set of attention KV port pairs (declared explicitly, not expanded from a
+# layer count), and fixed loop-carried recurrent-state pairs with `replace`
+# semantics. The decoder also declares BOTH a raw token input and a routed
+# sequence input simultaneously. Every number is model DATA; no model-family
+# name, layer count, hidden size, or patch/tensor dimension is baked in.
+schema_version: v1
+required_capabilities:
+  - position_program
+  - multi_axis_positions
+  - loop_carried_state
+  - dual_sequence_inputs
+pipeline:
+  models:
+    embedding:
+      filename: embedding.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        # Both raw tokens AND a routed pre-embedded sequence are consumed.
+        token_input: input_ids
+        inputs_embeds_input: inputs_embeds
+        attention_mask_input: attention_mask
+        position_ids_input: position_ids
+        logits_output: logits
+        # Only two attention layers expose KV here; the ports come from this
+        # declared, sparse list rather than being expanded from a layer total.
+        kv_inputs: [past.3.key, past.3.value, past.7.key, past.7.value]
+        kv_outputs: [present.3.key, present.3.value, present.7.key, present.7.value]
+        kv_update: append
+        # Fixed recurrent tensors: zero-initialized, wholly replaced each step.
+        state_pairs:
+          - input: conv_state.0.in
+            output: conv_state.0.out
+            init: zeros
+            update: replace
+          - input: recurrent_state.0.in
+            output: recurrent_state.0.out
+            init: zeros
+            update: replace
+  dataflow:
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+    max_tokens: 8
+  positions:
+    input: position_ids
+    rank: 3
+    axes: [temporal, height, width]
+    sections: [16, 24, 24]
+    dtype: int64
+    continuation: carry_max
+    processor_summaries: [image_grid_thw]

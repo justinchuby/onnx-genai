@@ -1,0 +1,98 @@
+# Architecture-neutral VLM fixture: a typed image preprocessing program that
+# emits TWO packed image tensor outputs plus a rich token-expansion contract.
+# Every concrete number here is model DATA carried in the fixture; none of it is
+# baked into the schema or runtime. No model-family name appears anywhere.
+schema_version: v1
+required_capabilities:
+  - image_preprocessing_program
+  - packed_image_outputs
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 896
+        mode: pad
+        interpolation: bicubic
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+      - op: patchify
+        patch_size: 14
+        flatten: true
+      - op: pad
+        pad_value: 0.0
+    outputs:
+      # First packed output: flattened patch pixels bound to an arbitrary port.
+      - name: pixel_values
+        content: pixels
+        dtype: float32
+      # Second packed output: per-patch coordinates with a sentinel pad value.
+      - name: pixel_position_ids
+        content: patch_coordinates
+        dtype: int64
+        pad_value: -1
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx
+      type: vision_encoder
+    embedding:
+      filename: embedding.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        inputs_embeds_input: inputs_embeds
+        attention_mask_input: attention_mask
+        logits_output: logits
+        kv_inputs: [past.0.key, past.0.value]
+        kv_outputs: [present.0.key, present.0.value]
+        kv_update: append
+  dataflow:
+    - from: vision_encoder.image_features
+      to: embedding.image_features
+      dtype: fp32
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_vision
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: fuse_embeddings
+        strategy:
+          kind: single_pass
+          model: embedding
+        run_on: prompt_only
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 16
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    embedding:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step
+  vision:
+    image_placeholder_token_id: 262144
+    image_token_id: 262145
+    token_count_source: per_patch
+    tokens_per_patch: 1
+    tokens_per_tile: 256
+    placeholder_per_image: true
+    row_separator_token_id: 262146
+    column_separator_token_id: 262147
+    thumbnail_order: prepend

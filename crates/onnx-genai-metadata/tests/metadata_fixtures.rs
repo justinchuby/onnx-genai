@@ -282,9 +282,10 @@ fn pipeline_vision_config_round_trips_via_json() {
     assert_eq!(decoded.image_placeholder_token_id, Some(32000_i64));
     assert_eq!(decoded.tokens_per_tile, Some(256_usize));
 
-    let round_tripped: PipelineVisionConfig =
-        serde_json::from_str(&serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).unwrap()).unwrap())
-            .expect("value round-trip");
+    let round_tripped: PipelineVisionConfig = serde_json::from_str(
+        &serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).unwrap()).unwrap(),
+    )
+    .expect("value round-trip");
     assert_eq!(round_tripped, decoded);
 }
 
@@ -335,6 +336,7 @@ pipeline:
         PipelineVisionConfig {
             image_placeholder_token_id: Some(32000),
             tokens_per_tile: Some(256),
+            ..Default::default()
         }
     );
 }
@@ -362,8 +364,132 @@ pipeline:
     let spec = metadata.pipeline.expect("pipeline section");
     let err = validate_pipeline_spec(&spec).expect_err("timesteps length mismatch is rejected");
     assert!(
-        err.errors.iter().any(|e| e.contains("timesteps has 2 entries")),
+        err.errors
+            .iter()
+            .any(|e| e.contains("timesteps has 2 entries")),
         "unexpected errors: {:?}",
         err.errors
     );
+}
+
+/// Compiles the committed JSON schema so fixtures can be validated against it.
+fn schema_validator() -> jsonschema::Validator {
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("schema/inference_metadata.schema.json");
+    let schema_text = std::fs::read_to_string(&schema_path).expect("read committed JSON schema");
+    let schema: serde_json::Value =
+        serde_json::from_str(&schema_text).expect("committed JSON schema is valid JSON");
+    jsonschema::validator_for(&schema).expect("committed JSON schema compiles")
+}
+
+/// Loads a crate-local YAML fixture as a JSON value for schema validation.
+fn fixture_json(name: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(crate_fixture(name)).expect("read fixture");
+    serde_yaml::from_str(&text).expect("fixture parses as a structured document")
+}
+
+#[test]
+fn vlm_packed_fixture_deserializes_and_validates_against_schema() {
+    // Rust deserializer round-trip.
+    let metadata = load_metadata(&crate_fixture("vlm_packed_valid.yaml"))
+        .expect("packed VLM fixture deserializes into the typed contract");
+
+    let preprocessing = metadata.preprocessing.expect("preprocessing section");
+    let image = preprocessing.image.expect("image program");
+    assert_eq!(
+        image.transforms.first().expect("first transform").op,
+        "decode_rgb"
+    );
+    assert!(
+        image.transforms.iter().any(|t| t.op == "patchify"),
+        "program declares a generic patchify op"
+    );
+    // Exactly two packed image outputs, bound to arbitrary endpoint names.
+    assert_eq!(image.outputs.len(), 2);
+    assert_eq!(image.outputs[0].name, "pixel_values");
+    assert_eq!(image.outputs[0].content, "pixels");
+    assert_eq!(image.outputs[0].dtype, "float32");
+    assert_eq!(image.outputs[1].name, "pixel_position_ids");
+    assert_eq!(image.outputs[1].content, "patch_coordinates");
+    assert_eq!(image.outputs[1].dtype, "int64");
+    assert_eq!(image.outputs[1].pad_value, Some(-1.0));
+
+    let spec = metadata.pipeline.expect("pipeline section");
+    validate_pipeline_spec(&spec).expect("packed VLM pipeline is structurally valid");
+    let vision = spec.vision.expect("rich vision expansion config");
+    assert_eq!(vision.image_placeholder_token_id, Some(262144));
+    assert_eq!(vision.image_token_id, Some(262145));
+    assert_eq!(vision.token_count_source.as_deref(), Some("per_patch"));
+    assert_eq!(vision.row_separator_token_id, Some(262146));
+    assert_eq!(vision.column_separator_token_id, Some(262147));
+    assert_eq!(vision.thumbnail_order.as_deref(), Some("prepend"));
+
+    // JSON-schema validation.
+    let validator = schema_validator();
+    let instance = fixture_json("vlm_packed_valid.yaml");
+    if let Err(error) = validator.validate(&instance) {
+        panic!("packed VLM fixture failed JSON-schema validation: {error}");
+    }
+}
+
+#[test]
+fn vlm_multistate_fixture_deserializes_and_validates_against_schema() {
+    let metadata = load_metadata(&crate_fixture("vlm_multistate_valid.yaml"))
+        .expect("multistate VLM fixture deserializes into the typed contract");
+
+    let spec = metadata.pipeline.expect("pipeline section");
+    validate_pipeline_spec(&spec).expect("multistate VLM pipeline is structurally valid");
+
+    // Declared 3-axis position program.
+    let positions = spec.positions.expect("position program");
+    assert_eq!(positions.input, "position_ids");
+    assert_eq!(positions.rank, 3);
+    assert_eq!(
+        positions.axes.as_deref(),
+        Some(
+            [
+                "temporal".to_string(),
+                "height".to_string(),
+                "width".to_string()
+            ]
+            .as_slice()
+        )
+    );
+    assert_eq!(positions.continuation.as_deref(), Some("carry_max"));
+
+    let io = spec.models["decoder"].io.as_ref().expect("decoder io");
+    // A decoder may declare BOTH a raw token input and a routed sequence input.
+    assert_eq!(io.token_input.as_deref(), Some("input_ids"));
+    assert_eq!(io.inputs_embeds_input.as_deref(), Some("inputs_embeds"));
+    // Sparse KV ports come from the declared list (two layers => four ports).
+    assert_eq!(io.kv_inputs.as_deref().map(<[_]>::len), Some(4));
+    assert_eq!(io.kv_outputs.as_deref().map(<[_]>::len), Some(4));
+    assert_eq!(io.kv_update.as_deref(), Some("append"));
+    // Two fixed loop-carried state pairs with replace semantics.
+    let state_pairs = io.state_pairs.as_ref().expect("state pairs");
+    assert_eq!(state_pairs.len(), 2);
+    assert_eq!(state_pairs[0].init.as_deref(), Some("zeros"));
+    assert_eq!(state_pairs[0].update.as_deref(), Some("replace"));
+
+    let validator = schema_validator();
+    let instance = fixture_json("vlm_multistate_valid.yaml");
+    if let Err(error) = validator.validate(&instance) {
+        panic!("multistate VLM fixture failed JSON-schema validation: {error}");
+    }
+}
+
+#[test]
+fn existing_tiny_gemma4_vlm_metadata_still_deserializes() {
+    // Backward compatibility: the committed VLM composite fixture that predates
+    // the typed multimodal contract must keep deserializing unchanged.
+    let metadata = load_metadata(&fixture("tiny-gemma4-vlm/inference_metadata.yaml"))
+        .expect("legacy VLM fixture still deserializes");
+    let spec = metadata.pipeline.expect("pipeline section");
+    validate_pipeline_spec(&spec).expect("legacy VLM pipeline still validates");
+    assert!(matches!(
+        spec.strategy.kind,
+        PipelineStrategyKind::Composite
+    ));
+    assert_eq!(spec.models.len(), 3);
 }

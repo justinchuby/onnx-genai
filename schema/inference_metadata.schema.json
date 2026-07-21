@@ -60,6 +60,17 @@
         }
       ]
     },
+    "preprocessing": {
+      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PreprocessingSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "quantization": {
       "description": "Model weight quantization intent, independent of the packed representation.",
       "anyOf": [
@@ -709,6 +720,311 @@
         }
       }
     },
+    "ImageOutputBinding": {
+      "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a generic content role to an ARBITRARY endpoint name with a\nDECLARED dtype. Neither the name nor the content role is inferred from a model\nidentity, and the dtype is always explicit rather than derived from the model.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label.",
+          "$ref": "#/$defs/ImageOutputContent"
+        },
+        "dtype": {
+          "description": "Declared output dtype. Always explicit; never inferred from the model.",
+          "$ref": "#/$defs/TensorDType"
+        },
+        "name": {
+          "description": "Arbitrary pipeline endpoint name this tensor is bound to (model DATA).",
+          "type": "string",
+          "examples": [
+            "pixel_values"
+          ],
+          "minLength": 1
+        },
+        "optional": {
+          "description": "Whether the runtime may omit this output when a model does not need it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "name",
+        "content",
+        "dtype"
+      ]
+    },
+    "ImageOutputContent": {
+      "description": "Generic image-output content-role vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "pixels",
+            "patch_coordinates",
+            "grid_dimensions",
+            "original_size",
+            "validity_mask"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "pixels",
+              "patch_coordinates",
+              "grid_dimensions",
+              "original_size",
+              "validity_mask"
+            ]
+          }
+        }
+      ]
+    },
+    "ImagePreprocessingProgram": {
+      "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad); outputs bind a produced tensor to an ARBITRARY pipeline\nendpoint name with a DECLARED dtype. A model may name an output\n`pixel_position_ids`, `image_grid_thw`, or anything else — that string is\ndata carried in the model's metadata, never a branch in the runtime.",
+      "type": "object",
+      "properties": {
+        "outputs": {
+          "description": "Named tensor outputs the program emits, each bound to a pipeline endpoint.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImageOutputBinding"
+          },
+          "minItems": 1
+        },
+        "transforms": {
+          "description": "Ordered list of generic transform operations applied to decoded pixels.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImageTransform"
+          }
+        }
+      },
+      "required": [
+        "outputs"
+      ]
+    },
+    "ImageSizeSpec": {
+      "description": "A square size or an explicit width/height for an image transform.",
+      "anyOf": [
+        {
+          "description": "A single edge length applied to both dimensions.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        {
+          "description": "Explicit width and height.",
+          "type": "object",
+          "properties": {
+            "height": {
+              "description": "Target height in pixels.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "width": {
+              "description": "Target width in pixels.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "width",
+            "height"
+          ]
+        }
+      ]
+    },
+    "ImageTokenCountSource": {
+      "description": "Image token-count source vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "per_tile",
+            "per_patch",
+            "from_grid"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "per_tile",
+              "per_patch",
+              "from_grid"
+            ]
+          }
+        }
+      ]
+    },
+    "ImageTransform": {
+      "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
+      "type": "object",
+      "properties": {
+        "flatten": {
+          "description": "Whether `patchify` flattens each patch into a single feature vector.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "include_thumbnail": {
+          "description": "Whether a `tile` operation also emits a global thumbnail tile.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "interpolation": {
+          "description": "Interpolation filter for a `resize` operation — generic string data.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "max_tiles": {
+          "description": "Maximum number of local tiles for a `tile` operation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "mean": {
+          "description": "Per-channel mean for a `normalize` operation (length is model data).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          }
+        },
+        "mode": {
+          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "op": {
+          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`).",
+          "$ref": "#/$defs/ImageTransformOp"
+        },
+        "pad_value": {
+          "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "patch_size": {
+          "description": "Edge length of a square patch for a `patchify` operation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "scale": {
+          "description": "Scalar multiplier for a `rescale` operation.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "size": {
+          "description": "Target size for a `resize` operation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageSizeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "std": {
+          "description": "Per-channel standard deviation for a `normalize` operation.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "number",
+            "format": "float"
+          }
+        },
+        "tile_size": {
+          "description": "Edge length of a square tile for a `tile` operation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "op"
+      ]
+    },
+    "ImageTransformOp": {
+      "description": "Generic image transform-operation vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "decode_rgb",
+            "resize",
+            "rescale",
+            "normalize",
+            "tile",
+            "patchify",
+            "pad"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "decode_rgb",
+              "resize",
+              "rescale",
+              "normalize",
+              "tile",
+              "patchify",
+              "pad"
+            ]
+          }
+        }
+      ]
+    },
     "KvCacheOperations": {
       "description": "Operational guarantees for mutable KV-cache state.",
       "type": "object",
@@ -856,6 +1172,29 @@
         }
       }
     },
+    "KvUpdateKind": {
+      "description": "Paired KV-cache update-semantics vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "append",
+            "shared_buffer"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "append",
+              "shared_buffer"
+            ]
+          }
+        }
+      ]
+    },
     "LayerPrecisionOverride": {
       "description": "Minimum precision required by a set of model layers.",
       "type": "object",
@@ -877,6 +1216,48 @@
       "required": [
         "layers",
         "min_precision"
+      ]
+    },
+    "LoopStatePair": {
+      "description": "One fixed-shape loop-carried recurrent-state port pair.\n\nGeneric and architecture-neutral: the runtime zero/other-initializes `input`\non the first step, runs the graph, and copies `output` back into `input` for\nthe next step (`replace` update). This models any fixed recurrent tensor\n(convolution state, linear-attention recurrent state, and so on) without\nreferencing a model family. It is intentionally distinct from growing or\nshared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`\nand `kv_update`.",
+      "type": "object",
+      "properties": {
+        "init": {
+          "description": "How `input` is initialized before the first step (e.g. `zeros`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateInitKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input": {
+          "description": "Graph input port that receives the carried state for this step.",
+          "type": "string",
+          "minLength": 1
+        },
+        "output": {
+          "description": "Graph output port that produces the next-step state.",
+          "type": "string",
+          "minLength": 1
+        },
+        "update": {
+          "description": "How `output` becomes the next step's `input` (fixed state uses `replace`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StateUpdateKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "input",
+        "output"
       ]
     },
     "ModelCapabilities": {
@@ -998,7 +1379,7 @@
           "minLength": 1
         },
         "inputs_embeds_input": {
-          "description": "Pre-embedded input (e.g. `inputs_embeds`) for embeds-driven decoders.",
+          "description": "Pre-embedded / routed sequence input (e.g. `inputs_embeds`).\n\nMay be declared alongside `token_input` (see its documentation): a graph\nthat consumes both a raw token input and one or more routed sequence\ninputs is explicitly permitted.",
           "type": [
             "string",
             "null"
@@ -1027,6 +1408,17 @@
             "minLength": 1
           }
         },
+        "kv_update": {
+          "description": "How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.\n\nThis declares GROWING/append versus fixed shared-buffer cache semantics\nexplicitly, and is deliberately kept separate from `state_pairs` (which\ndescribes fixed recurrent tensors that are wholly REPLACED). The KV pair\nlists are the authoritative sparse layer ports: the runtime binds exactly\nthe ports named in `kv_inputs`/`kv_outputs` and never expands them from a\ntotal layer count. Absent means the historical growing-cache default.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvUpdateKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "logits_output": {
           "description": "Logits output.",
           "type": [
@@ -1043,8 +1435,19 @@
           ],
           "minLength": 1
         },
+        "state_pairs": {
+          "description": "Fixed-shape loop-carried recurrent state ports, distinct from KV cache.\n\nEach pair binds an input port to its matching output port and declares\nhow the input is initialized and how the output feeds the next step\n(`replace` semantics for fixed recurrent tensors). These are neither KV\ncache nor fixed conditioning; the sparse set of state ports comes from\nthis declared list, never expanded from a layer count.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/LoopStatePair"
+          },
+          "minItems": 1
+        },
         "token_input": {
-          "description": "Token-id input (e.g. `input_ids`). Mutually exclusive with\n`inputs_embeds_input`.",
+          "description": "Token-id input (e.g. `input_ids`).\n\nA graph MAY declare this together with `inputs_embeds_input`: some fused\ndecoders consume a raw token stream AND a routed pre-embedded sequence in\nthe same forward pass. The two are not mutually exclusive; declaring both\nis a valid, explicit contract.",
           "type": [
             "string",
             "null"
@@ -1296,12 +1699,23 @@
             "$ref": "#/$defs/PhaseConfig"
           }
         },
+        "positions": {
+          "description": "Declared position-id generation and prefill→decode continuation program.\n\nGeneric and architecture-neutral: parameterized by rank, axis labels, and\nsection sizes so it expresses both ordinary rank-2 linear positions and\nrank-N multimodal coordinates as data — never a model-family branch.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionProgram"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "strategy": {
           "description": "Loop and execution strategy for the pipeline.",
           "$ref": "#/$defs/PipelineStrategy"
         },
         "vision": {
-          "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with `tokens_per_tile * num_tiles`\ncopies of that token before KV-cache allocation.",
+          "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with the declared expanded image-token\nsequence before KV-cache allocation.",
           "anyOf": [
             {
               "$ref": "#/$defs/PipelineVisionConfig"
@@ -1577,9 +1991,17 @@
       ]
     },
     "PipelineVisionConfig": {
-      "description": "Image placeholder token-expansion contract for encoder-free VLM pipelines.\n\nBoth fields must be set together; declaring only one is allowed for\nforward compatibility but will cause an engine error at generation time\nwhen `num_image_tiles` is supplied.",
+      "description": "Image placeholder token-expansion contract for encoder-free VLM pipelines.\n\nEvery field is optional and additive: legacy documents that declare only\n`image_placeholder_token_id` and `tokens_per_tile` keep working. The richer\nfields mirror the generic expansion the preprocessor already models\n(separate emitted image token, per-tile/per-patch count source, per-image\ncorrespondence, optional row/column separators, and thumbnail order). All of\nit is generic data — no field names or values reference a model family.",
       "type": "object",
       "properties": {
+        "column_separator_token_id": {
+          "description": "Optional token ID emitted between columns within a grid row.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "image_placeholder_token_id": {
           "description": "Token ID of the image placeholder in the tokenized prompt.\n\nThe engine replaces every occurrence of this token with the expanded\nimage token sequence before sequence-length and KV-cache sizing.",
           "type": [
@@ -1588,8 +2010,62 @@
           ],
           "format": "int64"
         },
+        "image_token_id": {
+          "description": "Token ID emitted for each expanded image position.\n\nDistinct from `image_placeholder_token_id`: the placeholder marks WHERE\nto expand, while this is the token actually written into the expanded\nsequence. When absent, the placeholder token itself is repeated.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "placeholder_per_image": {
+          "description": "Whether each placeholder occurrence corresponds to one input image in\nprompt order. Absent means the historical one-placeholder-per-image rule.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "row_separator_token_id": {
+          "description": "Optional token ID emitted between rows of a tiled image grid.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "thumbnail_order": {
+          "description": "Order of the optional global thumbnail tile relative to the local grid.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThumbnailOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token_count_source": {
+          "description": "Where the per-placeholder token count comes from (per tile, per patch, or\na declared grid). Generic selector, never a model-family branch.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageTokenCountSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tokens_per_patch": {
+          "description": "Number of image tokens each patch expands to, used when the count source\nis per patch. Declared data.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
         "tokens_per_tile": {
-          "description": "Number of image tokens each tile expands to.\n\nThe total expansion per placeholder is `tokens_per_tile * num_tiles`.",
+          "description": "Number of image tokens each tile expands to.\n\nThe total per-tile expansion is `tokens_per_tile * num_tiles`.",
           "type": [
             "integer",
             "null"
@@ -1598,6 +2074,108 @@
           "minimum": 1
         }
       }
+    },
+    "PositionContinuation": {
+      "description": "Prefill→decode position-continuation vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "linear_increment",
+            "carry_max",
+            "from_grid"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "linear_increment",
+              "carry_max",
+              "from_grid"
+            ]
+          }
+        }
+      ]
+    },
+    "PositionProgram": {
+      "description": "Declared position-id program for a decoder graph.\n\nThe runtime constructs the position tensor from these declared parameters\ninstead of assuming a fixed rank-2 layout. `rank` 1 (with a single axis)\nexpresses ordinary linear positions; `rank` N expresses multi-axis\nmultimodal coordinates. Axis labels and section sizes are opaque DATA — the\nruntime never infers them from a model name.",
+      "type": "object",
+      "properties": {
+        "axes": {
+          "description": "Optional per-axis labels, one per axis (DATA, e.g. `[\"t\", \"h\", \"w\"]`).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "continuation": {
+          "description": "How positions continue from the prompt (prefill) into per-token decode.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionContinuation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dtype": {
+          "description": "Declared dtype of the position tensor.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorDType"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "input": {
+          "description": "Graph input port that receives the position ids (arbitrary name, DATA).",
+          "type": "string",
+          "minLength": 1
+        },
+        "processor_summaries": {
+          "description": "Optional processor-summary endpoints this program reads to compute\nmulti-axis coordinates (e.g. a declared grid-dimensions output). Each\nentry is an arbitrary endpoint name (DATA), never a model-family hint.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rank": {
+          "description": "Number of position axes / leading rank of the position tensor.\n\n`1` is an ordinary linear position stream; values `> 1` describe\nmulti-axis multimodal coordinates. This is declared data, never a\nhardcoded constant in the runtime.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 1
+        },
+        "sections": {
+          "description": "Optional section sizes for sectioned rotary position embeddings.\n\nOpaque list of per-section widths; their meaning is model DATA, not a\nruntime branch.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        }
+      },
+      "required": [
+        "input",
+        "rank"
+      ]
     },
     "PreEmbedderSpec": {
       "description": "Structured binding for the optional pre-embedder that drives the outer\ndecoder (talker) of a `nested_autoregressive` stage via `inputs_embeds`.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
@@ -1698,6 +2276,23 @@
         "prefill_output",
         "trailing_output"
       ]
+    },
+    "PreprocessingSpec": {
+      "description": "Declared, architecture-neutral input preprocessing programs.",
+      "type": "object",
+      "properties": {
+        "image": {
+          "description": "Typed image preprocessing transform program and its named tensor outputs.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImagePreprocessingProgram"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     },
     "ProposalTopology": {
       "description": "Speculative proposal-topology vocabulary.",
@@ -2376,6 +2971,48 @@
         }
       }
     },
+    "StateInitKind": {
+      "description": "Loop-carried state initialization vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "zeros"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "zeros"
+            ]
+          }
+        }
+      ]
+    },
+    "StateUpdateKind": {
+      "description": "Loop-carried state update-semantics vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "replace"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "replace"
+            ]
+          }
+        }
+      ]
+    },
     "StrategyKind": {
       "description": "Generic inference-strategy vocabulary.",
       "type": "string",
@@ -2576,6 +3213,31 @@
               "uint8",
               "bool",
               "string"
+            ]
+          }
+        }
+      ]
+    },
+    "ThumbnailOrder": {
+      "description": "Optional-thumbnail ordering vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "none",
+            "prepend",
+            "append"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "none",
+              "prepend",
+              "append"
             ]
           }
         }

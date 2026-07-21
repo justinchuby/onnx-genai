@@ -83,6 +83,16 @@ pub struct InferenceMetadata {
     /// Populated from the model-level token id fields of a `genai_config.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<SpecialTokens>,
+
+    /// Declared, architecture-neutral input preprocessing programs.
+    ///
+    /// Carries the typed multimodal preprocessing contract (currently the image
+    /// transform program and its named tensor outputs). Every operation and
+    /// output is generic, parameterized data — never a model family, vendor
+    /// string, or baked-in shape. Absent means the model declares no native
+    /// preprocessing program and a runtime must obtain it elsewhere or fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocessing: Option<PreprocessingSpec>,
 }
 
 /// Author-declared text-generation defaults (sampling and beam search).
@@ -455,13 +465,21 @@ pub struct ModelCapabilities {
 /// for a declared port.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct ModelIoSpec {
-    /// Token-id input (e.g. `input_ids`). Mutually exclusive with
-    /// `inputs_embeds_input`.
+    /// Token-id input (e.g. `input_ids`).
+    ///
+    /// A graph MAY declare this together with `inputs_embeds_input`: some fused
+    /// decoders consume a raw token stream AND a routed pre-embedded sequence in
+    /// the same forward pass. The two are not mutually exclusive; declaring both
+    /// is a valid, explicit contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub token_input: Option<String>,
 
-    /// Pre-embedded input (e.g. `inputs_embeds`) for embeds-driven decoders.
+    /// Pre-embedded / routed sequence input (e.g. `inputs_embeds`).
+    ///
+    /// May be declared alongside `token_input` (see its documentation): a graph
+    /// that consumes both a raw token input and one or more routed sequence
+    /// inputs is explicitly permitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub inputs_embeds_input: Option<String>,
@@ -516,6 +534,59 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(length(min = 1)))]
     pub cross_kv_outputs: Option<Vec<String>>,
+
+    /// How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.
+    ///
+    /// This declares GROWING/append versus fixed shared-buffer cache semantics
+    /// explicitly, and is deliberately kept separate from `state_pairs` (which
+    /// describes fixed recurrent tensors that are wholly REPLACED). The KV pair
+    /// lists are the authoritative sparse layer ports: the runtime binds exactly
+    /// the ports named in `kv_inputs`/`kv_outputs` and never expands them from a
+    /// total layer count. Absent means the historical growing-cache default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::KvUpdateKind>")]
+    pub kv_update: Option<String>,
+
+    /// Fixed-shape loop-carried recurrent state ports, distinct from KV cache.
+    ///
+    /// Each pair binds an input port to its matching output port and declares
+    /// how the input is initialized and how the output feeds the next step
+    /// (`replace` semantics for fixed recurrent tensors). These are neither KV
+    /// cache nor fixed conditioning; the sparse set of state ports comes from
+    /// this declared list, never expanded from a layer count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub state_pairs: Option<Vec<LoopStatePair>>,
+}
+
+/// One fixed-shape loop-carried recurrent-state port pair.
+///
+/// Generic and architecture-neutral: the runtime zero/other-initializes `input`
+/// on the first step, runs the graph, and copies `output` back into `input` for
+/// the next step (`replace` update). This models any fixed recurrent tensor
+/// (convolution state, linear-attention recurrent state, and so on) without
+/// referencing a model family. It is intentionally distinct from growing or
+/// shared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`
+/// and `kv_update`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct LoopStatePair {
+    /// Graph input port that receives the carried state for this step.
+    #[schemars(length(min = 1))]
+    pub input: String,
+
+    /// Graph output port that produces the next-step state.
+    #[schemars(length(min = 1))]
+    pub output: String,
+
+    /// How `input` is initialized before the first step (e.g. `zeros`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::StateInitKind>")]
+    pub init: Option<String>,
+
+    /// How `output` becomes the next step's `input` (fixed state uses `replace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::StateUpdateKind>")]
+    pub update: Option<String>,
 }
 
 /// Build-time attention architecture and dimensions.
@@ -716,30 +787,270 @@ pub struct PipelineSpec {
     /// Vision-language model token-expansion contract.
     ///
     /// When present, the engine uses these fields to replace each image
-    /// placeholder token in the prompt with `tokens_per_tile * num_tiles`
-    /// copies of that token before KV-cache allocation.
+    /// placeholder token in the prompt with the declared expanded image-token
+    /// sequence before KV-cache allocation.
     #[serde(default)]
     pub vision: Option<PipelineVisionConfig>,
+
+    /// Declared position-id generation and prefill→decode continuation program.
+    ///
+    /// Generic and architecture-neutral: parameterized by rank, axis labels, and
+    /// section sizes so it expresses both ordinary rank-2 linear positions and
+    /// rank-N multimodal coordinates as data — never a model-family branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<PositionProgram>,
+}
+
+/// Declared position-id program for a decoder graph.
+///
+/// The runtime constructs the position tensor from these declared parameters
+/// instead of assuming a fixed rank-2 layout. `rank` 1 (with a single axis)
+/// expresses ordinary linear positions; `rank` N expresses multi-axis
+/// multimodal coordinates. Axis labels and section sizes are opaque DATA — the
+/// runtime never infers them from a model name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct PositionProgram {
+    /// Graph input port that receives the position ids (arbitrary name, DATA).
+    #[schemars(length(min = 1))]
+    pub input: String,
+
+    /// Number of position axes / leading rank of the position tensor.
+    ///
+    /// `1` is an ordinary linear position stream; values `> 1` describe
+    /// multi-axis multimodal coordinates. This is declared data, never a
+    /// hardcoded constant in the runtime.
+    #[schemars(range(min = 1))]
+    pub rank: usize,
+
+    /// Optional per-axis labels, one per axis (DATA, e.g. `["t", "h", "w"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub axes: Option<Vec<String>>,
+
+    /// Optional section sizes for sectioned rotary position embeddings.
+    ///
+    /// Opaque list of per-section widths; their meaning is model DATA, not a
+    /// runtime branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections: Option<Vec<usize>>,
+
+    /// Declared dtype of the position tensor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::TensorDType>")]
+    pub dtype: Option<String>,
+
+    /// How positions continue from the prompt (prefill) into per-token decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::PositionContinuation>")]
+    pub continuation: Option<String>,
+
+    /// Optional processor-summary endpoints this program reads to compute
+    /// multi-axis coordinates (e.g. a declared grid-dimensions output). Each
+    /// entry is an arbitrary endpoint name (DATA), never a model-family hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub processor_summaries: Option<Vec<String>>,
 }
 
 /// Image placeholder token-expansion contract for encoder-free VLM pipelines.
 ///
-/// Both fields must be set together; declaring only one is allowed for
-/// forward compatibility but will cause an engine error at generation time
-/// when `num_image_tiles` is supplied.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+/// Every field is optional and additive: legacy documents that declare only
+/// `image_placeholder_token_id` and `tokens_per_tile` keep working. The richer
+/// fields mirror the generic expansion the preprocessor already models
+/// (separate emitted image token, per-tile/per-patch count source, per-image
+/// correspondence, optional row/column separators, and thumbnail order). All of
+/// it is generic data — no field names or values reference a model family.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct PipelineVisionConfig {
     /// Token ID of the image placeholder in the tokenized prompt.
     ///
     /// The engine replaces every occurrence of this token with the expanded
     /// image token sequence before sequence-length and KV-cache sizing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_placeholder_token_id: Option<i64>,
 
     /// Number of image tokens each tile expands to.
     ///
-    /// The total expansion per placeholder is `tokens_per_tile * num_tiles`.
+    /// The total per-tile expansion is `tokens_per_tile * num_tiles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub tokens_per_tile: Option<usize>,
+
+    /// Token ID emitted for each expanded image position.
+    ///
+    /// Distinct from `image_placeholder_token_id`: the placeholder marks WHERE
+    /// to expand, while this is the token actually written into the expanded
+    /// sequence. When absent, the placeholder token itself is repeated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_token_id: Option<i64>,
+
+    /// Where the per-placeholder token count comes from (per tile, per patch, or
+    /// a declared grid). Generic selector, never a model-family branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::ImageTokenCountSource>")]
+    pub token_count_source: Option<String>,
+
+    /// Number of image tokens each patch expands to, used when the count source
+    /// is per patch. Declared data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub tokens_per_patch: Option<usize>,
+
+    /// Whether each placeholder occurrence corresponds to one input image in
+    /// prompt order. Absent means the historical one-placeholder-per-image rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder_per_image: Option<bool>,
+
+    /// Optional token ID emitted between rows of a tiled image grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_separator_token_id: Option<i64>,
+
+    /// Optional token ID emitted between columns within a grid row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_separator_token_id: Option<i64>,
+
+    /// Order of the optional global thumbnail tile relative to the local grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::ThumbnailOrder>")]
+    pub thumbnail_order: Option<String>,
+}
+
+/// Declared, architecture-neutral input preprocessing programs.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct PreprocessingSpec {
+    /// Typed image preprocessing transform program and its named tensor outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImagePreprocessingProgram>,
+}
+
+/// Generic image preprocessing program: an ordered transform pipeline plus the
+/// named tensor outputs it emits.
+///
+/// The program is expressed entirely as parameterized, architecture-neutral
+/// data. Transform operations are generic (decode, resize, rescale, normalize,
+/// tile, patchify, pad); outputs bind a produced tensor to an ARBITRARY pipeline
+/// endpoint name with a DECLARED dtype. A model may name an output
+/// `pixel_position_ids`, `image_grid_thw`, or anything else — that string is
+/// data carried in the model's metadata, never a branch in the runtime.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct ImagePreprocessingProgram {
+    /// Ordered list of generic transform operations applied to decoded pixels.
+    #[serde(default)]
+    pub transforms: Vec<ImageTransform>,
+
+    /// Named tensor outputs the program emits, each bound to a pipeline endpoint.
+    #[schemars(length(min = 1))]
+    pub outputs: Vec<ImageOutputBinding>,
+}
+
+/// One generic image transform operation.
+///
+/// `op` selects the operation from a generic vocabulary; the remaining fields
+/// are the parameters that operation reads (only the relevant ones are set).
+/// Every parameter is model DATA — concrete sizes, patch sizes, means, and so on
+/// live in a model's fixture, never as constants baked into this schema.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct ImageTransform {
+    /// Generic operation selector (e.g. `resize`, `normalize`, `patchify`).
+    #[schemars(with = "schema_vocabulary::ImageTransformOp")]
+    pub op: String,
+
+    /// Target size for a `resize` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<ImageSizeSpec>,
+
+    /// Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub mode: Option<String>,
+
+    /// Interpolation filter for a `resize` operation — generic string data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub interpolation: Option<String>,
+
+    /// Scalar multiplier for a `rescale` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+
+    /// Per-channel mean for a `normalize` operation (length is model data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean: Option<Vec<f32>>,
+
+    /// Per-channel standard deviation for a `normalize` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub std: Option<Vec<f32>>,
+
+    /// Edge length of a square tile for a `tile` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub tile_size: Option<usize>,
+
+    /// Maximum number of local tiles for a `tile` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_tiles: Option<usize>,
+
+    /// Whether a `tile` operation also emits a global thumbnail tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_thumbnail: Option<bool>,
+
+    /// Edge length of a square patch for a `patchify` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub patch_size: Option<usize>,
+
+    /// Whether `patchify` flattens each patch into a single feature vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flatten: Option<bool>,
+
+    /// Fill value for a `pad` operation, or sentinel for padded coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_value: Option<f64>,
+}
+
+/// A square size or an explicit width/height for an image transform.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ImageSizeSpec {
+    /// A single edge length applied to both dimensions.
+    Square(u32),
+    /// Explicit width and height.
+    Dimensions {
+        /// Target width in pixels.
+        width: u32,
+        /// Target height in pixels.
+        height: u32,
+    },
+}
+
+/// One named tensor output produced by an image preprocessing program.
+///
+/// The output binds a generic content role to an ARBITRARY endpoint name with a
+/// DECLARED dtype. Neither the name nor the content role is inferred from a model
+/// identity, and the dtype is always explicit rather than derived from the model.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct ImageOutputBinding {
+    /// Arbitrary pipeline endpoint name this tensor is bound to (model DATA).
+    #[schemars(length(min = 1), example = &"pixel_values")]
+    pub name: String,
+
+    /// Generic content role this tensor carries (pixels, coordinates, grid,
+    /// original size, or validity mask) — never a model-family label.
+    #[schemars(with = "schema_vocabulary::ImageOutputContent")]
+    pub content: String,
+
+    /// Declared output dtype. Always explicit; never inferred from the model.
+    #[schemars(with = "schema_vocabulary::TensorDType")]
+    pub dtype: String,
+
+    /// Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_value: Option<f64>,
+
+    /// Whether the runtime may omit this output when a model does not need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
 }
 
 /// One executable ONNX model in a pipeline.
@@ -1489,6 +1800,84 @@ mod schema_vocabulary {
         STRUCTURED_OUTPUT_FORMAT,
         ["json_schema", "regex", "context_free_grammar", "choice"]
     );
+
+    extensible_string!(
+        /// Generic image transform-operation vocabulary.
+        ImageTransformOp,
+        image_transform_op,
+        IMAGE_TRANSFORM_OP,
+        [
+            "decode_rgb",
+            "resize",
+            "rescale",
+            "normalize",
+            "tile",
+            "patchify",
+            "pad"
+        ]
+    );
+
+    extensible_string!(
+        /// Generic image-output content-role vocabulary.
+        ImageOutputContent,
+        image_output_content,
+        IMAGE_OUTPUT_CONTENT,
+        [
+            "pixels",
+            "patch_coordinates",
+            "grid_dimensions",
+            "original_size",
+            "validity_mask"
+        ]
+    );
+
+    extensible_string!(
+        /// Image token-count source vocabulary.
+        ImageTokenCountSource,
+        image_token_count_source,
+        IMAGE_TOKEN_COUNT_SOURCE,
+        ["per_tile", "per_patch", "from_grid"]
+    );
+
+    extensible_string!(
+        /// Optional-thumbnail ordering vocabulary.
+        ThumbnailOrder,
+        thumbnail_order,
+        THUMBNAIL_ORDER,
+        ["none", "prepend", "append"]
+    );
+
+    extensible_string!(
+        /// Prefill→decode position-continuation vocabulary.
+        PositionContinuation,
+        position_continuation,
+        POSITION_CONTINUATION,
+        ["linear_increment", "carry_max", "from_grid"]
+    );
+
+    extensible_string!(
+        /// Paired KV-cache update-semantics vocabulary.
+        KvUpdateKind,
+        kv_update_kind,
+        KV_UPDATE_KIND,
+        ["append", "shared_buffer"]
+    );
+
+    extensible_string!(
+        /// Loop-carried state initialization vocabulary.
+        StateInitKind,
+        state_init_kind,
+        STATE_INIT_KIND,
+        ["zeros"]
+    );
+
+    extensible_string!(
+        /// Loop-carried state update-semantics vocabulary.
+        StateUpdateKind,
+        state_update_kind,
+        STATE_UPDATE_KIND,
+        ["replace"]
+    );
 }
 
 mod schema_helpers {
@@ -1645,6 +2034,38 @@ mod schema_helpers {
 
     pub(super) fn structured_output_format(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::STRUCTURED_OUTPUT_FORMAT);
+    }
+
+    pub(super) fn image_transform_op(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TRANSFORM_OP);
+    }
+
+    pub(super) fn image_output_content(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_OUTPUT_CONTENT);
+    }
+
+    pub(super) fn image_token_count_source(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TOKEN_COUNT_SOURCE);
+    }
+
+    pub(super) fn thumbnail_order(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
+    }
+
+    pub(super) fn position_continuation(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::POSITION_CONTINUATION);
+    }
+
+    pub(super) fn kv_update_kind(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::KV_UPDATE_KIND);
+    }
+
+    pub(super) fn state_init_kind(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::STATE_INIT_KIND);
+    }
+
+    pub(super) fn state_update_kind(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::STATE_UPDATE_KIND);
     }
 
     fn extensible_string_enum(schema: &mut Schema, known_values: &[&str]) {
