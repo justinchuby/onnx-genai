@@ -1,10 +1,17 @@
 //! Metadata-driven RGB image preprocessing.
 
+pub mod packed;
+
 use std::path::Path;
 
 use anyhow::Context;
 use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
 use serde::Deserialize;
+
+pub use packed::{
+    ImageExpansionSummary, ImageTensorBundle, ImageTensorDType, ImageTensorData, NamedImageTensor,
+};
+use packed::{OutputSpec, PackSpec, PreparedImage};
 
 const CHANNELS: usize = 3;
 
@@ -123,47 +130,6 @@ pub struct ImagePreprocessConfig {
     pub interpolation: Interpolation,
     pub tiling: ImageTilingConfig,
     pub normalization: Normalization,
-}
-
-/// A contiguous image tensor whose batch dimension contains all produced tiles.
-#[derive(Debug)]
-pub struct ImageTensor {
-    pub shape: Vec<i64>,
-    pub data: Vec<f32>,
-    /// Total tiles across all input images.
-    pub num_tiles: usize,
-    /// Tile counts corresponding to each input image.
-    pub tiles_per_image: Vec<usize>,
-    /// Local tile grids corresponding to each input image.
-    pub tile_grids: Vec<TileGrid>,
-    pub original_sizes: Vec<(u32, u32)>,
-    /// Thumbnail position as stored in this tensor.
-    ///
-    /// When tiling with a thumbnail (`ImageTilingConfig::include_thumbnail`),
-    /// the pipeline always stores the thumbnail tile **first** within each
-    /// image's tile slice (`Prepend`). When no thumbnail is included this is
-    /// `None`. Token expansion must use this same ordering.
-    pub thumbnail_position: ThumbnailPosition,
-}
-
-impl ImageTensor {
-    /// Returns one normalized tile in the tensor's declared channel layout.
-    pub fn tile_data(&self, index: usize) -> Option<&[f32]> {
-        let values_per_tile = self.data.len().checked_div(self.num_tiles)?;
-        let start = index.checked_mul(values_per_tile)?;
-        let end = start.checked_add(values_per_tile)?;
-        self.data.get(start..end)
-    }
-
-    /// Returns the lightweight tiling metadata used by prompt token expansion.
-    pub fn tiling_summary(&self) -> ImageTilingSummary<'_> {
-        ImageTilingSummary {
-            num_tiles: self.num_tiles,
-            tiles_per_image: &self.tiles_per_image,
-            tile_grids: &self.tile_grids,
-            thumbnail_position: self.thumbnail_position,
-        }
-    }
 }
 
 /// Replaces each image placeholder in a prompt with its image's tile token sequence.
@@ -343,6 +309,7 @@ pub struct ImagePreprocessor {
     shape: Vec<i64>,
     layout: ImageLayout,
     config: ImagePreprocessConfig,
+    program: ImageProgram,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,6 +327,10 @@ struct ImageMetadata {
     resize: Option<ResizeMetadata>,
     tiling: Option<TilingMetadata>,
     normalize: Option<NormalizeMetadata>,
+    #[serde(default)]
+    transforms: Vec<ImageTransformMetadata>,
+    #[serde(default)]
+    outputs: Vec<ImageOutputMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,45 +363,133 @@ struct TilingMetadata {
     include_thumbnail: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImageTransformMetadata {
+    op: String,
+    size: Option<ImageSize>,
+    mode: Option<String>,
+    interpolation: Option<String>,
+    scale: Option<f64>,
+    mean: Option<Vec<f32>>,
+    std: Option<Vec<f32>>,
+    tile_size: Option<usize>,
+    max_tiles: Option<usize>,
+    include_thumbnail: Option<bool>,
+    patch_size: Option<usize>,
+    flatten: Option<bool>,
+    pad_value: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageOutputMetadata {
+    name: String,
+    content: String,
+    dtype: String,
+    pad_value: Option<f64>,
+    optional: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ImageProgram {
+    value_ops: Vec<ValueOp>,
+    patch_size: Option<usize>,
+    pad_value: Option<f64>,
+    outputs: Vec<OutputSpec>,
+}
+
+#[derive(Debug, Clone)]
+enum ValueOp {
+    Rescale(f32),
+    Normalize { mean: [f32; 3], std: [f32; 3] },
+}
+
 impl ImagePreprocessor {
-    /// Resolves preprocessing from a rank-4 model input and optional metadata file.
+    /// Resolves preprocessing from a model pixel input and optional metadata file.
     pub fn from_input_and_metadata(
         shape: &[i64],
         metadata_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
-        if shape.len() != 4 {
-            anyhow::bail!("vision input must be rank 4, but the model declares {shape:?}");
+        let document = metadata_path
+            .map(std::fs::read_to_string)
+            .transpose()
+            .context("failed to read preprocessing metadata")?
+            .map(|content| {
+                serde_yaml::from_str::<MetadataDocument>(&content)
+                    .context("failed to parse preprocessing metadata")
+            })
+            .transpose()?;
+        Self::from_metadata_document(shape, document)
+    }
+
+    fn from_metadata_document(
+        shape: &[i64],
+        document: Option<MetadataDocument>,
+    ) -> anyhow::Result<Self> {
+        if shape.is_empty() {
+            anyhow::bail!("vision pixel input shape must not be empty");
         }
-        let layout = match (shape[1], shape[3]) {
-            (3, _) => ImageLayout::Nchw,
-            (_, 3) => ImageLayout::Nhwc,
-            _ => anyhow::bail!(
-                "vision input must declare an RGB channel dimension, but the model declares {shape:?}"
-            ),
-        };
-        let (height, width) = match layout {
-            ImageLayout::Nchw => (shape[2], shape[3]),
-            ImageLayout::Nhwc => (shape[1], shape[2]),
-        };
-        if shape[0] == 0 || shape[0] < -1 {
-            anyhow::bail!("vision input has invalid batch dimension {}", shape[0]);
+        if shape
+            .iter()
+            .any(|dimension| *dimension == 0 || *dimension < -1)
+        {
+            anyhow::bail!("vision pixel input shape contains an invalid dimension: {shape:?}");
         }
-        let config = load_preprocessing(metadata_path, width, height)?;
+        let metadata = document
+            .and_then(|document| document.preprocessing)
+            .and_then(|preprocessing| preprocessing.image);
+        let is_typed_program = metadata
+            .as_ref()
+            .is_some_and(|image| !image.transforms.is_empty() || !image.outputs.is_empty());
+        let (layout, model_width, model_height) = if shape.len() == 4 {
+            let layout = match (shape[1], shape[3]) {
+                (3, _) => ImageLayout::Nchw,
+                (_, 3) => ImageLayout::Nhwc,
+                _ if is_typed_program => ImageLayout::Nchw,
+                _ => anyhow::bail!(
+                    "vision input must declare an RGB channel dimension, but the model declares {shape:?}"
+                ),
+            };
+            let (height, width) = match layout {
+                ImageLayout::Nchw => (shape[2], shape[3]),
+                ImageLayout::Nhwc => (shape[1], shape[2]),
+            };
+            (layout, width, height)
+        } else if is_typed_program {
+            (ImageLayout::Nchw, -1, -1)
+        } else {
+            anyhow::bail!(
+                "legacy image preprocessing requires a rank-4 vision input, but the model declares {shape:?}; packed inputs require preprocessing.image.transforms and outputs"
+            );
+        };
+        let (config, program) = if is_typed_program {
+            typed_program_from_metadata(
+                metadata.context("typed image preprocessing metadata is missing")?,
+                model_width,
+                model_height,
+            )?
+        } else {
+            let config = preprocessing_from_metadata(metadata, model_width, model_height)?;
+            let program = legacy_program(&config)?;
+            (config, program)
+        };
         let mut resolved_shape = shape.to_vec();
-        match layout {
-            ImageLayout::Nchw => {
-                resolved_shape[2] = i64::from(config.height);
-                resolved_shape[3] = i64::from(config.width);
-            }
-            ImageLayout::Nhwc => {
-                resolved_shape[1] = i64::from(config.height);
-                resolved_shape[2] = i64::from(config.width);
+        if resolved_shape.len() == 4 {
+            match layout {
+                ImageLayout::Nchw => {
+                    resolved_shape[2] = i64::from(config.height);
+                    resolved_shape[3] = i64::from(config.width);
+                }
+                ImageLayout::Nhwc => {
+                    resolved_shape[1] = i64::from(config.height);
+                    resolved_shape[2] = i64::from(config.width);
+                }
             }
         }
         Ok(Self {
             shape: resolved_shape,
             layout,
             config,
+            program,
         })
     }
 
@@ -451,8 +510,8 @@ impl ImagePreprocessor {
         &self.config
     }
 
-    /// Decodes encoded images and preprocesses them into one batched tensor.
-    pub fn preprocess_encoded<I, B>(&self, images: I) -> anyhow::Result<ImageTensor>
+    /// Decodes encoded images and preprocesses them into a named tensor bundle.
+    pub fn preprocess_encoded<I, B>(&self, images: I) -> anyhow::Result<ImageTensorBundle>
     where
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
@@ -464,96 +523,312 @@ impl ImagePreprocessor {
         self.preprocess(&images)
     }
 
-    /// Preprocesses decoded images into one batched tensor.
-    pub fn preprocess(&self, images: &[DynamicImage]) -> anyhow::Result<ImageTensor> {
+    /// Preprocesses decoded images into a named typed tensor bundle.
+    pub fn preprocess(&self, images: &[DynamicImage]) -> anyhow::Result<ImageTensorBundle> {
         if images.is_empty() {
             anyhow::bail!("at least one image is required");
         }
-        let pixels_per_image = self.config.width as usize * self.config.height as usize;
-        let mut tiles = Vec::new();
-        let mut tiles_per_image = Vec::with_capacity(images.len());
-        let mut tile_grids = Vec::with_capacity(images.len());
-        let mut original_sizes = Vec::with_capacity(images.len());
+        let width = self.config.width as usize;
+        let height = self.config.height as usize;
+        let mut prepared = Vec::with_capacity(images.len());
         for image in images {
-            original_sizes.push((image.width(), image.height()));
             let (grid, image_tiles) = tile_image(image, &self.config)?;
-            tile_grids.push(grid);
-            tiles_per_image.push(image_tiles.len());
-            tiles.extend(image_tiles);
+            let tiles = image_tiles
+                .iter()
+                .map(|tile| normalize_tile(tile, width, height, &self.program.value_ops))
+                .collect();
+            prepared.push(PreparedImage {
+                original_size: (image.width(), image.height()),
+                tile_grid: grid,
+                tiles,
+            });
         }
-        if self.shape[0] > 0 && self.shape[0] as usize != tiles.len() {
-            anyhow::bail!(
-                "this model expects {} image tile(s) per request, but preprocessing produced {}",
-                self.shape[0],
-                tiles.len()
-            );
-        }
-
-        let num_tiles = tiles.len();
-        let mut data = Vec::with_capacity(num_tiles * CHANNELS * pixels_per_image);
-        for rgb in &tiles {
-            match self.layout {
-                ImageLayout::Nchw => {
-                    for channel in 0..CHANNELS {
-                        data.extend(
-                            rgb.pixels()
-                                .map(|pixel| normalize(pixel[channel], channel, &self.config)),
-                        );
-                    }
-                }
-                ImageLayout::Nhwc => {
-                    for pixel in rgb.pixels() {
-                        data.extend(
-                            pixel
-                                .0
-                                .iter()
-                                .enumerate()
-                                .map(|(channel, value)| normalize(*value, channel, &self.config)),
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut shape = self.shape.clone();
-        shape[0] = i64::try_from(num_tiles).context("image tile batch is too large")?;
-        // The pipeline always places the thumbnail tile first within each image's
-        // tile slice (see tiled_image_for_grid). Carry this authoritative ordering
-        // in the tensor so callers can align token expansion with tile indices.
         let thumbnail_position = if self.config.tiling.include_thumbnail {
             ThumbnailPosition::Prepend
         } else {
             ThumbnailPosition::None
         };
-        Ok(ImageTensor {
-            shape,
-            data,
-            num_tiles,
-            tiles_per_image,
-            tile_grids,
-            original_sizes,
+        packed::build_bundle(
+            prepared,
+            &PackSpec {
+                width,
+                height,
+                layout: self.layout,
+                patch_size: self.program.patch_size,
+                pad_value: self.program.pad_value,
+                outputs: self.program.outputs.clone(),
+                declared_pixel_shape: self.shape.clone(),
+            },
             thumbnail_position,
-        })
+        )
     }
 }
 
-fn load_preprocessing(
-    metadata_path: Option<&Path>,
+fn legacy_program(config: &ImagePreprocessConfig) -> anyhow::Result<ImageProgram> {
+    let value_ops = match &config.normalization {
+        Normalization::ZeroToOne => vec![ValueOp::Rescale(1.0 / 255.0)],
+        Normalization::MeanStd { mean, std } => vec![
+            ValueOp::Rescale(1.0 / 255.0),
+            ValueOp::Normalize {
+                mean: *mean,
+                std: *std,
+            },
+        ],
+    };
+    Ok(ImageProgram {
+        value_ops,
+        patch_size: None,
+        pad_value: None,
+        outputs: vec![OutputSpec {
+            name: "pixels".to_owned(),
+            content: "pixels".to_owned(),
+            dtype: ImageTensorDType::Fp32,
+            pad_value: None,
+            optional: false,
+        }],
+    })
+}
+
+fn typed_program_from_metadata(
+    metadata: ImageMetadata,
     model_width: i64,
     model_height: i64,
-) -> anyhow::Result<ImagePreprocessConfig> {
-    let image_metadata = metadata_path
-        .map(std::fs::read_to_string)
-        .transpose()
-        .context("failed to read preprocessing metadata")?
-        .map(|content| {
-            serde_yaml::from_str::<MetadataDocument>(&content)
-                .context("failed to parse preprocessing metadata")
+) -> anyhow::Result<(ImagePreprocessConfig, ImageProgram)> {
+    if metadata.transforms.is_empty() {
+        anyhow::bail!(
+            "preprocessing.image.transforms must not be empty when typed image outputs are declared"
+        );
+    }
+    if metadata.outputs.is_empty() {
+        anyhow::bail!(
+            "preprocessing.image.outputs must not be empty when typed image transforms are declared"
+        );
+    }
+    if metadata.resize.is_some() || metadata.tiling.is_some() || metadata.normalize.is_some() {
+        anyhow::bail!(
+            "preprocessing.image cannot mix legacy resize/tiling/normalize fields with typed transforms"
+        );
+    }
+
+    let mut resize = None;
+    let mut tiling = None;
+    let mut value_ops = Vec::new();
+    let mut patch_size = None;
+    let mut pad_value = None;
+    let mut decoded = false;
+    let mut patchified = false;
+    let mut padded = false;
+    for transform in metadata.transforms {
+        match transform.op.as_str() {
+            "decode_rgb" => {
+                if decoded || resize.is_some() || !value_ops.is_empty() || patchified || padded {
+                    anyhow::bail!("decode_rgb must be the first image transform");
+                }
+                decoded = true;
+            }
+            "resize" => {
+                if resize.is_some()
+                    || tiling.is_some()
+                    || !value_ops.is_empty()
+                    || patchified
+                    || padded
+                {
+                    anyhow::bail!(
+                        "resize must occur once and before tile, rescale, normalize, patchify, or pad"
+                    );
+                }
+                let size = transform
+                    .size
+                    .context("image resize transform requires size metadata")?;
+                let mode = match transform.mode.as_deref().unwrap_or("stretch") {
+                    "stretch" | "fixed" | "fixed_size" => ResizeMode::Fixed,
+                    "crop" | "shortest_edge" | "shortest_edge_center_crop" => {
+                        ResizeMode::ShortestEdgeCenterCrop
+                    }
+                    "pad" | "longest_edge_pad" => ResizeMode::LongestEdgePad,
+                    other => anyhow::bail!(
+                        "unsupported image resize transform mode '{other}'; expected stretch, crop, or pad"
+                    ),
+                };
+                let interpolation = parse_interpolation(transform.interpolation.as_deref())?;
+                resize = Some((size, mode, interpolation));
+            }
+            "rescale" => {
+                if patchified || padded {
+                    anyhow::bail!("rescale must occur before patchify or pad");
+                }
+                let scale = transform
+                    .scale
+                    .context("image rescale transform requires scale metadata")?;
+                let scale = scale as f32;
+                if !scale.is_finite() {
+                    anyhow::bail!("image rescale scale must be finite and representable as fp32");
+                }
+                value_ops.push(ValueOp::Rescale(scale));
+            }
+            "normalize" => {
+                if patchified || padded {
+                    anyhow::bail!("normalize must occur before patchify or pad");
+                }
+                let mean = channel_values("mean", transform.mean)?;
+                let std = channel_values("std", transform.std)?;
+                if mean.iter().any(|value| !value.is_finite())
+                    || std.iter().any(|value| !value.is_finite() || *value <= 0.0)
+                {
+                    anyhow::bail!(
+                        "image normalization mean/std values must be finite and std must be greater than zero"
+                    );
+                }
+                value_ops.push(ValueOp::Normalize { mean, std });
+            }
+            "tile" => {
+                if tiling.is_some() || !value_ops.is_empty() || patchified || padded {
+                    anyhow::bail!(
+                        "tile must occur once and before rescale, normalize, patchify, or pad"
+                    );
+                }
+                let tile_size = transform
+                    .tile_size
+                    .context("image tile transform requires tile_size metadata")?;
+                if tile_size == 0 {
+                    anyhow::bail!("image tile transform tile_size must be greater than zero");
+                }
+                let tile_size = u32::try_from(tile_size).context("image tile_size is too large")?;
+                let max_tiles = transform.max_tiles.unwrap_or(6);
+                if max_tiles == 0 {
+                    anyhow::bail!("image tile transform max_tiles must be greater than zero");
+                }
+                tiling = Some(ImageTilingConfig {
+                    mode: TilingMode::DynamicAnyres,
+                    tile_size,
+                    max_tiles,
+                    aspect_ratios: default_anyres_grids(),
+                    include_thumbnail: transform.include_thumbnail.unwrap_or(false),
+                });
+            }
+            "patchify" => {
+                if patchified || padded {
+                    anyhow::bail!("patchify must occur once and before pad");
+                }
+                if transform.flatten == Some(false) {
+                    anyhow::bail!(
+                        "image patchify flatten=false is not supported; declare flatten=true for packed patch outputs"
+                    );
+                }
+                let size = transform
+                    .patch_size
+                    .context("image patchify transform requires patch_size metadata")?;
+                if size == 0 {
+                    anyhow::bail!("image patchify patch_size must be greater than zero");
+                }
+                patch_size = Some(size);
+                patchified = true;
+            }
+            "pad" => {
+                if !patchified {
+                    anyhow::bail!("image pad transform requires a preceding patchify transform");
+                }
+                if padded {
+                    anyhow::bail!("image pad transform may occur only once");
+                }
+                let value = transform.pad_value.unwrap_or(0.0);
+                if !value.is_finite() {
+                    anyhow::bail!("image pad transform pad_value must be finite");
+                }
+                pad_value = Some(value);
+                padded = true;
+            }
+            other => anyhow::bail!(
+                "unsupported required image transform '{other}'; supported operations are decode_rgb, resize, rescale, normalize, tile, patchify, and pad"
+            ),
+        }
+    }
+
+    let (width, height, resize_mode, interpolation) = match resize {
+        Some((ImageSize::Square(size), mode, interpolation)) => (size, size, mode, interpolation),
+        Some((ImageSize::Dimensions { width, height }, mode, interpolation)) => {
+            (width, height, mode, interpolation)
+        }
+        None => (
+            resolve_dimension("width", model_width, None)?,
+            resolve_dimension("height", model_height, None)?,
+            ResizeMode::Fixed,
+            Interpolation::Bicubic,
+        ),
+    };
+    if width == 0 || height == 0 {
+        anyhow::bail!("image resize dimensions must be greater than zero");
+    }
+    let tiling = match tiling {
+        Some(tiling) => {
+            if tiling.tile_size != width || tiling.tile_size != height {
+                anyhow::bail!(
+                    "image tile_size {} must match resized dimensions {width}x{height}",
+                    tiling.tile_size
+                );
+            }
+            tiling
+        }
+        None => ImageTilingConfig {
+            mode: TilingMode::None,
+            tile_size: width,
+            max_tiles: 1,
+            aspect_ratios: vec![TileGrid {
+                columns: 1,
+                rows: 1,
+            }],
+            include_thumbnail: false,
+        },
+    };
+    let outputs = metadata
+        .outputs
+        .into_iter()
+        .map(|output| {
+            Ok(OutputSpec {
+                name: output.name,
+                content: output.content,
+                dtype: ImageTensorDType::parse(&output.dtype)?,
+                pad_value: output.pad_value,
+                optional: output.optional.unwrap_or(false),
+            })
         })
-        .transpose()?
-        .and_then(|document| document.preprocessing)
-        .and_then(|preprocessing| preprocessing.image);
-    preprocessing_from_metadata(image_metadata, model_width, model_height)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((
+        ImagePreprocessConfig {
+            width,
+            height,
+            resize_mode,
+            interpolation,
+            tiling,
+            // Typed programs execute value transforms in declared order.
+            normalization: Normalization::ZeroToOne,
+        },
+        ImageProgram {
+            value_ops,
+            patch_size,
+            pad_value,
+            outputs,
+        },
+    ))
+}
+
+fn parse_interpolation(value: Option<&str>) -> anyhow::Result<Interpolation> {
+    match value.unwrap_or("bicubic") {
+        "bicubic" => Ok(Interpolation::Bicubic),
+        "bilinear" => Ok(Interpolation::Bilinear),
+        "lanczos" | "lanczos3" => Ok(Interpolation::Lanczos3),
+        other => anyhow::bail!("unsupported image interpolation '{other}'"),
+    }
+}
+
+fn channel_values(name: &str, values: Option<Vec<f32>>) -> anyhow::Result<[f32; 3]> {
+    let values = values.with_context(|| format!("image normalize transform requires {name}"))?;
+    values.try_into().map_err(|values: Vec<f32>| {
+        anyhow::anyhow!(
+            "image normalize transform {name} must contain 3 RGB values, got {}",
+            values.len()
+        )
+    })
 }
 
 fn preprocessing_from_metadata(
@@ -909,12 +1184,25 @@ fn resize_image_to(
     }
 }
 
-fn normalize(value: u8, channel: usize, config: &ImagePreprocessConfig) -> f32 {
-    let value = f32::from(value) / 255.0;
-    match &config.normalization {
-        Normalization::ZeroToOne => value,
-        Normalization::MeanStd { mean, std } => (value - mean[channel]) / std[channel],
+fn normalize_tile(
+    image: &RgbImage,
+    width: usize,
+    height: usize,
+    operations: &[ValueOp],
+) -> Vec<f32> {
+    let mut values = Vec::with_capacity(CHANNELS * width * height);
+    for channel in 0..CHANNELS {
+        values.extend(image.pixels().map(|pixel| {
+            operations.iter().fold(
+                f32::from(pixel[channel]),
+                |value, operation| match operation {
+                    ValueOp::Rescale(scale) => value * scale,
+                    ValueOp::Normalize { mean, std } => (value - mean[channel]) / std[channel],
+                },
+            )
+        }));
     }
+    values
 }
 
 #[cfg(test)]
@@ -1185,6 +1473,24 @@ mod tests {
                     std: [0.26862954, 0.261_302_6, 0.275_777_1],
                 },
             },
+            program: ImageProgram {
+                value_ops: vec![
+                    ValueOp::Rescale(1.0 / 255.0),
+                    ValueOp::Normalize {
+                        mean: [0.48145466, 0.4578275, 0.40821073],
+                        std: [0.26862954, 0.261_302_6, 0.275_777_1],
+                    },
+                ],
+                patch_size: None,
+                pad_value: None,
+                outputs: vec![OutputSpec {
+                    name: "pixels".to_owned(),
+                    content: "pixels".to_owned(),
+                    dtype: ImageTensorDType::Fp32,
+                    pad_value: None,
+                    optional: false,
+                }],
+            },
         };
         let tensor = preprocessor.preprocess(&[image]).unwrap();
         let expected = [
@@ -1192,7 +1498,9 @@ mod tests {
             (128.0 / 255.0 - 0.4578275) / 0.261_302_6,
             (0.0 - 0.40821073) / 0.275_777_1,
         ];
-        for (actual, expected) in tensor.data.iter().zip(expected) {
+        let pixels = tensor.tensor_by_content("pixels").unwrap();
+        let actual = pixels.data.as_f32_slice().unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-6);
         }
     }
@@ -1328,6 +1636,18 @@ preprocessing:
                 },
                 normalization: Normalization::ZeroToOne,
             },
+            program: ImageProgram {
+                value_ops: vec![ValueOp::Rescale(1.0 / 255.0)],
+                patch_size: None,
+                pad_value: None,
+                outputs: vec![OutputSpec {
+                    name: "pixels".to_owned(),
+                    content: "pixels".to_owned(),
+                    dtype: ImageTensorDType::Fp32,
+                    pad_value: None,
+                    optional: false,
+                }],
+            },
         }
     }
 
@@ -1339,8 +1659,9 @@ preprocessing:
             DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 3, Rgb([0, 0, 255]))),
         ];
         let tensor = preprocessor.preprocess(&images).unwrap();
+        let pixels = tensor.tensor_by_content("pixels").unwrap();
 
-        assert_eq!(tensor.shape, [2, 3, 2, 2]);
+        assert_eq!(pixels.shape, [2, 3, 2, 2]);
         assert_eq!(tensor.num_tiles, 2);
         assert_eq!(tensor.tiles_per_image, [1, 1]);
         assert_eq!(
@@ -1356,8 +1677,15 @@ preprocessing:
                 }
             ]
         );
-        assert_eq!(tensor.original_sizes, [(3, 2), (2, 3)]);
-        assert_eq!(tensor.data.len(), 2 * 3 * 2 * 2);
+        assert_eq!(
+            tensor
+                .images
+                .iter()
+                .map(|image| image.original_size)
+                .collect::<Vec<_>>(),
+            [(3, 2), (2, 3)]
+        );
+        assert_eq!(pixels.data.len(), 2 * 3 * 2 * 2);
     }
 
     #[test]
@@ -1374,8 +1702,9 @@ preprocessing:
             Rgb([(x * 20) as u8, (y * 30) as u8, 0])
         }));
         let tensor = preprocessor.preprocess(&[image]).unwrap();
+        let pixels = tensor.tensor_by_content("pixels").unwrap();
 
-        assert_eq!(tensor.shape, [7, 3, 2, 2]);
+        assert_eq!(pixels.shape, [7, 3, 2, 2]);
         assert_eq!(tensor.num_tiles, 7);
         assert_eq!(tensor.tiles_per_image, [7]);
         assert_eq!(
@@ -1385,7 +1714,7 @@ preprocessing:
                 rows: 2
             }]
         );
-        assert_eq!(tensor.data.len(), 7 * 3 * 2 * 2);
+        assert_eq!(pixels.data.len(), 7 * 3 * 2 * 2);
         assert_eq!(tensor.tile_data(0).unwrap().len(), 3 * 2 * 2);
         assert_eq!(tensor.tile_data(6).unwrap().len(), 3 * 2 * 2);
         assert!(tensor.tile_data(7).is_none());
@@ -1439,8 +1768,9 @@ preprocessing:
         );
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(800, 800, Rgb([64, 128, 255])));
         let tensor = preprocessor.preprocess(&[image]).unwrap();
+        let pixels = tensor.tensor_by_content("pixels").unwrap();
 
-        assert_eq!(tensor.shape, [5, 3, 2, 2]);
+        assert_eq!(pixels.shape, [5, 3, 2, 2]);
         assert_eq!(tensor.num_tiles, 5);
         assert_eq!(tensor.tiles_per_image, [5]);
         assert_eq!(
@@ -1573,11 +1903,183 @@ preprocessing:
         // Config must match the tensor layout reported by tiling_summary.
         config.thumbnail_position = summary.thumbnail_position;
 
-        let expanded =
-            expand_image_placeholders(&[99], summary, &config).unwrap();
+        let expanded = expand_image_placeholders(&[99], summary, &config).unwrap();
         // 3 tokens total: first corresponds to thumbnail (tensor index 0),
         // then the two local tiles in row-major order.
         assert_eq!(expanded.len(), 3);
         assert_eq!(expanded, [7, 7, 7]);
+    }
+
+    fn typed_preprocessor(shape: &[i64], image_yaml: &str) -> ImagePreprocessor {
+        let document = serde_yaml::from_str::<MetadataDocument>(image_yaml).unwrap();
+        ImagePreprocessor::from_metadata_document(shape, Some(document)).unwrap()
+    }
+
+    fn packed_test_images() -> [DynamicImage; 2] {
+        [
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 2, Rgb([255, 0, 0]))),
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([0, 0, 255]))),
+        ]
+    }
+
+    const PADDED_PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 2
+        mode: stretch
+        interpolation: bilinear
+      - op: tile
+        tile_size: 2
+        max_tiles: 2
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: patchify
+        patch_size: 1
+        flatten: true
+      - op: pad
+        pad_value: 0
+    outputs:
+      - name: image_pixels
+        content: pixels
+        dtype: fp32
+      - name: image_coordinates
+        content: patch_coordinates
+        dtype: int64
+        pad_value: -1
+"#;
+
+    // Small checked-in vectors generated once from equivalent HF processor
+    // operations (RGB conversion, resize, rescale, CHW patchify, and padding).
+    const HF_PADDED_PIXELS: [f32; 48] = [
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ];
+    const HF_PADDED_COORDINATES: [i64; 32] = [
+        0, 0, 0, 1, 1, 0, 1, 1, 2, 0, 2, 1, 3, 0, 3, 1, 0, 0, 0, 1, 1, 0, 1, 1, -1, -1, -1, -1, -1,
+        -1, -1, -1,
+    ];
+
+    #[test]
+    fn gemma4_shaped_padded_patches_and_sentinel_coordinates_match_fixture() {
+        let preprocessor = typed_preprocessor(&[2, 8, 3], PADDED_PROGRAM);
+        let bundle = preprocessor.preprocess(&packed_test_images()).unwrap();
+        let pixels = bundle.tensor("image_pixels").unwrap();
+        let coordinates = bundle.tensor("image_coordinates").unwrap();
+
+        assert_eq!(pixels.shape, [2, 8, 3]);
+        assert_eq!(
+            pixels.data.as_f32_slice().unwrap(),
+            HF_PADDED_PIXELS.as_slice()
+        );
+        assert_eq!(coordinates.shape, [2, 8, 2]);
+        assert_eq!(
+            coordinates.data,
+            ImageTensorData::Int64(HF_PADDED_COORDINATES.to_vec())
+        );
+        assert_eq!(
+            bundle
+                .images
+                .iter()
+                .map(|summary| (
+                    summary.image_index,
+                    summary.expansion_count,
+                    summary.tensor_offset,
+                    summary.tensor_length,
+                ))
+                .collect::<Vec<_>>(),
+            [(0, 8, 0, 8), (1, 4, 8, 8)]
+        );
+    }
+
+    #[test]
+    fn qwen_shaped_concatenated_patches_emit_per_image_grid() {
+        let program = PADDED_PROGRAM
+            .replace(
+                "      - op: tile\n        tile_size: 2\n        max_tiles: 2\n",
+                "",
+            )
+            .replace(
+                "      - op: pad\n        pad_value: 0\n",
+                "",
+            )
+            .replace(
+                "      - name: image_coordinates\n        content: patch_coordinates\n        dtype: int64\n        pad_value: -1\n",
+                "      - name: image_grid\n        content: grid_dimensions\n        dtype: int64\n",
+            );
+        let preprocessor = typed_preprocessor(&[8, 3], &program);
+        let bundle = preprocessor.preprocess(&packed_test_images()).unwrap();
+        let pixels = bundle.tensor("image_pixels").unwrap();
+        let grid = bundle.tensor("image_grid").unwrap();
+
+        assert_eq!(pixels.shape, [8, 3]);
+        assert_eq!(grid.shape, [2, 3]);
+        assert_eq!(grid.data, ImageTensorData::Int64(vec![1, 2, 2, 1, 2, 2]));
+        assert_eq!(
+            bundle
+                .images
+                .iter()
+                .map(|summary| summary.tensor_offset)
+                .collect::<Vec<_>>(),
+            [0, 4]
+        );
+    }
+
+    #[test]
+    fn phi_shaped_outputs_include_original_sizes_and_patch_validity() {
+        let program = PADDED_PROGRAM
+            .replace("dtype: fp32", "dtype: bf16")
+            .replace(
+                "      - name: image_coordinates\n",
+                "      - name: image_pixels_fp16\n        content: pixels\n        dtype: fp16\n      - name: image_coordinates\n",
+            )
+            .replace(
+                "      - name: image_coordinates\n        content: patch_coordinates\n        dtype: int64\n        pad_value: -1\n",
+                "      - name: image_sizes\n        content: original_size\n        dtype: int64\n      - name: patch_mask\n        content: validity_mask\n        dtype: bool\n",
+            );
+        let preprocessor = typed_preprocessor(&[2, 8, 3], &program);
+        let bundle = preprocessor.preprocess(&packed_test_images()).unwrap();
+
+        let pixels = bundle.tensor("image_pixels").unwrap();
+        assert_eq!(pixels.dtype, ImageTensorDType::Bf16);
+        assert!(matches!(pixels.data, ImageTensorData::Bf16(_)));
+        let fp16_pixels = bundle.tensor("image_pixels_fp16").unwrap();
+        assert_eq!(fp16_pixels.dtype, ImageTensorDType::Fp16);
+        assert_eq!(
+            fp16_pixels.data,
+            ImageTensorData::Fp16(
+                HF_PADDED_PIXELS
+                    .iter()
+                    .map(|value| if *value == 1.0 { 0x3c00 } else { 0 })
+                    .collect()
+            )
+        );
+        assert_eq!(
+            bundle.tensor("image_sizes").unwrap().data,
+            ImageTensorData::Int64(vec![2, 4, 2, 2])
+        );
+        assert_eq!(
+            bundle.tensor("patch_mask").unwrap().data,
+            ImageTensorData::Bool(vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn rank4_nchw_values_remain_unchanged_in_bundle() {
+        let preprocessor = ImagePreprocessor::from_input(&[1, 3, 1, 2]).unwrap();
+        let image = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(2, 1, vec![255, 0, 128, 0, 64, 255]).unwrap(),
+        );
+        let bundle = preprocessor.preprocess(&[image]).unwrap();
+        let pixels = bundle.tensor("pixels").unwrap();
+
+        assert_eq!(pixels.shape, [1, 3, 1, 2]);
+        assert_eq!(
+            pixels.data.as_f32_slice().unwrap(),
+            [1.0, 0.0, 0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0]
+        );
     }
 }
