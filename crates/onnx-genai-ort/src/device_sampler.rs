@@ -49,6 +49,16 @@ use crate::decode::DeviceSampleParams;
 /// one token id per row — applying temperature/top-k/top-p/min-p and the final
 /// greedy or categorical pick — without copying the full vocabulary to the host.
 pub(crate) trait DeviceSampler: Send {
+    /// Argmax each contiguous `vocab`-element row in the device logits buffer,
+    /// returning one token id per row in a single launch.
+    fn argmax_rows(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        rows: usize,
+        vocab: usize,
+    ) -> Result<Vec<u32>>;
+
     /// Select one token id per row from the device logits buffer at `ptr_addr`,
     /// applying `params` on-device.
     fn sample(
@@ -874,6 +884,16 @@ impl CudaSampler {
 }
 
 impl DeviceSampler for CudaSampler {
+    fn argmax_rows(
+        &self,
+        dtype: DataType,
+        ptr_addr: usize,
+        rows: usize,
+        vocab: usize,
+    ) -> Result<Vec<u32>> {
+        CudaSampler::argmax_rows(self, dtype, ptr_addr, rows, vocab)
+    }
+
     fn sample(
         &self,
         dtype: DataType,
@@ -885,7 +905,7 @@ impl DeviceSampler for CudaSampler {
         // Greedy is exact via argmax and ignores every monotonic filter
         // (temperature/top-k/top-p/min-p never move the maximum).
         if params.greedy {
-            return self.argmax_rows(dtype, ptr_addr, rows, vocab);
+            return DeviceSampler::argmax_rows(self, dtype, ptr_addr, rows, vocab);
         }
         // Non-greedy: temperature/top-k/top-p/min-p + categorical draw on-device.
         self.sample_rows(dtype, ptr_addr, rows, vocab, params)
@@ -1497,6 +1517,28 @@ mod tests {
                 .sample(dtype, ptr, 1, vocab, &DeviceSampleParams::greedy())
                 .expect("greedy sample");
             assert_eq!(ids, vec![expected], "greedy dtype {dtype:?}");
+        }
+    }
+
+    #[test]
+    fn multi_row_argmax_matches_per_row_reference_all_dtypes() {
+        let Some(sampler) = new_sampler() else { return };
+        let vocab = BLOCK as usize + 7;
+        let mut rows = vec![vec![-8.0f32; vocab]; 4];
+        rows[0][0] = 4.0;
+        rows[0][vocab - 1] = 9.0;
+        rows[1][17] = 12.0;
+        rows[1][991] = 11.0;
+        rows[2][503] = 7.0;
+        rows[2][504] = 7.0;
+        rows[3][777] = 6.0;
+        let expected: Vec<u32> = rows.iter().map(|row| host_argmax(row)).collect();
+
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let ptr = upload(&rows, dtype);
+            let ids = DeviceSampler::argmax_rows(&sampler, dtype, ptr, rows.len(), vocab)
+                .expect("multi-row argmax");
+            assert_eq!(ids, expected, "multi-row argmax dtype {dtype:?}");
         }
     }
 
