@@ -13,7 +13,7 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -69,6 +69,7 @@ struct DecodeCudaState {
     bindings: Vec<DeviceIoBinding>,
     base_binding_count: usize,
     kv_binding_range: std::ops::Range<usize>,
+    auxiliary_binding_range: std::ops::Range<usize>,
     input_ids_binding: usize,
     position_ids_binding: Option<usize>,
     logits_binding: usize,
@@ -751,6 +752,38 @@ impl NativeDecodeSession {
 }
 
 impl DecodeCudaState {
+    fn persistent_output_shape(
+        name: &str,
+        dtype: DataType,
+        shape: &[Dim],
+    ) -> anyhow::Result<Vec<usize>> {
+        if matches!(dtype, DataType::Undefined | DataType::String) {
+            bail!(
+                "cannot bind auxiliary CUDA graph output '{name}' persistently: dtype {dtype:?} does not have fixed-size device tensor storage, but CUDA graph capture requires every declared graph output to use stable device storage; export this output as a numeric tensor or remove the unused graph output"
+            );
+        }
+        let shape = shape
+            .iter()
+            .map(|dim| match dim {
+                Dim::Static(value) => *value,
+                Dim::Symbolic(_) => 1,
+            })
+            .collect::<Vec<_>>();
+        let elements = shape.iter().try_fold(1usize, |product, &dim| {
+            product.checked_mul(dim).with_context(|| {
+                format!(
+                    "cannot bind auxiliary CUDA graph output '{name}' persistently: shape {shape:?} overflows the device allocation size; export a bounded output shape or remove the unused graph output"
+                )
+            })
+        })?;
+        dtype.checked_storage_bytes(elements).with_context(|| {
+            format!(
+                "cannot bind auxiliary CUDA graph output '{name}' persistently: dtype {dtype:?} shape {shape:?} has no representable device allocation size; export a fixed-size numeric tensor or remove the unused graph output"
+            )
+        })?;
+        Ok(shape)
+    }
+
     fn new(
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
@@ -816,6 +849,59 @@ impl DecodeCudaState {
             )?);
         }
         let kv_end = bindings.len();
+
+        let logits_meta = session
+            .outputs()
+            .iter()
+            .find(|meta| meta.name == io.logits)
+            .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
+        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
+            || logits_meta.shape.is_empty()
+        {
+            bail!(
+                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
+                io.logits,
+                logits_meta.dtype,
+                logits_meta.shape
+            );
+        }
+        let logits_dtype = logits_meta.dtype;
+        let logits_shape =
+            Self::persistent_output_shape(io.logits, logits_dtype, &logits_meta.shape)?;
+        let logits_device_binding = session.allocate_device_output_binding(
+            io.logits,
+            logits_dtype,
+            logits_shape.clone(),
+            logits_shape.clone(),
+        )?;
+
+        let present_outputs = present_to_past.keys().cloned().collect::<HashSet<_>>();
+        let auxiliary_meta = session
+            .outputs()
+            .iter()
+            .filter(|meta| meta.name != io.logits && !present_outputs.contains(&meta.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let auxiliary_start = bindings.len();
+        for meta in auxiliary_meta {
+            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape)?;
+            bindings.push(
+                session
+                    .allocate_device_output_binding(
+                        &meta.name,
+                        meta.dtype,
+                        shape.clone(),
+                        shape,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to allocate persistent CUDA device binding for auxiliary graph output '{}'; CUDA graph capture requires every declared output to keep a stable device address",
+                            meta.name
+                        )
+                    })?,
+            );
+        }
+        let auxiliary_end = bindings.len();
         let base_binding_count = bindings.len();
 
         let input_ids_binding = bindings.len();
@@ -839,38 +925,9 @@ impl DecodeCudaState {
         } else {
             None
         };
-
-        let logits_meta = session
-            .outputs()
-            .iter()
-            .find(|meta| meta.name == io.logits)
-            .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
-        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
-            || logits_meta.shape.is_empty()
-        {
-            bail!(
-                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
-                io.logits,
-                logits_meta.dtype,
-                logits_meta.shape
-            );
-        }
-        let logits_dtype = logits_meta.dtype;
-        let logits_shape = logits_meta
-            .shape
-            .iter()
-            .map(|dim| match dim {
-                Dim::Static(value) => *value,
-                Dim::Symbolic(_) => 1,
-            })
-            .collect::<Vec<_>>();
         let logits_binding = bindings.len();
-        bindings.push(session.allocate_device_output_binding(
-            io.logits,
-            logits_dtype,
-            logits_shape.clone(),
-            logits_shape.clone(),
-        )?);
+        bindings.push(logits_device_binding);
+
         let vocab = *logits_shape
             .last()
             .context("CUDA logits shape has no vocabulary dimension")?;
@@ -888,6 +945,7 @@ impl DecodeCudaState {
             bindings,
             base_binding_count,
             kv_binding_range: kv_start..kv_end,
+            auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
             logits_binding,
@@ -954,6 +1012,7 @@ impl DecodeCudaState {
         session: &mut InferenceSession,
         trace: &TraceContext,
     ) -> anyhow::Result<()> {
+        debug_assert!(self.auxiliary_binding_range.end <= self.base_binding_count);
         if !self.graph_enabled {
             session.run_with_device_bindings(&[], &mut self.bindings)?;
             return Ok(());
@@ -1434,7 +1493,7 @@ fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, TensorData};
+    use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
 
     #[test]
     fn capture_fallback_emits_each_structured_decline_to_tracer() {
@@ -1689,7 +1748,19 @@ mod tests {
             present_value,
             &[("to", Attribute::Int(DataType::Float32 as i64))],
         );
-        for output in [logits, present_key, present_value] {
+        let auxiliary = graph.create_named_value(
+            "auxiliary_state",
+            DataType::Float32,
+            vec![1.into(), 1.into()],
+        );
+        insert_op(
+            &mut graph,
+            "Cast",
+            vec![input_ids],
+            auxiliary,
+            &[("to", Attribute::Int(DataType::Float32 as i64))],
+        );
+        for output in [logits, present_key, present_value, auxiliary] {
             graph.add_output(output);
         }
 
@@ -1920,6 +1991,28 @@ mod tests {
         assert_eq!(session.padded_query_capacity(), None);
     }
 
+    #[test]
+    fn persistent_auxiliary_output_shape_is_fixed_and_rejects_strings() {
+        let shape = DecodeCudaState::persistent_output_shape(
+            "auxiliary_state",
+            DataType::Float16,
+            &[Dim::Symbolic(SymbolId(0)), Dim::Static(1536)],
+        )
+        .expect("numeric auxiliary output must be bindable");
+        assert_eq!(shape, [1, 1536]);
+
+        let error = DecodeCudaState::persistent_output_shape(
+            "auxiliary_text",
+            DataType::String,
+            &[Dim::Static(1)],
+        )
+        .expect_err("variable-width auxiliary output must fail explicitly");
+        let message = error.to_string();
+        assert!(message.contains("auxiliary_text"));
+        assert!(message.contains("fixed-size device tensor storage"));
+        assert!(message.contains("export this output as a numeric tensor"));
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn native_cuda_capture_replay_is_bit_exact_and_refreshes_decode_inputs() -> anyhow::Result<()> {
@@ -1942,6 +2035,15 @@ mod tests {
         assert!(eager.cuda_graph_fallback_reason().is_none());
 
         let mut captured = capture_safe_cuda_decoder(true, MAX_LEN)?;
+        {
+            let state = captured.cuda.as_ref().expect("CUDA state");
+            assert_eq!(state.auxiliary_binding_range.len(), 1);
+            assert_eq!(
+                state.bindings[state.auxiliary_binding_range.start].output_name(),
+                Some("auxiliary_state")
+            );
+            assert!(state.auxiliary_binding_range.end <= state.base_binding_count);
+        }
         let captured_addresses = binding_addresses(&captured);
         let captured_first =
             run_capture_safe_decode(&mut captured, &TOKENS, &captured_addresses, MAX_LEN)?;
