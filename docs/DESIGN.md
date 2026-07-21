@@ -1324,7 +1324,7 @@ The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
 mechanism with a closed form. This path does not affect the single-AR-decoder TTS
 path or any other modality.
 
-**Real Qwen3-TTS export — build + validation + engine pre-embedder + emitter DONE.**
+**Real Qwen3-TTS export — build, validation, engine pre-embedder + prefill, and emitter DONE.**
 A real 1.7B Qwen3-TTS package (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) now **builds
 and runs end to end at the codec-token level** via Mobius (`examples/qwen3_tts.py`):
 the 3-model package (`embedding`, `talker`, `code_predictor`) produces valid multi-group
@@ -1365,26 +1365,29 @@ end *inside the onnx-genai engine*:
   + `_has_tts_pre_embedder`) rather than emit speculative metadata.
 
 Completing real Qwen3-TTS is therefore a focused, monitored effort. The build +
-codec-token validation, the Mobius `talker_step_embedder` pre-embedding component, the
-engine `pre_embedder`-driven outer loop, **and the Mobius
-`build_tts_pipeline_metadata` emitter are done** — the real 1.7B
-`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` package now self-describes the
-`pre_embedder`-driven `nested_autoregressive` contract and validates against the
-committed JSON schema. The remaining work is threading the real trailing-text
-`text_embed` and prefill embeds (the engine currently feeds `text_embed` zeros and a
-zero frame-0 seed — see the `pre_embedder` note) for bit-accurate real-package playback.
+codec-token validation, the Mobius `talker_step_embedder` + `talker_prefill_embedder`
+pre-embedding components, the engine `pre_embedder`-driven outer loop **plus real
+prefill + trailing-text threading (`prefill_embedder`)**, and the Mobius
+`build_tts_pipeline_metadata` emitter **are all done** — the real 1.7B
+`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` package now self-describes the full
+`pre_embedder` + `prefill_embedder` `nested_autoregressive` contract and validates
+against the committed JSON schema. The remaining refinements are the speaker / language
+/ instruct prefill branches and the exact `tts_pad` embedding for exhausted trailing
+text (see the `pre_embedder` note) toward fully bit-accurate real-package playback.
 
-##### The `pre_embedder` extension to `nested_autoregressive`
+##### The `pre_embedder` / `prefill_embedder` extension to `nested_autoregressive`
 
-`nested_autoregressive` gained one **optional** field, `pre_embedder` (a component
-name), keeping the contract minimal and backward compatible:
+`nested_autoregressive` gained two **optional** fields, `pre_embedder` and
+`prefill_embedder` (component names), keeping the contract minimal and backward
+compatible:
 
 ```yaml
 strategy:
   kind: nested_autoregressive
   outer: talker            # driven by inputs_embeds when pre_embedder is set
   inner: code_predictor
-  pre_embedder: talker_step_embedder   # NEW (optional)
+  pre_embedder: talker_step_embedder       # NEW (optional)
+  prefill_embedder: talker_prefill_embedder # NEW (optional; needs pre_embedder)
   num_code_groups: 16
   max_tokens: 2000
 # required wiring when pre_embedder is set:
@@ -1405,16 +1408,27 @@ dataflow:
    from the loaded session at runtime; the hidden size comes from the outer decoder's
    `inputs_embeds` input. The pre-embedder is a loop-internal component (`run_on:
    on_demand`), excluded from prompt/final phase classification.
-3. **Follow-up (documented TODO).** The engine currently feeds a **zero `text_embed`**
-   and a zero frame-0 seed; real trailing-text threading and prefill-embeds
-   materialization (the role/codec-tag/speaker/first-text interleaving) are the remaining
-   piece before bit-accurate real-package playback.
+3. **Prefill + trailing-text (`prefill_embedder`, optional; requires `pre_embedder`).**
+   Names a `prompt_only` component (`text_ids -> prefill_embeds [1,P,H] +
+   trailing_text_embeds [1,T,H]`) whose `text_ids` are auto-seeded with the tokenized
+   prompt. The engine reads its pooled outputs (resolved by name) and: on **frame 0**
+   feeds the multi-position `prefill_embeds` directly to the talker (advancing the past
+   length by `P`, *not* running the pre-embedder); on **frames k≥1** threads
+   `trailing_text_embeds[:, k-1, :]` as the pre-embedder's `text_embed` (zeros once the
+   text is exhausted). This moves the whole Qwen3-TTS prefill/trailing-text construction
+   into ONNX, keeping the engine generic. When absent, the engine feeds a zero frame-0
+   seed + zero `text_embed` (the earlier behavior).
+4. **Remaining follow-ups.** Speaker / language / instruct prefill branches (the
+   `talker_prefill_embedder` currently materializes the Auto / no-speaker / no-instruct
+   path) and the exact `tts_pad` embedding for exhausted trailing text — refinements
+   toward fully bit-accurate real-package playback.
 
-Proven by the synthetic fixture `tests/fixtures/tiny-tts-nested-preembed/` (built by
-`scripts/build_tiny_tts_nested_preembed.py`) and
-`crates/onnx-genai-engine/tests/tts_nested_preembed_pipeline_e2e.rs`, which drives the
-talker through `talker_step_embedder` and asserts a distinct code stream from the
-`input_ids` path — with zero regression to the legacy `tiny-tts-nested` fixture.
+Proven by the synthetic fixtures `tests/fixtures/tiny-tts-nested-preembed/` +
+`tiny-tts-nested-prefill/` (built by `scripts/build_tiny_tts_nested_preembed.py` /
+`build_tiny_tts_nested_prefill.py`) and their `*_pipeline_e2e.rs` tests, which drive the
+talker through `talker_step_embedder` (+ the prompt-derived `talker_prefill_embedder`)
+and assert a distinct code stream from the `input_ids` / zero-seed paths — with zero
+regression to the legacy `tiny-tts-nested` fixture.
 
 #### Speech-to-Text (ASR / Whisper-style)
 
