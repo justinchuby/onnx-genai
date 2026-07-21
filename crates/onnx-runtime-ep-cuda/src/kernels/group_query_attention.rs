@@ -90,7 +90,7 @@ extern "C" __global__ void gqa_prepare_metadata(
         for (int s = 0; s < query_length; ++s) {
             const long long position = position_ids
                 ? position_ids[b * query_length + s]
-                : past + s;
+                : query_start + s;
             if (position < 0 || position >= (long long)cache_rows) {
                 error |= 32;
             }
@@ -987,7 +987,7 @@ fn require_matching_capture_signature(
 ) -> Result<()> {
     if runtime.is_capturing()? && (current.is_none() || warmed != current) {
         return Err(EpError::KernelFailed(
-            "cuda_ep GroupQueryAttention: dtype, decode mode, or shape changed during CUDA graph capture; warm the exact f32 one-token fixed device-KV signature before capture".into(),
+            "cuda_ep GroupQueryAttention: dtype, decode mode, or shape changed during CUDA graph capture; warm the exact one-token fixed device-KV signature before capture".into(),
         ));
     }
     Ok(())
@@ -1068,23 +1068,29 @@ fn read_i64(runtime: &CudaRuntime, view: &TensorView, name: &str) -> Result<Vec<
 
 macro_rules! launch_1d {
     ($runtime:expr, $module:expr, $source:expr, $entry:expr, $count:expr, $builder:ident, $args:block) => {{
-        let function = $runtime.nvrtc_function($module, $source, $entry)?;
-        let grid = u32::try_from(($count).div_ceil(BLOCK as usize)).map_err(|_| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: launch grid exceeds u32".into())
-        })?;
-        let mut $builder = $runtime.stream().launch_builder(&function);
-        $args
-        // SAFETY: each invocation supplies the argument ABI for its entry point;
-        // input/output buffers outlive execution, and workspace buffers remain
-        // owned by the kernel while stream-ordered work is pending.
-        unsafe {
-            $builder.launch(LaunchConfig {
-                grid_dim: (grid, 1, 1),
-                block_dim: (BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            })
+        let launch_count: usize = $count;
+        if launch_count != 0 {
+            let function = $runtime.nvrtc_function($module, $source, $entry)?;
+            let grid =
+                u32::try_from(launch_count.div_ceil(BLOCK as usize)).map_err(|_| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: launch grid exceeds u32".into(),
+                    )
+                })?;
+            let mut $builder = $runtime.stream().launch_builder(&function);
+            $args
+            // SAFETY: each invocation supplies the argument ABI for its entry point;
+            // input/output buffers outlive execution, and workspace buffers remain
+            // owned by the kernel while stream-ordered work is pending.
+            unsafe {
+                $builder.launch(LaunchConfig {
+                    grid_dim: (grid, 1, 1),
+                    block_dim: (BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| driver_err(&format!("launch {}", $entry), e))?;
         }
-        .map_err(|e| driver_err(&format!("launch {}", $entry), e))?;
     }};
 }
 
@@ -1339,7 +1345,6 @@ impl GroupQueryAttentionKernel {
             let (k_batch, k_seq, k_hidden) = (k.shape[0], k.shape[1], k.shape[2]);
             if batch == 0
                 || q_seq == 0
-                || k_seq == 0
                 || input_hidden == 0
                 || k_hidden == 0
                 || !input_hidden.is_multiple_of(self.num_heads)
@@ -1428,10 +1433,10 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: do_rotary requires an even head_size".into(),
                     ));
                 }
-                if q_seq != k_seq {
+                if k_seq != 0 && q_seq != k_seq {
                     return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths".into(),
-                ));
+                        "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths unless current key/value are empty".into(),
+                    ));
                 }
                 let cos = inputs
                     .get(7)
@@ -1520,7 +1525,7 @@ impl GroupQueryAttentionKernel {
                 (q.dtype == DataType::Float32
                     || (q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim)))
                     && q_seq == 1
-                    && k_seq == 1
+                    && k_seq <= 1
                     && has_past_key
                     && present_capacity >= 1
                     && past_capacity == present_capacity
@@ -1558,7 +1563,7 @@ impl GroupQueryAttentionKernel {
             .is_some_and(|candidate| warmed_signature.as_ref() == Some(candidate));
 
         let mut valid_sequence_length = None;
-        let mut validated_past_lengths = None;
+        let mut validated_query_starts = None;
         let total_sequence_length = if capture_safe_decode {
             None
         } else {
@@ -1591,7 +1596,7 @@ impl GroupQueryAttentionKernel {
                     "cuda_ep GroupQueryAttention: valid sequence length {maximum} exceeds physical total_sequence_length capacity {total_sequence_length}"
                 )));
             }
-            let mut past_lengths = Vec::with_capacity(batch);
+            let mut query_starts = Vec::with_capacity(batch);
             for &total in &totals {
                 let past = total.checked_sub(current_key_length).ok_or_else(|| {
                     EpError::KernelFailed(
@@ -1599,7 +1604,7 @@ impl GroupQueryAttentionKernel {
                             .into(),
                     )
                 })?;
-                total.checked_sub(query_length).ok_or_else(|| {
+                let query_start = total.checked_sub(query_length).ok_or_else(|| {
                     EpError::KernelFailed(
                         "cuda_ep GroupQueryAttention: seqlens_k + 1 is shorter than current query sequence"
                             .into(),
@@ -1611,10 +1616,10 @@ impl GroupQueryAttentionKernel {
                             .into(),
                     ));
                 }
-                past_lengths.push(past);
+                query_starts.push(query_start);
             }
             valid_sequence_length = Some(maximum);
-            validated_past_lengths = Some(past_lengths);
+            validated_query_starts = Some(query_starts);
             Some(total_sequence_length)
         };
 
@@ -1630,10 +1635,10 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
                     ));
                 }
-            } else if validated_past_lengths.as_ref().is_some_and(|lengths| {
-                lengths
+            } else if validated_query_starts.as_ref().is_some_and(|starts| {
+                starts
                     .iter()
-                    .any(|&past| past as usize + q_seq > cache_rows_usize)
+                    .any(|&start| start as usize + q_seq > cache_rows_usize)
             }) {
                 return Err(EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: rotary position exceeds cache rows".into(),
@@ -2026,9 +2031,16 @@ impl GroupQueryAttentionKernel {
 
             if self.do_rotary {
                 let interleaved_i: i32 = self.rotary_interleaved.into();
-                for (tensor, seq_i, heads, capacity, current_offset) in [
-                    (q_bnsh, q_seq_i, heads_i, q_seq_i, 0i32),
-                    (present_k_ptr, k_seq_i, kv_heads_i, present_capacity_i, 1i32),
+                for (tensor, positions, seq_i, heads, capacity, current_offset) in [
+                    (q_bnsh, query_starts_gpu, q_seq_i, heads_i, q_seq_i, 0i32),
+                    (
+                        present_k_ptr,
+                        past_lengths_gpu,
+                        k_seq_i,
+                        kv_heads_i,
+                        present_capacity_i,
+                        1i32,
+                    ),
                 ] {
                     let count = batch * (heads as usize) * (seq_i as usize) * (dim / 2);
                     launch_1d!(
@@ -2044,7 +2056,7 @@ impl GroupQueryAttentionKernel {
                                 .arg(&cos_ptr)
                                 .arg(&sin_ptr)
                                 .arg(&positions_ptr)
-                                .arg(&past_lengths_gpu)
+                                .arg(&positions)
                                 .arg(&batch_i)
                                 .arg(&seq_i)
                                 .arg(&heads)
@@ -2137,7 +2149,7 @@ impl GroupQueryAttentionKernel {
         } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_fp16_splitk",
-                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=128); \
+                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
                  active split count (1/2/4/8, max {}) chosen on-device from valid length",
                 q_seq,
                 dim,
@@ -2314,13 +2326,12 @@ impl Kernel for GroupQueryAttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // Eligibility is tied to the exact f32 one-token, fixed-capacity,
-        // in-place device-KV reference-attention signature warmed by the most
-        // recent successful call.
+        // Eligibility is tied to the exact one-token, fixed-capacity, in-place
+        // device-KV decode signature warmed by the most recent successful call.
         match self.last_capture_safe_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed f32 q_seq==1 k_seq==1 fixed-capacity device-KV reference path; the current signature was not warmed as capture-safe",
+                "requires a warmed f32/fp16 q_seq==1 k_seq<=1 fixed-capacity device-KV decode path; the current signature was not warmed as capture-safe",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "GroupQueryAttention capture signature is unavailable because its state lock was poisoned",

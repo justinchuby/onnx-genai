@@ -7,8 +7,8 @@
 //! second kernel merges those states in fixed split order. Q/K/V and the output
 //! are `__half`; every softmax statistic and value accumulator stays in fp32.
 //!
-//! Model shape this targets (Qwen2.5-0.5B): 14 Q heads / 2 KV heads
-//! (`group_size = 7`), `head_dim = 64`, `Sq = 1`.
+//! The structural gate accepts any single-token fp16 GQA/MQA/MHA decode with an
+//! even `head_dim <= 256`.
 //!
 //! ## Reduction strategy
 //!
@@ -41,8 +41,8 @@
 //!     valid length selects 1/2/4/8/16 active splits, so replay observes updated
 //!     lengths without a host round trip or graph update. Inactive split CTAs
 //!     return before loading Q/K/V.
-//!   * The worst-case module-global scratch is 2,129,920 bytes
-//!     (`256 rows * 16 splits * 130 floats * 4 bytes`). It is shared by all GQA
+//!   * The worst-case module-global scratch is 4,227,072 bytes
+//!     (`256 rows * 16 splits * 258 floats * 4 bytes`). It is shared by all GQA
 //!     layers under the runtime's single-stream execution invariant; concurrent
 //!     streams would require per-stream scratch.
 
@@ -53,14 +53,14 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f16_v3";
+const MODULE_KEY: &str = "gqa_decode_attention_f16_v4";
 const ENTRY: &str = "gqa_decode_attention_f16";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
 /// `ceil(head_dim / 2 / 32)` `half2` slots (2 dims each) in registers, capped at
-/// `GQA_MAX_H2PL == 2`, i.e. `head_dim <= 2 * 2 * 32 == 128`.
-pub(super) const MAX_HEAD_DIM: usize = 128;
+/// `GQA_MAX_H2PL == 4`, i.e. `head_dim <= 2 * 4 * 32 == 256`.
+pub(super) const MAX_HEAD_DIM: usize = 256;
 
 /// Warps grouped into one CTA. Each CTA owns one query head; its warps split-K
 /// the sequence. Four warps (128 threads) is the ORT decode geometry and keeps
@@ -80,15 +80,15 @@ const DECODE_SRC: &str = r#"
 #include <cuda_fp16.h>
 
 #define GQA_WARP_SIZE 32
-#define GQA_MAX_H2PL 2   // half2 slots per lane; head_dim <= 2 * 2 * 32 == 128
-#define GQA_MAX_HEAD_SIZE 128
+#define GQA_MAX_H2PL 4   // half2 slots per lane; head_dim <= 2 * 4 * 32 == 256
+#define GQA_MAX_HEAD_SIZE 256
 #define GQA_MAX_SPLITS 16
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
 
 // Module globals are allocated when the NVRTC module is loaded, before graph
 // capture. All GQA layers share the same stream and therefore reuse this
-// scratch sequentially. The 2,129,920-byte allocation is sized for the full
+// scratch sequentially. The 4,227,072-byte allocation is sized for the full
 // 256-row, 16-split worst case. Concurrent streams would need separate scratch.
 // Shapes above the row cap retain the old one-CTA path.
 __device__ __align__(16) float gqa_split_scratch[
@@ -805,8 +805,9 @@ mod tests {
     fn support_gate_targets_even_head_dim_single_token_decode() {
         assert!(supported(1, 64));
         assert!(supported(1, 128));
+        assert!(supported(1, 256));
         assert!(!supported(1, 63)); // odd head_dim: no half2 vectorization
-        assert!(!supported(1, 130)); // exceeds MAX_HEAD_DIM
+        assert!(!supported(1, 258)); // exceeds MAX_HEAD_DIM
         assert!(!supported(2, 64)); // prefill (Sq > 1)
         assert!(!supported(1, 0));
     }
