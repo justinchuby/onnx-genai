@@ -285,6 +285,83 @@ extern "C" __global__ void gqa_attention_reference_f32(
                 * head_size + d] = result;
     }
 }
+
+// Fused single-token (Sq=1, Sk=1) decode prep: split (implicit, reads packed or
+// unpacked source directly), BSH->BNSH transpose (identity for Sq=1), in-place
+// KV cache append, and RoPE for Q and present-K -- all in one launch. Replaces
+// the split+transpose_in+append(K,V)+rope(Q,K) chain on the aliased device-KV
+// decode path. `past_lengths` is produced by the separate `gqa_prepare_metadata`
+// kernel (stream-ordered before this launch), so its poison/latch sentinel
+// (past < 0) still gates every cache write here identically to the unfused path.
+extern "C" __global__ void gqa_fuse_decode_prep(
+    const float* q_src, const float* k_src, const float* v_src, int packed,
+    float* q_bnsh, float* present_k, float* present_v,
+    const int* past_lengths, const float* cos_cache, const float* sin_cache,
+    const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
+    int present_capacity, int cache_rows, int do_rotary, int interleaved,
+    int cache_is_half)
+{
+    (void)cache_is_half;
+    const int half = dim / 2;
+    const int qN = q_heads * half;
+    const int kvN = kv_heads * half;
+    const int per_batch = qN + 2 * kvN;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * per_batch) return;
+    const int b = idx / per_batch;
+    int local = idx - b * per_batch;
+    const int past = past_lengths[b];
+    const int q_hidden = q_heads * dim;
+    const int kv_hidden = kv_heads * dim;
+    const int packed_hidden = q_hidden + 2 * kv_hidden;
+    const long long position = position_ids ? position_ids[b] : (long long)past;
+    const int rope_ok = do_rotary && position >= 0 && position < (long long)cache_rows;
+    const int pos = rope_ok ? (int)position : 0;
+    int region, h, k;
+    if (local < qN) { region = 0; h = local / half; k = local % half; }
+    else if (local < qN + kvN) { local -= qN; region = 1; h = local / half; k = local % half; }
+    else { local -= qN + kvN; region = 2; h = local / half; k = local % half; }
+    const int d0 = interleaved ? 2 * k : k;
+    const int d1 = interleaved ? 2 * k + 1 : k + half;
+    if (region == 0) {
+        const long src = (long)b * (packed ? packed_hidden : q_hidden) + (long)h * dim;
+        const long dst = (long)(b * q_heads + h) * dim;
+        const float x0 = q_src[src + d0];
+        const float x1 = q_src[src + d1];
+        if (rope_ok && past >= 0) {
+            const float c = cos_cache[pos * half + k];
+            const float sn = sin_cache[pos * half + k];
+            q_bnsh[dst + d0] = __fsub_rn(__fmul_rn(c, x0), __fmul_rn(sn, x1));
+            q_bnsh[dst + d1] = __fadd_rn(__fmul_rn(sn, x0), __fmul_rn(c, x1));
+        } else {
+            q_bnsh[dst + d0] = x0;
+            q_bnsh[dst + d1] = x1;
+        }
+        return;
+    }
+    if (past < 0 || past >= present_capacity) return;
+    const long dst = ((long)(b * kv_heads + h) * present_capacity + past) * dim;
+    if (region == 1) {
+        const long src = (long)b * (packed ? packed_hidden : kv_hidden)
+                       + (packed ? q_hidden : 0) + (long)h * dim;
+        const float x0 = k_src[src + d0];
+        const float x1 = k_src[src + d1];
+        if (rope_ok) {
+            const float c = cos_cache[pos * half + k];
+            const float sn = sin_cache[pos * half + k];
+            present_k[dst + d0] = __fsub_rn(__fmul_rn(c, x0), __fmul_rn(sn, x1));
+            present_k[dst + d1] = __fadd_rn(__fmul_rn(sn, x0), __fmul_rn(c, x1));
+        } else {
+            present_k[dst + d0] = x0;
+            present_k[dst + d1] = x1;
+        }
+    } else {
+        const long src = (long)b * (packed ? packed_hidden : kv_hidden)
+                       + (packed ? (q_hidden + kv_hidden) : 0) + (long)h * dim;
+        present_v[dst + d0] = v_src[src + d0];
+        present_v[dst + d1] = v_src[src + d1];
+    }
+}
 "#;
 
 const PREP_HALF_SRC: &str = r#"
@@ -440,6 +517,81 @@ __device__ void gqa_transpose_bnsh_to_bsh_body(
     dst[idx] = src[((b * heads + h) * seq + s) * dim + d];
 }
 
+// Half/bf16 counterpart of `gqa_fuse_decode_prep` (see the f32 source for the
+// full contract). RoPE reads/writes go through the shared float load/store and
+// cache helpers so the fused result is bit-identical to the unfused
+// split+transpose+append+rope chain; raw (non-rotary) writes stay direct T
+// copies to avoid any extra float round-trip.
+template <typename T>
+__device__ void gqa_fuse_decode_prep_body(
+    const T* q_src, const T* k_src, const T* v_src, int packed,
+    T* q_bnsh, T* present_k, T* present_v,
+    const int* past_lengths, const void* cos_cache, const void* sin_cache,
+    const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
+    int present_capacity, int cache_rows, int do_rotary, int interleaved,
+    int cache_is_half)
+{
+    const int half = dim / 2;
+    const int qN = q_heads * half;
+    const int kvN = kv_heads * half;
+    const int per_batch = qN + 2 * kvN;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * per_batch) return;
+    const int b = idx / per_batch;
+    int local = idx - b * per_batch;
+    const int past = past_lengths[b];
+    const int q_hidden = q_heads * dim;
+    const int kv_hidden = kv_heads * dim;
+    const int packed_hidden = q_hidden + 2 * kv_hidden;
+    const long long position = position_ids ? position_ids[b] : (long long)past;
+    const int rope_ok = do_rotary && position >= 0 && position < (long long)cache_rows;
+    const int pos = rope_ok ? (int)position : 0;
+    int region, h, k;
+    if (local < qN) { region = 0; h = local / half; k = local % half; }
+    else if (local < qN + kvN) { local -= qN; region = 1; h = local / half; k = local % half; }
+    else { local -= qN + kvN; region = 2; h = local / half; k = local % half; }
+    const int d0 = interleaved ? 2 * k : k;
+    const int d1 = interleaved ? 2 * k + 1 : k + half;
+    if (region == 0) {
+        const long src = (long)b * (packed ? packed_hidden : q_hidden) + (long)h * dim;
+        const long dst = (long)(b * q_heads + h) * dim;
+        if (rope_ok && past >= 0) {
+            const float x0 = gqa_load<T>(q_src[src + d0]);
+            const float x1 = gqa_load<T>(q_src[src + d1]);
+            const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
+            const float sn = gqa_load_cache(sin_cache, pos * half + k, cache_is_half);
+            q_bnsh[dst + d0] = gqa_store<T>(c * x0 - sn * x1);
+            q_bnsh[dst + d1] = gqa_store<T>(sn * x0 + c * x1);
+        } else {
+            q_bnsh[dst + d0] = q_src[src + d0];
+            q_bnsh[dst + d1] = q_src[src + d1];
+        }
+        return;
+    }
+    if (past < 0 || past >= present_capacity) return;
+    const long dst = ((long)(b * kv_heads + h) * present_capacity + past) * dim;
+    if (region == 1) {
+        const long src = (long)b * (packed ? packed_hidden : kv_hidden)
+                       + (packed ? q_hidden : 0) + (long)h * dim;
+        if (rope_ok) {
+            const float x0 = gqa_load<T>(k_src[src + d0]);
+            const float x1 = gqa_load<T>(k_src[src + d1]);
+            const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
+            const float sn = gqa_load_cache(sin_cache, pos * half + k, cache_is_half);
+            present_k[dst + d0] = gqa_store<T>(c * x0 - sn * x1);
+            present_k[dst + d1] = gqa_store<T>(sn * x0 + c * x1);
+        } else {
+            present_k[dst + d0] = k_src[src + d0];
+            present_k[dst + d1] = k_src[src + d1];
+        }
+    } else {
+        const long src = (long)b * (packed ? packed_hidden : kv_hidden)
+                       + (packed ? (q_hidden + kv_hidden) : 0) + (long)h * dim;
+        present_v[dst + d0] = v_src[src + d0];
+        present_v[dst + d1] = v_src[src + d1];
+    }
+}
+
 #define DEFINE_GQA_HALF_KERNELS(TYPE, SUFFIX) \
 extern "C" __global__ void gqa_transpose_bsh_to_bnsh_##SUFFIX( \
     const TYPE* src, TYPE* dst, int batch, int seq, int heads, int dim) { \
@@ -476,6 +628,17 @@ extern "C" __global__ void gqa_rope_bnsh_##SUFFIX( \
 extern "C" __global__ void gqa_transpose_bnsh_to_bsh_##SUFFIX( \
     const TYPE* src, TYPE* dst, int batch, int seq, int heads, int dim) { \
     gqa_transpose_bnsh_to_bsh_body<TYPE>(src, dst, batch, seq, heads, dim); \
+} \
+extern "C" __global__ void gqa_fuse_decode_prep_##SUFFIX( \
+    const TYPE* q_src, const TYPE* k_src, const TYPE* v_src, int packed, \
+    TYPE* q_bnsh, TYPE* present_k, TYPE* present_v, \
+    const int* past_lengths, const void* cos_cache, const void* sin_cache, \
+    const long long* position_ids, int batch, int q_heads, int kv_heads, int dim, \
+    int present_capacity, int cache_rows, int do_rotary, int interleaved, \
+    int cache_is_half) { \
+    gqa_fuse_decode_prep_body<TYPE>(q_src, k_src, v_src, packed, q_bnsh, present_k, \
+        present_v, past_lengths, cos_cache, sin_cache, position_ids, batch, q_heads, \
+        kv_heads, dim, present_capacity, cache_rows, do_rotary, interleaved, cache_is_half); \
 }
 
 DEFINE_GQA_HALF_KERNELS(__half, f16)
@@ -601,6 +764,7 @@ pub struct GroupQueryAttentionKernel {
     local_window_size: i64,
     softcap: f32,
     backend: GroupQueryAttentionBackend,
+    prep_fusion_disabled: bool,
     workspace: Mutex<GqaWorkspace>,
     last_capture_safe_signature: Mutex<Option<GqaCaptureSignature>>,
 }
@@ -841,12 +1005,22 @@ impl GroupQueryAttentionKernel {
             local_window_size,
             softcap,
             backend: GroupQueryAttentionBackend::Auto,
+            prep_fusion_disabled: false,
             last_capture_safe_signature: Mutex::new(None),
         })
     }
 
     pub fn with_backend(mut self, backend: GroupQueryAttentionBackend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Forces the unfused per-op decode prep chain (split, transpose, append,
+    /// RoPE, output transpose) instead of the single fused decode-prep launch.
+    /// Exposed so tests can prove the fused kernel is bit-identical to the
+    /// unfused reference path on the same inputs.
+    pub fn with_prep_fusion_disabled(mut self, disabled: bool) -> Self {
+        self.prep_fusion_disabled = disabled;
         self
     }
 
@@ -935,6 +1109,7 @@ impl GroupQueryAttentionKernel {
             append_entry,
             rope_entry,
             transpose_out_entry,
+            fuse_entry,
         ) = match q.dtype {
             DataType::Float32 => (
                 PREP_MODULE,
@@ -945,6 +1120,7 @@ impl GroupQueryAttentionKernel {
                 "gqa_append_cache",
                 "gqa_rope_bnsh",
                 "gqa_transpose_bnsh_to_bsh",
+                "gqa_fuse_decode_prep",
             ),
             DataType::Float16 => (
                 PREP_HALF_MODULE,
@@ -955,6 +1131,7 @@ impl GroupQueryAttentionKernel {
                 "gqa_append_cache_f16",
                 "gqa_rope_bnsh_f16",
                 "gqa_transpose_bnsh_to_bsh_f16",
+                "gqa_fuse_decode_prep_f16",
             ),
             DataType::BFloat16 => (
                 PREP_HALF_MODULE,
@@ -965,6 +1142,7 @@ impl GroupQueryAttentionKernel {
                 "gqa_append_cache_bf16",
                 "gqa_rope_bnsh_bf16",
                 "gqa_transpose_bnsh_to_bsh_bf16",
+                "gqa_fuse_decode_prep_bf16",
             ),
             _ => unreachable!(),
         };
@@ -1327,6 +1505,21 @@ impl GroupQueryAttentionKernel {
             }
         }
 
+        // Single-token decode lets the trailing BNSH->BSH output transpose
+        // collapse into the attention write (identical layouts when Sq==1), and
+        // when the KV cache is appended in place (aliased device-KV, matching
+        // past/present capacity) the whole split+transpose+append+RoPE prep
+        // chain fuses into one launch. Prefill/growing-cache/non-aliased shapes
+        // keep the unfused kernels.
+        let single_token = q_seq == 1;
+        let fuse_prep = single_token
+            && k_seq == 1
+            && dim.is_multiple_of(2)
+            && has_past_key
+            && aliased_device_kv
+            && past_capacity == present_capacity
+            && !self.prep_fusion_disabled;
+
         let mut workspace = self.workspace.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
         })?;
@@ -1342,17 +1535,21 @@ impl GroupQueryAttentionKernel {
         } else {
             0
         };
-        let packed_q = packed_qkv
+        let packed_q = (packed_qkv && !fuse_prep)
             .then(|| workspace.reserve(WS_PACKED_Q, batch * q_seq * q_hidden * element_size))
             .transpose()?;
-        let packed_k = packed_qkv
+        let packed_k = (packed_qkv && !fuse_prep)
             .then(|| workspace.reserve(WS_PACKED_K, batch * k_seq * k_hidden * element_size))
             .transpose()?;
-        let packed_v = packed_qkv
+        let packed_v = (packed_qkv && !fuse_prep)
             .then(|| workspace.reserve(WS_PACKED_V, batch * k_seq * k_hidden * element_size))
             .transpose()?;
         let q_bnsh = workspace.reserve(WS_Q_BNSH, batch * q_seq * q_hidden * element_size)?;
-        let out_bnsh = workspace.reserve(WS_OUT_BNSH, outputs[0].numel() * element_size)?;
+        // Sq==1 writes attention output straight into the BSH output tensor
+        // (identical layout), so the BNSH scratch is only needed for Sq>1.
+        let out_bnsh = (!single_token)
+            .then(|| workspace.reserve(WS_OUT_BNSH, outputs[0].numel() * element_size))
+            .transpose()?;
         let owned_present_k = (outputs.len() < 2)
             .then(|| {
                 workspace.reserve(
@@ -1384,6 +1581,18 @@ impl GroupQueryAttentionKernel {
             *owned_present_v.as_ref().ok_or_else(|| {
                 EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: internal present-value allocation missing".into(),
+                )
+            })?
+        };
+        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        // Sq==1 makes BNSH and BSH layouts identical, so attention writes into
+        // the real output tensor directly and the trailing transpose is skipped.
+        let attention_out = if single_token {
+            output_ptr
+        } else {
+            *out_bnsh.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal BNSH output allocation missing".into(),
                 )
             })?
         };
@@ -1428,160 +1637,216 @@ impl GroupQueryAttentionKernel {
             }
         );
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
-        let (q_ptr, k_ptr, v_ptr) = if packed_qkv {
-            let q_scratch = packed_q.as_ref().ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: internal packed-query allocation missing".into(),
+        if fuse_prep {
+            // Fused single-token decode prep. One launch subsumes the packed
+            // split, BSH->BNSH query transpose, in-place K/V cache append, and
+            // Q/present-K RoPE that the branch below performs as six separate
+            // kernels. `past_lengths_gpu` (from `gqa_prepare_metadata` above)
+            // still gates every cache write, preserving the poison/latch and
+            // bounds semantics of the unfused append/rope kernels.
+            let (q_src, k_src, v_src, packed_flag) = if packed_qkv {
+                (input_q_ptr, input_q_ptr, input_q_ptr, 1i32)
+            } else {
+                (
+                    input_q_ptr,
+                    cuptr(inputs[1].data_ptr::<u8>() as *const c_void),
+                    cuptr(inputs[2].data_ptr::<u8>() as *const c_void),
+                    0i32,
                 )
-            })?;
-            let k_scratch = packed_k.as_ref().ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: internal packed-key allocation missing".into(),
-                )
-            })?;
-            let v_scratch = packed_v.as_ref().ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: internal packed-value allocation missing".into(),
-                )
-            })?;
-            let packed_count = q.numel();
+            };
+            let interleaved_i: i32 = self.rotary_interleaved.into();
+            let do_rotary_i: i32 = self.do_rotary.into();
+            let fused_count = batch * (self.num_heads + 2 * self.kv_num_heads) * (dim / 2);
             launch_1d!(
                 self.runtime,
                 prep_module,
                 prep_src,
-                split_entry,
-                packed_count,
+                fuse_entry,
+                fused_count,
                 builder,
                 {
                     builder
-                        .arg(&input_q_ptr)
-                        .arg(q_scratch)
-                        .arg(k_scratch)
-                        .arg(v_scratch)
+                        .arg(&q_src)
+                        .arg(&k_src)
+                        .arg(&v_src)
+                        .arg(&packed_flag)
+                        .arg(&q_bnsh)
+                        .arg(&present_k_ptr)
+                        .arg(&present_v_ptr)
+                        .arg(&past_lengths_gpu)
+                        .arg(&cos_ptr)
+                        .arg(&sin_ptr)
+                        .arg(&positions_ptr)
+                        .arg(&batch_i)
+                        .arg(&heads_i)
+                        .arg(&kv_heads_i)
+                        .arg(&dim_i)
+                        .arg(&present_capacity_i)
+                        .arg(&cache_rows)
+                        .arg(&do_rotary_i)
+                        .arg(&interleaved_i)
+                        .arg(&rope_cache_is_half);
+                }
+            );
+        } else {
+            let (q_ptr, k_ptr, v_ptr) = if packed_qkv {
+                let q_scratch = packed_q.as_ref().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: internal packed-query allocation missing"
+                            .into(),
+                    )
+                })?;
+                let k_scratch = packed_k.as_ref().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: internal packed-key allocation missing"
+                            .into(),
+                    )
+                })?;
+                let v_scratch = packed_v.as_ref().ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: internal packed-value allocation missing"
+                            .into(),
+                    )
+                })?;
+                let packed_count = q.numel();
+                launch_1d!(
+                    self.runtime,
+                    prep_module,
+                    prep_src,
+                    split_entry,
+                    packed_count,
+                    builder,
+                    {
+                        builder
+                            .arg(&input_q_ptr)
+                            .arg(q_scratch)
+                            .arg(k_scratch)
+                            .arg(v_scratch)
+                            .arg(&batch_i)
+                            .arg(&q_seq_i)
+                            .arg(&heads_i)
+                            .arg(&kv_heads_i)
+                            .arg(&dim_i);
+                    }
+                );
+                (*q_scratch, *k_scratch, *v_scratch)
+            } else {
+                (
+                    input_q_ptr,
+                    cuptr(inputs[1].data_ptr::<u8>() as *const c_void),
+                    cuptr(inputs[2].data_ptr::<u8>() as *const c_void),
+                )
+            };
+            launch_1d!(
+                self.runtime,
+                prep_module,
+                prep_src,
+                transpose_in_entry,
+                batch * q_seq * q_hidden,
+                builder,
+                {
+                    builder
+                        .arg(&q_ptr)
+                        .arg(&q_bnsh)
                         .arg(&batch_i)
                         .arg(&q_seq_i)
                         .arg(&heads_i)
-                        .arg(&kv_heads_i)
                         .arg(&dim_i);
                 }
             );
-            (*q_scratch, *k_scratch, *v_scratch)
-        } else {
-            (
-                input_q_ptr,
-                cuptr(inputs[1].data_ptr::<u8>() as *const c_void),
-                cuptr(inputs[2].data_ptr::<u8>() as *const c_void),
-            )
-        };
-        launch_1d!(
-            self.runtime,
-            prep_module,
-            prep_src,
-            transpose_in_entry,
-            batch * q_seq * q_hidden,
-            builder,
-            {
-                builder
-                    .arg(&q_ptr)
-                    .arg(&q_bnsh)
-                    .arg(&batch_i)
-                    .arg(&q_seq_i)
-                    .arg(&heads_i)
-                    .arg(&dim_i);
-            }
-        );
 
-        let past_k_ptr = if has_past_key {
-            cuptr(inputs[3].data_ptr::<u8>() as *const c_void)
-        } else {
-            0
-        };
-        let past_v_ptr = if has_past_value {
-            cuptr(inputs[4].data_ptr::<u8>() as *const c_void)
-        } else {
-            0
-        };
-        for (current, past, present) in [
-            (k_ptr, past_k_ptr, present_k_ptr),
-            (v_ptr, past_v_ptr, present_v_ptr),
-        ] {
-            if past != 0 && past == present && past_capacity == present_capacity {
-                launch_1d!(
-                    self.runtime,
-                    prep_module,
-                    prep_src,
-                    append_entry,
-                    batch * self.kv_num_heads * k_seq * dim,
-                    builder,
-                    {
-                        builder
-                            .arg(&current)
-                            .arg(&present)
-                            .arg(&past_lengths_gpu)
-                            .arg(&batch_i)
-                            .arg(&k_seq_i)
-                            .arg(&kv_heads_i)
-                            .arg(&dim_i)
-                            .arg(&present_capacity_i);
-                    }
-                );
+            let past_k_ptr = if has_past_key {
+                cuptr(inputs[3].data_ptr::<u8>() as *const c_void)
             } else {
-                launch_1d!(
-                    self.runtime,
-                    prep_module,
-                    prep_src,
-                    build_entry,
-                    expected_cache_shape.iter().product::<usize>(),
-                    builder,
-                    {
-                        builder
-                            .arg(&current)
-                            .arg(&past)
-                            .arg(&present)
-                            .arg(&past_lengths_gpu)
-                            .arg(&batch_i)
-                            .arg(&k_seq_i)
-                            .arg(&kv_heads_i)
-                            .arg(&dim_i)
-                            .arg(&past_capacity_i)
-                            .arg(&present_capacity_i);
-                    }
-                );
-            }
-        }
-
-        if self.do_rotary {
-            let interleaved_i: i32 = self.rotary_interleaved.into();
-            for (tensor, seq_i, heads, capacity, current_offset) in [
-                (q_bnsh, q_seq_i, heads_i, q_seq_i, 0i32),
-                (present_k_ptr, k_seq_i, kv_heads_i, present_capacity_i, 1i32),
+                0
+            };
+            let past_v_ptr = if has_past_value {
+                cuptr(inputs[4].data_ptr::<u8>() as *const c_void)
+            } else {
+                0
+            };
+            for (current, past, present) in [
+                (k_ptr, past_k_ptr, present_k_ptr),
+                (v_ptr, past_v_ptr, present_v_ptr),
             ] {
-                let count = batch * (heads as usize) * (seq_i as usize) * (dim / 2);
-                launch_1d!(
-                    self.runtime,
-                    prep_module,
-                    prep_src,
-                    rope_entry,
-                    count,
-                    builder,
-                    {
-                        builder
-                            .arg(&tensor)
-                            .arg(&cos_ptr)
-                            .arg(&sin_ptr)
-                            .arg(&positions_ptr)
-                            .arg(&past_lengths_gpu)
-                            .arg(&batch_i)
-                            .arg(&seq_i)
-                            .arg(&heads)
-                            .arg(&dim_i)
-                            .arg(&capacity)
-                            .arg(&current_offset)
-                            .arg(&cache_rows)
-                            .arg(&interleaved_i)
-                            .arg(&rope_cache_is_half);
-                    }
-                );
+                if past != 0 && past == present && past_capacity == present_capacity {
+                    launch_1d!(
+                        self.runtime,
+                        prep_module,
+                        prep_src,
+                        append_entry,
+                        batch * self.kv_num_heads * k_seq * dim,
+                        builder,
+                        {
+                            builder
+                                .arg(&current)
+                                .arg(&present)
+                                .arg(&past_lengths_gpu)
+                                .arg(&batch_i)
+                                .arg(&k_seq_i)
+                                .arg(&kv_heads_i)
+                                .arg(&dim_i)
+                                .arg(&present_capacity_i);
+                        }
+                    );
+                } else {
+                    launch_1d!(
+                        self.runtime,
+                        prep_module,
+                        prep_src,
+                        build_entry,
+                        expected_cache_shape.iter().product::<usize>(),
+                        builder,
+                        {
+                            builder
+                                .arg(&current)
+                                .arg(&past)
+                                .arg(&present)
+                                .arg(&past_lengths_gpu)
+                                .arg(&batch_i)
+                                .arg(&k_seq_i)
+                                .arg(&kv_heads_i)
+                                .arg(&dim_i)
+                                .arg(&past_capacity_i)
+                                .arg(&present_capacity_i);
+                        }
+                    );
+                }
+            }
+
+            if self.do_rotary {
+                let interleaved_i: i32 = self.rotary_interleaved.into();
+                for (tensor, seq_i, heads, capacity, current_offset) in [
+                    (q_bnsh, q_seq_i, heads_i, q_seq_i, 0i32),
+                    (present_k_ptr, k_seq_i, kv_heads_i, present_capacity_i, 1i32),
+                ] {
+                    let count = batch * (heads as usize) * (seq_i as usize) * (dim / 2);
+                    launch_1d!(
+                        self.runtime,
+                        prep_module,
+                        prep_src,
+                        rope_entry,
+                        count,
+                        builder,
+                        {
+                            builder
+                                .arg(&tensor)
+                                .arg(&cos_ptr)
+                                .arg(&sin_ptr)
+                                .arg(&positions_ptr)
+                                .arg(&past_lengths_gpu)
+                                .arg(&batch_i)
+                                .arg(&seq_i)
+                                .arg(&heads)
+                                .arg(&dim_i)
+                                .arg(&capacity)
+                                .arg(&current_offset)
+                                .arg(&cache_rows)
+                                .arg(&interleaved_i)
+                                .arg(&rope_cache_is_half);
+                        }
+                    );
+                }
             }
         }
 
@@ -1610,7 +1875,7 @@ impl GroupQueryAttentionKernel {
                 q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh,
+                attention_out,
                 0,
                 0,
                 totals_gpu,
@@ -1636,7 +1901,7 @@ impl GroupQueryAttentionKernel {
                 q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh,
+                attention_out,
                 totals_gpu,
                 local_window_i,
                 self.softcap,
@@ -1662,7 +1927,7 @@ impl GroupQueryAttentionKernel {
                 q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh,
+                attention_out,
                 totals_gpu,
                 local_window_i,
                 self.softcap,
@@ -1704,7 +1969,7 @@ impl GroupQueryAttentionKernel {
                 .arg(&q_bnsh)
                 .arg(&present_k_ptr)
                 .arg(&present_v_ptr)
-                .arg(&out_bnsh)
+                .arg(&attention_out)
                 .arg(&score_scratch)
                 .arg(&totals_gpu)
                 .arg(&batch_i)
@@ -1744,7 +2009,7 @@ impl GroupQueryAttentionKernel {
                 q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh,
+                attention_out,
                 0,
                 0,
                 totals_gpu,
@@ -1754,24 +2019,32 @@ impl GroupQueryAttentionKernel {
             )?;
         }
 
-        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        launch_1d!(
-            self.runtime,
-            prep_module,
-            prep_src,
-            transpose_out_entry,
-            outputs[0].numel(),
-            builder,
-            {
-                builder
-                    .arg(&out_bnsh)
-                    .arg(&output_ptr)
-                    .arg(&batch_i)
-                    .arg(&q_seq_i)
-                    .arg(&heads_i)
-                    .arg(&dim_i);
-            }
-        );
+        // For Sq==1 attention already wrote the BSH output in place, so the
+        // BNSH->BSH transpose is skipped. Sq>1 still materialises via `out_bnsh`.
+        if !single_token {
+            let out_bnsh_ptr = out_bnsh.ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal BNSH output allocation missing".into(),
+                )
+            })?;
+            launch_1d!(
+                self.runtime,
+                prep_module,
+                prep_src,
+                transpose_out_entry,
+                outputs[0].numel(),
+                builder,
+                {
+                    builder
+                        .arg(&out_bnsh_ptr)
+                        .arg(&output_ptr)
+                        .arg(&batch_i)
+                        .arg(&q_seq_i)
+                        .arg(&heads_i)
+                        .arg(&dim_i);
+                }
+            );
+        }
         *last_signature = capture_candidate;
         Ok(())
     }

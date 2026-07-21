@@ -2707,6 +2707,92 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
 }
 
 #[test]
+fn gqa_gpu_fused_decode_prep_matches_unfused_bit_exactly() {
+    // The fused single-token decode-prep launch must be byte-for-byte identical
+    // to the unfused split+transpose+append+RoPE chain it replaces. Runs the
+    // same decode step through both paths (fusion on vs. forced off) on cloned
+    // device state and asserts the output and the appended KV cache match
+    // exactly. Uses the 4-head/2-kv/dim-2/capacity-5 fixed decode signature.
+    let Some(ep) = gpu() else { return };
+    let runtime = ep.runtime();
+    let fused =
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+    let unfused = GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0)
+        .unwrap()
+        .with_prep_fusion_disabled(true);
+
+    let packed_host = f32_tensor(&[1, 1, 16], &fill(16, 0x51));
+    let cache_k_host = f32_tensor(&[1, 2, 5, 2], &fill(20, 0x71));
+    let cache_v_host = f32_tensor(&[1, 2, 5, 2], &fill(20, 0x91));
+    // seqlens_k = 1 -> valid length 2, so past_len = 1 and the new token lands
+    // at cache row 1; total_sequence_length carries the physical capacity.
+    let seqlens_host = i32_tensor(&[1], &[1]);
+    let total_host = i32_tensor(&[1], &[5]);
+    let cos_host = f32_tensor(&[5, 1], &[1.0, 0.5, -1.0, 0.25, -0.5]);
+    let sin_host = f32_tensor(&[5, 1], &[0.0, 0.866_025_4, 0.0, 0.968_245_8, 0.866_025_4]);
+    let positions_host = i64_tensor(&[1, 1], &[1]);
+
+    let packed = upload(&ep, &packed_host).unwrap();
+    let seqlens = upload(&ep, &seqlens_host).unwrap();
+    let total = upload(&ep, &total_host).unwrap();
+    let cos = upload(&ep, &cos_host).unwrap();
+    let sin = upload(&ep, &sin_host).unwrap();
+    let positions = upload(&ep, &positions_host).unwrap();
+
+    let output_bytes = 8 * std::mem::size_of::<f32>();
+    let cache_bytes = 20 * std::mem::size_of::<f32>();
+
+    let run_once = |kernel: &GroupQueryAttentionKernel| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut cache_k = upload(&ep, &cache_k_host).unwrap();
+        let mut cache_v = upload(&ep, &cache_v_host).unwrap();
+        let mut output = ep.allocate(output_bytes, 256).unwrap();
+        execute_in_place_packed_f32_gqa(
+            kernel,
+            &ep,
+            &packed,
+            &mut cache_k,
+            &mut cache_v,
+            &seqlens,
+            &total,
+            &cos,
+            &sin,
+            &positions,
+            &mut output,
+            1,
+        )
+        .unwrap();
+        runtime.synchronize().unwrap();
+        let out = read_bytes(&ep, &output, output_bytes).unwrap();
+        let ck = read_bytes(&ep, &cache_k, cache_bytes).unwrap();
+        let cv = read_bytes(&ep, &cache_v, cache_bytes).unwrap();
+        ep.deallocate(output).unwrap();
+        ep.deallocate(cache_k).unwrap();
+        ep.deallocate(cache_v).unwrap();
+        (out, ck, cv)
+    };
+
+    let (fused_out, fused_k, fused_v) = run_once(&fused);
+    let (unfused_out, unfused_k, unfused_v) = run_once(&unfused);
+
+    assert_eq!(
+        fused_out, unfused_out,
+        "fused decode output diverged from the unfused prep chain"
+    );
+    assert_eq!(
+        fused_k, unfused_k,
+        "fused decode present-K diverged from the unfused append+RoPE chain"
+    );
+    assert_eq!(
+        fused_v, unfused_v,
+        "fused decode present-V diverged from the unfused append chain"
+    );
+
+    for buffer in [positions, sin, cos, total, seqlens, packed] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+#[test]
 fn gqa_gpu_rejected_features_return_clear_errors() {
     let Some(ep) = gpu() else { return };
     let mut registered = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
