@@ -25,6 +25,7 @@
 //!     zero-seed path) -> inner codes `[9,10,11,12]`, `code_0 == 8`.
 //!   * frame 1: `frame_codes=[8,10,11,12]` (Σ=41) `+ t_0=1` -> `S_1 == 42` ->
 //!     inner codes `[43,44,45,46]`.
+//!
 //! This is distinct from the ZERO-SEED (no-prefill) path
 //! `[[1,2,3,4],[10,11,12,13]]`, proving the prefill + trailing-text path is
 //! exercised. The test asserts the exact codes, shape, and closed-form waveform.
@@ -124,9 +125,9 @@ fn nested_ar_prefill_pipeline_prefills_and_threads_trailing_text() -> anyhow::Re
     // yield these — this is only reachable by feeding the multi-position
     // `prefill_embeds` (length `P == 2`) directly to the talker's `inputs_embeds`.
     let ts = PROMPT_ID as i64;
-    for g in 0..GROUPS {
+    for (g, &code) in expected[..GROUPS].iter().enumerate() {
         assert_eq!(
-            expected[g],
+            code,
             ts + g as i64 + 1,
             "frame-0 code {g} must reflect the prompt-derived prefill mean TS == {ts}"
         );

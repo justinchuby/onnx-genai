@@ -165,14 +165,14 @@ impl ChatTemplate {
             });
         }
 
-        if let Some(value) = tokenizer_config_value {
-            if let Some(template) = value.get("chat_template").and_then(Value::as_str) {
-                return Ok(Self {
-                    template: template.to_string(),
-                    bos_token,
-                    eos_token,
-                });
-            }
+        if let Some(value) = tokenizer_config_value
+            && let Some(template) = value.get("chat_template").and_then(Value::as_str)
+        {
+            return Ok(Self {
+                template: template.to_string(),
+                bos_token,
+                eos_token,
+            });
         }
 
         Ok(Self {

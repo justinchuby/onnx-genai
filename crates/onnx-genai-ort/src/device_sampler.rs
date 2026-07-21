@@ -1437,7 +1437,7 @@ mod tests {
             .iter()
             .map(|&z| if z == NEG_INF { 0.0 } else { (z - m).exp() })
             .sum();
-        if !(s > 0.0) {
+        if s.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return 0;
         }
         let target = clamp_rng(params.rng_value) * s;
@@ -1512,7 +1512,7 @@ mod tests {
         let vocab = logits.len();
         let expected = host_argmax(&logits);
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
-            let ptr = upload(&[logits.clone()], dtype);
+            let ptr = upload(std::slice::from_ref(&logits), dtype);
             let ids = sampler
                 .sample(dtype, ptr, 1, vocab, &DeviceSampleParams::greedy())
                 .expect("greedy sample");
@@ -1547,7 +1547,7 @@ mod tests {
         let Some(sampler) = new_sampler() else { return };
         let logits = sample_logits();
         let vocab = logits.len();
-        let ptr = upload(&[logits.clone()], DataType::Float32);
+        let ptr = upload(std::slice::from_ref(&logits), DataType::Float32);
         for p in parity_combos() {
             let expected = host_oracle(&logits, &p);
             let ids = sampler
@@ -1563,7 +1563,7 @@ mod tests {
         let logits = sample_logits();
         let vocab = logits.len();
         let argmax = host_argmax(&logits);
-        let ptr = upload(&[logits.clone()], DataType::Float32);
+        let ptr = upload(std::slice::from_ref(&logits), DataType::Float32);
         // With rng == 0 the inverse-CDF returns the first surviving index; the
         // argmax must always survive every filter, but it may not be index 0.
         // Instead assert every aggressive filter, when sampled at rng->1, can only
@@ -1659,7 +1659,7 @@ mod tests {
     /// logic combined independent thresholds and kept {0, 1, 2}.
     fn counterexample_logits() -> Vec<f32> {
         let mut probs = vec![0.50505f32, 0.06061, 0.04040];
-        probs.extend(std::iter::repeat(0.03939).take(10));
+        probs.extend(std::iter::repeat_n(0.03939, 10));
         // Logits whose softmax reproduces these probabilities (up to a constant).
         probs.iter().map(|p| p.ln()).collect()
     }
@@ -1722,7 +1722,7 @@ mod tests {
         let Some(sampler) = new_sampler() else { return };
         let logits = counterexample_logits();
         let vocab = logits.len();
-        let ptr = upload(&[logits.clone()], DataType::Float32);
+        let ptr = upload(std::slice::from_ref(&logits), DataType::Float32);
         for &rng in &[0.0f32, 0.3, 0.5, 0.7, 0.9, 0.999] {
             let p = params(1.0, 3, 0.9, 0.0, rng);
             let expected = host_oracle(&logits, &p);

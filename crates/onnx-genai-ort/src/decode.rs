@@ -3472,7 +3472,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         // prefix plus the new token (`row_len + 1`); inactive rows collapse to a
         // single position so their scratch write lands harmlessly at offset 0.
         let mut valid = vec![1usize; batch];
-        for row in 0..batch {
+        for (row, valid_len) in valid.iter_mut().enumerate() {
             if self.active[row] {
                 let next = self.row_lens[row] + 1;
                 if next > self.max_len {
@@ -3481,7 +3481,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
                         self.row_lens[row], self.max_len
                     )));
                 }
-                valid[row] = next;
+                *valid_len = next;
             }
         }
         let width = valid.iter().copied().max().unwrap_or(1).max(1);
@@ -3620,8 +3620,8 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
             OrtError::InvalidArgument(format!("convert batched logits to f32: {e}"))
         })?;
 
-        for row in 0..batch {
-            if advances[row] {
+        for (row, &advance) in advances[..batch].iter().enumerate() {
+            if advance {
                 self.row_lens[row] += 1;
             }
         }

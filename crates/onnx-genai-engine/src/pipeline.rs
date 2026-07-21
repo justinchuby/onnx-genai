@@ -1891,6 +1891,7 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
 /// Autoregressive pipelines drive a token decode loop (`generate`); single-pass
 /// and iterative (diffusion) pipelines produce tensors (`run_pipeline`).
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Keep plans inline to preserve the existing allocation behavior.
 enum PipelinePlan {
     Autoregressive(AutoregressivePlan),
     /// Dual, hierarchically-nested AR loops (multi-decoder TTS, DESIGN.md §20.3).
@@ -2746,7 +2747,7 @@ fn unmask_uniform(step: usize, position: usize) -> f64 {
     let seed = (step as u64)
         .wrapping_mul(0x2545_F491_4F6C_DD1D)
         .wrapping_add((position as u64).wrapping_mul(0xD1B5_4A32_D192_ED03))
-        .wrapping_add(0xA0761_D6478_BD642F);
+        .wrapping_add(0xA076_1D64_78BD_642F);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     rng.random::<f64>()
 }
@@ -4318,8 +4319,9 @@ mod tests {
         for (pos, &tok) in out.iter().enumerate() {
             assert_ne!(tok, mask_id, "position {pos} still masked / emitted the mask token");
         }
-        for pos in prompt_len..seq {
-            assert_eq!(out[pos], (pos % 4) as i64, "position {pos} token");
+        for (offset, &token) in out[prompt_len..seq].iter().enumerate() {
+            let pos = prompt_len + offset;
+            assert_eq!(token, (pos % 4) as i64, "position {pos} token");
         }
         assert_eq!(run(&sched), out, "ancestral sampling is deterministic");
     }

@@ -21,7 +21,7 @@ fn shared_buffer_model_dir() -> Option<PathBuf> {
     }
     let default = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../Microsoft/qwen2.5-0.5b-instruct-cuda-gpu-4/v4");
-    default.is_dir().then(|| default)
+    default.is_dir().then_some(default)
 }
 
 fn cuda_engine(model_dir: &Path) -> anyhow::Result<Engine> {
