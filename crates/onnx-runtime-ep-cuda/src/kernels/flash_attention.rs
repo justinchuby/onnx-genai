@@ -626,6 +626,10 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use half::f16;
+
     use super::*;
 
     #[test]
@@ -635,5 +639,278 @@ mod tests {
         assert!(!supported(1, 128));
         assert!(!supported(2, 129));
         assert!(!supported(2, 0));
+    }
+
+    fn runtime() -> Option<Arc<CudaRuntime>> {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous_hook);
+        runtime
+    }
+
+    fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
+        // SAFETY: reinterpreting a POD slice as raw bytes for a host->device copy.
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn as_bytes_mut<T: Copy>(values: &mut [T]) -> &mut [u8] {
+        // SAFETY: reinterpreting a POD slice as raw bytes for a device->host copy.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(values),
+            )
+        }
+    }
+
+    /// Causal fp32 (accumulated in f64) softmax attention oracle for a single
+    /// batch. It consumes the **fp16-rounded** inputs so the only residual error
+    /// the parity test sees is the kernel's fp16 output rounding plus its fp32
+    /// (vs f64) accumulation — not the input quantization, which both sides
+    /// share. Q is `[q_heads, sq, dim]`; K/V are `[kv_heads, sk, dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_reference(
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_heads: usize,
+        kv_heads: usize,
+        sq: usize,
+        sk: usize,
+        dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let group = q_heads / kv_heads;
+        let mut output = vec![0.0f32; q_heads * sq * dim];
+        for h in 0..q_heads {
+            let kv_head = h / group;
+            for qi in 0..sq {
+                // Prefill causal mask: query row `qi` attends to keys 0..=causal_max.
+                let causal_max = sk - sq + qi;
+                let q_base = (h * sq + qi) * dim;
+                let mut scores = vec![0.0f64; causal_max + 1];
+                let mut maximum = f64::NEG_INFINITY;
+                for (kj, score_slot) in scores.iter_mut().enumerate() {
+                    let k_base = (kv_head * sk + kj) * dim;
+                    let mut dot = 0.0f64;
+                    for d in 0..dim {
+                        dot += query[q_base + d] as f64 * key[k_base + d] as f64;
+                    }
+                    let score = dot * scale as f64;
+                    *score_slot = score;
+                    maximum = maximum.max(score);
+                }
+                let mut denom = 0.0f64;
+                for score in scores.iter_mut() {
+                    *score = (*score - maximum).exp();
+                    denom += *score;
+                }
+                let out_base = (h * sq + qi) * dim;
+                for d in 0..dim {
+                    let mut acc = 0.0f64;
+                    for (kj, prob) in scores.iter().enumerate() {
+                        let v_index = (kv_head * sk + kj) * dim + d;
+                        acc += prob / denom * value[v_index] as f64;
+                    }
+                    output[out_base + d] = acc as f32;
+                }
+            }
+        }
+        output
+    }
+
+    /// Permanent parity gate for the fp16 tensor-core prefill kernel
+    /// (`flash_attention_f16_tc`), mirroring the `gqa_decode_fp16` f64-oracle
+    /// test. Feeds byte-identical fp16 Q/K/V through the wmma kernel and an f64
+    /// host softmax oracle across multiple context lengths and input magnitudes,
+    /// then asserts the output tracks the oracle to the fp16 output floor.
+    ///
+    /// The magnitude sweep is load-bearing: the wmma matmuls MUST use fp32
+    /// accumulators (`fragment<accumulator, ..., float>`). With fp32 accumulation
+    /// the residual is pure fp16 output rounding (~2^-11 * |out|), so relative
+    /// error stays ~1e-3 at every magnitude. If either accumulator regresses to
+    /// fp16, accumulation precision collapses as inputs grow: at realistic
+    /// post-norm activation magnitudes the relative error explodes to 1%-25%
+    /// (the head/data-selective, ~1/sqrt(L) error Holden root-caused). The
+    /// relative-error assertion below fails hard on that regression and passes
+    /// with fp32 accumulators. A pure absolute tolerance cannot catch this
+    /// because the defect only surfaces once outputs are large.
+    #[test]
+    fn f16_tensor_core_prefill_matches_reference_softmax() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA flash TC parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.capabilities().compute_capability().0 < 7 {
+            eprintln!("skipping CUDA flash TC parity test: tensor cores require cc >= 7.0");
+            return;
+        }
+        if runtime
+            .require_nvrtc_half_headers("flash_attention_f16_tc")
+            .is_err()
+        {
+            eprintln!("skipping CUDA flash TC parity test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        let batch = 1usize;
+        let q_heads = 14usize;
+        let kv_heads = 2usize;
+        let dim = 64usize;
+        let group = q_heads / kv_heads;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        // Deterministic LCG so the test is reproducible without extra crates.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        // Round to fp16 once; keep the fp16 bits (device input) and the
+        // fp16-value-as-f32 (reference input) so both paths agree on inputs.
+        let round = |v: f32| -> (f16, f32) {
+            let h = f16::from_f32(v);
+            (h, h.to_f32())
+        };
+
+        // Worst absolute error is only meaningful at unit magnitude (outputs in
+        // ~[-1, 1]); worst relative error is the magnitude-robust metric that
+        // exposes an fp16-accumulator regression.
+        let mut worst_abs_unit = 0.0f32;
+        let mut worst_rel = 0.0f32;
+        let mut all_finite = true;
+
+        // Sweep context length L (sq == sk, causal self-attention prefill) and
+        // input magnitude. amp > 1 emulates post-norm activation scales and is
+        // what makes the gate sensitive to fp16 accumulation.
+        for &amp in &[1.0f32, 3.0] {
+            for &seq in &[2usize, 4, 8, 16, 30, 64, 96, 128, 192, 256, 300] {
+                let sq = seq;
+                let sk = seq;
+                let kv_capacity = seq;
+                let mut next = || {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0) * amp
+                };
+
+                let mut q_f16 = vec![f16::ZERO; q_heads * sq * dim];
+                let mut q_ref = vec![0.0f32; q_heads * sq * dim];
+                for (dh, df) in q_f16.iter_mut().zip(q_ref.iter_mut()) {
+                    let (h, f) = round(next());
+                    *dh = h;
+                    *df = f;
+                }
+                let kv_len = kv_heads * kv_capacity * dim;
+                let mut k_f16 = vec![f16::ZERO; kv_len];
+                let mut k_ref = vec![0.0f32; kv_len];
+                let mut v_f16 = vec![f16::ZERO; kv_len];
+                let mut v_ref = vec![0.0f32; kv_len];
+                for i in 0..kv_len {
+                    let (kh, kf) = round(next());
+                    k_f16[i] = kh;
+                    k_ref[i] = kf;
+                    let (vh, vf) = round(next());
+                    v_f16[i] = vh;
+                    v_ref[i] = vf;
+                }
+
+                let query_dev = runtime.alloc_raw(q_f16.len() * 2).unwrap();
+                let key_dev = runtime.alloc_raw(k_f16.len() * 2).unwrap();
+                let value_dev = runtime.alloc_raw(v_f16.len() * 2).unwrap();
+                let output_dev = runtime.alloc_raw(q_heads * sq * dim * 2).unwrap();
+
+                // SAFETY: device buffers were sized to hold each source slice.
+                unsafe {
+                    runtime.htod(as_bytes(&q_f16), query_dev).unwrap();
+                    runtime.htod(as_bytes(&k_f16), key_dev).unwrap();
+                    runtime.htod(as_bytes(&v_f16), value_dev).unwrap();
+                }
+
+                run(
+                    &runtime,
+                    DataType::Float16,
+                    q_heads,
+                    kv_heads,
+                    true,
+                    batch,
+                    sq,
+                    sk,
+                    kv_capacity,
+                    dim,
+                    group,
+                    scale,
+                    query_dev,
+                    key_dev,
+                    value_dev,
+                    output_dev,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0.0,
+                )
+                .unwrap();
+
+                let mut got_f16 = vec![f16::ZERO; q_heads * sq * dim];
+                // SAFETY: `output_dev` holds `q_heads * sq * dim` fp16 values.
+                unsafe {
+                    runtime
+                        .dtoh(as_bytes_mut(&mut got_f16), output_dev)
+                        .unwrap();
+                }
+
+                let expected = cpu_reference(
+                    &q_ref, &k_ref, &v_ref, q_heads, kv_heads, sq, sk, dim, scale,
+                );
+
+                for (g16, e) in got_f16.iter().zip(expected.iter()) {
+                    let g = g16.to_f32();
+                    if !g.is_finite() {
+                        all_finite = false;
+                    }
+                    let abs = (g - e).abs();
+                    // Floor the denominator so near-zero components (dominated by
+                    // fp16 output rounding) do not inflate the ratio.
+                    worst_rel = worst_rel.max(abs / e.abs().max(1e-2));
+                    if amp == 1.0 {
+                        worst_abs_unit = worst_abs_unit.max(abs);
+                    }
+                }
+
+                // SAFETY: each pointer came from this runtime's `alloc_raw`.
+                unsafe {
+                    runtime.free_raw(query_dev).unwrap();
+                    runtime.free_raw(key_dev).unwrap();
+                    runtime.free_raw(value_dev).unwrap();
+                    runtime.free_raw(output_dev).unwrap();
+                }
+            }
+        }
+
+        eprintln!(
+            "flash TC prefill parity: max_abs(unit)={worst_abs_unit:.3e} max_rel={worst_rel:.3e}"
+        );
+        assert!(all_finite, "flash TC kernel produced a non-finite output");
+        // Unit-magnitude absolute floor (mirrors the gqa_decode_fp16 gate): with
+        // fp32 accumulation the residual is fp16 output rounding (~5e-4). 2e-3
+        // leaves headroom for the fp32-vs-f64 reduction.
+        assert!(
+            worst_abs_unit < 2e-3,
+            "flash TC kernel diverged from reference softmax: max_abs(unit)={worst_abs_unit:.3e}"
+        );
+        // Magnitude-robust gate: fp32 accumulators keep relative error at the
+        // fp16 floor (~1e-3) across all magnitudes. An fp16-accumulator (or bad
+        // fragment layout / broken online-softmax rescale) regression pushes this
+        // to >1e-2 at amp=3. 6e-3 sits well clear of the fp32 floor and far below
+        // the >=1% error such a defect produces.
+        assert!(
+            worst_rel < 6e-3,
+            "flash TC kernel diverged from reference softmax: max_rel={worst_rel:.3e} \
+             (wmma accumulators must be fp32)"
+        );
     }
 }
