@@ -233,6 +233,8 @@ pub struct DeviceIoBinding {
     pub dtype: DataType,
     physical_shape: Vec<usize>,
     logical_shape: Vec<usize>,
+    /// Whether graph inputs see the valid prefix rather than allocation capacity.
+    expose_logical_input_shape: bool,
     buffer: Option<DeviceBuffer>,
     allocator: Arc<dyn ExecutionProvider>,
     transfer_stats: DeviceBindingTransferStats,
@@ -247,6 +249,7 @@ impl DeviceIoBinding {
         dtype: DataType,
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
+        expose_logical_input_shape: bool,
     ) -> Result<Self> {
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let numel = physical_shape.iter().try_fold(1usize, |product, &dim| {
@@ -266,6 +269,7 @@ impl DeviceIoBinding {
             dtype,
             physical_shape,
             logical_shape,
+            expose_logical_input_shape,
             buffer: Some(buffer),
             allocator,
             transfer_stats: DeviceBindingTransferStats::default(),
@@ -290,6 +294,14 @@ impl DeviceIoBinding {
 
     pub fn logical_shape(&self) -> &[usize] {
         &self.logical_shape
+    }
+
+    pub(crate) fn kernel_input_shape(&self) -> &[usize] {
+        if self.expose_logical_input_shape {
+            &self.logical_shape
+        } else {
+            &self.physical_shape
+        }
     }
 
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
@@ -349,9 +361,12 @@ impl DeviceIoBinding {
                 "device argmax bindings must belong to the same execution provider".into(),
             ));
         }
-        Ok(self
-            .allocator
-            .device_argmax(self.buffer(), elements, self.dtype, result.buffer_mut())?)
+        Ok(self.allocator.device_argmax(
+            self.buffer(),
+            elements,
+            self.dtype,
+            result.buffer_mut(),
+        )?)
     }
 
     pub(crate) fn buffer(&self) -> &DeviceBuffer {
@@ -390,6 +405,10 @@ impl std::fmt::Debug for DeviceIoBinding {
             .field("dtype", &self.dtype)
             .field("physical_shape", &self.physical_shape)
             .field("logical_shape", &self.logical_shape)
+            .field(
+                "expose_logical_input_shape",
+                &self.expose_logical_input_shape,
+            )
             .field("device", &self.buffer().device())
             .field("device_ptr", &self.device_ptr())
             .field("transfer_stats", &self.transfer_stats)

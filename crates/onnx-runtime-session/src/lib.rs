@@ -1053,15 +1053,18 @@ mod device_binding_tests {
     use super::*;
     #[cfg(feature = "cuda")]
     use onnx_runtime_ir::Attribute;
-    use onnx_runtime_ir::{Graph, Node, NodeId, static_shape};
+    #[cfg(feature = "cuda")]
+    use onnx_runtime_ir::static_shape;
+    use onnx_runtime_ir::{Graph, Node, NodeId};
 
     #[test]
     fn persistent_binding_aliases_input_output_and_suppresses_materialization() {
         let mut graph = Graph::new();
         graph.opset_imports.insert("".into(), 13);
-        let input = graph.create_named_value("input", DataType::Float32, static_shape([4]));
+        let length = graph.intern_symbol("length");
+        let input = graph.create_named_value("input", DataType::Float32, vec![length.into()]);
         graph.add_input(input);
-        let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+        let output = graph.create_named_value("output", DataType::Float32, vec![length.into()]);
         graph.insert_node(Node::new(
             NodeId(0),
             "Relu",
@@ -1093,7 +1096,7 @@ mod device_binding_tests {
             .chunks_exact(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert_eq!(values, vec![0.0, 3.0, 0.0, 5.0]);
+        assert_eq!(values, vec![0.0, 3.0, -4.0, 5.0]);
         assert_eq!(
             binding.transfer_stats(),
             DeviceBindingTransferStats {

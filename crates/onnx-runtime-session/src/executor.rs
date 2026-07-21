@@ -720,6 +720,7 @@ struct InInfo {
 struct ExternalValue {
     dtype: DataType,
     shape: Vec<usize>,
+    accepts_subshape: bool,
     ptr: *mut std::ffi::c_void,
     len: usize,
     alignment: usize,
@@ -727,6 +728,20 @@ struct ExternalValue {
 }
 
 impl ExternalValue {
+    fn accepts_output(&self, dtype: DataType, shape: &[usize], bytes: usize) -> bool {
+        self.dtype == dtype
+            && self.len >= bytes
+            && if self.accepts_subshape {
+                shape.len() == self.shape.len()
+                    && shape
+                        .iter()
+                        .zip(&self.shape)
+                        .all(|(&required, &capacity)| required <= capacity)
+            } else {
+                self.shape == shape
+            }
+    }
+
     fn writable_buffer(&self) -> Result<DeviceBuffer> {
         // SAFETY: `prepare_external_bindings` obtains this pointer from a live
         // `DeviceIoBinding` exclusively borrowed for the run. The binding owns
@@ -1002,6 +1017,15 @@ fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
         .iter()
         .try_fold(1usize, |count, &dim| count.checked_mul(dim))
         .is_some_and(|count| count <= MAX_SHAPE_DATA_ELEMS)
+}
+
+fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool {
+    // GQA treats the cache tensor extent as capacity and obtains the valid past
+    // length from seqlens_k. Standard Attention instead derives past length from
+    // the cache tensor extent itself.
+    node.domain == "com.microsoft"
+        && node.op_type == "GroupQueryAttention"
+        && matches!(input_index, 3 | 4)
 }
 
 /// Compute concrete output shapes from already-resolved input shapes and the
@@ -1890,6 +1914,11 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
+        let expose_logical_input_shape = output_name.is_some()
+            && self
+                .input_index
+                .get(&input_name)
+                .is_none_or(|&vid| !self.binding_consumers_use_physical_capacity(vid));
         DeviceIoBinding::allocate(
             self.ep.clone(),
             input_name,
@@ -1898,6 +1927,7 @@ impl Executor {
             dtype,
             physical_shape,
             logical_shape,
+            expose_logical_input_shape,
         )
     }
 
@@ -1916,7 +1946,24 @@ impl Executor {
             dtype,
             physical_shape,
             logical_shape,
+            false,
         )
+    }
+
+    fn binding_consumers_use_physical_capacity(&self, input: ValueId) -> bool {
+        let mut found = false;
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                found = true;
+                if !kernel_input_uses_physical_capacity(self.graph.node(plan.node_id), slot) {
+                    return false;
+                }
+            }
+        }
+        found
     }
 
     /// The compiled graph, retained for the §55.4 EPContext dump path: the
@@ -2219,7 +2266,6 @@ impl Executor {
             let bind_input = binding.binds_input();
             let output_name = binding.output_name().map(str::to_string);
             let dtype = binding.dtype;
-            let shape = binding.physical_shape().to_vec();
             let len = binding.buffer().len();
             let alignment = binding.buffer().alignment();
             let device = binding.buffer().device();
@@ -2229,28 +2275,30 @@ impl Executor {
                     self.ep.device_id()
                 )));
             }
-            let required = dtype.storage_bytes(shape.iter().product());
+            let physical_shape = binding.physical_shape();
+            let required = dtype.storage_bytes(physical_shape.iter().product());
             if required > len {
                 return Err(SessionError::Internal(format!(
-                    "device binding '{input_name}' needs {required} bytes for {shape:?}, allocation has {len}"
+                    "device binding '{input_name}' needs {required} bytes for {physical_shape:?}, allocation has {len}"
                 )));
             }
             let ptr = binding.buffer_mut().as_mut_ptr();
-            let value = ExternalValue {
-                dtype,
-                shape: shape.clone(),
-                ptr,
-                len,
-                alignment,
-                device,
-            };
             if bind_input {
                 let input_vid = *self.input_index.get(&input_name).ok_or_else(|| {
                     SessionError::InputNotFound {
                         name: input_name.clone(),
                     }
                 })?;
-                if external.inputs.insert(input_vid, value.clone()).is_some() {
+                let value = ExternalValue {
+                    dtype,
+                    shape: binding.kernel_input_shape().to_vec(),
+                    accepts_subshape: false,
+                    ptr,
+                    len,
+                    alignment,
+                    device,
+                };
+                if external.inputs.insert(input_vid, value).is_some() {
                     return Err(SessionError::Internal(format!(
                         "duplicate device input binding '{input_name}'"
                     )));
@@ -2285,6 +2333,16 @@ impl Executor {
                         got: format!("{dtype:?}"),
                     });
                 }
+                let value = ExternalValue {
+                    dtype,
+                    shape: binding.physical_shape().to_vec(),
+                    accepts_subshape: bind_input
+                        && binding.logical_shape() != binding.physical_shape(),
+                    ptr,
+                    len,
+                    alignment,
+                    device,
+                };
                 if external.outputs.insert(output_vid, value).is_some() {
                     return Err(SessionError::Internal(format!(
                         "duplicate device output binding '{output_name}'"
@@ -2365,8 +2423,8 @@ impl Executor {
         // execution loop, once their producing node's inputs are concrete.
         let mut resolved = self.resolve_soft(&bindings);
         if mode != RunMode::Eager {
-            // Persistent bindings expose the physical geometry the captured
-            // kernels will actually read and write. Seed only unresolved values:
+            // Persistent bindings seed the kernel-visible geometry selected by
+            // their input/output contracts. Seed only unresolved values:
             // statically/symbolically resolved shapes remain authoritative.
             external.seed_capture_shapes(&mut resolved);
         }
@@ -3156,7 +3214,7 @@ impl Executor {
             )?
             .max(1);
             if let Some(value) = external.outputs.get(&ovid) {
-                if value.dtype != output_dtypes[oi] || value.shape != *dims || value.len < need {
+                if !value.accepts_output(output_dtypes[oi], dims, need) {
                     let name = graph.value(ovid).name.as_deref().unwrap_or("<unnamed>");
                     return Err(SessionError::Internal(format!(
                         "external output '{name}' has {:?} {:?} ({} bytes), kernel requires {:?} {:?} ({need} bytes)",
@@ -3902,7 +3960,7 @@ impl Executor {
         self.views.remove(&vid);
         let need = bytes.max(1);
         if let Some(value) = external.outputs.get(&vid) {
-            if value.dtype != dtype || value.shape != dims || value.len < need {
+            if !value.accepts_output(dtype, &dims, need) {
                 let name = self.graph.value(vid).name.as_deref().unwrap_or("<unnamed>");
                 return Err(SessionError::Internal(format!(
                     "external output '{name}' has {:?} {:?} ({} bytes), sequence op requires {:?} {:?} ({need} bytes)",
@@ -5645,6 +5703,7 @@ mod tests {
         let external_value = |shape| ExternalValue {
             dtype: DataType::Float32,
             shape,
+            accepts_subshape: false,
             ptr: std::ptr::null_mut(),
             len: 0,
             alignment: 1,
@@ -5667,6 +5726,18 @@ mod tests {
         assert_eq!(resolved[&ValueId(0)], vec![1, 1]);
         assert_eq!(resolved[&ValueId(1)], vec![1, 4, 128, 64]);
         assert_eq!(resolved[&ValueId(2)], vec![1, 4, 128, 64]);
+    }
+
+    #[test]
+    fn only_gqa_cache_inputs_use_physical_capacity_as_kernel_geometry() {
+        let mut gqa = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
+        gqa.domain = "com.microsoft".to_string();
+        let attention = Node::new(NodeId(1), "Attention", vec![], vec![]);
+
+        assert!(kernel_input_uses_physical_capacity(&gqa, 3));
+        assert!(kernel_input_uses_physical_capacity(&gqa, 4));
+        assert!(!kernel_input_uses_physical_capacity(&gqa, 0));
+        assert!(!kernel_input_uses_physical_capacity(&attention, 4));
     }
 
     struct WeightDeliveryKernel {
