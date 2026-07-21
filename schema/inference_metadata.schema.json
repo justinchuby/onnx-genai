@@ -75,6 +75,13 @@
         "minLength": 1
       }
     },
+    "schema_version": {
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "speculative": {
       "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input.",
       "anyOf": [

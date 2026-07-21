@@ -17,6 +17,15 @@ use serde::{Deserialize, Deserializer};
     transform = schema_helpers::inference_metadata_aliases
 )]
 pub struct InferenceMetadata {
+    /// Schema version of this inference-metadata document, e.g. `"v1"`.
+    ///
+    /// Absent means the initial `"v1"` contract (readers default to `v1`).
+    /// Bump this only for breaking schema changes; additive fields keep the
+    /// same major version and rely on the forward-compatible "ignore unknown
+    /// fields" rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+
     /// Capability identifiers that a runtime MUST support or refuse to load the model.
     #[serde(default)]
     #[schemars(
