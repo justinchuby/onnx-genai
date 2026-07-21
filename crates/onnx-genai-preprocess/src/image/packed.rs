@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use anyhow::Context;
 
-use super::{ImageLayout, ThumbnailPosition, TileGrid};
+use super::{ImageLayout, MAX_IMAGE_COUNT, MAX_TENSOR_ELEMENTS, ThumbnailPosition, TileGrid};
 
 /// Declared tensor element type for an image processor output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,13 +189,24 @@ pub(super) fn build_bundle(
     thumbnail_position: ThumbnailPosition,
 ) -> anyhow::Result<ImageTensorBundle> {
     validate_outputs(&spec.outputs)?;
+    if prepared.len() > MAX_IMAGE_COUNT {
+        anyhow::bail!(
+            "image batch contains {} images, exceeding the supported limit of {MAX_IMAGE_COUNT}; split the request into smaller batches",
+            prepared.len()
+        );
+    }
     let num_tiles = prepared.iter().try_fold(0usize, |total, image| {
         total
             .checked_add(image.tiles.len())
             .context("image tile count is too large")
     })?;
-    let tiles_per_image = prepared.iter().map(|image| image.tiles.len()).collect();
-    let tile_grids = prepared.iter().map(|image| image.tile_grid).collect();
+    ensure_element_limit(num_tiles, "image tile count")?;
+    let mut tiles_per_image = try_vec_with_capacity(prepared.len(), "image tile counts")?;
+    let mut tile_grids = try_vec_with_capacity(prepared.len(), "image tile grids")?;
+    for image in &prepared {
+        tiles_per_image.push(image.tiles.len());
+        tile_grids.push(image.tile_grid);
+    }
 
     let (packed, feature_size) = match spec.patch_size {
         Some(patch_size) => {
@@ -209,14 +220,25 @@ pub(super) fn build_bundle(
                     spec.height
                 );
             }
-            let feature_size = 3usize
-                .checked_mul(patch_size)
-                .and_then(|value| value.checked_mul(patch_size))
-                .context("image patch feature dimension is too large")?;
-            let packed = prepared
-                .iter()
-                .map(|image| pack_image(image, spec.width, spec.height, patch_size))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let feature_size = checked_element_product(
+                "image patch feature dimension",
+                &[3, patch_size, patch_size],
+            )?;
+            let patches_per_tile = (spec.width / patch_size)
+                .checked_mul(spec.height / patch_size)
+                .context("image patches per tile overflowed")?;
+            let total_patch_count = num_tiles
+                .checked_mul(patches_per_tile)
+                .context("total image patch count overflowed")?;
+            checked_element_product(
+                "packed image pixel storage",
+                &[total_patch_count, feature_size],
+            )?;
+            checked_element_product("packed image coordinate storage", &[total_patch_count, 2])?;
+            let mut packed = try_vec_with_capacity(prepared.len(), "packed image batch")?;
+            for image in &prepared {
+                packed.push(pack_image(image, spec.width, spec.height, patch_size)?);
+            }
             (Some(packed), Some(feature_size))
         }
         None => (None, None),
@@ -228,11 +250,29 @@ pub(super) fn build_bundle(
         .unwrap_or(0);
     let total_patches = packed
         .as_ref()
-        .map(|images| images.iter().map(|image| image.patch_count).sum())
+        .map(|images| {
+            images.iter().try_fold(0usize, |total, image| {
+                total
+                    .checked_add(image.patch_count)
+                    .context("total image patch count overflowed")
+            })
+        })
+        .transpose()?
         .unwrap_or(0);
+    ensure_element_limit(total_patches, "total image patch count")?;
     let padded = spec.patch_size.is_some() && spec.pad_value.is_some();
+    validate_total_output_elements(
+        &prepared,
+        packed.as_deref(),
+        feature_size,
+        max_patches,
+        total_patches,
+        num_tiles,
+        padded,
+        spec,
+    )?;
 
-    let mut tensors = Vec::with_capacity(spec.outputs.len());
+    let mut tensors = try_vec_with_capacity(spec.outputs.len(), "image output tensor list")?;
     for output in &spec.outputs {
         let produced = match output.content.as_str() {
             "pixels" => Some(build_pixels(
@@ -287,7 +327,7 @@ pub(super) fn build_bundle(
         }
     }
 
-    let images = expansion_summaries(&prepared, packed.as_deref(), max_patches, padded);
+    let images = expansion_summaries(&prepared, packed.as_deref(), max_patches, padded)?;
     Ok(ImageTensorBundle {
         tensors,
         images,
@@ -296,6 +336,128 @@ pub(super) fn build_bundle(
         tile_grids,
         thumbnail_position,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_total_output_elements(
+    prepared: &[PreparedImage],
+    packed: Option<&[PackedImage]>,
+    feature_size: Option<usize>,
+    max_patches: usize,
+    total_patches: usize,
+    num_tiles: usize,
+    padded: bool,
+    spec: &PackSpec,
+) -> anyhow::Result<()> {
+    let mut total = 0usize;
+    for output in &spec.outputs {
+        let count = match output.content.as_str() {
+            "pixels" => match feature_size {
+                Some(feature_size) if padded => checked_element_product(
+                    &format!("padded pixel output '{}'", output.name),
+                    &[prepared.len(), max_patches, feature_size],
+                )?,
+                Some(feature_size) => checked_element_product(
+                    &format!("concatenated pixel output '{}'", output.name),
+                    &[total_patches, feature_size],
+                )?,
+                None => checked_element_product(
+                    &format!("rank-4 pixel output '{}'", output.name),
+                    &[num_tiles, 3, spec.width, spec.height],
+                )?,
+            },
+            "patch_coordinates" => match packed {
+                Some(_) if padded => checked_element_product(
+                    &format!("padded coordinate output '{}'", output.name),
+                    &[prepared.len(), max_patches, 2],
+                )?,
+                Some(_) => checked_element_product(
+                    &format!("coordinate output '{}'", output.name),
+                    &[total_patches, 2],
+                )?,
+                None if output.optional => 0,
+                None => anyhow::bail!(
+                    "required image output '{}' with content patch_coordinates requires a patchify transform",
+                    output.name
+                ),
+            },
+            "grid_dimensions" => match packed {
+                Some(_) => checked_element_product(
+                    &format!("grid output '{}'", output.name),
+                    &[prepared.len(), 3],
+                )?,
+                None if output.optional => 0,
+                None => anyhow::bail!(
+                    "required image output '{}' with content grid_dimensions requires a patchify transform",
+                    output.name
+                ),
+            },
+            "original_size" => checked_element_product(
+                &format!("original-size output '{}'", output.name),
+                &[prepared.len(), 2],
+            )?,
+            "validity_mask" => {
+                if padded {
+                    checked_element_product(
+                        &format!("padded validity mask '{}'", output.name),
+                        &[prepared.len(), max_patches],
+                    )?
+                } else if packed.is_some() {
+                    total_patches
+                } else {
+                    num_tiles
+                }
+            }
+            _ if output.optional => 0,
+            other => anyhow::bail!(
+                "required image output '{}' uses unsupported content role '{other}'",
+                output.name
+            ),
+        };
+        total = total
+            .checked_add(count)
+            .context("total image output element count overflowed")?;
+        if total > MAX_TENSOR_ELEMENTS {
+            anyhow::bail!(
+                "image output bundle requires {total} elements across declared tensors, exceeding the safety limit of {MAX_TENSOR_ELEMENTS}; reduce image dimensions, tile count, patch count, batch size, or duplicate pixel outputs"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn checked_element_product(description: &str, factors: &[usize]) -> anyhow::Result<usize> {
+    let elements = factors.iter().try_fold(1usize, |product, factor| {
+        product
+            .checked_mul(*factor)
+            .with_context(|| format!("{description} element count overflowed"))
+    })?;
+    ensure_element_limit(elements, description)?;
+    Ok(elements)
+}
+
+fn ensure_element_limit(elements: usize, description: &str) -> anyhow::Result<()> {
+    if elements > MAX_TENSOR_ELEMENTS {
+        anyhow::bail!(
+            "{description} requires {elements} elements, exceeding the safety limit of {MAX_TENSOR_ELEMENTS}; reduce image dimensions, tile count, patch count, or batch size"
+        );
+    }
+    Ok(())
+}
+
+fn try_vec_with_capacity<T>(capacity: usize, description: &str) -> anyhow::Result<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .with_context(|| format!("failed to allocate {description} with {capacity} elements"))?;
+    Ok(values)
+}
+
+fn try_filled_vec<T: Clone>(length: usize, value: T, description: &str) -> anyhow::Result<Vec<T>> {
+    ensure_element_limit(length, description)?;
+    let mut values = try_vec_with_capacity(length, description)?;
+    values.resize(length, value);
+    Ok(values)
 }
 
 fn validate_outputs(outputs: &[OutputSpec]) -> anyhow::Result<()> {
@@ -348,15 +510,25 @@ fn pack_image(
         .len()
         .checked_mul(per_tile)
         .context("image patch count is too large")?;
-    let feature_size = 3 * patch_size * patch_size;
-    let mut patches = Vec::with_capacity(patch_count * feature_size);
-    let mut coordinates = Vec::with_capacity(patch_count * 2);
+    ensure_element_limit(patch_count, "image patch count")?;
+    let feature_size = checked_element_product(
+        "image patch feature dimension",
+        &[3, patch_size, patch_size],
+    )?;
+    let patch_elements =
+        checked_element_product("packed image pixel output", &[patch_count, feature_size])?;
+    let coordinate_elements =
+        checked_element_product("packed image coordinates", &[patch_count, 2])?;
+    let expected_tile_elements =
+        checked_element_product("normalized image tile", &[3, width, height])?;
+    let mut patches = try_vec_with_capacity(patch_elements, "packed image pixels")?;
+    let mut coordinates = try_vec_with_capacity(coordinate_elements, "packed image coordinates")?;
     for (tile_index, tile) in image.tiles.iter().enumerate() {
-        if tile.len() != 3 * width * height {
+        if tile.len() != expected_tile_elements {
             anyhow::bail!(
                 "normalized image tile has {} values, expected {} for RGB {}x{}",
                 tile.len(),
-                3 * width * height,
+                expected_tile_elements,
                 width,
                 height
             );
@@ -372,8 +544,13 @@ fn pack_image(
                     }
                 }
                 coordinates.push(
-                    i64::try_from(tile_index * patches_h + patch_y)
-                        .context("image patch row coordinate is too large")?,
+                    i64::try_from(
+                        tile_index
+                            .checked_mul(patches_h)
+                            .and_then(|value| value.checked_add(patch_y))
+                            .context("image patch row coordinate overflowed")?,
+                    )
+                    .context("image patch row coordinate is too large")?,
                 );
                 coordinates.push(
                     i64::try_from(patch_x).context("image patch column coordinate is too large")?,
@@ -408,10 +585,24 @@ fn build_pixels(
         let feature_size = feature_size.context("missing packed image feature size")?;
         if padded {
             let fill = output.pad_value.or(spec.pad_value).unwrap_or_default() as f32;
-            let mut values = vec![fill; prepared.len() * max_patches * feature_size];
+            let element_count = checked_element_product(
+                &format!("padded pixel output '{}'", output.name),
+                &[prepared.len(), max_patches, feature_size],
+            )?;
+            let mut values = try_filled_vec(
+                element_count,
+                fill,
+                &format!("padded pixel output '{}'", output.name),
+            )?;
             for (image_index, image) in packed.iter().enumerate() {
-                let start = image_index * max_patches * feature_size;
-                values[start..start + image.patches.len()].copy_from_slice(&image.patches);
+                let start = checked_element_product(
+                    "padded image pixel offset",
+                    &[image_index, max_patches, feature_size],
+                )?;
+                let end = start
+                    .checked_add(image.patches.len())
+                    .context("padded image pixel range overflowed")?;
+                values[start..end].copy_from_slice(&image.patches);
             }
             (
                 vec![
@@ -422,7 +613,14 @@ fn build_pixels(
                 values,
             )
         } else {
-            let mut values = Vec::with_capacity(total_patches * feature_size);
+            let element_count = checked_element_product(
+                &format!("concatenated pixel output '{}'", output.name),
+                &[total_patches, feature_size],
+            )?;
+            let mut values = try_vec_with_capacity(
+                element_count,
+                &format!("concatenated pixel output '{}'", output.name),
+            )?;
             for image in packed {
                 values.extend_from_slice(&image.patches);
             }
@@ -435,30 +633,35 @@ fn build_pixels(
             )
         }
     } else {
-        let mut values = Vec::with_capacity(
-            prepared
-                .iter()
-                .map(|image| image.tiles.len())
-                .sum::<usize>()
-                * 3
-                * spec.width
-                * spec.height,
-        );
+        let tile_count = prepared.iter().try_fold(0usize, |total, image| {
+            total
+                .checked_add(image.tiles.len())
+                .context("image tile count overflowed")
+        })?;
+        let element_count = checked_element_product(
+            &format!("rank-4 pixel output '{}'", output.name),
+            &[tile_count, 3, spec.width, spec.height],
+        )?;
+        let pixels_per_tile =
+            checked_element_product("image tile spatial size", &[spec.width, spec.height])?;
+        let mut values = try_vec_with_capacity(
+            element_count,
+            &format!("rank-4 pixel output '{}'", output.name),
+        )?;
         for image in prepared {
             for tile in &image.tiles {
                 match spec.layout {
                     ImageLayout::Nchw => values.extend_from_slice(tile),
                     ImageLayout::Nhwc => {
-                        for pixel in 0..spec.width * spec.height {
+                        for pixel in 0..pixels_per_tile {
                             for channel in 0..3 {
-                                values.push(tile[channel * spec.width * spec.height + pixel]);
+                                values.push(tile[channel * pixels_per_tile + pixel]);
                             }
                         }
                     }
                 }
             }
         }
-        let tile_count = prepared.iter().map(|image| image.tiles.len()).sum();
         let shape = match spec.layout {
             ImageLayout::Nchw => vec![
                 to_i64(tile_count, "image tile count")?,
@@ -495,10 +698,24 @@ fn build_coordinates(
     let sentinel = output.pad_value.unwrap_or(-1.0);
     let sentinel = exact_i64(sentinel, &output.name)?;
     let (shape, values) = if padded {
-        let mut values = vec![sentinel; packed.len() * max_patches * 2];
+        let element_count = checked_element_product(
+            &format!("padded coordinate output '{}'", output.name),
+            &[packed.len(), max_patches, 2],
+        )?;
+        let mut values = try_filled_vec(
+            element_count,
+            sentinel,
+            &format!("padded coordinate output '{}'", output.name),
+        )?;
         for (image_index, image) in packed.iter().enumerate() {
-            let start = image_index * max_patches * 2;
-            values[start..start + image.coordinates.len()].copy_from_slice(&image.coordinates);
+            let start = checked_element_product(
+                "padded image coordinate offset",
+                &[image_index, max_patches, 2],
+            )?;
+            let end = start
+                .checked_add(image.coordinates.len())
+                .context("padded image coordinate range overflowed")?;
+            values[start..end].copy_from_slice(&image.coordinates);
         }
         (
             vec![
@@ -509,7 +726,14 @@ fn build_coordinates(
             values,
         )
     } else {
-        let mut values = Vec::with_capacity(total_patches * 2);
+        let element_count = checked_element_product(
+            &format!("coordinate output '{}'", output.name),
+            &[total_patches, 2],
+        )?;
+        let mut values = try_vec_with_capacity(
+            element_count,
+            &format!("coordinate output '{}'", output.name),
+        )?;
         for image in packed {
             values.extend_from_slice(&image.coordinates);
         }
@@ -525,10 +749,15 @@ fn build_coordinates(
 }
 
 fn build_grid(packed: &[PackedImage], output: &OutputSpec) -> anyhow::Result<NamedImageTensor> {
-    let values = packed
-        .iter()
-        .flat_map(|image| image.grid)
-        .collect::<Vec<_>>();
+    let element_count = checked_element_product(
+        &format!("grid output '{}'", output.name),
+        &[packed.len(), 3],
+    )?;
+    let mut values =
+        try_vec_with_capacity(element_count, &format!("grid output '{}'", output.name))?;
+    for image in packed {
+        values.extend_from_slice(&image.grid);
+    }
     Ok(NamedImageTensor {
         name: output.name.clone(),
         content: output.content.clone(),
@@ -542,15 +771,18 @@ fn build_original_sizes(
     prepared: &[PreparedImage],
     output: &OutputSpec,
 ) -> anyhow::Result<NamedImageTensor> {
-    let values = prepared
-        .iter()
-        .flat_map(|image| {
-            [
-                i64::from(image.original_size.1),
-                i64::from(image.original_size.0),
-            ]
-        })
-        .collect::<Vec<_>>();
+    let element_count = checked_element_product(
+        &format!("original-size output '{}'", output.name),
+        &[prepared.len(), 2],
+    )?;
+    let mut values = try_vec_with_capacity(
+        element_count,
+        &format!("original-size output '{}'", output.name),
+    )?;
+    for image in prepared {
+        values.push(i64::from(image.original_size.1));
+        values.push(i64::from(image.original_size.0));
+    }
     Ok(NamedImageTensor {
         name: output.name.clone(),
         content: output.content.clone(),
@@ -570,10 +802,23 @@ fn build_validity_mask(
 ) -> anyhow::Result<NamedImageTensor> {
     let (shape, values) = match packed {
         Some(packed) if padded => {
-            let mut values = vec![0_i64; packed.len() * max_patches];
+            let element_count = checked_element_product(
+                &format!("padded validity mask '{}'", output.name),
+                &[packed.len(), max_patches],
+            )?;
+            let mut values = try_filled_vec(
+                element_count,
+                0_i64,
+                &format!("padded validity mask '{}'", output.name),
+            )?;
             for (image_index, image) in packed.iter().enumerate() {
-                let start = image_index * max_patches;
-                values[start..start + image.patch_count].fill(1);
+                let start = image_index
+                    .checked_mul(max_patches)
+                    .context("padded validity-mask offset overflowed")?;
+                let end = start
+                    .checked_add(image.patch_count)
+                    .context("padded validity-mask range overflowed")?;
+                values[start..end].fill(1);
             }
             (
                 vec![
@@ -583,13 +828,28 @@ fn build_validity_mask(
                 values,
             )
         }
-        Some(_) => (
-            vec![to_i64(total_patches, "total patch count")?],
-            vec![1; total_patches],
-        ),
+        Some(_) => {
+            ensure_element_limit(total_patches, "validity mask element count")?;
+            (
+                vec![to_i64(total_patches, "total patch count")?],
+                try_filled_vec(
+                    total_patches,
+                    1,
+                    &format!("validity mask '{}'", output.name),
+                )?,
+            )
+        }
         None => {
-            let count = prepared.iter().map(|image| image.tiles.len()).sum();
-            (vec![to_i64(count, "image tile count")?], vec![1; count])
+            let count = prepared.iter().try_fold(0usize, |total, image| {
+                total
+                    .checked_add(image.tiles.len())
+                    .context("image tile count overflowed")
+            })?;
+            ensure_element_limit(count, "validity mask element count")?;
+            (
+                vec![to_i64(count, "image tile count")?],
+                try_filled_vec(count, 1, &format!("validity mask '{}'", output.name))?,
+            )
         }
     };
     Ok(NamedImageTensor {
@@ -606,29 +866,28 @@ fn expansion_summaries(
     packed: Option<&[PackedImage]>,
     max_patches: usize,
     padded: bool,
-) -> Vec<ImageExpansionSummary> {
+) -> anyhow::Result<Vec<ImageExpansionSummary>> {
     let mut offset = 0;
-    prepared
-        .iter()
-        .enumerate()
-        .map(|(image_index, image)| {
-            let expansion_count = packed
-                .map(|packed| packed[image_index].patch_count)
-                .unwrap_or(image.tiles.len());
-            let tensor_length = if padded { max_patches } else { expansion_count };
-            let summary = ImageExpansionSummary {
-                image_index,
-                original_size: image.original_size,
-                tile_grid: image.tile_grid,
-                tile_count: image.tiles.len(),
-                expansion_count,
-                tensor_offset: offset,
-                tensor_length,
-            };
-            offset += tensor_length;
-            summary
-        })
-        .collect()
+    let mut summaries = try_vec_with_capacity(prepared.len(), "image expansion summaries")?;
+    for (image_index, image) in prepared.iter().enumerate() {
+        let expansion_count = packed
+            .map(|packed| packed[image_index].patch_count)
+            .unwrap_or(image.tiles.len());
+        let tensor_length = if padded { max_patches } else { expansion_count };
+        summaries.push(ImageExpansionSummary {
+            image_index,
+            original_size: image.original_size,
+            tile_grid: image.tile_grid,
+            tile_count: image.tiles.len(),
+            expansion_count,
+            tensor_offset: offset,
+            tensor_length,
+        });
+        offset = offset
+            .checked_add(tensor_length)
+            .context("image expansion tensor offset overflowed")?;
+    }
+    Ok(summaries)
 }
 
 fn validate_declared_shape(name: &str, actual: &[i64], declared: &[i64]) -> anyhow::Result<()> {
@@ -662,12 +921,18 @@ fn convert_f32(
 ) -> anyhow::Result<ImageTensorData> {
     match dtype {
         ImageTensorDType::Fp32 => Ok(ImageTensorData::Fp32(values)),
-        ImageTensorDType::Fp16 => Ok(ImageTensorData::Fp16(
-            values.into_iter().map(f32_to_f16_bits).collect(),
-        )),
-        ImageTensorDType::Bf16 => Ok(ImageTensorData::Bf16(
-            values.into_iter().map(f32_to_bf16_bits).collect(),
-        )),
+        ImageTensorDType::Fp16 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("fp16 pixel output '{name}'"))?;
+            converted.extend(values.into_iter().map(f32_to_f16_bits));
+            Ok(ImageTensorData::Fp16(converted))
+        }
+        ImageTensorDType::Bf16 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("bf16 pixel output '{name}'"))?;
+            converted.extend(values.into_iter().map(f32_to_bf16_bits));
+            Ok(ImageTensorData::Bf16(converted))
+        }
         _ => anyhow::bail!(
             "image pixel output '{name}' must declare fp32, fp16, or bf16, not {dtype:?}"
         ),
@@ -680,60 +945,77 @@ fn convert_i64(
     name: &str,
 ) -> anyhow::Result<ImageTensorData> {
     match dtype {
-        ImageTensorDType::Fp32 => Ok(ImageTensorData::Fp32(
-            values.into_iter().map(|value| value as f32).collect(),
-        )),
-        ImageTensorDType::Fp16 => Ok(ImageTensorData::Fp16(
-            values
-                .into_iter()
-                .map(|value| f32_to_f16_bits(value as f32))
-                .collect(),
-        )),
-        ImageTensorDType::Bf16 => Ok(ImageTensorData::Bf16(
-            values
-                .into_iter()
-                .map(|value| f32_to_bf16_bits(value as f32))
-                .collect(),
-        )),
+        ImageTensorDType::Fp32 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("fp32 image output '{name}'"))?;
+            converted.extend(values.into_iter().map(|value| value as f32));
+            Ok(ImageTensorData::Fp32(converted))
+        }
+        ImageTensorDType::Fp16 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("fp16 image output '{name}'"))?;
+            converted.extend(
+                values
+                    .into_iter()
+                    .map(|value| f32_to_f16_bits(value as f32)),
+            );
+            Ok(ImageTensorData::Fp16(converted))
+        }
+        ImageTensorDType::Bf16 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("bf16 image output '{name}'"))?;
+            converted.extend(
+                values
+                    .into_iter()
+                    .map(|value| f32_to_bf16_bits(value as f32)),
+            );
+            Ok(ImageTensorData::Bf16(converted))
+        }
         ImageTensorDType::Int64 => Ok(ImageTensorData::Int64(values)),
-        ImageTensorDType::Int32 => values
-            .into_iter()
-            .map(|value| {
-                i32::try_from(value).with_context(|| {
+        ImageTensorDType::Int32 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("int32 image output '{name}'"))?;
+            for value in values {
+                converted.push(i32::try_from(value).with_context(|| {
                     format!("image output '{name}' value {value} does not fit declared int32")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map(ImageTensorData::Int32),
-        ImageTensorDType::Int8 => values
-            .into_iter()
-            .map(|value| {
-                i8::try_from(value).with_context(|| {
+                })?);
+            }
+            Ok(ImageTensorData::Int32(converted))
+        }
+        ImageTensorDType::Int8 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("int8 image output '{name}'"))?;
+            for value in values {
+                converted.push(i8::try_from(value).with_context(|| {
                     format!("image output '{name}' value {value} does not fit declared int8")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map(ImageTensorData::Int8),
-        ImageTensorDType::Uint8 => values
-            .into_iter()
-            .map(|value| {
-                u8::try_from(value).with_context(|| {
+                })?);
+            }
+            Ok(ImageTensorData::Int8(converted))
+        }
+        ImageTensorDType::Uint8 => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("uint8 image output '{name}'"))?;
+            for value in values {
+                converted.push(u8::try_from(value).with_context(|| {
                     format!("image output '{name}' value {value} does not fit declared uint8")
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map(ImageTensorData::Uint8),
-        ImageTensorDType::Bool => values
-            .into_iter()
-            .map(|value| match value {
-                0 => Ok(0),
-                1 => Ok(1),
-                _ => anyhow::bail!(
-                    "image output '{name}' value {value} cannot be represented as bool; expected 0 or 1"
-                ),
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-            .map(ImageTensorData::Bool),
+                })?);
+            }
+            Ok(ImageTensorData::Uint8(converted))
+        }
+        ImageTensorDType::Bool => {
+            let mut converted =
+                try_vec_with_capacity(values.len(), &format!("bool image output '{name}'"))?;
+            for value in values {
+                converted.push(match value {
+                    0 => 0,
+                    1 => 1,
+                    _ => anyhow::bail!(
+                        "image output '{name}' value {value} cannot be represented as bool; expected 0 or 1"
+                    ),
+                });
+            }
+            Ok(ImageTensorData::Bool(converted))
+        }
     }
 }
 
@@ -794,5 +1076,47 @@ fn f32_to_f16_bits(value: f32) -> u16 {
         }
     } else {
         sign | ((half_exponent as u16) << 10) | ((rounded >> 13) as u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_products_reject_arithmetic_overflow() {
+        let error = checked_element_product("test image tensor", &[usize::MAX, 2]).unwrap_err();
+        assert!(error.to_string().contains("element count overflowed"));
+    }
+
+    #[test]
+    fn allocation_products_reject_the_explicit_element_limit() {
+        let error =
+            checked_element_product("test image tensor", &[MAX_TENSOR_ELEMENTS + 1]).unwrap_err();
+        assert!(error.to_string().contains("exceeding the safety limit"));
+    }
+
+    #[test]
+    fn output_bundle_rejects_an_aggregate_above_the_element_limit() {
+        let output = |name: &str| OutputSpec {
+            name: name.to_owned(),
+            content: "pixels".to_owned(),
+            dtype: ImageTensorDType::Fp32,
+            pad_value: None,
+            optional: false,
+        };
+        let spec = PackSpec {
+            width: 4_096,
+            height: 4_096,
+            layout: ImageLayout::Nchw,
+            patch_size: None,
+            pad_value: None,
+            outputs: vec![output("pixels_a"), output("pixels_b")],
+            declared_pixel_shape: vec![-1, 3, 4_096, 4_096],
+        };
+
+        let error =
+            validate_total_output_elements(&[], None, None, 0, 0, 1, false, &spec).unwrap_err();
+        assert!(error.to_string().contains("across declared tensors"));
     }
 }

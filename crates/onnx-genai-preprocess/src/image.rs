@@ -14,6 +14,13 @@ pub use packed::{
 use packed::{OutputSpec, PackSpec, PreparedImage};
 
 const CHANNELS: usize = 3;
+pub(super) const MAX_IMAGE_COUNT: usize = 1_024;
+pub(super) const MAX_IMAGE_PIXELS: usize = 16 * 1024 * 1024;
+pub(super) const MAX_TENSOR_ELEMENTS: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_OUTPUTS: usize = 64;
+const MAX_IMAGE_TRANSFORMS: usize = 64;
+const MAX_TILES_PER_IMAGE: usize = 4_096;
+const MAX_ASPECT_RATIOS: usize = 4_096;
 
 /// Tensor channel layout declared by the model input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +406,7 @@ struct ImageProgram {
 
 #[derive(Debug, Clone)]
 enum ValueOp {
+    Divide(f32),
     Rescale(f32),
     Normalize { mean: [f32; 3], std: [f32; 3] },
 }
@@ -516,11 +524,22 @@ impl ImagePreprocessor {
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
-        let images = images
-            .into_iter()
-            .map(|bytes| image::load_from_memory(bytes.as_ref()).context("failed to decode image"))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.preprocess(&images)
+        let mut decoded = Vec::new();
+        for (image_index, bytes) in images.into_iter().enumerate() {
+            if image_index == MAX_IMAGE_COUNT {
+                anyhow::bail!(
+                    "image batch contains more than the supported limit of {MAX_IMAGE_COUNT} images; split the request into smaller batches"
+                );
+            }
+            decoded
+                .try_reserve(1)
+                .context("failed to allocate decoded image batch")?;
+            decoded.push(
+                image::load_from_memory(bytes.as_ref())
+                    .with_context(|| format!("failed to decode image {image_index}"))?,
+            );
+        }
+        self.preprocess(&decoded)
     }
 
     /// Preprocesses decoded images into a named typed tensor bundle.
@@ -528,15 +547,54 @@ impl ImagePreprocessor {
         if images.is_empty() {
             anyhow::bail!("at least one image is required");
         }
+        if images.len() > MAX_IMAGE_COUNT {
+            anyhow::bail!(
+                "image batch contains {} images, exceeding the supported limit of {MAX_IMAGE_COUNT}; split the request into smaller batches",
+                images.len()
+            );
+        }
         let width = self.config.width as usize;
         let height = self.config.height as usize;
-        let mut prepared = Vec::with_capacity(images.len());
-        for image in images {
+        let tile_elements = checked_image_elements(width, height, "normalized image tile")?;
+        let mut prepared_elements = 0usize;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(images.len())
+            .context("failed to allocate prepared image batch")?;
+        for (image_index, image) in images.iter().enumerate() {
+            validate_source_image(image, image_index)?;
             let (grid, image_tiles) = tile_image(image, &self.config)?;
-            let tiles = image_tiles
-                .iter()
-                .map(|tile| normalize_tile(tile, width, height, &self.program.value_ops))
-                .collect();
+            if image_tiles.len() > MAX_TILES_PER_IMAGE + 1 {
+                anyhow::bail!(
+                    "image {image_index} produced {} tiles, exceeding the supported limit of {}; reduce max_tiles",
+                    image_tiles.len(),
+                    MAX_TILES_PER_IMAGE + 1
+                );
+            }
+            let image_elements = image_tiles
+                .len()
+                .checked_mul(tile_elements)
+                .context("prepared image element count overflowed")?;
+            prepared_elements = prepared_elements
+                .checked_add(image_elements)
+                .context("prepared image batch element count overflowed")?;
+            if prepared_elements > MAX_TENSOR_ELEMENTS {
+                anyhow::bail!(
+                    "prepared image batch requires {prepared_elements} fp32 elements, exceeding the safety limit of {MAX_TENSOR_ELEMENTS}; reduce image dimensions, tile count, or batch size"
+                );
+            }
+            let mut tiles = Vec::new();
+            tiles
+                .try_reserve_exact(image_tiles.len())
+                .context("failed to allocate normalized image tiles")?;
+            for tile in &image_tiles {
+                tiles.push(normalize_tile(
+                    tile,
+                    width,
+                    height,
+                    &self.program.value_ops,
+                )?);
+            }
             prepared.push(PreparedImage {
                 original_size: (image.width(), image.height()),
                 tile_grid: grid,
@@ -566,9 +624,9 @@ impl ImagePreprocessor {
 
 fn legacy_program(config: &ImagePreprocessConfig) -> anyhow::Result<ImageProgram> {
     let value_ops = match &config.normalization {
-        Normalization::ZeroToOne => vec![ValueOp::Rescale(1.0 / 255.0)],
+        Normalization::ZeroToOne => vec![ValueOp::Divide(255.0)],
         Normalization::MeanStd { mean, std } => vec![
-            ValueOp::Rescale(1.0 / 255.0),
+            ValueOp::Divide(255.0),
             ValueOp::Normalize {
                 mean: *mean,
                 std: *std,
@@ -594,6 +652,18 @@ fn typed_program_from_metadata(
     model_width: i64,
     model_height: i64,
 ) -> anyhow::Result<(ImagePreprocessConfig, ImageProgram)> {
+    if metadata.transforms.len() > MAX_IMAGE_TRANSFORMS {
+        anyhow::bail!(
+            "preprocessing.image.transforms contains {} entries, exceeding the supported limit of {MAX_IMAGE_TRANSFORMS}",
+            metadata.transforms.len()
+        );
+    }
+    if metadata.outputs.len() > MAX_IMAGE_OUTPUTS {
+        anyhow::bail!(
+            "preprocessing.image.outputs contains {} entries, exceeding the supported limit of {MAX_IMAGE_OUTPUTS}",
+            metadata.outputs.len()
+        );
+    }
     if metadata.transforms.is_empty() {
         anyhow::bail!(
             "preprocessing.image.transforms must not be empty when typed image outputs are declared"
@@ -698,6 +768,11 @@ fn typed_program_from_metadata(
                 if max_tiles == 0 {
                     anyhow::bail!("image tile transform max_tiles must be greater than zero");
                 }
+                if max_tiles > MAX_TILES_PER_IMAGE {
+                    anyhow::bail!(
+                        "image tile transform max_tiles {max_tiles} exceeds the supported limit of {MAX_TILES_PER_IMAGE}; reduce max_tiles"
+                    );
+                }
                 tiling = Some(ImageTilingConfig {
                     mode: TilingMode::DynamicAnyres,
                     tile_size,
@@ -756,9 +831,7 @@ fn typed_program_from_metadata(
             Interpolation::Bicubic,
         ),
     };
-    if width == 0 || height == 0 {
-        anyhow::bail!("image resize dimensions must be greater than zero");
-    }
+    validate_image_dimensions(width, height, "image resize")?;
     let tiling = match tiling {
         Some(tiling) => {
             if tiling.tile_size != width || tiling.tile_size != height {
@@ -780,19 +853,19 @@ fn typed_program_from_metadata(
             include_thumbnail: false,
         },
     };
-    let outputs = metadata
-        .outputs
-        .into_iter()
-        .map(|output| {
-            Ok(OutputSpec {
-                name: output.name,
-                content: output.content,
-                dtype: ImageTensorDType::parse(&output.dtype)?,
-                pad_value: output.pad_value,
-                optional: output.optional.unwrap_or(false),
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut outputs = Vec::new();
+    outputs
+        .try_reserve_exact(metadata.outputs.len())
+        .context("failed to allocate image output specifications")?;
+    for output in metadata.outputs {
+        outputs.push(OutputSpec {
+            name: output.name,
+            content: output.content,
+            dtype: ImageTensorDType::parse(&output.dtype)?,
+            pad_value: output.pad_value,
+            optional: output.optional.unwrap_or(false),
+        });
+    }
     Ok((
         ImagePreprocessConfig {
             width,
@@ -846,6 +919,7 @@ fn preprocessing_from_metadata(
         });
     let width = resolve_dimension("width", model_width, declared_size.map(|size| size.0))?;
     let height = resolve_dimension("height", model_height, declared_size.map(|size| size.1))?;
+    validate_image_dimensions(width, height, "image resize")?;
 
     let resize = metadata.as_ref().and_then(|image| image.resize.as_ref());
     let mode = resize.and_then(|resize| resize.mode.as_deref());
@@ -945,21 +1019,37 @@ fn tiling_from_metadata(
     if max_tiles == 0 {
         anyhow::bail!("image tiling max_tiles must be greater than zero");
     }
+    if max_tiles > MAX_TILES_PER_IMAGE {
+        anyhow::bail!(
+            "image tiling max_tiles {max_tiles} exceeds the supported limit of {MAX_TILES_PER_IMAGE}; reduce max_tiles"
+        );
+    }
 
     let configured_ratios = metadata.and_then(|tiling| tiling.aspect_ratios.as_ref());
+    if configured_ratios.is_some_and(|ratios| ratios.len() > MAX_ASPECT_RATIOS) {
+        anyhow::bail!(
+            "image tiling aspect_ratios exceeds the supported limit of {MAX_ASPECT_RATIOS} entries"
+        );
+    }
     let aspect_ratios = match (mode, configured_ratios) {
         (TilingMode::FixedGrid, None) => vec![TileGrid {
             columns: 1,
             rows: 1,
         }],
         (TilingMode::DynamicAnyres, None) => default_anyres_grids(),
-        (_, Some(ratios)) => ratios
-            .iter()
-            .map(|[columns, rows]| TileGrid {
-                columns: *columns,
-                rows: *rows,
-            })
-            .collect(),
+        (_, Some(ratios)) => {
+            let mut grids = Vec::new();
+            grids
+                .try_reserve_exact(ratios.len())
+                .context("failed to allocate image tiling aspect ratios")?;
+            for [columns, rows] in ratios {
+                grids.push(TileGrid {
+                    columns: *columns,
+                    rows: *rows,
+                });
+            }
+            grids
+        }
         (TilingMode::None, _) => unreachable!("none returned above"),
     };
     if aspect_ratios.is_empty() {
@@ -1006,18 +1096,81 @@ fn default_anyres_grids() -> Vec<TileGrid> {
         .collect()
 }
 
+fn validate_image_dimensions(width: u32, height: u32, description: &str) -> anyhow::Result<()> {
+    if width == 0 || height == 0 {
+        anyhow::bail!("{description} dimensions must be greater than zero, got {width}x{height}");
+    }
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .context("image dimensions are too large for this platform")?;
+    if pixels > MAX_IMAGE_PIXELS {
+        anyhow::bail!(
+            "{description} dimensions {width}x{height} require {pixels} pixels, exceeding the safety limit of {MAX_IMAGE_PIXELS}; reduce the configured image size"
+        );
+    }
+    Ok(())
+}
+
+fn validate_source_image(image: &DynamicImage, image_index: usize) -> anyhow::Result<()> {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        anyhow::bail!(
+            "source image {image_index} has degenerate dimensions {width}x{height}; provide an image with nonzero width and height"
+        );
+    }
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .context("source image dimensions are too large for this platform")?;
+    if pixels > MAX_IMAGE_PIXELS {
+        anyhow::bail!(
+            "source image {image_index} dimensions {width}x{height} contain {pixels} pixels, exceeding the safety limit of {MAX_IMAGE_PIXELS}; resize the image before preprocessing"
+        );
+    }
+    Ok(())
+}
+
+fn checked_image_elements(width: usize, height: usize, description: &str) -> anyhow::Result<usize> {
+    let elements = CHANNELS
+        .checked_mul(width)
+        .and_then(|value| value.checked_mul(height))
+        .with_context(|| format!("{description} element count overflowed"))?;
+    if elements > MAX_TENSOR_ELEMENTS {
+        anyhow::bail!(
+            "{description} requires {elements} elements, exceeding the safety limit of {MAX_TENSOR_ELEMENTS}; reduce image dimensions"
+        );
+    }
+    Ok(elements)
+}
+
 fn resolve_dimension(name: &str, model: i64, configured: Option<u32>) -> anyhow::Result<u32> {
     if model == 0 || model < -1 {
         anyhow::bail!("vision input has invalid {name} dimension {model}");
     }
-    match (model, configured) {
-        (model, Some(configured)) if model > 0 && model as u32 != configured => anyhow::bail!(
+    let model_dimension = (model > 0)
+        .then(|| {
+            u32::try_from(model)
+                .with_context(|| format!("vision input {name} dimension {model} is too large"))
+        })
+        .transpose()?;
+    match (model_dimension, configured) {
+        (Some(model), Some(configured)) if model != configured => anyhow::bail!(
             "preprocessing {name} {configured} does not match model input {name} {model}"
         ),
         (_, Some(0)) => anyhow::bail!("preprocessing {name} must be greater than zero"),
         (_, Some(configured)) => Ok(configured),
-        (model, None) if model > 0 => Ok(model as u32),
-        (_, None) => anyhow::bail!(
+        (Some(model), None) => Ok(model),
+        (None, None) => anyhow::bail!(
             "dynamic vision input {name} requires preprocessing.image.resize.size metadata"
         ),
     }
@@ -1033,7 +1186,7 @@ fn tile_image(
                 columns: 1,
                 rows: 1,
             },
-            vec![resize_image(image, config)],
+            vec![resize_image(image, config)?],
         )),
         TilingMode::FixedGrid => {
             let grid = config.tiling.aspect_ratios[0];
@@ -1066,12 +1219,25 @@ fn tiled_image_for_grid(
         .rows
         .checked_mul(tile_size)
         .context("tiled image height is too large")?;
-    let resized = resize_image_to(image, config, width, height);
+    validate_image_dimensions(width, height, "tiled image canvas")?;
+    let resized = resize_image_to(image, config, width, height)?;
     let local_count = grid.tile_count()?;
-    let mut tiles = Vec::with_capacity(local_count + usize::from(config.tiling.include_thumbnail));
+    let tile_count = local_count
+        .checked_add(usize::from(config.tiling.include_thumbnail))
+        .context("image tile count overflowed")?;
+    if tile_count > MAX_TILES_PER_IMAGE + 1 {
+        anyhow::bail!(
+            "image tiling produces {tile_count} tiles, exceeding the supported limit of {}; reduce max_tiles or the configured grid",
+            MAX_TILES_PER_IMAGE + 1
+        );
+    }
+    let mut tiles = Vec::new();
+    tiles
+        .try_reserve_exact(tile_count)
+        .context("failed to allocate image tile batch")?;
     // Encoder conventions place the global view before row-major local tiles.
     if config.tiling.include_thumbnail {
-        tiles.push(resize_image_to(image, config, tile_size, tile_size));
+        tiles.push(resize_image_to(image, config, tile_size, tile_size)?);
     }
     for row in 0..grid.rows {
         for column in 0..grid.columns {
@@ -1133,7 +1299,7 @@ fn select_best_grid(
         .context("no image tiling aspect ratio fits max_tiles")
 }
 
-fn resize_image(image: &DynamicImage, config: &ImagePreprocessConfig) -> RgbImage {
+fn resize_image(image: &DynamicImage, config: &ImagePreprocessConfig) -> anyhow::Result<RgbImage> {
     resize_image_to(image, config, config.width, config.height)
 }
 
@@ -1142,7 +1308,8 @@ fn resize_image_to(
     config: &ImagePreprocessConfig,
     width: u32,
     height: u32,
-) -> RgbImage {
+) -> anyhow::Result<RgbImage> {
+    validate_image_dimensions(width, height, "resized image")?;
     let rgb = image.to_rgb8();
     let filter = match config.interpolation {
         Interpolation::Bicubic => FilterType::CatmullRom,
@@ -1150,21 +1317,26 @@ fn resize_image_to(
         Interpolation::Lanczos3 => FilterType::Lanczos3,
     };
     match config.resize_mode {
-        ResizeMode::Fixed => image::imageops::resize(&rgb, width, height, filter),
+        ResizeMode::Fixed => Ok(image::imageops::resize(&rgb, width, height, filter)),
         ResizeMode::ShortestEdgeCenterCrop => {
             let scale =
                 (width as f64 / rgb.width() as f64).max(height as f64 / rgb.height() as f64);
             let resized_width = ((rgb.width() as f64 * scale).round() as u32).max(width);
             let resized_height = ((rgb.height() as f64 * scale).round() as u32).max(height);
+            validate_image_dimensions(
+                resized_width,
+                resized_height,
+                "center-crop intermediate image",
+            )?;
             let resized = image::imageops::resize(&rgb, resized_width, resized_height, filter);
-            image::imageops::crop_imm(
+            Ok(image::imageops::crop_imm(
                 &resized,
                 (resized_width - width) / 2,
                 (resized_height - height) / 2,
                 width,
                 height,
             )
-            .to_image()
+            .to_image())
         }
         ResizeMode::LongestEdgePad => {
             let scale =
@@ -1179,7 +1351,7 @@ fn resize_image_to(
                 i64::from((width - resized_width) / 2),
                 i64::from((height - resized_height) / 2),
             );
-            padded
+            Ok(padded)
         }
     }
 }
@@ -1189,25 +1361,37 @@ fn normalize_tile(
     width: usize,
     height: usize,
     operations: &[ValueOp],
-) -> Vec<f32> {
-    let mut values = Vec::with_capacity(CHANNELS * width * height);
+) -> anyhow::Result<Vec<f32>> {
+    let element_count = checked_image_elements(width, height, "normalized image tile")?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(element_count)
+        .context("failed to allocate normalized image tile")?;
     for channel in 0..CHANNELS {
         values.extend(image.pixels().map(|pixel| {
             operations.iter().fold(
                 f32::from(pixel[channel]),
                 |value, operation| match operation {
+                    ValueOp::Divide(divisor) => value / divisor,
                     ValueOp::Rescale(scale) => value * scale,
                     ValueOp::Normalize { mean, std } => (value - mean[channel]) / std[channel],
                 },
             )
         }));
     }
-    values
+    Ok(values)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod hf_reference {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/hf_vlm_reference.rs"
+        ));
+    }
 
     fn token_expansion_config() -> TokenExpansionConfig {
         TokenExpansionConfig {
@@ -1444,7 +1628,7 @@ mod tests {
                 Rgb([0, 0, 255])
             }
         }));
-        assert_eq!(resize_image(&image, &config).dimensions(), (4, 4));
+        assert_eq!(resize_image(&image, &config).unwrap().dimensions(), (4, 4));
     }
 
     #[test]
@@ -1997,27 +2181,57 @@ preprocessing:
 
     #[test]
     fn qwen_shaped_concatenated_patches_emit_per_image_grid() {
-        let program = PADDED_PROGRAM
-            .replace(
-                "      - op: tile\n        tile_size: 2\n        max_tiles: 2\n",
-                "",
-            )
-            .replace(
-                "      - op: pad\n        pad_value: 0\n",
-                "",
-            )
-            .replace(
-                "      - name: image_coordinates\n        content: patch_coordinates\n        dtype: int64\n        pad_value: -1\n",
-                "      - name: image_grid\n        content: grid_dimensions\n        dtype: int64\n",
-            );
-        let preprocessor = typed_preprocessor(&[8, 3], &program);
-        let bundle = preprocessor.preprocess(&packed_test_images()).unwrap();
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 4
+        mode: stretch
+        interpolation: bilinear
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: patchify
+        patch_size: 2
+        flatten: true
+    outputs:
+      - name: image_pixels
+        content: pixels
+        dtype: fp32
+      - name: image_grid
+        content: grid_dimensions
+        dtype: int64
+"#;
+        let images = [
+            DynamicImage::ImageRgb8(
+                RgbImage::from_raw(4, 4, hf_reference::QWEN_IMAGE_0.to_vec()).unwrap(),
+            ),
+            DynamicImage::ImageRgb8(
+                RgbImage::from_raw(4, 4, hf_reference::QWEN_IMAGE_1.to_vec()).unwrap(),
+            ),
+        ];
+        let preprocessor = typed_preprocessor(&[8, 12], PROGRAM);
+        let bundle = preprocessor.preprocess(&images).unwrap();
         let pixels = bundle.tensor("image_pixels").unwrap();
         let grid = bundle.tensor("image_grid").unwrap();
 
-        assert_eq!(pixels.shape, [8, 3]);
+        assert_eq!(pixels.shape, [8, 12]);
+        assert_eq!(
+            pixels
+                .data
+                .as_f32_slice()
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            hf_reference::QWEN_PIXEL_BITS
+        );
         assert_eq!(grid.shape, [2, 3]);
-        assert_eq!(grid.data, ImageTensorData::Int64(vec![1, 2, 2, 1, 2, 2]));
+        assert_eq!(
+            grid.data,
+            ImageTensorData::Int64(hf_reference::QWEN_GRID.to_vec())
+        );
         assert_eq!(
             bundle
                 .images
@@ -2030,40 +2244,72 @@ preprocessing:
 
     #[test]
     fn phi_shaped_outputs_include_original_sizes_and_patch_validity() {
-        let program = PADDED_PROGRAM
-            .replace("dtype: fp32", "dtype: bf16")
-            .replace(
-                "      - name: image_coordinates\n",
-                "      - name: image_pixels_fp16\n        content: pixels\n        dtype: fp16\n      - name: image_coordinates\n",
-            )
-            .replace(
-                "      - name: image_coordinates\n        content: patch_coordinates\n        dtype: int64\n        pad_value: -1\n",
-                "      - name: image_sizes\n        content: original_size\n        dtype: int64\n      - name: patch_mask\n        content: validity_mask\n        dtype: bool\n",
-            );
-        let preprocessor = typed_preprocessor(&[2, 8, 3], &program);
-        let bundle = preprocessor.preprocess(&packed_test_images()).unwrap();
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 4
+        mode: stretch
+        interpolation: bilinear
+      - op: tile
+        tile_size: 4
+        max_tiles: 2
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+      - op: patchify
+        patch_size: 2
+        flatten: true
+      - op: pad
+        pad_value: 0
+    outputs:
+      - name: image_pixels
+        content: pixels
+        dtype: bf16
+      - name: image_pixels_fp16
+        content: pixels
+        dtype: fp16
+      - name: image_sizes
+        content: original_size
+        dtype: int64
+      - name: patch_mask
+        content: validity_mask
+        dtype: bool
+"#;
+        let images = [
+            DynamicImage::ImageRgb8(
+                RgbImage::from_raw(8, 4, hf_reference::PHI_IMAGE_0.to_vec()).unwrap(),
+            ),
+            DynamicImage::ImageRgb8(
+                RgbImage::from_raw(4, 4, hf_reference::PHI_IMAGE_1.to_vec()).unwrap(),
+            ),
+        ];
+        let preprocessor = typed_preprocessor(&[2, 8, 12], PROGRAM);
+        let bundle = preprocessor.preprocess(&images).unwrap();
 
         let pixels = bundle.tensor("image_pixels").unwrap();
         assert_eq!(pixels.dtype, ImageTensorDType::Bf16);
-        assert!(matches!(pixels.data, ImageTensorData::Bf16(_)));
+        assert_eq!(
+            pixels.data,
+            ImageTensorData::Bf16(hf_reference::PHI_BF16_BITS.to_vec())
+        );
         let fp16_pixels = bundle.tensor("image_pixels_fp16").unwrap();
         assert_eq!(fp16_pixels.dtype, ImageTensorDType::Fp16);
         assert_eq!(
             fp16_pixels.data,
-            ImageTensorData::Fp16(
-                HF_PADDED_PIXELS
-                    .iter()
-                    .map(|value| if *value == 1.0 { 0x3c00 } else { 0 })
-                    .collect()
-            )
+            ImageTensorData::Fp16(hf_reference::PHI_FP16_BITS.to_vec())
         );
         assert_eq!(
             bundle.tensor("image_sizes").unwrap().data,
-            ImageTensorData::Int64(vec![2, 4, 2, 2])
+            ImageTensorData::Int64(hf_reference::PHI_SIZES.to_vec())
         );
         assert_eq!(
             bundle.tensor("patch_mask").unwrap().data,
-            ImageTensorData::Bool(vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0])
+            ImageTensorData::Bool(hf_reference::PHI_MASK.to_vec())
         );
     }
 
@@ -2081,5 +2327,75 @@ preprocessing:
             pixels.data.as_f32_slice().unwrap(),
             [1.0, 0.0, 0.0, 64.0 / 255.0, 128.0 / 255.0, 1.0]
         );
+    }
+
+    #[test]
+    fn legacy_zero_to_one_is_bit_exact_for_every_u8() {
+        let preprocessor = ImagePreprocessor::from_input(&[1, 3, 1, 256]).unwrap();
+        let image = RgbImage::from_fn(256, 1, |x, _| {
+            let value = x as u8;
+            Rgb([value, value, value])
+        });
+        let values = normalize_tile(&image, 256, 1, &preprocessor.program.value_ops).unwrap();
+
+        for channel in 0..CHANNELS {
+            for value in 0u8..=u8::MAX {
+                let actual = values[channel * 256 + usize::from(value)].to_bits();
+                let expected = (f32::from(value) / 255.0).to_bits();
+                assert_eq!(
+                    actual, expected,
+                    "legacy normalization changed byte {value}: actual {actual:#010x}, expected {expected:#010x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_degenerate_source_images_before_resize() {
+        let preprocessor = ImagePreprocessor::from_input(&[1, 3, 2, 2]).unwrap();
+        let image = DynamicImage::ImageRgb8(RgbImage::new(0, 2));
+        let error = preprocessor.preprocess(&[image]).unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "degenerate dimensions 0x2; provide an image with nonzero width and height"
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_center_crop_intermediates_before_allocation() {
+        let preprocessor = ImagePreprocessor::from_input(&[1, 3, 4_096, 4_096]).unwrap();
+        let image = DynamicImage::ImageRgb8(RgbImage::new(16_384, 1));
+        let error = preprocessor.preprocess(&[image]).unwrap_err();
+
+        assert!(error.to_string().contains("center-crop intermediate image"));
+        assert!(error.to_string().contains("exceeding the safety limit"));
+    }
+
+    #[test]
+    fn rejects_metadata_dimensions_above_the_pixel_limit() {
+        let yaml = format!(
+            r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: {{width: {}, height: 1}}
+      - op: patchify
+        patch_size: 1
+    outputs:
+      - name: pixels
+        content: pixels
+        dtype: fp32
+"#,
+            MAX_IMAGE_PIXELS + 1
+        );
+        let document = serde_yaml::from_str::<MetadataDocument>(&yaml).unwrap();
+        let error =
+            ImagePreprocessor::from_metadata_document(&[-1, 3], Some(document)).unwrap_err();
+
+        assert!(error.to_string().contains("exceeding the safety limit"));
     }
 }
