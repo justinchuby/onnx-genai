@@ -135,7 +135,9 @@ pub use collector::{
     CompositeCollector, DEFAULT_MAX_EVENTS, FileCollector, MemoryCollector, NoopCollector,
     TraceCollector,
 };
-pub use context::{SpanGuard, TraceContext, annotate_current_span};
+pub use context::{
+    SpanGuard, TraceContext, annotate_current_span, annotate_current_span_with, tracing_active,
+};
 pub use diagnose::{
     AutoDiagnosis, BoundType, DiagnosedIssue, DiagnosisConfig, IssueCategory, KernelSample,
     Precision, RooflineAnalyzer, RooflineResult, Severity, render_roofline_report,

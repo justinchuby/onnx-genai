@@ -35,30 +35,53 @@ thread_local! {
     static ACTIVE_SPANS: RefCell<Vec<Weak<Mutex<Args>>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Whether the current thread has an active tracing span.
+///
+/// This is a cheap thread-local check with no allocation, locking, or argument
+/// construction, intended for guarding optional hot-path instrumentation.
+#[must_use]
+#[inline]
+pub fn tracing_active() -> bool {
+    ACTIVE_SPANS.with(|spans| !spans.borrow().is_empty())
+}
+
+fn current_span_args() -> Option<Arc<Mutex<Args>>> {
+    ACTIVE_SPANS.with(|spans| {
+        let mut spans = spans.borrow_mut();
+        loop {
+            match spans.last().and_then(Weak::upgrade) {
+                Some(active) => break Some(active),
+                None if !spans.is_empty() => {
+                    spans.pop();
+                }
+                None => break None,
+            }
+        }
+    })
+}
+
 /// Merge metadata into the innermost active span on the current thread.
 ///
 /// Kernel implementations use this to enrich the executor-created operation
 /// span without needing a tracing handle in the kernel ABI. This is a no-op
 /// when no enabled span is active.
 pub fn annotate_current_span(args: Args) {
-    ACTIVE_SPANS.with(|spans| {
-        let mut spans = spans.borrow_mut();
-        loop {
-            match spans.last().and_then(Weak::upgrade) {
-                Some(active) => {
-                    active
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .merge(args);
-                    break;
-                }
-                None if !spans.is_empty() => {
-                    spans.pop();
-                }
-                None => break,
-            }
-        }
-    });
+    annotate_current_span_with(|| args);
+}
+
+/// Lazily build and merge metadata into the current thread's active span.
+///
+/// `build_args` is not called when no span is active, so callers can put shape
+/// scans and metric calculations inside the closure without disabled-path cost.
+pub fn annotate_current_span_with(build_args: impl FnOnce() -> Args) {
+    let Some(active) = current_span_args() else {
+        return;
+    };
+    let args = build_args();
+    active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .merge(args);
 }
 
 struct Inner {

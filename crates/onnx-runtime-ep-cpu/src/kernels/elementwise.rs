@@ -242,9 +242,9 @@ impl Kernel for BinaryKernel {
         check_arity(self.op.name(), inputs, outputs, min_in, max_in, 1)?;
         let op = self.op;
         if op == BinOp::Mul {
-            let flops = (outputs[0].numel() as u64)
-                .saturating_mul(inputs.len().saturating_sub(1) as u64);
-            crate::trace::record_kernel_metrics(inputs, outputs, flops);
+            crate::trace::record_kernel_metrics(inputs, outputs, || {
+                (outputs[0].numel() as u64).saturating_mul(inputs.len().saturating_sub(1) as u64)
+            });
         }
         if op == BinOp::Mul && multiply_contiguous_f32(inputs, &mut outputs[0]) {
             return Ok(());

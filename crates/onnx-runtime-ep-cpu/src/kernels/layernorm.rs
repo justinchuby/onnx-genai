@@ -33,17 +33,19 @@ impl KernelFactory for LayerNormFactory {
 impl Kernel for LayerNormKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("LayerNormalization", inputs, outputs, 2, 3, 1)?;
-        let elements = inputs[0].numel() as u64;
-        // Estimate the explicit arithmetic in mean/variance/normalization.
-        // sqrt is counted as one operation; bias contributes one add/element.
-        let groups = normalization_groups(inputs[0].shape, self.axis).unwrap_or(0) as u64;
-        let mut flops = elements
-            .saturating_mul(7)
-            .saturating_add(groups.saturating_mul(5));
-        if inputs.len() == 3 {
-            flops = flops.saturating_add(elements);
-        }
-        crate::trace::record_kernel_metrics(inputs, outputs, flops);
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = inputs[0].numel() as u64;
+            // Estimate the explicit arithmetic in mean/variance/normalization.
+            // sqrt is counted as one operation; bias contributes one add/element.
+            let groups = normalization_groups(inputs[0].shape, self.axis).unwrap_or(0) as u64;
+            let mut flops = elements
+                .saturating_mul(7)
+                .saturating_add(groups.saturating_mul(5));
+            if inputs.len() == 3 {
+                flops = flops.saturating_add(elements);
+            }
+            flops
+        });
         let x = to_dense_f32(&inputs[0])?;
         let scale = to_dense_f32(&inputs[1])?;
         let bias = if inputs.len() == 3 {
@@ -84,8 +86,7 @@ fn normalization_groups(shape: &[usize], axis: i64) -> Option<usize> {
     } else {
         axis
     };
-    (axis >= 0 && axis as usize <= shape.len())
-        .then(|| shape[..axis as usize].iter().product())
+    (axis >= 0 && axis as usize <= shape.len()).then(|| shape[..axis as usize].iter().product())
 }
 
 /// Shared LayerNorm math for fused contrib kernels. Returns the normalized

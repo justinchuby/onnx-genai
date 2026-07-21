@@ -298,13 +298,13 @@ impl MatMulKernel {
     ) -> Result<()> {
         check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
         let geom = matmul_geometry(&inputs[0], &inputs[1])?;
-        let batch_count = numel(&geom.batch_shape) as u64;
-        let flops = batch_count
-            .saturating_mul(geom.m as u64)
-            .saturating_mul(geom.n as u64)
-            .saturating_mul(geom.k as u64)
-            .saturating_mul(2);
-        crate::trace::record_kernel_metrics(inputs, outputs, flops);
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            (numel(&geom.batch_shape) as u64)
+                .saturating_mul(geom.m as u64)
+                .saturating_mul(geom.n as u64)
+                .saturating_mul(geom.k as u64)
+                .saturating_mul(2)
+        });
 
         // Direct f32 output fast path: when the output is a contiguous Float32
         // CPU tensor that does not alias either input, GEMM writes straight into
@@ -704,6 +704,7 @@ mod tests {
         assert_eq!(out.to_f32(), vec![58., 64., 139., 154.]);
     }
 
+    #[cfg(feature = "tracing")]
     #[test]
     fn matmul_populates_active_trace_span_metrics() {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);

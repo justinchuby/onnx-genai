@@ -11,6 +11,7 @@ categories = ["science", "hardware-support"]
 [features]
 # Opt-in vendored MLAS f32 SGEMM. Kept off by default because it builds C++/asm.
 mlas = ["dep:mlas-sys"]
+tracing = ["dep:onnx-runtime-tracer"]
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }
@@ -19,7 +20,7 @@ onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
 mlas-sys = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
-onnx-runtime-tracer = { workspace = true }
+onnx-runtime-tracer = { workspace = true, optional = true }
 thiserror = { workspace = true }
 half = "2"
 rayon = "1"
