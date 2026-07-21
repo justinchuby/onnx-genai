@@ -4,9 +4,26 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-21T05:00Z — native CUDA fp16 decode **stacked to 558 tok/s** on H200 (coherent, 0 fallbacks, greedy tokens bit-identical), up from 344, closing ~85% of the gap to ORT-genai's 657. Three profiler-guided kernel levers landed (vectorized fp16×int4 GEMV, true multi-CTA split-K flash decode, parallel multi-block argmax) plus segmented CUDA-graph capture (whole-subgraph claim + clean mid-capture failure recovery). CI hardening in flight (test coverage 6→27 crates; warnings-as-errors)._
+_Last updated: 2026-07-21T08:25Z — native CUDA fp16 decode wave-2 **stacked to 663–672 tok/s** on H200 (0 fallbacks, token-identical), up from ~556 entering the wave and **beating ORT-genai's 657 tok/s**. CI now tests and warning-gates all 27 pure-offline crates (1,921 tests) across Linux x86_64, Windows x86_64/ARM64, and macOS ARM64._
 
-**Current `origin/main` implementation HEAD:** `e20e438`.
+**Current `origin/main` implementation HEAD:** `f099215`.
+
+## 2026-07-21 — Native CUDA fp16 decode wave-2 beats ORT (556 → 671 tok/s)
+
+Three disjoint ep-cuda kernel levers landed for Qwen2.5-0.5B int4 decode on H200. Each is bit-exact / token-identical, CUDA-graph-capture-safe (**0 fallbacks**), and portable across SM architectures (**sm_53+**, with no sm_90-only intrinsics; verified fast on consumer GPUs including RTX 4060 sm_89). **Stacked result (warmups=3, runs=5): 663–672 tok/s**, up from ~556 entering wave-2 and 344 at the start of the fp16 campaign — **beating the identical-model ORT-genai reference of 657 tok/s.**
+
+- **Warp-shuffle fp16 skip-RMSNorm ✅ (`5817cb0`):** replaced the one-CTA shared-memory reduction tree with a single-warp `__shfl` reduction and `half2` loads. `skip_rmsnorm_f16` improved **6.2 → 5.07 µs/call**; ~583 tok/s solo.
+- **GQA decode prep-chain fusion ✅ (`95b041d`):** fused split + BSH→BNSH transpose + in-place K/V cache append + Q/K RoPE into one kernel, and dropped the trailing output transpose for Sq=1. Prep launches fell **192 → 48/token (−75%)**; end-to-end **557 → 615 tok/s** with byte-identical parity.
+- **Down-projection GEMV specialization ✅ (`f099215`):** specialized the K=4864/N=896 shape with a warp output tile and shared activation staging while leaving the other four projection families on the unchanged general kernel. Down-proj improved **10.24 → 7.28 µs/call**, matching ORT's 7.39 µs; other shapes stayed flat.
+- **Roofline context:** decode is launch/occupancy-bound, not HBM-bound — GEMV sustains only ~9% of H200 peak bandwidth. The realistic architecture ceiling for this graph shape is ~700–770 tok/s, leaving headroom through deeper operator/graph fusion.
+
+## 2026-07-21 — CI coverage expanded to 27 crates + warnings-as-errors
+
+- **Pure-offline coverage ✅ (`398fd8e`, `bf52524`, `d2b5bbd`):** expanded `cargo test` from 6 to **27 pure-offline crates**, now running **1,921 tests**, with blocking clippy across the same 27-crate set.
+- **Warnings-as-errors ✅:** the test job now runs with `RUSTFLAGS=-D warnings`, and clippy blocks with `-- -D warnings`; the former advisory clippy lane was removed.
+- **Native Windows ARM64 ✅:** added a `windows-11-arm` / `aarch64-pc-windows-msvc` lane under the same warnings gate. CI now covers Linux x86_64, Windows x86_64, Windows ARM64, and macOS ARM64.
+- **Formatting remains advisory:** `cargo fmt` intentionally retains `continue-on-error` pending a separate repo-wide formatting sweep.
+- **Deferred:** `onnx-runtime-ep-cuda` remains compile-checked only, not yet warnings-gated, and carries ~21 clippy warnings. Clean-up and gating follow after the performance campaign settles.
 
 ## 2026-07-21 — fp16 decode wave-1 perf campaign (344 → 558 tok/s) + segmented capture
 
