@@ -724,6 +724,25 @@ pub struct PipelineStrategy {
     #[schemars(range(min = 1))]
     #[serde(default)]
     pub num_code_groups: Option<usize>,
+
+    /// Optional pre-embedder component driving the outer decoder (talker) of a
+    /// `nested_autoregressive` stage through `inputs_embeds` instead of
+    /// `input_ids`.
+    ///
+    /// A real Qwen3-TTS talker is not driven by token ids: each step's
+    /// `inputs_embeds` is materialized from the PREVIOUS frame's codes as
+    /// `codec_sum(+ text_embed)` (where
+    /// `codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).
+    /// When this field names such a component (inputs
+    /// `frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,
+    /// hidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds
+    /// the outer decoder's per-step `inputs_embeds` through it, keeping the engine
+    /// generic. Requires a dataflow edge
+    /// `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.
+    ///
+    /// When absent the outer loop is `input_ids`-driven (backward compatible).
+    #[serde(default)]
+    pub pre_embedder: Option<String>,
 }
 
 /// Named child stage of a composite pipeline strategy.

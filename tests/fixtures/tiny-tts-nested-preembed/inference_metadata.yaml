@@ -1,0 +1,65 @@
+# Tiny PRE-EMBEDDER-DRIVEN nested-autoregressive (multi-decoder TTS) fixture.
+# Built by scripts/build_tiny_tts_nested_preembed.py; exercises the OPTIONAL
+# `pre_embedder` extension of the nested_autoregressive contract (DESIGN.md
+# §20.3). The outer `talker` is driven by `inputs_embeds` materialized each frame
+# from the PREVIOUS frame's codes by `talker_step_embedder` (a codec-sum
+# pre-embedder: frame_codes[+text_embed] -> inputs_embeds), NOT by input_ids.
+# The engine feeds text_embed zeros for now (real trailing-text/prefill embeds
+# are a documented follow-up). The inner code_predictor loop is unchanged.
+pipeline:
+  models:
+    talker:
+      filename: talker.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+    talker_step_embedder:
+      filename: talker_step_embedder.onnx.textproto
+      type: embedding
+    code_predictor:
+      filename: code_predictor.onnx.textproto
+      type: decoder
+    vocoder:
+      filename: vocoder.onnx.textproto
+      type: vocoder
+  dataflow:
+    # Per-step pre-embedder feed: the talker's inputs_embeds each frame.
+    - from: talker_step_embedder.inputs_embeds
+      to: talker.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+    # Per-frame hidden binding: inner step 0 seed.
+    - from: talker.last_hidden_state
+      to: code_predictor.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+    # Assembled per-frame codes -> vocoder.
+    - from: talker.output_codes
+      to: vocoder.codes
+      dtype: int64
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: generate_codes
+        strategy:
+          kind: nested_autoregressive
+          outer: talker
+          inner: code_predictor
+          pre_embedder: talker_step_embedder
+          num_code_groups: 4
+          max_tokens: 3
+        run_on: every_step
+      - name: vocode
+        strategy:
+          kind: single_pass
+          model: vocoder
+        run_on: final_only
+  phases:
+    talker:
+      run_on: every_step
+    talker_step_embedder:
+      run_on: on_demand
+    code_predictor:
+      run_on: every_step
+    vocoder:
+      run_on: final_only

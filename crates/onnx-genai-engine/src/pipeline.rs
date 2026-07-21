@@ -486,7 +486,10 @@ impl PipelineEngine {
 
         // Fixed routed extras for each decoder (encoder conditioning etc.). The
         // inner decoder's seed input is threaded per inner step, so exclude it.
-        let outer_extras = self.decoder_extra_inputs(&plan.outer, &tensors, None)?;
+        // In pre-embedder mode the outer decoder's per-step `inputs_embeds` is
+        // built each frame (not a fixed routed extra), so exclude it too.
+        let outer_extra_exclude = plan.pre_embedder.as_ref().map(|p| p.outer_input.as_str());
+        let outer_extras = self.decoder_extra_inputs(&plan.outer, &tensors, outer_extra_exclude)?;
         let inner_extras =
             self.decoder_extra_inputs(&plan.inner, &tensors, Some(&plan.inner_embeds_input))?;
 
@@ -498,6 +501,80 @@ impl PipelineEngine {
             .models
             .session(&plan.inner)
             .with_context(|| format!("nested inner decoder '{}' was not loaded", plan.inner))?;
+
+        // Resolve the pre-embedder session and its input ports (sessions are not
+        // available at plan-build time, so this is done here). `frame_codes` is
+        // the sole int64 input (or one named `frame_codes`); the optional
+        // `text_embed` trailing-text input is a second float input.
+        let pre_embed = match plan.pre_embedder.as_ref() {
+            Some(binding) => {
+                let session = self.models.session(&binding.component).with_context(|| {
+                    format!("nested pre_embedder '{}' was not loaded", binding.component)
+                })?;
+                let frame_codes_input = session
+                    .inputs()
+                    .iter()
+                    .find(|info| info.name == "frame_codes")
+                    .or_else(|| {
+                        session
+                            .inputs()
+                            .iter()
+                            .find(|info| info.dtype == DataType::Int64)
+                    })
+                    .map(|info| info.name.clone())
+                    .with_context(|| {
+                        format!(
+                            "nested pre_embedder '{}' must expose an int64 'frame_codes' input",
+                            binding.component
+                        )
+                    })?;
+                let text_embed_input = session
+                    .inputs()
+                    .iter()
+                    .find(|info| {
+                        info.name != frame_codes_input
+                            && (info.name == "text_embed"
+                                || matches!(
+                                    info.dtype,
+                                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                                ))
+                    })
+                    .map(|info| info.name.clone());
+                // Hidden size for the per-step embedding / zero `text_embed`:
+                // prefer the outer decoder's `inputs_embeds` input, fall back to
+                // the pre-embedder's `inputs_embeds` output.
+                let hidden = outer_session
+                    .inputs()
+                    .iter()
+                    .find(|info| info.name == binding.outer_input)
+                    .and_then(|info| info.shape.last().copied())
+                    .filter(|dim| *dim > 0)
+                    .or_else(|| {
+                        session
+                            .outputs()
+                            .iter()
+                            .find(|info| info.name.to_ascii_lowercase().ends_with("inputs_embeds"))
+                            .and_then(|info| info.shape.last().copied())
+                            .filter(|dim| *dim > 0)
+                    })
+                    .map(|dim| dim as usize)
+                    .with_context(|| {
+                        format!(
+                            "could not determine hidden size for nested pre_embedder '{}' \
+                             (outer '{}' input '{}' has no static last dim)",
+                            binding.component, plan.outer, binding.outer_input
+                        )
+                    })?;
+                Some(ResolvedPreEmbedder {
+                    session,
+                    outer_input: binding.outer_input.clone(),
+                    frame_codes_input,
+                    text_embed_input,
+                    hidden,
+                })
+            }
+            None => None,
+        };
 
         // The inner decoder's per-code embedding output: its sole output that is
         // neither logits nor a present-KV tensor. Threaded into the next inner
@@ -524,17 +601,47 @@ impl PipelineEngine {
         // previous frame's outer argmax token on each subsequent frame.
         let mut outer_input_tokens = prompt_tokens.clone();
         let mut outer_past_len = 0usize;
+        // Pre-embedder mode only: the previous frame's assembled code tuple
+        // `[outer_code_0, inner_code_1, ..., inner_code_{G-1}]`, used to build the
+        // next frame's `inputs_embeds`. `None` on frame 0 (prefill).
+        let mut prev_frame_codes: Option<Vec<i64>> = None;
 
         for _frame in 0..plan.max_frames {
             // --- Outer talker step: one audio frame. ---
-            let outer_outputs = run_decode_step_with_extra(
-                outer_session,
-                &mut outer_state,
-                &outer_input_tokens,
-                outer_past_len,
-                &outer_extras,
-            )?;
-            outer_past_len += outer_input_tokens.len();
+            let outer_outputs = if let Some(pre) = &pre_embed {
+                // Build this frame's `frame_codes` from the previous frame's code
+                // tuple (frame 0 uses a zero seed — real prompt-embeds prefill is
+                // a follow-up), run the pre-embedder to materialize the talker's
+                // `inputs_embeds`, and feed it as a single-position extra input.
+                let frame_codes = prev_frame_codes
+                    .clone()
+                    .unwrap_or_else(|| vec![0i64; plan.num_code_groups]);
+                let inputs_embeds = run_pre_embedder(pre, &frame_codes)?;
+                let mut step_extras = Vec::with_capacity(outer_extras.len() + 1);
+                for (name, value) in &outer_extras {
+                    step_extras.push((name.clone(), clone_value(value)?));
+                }
+                step_extras.push((pre.outer_input.clone(), inputs_embeds));
+                let outputs = run_decode_step_with_extra(
+                    outer_session,
+                    &mut outer_state,
+                    &[0],
+                    outer_past_len,
+                    &step_extras,
+                )?;
+                outer_past_len += 1;
+                outputs
+            } else {
+                let outputs = run_decode_step_with_extra(
+                    outer_session,
+                    &mut outer_state,
+                    &outer_input_tokens,
+                    outer_past_len,
+                    &outer_extras,
+                )?;
+                outer_past_len += outer_input_tokens.len();
+                outputs
+            };
 
             let outer_logits = named_output(outer_session, &outer_outputs, "logits", true)?;
             let outer_token = argmax_last_row(outer_logits)?;
@@ -551,6 +658,7 @@ impl PipelineEngine {
             // --- Inner code_predictor loop: num_code_groups residual codes. ---
             let mut inner_state = DecodeState::new(inner_session)?;
             let mut inner_embeds = seed;
+            let mut frame_inner_codes: Vec<i64> = Vec::with_capacity(plan.num_code_groups);
             for step in 0..plan.num_code_groups {
                 let mut step_extras = Vec::with_capacity(inner_extras.len() + 1);
                 for (name, value) in &inner_extras {
@@ -566,7 +674,9 @@ impl PipelineEngine {
                     &step_extras,
                 )?;
                 let inner_logits = named_output(inner_session, &inner_outputs, "logits", true)?;
-                codes.push(argmax_last_row(inner_logits)?);
+                let inner_code = argmax_last_row(inner_logits)?;
+                codes.push(inner_code);
+                frame_inner_codes.push(inner_code);
                 // Thread the inner decoder's per-code embedding into the next step.
                 inner_embeds = clone_value(named_output(
                     inner_session,
@@ -574,6 +684,17 @@ impl PipelineEngine {
                     &inner_embed_output,
                     false,
                 )?)?;
+            }
+
+            // Pre-embedder mode: remember this frame's code tuple for the next
+            // frame's `frame_codes`: the talker's own code as group 0 and the
+            // inner residuals for groups 1..G-1 (matching the real Qwen3-TTS
+            // layout where code_0 comes from the talker, not the code predictor).
+            if pre_embed.is_some() {
+                let mut tuple = Vec::with_capacity(plan.num_code_groups);
+                tuple.push(outer_token);
+                tuple.extend_from_slice(&frame_inner_codes[1..]);
+                prev_frame_codes = Some(tuple);
             }
         }
 
@@ -1711,6 +1832,18 @@ struct AutoregressivePlan {
 /// `{outer}.output_codes` of shape `[1, frames, num_code_groups]` (int64), routed
 /// to a post-decode `final_only` vocoder stage by a dataflow edge (e.g.
 /// `talker.output_codes -> vocoder.codes`).
+///
+/// ## Pre-embedder mode (optional, backward compatible)
+///
+/// By default the outer talker is `input_ids`-driven (frame 0 = prompt tokens,
+/// later frames = the talker's previous argmax token). When `pre_embedder` is
+/// set, the talker is instead driven by `inputs_embeds` materialized each frame
+/// from the PREVIOUS frame's codes `[outer_code_0, inner_code_1, ...,
+/// inner_code_{num_code_groups-1}]` through a codec-sum pre-embedder component
+/// (`frame_codes [+ text_embed] -> inputs_embeds`), matching the real Qwen3-TTS
+/// talker. This keeps the engine generic: the codec-sum construction lives in an
+/// ONNX component, not in Rust. See [`PreEmbedderBinding`]. The inner loop is
+/// unchanged in both modes.
 #[derive(Debug, Clone)]
 struct NestedAutoregressivePlan {
     /// Outer decoder component (talker); one outer step == one audio frame.
@@ -1732,7 +1865,36 @@ struct NestedAutoregressivePlan {
     /// Post-decode components (`final_only`, e.g. a vocoder), run once after the
     /// outer loop over the shared pool (which holds `{outer}.output_codes`).
     post_decode_components: Vec<String>,
+    /// Optional pre-embedder binding driving the outer talker via
+    /// `inputs_embeds` (materialized codec-sum embedder) instead of `input_ids`.
+    ///
+    /// When `None` the outer loop is `input_ids`-driven and behaves exactly as
+    /// before (backward compatible). When `Some`, each outer frame builds the
+    /// talker's per-step `inputs_embeds` from the PREVIOUS frame's codes through
+    /// the named pre-embedder component (see [`PreEmbedderBinding`]).
+    pre_embedder: Option<PreEmbedderBinding>,
     dataflow: Vec<DataflowEdge>,
+}
+
+/// Wiring for a pre-embedder that drives the outer talker's per-step
+/// `inputs_embeds` in a [`NestedAutoregressivePlan`].
+///
+/// The real Qwen3-TTS talker consumes `inputs_embeds` (not `input_ids`), built
+/// each step from the previous frame's codes as `codec_sum(+ text_embed)`. On the
+/// Mobius side that construction is materialized into an ONNX component with
+/// inputs `frame_codes [batch, num_code_groups]` int64 (`[+ text_embed [batch, 1,
+/// hidden]]`) → output `inputs_embeds [batch, 1, hidden]`. This binding records
+/// the component name and the outer decoder input port fed by it; the exact
+/// pre-embedder input names are resolved from its loaded session at drive time
+/// (sessions are not available at plan-build time).
+#[derive(Debug, Clone)]
+struct PreEmbedderBinding {
+    /// Pre-embedder component name (a declared model).
+    component: String,
+    /// Outer decoder input port that receives the per-step embeddings
+    /// (`inputs_embeds`), from the required dataflow edge
+    /// `{component}.inputs_embeds -> {outer}.inputs_embeds`.
+    outer_input: String,
 }
 
 /// One forward invocation of a single model with no runtime-managed loop.
@@ -3205,12 +3367,58 @@ impl PipelinePlan {
         // (the sole non-logits, non-KV output), since sessions are not available
         // at plan-build time.
 
+        // Optional pre-embedder driving the outer talker via `inputs_embeds`
+        // (materialized codec-sum embedder) instead of `input_ids`. When set it
+        // must be a declared model, distinct from the loop decoders, and wired to
+        // the outer decoder by a dataflow edge
+        // `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.
+        let pre_embedder = match nested.pre_embedder.as_deref() {
+            Some(name) => {
+                if !spec.models.contains_key(name) {
+                    anyhow::bail!(
+                        "nested_autoregressive pre_embedder '{name}' is not declared in models"
+                    );
+                }
+                if name == outer || name == inner {
+                    anyhow::bail!(
+                        "nested_autoregressive pre_embedder '{name}' must be distinct from the \
+                         outer/inner decoders"
+                    );
+                }
+                let edge = spec
+                    .dataflow
+                    .iter()
+                    .find(|edge| {
+                        endpoint_component(&edge.from) == Some(name)
+                            && endpoint_component(&edge.to) == Some(outer.as_str())
+                    })
+                    .with_context(|| {
+                        format!(
+                            "nested_autoregressive pre_embedder '{name}' needs a per-step feed: a \
+                             dataflow edge '{name}.inputs_embeds -> {outer}.inputs_embeds'"
+                        )
+                    })?;
+                let (_, outer_input) = parse_endpoint(&edge.to)?;
+                Some(PreEmbedderBinding {
+                    component: name.to_string(),
+                    outer_input: outer_input.to_string(),
+                })
+            }
+            None => None,
+        };
+        let pre_embedder_component = pre_embedder.as_ref().map(|p| p.component.clone());
+
         // Prompt-phase (`prompt_only`) and post-decode (`final_only`) components,
         // treating both loop decoders as loop components (neither pre nor post).
         let mut prompt_components = Vec::new();
         let mut post_decode_components = Vec::new();
         for component in topological_components(spec)? {
             if component == outer || component == inner {
+                continue;
+            }
+            // The pre-embedder is driven per-frame inside the outer loop, not as a
+            // prompt/final stage — exclude it from phase classification.
+            if pre_embedder_component.as_deref() == Some(component.as_str()) {
                 continue;
             }
             match component_phase(spec, &component, &outer) {
@@ -3236,6 +3444,7 @@ impl PipelinePlan {
             inner_embeds_input,
             prompt_components,
             post_decode_components,
+            pre_embedder,
             dataflow: spec.dataflow.clone(),
         }))
     }
@@ -3675,6 +3884,77 @@ fn last_position_hidden(hidden: &Value) -> anyhow::Result<Value> {
         .map_err(|e| anyhow::anyhow!("failed to build inner seed embedding: {e}"))
 }
 
+/// A [`PreEmbedderBinding`] resolved against its loaded session for driving —
+/// the codec-sum pre-embedder that materializes the outer talker's per-step
+/// `inputs_embeds` from the previous frame's codes.
+struct ResolvedPreEmbedder<'a> {
+    /// Loaded pre-embedder session.
+    session: &'a Session,
+    /// Outer decoder input port fed the per-step embeddings (`inputs_embeds`).
+    outer_input: String,
+    /// Pre-embedder input receiving the previous frame's codes (int64 `[1, G]`).
+    frame_codes_input: String,
+    /// Optional trailing-text input; fed zeros for now (documented follow-up).
+    text_embed_input: Option<String>,
+    /// Embedding hidden size for the emitted `inputs_embeds` / zero `text_embed`.
+    hidden: usize,
+}
+
+/// Build the outer talker's per-step `inputs_embeds` by running the codec-sum
+/// pre-embedder over one frame's `frame_codes` (`[outer_code_0, inner_code_1,
+/// ..., inner_code_{G-1}]`). Returns a `[1, 1, hidden]` embedding.
+///
+/// TODO(any-to-any): the pre-embedder's `text_embed` (trailing-text
+/// conditioning) input is fed a zero `[1, 1, hidden]` tensor for now. Real
+/// trailing-text threading (and full prefill-embeds materialization on frame 0)
+/// is a deliberate follow-up.
+fn run_pre_embedder(pre: &ResolvedPreEmbedder<'_>, frame_codes: &[i64]) -> anyhow::Result<Value> {
+    let mut inputs: Vec<(String, Value)> = Vec::with_capacity(2);
+    inputs.push((
+        pre.frame_codes_input.clone(),
+        Value::from_slice_i64(frame_codes, &[1, frame_codes.len() as i64])?,
+    ));
+    if let Some(name) = &pre.text_embed_input {
+        let dtype = pre
+            .session
+            .inputs()
+            .iter()
+            .find(|info| &info.name == name)
+            .map(|info| info.dtype)
+            .unwrap_or(DataType::Float32);
+        let zeros = vec![0.0f32; pre.hidden];
+        inputs.push((
+            name.clone(),
+            Value::from_f32_slice_as(&zeros, &[1, 1, pre.hidden as i64], dtype)
+                .map_err(|e| anyhow::anyhow!("failed to build zero text_embed: {e}"))?,
+        ));
+    }
+    let refs = inputs
+        .iter()
+        .map(|(name, value)| (name.as_str(), value))
+        .collect::<Vec<_>>();
+    let outputs = pre
+        .session
+        .run(&refs)
+        .map_err(|e| anyhow::anyhow!("ORT pre-embedder run failed: {e}"))?;
+    let index = pre
+        .session
+        .output_names()
+        .iter()
+        .position(|name| name == "inputs_embeds")
+        .or_else(|| {
+            pre.session
+                .output_names()
+                .iter()
+                .position(|name| name.to_ascii_lowercase().ends_with("inputs_embeds"))
+        })
+        .unwrap_or(0);
+    let value = outputs
+        .get(index)
+        .context("pre-embedder produced no inputs_embeds output")?;
+    clone_value(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3934,6 +4214,7 @@ pipeline:
                 outer: None,
                 inner: None,
                 num_code_groups: None,
+                pre_embedder: None,
                 stages: vec![
                     PipelineStrategyStage {
                         name: "encode".to_string(),
@@ -3959,6 +4240,7 @@ pipeline:
                             outer: None,
                             inner: None,
                             num_code_groups: None,
+                            pre_embedder: None,
                             stages: vec![],
                         }),
                         run_on: Some(PhaseRunOn::PromptOnly),
@@ -3987,6 +4269,7 @@ pipeline:
                             outer: None,
                             inner: None,
                             num_code_groups: None,
+                            pre_embedder: None,
                             stages: vec![],
                         }),
                         run_on: Some(PhaseRunOn::EveryStep),
@@ -4047,6 +4330,7 @@ pipeline:
             outer: None,
             inner: None,
             num_code_groups: None,
+            pre_embedder: None,
             stages: vec![],
         }
     }
