@@ -90,9 +90,53 @@ const ACTIVITY_RECORD_ALIGNMENT: usize = 8;
 /// larger buffer is simpler and fine for Phase 1).
 const ACTIVITY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
-/// CUDA 13 CUPTI sonames, tried through the platform loader before pip-wheel
-/// paths. The unversioned name is a fallback for toolkit/devel installations.
-const LIBCUPTI_SONAMES: &[&str] = &["libcupti.so.13", "libcupti.so"];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetOs {
+    Linux,
+    Macos,
+    Windows,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetArch {
+    Aarch64,
+    Other,
+}
+
+fn target_os() -> TargetOs {
+    if cfg!(target_os = "linux") {
+        TargetOs::Linux
+    } else if cfg!(target_os = "macos") {
+        TargetOs::Macos
+    } else if cfg!(target_os = "windows") {
+        TargetOs::Windows
+    } else {
+        TargetOs::Other
+    }
+}
+
+fn target_arch() -> TargetArch {
+    if cfg!(target_arch = "aarch64") {
+        TargetArch::Aarch64
+    } else {
+        TargetArch::Other
+    }
+}
+
+/// CUPTI library names tried through the platform loader before package paths.
+fn libcupti_names_for(os: TargetOs) -> &'static [&'static str] {
+    match os {
+        TargetOs::Linux => &["libcupti.so.13", "libcupti.so.12", "libcupti.so"],
+        TargetOs::Macos => &["libcupti.dylib"],
+        TargetOs::Windows => &["cupti64_13.dll", "cupti64_12.dll", "cupti.dll"],
+        TargetOs::Other => &[],
+    }
+}
+
+fn cupti_supported(os: TargetOs, arch: TargetArch) -> bool {
+    !(os == TargetOs::Windows && arch == TargetArch::Aarch64)
+}
 
 // --- FFI signatures ----------------------------------------------------------
 
@@ -180,7 +224,7 @@ struct LoadedCuptiLibrary {
 
 /// Inject extra library search roots (typically Python `sys.path` entries and
 /// the loaded extension module's directory) that the CUPTI loader should probe
-/// for the pip layout `<root>/nvidia/cuda_cupti/lib/libcupti.so*`.
+/// for the pip layout `<root>/nvidia/cuda_cupti/{lib,bin}/<platform name>`.
 ///
 /// This is the runtime-agnostic seam the Python binding uses: the tracer never
 /// depends on PyO3, it just accepts a plain `Vec<PathBuf>`. Call this **once, at
@@ -194,6 +238,16 @@ pub fn set_search_paths(paths: Vec<PathBuf>) {
 fn cupti_library() -> std::result::Result<&'static LoadedCuptiLibrary, &'static CuptiLoadError> {
     CUPTI_LIBRARY
         .get_or_init(|| {
+            let os = target_os();
+            let arch = target_arch();
+            if !cupti_supported(os, arch) {
+                return Err(CuptiLoadError {
+                    attempted: Vec::new(),
+                    cause: "CUPTI is unavailable on Windows ARM64 because NVIDIA ships \
+                            x64-only CUPTI libraries; GPU profiling is disabled"
+                        .to_string(),
+                });
+            }
             let candidates = libcupti_candidates();
             let mut last_error = None;
             let mut attempted = Vec::new();
@@ -238,10 +292,10 @@ fn required_symbol<T: Copy>(loaded: &LoadedCuptiLibrary, name: &'static [u8]) ->
 /// Build the runtime search list for CUDA 13 CUPTI.
 ///
 /// In addition to the normal loader path, NVIDIA's pip package installs CUPTI
-/// below `site-packages/nvidia/cuda_cupti/lib`. Python locations are derived at
-/// runtime from injected `sys.path` roots (see [`set_search_paths`]), explicit
-/// environment hints, `PYTHONPATH`, and likely interpreter prefixes; no
-/// build-machine path is embedded in the binary.
+/// below `site-packages/nvidia/cuda_cupti/lib` on Unix and `bin` on Windows.
+/// Python locations are derived at runtime from injected `sys.path` roots (see
+/// [`set_search_paths`]), explicit environment hints, `PYTHONPATH`, and likely
+/// interpreter prefixes; no build-machine path is embedded in the binary.
 fn libcupti_candidates() -> Vec<PathBuf> {
     let injected = INJECTED_SEARCH_PATHS.get().map(Vec::as_slice).unwrap_or(&[]);
     collect_libcupti_candidates(injected)
@@ -251,7 +305,22 @@ fn libcupti_candidates() -> Vec<PathBuf> {
 /// site-packages roots, plus the process environment, produce the ordered list
 /// of `libcupti` paths to try.
 fn collect_libcupti_candidates(injected: &[PathBuf]) -> Vec<PathBuf> {
-    let mut candidates = LIBCUPTI_SONAMES.iter().map(PathBuf::from).collect::<Vec<_>>();
+    collect_libcupti_candidates_for(injected, target_os(), target_arch())
+}
+
+fn collect_libcupti_candidates_for(
+    injected: &[PathBuf],
+    os: TargetOs,
+    arch: TargetArch,
+) -> Vec<PathBuf> {
+    if !cupti_supported(os, arch) {
+        return Vec::new();
+    }
+
+    let mut candidates = libcupti_names_for(os)
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
     let mut site_packages = Vec::new();
 
     // Injected roots (e.g. the Python interpreter's real `sys.path` and the
@@ -288,7 +357,7 @@ fn collect_libcupti_candidates(injected: &[PathBuf]) -> Vec<PathBuf> {
         discover_site_packages(&prefix, &mut site_packages);
     }
     for root in site_packages {
-        push_pip_cupti_candidates(&root, &mut candidates);
+        push_pip_cupti_candidates(&root, os, &mut candidates);
     }
     candidates
 }
@@ -306,9 +375,10 @@ fn discover_site_packages(prefix: &Path, roots: &mut Vec<PathBuf>) {
     }
 }
 
-fn push_pip_cupti_candidates(site_packages: &Path, candidates: &mut Vec<PathBuf>) {
-    let library_dir = site_packages.join("nvidia/cuda_cupti/lib");
-    for soname in LIBCUPTI_SONAMES {
+fn push_pip_cupti_candidates(site_packages: &Path, os: TargetOs, candidates: &mut Vec<PathBuf>) {
+    let library_subdir = if os == TargetOs::Windows { "bin" } else { "lib" };
+    let library_dir = site_packages.join("nvidia/cuda_cupti").join(library_subdir);
+    for soname in libcupti_names_for(os) {
         let candidate = library_dir.join(soname);
         if !candidates.contains(&candidate) {
             candidates.push(candidate);
@@ -1099,20 +1169,47 @@ mod tests {
     }
 
     #[test]
-    fn pip_wheel_candidates_use_cuda_13_layout() {
-        let mut candidates = Vec::new();
-        push_pip_cupti_candidates(Path::new("/venv/lib/python3.12/site-packages"), &mut candidates);
+    fn generates_per_os_cupti_names() {
         assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from(
-                    "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so.13"
-                ),
-                PathBuf::from(
-                    "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so"
-                ),
-            ]
+            libcupti_names_for(TargetOs::Linux),
+            ["libcupti.so.13", "libcupti.so.12", "libcupti.so"]
         );
+        assert_eq!(libcupti_names_for(TargetOs::Macos), ["libcupti.dylib"]);
+        assert_eq!(
+            libcupti_names_for(TargetOs::Windows),
+            ["cupti64_13.dll", "cupti64_12.dll", "cupti.dll"]
+        );
+        assert!(libcupti_names_for(TargetOs::Other).is_empty());
+    }
+
+    #[test]
+    fn pip_wheel_candidates_use_per_os_layout() {
+        let site_packages = Path::new("/venv/lib/python3.12/site-packages");
+        let mut linux = Vec::new();
+        push_pip_cupti_candidates(site_packages, TargetOs::Linux, &mut linux);
+        assert_eq!(
+            linux[0],
+            PathBuf::from(
+                "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/lib/libcupti.so.13"
+            )
+        );
+
+        let mut windows = Vec::new();
+        push_pip_cupti_candidates(site_packages, TargetOs::Windows, &mut windows);
+        assert_eq!(
+            windows[0],
+            PathBuf::from(
+                "/venv/lib/python3.12/site-packages/nvidia/cuda_cupti/bin/cupti64_13.dll"
+            )
+        );
+    }
+
+    #[test]
+    fn windows_arm64_degrades_to_unavailable() {
+        assert!(
+            collect_libcupti_candidates_for(&[], TargetOs::Windows, TargetArch::Aarch64).is_empty()
+        );
+        assert!(cupti_supported(TargetOs::Windows, TargetArch::Other));
     }
 
     #[test]
@@ -1252,16 +1349,21 @@ mod tests {
     #[test]
     fn injected_site_packages_are_probed_with_pip_layout() {
         // Fix #2: a pip-style env where VIRTUAL_ENV/PYTHONPATH are irrelevant —
-        // discovery must still find libcupti under an injected site-packages
-        // root using the standard `nvidia/cuda_cupti/lib` layout.
+        // discovery must still find CUPTI under an injected site-packages root
+        // using the platform's standard `nvidia/cuda_cupti/{lib,bin}` layout.
         let base = std::env::temp_dir().join(format!(
             "nxrt-cupti-discovery-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let lib_dir = base.join("nvidia/cuda_cupti/lib");
+        let os = target_os();
+        let Some(library_name) = libcupti_names_for(os).first() else {
+            return;
+        };
+        let library_subdir = if os == TargetOs::Windows { "bin" } else { "lib" };
+        let lib_dir = base.join("nvidia/cuda_cupti").join(library_subdir);
         std::fs::create_dir_all(&lib_dir).expect("create dummy site-packages layout");
-        let dummy = lib_dir.join("libcupti.so.13");
+        let dummy = lib_dir.join(library_name);
         std::fs::write(&dummy, b"not a real library").expect("write dummy libcupti");
 
         let candidates = collect_libcupti_candidates(std::slice::from_ref(&base));
@@ -1281,7 +1383,15 @@ mod tests {
         // the OnceLock-backed discovery. Only one test sets the global.
         let base = std::env::temp_dir().join(format!("nxrt-cupti-inject-{}", std::process::id()));
         set_search_paths(vec![base.clone()]);
-        let expected = base.join("nvidia/cuda_cupti/lib/libcupti.so.13");
+        let expected = base
+            .join("nvidia/cuda_cupti")
+            .join(if cfg!(target_os = "windows") {
+                "bin/cupti64_13.dll"
+            } else if cfg!(target_os = "macos") {
+                "lib/libcupti.dylib"
+            } else {
+                "lib/libcupti.so.13"
+            });
         assert!(
             libcupti_candidates().contains(&expected),
             "set_search_paths did not reach the discovery list",
