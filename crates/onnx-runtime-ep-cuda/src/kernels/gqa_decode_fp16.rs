@@ -2,7 +2,7 @@
 //!
 //! This is the fp16 sibling of [`super::gqa_decode`]. Where the f32 kernel
 //! assigns **one warp per query row** (only ~4 CTAs/layer for Qwen's 14 heads),
-//! this kernel launches up to eight multi-warp CTAs per query head. Each CTA
+//! this kernel launches up to sixteen multi-warp CTAs per query head. Each CTA
 //! owns a contiguous KV slice and writes a partial online-softmax state; a
 //! second kernel merges those states in fixed split order. Q/K/V and the output
 //! are `__half`; every softmax statistic and value accumulator stays in fp32.
@@ -38,9 +38,13 @@
 //!     module-global allocation created when NVRTC loads the module, before
 //!     capture; per-CTA scratch is dynamic shared memory.
 //!   * Fixed launch geometry uses the maximum split count. The device-resident
-//!     valid length selects 1/2/4/8 active splits, so replay observes updated
+//!     valid length selects 1/2/4/8/16 active splits, so replay observes updated
 //!     lengths without a host round trip or graph update. Inactive split CTAs
 //!     return before loading Q/K/V.
+//!   * The worst-case module-global scratch is 2,129,920 bytes
+//!     (`256 rows * 16 splits * 130 floats * 4 bytes`). It is shared by all GQA
+//!     layers under the runtime's single-stream execution invariant; concurrent
+//!     streams would require per-stream scratch.
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -49,7 +53,7 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f16_v2";
+const MODULE_KEY: &str = "gqa_decode_attention_f16_v3";
 const ENTRY: &str = "gqa_decode_attention_f16";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
@@ -63,7 +67,7 @@ pub(super) const MAX_HEAD_DIM: usize = 128;
 /// the flash merge cheap (a 4-way reduction in shared memory).
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
-pub(super) const MAX_SPLITS: usize = 8;
+pub(super) const MAX_SPLITS: usize = 16;
 
 /// Whether the fp16 flash-decode kernel handles this shape. Single query token
 /// (`Sq=1`) with an **even** `head_dim` within [`MAX_HEAD_DIM`] (the `half2`
@@ -78,13 +82,15 @@ const DECODE_SRC: &str = r#"
 #define GQA_WARP_SIZE 32
 #define GQA_MAX_H2PL 2   // half2 slots per lane; head_dim <= 2 * 2 * 32 == 128
 #define GQA_MAX_HEAD_SIZE 128
-#define GQA_MAX_SPLITS 8
+#define GQA_MAX_SPLITS 16
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
 
 // Module globals are allocated when the NVRTC module is loaded, before graph
 // capture. All GQA layers share the same stream and therefore reuse this
-// scratch sequentially. Shapes above the row cap retain the old one-CTA path.
+// scratch sequentially. The 2,129,920-byte allocation is sized for the full
+// 256-row, 16-split worst case. Concurrent streams would need separate scratch.
+// Shapes above the row cap retain the old one-CTA path.
 __device__ __align__(16) float gqa_split_scratch[
     GQA_MAX_SCRATCH_ROWS * GQA_MAX_SPLITS * GQA_SCRATCH_STRIDE];
 
@@ -92,6 +98,7 @@ __device__ __forceinline__ int gqa_active_splits(const int sequence_length) {
     if (sequence_length <= 64) return 1;
     if (sequence_length <= 128) return 2;
     if (sequence_length <= 256) return 4;
+    if (sequence_length <= 512) return 8;
     return GQA_MAX_SPLITS;
 }
 
@@ -552,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn fp16_decode_kernel_matches_reference_softmax() {
+    fn fp16_decode_kernel_matches_reference_softmax_at_short_and_long_context() {
         let Some(runtime) = runtime() else {
             eprintln!("skipping CUDA GQA fp16 decode parity test: CUDA runtime unavailable");
             return;
@@ -626,7 +633,9 @@ mod tests {
         let mut worst_rel = 0.0f32;
         let mut all_finite = true;
         let allocations_before = runtime.allocation_counts();
-        for total in [1usize, 64, 65, 128, 129, 256, 257, 1023] {
+        // 1 exercises the single-active-split short path; 513 and 1023 exercise
+        // the new 16-split long-context path on both sides of a large span.
+        for total in [1usize, 64, 65, 128, 129, 256, 257, 512, 513, 1023] {
             let totals = [total as i32];
             // SAFETY: `totals_dev` holds `batch` i32 values.
             unsafe {
