@@ -1,10 +1,10 @@
-# onnx-rs Python bindings
+# onnx-std Python bindings
 
-`onnx_rs` is the Python extension for the `onnx-rs` ONNX serialization
+`onnx_std` is the Python extension for the `onnx-std` ONNX serialization
 library. It provides an opaque `Model` handle plus binary protobuf, readable
 text, protobuf JSON, and protobuf TextFormat round-trips.
 
-The distribution name is `onnx-rs`; the import name is `onnx_rs`, so it does
+The distribution name is `onnx-std`; the import name is `onnx_std`, so it does
 not collide with the `onnx` package.
 
 ## Install
@@ -29,23 +29,23 @@ The extension uses PyO3's stable ABI with a minimum CPython version of 3.10.
 ```python
 from pathlib import Path
 
-import onnx_rs
+import onnx_std
 
-model = onnx_rs.load_model("model.onnx")  # str, os.PathLike, or bytes
+model = onnx_std.load_model("model.onnx")  # str, os.PathLike, or bytes
 
-# onnx-rs readable text DSL
-text = onnx_rs.to_text(model)
-model_from_text = onnx_rs.from_text(text)
+# onnx-std readable text DSL
+text = onnx_std.to_text(model)
+model_from_text = onnx_std.from_text(text)
 
 # Canonical ONNX protobuf JSON
-json_document = onnx_rs.to_json(model)
-model_from_json = onnx_rs.from_json(json_document)
+json_document = onnx_std.to_json(model)
+model_from_json = onnx_std.from_json(json_document)
 
 # Protobuf TextFormat (.onnxtxt/.pbtxt)
-textproto = onnx_rs.to_textproto(model)
-model_from_textproto = onnx_rs.from_textproto(textproto)
+textproto = onnx_std.to_textproto(model)
+model_from_textproto = onnx_std.from_textproto(textproto)
 
-onnx_rs.save_model(model_from_textproto, Path("roundtrip.onnx"))
+onnx_std.save_model(model_from_textproto, Path("roundtrip.onnx"))
 ```
 
 The readable text DSL describes graph structure but intentionally replaces
@@ -55,7 +55,7 @@ protobuf when tensor bytes must be preserved.
 Raw protobuf bytes are accepted directly:
 
 ```python
-model = onnx_rs.load_model(Path("model.onnx").read_bytes())
+model = onnx_std.load_model(Path("model.onnx").read_bytes())
 ```
 
 Pass a filesystem path, rather than bytes, for models with external tensor

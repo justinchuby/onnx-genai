@@ -45,9 +45,9 @@ members = [
     # ── Distributed runtime: communicator + buffer ownership (new — see docs/COMMUNICATOR_BUFFER_IMPL.md) ──
     "crates/onnx-runtime-comm",
 
-    # ── onnx-rs standard library (new — see docs/ONNX_RS.md) ──
-    "crates/onnx-rs",
-    "crates/onnx-rs-python",
+    # ── onnx-std standard library (new — see docs/ONNX_RS.md) ──
+    "crates/onnx-std",
+    "crates/onnx-std-python",
 
     # ── FEASIBILITY SPIKE (see docs/MLAS_SYS_SPIKE.md) ──
     # Registered as a member so `cargo build -p mlas-sys` resolves, but kept
@@ -93,8 +93,8 @@ default-members = [
     "crates/onnx-genai-cli",
     "crates/onnx-runtime-protocol-trace",
     "crates/onnx-runtime-comm",
-    "crates/onnx-rs",
-    "crates/onnx-rs-python",
+    "crates/onnx-std",
+    "crates/onnx-std-python",
 ]
 
 [workspace.package]
@@ -139,8 +139,8 @@ onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-d
 onnx-runtime-protocol-trace = { path = "crates/onnx-runtime-protocol-trace", version = "=0.1.0-dev.3" }
 onnx-runtime-comm = { path = "crates/onnx-runtime-comm", version = "=0.1.0-dev.3" }
 
-# onnx-rs standard library (new — see docs/ONNX_RS.md)
-onnx-rs = { path = "crates/onnx-rs", version = "=0.1.0-dev.3" }
+# onnx-std standard library (new — see docs/ONNX_RS.md)
+onnx-std = { path = "crates/onnx-std", version = "=0.1.0-dev.3" }
 
 # External
 tokenizers = "0.21"

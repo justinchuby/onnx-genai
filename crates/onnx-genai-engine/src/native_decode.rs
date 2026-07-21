@@ -1479,7 +1479,7 @@ mod tests {
             graph.add_output(output);
         }
 
-        let model = onnx_rs::Model::new(graph).to_proto()?.encode_to_vec();
+        let model = onnx_std::Model::new(graph).to_proto()?.encode_to_vec();
         let session = InferenceSession::builder()
             .model_bytes(&model)
             .device(DevicePreference::Gpu { index: Some(0) })

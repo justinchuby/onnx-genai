@@ -555,12 +555,12 @@ impl Session {
 
         // Textproto fixtures (`*.textproto`) are git-friendly ONNX protobuf
         // TextFormat. ORT cannot read them from disk, so convert to binary bytes
-        // (via onnx-rs) and create the session from memory. Binary `.onnx` files
+        // (via onnx-std) and create the session from memory. Binary `.onnx` files
         // continue to load directly from the path. Textproto has no
         // model-directory context, so such fixtures must inline all weights.
         let model_bytes: Option<Vec<u8>> = if is_textproto_path(path) {
             let text = std::fs::read_to_string(path)?;
-            Some(onnx_rs::textproto::to_binary(&text).map_err(|err| {
+            Some(onnx_std::textproto::to_binary(&text).map_err(|err| {
                 OrtError::InvalidArgument(format!(
                     "failed to convert textproto model {}: {err}",
                     path.display()

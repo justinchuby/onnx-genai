@@ -1,4 +1,4 @@
-//! # `onnx-rs`
+//! # `onnx-std`
 //!
 //! A pure-Rust ONNX **standard library** — model I/O, textual format, and an
 //! extensible validator — built on the shared runtime IR. This is the first
@@ -6,16 +6,16 @@
 //!
 //! ## Relationship to the rest of the workspace
 //!
-//! `onnx-rs` does **not** define its own IR. Per ONNX_RS §4.1 ("Shared Crate"),
+//! `onnx-std` does **not** define its own IR. Per ONNX_RS §4.1 ("Shared Crate"),
 //! the `Graph` / `Node` / `Value` / `Tensor` / `WeightRef` types are reused
 //! verbatim from [`onnx_runtime_ir`], and the protobuf parse/encode stack is
-//! reused from [`onnx_runtime_loader`]. `onnx-rs` is the *standard-library*
+//! reused from [`onnx_runtime_loader`]. `onnx-std` is the *standard-library*
 //! layer on top: ergonomic model I/O, a human-readable text format, and a
 //! checker — the concerns the design assigns to the ONNX library rather than the
 //! inference runtime.
 //!
 //! ```text
-//! onnx-rs  ──(standard lib: load/save/print/check)
+//! onnx-std  ──(standard lib: load/save/print/check)
 //!    │
 //!    └─ depends on ─▶ onnx-runtime-ir      (shared Graph/Node/Value IR)
 //!    └─ depends on ─▶ onnx-runtime-loader  (protobuf serde + weight mmap)
@@ -46,12 +46,12 @@
 //! ## Example
 //!
 //! ```no_run
-//! let model = onnx_rs::load_model("model.onnx")?;
+//! let model = onnx_std::load_model("model.onnx")?;
 //! println!("{}", model.to_text());
 //! let report = model.validate();
 //! assert!(report.is_valid());
-//! onnx_rs::save_model(&model, "roundtrip.onnx")?;
-//! # Ok::<(), onnx_rs::Error>(())
+//! onnx_std::save_model(&model, "roundtrip.onnx")?;
+//! # Ok::<(), onnx_std::Error>(())
 //! ```
 
 #![forbid(unsafe_code)]

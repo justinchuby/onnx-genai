@@ -1754,13 +1754,13 @@ dependencies = [
  "onnx-genai-preprocess",
  "onnx-genai-runtime-config",
  "onnx-genai-scheduler",
- "onnx-rs",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "onnx-runtime-session",
  "onnx-runtime-tracer",
+ "onnx-std",
  "prost",
  "rand 0.9.5",
  "serde",
@@ -1817,7 +1817,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
- "onnx-rs",
+ "onnx-std",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1918,30 +1918,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "onnx-rs"
-version = "0.1.0-dev.3"
-dependencies = [
- "onnx-runtime-ir",
- "onnx-runtime-loader",
- "onnx-runtime-shape-inference",
- "prost",
- "prost-reflect",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "onnx-rs-python"
-version = "0.1.0-dev.3"
-dependencies = [
- "onnx-rs",
- "onnx-runtime-loader",
- "pyo3",
 ]
 
 [[package]]
@@ -2131,6 +2107,30 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "onnx-std"
+version = "0.1.0-dev.3"
+dependencies = [
+ "onnx-runtime-ir",
+ "onnx-runtime-loader",
+ "onnx-runtime-shape-inference",
+ "prost",
+ "prost-reflect",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "onnx-std-python"
+version = "0.1.0-dev.3"
+dependencies = [
+ "onnx-runtime-loader",
+ "onnx-std",
+ "pyo3",
 ]
 
 [[package]]

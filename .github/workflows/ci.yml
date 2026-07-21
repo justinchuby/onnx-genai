@@ -129,7 +129,7 @@ jobs:
           -p onnx-runtime-loader
           -p onnx-runtime-session
           -p onnx-runtime-tracer
-          -p onnx-rs
+          -p onnx-std
           -p onnx-runtime-shape-inference
           -p onnx-runtime-optimizer
           -p onnx-runtime-quantization

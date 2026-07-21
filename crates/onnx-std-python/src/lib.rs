@@ -1,8 +1,8 @@
-//! Python bindings for `onnx-rs` model serialization.
+//! Python bindings for `onnx-std` model serialization.
 
 use std::path::{Path, PathBuf};
 
-use ::onnx_rs as onnx;
+use ::onnx_std as onnx;
 use onnx::{Error as OnnxError, Model as OnnxModel};
 use onnx_runtime_loader::{LoaderError, ModelMetadata, load_model_bytes_with_weights};
 use pyo3::exceptions::{
@@ -15,7 +15,7 @@ use pyo3::types::{PyBytes, PyString};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// An opaque, owned ONNX model handle.
-#[pyclass(module = "onnx_rs", name = "Model")]
+#[pyclass(module = "onnx_std", name = "Model")]
 struct Model {
     inner: OnnxModel,
 }
@@ -83,14 +83,14 @@ fn save_model(model: PyRef<'_, Model>, path: &Bound<'_, PyAny>) -> PyResult<()> 
     })
 }
 
-/// Serialize a model using the human-readable onnx-rs text DSL.
+/// Serialize a model using the human-readable onnx-std text DSL.
 #[pyfunction]
 #[pyo3(signature = (model))]
 fn to_text(model: PyRef<'_, Model>) -> String {
     onnx::to_text(&model.inner)
 }
 
-/// Parse a model from the human-readable onnx-rs text DSL.
+/// Parse a model from the human-readable onnx-std text DSL.
 #[pyfunction]
 #[pyo3(signature = (source))]
 fn from_text(source: &str) -> PyResult<Model> {
@@ -99,9 +99,9 @@ fn from_text(source: &str) -> PyResult<Model> {
         .map_err(|error| {
             codec_error(
                 "parse",
-                "onnx-rs text",
+                "onnx-std text",
                 error,
-                "Pass text produced by onnx_rs.to_text(model), and correct the reported line.",
+                "Pass text produced by onnx_std.to_text(model), and correct the reported line.",
             )
         })
 }
@@ -133,7 +133,7 @@ fn from_json(source: &str) -> PyResult<Model> {
                 "ONNX JSON",
                 error,
                 "Pass a valid ONNX protobuf-JSON document, such as output from \
-                 onnx_rs.to_json(model).",
+                 onnx_std.to_json(model).",
             )
         })
 }
@@ -165,7 +165,7 @@ fn from_textproto(source: &str) -> PyResult<Model> {
                 "ONNX TextProto",
                 error,
                 "Pass valid protobuf TextFormat, such as output from \
-                 onnx_rs.to_textproto(model).",
+                 onnx_std.to_textproto(model).",
             )
         })
 }
@@ -298,15 +298,15 @@ fn codec_error(operation: &str, format: &str, error: OnnxError, fix: &str) -> Py
     ))
 }
 
-/// The `onnx_rs` Python module.
+/// The `onnx_std` Python module.
 #[pymodule]
-fn onnx_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn onnx_std(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
     m.add(
         "__doc__",
         PyString::new(
             m.py(),
-            "onnx_rs — Python bindings for onnx-rs model loading, saving, and string codecs.",
+            "onnx_std — Python bindings for onnx-std model loading, saving, and string codecs.",
         ),
     )?;
     m.add_class::<Model>()?;
@@ -360,18 +360,18 @@ mod tests {
     #[test]
     fn binary_bytes_load_preserves_model_metadata() {
         let mut model = tiny_model();
-        model.metadata.producer_name = "onnx-rs-python-test".to_string();
+        model.metadata.producer_name = "onnx-std-python-test".to_string();
         let path = std::env::current_dir()
             .expect("current directory")
             .join("target")
-            .join(format!("onnx_rs_python_{}.onnx", std::process::id()));
+            .join(format!("onnx_std_python_{}.onnx", std::process::id()));
         std::fs::create_dir_all(path.parent().expect("test output parent"))
             .expect("create test output directory");
         onnx::save_model(&model, &path).expect("save test model");
         let bytes = std::fs::read(&path).expect("read test model");
         let loaded = load_model_bytes(&bytes).expect("load model bytes");
         assert_eq!(loaded.graph.num_nodes(), 1);
-        assert_eq!(loaded.metadata.producer_name, "onnx-rs-python-test");
+        assert_eq!(loaded.metadata.producer_name, "onnx-std-python-test");
         let _ = std::fs::remove_file(path);
     }
 

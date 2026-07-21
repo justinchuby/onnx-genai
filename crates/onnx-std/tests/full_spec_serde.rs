@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use onnx_rs::{
+use onnx_std::{
     DeviceConfigurationProto, IntIntListEntryProto, Json, Model, NodeDeviceConfigurationProto,
     ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, Text, TextCodec, TextProto,
     load_model, save_model, simple_sharded_dim_proto,
@@ -314,7 +314,7 @@ fn full_spec_proto() -> ModelProto {
                 version: 1,
             },
         ],
-        producer_name: "onnx-rs-full-spec".into(),
+        producer_name: "onnx-std-full-spec".into(),
         producer_version: "1".into(),
         domain: "test.model".into(),
         model_version: 42,
@@ -603,22 +603,22 @@ fn every_bound_dtype_round_trips_typed_and_raw_payloads() {
     let node = model.graph.nodes.values().next().unwrap();
     assert!(matches!(
         node.attr("tensors"),
-        Some(onnx_rs::ir::Attribute::Tensors(values)) if values.len() == 1
+        Some(onnx_std::ir::Attribute::Tensors(values)) if values.len() == 1
     ));
     assert!(matches!(
         node.attr("sparse_tensors"),
-        Some(onnx_rs::ir::Attribute::SparseTensors(values)) if values.len() == 1
+        Some(onnx_std::ir::Attribute::SparseTensors(values)) if values.len() == 1
     ));
     assert!(matches!(
         node.attr("type_protos"),
-        Some(onnx_rs::ir::Attribute::TypeProtos(values)) if values.len() == 5
+        Some(onnx_std::ir::Attribute::TypeProtos(values)) if values.len() == 5
     ));
-    assert_eq!(onnx_rs::ir::DataType::Complex64.to_onnx(), 14);
-    assert_eq!(onnx_rs::ir::DataType::Complex128.to_onnx(), 15);
-    assert_eq!(onnx_rs::ir::DataType::Undefined.to_onnx(), 0);
-    assert_eq!(onnx_rs::ir::DataType::Float8E8M0.to_onnx(), 24);
-    assert_eq!(onnx_rs::ir::DataType::Uint2.storage_bytes(5), 2);
-    assert_eq!(onnx_rs::ir::DataType::Int2.storage_bytes(5), 2);
+    assert_eq!(onnx_std::ir::DataType::Complex64.to_onnx(), 14);
+    assert_eq!(onnx_std::ir::DataType::Complex128.to_onnx(), 15);
+    assert_eq!(onnx_std::ir::DataType::Undefined.to_onnx(), 0);
+    assert_eq!(onnx_std::ir::DataType::Float8E8M0.to_onnx(), 24);
+    assert_eq!(onnx_std::ir::DataType::Uint2.storage_bytes(5), 2);
+    assert_eq!(onnx_std::ir::DataType::Int2.storage_bytes(5), 2);
 }
 
 #[test]
@@ -713,7 +713,7 @@ fn multi_device_wire_and_textual_round_trips_are_lossless() {
 
 #[test]
 fn multi_device_checker_accepts_valid_annotations_and_rejects_invalid_ones() {
-    use onnx_rs::check::{
+    use onnx_std::check::{
         MultiDeviceConfigurationRule, ValidationContext, ValidationRule, ViolationLocation,
     };
 
@@ -952,7 +952,7 @@ fn full_spec_binary_model_io_is_lossless() {
     let path = std::env::current_dir()
         .unwrap()
         .join("target")
-        .join("onnx_rs_full_spec_roundtrip.onnx");
+        .join("onnx_std_full_spec_roundtrip.onnx");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     save_model(&model, &path).unwrap();
     let loaded = load_model(&path).unwrap();

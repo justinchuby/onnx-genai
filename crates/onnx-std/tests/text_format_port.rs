@@ -1,7 +1,7 @@
 // Ported from onnx/onnx onnx/test/parser_test.py and printer_test.py.
 
-use onnx_rs::ir::{Attribute, DataType, Dim, Graph, Node, NodeId};
-use onnx_rs::{Json, Model, ModelMetadata, Text, TextCodec, TextProto, from_text, to_text};
+use onnx_std::ir::{Attribute, DataType, Dim, Graph, Node, NodeId};
+use onnx_std::{Json, Model, ModelMetadata, Text, TextCodec, TextProto, from_text, to_text};
 use prost::Message;
 
 const BASIC_MODEL: &str = r#"
@@ -157,7 +157,7 @@ agraph (float[N] x) => (float[N] out) {
 #[test]
 fn parses_upstream_node_domain_outputs_and_int_attribute() {
     // Port of parser_test.py::test_parse_node, wrapped in a model because
-    // onnx-rs intentionally exposes model-level text parsing.
+    // onnx-std intentionally exposes model-level text parsing.
     let source = r#"
 <
   ir_version: 10,
@@ -299,7 +299,7 @@ fn json_and_textproto_round_trip_attribute_model() {
 
 #[test]
 fn parses_supported_upstream_special_float_literals() {
-    // Upstream covers additional aliases; onnx-rs currently supports the
+    // Upstream covers additional aliases; onnx-std currently supports the
     // canonical spellings emitted by its own printer.
     for (literal, expected) in [
         ("inf", f32::INFINITY),
