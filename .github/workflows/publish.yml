@@ -259,6 +259,12 @@ jobs:
             os: windows-latest
             archs: AMD64
             cuda: true
+          # Windows on ARM has no CUDA, so build a CPU-only wheel on the native
+          # arm64 runner.
+          - name: Windows ARM64
+            os: windows-11-arm
+            archs: ARM64
+            cuda: false
           # ONNX Runtime 1.27 publishes no osx-x86_64 native archive (ort-sys
           # 404s) and MLX is Apple-Silicon only, so we build just arm64.
           - name: macOS arm64
@@ -283,8 +289,9 @@ jobs:
       CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
       CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libonnxruntime.so.1 -w {dest_dir} {wheel}"
       # macOS wheels still bake an absolute ONNX Runtime install-name that needs a
-      # runtime fixup, so skip the on-macOS smoke test until that lands.
-      CIBW_TEST_SKIP: "*-macosx_*"
+      # runtime fixup, so skip the on-macOS smoke test until that lands. Windows
+      # arm64 has no guaranteed onnxruntime wheel in the test env, so skip there too.
+      CIBW_TEST_SKIP: "*-macosx_* *-win_arm64"
 
     steps:
       - uses: actions/checkout@v5
