@@ -334,6 +334,13 @@ impl CudaRuntime {
         self.graph.end()
     }
 
+    /// Abort an in-progress stream capture, discarding any half-recorded graph
+    /// and returning the lifecycle to idle so a subsequent [`reset_graph`]
+    /// succeeds. Used on the error path of segmented capture.
+    pub fn abort_graph_capture(&self) -> Result<()> {
+        self.graph.abort()
+    }
+
     /// Launch the installed graph executable on the same EP stream.
     ///
     /// Replays every installed segment in capture order (one graph for a

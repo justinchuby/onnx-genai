@@ -354,6 +354,46 @@ enum RunMode {
     Replay,
 }
 
+/// Scope guard that guarantees an in-progress segment capture is always ended
+/// before its enclosing function returns.
+///
+/// During [`RunMode::Capture`], nodes are recorded between
+/// `begin_device_graph_capture` and `end_device_graph_capture`. If a node fails
+/// mid-record, the `?` early return would otherwise skip the end call and leave
+/// the CUDA stream wedged in capture mode — the caller's
+/// `reset_device_graph()` is then a no-op (reset is rejected while capturing),
+/// so every later eager/replay launch fails with `STREAM_CAPTURE_INVALIDATED`.
+///
+/// While armed, [`Drop`] aborts the capture (ending stream capture and
+/// discarding the half-recorded graph). The success path calls [`disarm`] and
+/// then ends the capture normally via `end_device_graph_capture`.
+///
+/// [`disarm`]: SegmentCaptureGuard::disarm
+struct SegmentCaptureGuard<'a> {
+    ep: &'a dyn ExecutionProvider,
+    armed: bool,
+}
+
+impl<'a> SegmentCaptureGuard<'a> {
+    fn arm(ep: &'a dyn ExecutionProvider) -> Self {
+        Self { ep, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SegmentCaptureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: the abort itself may fail, but the caller is already
+            // unwinding a capture failure and will reset the lifecycle next.
+            let _ = self.ep.abort_device_graph_capture();
+        }
+    }
+}
+
 /// One contiguous run of plan nodes that either share a captured device graph or
 /// all execute eagerly (a non-capturable seam).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2551,9 +2591,18 @@ impl Executor {
                             let kernels = self.collect_segment_kernels(seg, resolved)?;
                             ep.begin_device_graph_capture(&kernels)?;
                         }
+                        // Any early return (`?`) while recording this segment
+                        // must end the stream capture before it propagates —
+                        // otherwise the stream stays wedged in capture mode and
+                        // the caller's `reset_device_graph()` is a no-op (reset
+                        // is rejected while capturing). The guard aborts the
+                        // capture on drop; `disarm()` hands off to the normal
+                        // `end_device_graph_capture()` on the success path.
+                        let mut capture_guard = SegmentCaptureGuard::arm(ep.as_ref());
                         for pi in seg.start..seg.end {
                             self.exec_plan_node(pi, resolved, outer_scope, external)?;
                         }
+                        capture_guard.disarm();
                         ep.end_device_graph_capture()?;
                         ep.replay_device_graph_segment(seg.graph_index)?;
                     }

@@ -372,6 +372,18 @@ pub trait ExecutionProvider: Send + Sync {
         )))
     }
 
+    /// Abort an in-progress device-graph capture, returning the stream and
+    /// lifecycle to a clean idle state so a subsequent [`reset_device_graph`]
+    /// succeeds. Called on the error path of segmented capture when a node
+    /// fails mid-record: the capture must always be ended before reset, so the
+    /// stream is not left wedged in capture mode. EPs without device graphs have
+    /// nothing to abort.
+    ///
+    /// [`reset_device_graph`]: ExecutionProvider::reset_device_graph
+    fn abort_device_graph_capture(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Replay the installed device graph.
     ///
     /// When the EP holds multiple captured **segments** (segmented capture), this

@@ -314,6 +314,12 @@ impl UnaryMathKernel {
         // `x_ptr`/`y_ptr` are live device allocations of `n` f32 elements, and
         // the u64 count and indexing cover their validated bounds without overflow.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if self.runtime.is_capturing()? {
+            // A stream synchronize is illegal mid-capture. The launch is
+            // recorded into the segment graph and replayed, so skip the sync
+            // instead of erroring inside the captured segment.
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }
@@ -411,6 +417,12 @@ impl NotKernel {
         // pointers are live device allocations of `n` 1-byte bool elements, and
         // the u64 count and indexing cover their validated bounds without overflow.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch not_bool", e))?;
+        if self.runtime.is_capturing()? {
+            // A stream synchronize is illegal mid-capture. The launch is
+            // recorded into the segment graph and replayed, so skip the sync
+            // instead of erroring inside the captured segment.
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }
