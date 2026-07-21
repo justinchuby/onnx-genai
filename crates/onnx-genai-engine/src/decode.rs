@@ -9,19 +9,19 @@
 //! engine.
 
 use crate::config::{GenerateOptions, SessionId};
-use crate::kv_bridge::{mirror_present_kv_to_pages, KvModelInfo};
+use crate::kv_bridge::{KvModelInfo, mirror_present_kv_to_pages};
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
 use crate::processors::select_next_token_with_rng;
 use crate::sampling::SamplingRng;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
-use onnx_genai_metadata::InferenceMetadata;
+use onnx_genai_metadata::{InferenceMetadata, LoopStatePair, PositionProgram};
 use onnx_genai_ort::{
     DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams, Session,
     StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 /// Model-I/O strategy used to construct the appropriate [`DecodeBackend`].
@@ -259,25 +259,307 @@ pub(crate) struct ResolvedIo {
     /// `(past_input, present_output)` pairs, positionally paired. Empty for a
     /// non-KV graph.
     pub(crate) kv_pairs: Vec<(String, String)>,
+    /// Fixed loop-carried `(input, output)` pairs with replace semantics.
+    pub(crate) state_pairs: Vec<(String, String)>,
+}
+
+fn resolve_state_pairs(
+    session: &Session,
+    declared: Option<&[LoopStatePair]>,
+    kv_pairs: &[(String, String)],
+) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(declared) = declared else {
+        return Ok(Vec::new());
+    };
+    let kv_inputs = kv_pairs
+        .iter()
+        .map(|(input, _)| input.as_str())
+        .collect::<HashSet<_>>();
+    let kv_outputs = kv_pairs
+        .iter()
+        .map(|(_, output)| output.as_str())
+        .collect::<HashSet<_>>();
+    let mut inputs = HashSet::new();
+    let mut outputs = HashSet::new();
+    let mut resolved = Vec::with_capacity(declared.len());
+
+    for pair in declared {
+        let init = pair.init.as_deref().unwrap_or("zeros");
+        if init != "zeros" {
+            anyhow::bail!(
+                "state pair '{}'=>'{}' declares unsupported init '{init}'; supported initializers: zeros",
+                pair.input,
+                pair.output
+            );
+        }
+        let update = pair.update.as_deref().unwrap_or("replace");
+        if update != "replace" {
+            anyhow::bail!(
+                "state pair '{}'=>'{}' declares unsupported update '{update}'; supported updates: replace",
+                pair.input,
+                pair.output
+            );
+        }
+        if !inputs.insert(pair.input.as_str()) {
+            anyhow::bail!("state_pairs declares input '{}' more than once", pair.input);
+        }
+        if !outputs.insert(pair.output.as_str()) {
+            anyhow::bail!(
+                "state_pairs declares output '{}' more than once",
+                pair.output
+            );
+        }
+        if kv_inputs.contains(pair.input.as_str())
+            || kv_outputs.contains(pair.input.as_str())
+            || kv_inputs.contains(pair.output.as_str())
+            || kv_outputs.contains(pair.output.as_str())
+        {
+            anyhow::bail!(
+                "state pair '{}'=>'{}' overlaps declared KV ports; fixed replace-state and KV cache ports must be separate",
+                pair.input,
+                pair.output
+            );
+        }
+        let input = session
+            .inputs()
+            .iter()
+            .find(|info| info.name == pair.input)
+            .with_context(|| {
+                format!(
+                    "state_pairs declares input '{}' but the graph does not expose it; graph inputs: {:?}",
+                    pair.input,
+                    session.input_names()
+                )
+            })?;
+        let output = session
+            .outputs()
+            .iter()
+            .find(|info| info.name == pair.output)
+            .with_context(|| {
+                format!(
+                    "state_pairs declares output '{}' but the graph does not expose it; graph outputs: {:?}",
+                    pair.output,
+                    session.output_names()
+                )
+            })?;
+        if input.dtype != output.dtype {
+            anyhow::bail!(
+                "state pair '{}'=>'{}' has incompatible dtypes: input {:?}, output {:?}; replace-state ports must match",
+                pair.input,
+                pair.output,
+                input.dtype,
+                output.dtype
+            );
+        }
+        if !shapes_compatible(&input.shape, &output.shape) {
+            anyhow::bail!(
+                "state pair '{}'=>'{}' has incompatible shapes: input {:?}, output {:?}; replace-state ports must match",
+                pair.input,
+                pair.output,
+                input.shape,
+                output.shape
+            );
+        }
+        if input.shape.iter().any(|dimension| *dimension <= 0) {
+            anyhow::bail!(
+                "state input '{}' has dynamic or invalid shape {:?}; zero initialization requires every fixed-state dimension to be concrete and positive",
+                pair.input,
+                input.shape
+            );
+        }
+        if !matches!(
+            input.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16 | DataType::Int64
+        ) {
+            anyhow::bail!(
+                "state input '{}' has unsupported zero-initialization dtype {:?}; supported dtypes: Float32, Float16, BFloat16, Int64",
+                pair.input,
+                input.dtype
+            );
+        }
+        resolved.push((pair.input.clone(), pair.output.clone()));
+    }
+
+    Ok(resolved)
+}
+
+fn validate_declared_port_pairs(
+    session: &Session,
+    input_label: &str,
+    inputs: Option<&[String]>,
+    output_label: &str,
+    outputs: Option<&[String]>,
+) -> anyhow::Result<()> {
+    match (inputs, outputs) {
+        (Some(inputs), Some(outputs)) => {
+            if inputs.len() != outputs.len() {
+                anyhow::bail!(
+                    "{input_label} ({}) and {output_label} ({}) must have equal length for positional pairing",
+                    inputs.len(),
+                    outputs.len()
+                );
+            }
+            for input in inputs {
+                if !session.inputs().iter().any(|info| info.name == *input) {
+                    anyhow::bail!(
+                        "{input_label} declares input '{input}' but the graph does not expose it; graph inputs: {:?}",
+                        session.input_names()
+                    );
+                }
+            }
+            for output in outputs {
+                if !session.outputs().iter().any(|info| info.name == *output) {
+                    anyhow::bail!(
+                        "{output_label} declares output '{output}' but the graph does not expose it; graph outputs: {:?}",
+                        session.output_names()
+                    );
+                }
+            }
+        }
+        (None, None) => {}
+        _ => anyhow::bail!(
+            "{input_label} and {output_label} must be declared together for positional pairing"
+        ),
+    }
+    Ok(())
+}
+
+fn resolve_position_program(
+    session: &Session,
+    io: &onnx_genai_metadata::ModelIoSpec,
+    positions: Option<&PositionProgram>,
+) -> anyhow::Result<Option<String>> {
+    let Some(program) = positions else {
+        return Ok(io.position_ids_input.clone());
+    };
+    if program.rank == 0 {
+        anyhow::bail!("pipeline.positions.rank must be at least 1");
+    }
+    if let Some(io_input) = io.position_ids_input.as_deref()
+        && io_input != program.input
+    {
+        anyhow::bail!(
+            "pipeline.positions.input '{}' does not match decoder io.position_ids_input '{}'; declare the same graph port in both metadata sections",
+            program.input,
+            io_input
+        );
+    }
+    if let Some(axes) = &program.axes
+        && axes.len() != program.rank
+    {
+        anyhow::bail!(
+            "pipeline.positions declares rank {} but {} axis labels {:?}; provide exactly one label per position axis",
+            program.rank,
+            axes.len(),
+            axes
+        );
+    }
+    if program
+        .sections
+        .as_ref()
+        .is_some_and(|sections| sections.contains(&0))
+    {
+        anyhow::bail!("pipeline.positions.sections must contain only positive section sizes");
+    }
+    let dtype = program.dtype.as_deref().unwrap_or("int64");
+    if dtype != "int64" {
+        anyhow::bail!(
+            "pipeline.positions declares dtype '{dtype}', but the engine currently supports generated position tensors only as int64"
+        );
+    }
+    let continuation = program
+        .continuation
+        .as_deref()
+        .unwrap_or("linear_increment");
+    if !matches!(continuation, "linear_increment" | "carry_max" | "from_grid") {
+        anyhow::bail!(
+            "pipeline.positions declares unsupported continuation '{continuation}'; supported continuations: linear_increment, carry_max, from_grid"
+        );
+    }
+    let input = session
+        .inputs()
+        .iter()
+        .find(|info| info.name == program.input)
+        .with_context(|| {
+            format!(
+                "pipeline.positions declares input '{}' but the decoder graph does not expose it; graph inputs: {:?}",
+                program.input,
+                session.input_names()
+            )
+        })?;
+    ensure_i64(input)?;
+    validate_position_shape(input, program.rank)?;
+    Ok(Some(program.input.clone()))
+}
+
+fn shapes_compatible(left: &[i64], right: &[i64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left <= &0 || right <= &0 || left == right)
+}
+
+fn validate_position_shape(info: &TensorInfo, rank: usize) -> anyhow::Result<()> {
+    let expected_tensor_rank = if rank == 1 { 2 } else { 3 };
+    if info.shape.len() != expected_tensor_rank {
+        anyhow::bail!(
+            "position input '{}' has shape {:?}, but metadata rank {} requires tensor shape {}",
+            info.name,
+            info.shape,
+            rank,
+            if rank == 1 {
+                "[batch, sequence]".to_string()
+            } else {
+                format!("[{rank}, batch, sequence]")
+            }
+        );
+    }
+    if rank > 1 && info.shape[0] > 0 && info.shape[0] != rank as i64 {
+        anyhow::bail!(
+            "position input '{}' has leading axis dimension {}, but pipeline.positions.rank is {}",
+            info.name,
+            info.shape[0],
+            rank
+        );
+    }
+    let batch_axis = usize::from(rank > 1);
+    if info.shape[batch_axis] > 0 && info.shape[batch_axis] != 1 {
+        anyhow::bail!(
+            "position input '{}' has batch dimension {}, but the decode engine currently runs batch size 1",
+            info.name,
+            info.shape[batch_axis]
+        );
+    }
+    Ok(())
 }
 
 impl ResolvedIo {
     /// Resolve port bindings from an explicit `io` block when present, else fall
     /// back to tensor-name conventions.
-    pub(crate) fn resolve(
+    pub(crate) fn resolve_with_positions(
         session: &Session,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
         match io {
-            Some(io) => Self::from_spec(session, io),
+            Some(io) => Self::from_spec(session, io, positions),
             // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-            None => Ok(Self::default()),
+            None => {
+                if positions.is_some() {
+                    anyhow::bail!(
+                        "pipeline.positions requires an explicit decoder io block so its position input can be validated"
+                    );
+                }
+                Ok(Self::default())
+            }
         }
     }
 
     fn from_spec(
         session: &Session,
         io: &onnx_genai_metadata::ModelIoSpec,
+        positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
         let has_input = |name: &str| session.inputs().iter().any(|info| info.name == name);
         let has_output = |name: &str| session.outputs().iter().any(|info| info.name == name);
@@ -287,6 +569,10 @@ impl ResolvedIo {
             ("io.inputs_embeds_input", &io.inputs_embeds_input),
             ("io.attention_mask_input", &io.attention_mask_input),
             ("io.position_ids_input", &io.position_ids_input),
+            (
+                "io.encoder_hidden_states_input",
+                &io.encoder_hidden_states_input,
+            ),
         ] {
             if let Some(name) = port.as_deref().filter(|name| !has_input(name)) {
                 anyhow::bail!(
@@ -306,12 +592,6 @@ impl ResolvedIo {
                 );
             }
         }
-        if io.token_input.is_some() && io.inputs_embeds_input.is_some() {
-            anyhow::bail!(
-                "io.token_input and io.inputs_embeds_input are mutually exclusive; a decoder consumes tokens OR pre-embedded inputs, not both"
-            );
-        }
-
         let kv_pairs = match (&io.kv_inputs, &io.kv_outputs) {
             (Some(inputs), Some(outputs)) => {
                 if inputs.len() != outputs.len() {
@@ -348,16 +628,34 @@ impl ResolvedIo {
                 "io.kv_inputs and io.kv_outputs must be declared together (positional KV pairing)"
             ),
         };
+        if let Some(update) = io.kv_update.as_deref()
+            && !matches!(update, "append" | "shared_buffer")
+        {
+            anyhow::bail!(
+                "io.kv_update declares unsupported update '{update}'; supported KV updates: append, shared_buffer"
+            );
+        }
+        validate_declared_port_pairs(
+            session,
+            "io.cross_kv_inputs",
+            io.cross_kv_inputs.as_deref(),
+            "io.cross_kv_outputs",
+            io.cross_kv_outputs.as_deref(),
+        )?;
+
+        let state_pairs = resolve_state_pairs(session, io.state_pairs.as_deref(), &kv_pairs)?;
+        let position_ids_input = resolve_position_program(session, io, positions)?;
 
         Ok(Self {
             explicit: true,
             token_input: io.token_input.clone(),
             inputs_embeds_input: io.inputs_embeds_input.clone(),
             attention_mask_input: io.attention_mask_input.clone(),
-            position_ids_input: io.position_ids_input.clone(),
+            position_ids_input,
             logits_output: io.logits_output.clone(),
             hidden_output: io.hidden_output.clone(),
             kv_pairs,
+            state_pairs,
         })
     }
 
@@ -398,6 +696,9 @@ pub(crate) struct DecodeState {
     pub(crate) present_to_past: HashMap<String, String>,
     pub(crate) kv_inputs: Vec<String>,
     pub(crate) io: ResolvedIo,
+    loop_state: HashMap<String, Value>,
+    positions: Option<PositionProgram>,
+    next_positions: Option<Vec<i64>>,
     sliding_window: Option<usize>,
     sink_tokens: usize,
     retained_kv_len: usize,
@@ -415,11 +716,25 @@ impl DecodeState {
         session: &Session,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
     ) -> anyhow::Result<Self> {
-        let resolved = ResolvedIo::resolve(session, io)?;
-        Self::from_resolved(session, resolved)
+        Self::new_with_io_and_positions(session, io, None)
     }
 
-    fn from_resolved(session: &Session, resolved: ResolvedIo) -> anyhow::Result<Self> {
+    /// Construct generic decoder state from explicit graph I/O and the pipeline's
+    /// declared position program.
+    pub(crate) fn new_with_io_and_positions(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        positions: Option<&PositionProgram>,
+    ) -> anyhow::Result<Self> {
+        let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
+        Self::from_resolved(session, resolved, positions.cloned())
+    }
+
+    fn from_resolved(
+        session: &Session,
+        resolved: ResolvedIo,
+        positions: Option<PositionProgram>,
+    ) -> anyhow::Result<Self> {
         if resolved.explicit {
             let kv_inputs = resolved
                 .kv_pairs
@@ -438,6 +753,9 @@ impl DecodeState {
                 present_to_past,
                 kv_inputs,
                 io: resolved,
+                loop_state: HashMap::new(),
+                positions,
+                next_positions: None,
                 sliding_window: None,
                 sink_tokens: 0,
                 retained_kv_len: 0,
@@ -467,6 +785,9 @@ impl DecodeState {
                 present_to_past: HashMap::new(),
                 kv_inputs,
                 io: resolved,
+                loop_state: HashMap::new(),
+                positions,
+                next_positions: None,
                 sliding_window: None,
                 sink_tokens: 0,
                 retained_kv_len: 0,
@@ -498,6 +819,9 @@ impl DecodeState {
             present_to_past,
             kv_inputs,
             io: resolved,
+            loop_state: HashMap::new(),
+            positions,
+            next_positions: None,
             sliding_window: None,
             sink_tokens: 0,
             retained_kv_len: 0,
@@ -516,32 +840,56 @@ impl DecodeState {
         path: &ModelDecodePath,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
     ) -> anyhow::Result<Self> {
+        Self::new_for_path_with_io_and_positions(session, path, io, None)
+    }
+
+    pub(crate) fn new_for_path_with_io_and_positions(
+        session: &Session,
+        path: &ModelDecodePath,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        positions: Option<&PositionProgram>,
+    ) -> anyhow::Result<Self> {
         match path {
-            ModelDecodePath::Legacy => Self::new_with_io(session, io),
-            ModelDecodePath::StaticCache { .. } => Ok(Self {
-                use_kv: true,
-                past: HashMap::new(),
-                present_to_past: HashMap::new(),
-                kv_inputs: Vec::new(),
-                io: ResolvedIo::resolve(session, io)?,
-                sliding_window: None,
-                sink_tokens: 0,
-                retained_kv_len: 0,
-                runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
-                    stable_session_ref(session),
-                    StaticCacheDecodeOptions { batch_size: 1 },
-                )?)),
-            }),
+            ModelDecodePath::Legacy => Self::new_with_io_and_positions(session, io, positions),
+            ModelDecodePath::StaticCache { .. } => {
+                let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
+                if !resolved.state_pairs.is_empty() || positions.is_some() {
+                    anyhow::bail!(
+                        "static-cache decode does not support declared generic positions or fixed loop-carried state; select the past/present or legacy decode path"
+                    );
+                }
+                Ok(Self {
+                    use_kv: true,
+                    past: HashMap::new(),
+                    present_to_past: HashMap::new(),
+                    kv_inputs: Vec::new(),
+                    io: resolved,
+                    loop_state: HashMap::new(),
+                    positions: None,
+                    next_positions: None,
+                    sliding_window: None,
+                    sink_tokens: 0,
+                    retained_kv_len: 0,
+                    runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
+                        stable_session_ref(session),
+                        StaticCacheDecodeOptions { batch_size: 1 },
+                    )?)),
+                })
+            }
             ModelDecodePath::PastPresent {
                 shared_buffer,
                 max_len,
                 sliding_window,
                 sink_tokens,
             } => {
-                let mut state = Self::new_with_io(session, io)?;
+                let mut state = Self::new_with_io_and_positions(session, io, positions)?;
                 state.sliding_window = *sliding_window;
                 state.sink_tokens = sink_tokens.unwrap_or(0);
-                if state.use_kv && sliding_window.is_none() {
+                if state.use_kv
+                    && sliding_window.is_none()
+                    && state.io.state_pairs.is_empty()
+                    && state.positions.is_none()
+                {
                     state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new(
                         stable_session_ref(session),
                         DecodeSessionOptions {
@@ -612,6 +960,11 @@ impl DecodeState {
     }
 
     pub(crate) fn rewind_runner(&mut self, target_len: usize) -> anyhow::Result<()> {
+        if target_len != 0 && !self.loop_state.is_empty() {
+            anyhow::bail!(
+                "cannot rewind fixed loop-carried decoder state to token {target_len}; reset to zero and replay the prefix instead"
+            );
+        }
         match &mut self.runner {
             Some(DecodeRunner::StaticCache(session)) => session.rewind(target_len)?,
             Some(DecodeRunner::PastPresent(session)) => session.rewind(target_len)?,
@@ -620,6 +973,10 @@ impl DecodeState {
             None => {
                 self.past.clear();
             }
+        }
+        if target_len == 0 {
+            self.loop_state.clear();
+            self.next_positions = None;
         }
         Ok(())
     }
@@ -912,7 +1269,11 @@ pub(crate) fn next_session_token_logits(
             state.decode_state.sink_tokens(),
         )?;
     }
-    extract_next_token_logits_from_outputs(session, &outputs, state.decode_state.io.logits_output.as_deref())
+    extract_next_token_logits_from_outputs(
+        session,
+        &outputs,
+        state.decode_state.io.logits_output.as_deref(),
+    )
 }
 
 pub(crate) fn next_session_token_logits_and_hidden(
@@ -990,7 +1351,11 @@ pub(crate) fn next_session_token_logits_and_hiddens(
             state.decode_state.sink_tokens(),
         )?;
     }
-    let logits = extract_next_token_logits_from_outputs(session, &outputs, state.decode_state.io.logits_output.as_deref())?;
+    let logits = extract_next_token_logits_from_outputs(
+        session,
+        &outputs,
+        state.decode_state.io.logits_output.as_deref(),
+    )?;
     let hidden = hidden_outputs
         .iter()
         .map(|output| extract_last_hidden(session, &outputs, output))
@@ -1050,7 +1415,11 @@ pub(crate) fn next_draft_token_logits(
         )?;
     }
 
-    extract_next_token_logits_from_outputs(&draft_model.session, &outputs, draft_state.decode_state.io.logits_output.as_deref())
+    extract_next_token_logits_from_outputs(
+        &draft_model.session,
+        &outputs,
+        draft_state.decode_state.io.logits_output.as_deref(),
+    )
 }
 
 pub(crate) fn apply_paged_sliding_window(
@@ -1543,12 +1912,35 @@ pub(crate) fn run_decode_step_with_extra(
 
     let seq_len = token_ids.len();
     let retained_past_len = decode_state.retained_kv_len(past_len);
-    let (total_len, position_ids) = decode_step_layout(past_len, retained_past_len, seq_len)?;
+    let (total_len, legacy_position_ids) =
+        decode_step_layout(past_len, retained_past_len, seq_len)?;
     let input_ids = token_ids
         .iter()
         .map(|&id| i64::from(id))
         .collect::<Vec<_>>();
     let attention_mask = vec![1_i64; total_len];
+    let mut position_step = if let Some(position_input) =
+        decode_state.io.position_ids_input.as_deref()
+    {
+        let info = session
+            .inputs()
+            .iter()
+            .find(|info| info.name == position_input)
+            .with_context(|| {
+                format!("declared position input '{position_input}' disappeared from graph inputs")
+            })?;
+        Some(build_position_step(
+            info,
+            decode_state.positions.as_ref(),
+            decode_state.next_positions.as_deref(),
+            past_len,
+            seq_len,
+            &legacy_position_ids,
+            extra_inputs,
+        )?)
+    } else {
+        None
+    };
 
     let mut owned_inputs: Vec<(String, Value)> = Vec::new();
     for info in session.inputs() {
@@ -1566,11 +1958,21 @@ pub(crate) fn run_decode_step_with_extra(
                 Value::from_slice_i64(&attention_mask, &[1, total_len as i64])?,
             ));
         } else if decode_state.io.is_position_ids_input(&info.name, &lower) {
-            ensure_i64(info)?;
-            owned_inputs.push((
-                info.name.clone(),
-                Value::from_slice_i64(&position_ids, &[1, seq_len as i64])?,
-            ));
+            if position_step.is_none() {
+                position_step = Some(build_position_step(
+                    info,
+                    decode_state.positions.as_ref(),
+                    decode_state.next_positions.as_deref(),
+                    past_len,
+                    seq_len,
+                    &legacy_position_ids,
+                    extra_inputs,
+                )?);
+            }
+            let step = position_step.as_ref().context(
+                "position input was resolved without a generated or routed position tensor",
+            )?;
+            owned_inputs.push((info.name.clone(), clone_value(&step.value)?));
         } else if decode_state.use_kv && decode_state.kv_inputs.contains(&info.name) {
             let value = if retained_past_len == 0 {
                 empty_past_value(info)?
@@ -1578,6 +1980,17 @@ pub(crate) fn run_decode_step_with_extra(
                 clone_value(decode_state.past.get(&info.name).with_context(|| {
                     format!("missing cached KV tensor for input '{}'", info.name)
                 })?)?
+            };
+            owned_inputs.push((info.name.clone(), value));
+        } else if decode_state
+            .io
+            .state_pairs
+            .iter()
+            .any(|(input, _)| input == &info.name)
+        {
+            let value = match decode_state.loop_state.get(&info.name) {
+                Some(value) => clone_value(value)?,
+                None => zero_state_value(info)?,
             };
             owned_inputs.push((info.name.clone(), value));
         } else if let Some((_, value)) = extra_inputs.iter().find(|(name, _)| name == &info.name) {
@@ -1589,9 +2002,16 @@ pub(crate) fn run_decode_step_with_extra(
             );
         } else {
             anyhow::bail!(
-                "unsupported model input '{}' with shape {:?}; supported inputs are input_ids, attention_mask, position_ids, past key-values, and pipeline-routed extra inputs",
+                "unsupported model input '{}' with shape {:?}; supported inputs are token IDs, attention masks, declared position programs, KV cache, fixed loop state, and pipeline-routed extra inputs (explicit io: {}, declared state inputs: {:?})",
                 info.name,
-                info.shape
+                info.shape,
+                decode_state.io.explicit,
+                decode_state
+                    .io
+                    .state_pairs
+                    .iter()
+                    .map(|(input, _)| input)
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -1623,6 +2043,48 @@ pub(crate) fn run_decode_step_with_extra(
         }
         decode_state.apply_window_after_step(session, past_len + seq_len, total_len)?;
     }
+    if !decode_state.io.state_pairs.is_empty() {
+        let mut replacements = HashMap::with_capacity(decode_state.io.state_pairs.len());
+        for (input_name, output_name) in &decode_state.io.state_pairs {
+            let output_index = session
+                .output_names()
+                .iter()
+                .position(|name| name == output_name)
+                .with_context(|| {
+                    format!(
+                        "declared loop-state output '{output_name}' disappeared from graph outputs"
+                    )
+                })?;
+            let value = outputs.get(output_index).with_context(|| {
+                format!("loop-state output '{output_name}' index was out of range")
+            })?;
+            let input_info = session
+                .inputs()
+                .iter()
+                .find(|info| info.name == *input_name)
+                .with_context(|| {
+                    format!(
+                        "declared loop-state input '{input_name}' disappeared from graph inputs"
+                    )
+                })?;
+            if value.dtype() != input_info.dtype
+                || !shapes_compatible(value.shape(), &input_info.shape)
+            {
+                anyhow::bail!(
+                    "loop-state output '{output_name}' produced dtype {:?} shape {:?}, incompatible with next-step input '{input_name}' dtype {:?} shape {:?}",
+                    value.dtype(),
+                    value.shape(),
+                    input_info.dtype,
+                    input_info.shape
+                );
+            }
+            replacements.insert(input_name.clone(), clone_value(value)?);
+        }
+        decode_state.loop_state = replacements;
+    }
+    if let Some(step) = position_step {
+        decode_state.next_positions = Some(step.next);
+    }
 
     Ok(outputs)
 }
@@ -1637,10 +2099,7 @@ pub(crate) fn extract_next_token_logits_with_io(
 
 /// Locate the logits output index, preferring an explicitly declared name from
 /// the resolved `io` binding and falling back to tensor-name conventions.
-fn logits_output_index(
-    session: &Session,
-    logits_output: Option<&str>,
-) -> anyhow::Result<usize> {
+fn logits_output_index(session: &Session, logits_output: Option<&str>) -> anyhow::Result<usize> {
     if let Some(declared) = logits_output {
         return session
             .output_names()
@@ -1801,6 +2260,193 @@ fn decode_step_layout(
         .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((attended_len, position_ids))
+}
+
+struct PositionStep {
+    value: Value,
+    next: Vec<i64>,
+}
+
+fn build_position_step(
+    info: &TensorInfo,
+    program: Option<&PositionProgram>,
+    next_positions: Option<&[i64]>,
+    absolute_past_len: usize,
+    input_len: usize,
+    legacy_positions: &[i64],
+    extra_inputs: &[(String, Value)],
+) -> anyhow::Result<PositionStep> {
+    ensure_i64(info)?;
+    let rank = match program {
+        Some(program) => program.rank,
+        None if info.shape.len() == 2 => 1,
+        None if info.shape.len() == 3 && info.shape[0] > 0 => {
+            usize::try_from(info.shape[0]).context("position axis count exceeds usize range")?
+        }
+        None => {
+            anyhow::bail!(
+                "position input '{}' has shape {:?}; multi-axis position inputs require pipeline.positions metadata with an explicit rank",
+                info.name,
+                info.shape
+            )
+        }
+    };
+    validate_position_shape(info, rank)?;
+
+    if let Some((_, supplied)) = extra_inputs.iter().find(|(name, _)| name == &info.name) {
+        if supplied.dtype() != DataType::Int64 {
+            anyhow::bail!(
+                "routed position input '{}' must be Int64, got {:?}",
+                info.name,
+                supplied.dtype()
+            );
+        }
+        validate_position_value_shape(info, supplied.shape(), rank, input_len)?;
+        let data = supplied
+            .to_vec_i64()
+            .with_context(|| format!("failed to read routed position tensor '{}'", info.name))?;
+        return Ok(PositionStep {
+            next: next_position_axes(&data, rank, input_len)?,
+            value: clone_value(supplied)?,
+        });
+    }
+
+    let continuation = program
+        .and_then(|program| program.continuation.as_deref())
+        .unwrap_or("linear_increment");
+    if continuation == "from_grid" && next_positions.is_none() {
+        anyhow::bail!(
+            "pipeline.positions continuation 'from_grid' requires the prefill position tensor '{}' to be supplied by a pipeline dataflow edge; route the processor-derived coordinates to that decoder input",
+            info.name
+        );
+    }
+    let absolute_start =
+        i64::try_from(absolute_past_len).context("position id exceeds i64 range")?;
+    let starts = if matches!(continuation, "carry_max" | "from_grid") {
+        next_positions
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| vec![absolute_start; rank])
+    } else {
+        vec![absolute_start; rank]
+    };
+    if starts.len() != rank {
+        anyhow::bail!(
+            "position continuation for '{}' retained {} axes, but metadata declares rank {}",
+            info.name,
+            starts.len(),
+            rank
+        );
+    }
+
+    let mut data = Vec::with_capacity(
+        rank.checked_mul(input_len)
+            .context("position tensor element count overflow")?,
+    );
+    for start in &starts {
+        for offset in 0..input_len {
+            data.push(
+                start
+                    .checked_add(i64::try_from(offset).context("position offset exceeds i64")?)
+                    .context("position id overflow")?,
+            );
+        }
+    }
+    if rank == 1 && continuation == "linear_increment" {
+        data.copy_from_slice(legacy_positions);
+    }
+    let next = starts
+        .into_iter()
+        .map(|start| {
+            start
+                .checked_add(i64::try_from(input_len).context("position length exceeds i64")?)
+                .context("next position id overflow")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let shape = if rank == 1 {
+        vec![1, input_len as i64]
+    } else {
+        vec![rank as i64, 1, input_len as i64]
+    };
+    Ok(PositionStep {
+        value: Value::from_vec_i64(data, &shape)
+            .with_context(|| format!("failed to build position input '{}'", info.name))?,
+        next,
+    })
+}
+
+fn validate_position_value_shape(
+    info: &TensorInfo,
+    actual: &[i64],
+    rank: usize,
+    input_len: usize,
+) -> anyhow::Result<()> {
+    let expected = if rank == 1 {
+        vec![1, input_len as i64]
+    } else {
+        vec![rank as i64, 1, input_len as i64]
+    };
+    if actual != expected {
+        anyhow::bail!(
+            "routed position input '{}' has shape {:?}, expected {:?} from pipeline.positions rank {} and decode sequence length {}",
+            info.name,
+            actual,
+            expected,
+            rank,
+            input_len
+        );
+    }
+    Ok(())
+}
+
+fn next_position_axes(data: &[i64], rank: usize, input_len: usize) -> anyhow::Result<Vec<i64>> {
+    if data.len()
+        != rank
+            .checked_mul(input_len)
+            .context("position tensor element count overflow")?
+    {
+        anyhow::bail!(
+            "position tensor contains {} elements, expected {} axes × {} sequence positions",
+            data.len(),
+            rank,
+            input_len
+        );
+    }
+    data.chunks(input_len)
+        .map(|axis| {
+            axis.iter()
+                .copied()
+                .max()
+                .context("position axis cannot be empty")?
+                .checked_add(1)
+                .context("next position id overflow")
+        })
+        .collect()
+}
+
+fn zero_state_value(info: &TensorInfo) -> anyhow::Result<Value> {
+    let element_count = info.shape.iter().try_fold(1_usize, |count, dimension| {
+        let dimension = usize::try_from(*dimension).with_context(|| {
+            format!(
+                "state input '{}' has non-concrete dimension {}",
+                info.name, dimension
+            )
+        })?;
+        count
+            .checked_mul(dimension)
+            .context("state tensor element count overflow")
+    })?;
+    match info.dtype {
+        DataType::Float32 => Value::from_vec_f32(vec![0.0; element_count], &info.shape),
+        DataType::Float16 => Value::from_vec_f16_bits(vec![0; element_count], &info.shape),
+        DataType::BFloat16 => Value::from_vec_bf16_bits(vec![0; element_count], &info.shape),
+        DataType::Int64 => Value::from_vec_i64(vec![0; element_count], &info.shape),
+        dtype => anyhow::bail!(
+            "state input '{}' has unsupported zero-initialization dtype {:?}",
+            info.name,
+            dtype
+        ),
+    }
+    .with_context(|| format!("failed to zero-initialize loop-state input '{}'", info.name))
 }
 
 fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -2088,8 +2734,9 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_kv_mode_from_shared_buffer_len, decode_step_layout, is_group_query_attention,
-        is_share_buffer_kv_dtype, is_token_input_name, shared_kv_buffer_len_from_metadata,
+        DecodeState, decode_kv_mode_from_shared_buffer_len, decode_step_layout,
+        extract_next_token_logits_with_io, is_group_query_attention, is_share_buffer_kv_dtype,
+        is_token_input_name, run_decode_step_with_extra, shared_kv_buffer_len_from_metadata,
         slice_value_axis, sliding_window_from_metadata,
     };
     use onnx_genai_genai_config::GenAiConfig;
@@ -2097,7 +2744,8 @@ mod tests {
         AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
         RuntimeKvConfig,
     };
-    use onnx_genai_ort::{DecodeKvMode, Value};
+    use onnx_genai_ort::{DecodeKvMode, PipelineModels, Value};
+    use std::{collections::HashSet, path::Path};
 
     #[test]
     fn recognizes_causal_and_seq2seq_token_input_names() {
@@ -2139,6 +2787,7 @@ mod tests {
             model: None,
             kv_cache: None,
             quantization: None,
+            preprocessing: None,
             pipeline: None,
             strategy: None,
             speculative: None,
@@ -2450,5 +3099,90 @@ mod tests {
             suffix.to_vec_f32().unwrap(),
             vec![20.0, 21.0, 30.0, 31.0, 40.0, 41.0]
         );
+    }
+
+    #[test]
+    fn declared_multiaxis_positions_and_replace_state_continue_across_steps() -> anyhow::Result<()>
+    {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-multiaxis-state-decoder");
+        let models = PipelineModels::load(&fixture)?;
+        let session = models
+            .session("decoder")
+            .expect("fixture decoder session is loaded");
+        let component = &models.directory.spec.models["decoder"];
+        let positions = models
+            .directory
+            .spec
+            .positions
+            .as_ref()
+            .expect("fixture position program");
+        let mut state = DecodeState::new_with_io_and_positions(
+            session,
+            component.io.as_ref(),
+            Some(positions),
+        )?;
+        let routed = Value::from_vec_f32(vec![0.0; 3], &[1, 3, 1])?;
+        let extras = vec![("routed_sequence".to_string(), routed)];
+
+        let outputs = run_decode_step_with_extra(session, &mut state, &[1, 2, 3], 0, &extras)?;
+        let logits =
+            extract_next_token_logits_with_io(session, outputs, state.io.logits_output.as_deref())?;
+        assert_eq!(
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index),
+            Some(6)
+        );
+        assert_eq!(state.next_positions, Some(vec![3, 3, 3]));
+        assert_eq!(state.loop_state["state_a.in"].to_vec_f32()?, vec![1.0, 1.0]);
+        assert_eq!(state.loop_state["state_b.in"].to_vec_f32()?, vec![2.0, 2.0]);
+        assert_eq!(
+            state.past.keys().cloned().collect::<HashSet<_>>(),
+            [
+                "past.3.key".to_string(),
+                "past.3.value".to_string(),
+                "past.11.key".to_string(),
+                "past.11.value".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let outputs = run_decode_step_with_extra(session, &mut state, &[6], 3, &extras)?;
+        let logits =
+            extract_next_token_logits_with_io(session, outputs, state.io.logits_output.as_deref())?;
+        assert_eq!(
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index),
+            Some(15)
+        );
+        assert_eq!(state.next_positions, Some(vec![4, 4, 4]));
+
+        let outputs = run_decode_step_with_extra(session, &mut state, &[15], 4, &extras)?;
+        let logits =
+            extract_next_token_logits_with_io(session, outputs, state.io.logits_output.as_deref())?;
+        assert_eq!(
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index),
+            Some(24)
+        );
+        assert_eq!(state.loop_state["state_a.in"].to_vec_f32()?, vec![3.0, 3.0]);
+        assert_eq!(state.loop_state["state_b.in"].to_vec_f32()?, vec![6.0, 6.0]);
+        assert!(
+            state
+                .past
+                .values()
+                .all(|value| value.shape() == [1, 1, 5, 1])
+        );
+        Ok(())
     }
 }
