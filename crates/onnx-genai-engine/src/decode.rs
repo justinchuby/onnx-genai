@@ -726,7 +726,17 @@ impl DecodeState {
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_io_positions_and_state_budget(session, io, positions, u64::MAX)
+    }
+
+    pub(crate) fn new_with_io_positions_and_state_budget(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        positions: Option<&PositionProgram>,
+        fixed_state_budget_bytes: u64,
+    ) -> anyhow::Result<Self> {
         let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
+        validate_fixed_state_budget(session, &resolved.state_pairs, fixed_state_budget_bytes)?;
         Self::from_resolved(session, resolved, positions.cloned())
     }
 
@@ -840,17 +850,23 @@ impl DecodeState {
         path: &ModelDecodePath,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
     ) -> anyhow::Result<Self> {
-        Self::new_for_path_with_io_and_positions(session, path, io, None)
+        Self::new_for_path_with_io_positions_and_state_budget(session, path, io, None, u64::MAX)
     }
 
-    pub(crate) fn new_for_path_with_io_and_positions(
+    pub(crate) fn new_for_path_with_io_positions_and_state_budget(
         session: &Session,
         path: &ModelDecodePath,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
         positions: Option<&PositionProgram>,
+        fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {
         match path {
-            ModelDecodePath::Legacy => Self::new_with_io_and_positions(session, io, positions),
+            ModelDecodePath::Legacy => Self::new_with_io_positions_and_state_budget(
+                session,
+                io,
+                positions,
+                fixed_state_budget_bytes,
+            ),
             ModelDecodePath::StaticCache { .. } => {
                 let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
                 if !resolved.state_pairs.is_empty() || positions.is_some() {
@@ -882,7 +898,12 @@ impl DecodeState {
                 sliding_window,
                 sink_tokens,
             } => {
-                let mut state = Self::new_with_io_and_positions(session, io, positions)?;
+                let mut state = Self::new_with_io_positions_and_state_budget(
+                    session,
+                    io,
+                    positions,
+                    fixed_state_budget_bytes,
+                )?;
                 state.sliding_window = *sliding_window;
                 state.sink_tokens = sink_tokens.unwrap_or(0);
                 if state.use_kv
@@ -2280,9 +2301,6 @@ fn build_position_step(
     let rank = match program {
         Some(program) => program.rank,
         None if info.shape.len() == 2 => 1,
-        None if info.shape.len() == 3 && info.shape[0] > 0 => {
-            usize::try_from(info.shape[0]).context("position axis count exceeds usize range")?
-        }
         None => {
             anyhow::bail!(
                 "position input '{}' has shape {:?}; multi-axis position inputs require pipeline.positions metadata with an explicit rank",
@@ -2424,7 +2442,31 @@ fn next_position_axes(data: &[i64], rank: usize, input_len: usize) -> anyhow::Re
 }
 
 fn zero_state_value(info: &TensorInfo) -> anyhow::Result<Value> {
-    let element_count = info.shape.iter().try_fold(1_usize, |count, dimension| {
+    let element_count = fixed_state_element_count(info)?;
+    match info.dtype {
+        DataType::Float32 => {
+            Value::from_vec_f32(fallible_zeroed(element_count, 0.0, info)?, &info.shape)
+        }
+        DataType::Float16 => {
+            Value::from_vec_f16_bits(fallible_zeroed(element_count, 0, info)?, &info.shape)
+        }
+        DataType::BFloat16 => {
+            Value::from_vec_bf16_bits(fallible_zeroed(element_count, 0, info)?, &info.shape)
+        }
+        DataType::Int64 => {
+            Value::from_vec_i64(fallible_zeroed(element_count, 0, info)?, &info.shape)
+        }
+        dtype => anyhow::bail!(
+            "state input '{}' has unsupported zero-initialization dtype {:?}",
+            info.name,
+            dtype
+        ),
+    }
+    .with_context(|| format!("failed to zero-initialize loop-state input '{}'", info.name))
+}
+
+fn fixed_state_element_count(info: &TensorInfo) -> anyhow::Result<usize> {
+    info.shape.iter().try_fold(1_usize, |count, dimension| {
         let dimension = usize::try_from(*dimension).with_context(|| {
             format!(
                 "state input '{}' has non-concrete dimension {}",
@@ -2434,19 +2476,58 @@ fn zero_state_value(info: &TensorInfo) -> anyhow::Result<Value> {
         count
             .checked_mul(dimension)
             .context("state tensor element count overflow")
-    })?;
-    match info.dtype {
-        DataType::Float32 => Value::from_vec_f32(vec![0.0; element_count], &info.shape),
-        DataType::Float16 => Value::from_vec_f16_bits(vec![0; element_count], &info.shape),
-        DataType::BFloat16 => Value::from_vec_bf16_bits(vec![0; element_count], &info.shape),
-        DataType::Int64 => Value::from_vec_i64(vec![0; element_count], &info.shape),
-        dtype => anyhow::bail!(
-            "state input '{}' has unsupported zero-initialization dtype {:?}",
-            info.name,
-            dtype
-        ),
+    })
+}
+
+fn fixed_state_bytes(info: &TensorInfo) -> anyhow::Result<u64> {
+    let elements = u64::try_from(fixed_state_element_count(info)?)
+        .context("state tensor element count exceeds u64")?;
+    elements
+        .checked_mul(info.dtype.size_of() as u64)
+        .context("state tensor byte size overflow")
+}
+
+fn validate_fixed_state_budget(
+    session: &Session,
+    state_pairs: &[(String, String)],
+    budget_bytes: u64,
+) -> anyhow::Result<()> {
+    let mut required_bytes = 0_u64;
+    for (input, _) in state_pairs {
+        let info = session
+            .inputs()
+            .iter()
+            .find(|info| info.name == *input)
+            .with_context(|| format!("declared fixed-state input '{input}' disappeared"))?;
+        required_bytes = required_bytes
+            .checked_add(fixed_state_bytes(info)?)
+            .context("total fixed-state allocation size overflow")?;
     }
-    .with_context(|| format!("failed to zero-initialize loop-state input '{}'", info.name))
+    if required_bytes > budget_bytes {
+        anyhow::bail!(
+            "decoder fixed-state initialization requires {required_bytes} bytes, but the configured host RAM admission budget is {budget_bytes} bytes; reduce declared state dimensions or raise serving.memory.limits.host_ram_limit"
+        );
+    }
+    Ok(())
+}
+
+fn fallible_zeroed<T: Clone>(
+    element_count: usize,
+    zero: T,
+    info: &TensorInfo,
+) -> anyhow::Result<Vec<T>> {
+    let bytes = element_count
+        .checked_mul(std::mem::size_of::<T>())
+        .context("state tensor allocation byte size overflow")?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(element_count).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to allocate {bytes} bytes for loop-state input '{}': {error}",
+            info.name
+        )
+    })?;
+    data.resize(element_count, zero);
+    Ok(data)
 }
 
 fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -2734,17 +2815,18 @@ pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeState, decode_kv_mode_from_shared_buffer_len, decode_step_layout,
-        extract_next_token_logits_with_io, is_group_query_attention, is_share_buffer_kv_dtype,
-        is_token_input_name, run_decode_step_with_extra, shared_kv_buffer_len_from_metadata,
-        slice_value_axis, sliding_window_from_metadata,
+        DecodeState, build_position_step, decode_kv_mode_from_shared_buffer_len,
+        decode_step_layout, extract_next_token_logits_with_io, is_group_query_attention,
+        is_share_buffer_kv_dtype, is_token_input_name, run_decode_step_with_extra,
+        shared_kv_buffer_len_from_metadata, slice_value_axis, sliding_window_from_metadata,
+        zero_state_value,
     };
     use onnx_genai_genai_config::GenAiConfig;
     use onnx_genai_metadata::{
         AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
         RuntimeKvConfig,
     };
-    use onnx_genai_ort::{DecodeKvMode, PipelineModels, Value};
+    use onnx_genai_ort::{DataType, DecodeKvMode, PipelineModels, TensorInfo, Value};
     use std::{collections::HashSet, path::Path};
 
     #[test]
@@ -2778,6 +2860,48 @@ mod tests {
         assert!(is_share_buffer_kv_dtype("bfloat16"));
         assert!(is_share_buffer_kv_dtype("BF16"));
         assert!(!is_share_buffer_kv_dtype("int8"));
+    }
+
+    #[test]
+    fn metadata_free_multiaxis_positions_are_rejected() {
+        let info = TensorInfo {
+            name: "position_ids".to_string(),
+            dtype: DataType::Int64,
+            shape: vec![3, 1, -1],
+        };
+        let error = build_position_step(&info, None, None, 0, 1, &[0], &[])
+            .err()
+            .expect("rank-3 positions without metadata must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("require pipeline.positions metadata"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fixed_state_zero_initialization_is_fallible_and_supports_half_types() {
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let info = TensorInfo {
+                name: format!("{dtype:?}_state"),
+                dtype,
+                shape: vec![2, 3],
+            };
+            let value = zero_state_value(&info).expect("small half state should initialize");
+            assert_eq!(value.dtype(), dtype);
+            assert_eq!(value.shape(), [2, 3]);
+        }
+
+        let hostile = TensorInfo {
+            name: "hostile_state".to_string(),
+            dtype: DataType::Float32,
+            shape: vec![i64::MAX / 4 + 1],
+        };
+        let error = zero_state_value(&hostile)
+            .err()
+            .expect("an unallocatable state must return an error");
+        assert!(error.to_string().contains("failed to allocate"), "{error}");
     }
 
     fn empty_metadata() -> InferenceMetadata {

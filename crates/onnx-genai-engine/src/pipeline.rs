@@ -7,6 +7,7 @@ use crate::decode::{
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
     Engine, EngineConfig, model_requires_native_backend, requested_decode_backend,
+    resolved_host_ram_budget,
 };
 use crate::kv_bridge::infer_kv_model_info;
 use crate::logits::TokenId;
@@ -124,6 +125,7 @@ pub struct PipelineEngine {
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
     tokenizer_component: String,
+    fixed_state_budget_bytes: u64,
 }
 
 impl Engine {
@@ -192,31 +194,40 @@ impl PipelineEngine {
         // Only autoregressive pipelines drive a token-by-token decode loop and
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
-        let (decoder_state, tokenizer_component) = match &plan {
+        let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
                     .session(&ar.decoder)
                     .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-                let _kv_model =
+                let kv_model =
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
+                let fixed_state_budget_bytes =
+                    resolved_host_ram_budget(&config, kv_model.as_ref())?;
                 let decoder_io = models
                     .directory
                     .spec
                     .models
                     .get(&ar.decoder)
                     .and_then(|component| component.io.as_ref());
+                let positions = models.directory.spec.positions.as_ref();
                 (
-                    Some(DecodeState::new_with_io(decoder, decoder_io)?),
+                    Some(DecodeState::new_with_io_positions_and_state_budget(
+                        decoder,
+                        decoder_io,
+                        positions,
+                        fixed_state_budget_bytes,
+                    )?),
                     ar.decoder.clone(),
+                    fixed_state_budget_bytes,
                 )
             }
             // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
             // decode loops with per-loop `DecodeState`s built inside the driver,
             // so no shared decode state is created here. The tokenizer component
             // is the outer decoder (talker).
-            PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone()),
-            PipelinePlan::SinglePass(sp) => (None, sp.model.clone()),
-            PipelinePlan::Iterative(it) => (None, it.denoiser.clone()),
+            PipelinePlan::NestedAutoregressive(nested) => (None, nested.outer.clone(), 0),
+            PipelinePlan::SinglePass(sp) => (None, sp.model.clone(), 0),
+            PipelinePlan::Iterative(it) => (None, it.denoiser.clone(), 0),
             // A pure composite produces tensors (run_pipeline), not text; it has
             // no autoregressive decode state. Use the last stage's model as the
             // nominal tokenizer component (unused unless a tokenizer is queried).
@@ -228,6 +239,7 @@ impl PipelineEngine {
                         CompositeStageKind::SinglePass { model } => model.clone(),
                     })
                     .unwrap_or_default(),
+                0,
             ),
         };
         Ok(Self {
@@ -235,6 +247,7 @@ impl PipelineEngine {
             plan,
             decoder_state,
             tokenizer_component,
+            fixed_state_budget_bytes,
         })
     }
 
@@ -388,7 +401,19 @@ impl PipelineEngine {
                 .models
                 .session(&ar.decoder)
                 .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-            DecodeState::new(decoder)?
+            let decoder_io = self
+                .models
+                .directory
+                .spec
+                .models
+                .get(&ar.decoder)
+                .and_then(|component| component.io.as_ref());
+            DecodeState::new_with_io_positions_and_state_budget(
+                decoder,
+                decoder_io,
+                self.models.directory.spec.positions.as_ref(),
+                self.fixed_state_budget_bytes,
+            )?
         });
 
         let decoder = self

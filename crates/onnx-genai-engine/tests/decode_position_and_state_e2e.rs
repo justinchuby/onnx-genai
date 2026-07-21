@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use onnx_genai_engine::{
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, ResourceLimit,
+    ResourceLimits,
+};
 use onnx_genai_ort::PipelineModels;
 
 fn fixture_dir() -> PathBuf {
@@ -79,4 +83,52 @@ fn multiaxis_position_and_state_fixture_matches_contract() -> anyhow::Result<()>
         );
     }
     Ok(())
+}
+
+fn generation_request() -> GenerateRequest {
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3]));
+    request.options = GenerateOptions {
+        max_new_tokens: 3,
+        temperature: 0.0,
+        greedy: true,
+        stop_on_eos: false,
+        ..GenerateOptions::default()
+    };
+    request
+}
+
+#[test]
+fn pipeline_generation_carries_multiaxis_positions_and_fixed_state_after_reset()
+-> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&fixture_dir(), EngineConfig::default())?;
+
+    assert_eq!(
+        engine.generate(generation_request())?.token_ids,
+        vec![6, 15, 24]
+    );
+    assert_eq!(
+        engine.generate(generation_request())?.token_ids,
+        vec![6, 15, 24],
+        "each public generate call must rebuild the decoder with explicit I/O, position metadata, and fixed state"
+    );
+    Ok(())
+}
+
+#[test]
+fn pipeline_load_rejects_fixed_state_over_host_admission_budget() {
+    let config = EngineConfig {
+        limits: ResourceLimits {
+            host_ram_limit: ResourceLimit::Bytes(15),
+            ..ResourceLimits::default()
+        },
+        ..EngineConfig::default()
+    };
+
+    let error = match Engine::from_pipeline_dir(&fixture_dir(), config) {
+        Ok(_) => panic!("16 bytes of fixed state must not fit a 15-byte host admission budget"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("requires 16 bytes"), "{message}");
+    assert!(message.contains("budget is 15 bytes"), "{message}");
 }

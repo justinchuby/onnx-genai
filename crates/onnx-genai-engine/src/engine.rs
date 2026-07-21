@@ -285,6 +285,19 @@ fn governor_kv_config(
     })
 }
 
+pub(crate) fn resolved_host_ram_budget(
+    config: &EngineConfig,
+    kv_model: Option<&KvModelInfo>,
+) -> anyhow::Result<u64> {
+    let governor = EngineResourceGovernor::new(
+        config.limits.clone(),
+        config.allow_runtime_override,
+        governor_kv_config(kv_model, config)?,
+    )
+    .context("failed to resolve the engine memory budget for decoder fixed state")?;
+    Ok(governor.snapshot().resolved_limits.host_ram_bytes)
+}
+
 /// The generation engine.
 pub struct Engine {
     /// Resolved decoder execution backend.
@@ -1547,14 +1560,30 @@ impl Engine {
             .context("ORT decoder session is unavailable")?;
         // Bind ports from an explicit `model.io` block when the package declares
         // one; otherwise DecodeState falls back to tensor-name conventions.
-        let io = self.metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
+        let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
         if matches!(
             &self.speculative_mode,
             SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
         ) {
-            DecodeState::new_with_io(session, io)
+            DecodeState::new_with_io_positions_and_state_budget(
+                session,
+                io,
+                None,
+                fixed_state_budget_bytes,
+            )
         } else {
-            DecodeState::new_for_path_with_io(session, &self.decode_path, io)
+            DecodeState::new_for_path_with_io_positions_and_state_budget(
+                session,
+                &self.decode_path,
+                io,
+                None,
+                fixed_state_budget_bytes,
+            )
         }
     }
 
