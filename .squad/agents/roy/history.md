@@ -120,3 +120,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 - Made all four normalization decode variants capture-safe with persistent shape-keyed SkipSimplified metadata; Chew approved and `6184d82` landed.
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
+
+- Completed OS-aware CUPTI discovery across Linux/macOS/Windows, including pip layouts and Windows ARM64 graceful degradation (`8cd36c3`); Pris approved.

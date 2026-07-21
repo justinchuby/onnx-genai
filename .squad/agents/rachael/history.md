@@ -91,3 +91,7 @@ Batched-driver DoS hardening is canonical: admission is bounded by `max_pending`
 - Landed the serialized CUDA graph runtime/decode foundation and on-device GQA metadata path, then completed real Qwen capture via persistent external-shape seeding (`13c094a`): zero fallbacks, token-exact parity, +251.8% tok/s at 256 and +106.7% at 1024.
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
+
+- Added per-op logical bytes and documented FLOP estimates to major CPU kernel trace emit-sites; after zero-overhead and feature-propagation revisions, the combined work landed as `61f4d2c`.

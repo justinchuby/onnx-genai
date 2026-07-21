@@ -116,3 +116,7 @@ Recorded approvals for the vendoring spike, corrected integration, and corrected
 - Reviewed issue #40 Phase-1 slices: 1a 🟡 approved with two non-blocking pressure follow-ups; 1b 🟢 approved after those fixes and full BufferOwnership/concurrency conformance audit.
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
+
+- Revised CPU kernel tracing so bytes/FLOPs are computed only with an active span and the tracer dependency is optional; the reviewed combined work landed as `61f4d2c`.
