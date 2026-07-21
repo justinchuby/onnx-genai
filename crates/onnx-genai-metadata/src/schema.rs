@@ -741,8 +741,13 @@ pub struct PipelineStrategy {
     /// `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.
     ///
     /// When absent the outer loop is `input_ids`-driven (backward compatible).
+    ///
+    /// All graph-specific port bindings (the pre-embedder's `frame_codes` /
+    /// optional `text_embed` inputs and the output feeding the outer decoder)
+    /// are declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses
+    /// them by tensor name or dtype.
     #[serde(default)]
-    pub pre_embedder: Option<String>,
+    pub pre_embedder: Option<PreEmbedderSpec>,
 
     /// Optional prefill embedder component that supplies the outer decoder
     /// (talker) with its real frame-0 PREFILL sequence and the per-frame
@@ -762,8 +767,65 @@ pub struct PipelineStrategy {
     /// Only meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`
     /// path feeds the trailing-text vectors through it). When absent, frame 0
     /// uses a zero seed and every `text_embed` is zero (backward compatible).
+    ///
+    /// All graph-specific port bindings (the prompt input plus the prefill and
+    /// trailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];
+    /// the runtime never guesses them by tensor name or dtype.
     #[serde(default)]
-    pub prefill_embedder: Option<String>,
+    pub prefill_embedder: Option<PrefillEmbedderSpec>,
+}
+
+/// Structured binding for the optional pre-embedder that drives the outer
+/// decoder (talker) of a `nested_autoregressive` stage via `inputs_embeds`.
+///
+/// Every graph-specific port the runtime touches is declared here, so the
+/// engine never infers a port by tensor name or dtype.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct PreEmbedderSpec {
+    /// Declared model name of the pre-embedder component.
+    #[schemars(length(min = 1))]
+    pub component: String,
+
+    /// Pre-embedder input port receiving the previous frame's codes
+    /// (`int64 [batch, num_code_groups]`).
+    #[schemars(length(min = 1))]
+    pub frame_codes_input: String,
+
+    /// Optional pre-embedder input port receiving the per-frame trailing-text
+    /// conditioning vector (`float [batch, 1, hidden]`). When absent, the
+    /// pre-embedder exposes no trailing-text input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_embed_input: Option<String>,
+}
+
+/// Structured binding for the optional prefill embedder that supplies the outer
+/// decoder (talker) of a `nested_autoregressive` stage with its frame-0 PREFILL
+/// sequence and per-frame trailing-text conditioning.
+///
+/// Every graph-specific port the runtime touches is declared here, so the
+/// engine never infers a port by tensor name or dtype.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct PrefillEmbedderSpec {
+    /// Declared model name of the (prompt-phase) prefill embedder component.
+    #[schemars(length(min = 1))]
+    pub component: String,
+
+    /// Prefill-embedder input port receiving the tokenized prompt
+    /// (`int64 [batch, text_len]`, e.g. `text_ids`).
+    #[schemars(length(min = 1))]
+    pub prompt_input: String,
+
+    /// Prefill-embedder output port carrying the talker's frame-0 multi-position
+    /// PREFILL sequence (`float [batch, prefill_len, hidden]`), fed DIRECTLY to
+    /// the outer decoder's `inputs_embeds` on frame 0.
+    #[schemars(length(min = 1))]
+    pub prefill_output: String,
+
+    /// Prefill-embedder output port carrying the per-frame trailing-text vectors
+    /// (`float [batch, trailing_len, hidden]`), one sliced per outer frame
+    /// `k >= 1` into the pre-embedder's `text_embed`.
+    #[schemars(length(min = 1))]
+    pub trailing_output: String,
 }
 
 /// Named child stage of a composite pipeline strategy.

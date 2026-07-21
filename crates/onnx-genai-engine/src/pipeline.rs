@@ -482,6 +482,19 @@ impl PipelineEngine {
 
         let mut tensors = pipeline_request.inputs;
         self.seed_prompt_token_inputs(&plan.prompt_components, &prompt_tokens, &mut tensors)?;
+        // Explicitly seed the prefill embedder's metadata-declared prompt input
+        // with the tokenized prompt (int64 `[1, L]`) unless a dataflow edge
+        // already routes it. This does NOT rely on `is_token_input_name` — the
+        // prompt port is declared in the PrefillEmbedderSpec, never guessed.
+        if let Some(prefill) = plan.prefill_embedder.as_ref() {
+            let endpoint = format!("{}.{}", prefill.component, prefill.prompt_input);
+            let routed = plan.dataflow.iter().any(|edge| edge.to == endpoint);
+            if !routed && !tensors.contains_key(&endpoint) {
+                let ids: Vec<i64> = prompt_tokens.iter().map(|&t| i64::from(t)).collect();
+                let value = Value::from_slice_i64(&ids, &[1, ids.len() as i64])?;
+                tensors.insert(endpoint, value);
+            }
+        }
         self.run_prompt_phase_components(&plan.prompt_components, &mut tensors, "prologue", None)?;
 
         // Fixed routed extras for each decoder (encoder conditioning etc.). The
@@ -502,47 +515,52 @@ impl PipelineEngine {
             .session(&plan.inner)
             .with_context(|| format!("nested inner decoder '{}' was not loaded", plan.inner))?;
 
-        // Resolve the pre-embedder session and its input ports (sessions are not
-        // available at plan-build time, so this is done here). `frame_codes` is
-        // the sole int64 input (or one named `frame_codes`); the optional
-        // `text_embed` trailing-text input is a second float input.
+        // Resolve the pre-embedder session and confirm its metadata-declared
+        // ports exist (sessions are not available at plan-build time). All port
+        // names come from the `PreEmbedderSpec` / the required dataflow edge —
+        // there is NO name/dtype guessing here.
         let pre_embed = match plan.pre_embedder.as_ref() {
             Some(binding) => {
                 let session = self.models.session(&binding.component).with_context(|| {
                     format!("nested pre_embedder '{}' was not loaded", binding.component)
                 })?;
-                let frame_codes_input = session
+                let frame_codes_input = binding.frame_codes_input.clone();
+                if !session
                     .inputs()
                     .iter()
-                    .find(|info| info.name == "frame_codes")
-                    .or_else(|| {
-                        session
-                            .inputs()
-                            .iter()
-                            .find(|info| info.dtype == DataType::Int64)
-                    })
-                    .map(|info| info.name.clone())
-                    .with_context(|| {
-                        format!(
-                            "nested pre_embedder '{}' must expose an int64 'frame_codes' input",
-                            binding.component
-                        )
-                    })?;
-                let text_embed_input = session
-                    .inputs()
+                    .any(|info| info.name == frame_codes_input)
+                {
+                    anyhow::bail!(
+                        "nested pre_embedder '{}' has no declared frame_codes input '{}'",
+                        binding.component,
+                        frame_codes_input
+                    );
+                }
+                let text_embed_input = binding.text_embed_input.clone();
+                if let Some(name) = &text_embed_input
+                    && !session.inputs().iter().any(|info| &info.name == name)
+                {
+                    anyhow::bail!(
+                        "nested pre_embedder '{}' has no declared text_embed input '{}'",
+                        binding.component,
+                        name
+                    );
+                }
+                if !session
+                    .output_names()
                     .iter()
-                    .find(|info| {
-                        info.name != frame_codes_input
-                            && (info.name == "text_embed"
-                                || matches!(
-                                    info.dtype,
-                                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
-                                ))
-                    })
-                    .map(|info| info.name.clone());
+                    .any(|name| name == &binding.output_port)
+                {
+                    anyhow::bail!(
+                        "nested pre_embedder '{}' has no declared output port '{}'",
+                        binding.component,
+                        binding.output_port
+                    );
+                }
                 // Hidden size for the per-step embedding / zero `text_embed`:
-                // prefer the outer decoder's `inputs_embeds` input, fall back to
-                // the pre-embedder's `inputs_embeds` output.
+                // prefer the outer decoder's `inputs_embeds` input (a metadata
+                // port captured from the edge `to`), fall back to the
+                // pre-embedder's declared output port.
                 let hidden = outer_session
                     .inputs()
                     .iter()
@@ -553,7 +571,7 @@ impl PipelineEngine {
                         session
                             .outputs()
                             .iter()
-                            .find(|info| info.name.to_ascii_lowercase().ends_with("inputs_embeds"))
+                            .find(|info| info.name == binding.output_port)
                             .and_then(|info| info.shape.last().copied())
                             .filter(|dim| *dim > 0)
                     })
@@ -568,6 +586,7 @@ impl PipelineEngine {
                 Some(ResolvedPreEmbedder {
                     session,
                     outer_input: binding.outer_input.clone(),
+                    output_port: binding.output_port.clone(),
                     frame_codes_input,
                     text_embed_input,
                     hidden,
@@ -584,21 +603,20 @@ impl PipelineEngine {
         // `text_embed` vector per outer frame `k >= 1` (fed through the
         // pre-embedder). Only valid alongside `pre_embedder`.
         let prefill = match plan.prefill_embedder.as_ref() {
-            Some(component) => {
+            Some(binding) => {
+                let component = binding.component.as_str();
                 let pre = pre_embed.as_ref().with_context(|| {
                     format!(
                         "nested prefill_embedder '{component}' requires a pre_embedder to be set"
                     )
                 })?;
-                let session = self.models.session(component).with_context(|| {
+                let _ = self.models.session(component).with_context(|| {
                     format!("nested prefill_embedder '{component}' was not loaded")
                 })?;
-                // The prefill component exposes two float outputs: the
-                // multi-position prefill sequence and the trailing-text vectors.
-                // Resolve by name (`prefill_embeds` / `trailing_text_embeds`),
-                // falling back to declaration order for the unmatched port.
-                let prefill_name = resolve_prefill_output(session, "prefill", 0)?;
-                let trailing_name = resolve_prefill_output(session, "trailing", 1)?;
+                // The prefill component's two float outputs are metadata-declared
+                // (`prefill_output` / `trailing_output`) — no name/dtype guessing.
+                let prefill_name = binding.prefill_output.as_str();
+                let trailing_name = binding.trailing_output.as_str();
                 let prefill_value = tensors
                     .get(&format!("{component}.{prefill_name}"))
                     .with_context(|| {
@@ -1975,14 +1993,14 @@ struct NestedAutoregressivePlan {
     /// talker's per-step `inputs_embeds` from the PREVIOUS frame's codes through
     /// the named pre-embedder component (see [`PreEmbedderBinding`]).
     pre_embedder: Option<PreEmbedderBinding>,
-    /// Optional prefill-embedder component name (a declared model), driving the
-    /// talker's real frame-0 PREFILL sequence and per-frame trailing-text
-    /// conditioning. Only valid alongside `pre_embedder`. When `Some`, the driver
-    /// looks up this prompt-phase component's pooled `prefill_embeds` /
-    /// `trailing_text_embeds` outputs (see the runtime resolution in
-    /// [`PipelineEngine::run_nested_autoregressive`]). When `None`, frame 0 uses a
-    /// zero seed and every `text_embed` is zero (backward compatible).
-    prefill_embedder: Option<String>,
+    /// Optional prefill-embedder binding, driving the talker's real frame-0
+    /// PREFILL sequence and per-frame trailing-text conditioning. Only valid
+    /// alongside `pre_embedder`. When `Some`, the driver looks up this
+    /// prompt-phase component's pooled `prefill_output` / `trailing_output`
+    /// tensors (all ports metadata-declared, see [`PrefillEmbedderBinding`]).
+    /// When `None`, frame 0 uses a zero seed and every `text_embed` is zero
+    /// (backward compatible).
+    prefill_embedder: Option<PrefillEmbedderBinding>,
     dataflow: Vec<DataflowEdge>,
 }
 
@@ -2003,8 +2021,35 @@ struct PreEmbedderBinding {
     component: String,
     /// Outer decoder input port that receives the per-step embeddings
     /// (`inputs_embeds`), from the required dataflow edge
-    /// `{component}.inputs_embeds -> {outer}.inputs_embeds`.
+    /// `{component}.{output_port} -> {outer}.inputs_embeds` (the edge `to` side).
     outer_input: String,
+    /// Pre-embedder output port feeding the outer decoder, from the same edge's
+    /// `from` side. Metadata-declared — never guessed by name/dtype.
+    output_port: String,
+    /// Pre-embedder input port receiving the previous frame's codes
+    /// (`int64 [1, G]`). Metadata-declared via [`PreEmbedderSpec::frame_codes_input`].
+    frame_codes_input: String,
+    /// Optional pre-embedder input port receiving the per-frame trailing-text
+    /// vector. Metadata-declared via [`PreEmbedderSpec::text_embed_input`].
+    text_embed_input: Option<String>,
+}
+
+/// Wiring for the optional prefill embedder that supplies the outer talker's
+/// frame-0 PREFILL sequence and per-frame trailing-text conditioning in a
+/// [`NestedAutoregressivePlan`]. Every port is metadata-declared (from
+/// [`PrefillEmbedderSpec`]); the runtime never guesses one by name or dtype.
+#[derive(Debug, Clone)]
+struct PrefillEmbedderBinding {
+    /// Prefill-embedder component name (a declared, prompt-phase model).
+    component: String,
+    /// Input port receiving the tokenized prompt (`int64 [1, L]`).
+    prompt_input: String,
+    /// Output port carrying the talker's frame-0 PREFILL sequence
+    /// (`float [1, prefill_len, hidden]`).
+    prefill_output: String,
+    /// Output port carrying the per-frame trailing-text vectors
+    /// (`float [1, trailing_len, hidden]`).
+    trailing_output: String,
 }
 
 /// One forward invocation of a single model with no runtime-managed loop.
@@ -3482,8 +3527,9 @@ impl PipelinePlan {
         // must be a declared model, distinct from the loop decoders, and wired to
         // the outer decoder by a dataflow edge
         // `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.
-        let pre_embedder = match nested.pre_embedder.as_deref() {
-            Some(name) => {
+        let pre_embedder = match nested.pre_embedder.as_ref() {
+            Some(spec_pre) => {
+                let name = spec_pre.component.as_str();
                 if !spec.models.contains_key(name) {
                     anyhow::bail!(
                         "nested_autoregressive pre_embedder '{name}' is not declared in models"
@@ -3505,13 +3551,21 @@ impl PipelinePlan {
                     .with_context(|| {
                         format!(
                             "nested_autoregressive pre_embedder '{name}' needs a per-step feed: a \
-                             dataflow edge '{name}.inputs_embeds -> {outer}.inputs_embeds'"
+                             dataflow edge '{name}.<output> -> {outer}.inputs_embeds'"
                         )
                     })?;
+                // Both ports come from the REQUIRED edge (metadata): the outer
+                // decoder input from the `to` side and the pre-embedder output
+                // from the `from` side. The `frame_codes` / `text_embed` inputs
+                // come from the PreEmbedderSpec. Nothing is guessed by name/dtype.
                 let (_, outer_input) = parse_endpoint(&edge.to)?;
+                let (_, output_port) = parse_endpoint(&edge.from)?;
                 Some(PreEmbedderBinding {
                     component: name.to_string(),
                     outer_input: outer_input.to_string(),
+                    output_port: output_port.to_string(),
+                    frame_codes_input: spec_pre.frame_codes_input.clone(),
+                    text_embed_input: spec_pre.text_embed_input.clone(),
                 })
             }
             None => None,
@@ -3526,8 +3580,9 @@ impl PipelinePlan {
         // phase. It must be a declared model distinct from the loop decoders and
         // the pre-embedder, and only makes sense alongside a `pre_embedder` (the
         // trailing-text vectors are threaded through it on frames >= 1).
-        let prefill_embedder = match nested.prefill_embedder.as_deref() {
-            Some(name) => {
+        let prefill_embedder = match nested.prefill_embedder.as_ref() {
+            Some(spec_prefill) => {
+                let name = spec_prefill.component.as_str();
                 if !spec.models.contains_key(name) {
                     anyhow::bail!(
                         "nested_autoregressive prefill_embedder '{name}' is not declared in models"
@@ -3551,7 +3606,14 @@ impl PipelinePlan {
                          (frames >= 1 thread its trailing-text vectors through the pre-embedder)"
                     );
                 }
-                Some(name.to_string())
+                // All ports (prompt input, prefill and trailing outputs) are
+                // metadata-declared in the PrefillEmbedderSpec — never guessed.
+                Some(PrefillEmbedderBinding {
+                    component: name.to_string(),
+                    prompt_input: spec_prefill.prompt_input.clone(),
+                    prefill_output: spec_prefill.prefill_output.clone(),
+                    trailing_output: spec_prefill.trailing_output.clone(),
+                })
             }
             None => None,
         };
@@ -4041,10 +4103,15 @@ struct ResolvedPreEmbedder<'a> {
     session: &'a Session,
     /// Outer decoder input port fed the per-step embeddings (`inputs_embeds`).
     outer_input: String,
+    /// Pre-embedder output port feeding the outer decoder. Metadata-declared
+    /// (from the required dataflow edge's `from` side) — never guessed.
+    output_port: String,
     /// Pre-embedder input receiving the previous frame's codes (int64 `[1, G]`).
+    /// Metadata-declared via `PreEmbedderSpec::frame_codes_input`.
     frame_codes_input: String,
     /// Optional trailing-text input. Fed the prefill embedder's per-frame
     /// `trailing_text_embeds` slice when a `prefill_embedder` is set, else zeros.
+    /// Metadata-declared via `PreEmbedderSpec::text_embed_input`.
     text_embed_input: Option<String>,
     /// Embedding hidden size for the emitted `inputs_embeds` / `text_embed`.
     hidden: usize,
@@ -4067,43 +4134,6 @@ struct ResolvedPrefill {
     hidden: usize,
 }
 
-/// Resolve one of the prefill embedder's two float outputs by name substring
-/// (`prefill` / `trailing`), falling back to declaration order (`fallback_idx`)
-/// among its float outputs.
-fn resolve_prefill_output(
-    session: &Session,
-    needle: &str,
-    fallback_idx: usize,
-) -> anyhow::Result<String> {
-    let float_outputs: Vec<&str> = session
-        .outputs()
-        .iter()
-        .filter(|info| {
-            matches!(
-                info.dtype,
-                DataType::Float32 | DataType::Float16 | DataType::BFloat16
-            )
-        })
-        .map(|info| info.name.as_str())
-        .collect();
-    if let Some(name) = float_outputs
-        .iter()
-        .find(|name| name.to_ascii_lowercase().contains(needle))
-    {
-        return Ok((*name).to_string());
-    }
-    float_outputs
-        .get(fallback_idx)
-        .map(|name| (*name).to_string())
-        .with_context(|| {
-            format!(
-                "prefill embedder must expose a float '{needle}' output (or at least \
-                 {} float outputs); found {float_outputs:?}",
-                fallback_idx + 1
-            )
-        })
-}
-
 /// Build the outer talker's per-step `inputs_embeds` by running the codec-sum
 /// pre-embedder over one frame's `frame_codes` (`[outer_code_0, inner_code_1,
 /// ..., inner_code_{G-1}]`). Returns a `[1, 1, hidden]` embedding.
@@ -4112,6 +4142,10 @@ fn resolve_prefill_output(
 /// trailing-text conditioning input (the prefill embedder's per-frame
 /// `trailing_text_embeds` vector). When `None`, a zero `[1, 1, hidden]` tensor is
 /// fed (the backward-compatible no-prefill_embedder path).
+///
+/// Every port used here (`frame_codes_input`, `text_embed_input`, `output_port`)
+/// is metadata-declared on [`ResolvedPreEmbedder`] — there is NO name/dtype
+/// guessing of the pre-embedder's ports.
 fn run_pre_embedder(
     pre: &ResolvedPreEmbedder<'_>,
     frame_codes: &[i64],
@@ -4148,21 +4182,21 @@ fn run_pre_embedder(
         .session
         .run(&refs)
         .map_err(|e| anyhow::anyhow!("ORT pre-embedder run failed: {e}"))?;
+    // Select the metadata-declared output port (never guessed by name).
     let index = pre
         .session
         .output_names()
         .iter()
-        .position(|name| name == "inputs_embeds")
-        .or_else(|| {
-            pre.session
-                .output_names()
-                .iter()
-                .position(|name| name.to_ascii_lowercase().ends_with("inputs_embeds"))
-        })
-        .unwrap_or(0);
+        .position(|name| name == &pre.output_port)
+        .with_context(|| {
+            format!(
+                "pre-embedder has no declared output port '{}'",
+                pre.output_port
+            )
+        })?;
     let value = outputs
         .get(index)
-        .context("pre-embedder produced no inputs_embeds output")?;
+        .context("pre-embedder produced no output for its declared port")?;
     clone_value(value)
 }
 

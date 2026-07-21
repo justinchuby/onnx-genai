@@ -49,8 +49,15 @@ pipeline:
           kind: nested_autoregressive
           outer: talker
           inner: code_predictor
-          pre_embedder: talker_step_embedder
-          prefill_embedder: talker_prefill_embedder
+          pre_embedder:
+            component: talker_step_embedder
+            frame_codes_input: frame_codes
+            text_embed_input: text_embed
+          prefill_embedder:
+            component: talker_prefill_embedder
+            prompt_input: text_ids
+            prefill_output: prefill_embeds
+            trailing_output: trailing_text_embeds
           num_code_groups: 4
           max_tokens: 2
         run_on: every_step
