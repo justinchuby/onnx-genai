@@ -74,7 +74,8 @@ skip = "*-musllinux_*"
 test-command = "onnx-genai version"
 
 [tool.cibuildwheel.linux]
-# Linux wheel builds run inside a manylinux container, so provision Rust. ONNX
-# Runtime headers/import library for the build come from the ort-sys auto-download.
-before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+# Linux wheel builds run inside a manylinux container, so provision Rust and
+# libclang (bindgen needs libclang.so to generate onnx-genai-ort-sys bindings).
+# ONNX Runtime headers/import library for the build come from the ort-sys auto-download.
+before-all = "dnf install -y clang || yum install -y clang; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }

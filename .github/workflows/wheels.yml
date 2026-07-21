@@ -130,21 +130,19 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             archs: x86_64
-            config_settings: "build-args=--features cuda"
+            cuda: true
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
-            config_settings: "build-args=--features cuda"
-          # macos-15-intel is GitHub's final hosted Intel runner line.
-          - name: macOS x86_64
-            os: macos-15-intel
-            archs: x86_64
-            config_settings: ""
+            cuda: true
+          # macOS ships only Apple Silicon: ONNX Runtime 1.27 publishes no
+          # osx-x86_64 native archive (the ort-sys auto-download 404s), and MLX
+          # is Apple-Silicon only, so we build just the arm64 wheel.
           # macos-14 is the GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
             os: macos-14
             archs: arm64
-            config_settings: ""
+            cuda: false
         include:
           - package: onnx-genai
             package_dir: crates/onnx-genai-python
@@ -155,8 +153,10 @@ jobs:
       CIBW_ARCHS: ${{ matrix.platform.archs }}
       CIBW_BUILD: "cp311-*"
       CIBW_SKIP: "*-musllinux_*"
-      # On Windows/Linux this appends `--features cuda` to the maturin build.
-      CIBW_CONFIG_SETTINGS: ${{ matrix.platform.config_settings }}
+      # CIBW_CONFIG_SETTINGS (the maturin `--features`) is computed per package in
+      # the "Select build features" step below: it differs by package because the
+      # CLI's pyo3 module is behind an optional `python` feature, while the
+      # extension crate's pyo3 is non-optional.
       # Do NOT vendor libonnxruntime into the wheel. Windows/macOS wheel tags are
       # already valid for PyPI, so skip repair there entirely. On Linux we still
       # need auditwheel to retag the wheel manylinux-compliant, but we exclude
@@ -179,6 +179,27 @@ jobs:
           python-version: "3.11"
       - uses: dtolnay/rust-toolchain@stable
 
+      # Compute the maturin --features per package. maturin's CLI --features
+      # REPLACES pyproject [tool.maturin] features, so when we add `cuda` we must
+      # re-add every feature the package needs to build its pyo3 module:
+      #   * onnx-genai (extension): pyo3 is non-optional, so `cuda` alone is enough
+      #     (maturin still detects pyo3 and auto-adds extension-module).
+      #   * onnx-genai-server (CLI): pyo3 is optional behind the `python` feature,
+      #     so we must pass `python,cuda` or maturin sees no bindings and fails
+      #     trying to install cffi. abi3-py310 comes from the Cargo.toml pyo3 dep.
+      # macOS builds no CUDA feature, so config-settings stays empty and the
+      # pyproject features apply unchanged.
+      - name: Select build features
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform.cuda }}" != "true" ]; then
+            echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,cuda" >> "$GITHUB_ENV"
+          else
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
+          fi
+
       - name: Build and smoke-test wheel
         uses: pypa/cibuildwheel@v4.1.0
         with:
@@ -193,11 +214,11 @@ jobs:
           if-no-files-found: error
 
   publish-cpu:
-    name: Publish CPU wheels
+    name: Publish nxrt CPU wheels
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: [cpu-wheels, onnx-genai-wheels]
+    needs: [cpu-wheels]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -211,6 +232,26 @@ jobs:
           path: wheelhouse
           merge-multiple: true
 
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse
+
+  # Publishing onnx-genai / onnx-genai-server is deliberately independent of the
+  # nxrt cpu-wheels job so a failure in that separate package never blocks the
+  # onnx-genai release.
+  publish-onnx-genai:
+    name: Publish onnx-genai wheels
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [onnx-genai-wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
       - name: Download onnx-genai wheels
         uses: actions/download-artifact@v4
         with:
