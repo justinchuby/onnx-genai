@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
-use onnx_genai_engine::{GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain};
+use onnx_genai_engine::{
+    Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
+    NativeDecodeDevice, NativeDecodeSession, ProcessorChain,
+};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_session::InferenceSession;
 
@@ -34,6 +37,12 @@ struct Args {
     warmups: usize,
     #[arg(long, default_value_t = 1)]
     runs: usize,
+    /// Time steady decode from token callbacks, excluding the first N emitted
+    /// tokens so prefill, eager warmup, and graph capture are outside the window.
+    #[arg(long)]
+    steady: bool,
+    #[arg(long, default_value_t = 8)]
+    decode_skip: usize,
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
     ep: ExecutionProvider,
     #[arg(long, default_value = "Hello")]
@@ -82,6 +91,104 @@ fn generate(
     Ok(result.token_ids)
 }
 
+fn request(prompt: &str, tokens: usize) -> GenerateRequest {
+    let mut request = GenerateRequest::new(prompt.to_string());
+    request.options.max_new_tokens = tokens;
+    request.options.temperature = 0.0;
+    request.options.greedy = true;
+    request.options.stop_on_eos = false;
+    request
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
+    if args.synthetic {
+        bail!("--steady requires a real model directory");
+    }
+    if args.tokens <= args.decode_skip {
+        bail!("--tokens must be greater than --decode-skip");
+    }
+
+    let mut config = EngineConfig {
+        decode_backend: EngineDecodeBackend::Native,
+        ..EngineConfig::default()
+    };
+    config.native_device = Some(device);
+    let mut engine = Engine::from_dir(model_dir, config)
+        .with_context(|| format!("load native engine {}", model_dir.display()))?;
+
+    for _ in 0..args.warmups {
+        std::hint::black_box(
+            engine
+                .generate(request(&args.prompt, args.tokens))
+                .context("steady warmup generation")?,
+        );
+    }
+
+    let mut prefills_ms = Vec::with_capacity(args.runs);
+    let mut decode_ms_per_token = Vec::with_capacity(args.runs);
+    let mut throughputs = Vec::with_capacity(args.runs);
+    let mut reference_tokens = None;
+    for run in 1..=args.runs {
+        let start = Instant::now();
+        let mut token_times = Vec::with_capacity(args.tokens);
+        let mut callback = |_| {
+            token_times.push(start.elapsed());
+            Ok(())
+        };
+        let result = engine
+            .generate_with_callback(request(&args.prompt, args.tokens), Some(&mut callback))
+            .context("steady measured generation")?;
+        if token_times.len() <= args.decode_skip {
+            bail!(
+                "generation emitted {} tokens, not enough for --decode-skip {}",
+                token_times.len(),
+                args.decode_skip
+            );
+        }
+        if let Some(reference) = &reference_tokens {
+            if reference != &result.token_ids {
+                bail!("native greedy decode was not deterministic across measured runs");
+            }
+        } else {
+            reference_tokens = Some(result.token_ids.clone());
+        }
+
+        let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
+        let decode_tokens = token_times.len() - args.decode_skip;
+        let decode_wall = token_times[token_times.len() - 1] - token_times[args.decode_skip - 1];
+        let ms_per_token = decode_wall.as_secs_f64() * 1_000.0 / decode_tokens as f64;
+        let tok_per_s = decode_tokens as f64 / decode_wall.as_secs_f64();
+        println!(
+            "steady_run {run}: prefill={prefill_ms:.3} ms decode_tokens={decode_tokens} \
+             decode_wall={:.3} ms decode={ms_per_token:.3} ms/token throughput={tok_per_s:.2} tok/s",
+            decode_wall.as_secs_f64() * 1_000.0
+        );
+        prefills_ms.push(prefill_ms);
+        decode_ms_per_token.push(ms_per_token);
+        throughputs.push(tok_per_s);
+    }
+
+    println!(
+        "steady_median: prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
+         (runs={} warmups={} decode_skip={})",
+        median(&mut prefills_ms),
+        median(&mut decode_ms_per_token),
+        median(&mut throughputs),
+        args.runs,
+        args.warmups,
+        args.decode_skip
+    );
+    if let Some(tokens) = reference_tokens {
+        println!("generated_token_ids: {tokens:?}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.tokens == 0 || args.runs == 0 {
@@ -106,6 +213,13 @@ fn main() -> Result<()> {
     } else {
         model_file(args.model.as_deref().expect("validated model argument"))
     };
+    if args.steady {
+        return run_steady(
+            &args,
+            args.model.as_deref().expect("validated model argument"),
+            device,
+        );
+    }
     let tokenizer_path = if args.synthetic {
         fixture_path("tiny-gemma4-assistant").join("tokenizer.json")
     } else {
@@ -176,6 +290,7 @@ fn main() -> Result<()> {
         )?);
     }
 
+    let stats_before = session.cuda_kv_debug_stats();
     let mut generated = 0usize;
     let mut elapsed = Duration::ZERO;
     let mut reference_tokens = None;
@@ -202,9 +317,25 @@ fn main() -> Result<()> {
         elapsed.as_secs_f64() * 1_000.0
     );
     if let Some(stats) = session.cuda_kv_debug_stats() {
+        let before = stats_before
+            .as_ref()
+            .expect("CUDA stats before measurement");
         println!(
             "cuda_graph: enabled={} captures={} replays={} fallbacks={}",
             stats.graph.enabled, stats.graph.captures, stats.graph.replays, stats.graph.fallbacks
+        );
+        println!(
+            "cuda_graph_measured: captures={} replays={} fallbacks={}",
+            stats.graph.captures - before.graph.captures,
+            stats.graph.replays - before.graph.replays,
+            stats.graph.fallbacks - before.graph.fallbacks
+        );
+        println!(
+            "device_kv_measured: h2d_calls={} h2d_bytes={} d2h_calls={} d2h_bytes={}",
+            stats.kv_transfers.host_upload_calls - before.kv_transfers.host_upload_calls,
+            stats.kv_transfers.host_upload_bytes - before.kv_transfers.host_upload_bytes,
+            stats.kv_transfers.host_download_calls - before.kv_transfers.host_download_calls,
+            stats.kv_transfers.host_download_bytes - before.kv_transfers.host_download_bytes
         );
         if let Some(reason) = session.cuda_graph_fallback_reason() {
             println!("cuda_graph_fallback_reason: {reason}");
