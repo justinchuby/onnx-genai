@@ -1,0 +1,48 @@
+schema_version: v1
+pipeline:
+  models:
+    embedding:
+      filename: embedding.onnx.textproto
+      type: encoder
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        token_input: input_ids
+        inputs_embeds_input: routed_sequence
+        attention_mask_input: attention_mask
+        position_ids_input: position_ids
+        logits_output: logits
+        kv_inputs: [past.3.key, past.3.value, past.11.key, past.11.value]
+        kv_outputs: [present.3.key, present.3.value, present.11.key, present.11.value]
+        kv_update: append
+        state_pairs:
+          - input: state_a.in
+            output: state_a.out
+            init: zeros
+            update: replace
+          - input: state_b.in
+            output: state_b.out
+            init: zeros
+            update: replace
+  dataflow:
+    - from: embedding.routed_sequence
+      to: decoder.routed_sequence
+      dtype: fp32
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+    max_tokens: 3
+  phases:
+    embedding:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step
+  positions:
+    input: position_ids
+    rank: 3
+    axes: [first, second, third]
+    sections: [2, 3, 5]
+    dtype: int64
+    continuation: carry_max
