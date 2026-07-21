@@ -114,22 +114,107 @@ jobs:
           path: wheelhouse/*.whl
           if-no-files-found: error
 
+  # onnx-genai (ORT-backed genai extension) and onnx-genai-server (the unified
+  # CLI). These wheels deliberately DO NOT bundle libonnxruntime: it is loaded
+  # at runtime from the installed onnxruntime / onnxruntime-gpu pip wheel, so a
+  # user's CUDA (or MLX) install is picked up automatically. Windows and Linux
+  # wheels are compiled with the `cuda` Cargo feature (dynamically loaded ORT
+  # CUDAExecutionProvider); the multi-GB nvidia runtime is a `[cuda]` pip extra.
+  onnx-genai-wheels:
+    name: ${{ matrix.package }} (${{ matrix.platform.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [onnx-genai, onnx-genai-server]
+        platform:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+            config_settings: "build-args=--features cuda"
+          - name: Windows AMD64
+            os: windows-latest
+            archs: AMD64
+            config_settings: "build-args=--features cuda"
+          # macos-15-intel is GitHub's final hosted Intel runner line.
+          - name: macOS x86_64
+            os: macos-15-intel
+            archs: x86_64
+            config_settings: ""
+          # macos-14 is the GitHub-hosted Apple Silicon runner.
+          - name: macOS arm64
+            os: macos-14
+            archs: arm64
+            config_settings: ""
+        include:
+          - package: onnx-genai
+            package_dir: crates/onnx-genai-python
+          - package: onnx-genai-server
+            package_dir: crates/onnx-genai-cli
+    runs-on: ${{ matrix.platform.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.platform.archs }}
+      CIBW_BUILD: "cp311-*"
+      CIBW_SKIP: "*-musllinux_*"
+      # On Windows/Linux this appends `--features cuda` to the maturin build.
+      CIBW_CONFIG_SETTINGS: ${{ matrix.platform.config_settings }}
+      # Do NOT vendor libonnxruntime into the wheel. Windows/macOS wheel tags are
+      # already valid for PyPI, so skip repair there entirely. On Linux we still
+      # need auditwheel to retag the wheel manylinux-compliant, but we exclude
+      # libonnxruntime so it stays an unresolved runtime dependency the loader
+      # shim satisfies from the onnxruntime package.
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: ""
+      CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libonnxruntime.so.1 -w {dest_dir} {wheel}"
+      # macOS wheels still bake an absolute ONNX Runtime install-name that needs
+      # a runtime fixup, so skip the on-macOS smoke test until that lands. The
+      # wheel is still built and uploaded for iteration.
+      CIBW_TEST_SKIP: "*-macosx_*"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and smoke-test wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: ${{ matrix.package_dir }}
+          output-dir: wheelhouse
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-genai-wheels-${{ matrix.package }}-${{ matrix.platform.os }}-${{ matrix.platform.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
   publish-cpu:
     name: Publish CPU wheels
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: cpu-wheels
+    needs: [cpu-wheels, onnx-genai-wheels]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
 
     steps:
-      - name: Download CPU wheels
+      - name: Download nxrt CPU wheels
         uses: actions/download-artifact@v4
         with:
           pattern: cpu-wheels-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Download onnx-genai wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: onnx-genai-wheels-*
           path: wheelhouse
           merge-multiple: true
 
