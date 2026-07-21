@@ -150,24 +150,26 @@ jobs:
             return 1
           }
 
+          # Crates are published in topological (dependency-first) order so every
+          # `=<version>` path dependency already exists on crates.io. Regenerate
+          # with the workspace's cargo-metadata graph after adding/moving a crate.
           publish_crate onnx-runtime-ir
           publish_crate onnx-runtime-shape-inference
           publish_crate onnx-runtime-loader
           publish_crate onnx-std
-          publish_crate onnx-runtime-ep-api
-          publish_crate onnx-runtime-ep-cpu
           publish_crate onnx-runtime-optimizer
-          publish_crate onnx-runtime-session
-          publish_crate onnx-runtime-capi
           publish_crate onnx-runtime-cpuinfo
-          publish_crate onnx-runtime-eager
-          publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-runtime-memory
           publish_crate onnx-runtime-tracer
-
+          publish_crate onnx-runtime-ep-api
+          publish_crate onnx-runtime-ep-cpu
+          publish_crate onnx-runtime-eager
+          publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-genai-metadata
           publish_crate onnx-genai-ort-sys
           publish_crate onnx-genai-runtime-config
+          publish_crate onnx-runtime-session
+          publish_crate onnx-runtime-capi
           publish_crate onnx-genai-preprocess
           publish_crate onnx-genai-router
           publish_crate onnx-genai-genai-config
