@@ -98,7 +98,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 edition = "2024"
 license = "MIT"
 authors = ["Justin Chu"]
@@ -106,41 +106,41 @@ repository = "https://github.com/justinchuby/onnx-genai"
 
 [workspace.dependencies]
 # Internal crates
-onnx-genai = { path = "crates/onnx-genai", version = "=0.1.0-dev.2" }
-onnx-genai-preprocess = { path = "crates/onnx-genai-preprocess", version = "=0.1.0-dev.2" }
-onnx-genai-metadata = { path = "crates/onnx-genai-metadata", version = "=0.1.0-dev.2" }
-onnx-genai-genai-config = { path = "crates/onnx-genai-genai-config", version = "=0.1.0-dev.2" }
-onnx-genai-comfyui-config = { path = "crates/onnx-genai-comfyui-config", version = "=0.1.0-dev.2" }
-onnx-genai-runtime-config = { path = "crates/onnx-genai-runtime-config", version = "=0.1.0-dev.2" }
-onnx-genai-kv = { path = "crates/onnx-genai-kv", version = "=0.1.0-dev.2" }
-onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler", version = "=0.1.0-dev.2" }
-onnx-genai-engine = { path = "crates/onnx-genai-engine", version = "=0.1.0-dev.2" }
-onnx-genai-ort = { path = "crates/onnx-genai-ort", version = "=0.1.0-dev.2" }
-onnx-genai-ort-sys = { path = "crates/onnx-genai-ort/ort-sys", version = "=0.1.0-dev.2" }
-onnx-genai-capi = { path = "crates/onnx-genai-capi", version = "=0.1.0-dev.2" }
-onnx-genai-server = { path = "crates/onnx-genai-server", version = "=0.1.0-dev.2" }
+onnx-genai = { path = "crates/onnx-genai", version = "=0.1.0-dev.3" }
+onnx-genai-preprocess = { path = "crates/onnx-genai-preprocess", version = "=0.1.0-dev.3" }
+onnx-genai-metadata = { path = "crates/onnx-genai-metadata", version = "=0.1.0-dev.3" }
+onnx-genai-genai-config = { path = "crates/onnx-genai-genai-config", version = "=0.1.0-dev.3" }
+onnx-genai-comfyui-config = { path = "crates/onnx-genai-comfyui-config", version = "=0.1.0-dev.3" }
+onnx-genai-runtime-config = { path = "crates/onnx-genai-runtime-config", version = "=0.1.0-dev.3" }
+onnx-genai-kv = { path = "crates/onnx-genai-kv", version = "=0.1.0-dev.3" }
+onnx-genai-scheduler = { path = "crates/onnx-genai-scheduler", version = "=0.1.0-dev.3" }
+onnx-genai-engine = { path = "crates/onnx-genai-engine", version = "=0.1.0-dev.3" }
+onnx-genai-ort = { path = "crates/onnx-genai-ort", version = "=0.1.0-dev.3" }
+onnx-genai-ort-sys = { path = "crates/onnx-genai-ort/ort-sys", version = "=0.1.0-dev.3" }
+onnx-genai-capi = { path = "crates/onnx-genai-capi", version = "=0.1.0-dev.3" }
+onnx-genai-server = { path = "crates/onnx-genai-server", version = "=0.1.0-dev.3" }
 # ORT 2.0 runtime layer (new)
-onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.2" }
-onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.2" }
-onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.2" }
-onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.2" }
-onnx-runtime-shape-inference = { path = "crates/onnx-runtime-shape-inference", version = "=0.1.0-dev.2" }
-onnx-runtime-optimizer = { path = "crates/onnx-runtime-optimizer", version = "=0.1.0-dev.2" }
-onnx-runtime-quantization = { path = "crates/onnx-runtime-quantization", version = "=0.1.0-dev.2" }
-onnx-runtime-ep-api = { path = "crates/onnx-runtime-ep-api", version = "=0.1.0-dev.2" }
-onnx-runtime-ep-cpu = { path = "crates/onnx-runtime-ep-cpu", version = "=0.1.0-dev.2" }
+onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.3" }
+onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.3" }
+onnx-runtime-cpuinfo = { path = "crates/onnx-runtime-cpuinfo", version = "=0.1.0-dev.3" }
+onnx-runtime-loader = { path = "crates/onnx-runtime-loader", version = "=0.1.0-dev.3" }
+onnx-runtime-shape-inference = { path = "crates/onnx-runtime-shape-inference", version = "=0.1.0-dev.3" }
+onnx-runtime-optimizer = { path = "crates/onnx-runtime-optimizer", version = "=0.1.0-dev.3" }
+onnx-runtime-quantization = { path = "crates/onnx-runtime-quantization", version = "=0.1.0-dev.3" }
+onnx-runtime-ep-api = { path = "crates/onnx-runtime-ep-api", version = "=0.1.0-dev.3" }
+onnx-runtime-ep-cpu = { path = "crates/onnx-runtime-ep-cpu", version = "=0.1.0-dev.3" }
 mlas-sys = { path = "crates/mlas-sys", version = "0.0.0" }
-onnx-runtime-ep-cuda = { path = "crates/onnx-runtime-ep-cuda", version = "=0.1.0-dev.2" }
-onnx-runtime-eager = { path = "crates/onnx-runtime-eager", version = "=0.1.0-dev.2" }
-onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0-dev.2" }
-onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.2" }
-onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer", version = "=0.1.0-dev.2" }
-onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-dev.2" }
-onnx-runtime-protocol-trace = { path = "crates/onnx-runtime-protocol-trace", version = "=0.1.0-dev.2" }
-onnx-runtime-comm = { path = "crates/onnx-runtime-comm", version = "=0.1.0-dev.2" }
+onnx-runtime-ep-cuda = { path = "crates/onnx-runtime-ep-cuda", version = "=0.1.0-dev.3" }
+onnx-runtime-eager = { path = "crates/onnx-runtime-eager", version = "=0.1.0-dev.3" }
+onnx-runtime-session = { path = "crates/onnx-runtime-session", version = "=0.1.0-dev.3" }
+onnx-runtime-capi = { path = "crates/onnx-runtime-capi", version = "=0.1.0-dev.3" }
+onnx-runtime-tracer = { path = "crates/onnx-runtime-tracer", version = "=0.1.0-dev.3" }
+onnx-runtime-dlpack = { path = "crates/onnx-runtime-dlpack", version = "=0.1.0-dev.3" }
+onnx-runtime-protocol-trace = { path = "crates/onnx-runtime-protocol-trace", version = "=0.1.0-dev.3" }
+onnx-runtime-comm = { path = "crates/onnx-runtime-comm", version = "=0.1.0-dev.3" }
 
 # onnx-rs standard library (new — see docs/ONNX_RS.md)
-onnx-rs = { path = "crates/onnx-rs", version = "=0.1.0-dev.2" }
+onnx-rs = { path = "crates/onnx-rs", version = "=0.1.0-dev.3" }
 
 # External
 tokenizers = "0.21"
