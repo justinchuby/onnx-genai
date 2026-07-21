@@ -39,10 +39,6 @@ rand = "0.9"
 rand_distr = "0.5"
 
 [[bin]]
-name = "onnx-genai"
-path = "src/bin/onnx-genai.rs"
-
-[[bin]]
 name = "run_comfyui"
 path = "src/bin/run_comfyui.rs"
 

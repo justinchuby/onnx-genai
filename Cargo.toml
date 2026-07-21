@@ -35,6 +35,10 @@ members = [
     "crates/onnx-runtime-python",
     "crates/onnx-runtime-dlpack",
 
+    # ── Python packaging + unified CLI (onnx-genai / onnx-genai-server wheels) ──
+    "crates/onnx-genai-python",
+    "crates/onnx-genai-cli",
+
     # ── Protocol conformance framework (new — see docs/PRESSURE_PROTOCOL_IMPL.md) ──
     "crates/onnx-runtime-protocol-trace",
 
@@ -85,6 +89,8 @@ default-members = [
     "crates/onnx-runtime-tracer",
     "crates/onnx-runtime-python",
     "crates/onnx-runtime-dlpack",
+    "crates/onnx-genai-python",
+    "crates/onnx-genai-cli",
     "crates/onnx-runtime-protocol-trace",
     "crates/onnx-runtime-comm",
     "crates/onnx-rs",
@@ -112,6 +118,7 @@ onnx-genai-engine = { path = "crates/onnx-genai-engine", version = "=0.1.0-dev.2
 onnx-genai-ort = { path = "crates/onnx-genai-ort", version = "=0.1.0-dev.2" }
 onnx-genai-ort-sys = { path = "crates/onnx-genai-ort/ort-sys", version = "=0.1.0-dev.2" }
 onnx-genai-capi = { path = "crates/onnx-genai-capi", version = "=0.1.0-dev.2" }
+onnx-genai-server = { path = "crates/onnx-genai-server", version = "=0.1.0-dev.2" }
 # ORT 2.0 runtime layer (new)
 onnx-runtime-ir = { path = "crates/onnx-runtime-ir", version = "=0.1.0-dev.2" }
 onnx-runtime-memory = { path = "crates/onnx-runtime-memory", version = "=0.1.0-dev.2" }

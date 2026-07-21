@@ -1715,6 +1715,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-cli"
+version = "0.1.0-dev.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "onnx-genai",
+ "onnx-genai-engine",
+ "onnx-genai-server",
+ "pyo3",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "onnx-genai-comfyui-config"
 version = "0.1.0-dev.2"
 dependencies = [
@@ -1829,6 +1843,14 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_yaml",
+]
+
+[[package]]
+name = "onnx-genai-python"
+version = "0.1.0-dev.2"
+dependencies = [
+ "onnx-genai-engine",
+ "pyo3",
 ]
 
 [[package]]

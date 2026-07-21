@@ -1,0 +1,66 @@
+# Unified `onnx-genai` command-line tool.
+#
+# Ships as the `onnx-genai-server` wheel (maturin mixed project): `pip install
+# onnx-genai-server` installs a single `onnx-genai` console command exposing
+# `serve`, `generate`, `run`, `show`, `list`, and `version`. It depends on the
+# core `onnx-genai` engine (generation) and `onnx-genai-server` (the
+# OpenAI-compatible server), so it lives in its own crate to avoid a dependency
+# cycle with the core crate.
+#
+# Two build outputs share one code base:
+# - the `onnx-genai` binary (`src/main.rs`) for local development, and
+# - the `_onnx_genai_server` PyO3 extension module (behind the `python` feature)
+#   that the wheel imports. The wheel's Python console entry point loads ONNX
+#   Runtime from the installed `onnxruntime` wheel, then calls into the module —
+#   which is how the wheel-installed command finds ONNX Runtime without bundling
+#   it (a raw binary has no import-time hook to locate the onnxruntime package).
+[package]
+name = "onnx-genai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified onnx-genai command-line interface (serve, generate, run, show, list)"
+publish = false
+
+[lib]
+# `_onnx_genai_server` is the wheel's private extension module (cdylib). `rlib`
+# lets the `onnx-genai` binary reuse the same `run` entry point.
+name = "_onnx_genai_server"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "onnx-genai"
+path = "src/main.rs"
+
+[features]
+default = []
+# Build the PyO3 extension module for the `onnx-genai-server` wheel. maturin adds
+# `pyo3/extension-module` on top of this at wheel-build time.
+python = ["dep:pyo3"]
+# Enable ONNX Runtime's built-in CUDAExecutionProvider (CUDA 13) plus the cudarc
+# GPU sampler, without the nxrt-native CUDA kernel crate. GPU ONNX Runtime is
+# provided at runtime by the `onnxruntime-gpu` wheel (the `onnx-genai-server[cuda]`
+# pip extra); nothing CUDA is bundled.
+cuda = ["onnx-genai-server/ort-cuda"]
+# Native decoder execution for models containing native-only operators.
+native-backend = ["onnx-genai-server/native-backend"]
+mlas = ["onnx-genai-server/mlas"]
+
+[dependencies]
+onnx-genai = { workspace = true }
+onnx-genai-engine = { workspace = true }
+onnx-genai-server = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dependencies.pyo3]
+version = "0.29"
+# `abi3-py310` builds against the limited API (a single cp310-abi3 module usable
+# on CPython 3.10+); the real 3.11 minimum is enforced by the wheel's
+# requires-python and the onnxruntime dependency.
+features = ["abi3-py310"]
+optional = true

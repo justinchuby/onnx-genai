@@ -20,6 +20,7 @@ use axum::{
 use tracing::Instrument;
 
 mod audio_input;
+mod cli;
 mod driver;
 mod image_input;
 mod metrics;
@@ -31,6 +32,7 @@ mod sse;
 mod state;
 mod types;
 
+pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
 pub use registry::EvictionPolicy;
 pub use routes::{

@@ -16,6 +16,11 @@ metrics = []
 profiling = []
 # Enables the ORT and native-runtime CUDA execution providers (build on a CUDA host, e.g. H200).
 cuda = ["onnx-genai-ort/cuda", "onnx-genai-engine/cuda"]
+# ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
+# (CUDA 13) plus the cudarc GPU sampler in `onnx-genai-ort`, WITHOUT the
+# nxrt-native CUDA kernel crate. This is what the `onnx-genai-server` wheel's
+# CUDA build uses; GPU ONNX Runtime comes from the `onnxruntime-gpu` wheel.
+ort-cuda = ["onnx-genai-ort/cuda", "onnx-genai-ort/cuda-13000", "onnx-genai-engine/ort-cuda"]
 # CUDA API version passthroughs, forwarded to `onnx-genai-ort`/`onnx-genai-engine`.
 cuda-12060 = ["onnx-genai-ort/cuda-12060", "onnx-genai-engine/cuda-12060"]
 cuda-12080 = ["onnx-genai-ort/cuda-12080", "onnx-genai-engine/cuda-12080"]
