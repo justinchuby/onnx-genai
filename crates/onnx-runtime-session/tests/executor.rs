@@ -35,6 +35,19 @@ fn f32_init(g: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId 
     vid
 }
 
+fn i64_init(g: &mut Graph, name: &str, dims: &[usize], data: &[i64]) -> ValueId {
+    let vid = g.create_named_value(name, DataType::Int64, static_shape(dims.iter().copied()));
+    g.set_initializer(
+        vid,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            dims.to_vec(),
+            data.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        )),
+    );
+    vid
+}
+
 /// Add a named graph input, returning its value id.
 fn input(g: &mut Graph, name: &str, dtype: DataType, dims: &[usize]) -> ValueId {
     let vid = g.create_named_value(name, dtype, static_shape(dims.iter().copied()));
@@ -174,6 +187,84 @@ fn gqa_decode_growing_cache_extends_present_to_logical_total() {
     assert_eq!(outputs[0].shape, vec![1, 1, 8]);
     assert_eq!(outputs[1].shape, vec![1, 2, 3, 2]);
     assert_eq!(outputs[2].shape, vec![1, 2, 3, 2]);
+}
+
+#[test]
+fn dynamic_slice_shape_propagates_through_unsqueeze_and_comparison_broadcast() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+
+    let data = input(&mut g, "data", DataType::Float32, &[4]);
+    let one = i64_init(&mut g, "one", &[1], &[1]);
+    let starts = i64_init(&mut g, "starts", &[1], &[0]);
+    let slice_axes = i64_init(&mut g, "slice_axes", &[1], &[0]);
+    let steps = i64_init(&mut g, "steps", &[1], &[1]);
+    let unsqueeze_axes = i64_init(&mut g, "unsqueeze_axes", &[1], &[-1]);
+    let thresholds = f32_init(&mut g, "thresholds", &[1, 2], &[1.5, 2.5]);
+    let dynamic_extent = g.intern_symbol("dynamic_extent");
+
+    let data_shape = g.create_value(DataType::Int64, static_shape([1]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Shape",
+        vec![Some(data)],
+        vec![data_shape],
+    ));
+    let end = g.create_value(DataType::Int64, static_shape([1]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Sub",
+        vec![Some(data_shape), Some(one)],
+        vec![end],
+    ));
+
+    let sliced = g.create_value(DataType::Float32, vec![Dim::Symbolic(dynamic_extent)]);
+    g.mark_value_shape_unknown(sliced);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Slice",
+        vec![
+            Some(data),
+            Some(starts),
+            Some(end),
+            Some(slice_axes),
+            Some(steps),
+        ],
+        vec![sliced],
+    ));
+
+    let unsqueezed = g.create_value(
+        DataType::Float32,
+        vec![Dim::Symbolic(dynamic_extent), Dim::Static(1)],
+    );
+    g.mark_value_shape_unknown(unsqueezed);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Unsqueeze",
+        vec![Some(sliced), Some(unsqueeze_axes)],
+        vec![unsqueezed],
+    ));
+
+    let compared = g.create_value(
+        DataType::Bool,
+        vec![Dim::Symbolic(dynamic_extent), Dim::Static(2)],
+    );
+    g.mark_value_shape_unknown(compared);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Less",
+        vec![Some(unsqueezed), Some(thresholds)],
+        vec![compared],
+    ));
+    g.add_output(compared);
+
+    let mut session = InferenceSession::from_graph(g).expect("build dynamic-shape session");
+    let data = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let outputs = session.run(&[("data", &data)]).expect("run dynamic chain");
+
+    assert_eq!(outputs[0].shape, vec![3, 2]);
+    assert_eq!(outputs[0].dtype, DataType::Bool);
+    assert_eq!(outputs[0].as_bytes(), &[1, 1, 0, 1, 0, 0]);
 }
 
 /// Insert an op node whose single output carries an explicit (possibly
@@ -697,11 +788,10 @@ fn symbol_conflict_across_inputs_is_rejected() {
     assert_eq!(out[0].shape, vec![2, 4]);
 }
 
-/// A value whose shape carries a symbol that no input binds cannot be sized:
-/// the session reports it as an uninferred shape naming the producing op,
-/// rather than guessing (the loader-shape-inference-gap signal, §5).
+/// A registered op whose declared output shape carries an unbound symbol can be
+/// sized from its concrete runtime inputs via the standard shape rule.
 #[test]
-fn unresolved_symbol_reports_uninferred_shape() {
+fn registered_shape_rule_resolves_unbound_declared_symbol() {
     let mut g = Graph::new();
     let batch = g.intern_symbol("batch");
     let ghost = g.intern_symbol("ghost"); // never appears on any input
@@ -712,7 +802,7 @@ fn unresolved_symbol_reports_uninferred_shape() {
         DataType::Float32,
         vec![Dim::Symbolic(batch), Dim::Static(4)],
     );
-    // Relu output declares an unbindable symbol on its leading dim.
+    // Relu declares an unbindable symbol on its leading dim.
     let y = op_shaped(
         &mut g,
         "Relu",
@@ -725,11 +815,10 @@ fn unresolved_symbol_reports_uninferred_shape() {
 
     let mut session = InferenceSession::from_graph(g).expect("build");
     let x_t = Tensor::from_f32(&[2, 4], &[0.0; 8]).unwrap();
-    let err = session.run(&[("X", &x_t)]).unwrap_err();
-    assert!(
-        matches!(err, SessionError::UnresolvedShape { ref op, .. } if op == "Relu"),
-        "expected UnresolvedShape naming the producing op, got {err:?}"
-    );
+    let outputs = session
+        .run(&[("X", &x_t)])
+        .expect("runtime shape inference");
+    assert_eq!(outputs[0].shape, vec![2, 4]);
 }
 
 /// A symbolic input supplied with the wrong rank is rejected before dispatch.

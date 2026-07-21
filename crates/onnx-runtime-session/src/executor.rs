@@ -62,7 +62,9 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
-use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
+use onnx_runtime_shape_inference::{
+    DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, SymbolInterner, TypeInfo,
+};
 use onnx_runtime_tracer::{TraceContext, annotate_current_span_with};
 
 use crate::SessionOutput;
@@ -985,12 +987,11 @@ fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
     }
 }
 
-/// Compute the concrete output shapes of a *data-dependent* shape op from its
-/// already-resolved input shapes and the runtime *values* of its integer
-/// inputs. This is the executor's fallback for the rare value whose shape the
-/// loader's static (symbolic) inference could not pin down — e.g. a `Slice`
-/// whose `ends` is produced by a runtime `Shape → Min → Cast` chain, so its
-/// extent is only known once those upstream nodes have executed.
+/// Compute concrete output shapes from already-resolved input shapes and the
+/// runtime *values* of integer inputs. This is the executor's fallback for the
+/// rare value whose shape the loader's static (symbolic) inference could not pin
+/// down — e.g. a `Slice` whose `ends` is produced by a runtime
+/// `Shape → Min → Cast` chain, followed by movement/broadcast nodes.
 ///
 /// Model-agnostic: it dispatches on the op type alone. Returns `None` for ops
 /// this executor cannot resolve dynamically, which surfaces as
@@ -998,7 +999,9 @@ fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
 fn dynamic_output_shapes(
     node: &Node,
     input_shapes: &[Vec<usize>],
+    input_dtypes: &[DataType],
     input_values: &[Option<Vec<i64>>],
+    opset: u64,
 ) -> Option<Vec<Vec<usize>>> {
     match node.op_type.as_str() {
         // Opset-10+ `Slice`: data, starts, ends, [axes], [steps] as inputs. The
@@ -1066,7 +1069,70 @@ fn dynamic_output_shapes(
             }
             Some(shapes)
         }
-        _ => None,
+        _ => {
+            // Re-run the standard, opset-aware shape rule with the concrete
+            // runtime input shapes and any small integer input values now
+            // available. This covers shape-preserving movement and broadcasting
+            // ops after a data-dependent node without duplicating their ONNX
+            // semantics here (notably Unsqueeze axis normalization).
+            let inputs = node
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(i, input)| {
+                    if input.is_none() {
+                        return Some(NodeIo::default());
+                    }
+                    let shape = input_shapes
+                        .get(i)?
+                        .iter()
+                        .map(|&dim| i64::try_from(dim).ok().map(DimExpr::constant))
+                        .collect::<Option<Vec<_>>>()?;
+                    let dtype = *input_dtypes.get(i)?;
+                    let shape_data = input_values.get(i)?.as_ref().and_then(|values| {
+                        let elems = values
+                            .iter()
+                            .copied()
+                            .map(DimExpr::constant)
+                            .collect::<Vec<_>>();
+                        match input_shapes[i].as_slice() {
+                            [] if elems.len() == 1 => {
+                                Some(ShapeData::scalar(dtype, elems[0].clone()))
+                            }
+                            [len] if *len == elems.len() => Some(ShapeData::vector(dtype, elems)),
+                            _ => None,
+                        }
+                    });
+                    Some(NodeIo {
+                        type_info: Some(TypeInfo::new(dtype, shape)),
+                        shape_data,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let mut imports = HashMap::new();
+            let domain = if node.domain == "ai.onnx" {
+                String::new()
+            } else {
+                node.domain.clone()
+            };
+            imports.insert(domain, opset);
+            let mut interner = SymbolInterner::new(0x8000_0000);
+            static REGISTRY: std::sync::OnceLock<InferenceRegistry> = std::sync::OnceLock::new();
+            REGISTRY
+                .get_or_init(InferenceRegistry::default_registry)
+                .infer_node(node, &imports, inputs, MergePolicy::Strict, &mut interner)
+                .ok()?
+                .into_iter()
+                .map(|output| {
+                    output
+                        .type_info?
+                        .shape
+                        .into_iter()
+                        .map(|dim| usize::try_from(dim.as_const()?).ok())
+                        .collect()
+                })
+                .collect()
+        }
     }
 }
 
@@ -2760,22 +2826,28 @@ impl Executor {
                 })
                 .collect();
             let node = self.graph.node(node_id);
-            let out_shapes =
-                dynamic_output_shapes(node, &input_shapes, &input_values).ok_or_else(|| {
-                    let vid = outputs
-                        .iter()
-                        .find(|v| !resolved.contains_key(v))
-                        .copied()
-                        .unwrap_or(outputs[0]);
-                    let value = self.graph.value(vid);
-                    SessionError::UnresolvedShape {
-                        value: value
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("value#{}", vid.0)),
-                        op: node.op_type.clone(),
-                    }
-                })?;
+            let out_shapes = dynamic_output_shapes(
+                node,
+                &input_shapes,
+                &input_dtypes,
+                &input_values,
+                effective_opset(&self.graph, node),
+            )
+            .ok_or_else(|| {
+                let vid = outputs
+                    .iter()
+                    .find(|v| !resolved.contains_key(v))
+                    .copied()
+                    .unwrap_or(outputs[0]);
+                let value = self.graph.value(vid);
+                SessionError::UnresolvedShape {
+                    value: value
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("value#{}", vid.0)),
+                    op: node.op_type.clone(),
+                }
+            })?;
             if out_shapes.len() != outputs.len() {
                 return Err(SessionError::OutputShapeCountMismatch {
                     op: self.graph.node(node_id).op_type.clone(),
@@ -6567,13 +6639,29 @@ mod tests {
             Some(vec![0]), // axes
             Some(vec![1]), // steps
         ];
-        let out = dynamic_output_shapes(&node, &input_shapes, &input_values).unwrap();
+        let input_dtypes = vec![
+            DataType::Float32,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+            DataType::Int64,
+        ];
+        let out =
+            dynamic_output_shapes(&node, &input_shapes, &input_dtypes, &input_values, 17).unwrap();
         assert_eq!(out.len(), 1, "Slice must resolve exactly one output shape");
         assert_eq!(out[0], vec![2, 2]);
 
         // An op the sizer cannot resolve returns None (surfaces as UnresolvedShape).
-        let other = Node::new(NodeId(1), "Conv", vec![], vec![]);
-        assert!(dynamic_output_shapes(&other, &input_shapes, &input_values).is_none());
+        let other = Node::new(
+            NodeId(1),
+            "NxrtNeverRegisteredSentinelOp",
+            vec![],
+            vec![ValueId(0)],
+        );
+        assert!(
+            dynamic_output_shapes(&other, &input_shapes, &input_dtypes, &input_values, 17)
+                .is_none()
+        );
     }
 
     #[test]
@@ -6611,7 +6699,21 @@ mod tests {
         let input_values = vec![None, None, None, None, None, None, Some(vec![17])];
 
         assert_eq!(
-            dynamic_output_shapes(&node, &input_shapes, &input_values),
+            dynamic_output_shapes(
+                &node,
+                &input_shapes,
+                &[
+                    DataType::Float32,
+                    DataType::Undefined,
+                    DataType::Undefined,
+                    DataType::Float32,
+                    DataType::Float32,
+                    DataType::Int32,
+                    DataType::Int32,
+                ],
+                &input_values,
+                1,
+            ),
             Some(vec![
                 vec![1, 1, 896],
                 vec![1, 2, 17, 64],
