@@ -307,6 +307,20 @@ impl CudaGraphLifecycle {
         Ok(self.lock()?.segments.len())
     }
 
+    /// Whether exactly one whole-subgraph segment is installed.
+    ///
+    /// Dormant scaffolding for the option (c) padded single-M=maxK captured
+    /// verify graph (enabled in WP4). Retaining a captured graph across a
+    /// contents-only `rewind` is only sound when the capture is a *single*
+    /// fixed-topology whole-subgraph segment — a segmented capture interleaves
+    /// eager seam nodes whose per-step effects a bare replay would not reproduce.
+    /// A retained-graph verify path must gate on this invariant before reusing
+    /// the capture instead of re-warming.
+    #[allow(dead_code)]
+    pub(crate) fn holds_single_capture(&self) -> Result<bool> {
+        Ok(self.lock()?.segments.len() == 1)
+    }
+
     pub(crate) fn capture_status(&self) -> Result<CUstreamCaptureStatus> {
         let _state = self.lock()?;
         self.stream
@@ -645,5 +659,45 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
             CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
         );
         assert!(!runtime.has_graph_executable().unwrap());
+    }
+
+    #[test]
+    fn holds_single_capture_tracks_whole_subgraph_segment() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping holds_single_capture test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+        let n = 16usize;
+        let size = n * std::mem::size_of::<f32>();
+        let input_ptr = runtime.alloc_raw(size).unwrap();
+        let output_ptr = runtime.alloc_raw(size).unwrap();
+
+        let lifecycle = CudaGraphLifecycle::new(runtime.stream().clone());
+        // No capture installed yet.
+        assert!(!lifecycle.holds_single_capture().unwrap());
+
+        // One whole-subgraph segment satisfies the option (c) retain invariant.
+        lifecycle.begin().unwrap();
+        launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
+        lifecycle.end().unwrap();
+        assert!(lifecycle.holds_single_capture().unwrap());
+        assert_eq!(lifecycle.segment_count().unwrap(), 1);
+
+        // A second appended segment (segmented capture) breaks the invariant.
+        lifecycle.begin().unwrap();
+        launch_add_one(&runtime, &function, output_ptr, input_ptr, n);
+        lifecycle.end().unwrap();
+        assert!(!lifecycle.holds_single_capture().unwrap());
+        assert_eq!(lifecycle.segment_count().unwrap(), 2);
+
+        assert!(lifecycle.reset().unwrap());
+        assert!(!lifecycle.holds_single_capture().unwrap());
+
+        // SAFETY: reset dropped all segment ownership before the buffers are freed.
+        unsafe {
+            runtime.free_raw(output_ptr).unwrap();
+            runtime.free_raw(input_ptr).unwrap();
+        }
     }
 }

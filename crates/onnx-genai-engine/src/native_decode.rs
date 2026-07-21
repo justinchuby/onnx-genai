@@ -12,7 +12,7 @@ use onnx_runtime_session::{
     CaptureDeclineReport, DeviceAllocationCounts, DeviceBindingTransferStats,
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
-use onnx_runtime_tracer::{TraceContext, capture_rejected};
+use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -82,6 +82,24 @@ struct DecodeCudaState {
     graph_fallbacks: u64,
     graph_fallback_reason: Option<String>,
     graph_fallback_report: Option<CaptureDeclineReport>,
+    /// When `false` (today's default), `NativeDecodeSession::rewind` invalidates
+    /// the captured decode graph before rolling the device KV back — correct for
+    /// the eager M=K verify path (option (b)), which captures nothing.
+    ///
+    /// When `true`, rewind performs a *contents-only* mutation (zero the mask
+    /// tail + truncate the KV logical length) and **retains** the captured graph.
+    /// This is the option (c) invariant: a single fixed-topology M=maxK graph
+    /// whose device-binding pointers stay invariant while only buffer contents /
+    /// logical shapes change across steps — exactly the data-driven mutation the
+    /// captured graph already tolerates on the M=1 replay path. Kept dormant
+    /// (default `false`) until WP4 graduates verify to the captured path.
+    retain_graph_on_rewind: bool,
+    /// Dormant option (c) scaffolding: the fixed query-row capacity (M=maxK) a
+    /// padded single-capture verify graph would be captured at. `None` today —
+    /// the eager verify path (option (b)) captures nothing. Set only by the
+    /// dormant `configure_padded_verify_capture` switch (not on the hot path).
+    #[allow(dead_code)]
+    padded_query_capacity: Option<usize>,
 }
 
 struct DecodeCudaIo<'a> {
@@ -334,6 +352,34 @@ impl NativeDecodeSession {
         self.trace = trace;
     }
 
+    /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK
+    /// captured verify graph and retain the captured graph across `rewind`. No-op
+    /// on non-CUDA sessions. Not wired into any live decode path yet; exercised
+    /// only by the option-(c) rewind-correctness tests.
+    #[cfg(test)]
+    fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
+        if let Some(state) = self.cuda.as_mut() {
+            state.configure_padded_verify_capture(max_query_rows);
+        }
+    }
+
+    /// Toggle the option (c) "rewind retains the captured graph" guard directly.
+    /// Dormant: bring-up / correctness tests only.
+    #[cfg(test)]
+    fn set_retain_graph_on_rewind(&mut self, retain: bool) {
+        if let Some(state) = self.cuda.as_mut() {
+            state.set_retain_graph_on_rewind(retain);
+        }
+    }
+
+    /// Fixed query-row capacity of the dormant padded verify capture, or `None`.
+    #[cfg(test)]
+    fn padded_query_capacity(&self) -> Option<usize> {
+        self.cuda
+            .as_ref()
+            .and_then(DecodeCudaState::padded_query_capacity)
+    }
+
     pub fn decode(
         &mut self,
         token_ids: &[TokenId],
@@ -537,6 +583,136 @@ impl NativeDecodeSession {
         Ok(logits)
     }
 
+    /// Speculative **verify** primitive (option (b): the safe eager M=K path).
+    ///
+    /// Runs the `draft` candidate tokens (K = `draft.len()`) through the target
+    /// in a single eager forward and returns `[K, vocab]` host logits — one
+    /// predicted-distribution row per draft position. This is the primitive
+    /// WP2/WP3 build on: the driver compares each row's argmax against `draft`
+    /// to find the accepted prefix (plus the free bonus token) and then rewinds
+    /// the device KV to the committed length.
+    ///
+    /// It never enters the M=1 captured-graph greedy hot path — it always takes
+    /// the eager multi-token forward (`decode_cuda_eager`) so the 762 tok/s plain
+    /// path stays byte-identical. Greedy is the target regime, but returning raw
+    /// logits also lets a driver fall back to host sampling for non-greedy
+    /// requests. `past` must equal the committed length (`current_len`).
+    pub fn decode_verify(
+        &mut self,
+        draft: &[TokenId],
+        past: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if draft.is_empty() {
+            bail!("native decode_verify requires at least one draft token");
+        }
+        if past != self.current_len {
+            bail!(
+                "native decode_verify past length mismatch: caller supplied {past}, adapter holds {}",
+                self.current_len
+            );
+        }
+        if self.cuda.is_some() {
+            return self.decode_cuda_eager(draft, past);
+        }
+        // CPU sessions already run any M>1 forward eagerly through the shared
+        // decode path, which returns the full [K, vocab] rows verify needs.
+        <Self as DecodeBackend>::decode(self, draft, past)
+    }
+
+    /// Eager multi-token (M=K) CUDA forward used by the verify primitive.
+    ///
+    /// Self-contained on purpose: it mirrors `decode_cuda`'s eager branch but is
+    /// a *separate* method so the M=1 captured-graph hot path in `decode_cuda`
+    /// stays byte-identical and out of verify's blast radius. It invalidates any
+    /// captured graph (option (b) captures nothing), rebuilds host `[1,K]`
+    /// input/position tensors, runs against the device KV/mask bindings, and
+    /// advances the KV logical length to `past_len + K`.
+    ///
+    /// The whole pass is wrapped in its own trace span so Deckard's per-op
+    /// timings under it remain attributable to the verify forward.
+    fn decode_cuda_eager(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let _verify_span = self
+            .trace
+            .span("native_decode_verify", "spec")
+            .with_args(Args::new().with("rows", token_ids.len() as u64));
+        let total_len = past_len
+            .checked_add(token_ids.len())
+            .context("native decode context length overflow")?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.max_len {
+            bail!(
+                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
+                state.max_len
+            );
+        }
+        state.extend_mask(past_len, total_len)?;
+        state.invalidate_graph(&mut self.session)?;
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
+        let mut owned = Vec::with_capacity(2);
+        owned.push((self.input_ids.clone(), input_ids));
+        if let Some(position_ids_name) = &self.position_ids {
+            let positions = (past_len..total_len)
+                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            owned.push((
+                position_ids_name.clone(),
+                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
+            ));
+        }
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let outputs = match self
+            .session
+            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
+        {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native CUDA verify forward pass failed{diagnosis}: {error}");
+            }
+        };
+        let names = self
+            .session
+            .outputs()
+            .iter()
+            .map(|meta| meta.name.clone())
+            .collect::<Vec<_>>();
+        let mut named = names
+            .into_iter()
+            .zip(outputs)
+            .filter_map(|(name, tensor)| tensor.map(|tensor| (name, tensor)))
+            .collect::<HashMap<_, _>>();
+        let logits = named
+            .remove(&self.logits)
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        if !named.is_empty() {
+            bail!(
+                "native CUDA verify unexpectedly materialized bound outputs: {:?}",
+                named.keys().collect::<Vec<_>>()
+            );
+        }
+        let logits = extract_logits(&logits)?;
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(logits)
+    }
+
     fn decode_cuda_greedy(
         &mut self,
         token_id: TokenId,
@@ -725,6 +901,8 @@ impl DecodeCudaState {
             graph_fallbacks: 0,
             graph_fallback_reason: None,
             graph_fallback_report: None,
+            retain_graph_on_rewind: false,
+            padded_query_capacity: None,
         })
     }
 
@@ -848,6 +1026,32 @@ impl DecodeCudaState {
         session.reset_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         Ok(())
+    }
+
+    /// Dormant option (c) switch (kept off until WP4). Arm the padded single
+    /// M=maxK captured verify graph: fix the query-row capacity at `max_query_rows`
+    /// and retain the captured graph across `rewind` (contents-only mutation)
+    /// instead of invalidating it. Not reachable from the plain M=1 hot path nor
+    /// the eager (option (b)) verify path; only a future WP4 driver flips it on.
+    #[allow(dead_code)]
+    fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
+        self.padded_query_capacity = Some(max_query_rows);
+        self.retain_graph_on_rewind = true;
+    }
+
+    /// Toggle whether `rewind` retains the captured decode graph (option (c),
+    /// contents-only mutation) or invalidates it (option (b), the eager default).
+    /// Dormant: only exercised by option-(c) correctness tests until WP4.
+    #[allow(dead_code)]
+    fn set_retain_graph_on_rewind(&mut self, retain: bool) {
+        self.retain_graph_on_rewind = retain;
+    }
+
+    /// Fixed query-row capacity (M=maxK) of the dormant padded verify capture, or
+    /// `None` while the eager (option (b)) verify path is in force.
+    #[allow(dead_code)]
+    fn padded_query_capacity(&self) -> Option<usize> {
+        self.padded_query_capacity
     }
 
     fn debug_stats(&self, session: &InferenceSession) -> CudaKvDebugStats {
@@ -1014,7 +1218,15 @@ impl DecodeBackend for NativeDecodeSession {
             return Ok(());
         }
         if let Some(state) = &mut self.cuda {
-            state.invalidate_graph(&mut self.session)?;
+            // Option (b) default: invalidate the captured decode graph before the
+            // KV roll-back (the eager verify path captures nothing, and the plain
+            // M=1 path re-warms cleanly). Option (c) (dormant until WP4) retains
+            // the single fixed-topology M=maxK graph and rewinds contents only —
+            // `state.rewind` mutates just the mask tail + KV logical length, the
+            // same data-driven mutation the captured graph already tolerates.
+            if !state.retain_graph_on_rewind {
+                state.invalidate_graph(&mut self.session)?;
+            }
             state.rewind(target_len)?;
             self.current_len = target_len;
             return Ok(());
@@ -1617,6 +1829,97 @@ mod tests {
         assert_eq!(session.current_len(), 3);
     }
 
+    #[test]
+    fn native_decode_verify_then_rewind_matches_fresh_decode() {
+        // WP1 exit criterion (CPU logic coverage): verify K tokens, rewind to the
+        // committed length, and prove a subsequent decode is bit-identical to a
+        // fresh decode from the same committed prefix (no KV corruption). The
+        // device-KV bit-identity variant is `native_cuda_verify_rewind_no_kv_corruption`.
+        let mut session =
+            NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+        let prompt = [1, 2, 3];
+        session.decode(&prompt, 0).expect("prefill");
+        let past = session.current_len();
+        assert_eq!(past, prompt.len());
+
+        // Verify a K-token draft via the verify primitive: returns [K, vocab].
+        let draft = [4, 5, 6];
+        let rows = session.decode_verify(&draft, past).expect("verify");
+        assert_eq!(rows.len(), draft.len());
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(session.current_len(), past + draft.len());
+
+        // Accept j of the draft, rewind device/host KV to the committed length.
+        let j = 1;
+        session.rewind(past + j).expect("rewind");
+        assert_eq!(session.current_len(), past + j);
+
+        // Subsequent decode from the committed prefix.
+        let feed = 9;
+        let after = session
+            .decode(&[feed], past + j)
+            .expect("decode after rewind");
+
+        // Fresh session decoded over the committed prefix prompt ++ draft[..j].
+        let mut fresh =
+            NativeDecodeSession::from_session(tiny_decoder(false)).expect("fresh decoder");
+        let mut committed = prompt.to_vec();
+        committed.extend_from_slice(&draft[..j]);
+        fresh.decode(&committed, 0).expect("fresh prefill");
+        let fresh_after = fresh
+            .decode(&[feed], committed.len())
+            .expect("fresh decode");
+
+        let after_bits = after
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>();
+        let fresh_bits = fresh_after
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_bits, fresh_bits,
+            "verify+rewind diverged from fresh decode"
+        );
+    }
+
+    #[test]
+    fn native_decode_verify_requires_matching_past_and_nonempty_draft() {
+        let mut session =
+            NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+        session.decode(&[1, 2], 0).expect("prefill");
+        assert!(
+            session
+                .decode_verify(&[], 2)
+                .expect_err("empty draft must fail")
+                .to_string()
+                .contains("at least one draft token")
+        );
+        assert!(
+            session
+                .decode_verify(&[3], 5)
+                .expect_err("past mismatch must fail")
+                .to_string()
+                .contains("past length mismatch")
+        );
+    }
+
+    #[test]
+    fn native_decode_option_c_scaffolding_is_dormant_by_default() {
+        // The padded M=maxK capture + retain-graph-on-rewind switches (option (c))
+        // must stay dormant. On a CPU session (no CUDA state) the controls are
+        // inert no-ops and the capacity stays `None`.
+        let mut session =
+            NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+        assert_eq!(session.padded_query_capacity(), None);
+        session.set_retain_graph_on_rewind(true);
+        session.configure_padded_verify_capture(8);
+        assert_eq!(session.padded_query_capacity(), None);
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn native_cuda_capture_replay_is_bit_exact_and_refreshes_decode_inputs() -> anyhow::Result<()> {
@@ -1823,6 +2126,111 @@ mod tests {
             .decode(&vec![0; 129], 0)
             .expect_err("decode beyond configured KV capacity must fail");
         assert!(error.to_string().contains("CUDA KV capacity exceeded"));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
+        // WP1 exit criterion on real device KV: decode K draft tokens through the
+        // eager M=K verify primitive, rewind to the committed length (past+j), and
+        // prove a subsequent M=1 decode is BIT-IDENTICAL to a fresh M=1 decode from
+        // the same committed prefix. Bit-identity proves the rewind left no stale
+        // KV columns attended. Both rewind regimes are exercised: option (b)
+        // (invalidate-on-rewind, the default) and the dormant option (c) guard
+        // (retain-graph-on-rewind), which must be equally KV-correct.
+        if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+            eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+            return Ok(());
+        }
+        let model_dir = Path::new("/home/justinchu/qwen2.5-0.5b-int4-onnx");
+        if !model_dir.join("model.onnx").is_file() {
+            eprintln!("skipping CUDA smoke; target model is not installed");
+            return Ok(());
+        }
+        let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
+        let prompt = tokenizer.encode("The quick brown fox")?;
+
+        let argmax = |row: &[f32]| -> TokenId {
+            row.iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index as TokenId)
+                .expect("logits row must not be empty")
+        };
+        let make = |graph: bool| -> anyhow::Result<NativeDecodeSession> {
+            NativeDecodeSession::load_with_cuda_options(
+                model_dir.join("model.onnx"),
+                NativeDecodeDevice::Cuda { index: Some(0) },
+                NativeDecodeCudaOptions {
+                    kv_max_len: Some(128),
+                    graph_capture: Some(graph),
+                },
+            )
+        };
+
+        // Oracle: greedy-continue the prompt to obtain a deterministic draft.
+        let mut oracle = make(true)?;
+        let mut logits = oracle.decode(&prompt, 0)?.pop().context("prefill logits")?;
+        let mut cont = Vec::new();
+        for _ in 0..6 {
+            let token = argmax(&logits);
+            cont.push(token);
+            logits = oracle
+                .decode(&[token], oracle.current_len())?
+                .pop()
+                .context("oracle decode logits")?;
+        }
+        drop(oracle);
+
+        let past = prompt.len();
+        let draft = &cont[..4];
+        let j = 2usize; // pretend the driver accepted 2 of the 4 draft tokens
+        let feed = cont[j]; // deterministic next token fed after the committed prefix
+
+        for retain in [false, true] {
+            let mut verify_sess = make(true)?;
+            verify_sess.decode(&prompt, 0)?;
+            if retain {
+                verify_sess.set_retain_graph_on_rewind(true);
+            }
+            assert_eq!(verify_sess.current_len(), past);
+
+            // Eager M=K verify pass returns one logits row per draft position.
+            let rows = verify_sess.decode_verify(draft, past)?;
+            assert_eq!(rows.len(), draft.len());
+            assert_eq!(verify_sess.current_len(), past + draft.len());
+
+            // Rewind to the committed length; mask/KV logical shapes must follow.
+            verify_sess.rewind(past + j)?;
+            assert_eq!(verify_sess.current_len(), past + j);
+            let stats = verify_sess.cuda_kv_debug_stats().unwrap();
+            assert_eq!(stats.logical_len, past + j);
+
+            let after = verify_sess.decode(&[feed], past + j)?;
+
+            // Fresh M=1 reference from the committed prefix prompt ++ draft[..j].
+            let mut fresh = make(true)?;
+            let mut committed = prompt.clone();
+            committed.extend_from_slice(&draft[..j]);
+            fresh.decode(&committed, 0)?;
+            let fresh_after = fresh.decode(&[feed], committed.len())?;
+
+            let after_bits = after
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>();
+            let fresh_bits = fresh_after
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after_bits, fresh_bits,
+                "verify+rewind (retain_graph_on_rewind={retain}) corrupted device KV vs fresh M=1 decode"
+            );
+        }
         Ok(())
     }
 
