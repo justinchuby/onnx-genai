@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "tok0",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "tok0": 0,
+      "tok1": 1,
+      "tok2": 2,
+      "tok3": 3,
+      "tok4": 4,
+      "tok5": 5,
+      "tok6": 6,
+      "tok7": 7
+    },
+    "unk_token": "tok0"
+  }
+}

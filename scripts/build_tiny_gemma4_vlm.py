@@ -329,8 +329,11 @@ def write_tokenizer(path: Path) -> None:
 METADATA = """\
 # Tiny Gemma4-style VLM composite pipeline fixture with inputs_embeds fusion.
 # Built by scripts/build_tiny_gemma4_vlm.py; exercises the composite strategy
-# with two prompt_only single_pass stages (vision + fusion) feeding an
-# autoregressive decoder that consumes inputs_embeds (DESIGN.md §20).
+# with a prompt_only vision stage plus an every_step embedding component (its
+# `input_ids` seeded with the running token each step via the declared
+# io.token_input) feeding an autoregressive decoder that consumes inputs_embeds
+# (DESIGN.md §20). The embedding runs generically as an every_step component;
+# no tensor-name special case is involved.
 pipeline:
   models:
     vision_encoder:
@@ -339,6 +342,8 @@ pipeline:
     embedding:
       filename: embedding.onnx.textproto
       type: encoder
+      io:
+        token_input: input_ids
     decoder:
       filename: decoder.onnx.textproto
       type: decoder
@@ -364,7 +369,7 @@ pipeline:
         strategy:
           kind: single_pass
           model: embedding
-        run_on: prompt_only
+        run_on: every_step
       - name: decode
         strategy:
           kind: autoregressive
@@ -375,7 +380,7 @@ pipeline:
     vision_encoder:
       run_on: prompt_only
     embedding:
-      run_on: prompt_only
+      run_on: every_step
     decoder:
       run_on: every_step
 """
