@@ -107,8 +107,21 @@ fn bool_attribute(node: &Node, name: &str) -> Result<(), String> {
 
 fn rms_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 2)?;
-    require_dtype(input_dtypes, 0, DataType::Float32, "X")?;
-    require_dtype(input_dtypes, 1, DataType::Float32, "scale")?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float16, DataType::Float32],
+        "X",
+    )?;
+    require_one_of(
+        input_dtypes,
+        1,
+        &[DataType::Float16, DataType::Float32],
+        "scale",
+    )?;
+    if input_dtypes[0] == DataType::Float32 && input_dtypes[1] != DataType::Float32 {
+        return Err("f32 X requires f32 scale".into());
+    }
     match node.attr("stash_type") {
         None => Ok(()),
         Some(attribute) if attribute.as_int() == Some(1) => Ok(()),
@@ -128,8 +141,19 @@ fn rotary_embedding(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
         ));
     }
     metadata_arity(node, input_dtypes)?;
-    for (index, name) in [(0, "X"), (1, "cos_cache"), (2, "sin_cache")] {
-        require_dtype(input_dtypes, index, DataType::Float32, name)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float16, DataType::Float32],
+        "X",
+    )?;
+    for (index, name) in [(1, "cos_cache"), (2, "sin_cache")] {
+        if input_dtypes[index] != input_dtypes[0] {
+            return Err(format!(
+                "input {index} ('{name}') dtype {:?} must match X dtype {:?}",
+                input_dtypes[index], input_dtypes[0]
+            ));
+        }
     }
     if node.inputs.get(3).is_some_and(Option::is_some) {
         require_dtype(input_dtypes, 3, DataType::Int64, "position_ids")?;

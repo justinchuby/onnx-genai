@@ -1,4 +1,4 @@
-//! Fused **normalization** kernels on the GPU via runtime-compiled (NVRTC) f32
+//! Fused **normalization** kernels on the GPU via runtime-compiled (NVRTC)
 //! kernels: `LayerNormalization` (ai.onnx + `com.microsoft`),
 //! `SkipLayerNormalization` and `SimplifiedLayerNormalization` /
 //! `RMSNormalization` (`com.microsoft` / ai.onnx).
@@ -26,7 +26,7 @@
 //!
 //! ## Limits (actionable errors, never panics — RULES.md #1)
 //!
-//! * dtype other than f32 → deferred (names the dtype + op).
+//! * activation dtype other than f32/f16 → deferred (names the dtype + op).
 //! * `axis`/last-dim size 0, or a `scale`/`bias`/`gamma`/`beta` length that does
 //!   not match the normalized size → rejected, naming the offending length.
 //! * non-contiguous (strided) operands → "materialise first" error.
@@ -52,6 +52,15 @@ use super::softmax::resolve_axis;
 /// normalized+affine output in a third pass. Optional `mean`/`inv_std` outputs
 /// are written when the pointers are non-null.
 const LAYERNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float load_layernorm_param(
+    const void* values, const int is_half, const int index) {
+    return is_half
+        ? __half2float(((const __half*)values)[index])
+        : ((const float*)values)[index];
+}
+
 extern "C" __global__ void layernorm_f32(
     const float* x,
     const float* scale,
@@ -112,12 +121,82 @@ extern "C" __global__ void layernorm_f32(
         y[base + j] = o;
     }
 }
+
+extern "C" __global__ void layernorm_f16(
+    const __half* x,
+    const void*   scale,
+    const void*   bias,
+    __half*       y,
+    float*        mean_out,
+    float*        invstd_out,
+    const int     num_groups,
+    const int     norm_size,
+    const int     scale_is_half,
+    const int     bias_is_half,
+    const int     has_bias,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    float s = 0.0f;
+    for (int j = tid; j < norm_size; j += nt)
+        s += __half2float(x[base + j]);
+    red[tid] = s;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float mean = red[0] / (float)norm_size;
+    __syncthreads();
+
+    float v = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        const float d = __half2float(x[base + j]) - mean;
+        v += d * d;
+    }
+    red[tid] = v;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std =
+        1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) mean_out[g] = mean;
+        if (invstd_out) invstd_out[g] = inv_std;
+    }
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const float xhat = (__half2float(x[base + j]) - mean) * inv_std;
+        float o = xhat * load_layernorm_param(scale, scale_is_half, j);
+        if (has_bias)
+            o += load_layernorm_param(bias, bias_is_half, j);
+        y[base + j] = __float2half_rn(o);
+    }
+}
 "#;
 
 /// NVRTC source for the fused f32 `RMSNormalization` /
 /// `SimplifiedLayerNormalization`: no mean subtraction, scale by the inverse
 /// root-mean-square.
 const RMSNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float load_rmsnorm_scale(
+    const void* values, const int is_half, const int index) {
+    return is_half
+        ? __half2float(((const __half*)values)[index])
+        : ((const float*)values)[index];
+}
+
 extern "C" __global__ void rmsnorm_f32(
     const float* x,
     const float* scale,
@@ -155,6 +234,46 @@ extern "C" __global__ void rmsnorm_f32(
 
     for (int j = tid; j < norm_size; j += nt)
         y[base + j] = x[base + j] * inv_std * scale[j];
+}
+
+extern "C" __global__ void rmsnorm_f16(
+    const __half* x,
+    const void*   scale,
+    __half*       y,
+    float*        invstd_out,
+    const int     num_groups,
+    const int     norm_size,
+    const int     scale_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        const float xv = __half2float(x[base + j]);
+        ss += xv * xv;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std =
+        1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0 && invstd_out) invstd_out[g] = inv_std;
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const float o = __half2float(x[base + j]) * inv_std
+            * load_rmsnorm_scale(scale, scale_is_half, j);
+        y[base + j] = __float2half_rn(o);
+    }
 }
 "#;
 
@@ -302,8 +421,8 @@ extern "C" __global__ void skip_layernorm_f32(
 }
 "#;
 
-const LAYERNORM_MODULE: &str = "layernorm_f32";
-const RMSNORM_MODULE: &str = "rmsnorm_f32";
+const LAYERNORM_MODULE: &str = "layernorm_f16_v1";
+const RMSNORM_MODULE: &str = "rmsnorm_f16_v1";
 const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f32";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
@@ -315,6 +434,15 @@ fn require_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
     if dt != DataType::Float32 {
         return Err(not_implemented(format!(
             "{op} with {name} dtype {dt:?} (this slice is f32-only; f16/bf16 pending)"
+        )));
+    }
+    Ok(())
+}
+
+fn require_f16_or_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
+    if !matches!(dt, DataType::Float16 | DataType::Float32) {
+        return Err(not_implemented(format!(
+            "{op} with {name} dtype {dt:?} (expected f16 or f32)"
         )));
     }
     Ok(())
@@ -355,18 +483,29 @@ impl KernelFactory for LayerNormFactory {
             axis,
             epsilon,
             runtime: self.runtime.clone(),
+            warmed_signature: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
 
-/// Fused f32 LayerNormalization kernel.
+/// Fused f32/f16 LayerNormalization kernel.
 #[derive(Debug)]
 pub struct LayerNormKernel {
     axis: i64,
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    warmed_signature: Mutex<Option<NormCaptureSignature>>,
     last_call_capture_safe: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NormCaptureSignature {
+    activation_dtype: DataType,
+    scale_dtype: DataType,
+    bias_dtype: Option<DataType>,
+    input_shape: Vec<usize>,
+    output_dtypes_and_shapes: Vec<(DataType, Vec<usize>)>,
 }
 
 impl LayerNormKernel {
@@ -383,9 +522,18 @@ impl LayerNormKernel {
         let x = &inputs[0];
         let scale = &inputs[1];
         let bias = inputs.get(2);
-        require_f32("LayerNormalization", "X", x.dtype)?;
-        require_f32("LayerNormalization", "Scale", scale.dtype)?;
-        require_f32("LayerNormalization", "Y", outputs[0].dtype)?;
+        require_f16_or_f32("LayerNormalization", "X", x.dtype)?;
+        if x.dtype == DataType::Float32 {
+            require_f32("LayerNormalization", "Scale", scale.dtype)?;
+        } else {
+            require_f16_or_f32("LayerNormalization", "Scale", scale.dtype)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep LayerNormalization: Y dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous("LayerNormalization", "X", x.is_contiguous())?;
         require_contiguous("LayerNormalization", "Scale", scale.is_contiguous())?;
         require_contiguous("LayerNormalization", "Y", outputs[0].is_contiguous())?;
@@ -409,7 +557,11 @@ impl LayerNormKernel {
         let bias_ptr = match bias {
             None => 0u64,
             Some(b) => {
-                require_f32("LayerNormalization", "B", b.dtype)?;
+                if x.dtype == DataType::Float32 {
+                    require_f32("LayerNormalization", "B", b.dtype)?;
+                } else {
+                    require_f16_or_f32("LayerNormalization", "B", b.dtype)?;
+                }
                 require_contiguous("LayerNormalization", "B", b.is_contiguous())?;
                 if b.numel() != norm_size {
                     return Err(EpError::KernelFailed(format!(
@@ -446,10 +598,36 @@ impl LayerNormKernel {
         let has_bias: i32 = i32::from(bias_ptr != 0);
         let eps = self.epsilon;
         let groups_i = groups_u_i32(groups_u);
+        let signature = (num_groups == 1).then(|| NormCaptureSignature {
+            activation_dtype: x.dtype,
+            scale_dtype: scale.dtype,
+            bias_dtype: bias.map(|bias| bias.dtype),
+            input_shape: x.shape.to_vec(),
+            output_dtypes_and_shapes: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+        });
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self
+            .warmed_signature
+            .lock()
+            .expect("cuda_ep LayerNormalization capture signature poisoned");
+        if capturing && warmed_signature.as_ref() != signature.as_ref() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep LayerNormalization: dtype or shape changed during CUDA graph capture; warm the exact single-group signature before capture"
+                    .into(),
+            ));
+        }
 
+        let entry = if x.dtype == DataType::Float16 {
+            "layernorm_f16"
+        } else {
+            "layernorm_f32"
+        };
         let func = self
             .runtime
-            .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, "layernorm_f32")?;
+            .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, entry)?;
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
@@ -458,6 +636,8 @@ impl LayerNormKernel {
         )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
+        let scale_is_half = i32::from(scale.dtype == DataType::Float16);
+        let bias_is_half = i32::from(bias.is_some_and(|bias| bias.dtype == DataType::Float16));
         builder
             .arg(&x_ptr)
             .arg(&scale_ptr)
@@ -466,16 +646,26 @@ impl LayerNormKernel {
             .arg(&mean_ptr)
             .arg(&invstd_ptr)
             .arg(&groups_i)
-            .arg(&norm_i)
-            .arg(&has_bias)
-            .arg(&eps);
+            .arg(&norm_i);
+        if x.dtype == DataType::Float16 {
+            builder
+                .arg(&scale_is_half)
+                .arg(&bias_is_half)
+                .arg(&has_bias)
+                .arg(&eps);
+        } else {
+            builder.arg(&has_bias).arg(&eps);
+        }
         // SAFETY: `func` is the compiled layernorm entry; the argument list and
         // ABI match its signature; every non-null pointer is a live device
         // allocation sized as validated above (X/Y: num_groups·norm_size;
         // scale/bias: norm_size; mean/invstd: num_groups).
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch layernorm_f32", e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if !capturing {
+            *warmed_signature = signature.clone();
+        }
         self.last_call_capture_safe
-            .store(num_groups == 1, Ordering::Relaxed);
+            .store(signature.is_some(), Ordering::Relaxed);
         Ok(())
     }
 }
@@ -524,17 +714,19 @@ impl KernelFactory for RmsNormFactory {
             axis,
             epsilon,
             runtime: self.runtime.clone(),
+            warmed_signature: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
 
-/// Fused f32 RMSNormalization / SimplifiedLayerNormalization kernel.
+/// Fused f32/f16 RMSNormalization / SimplifiedLayerNormalization kernel.
 #[derive(Debug)]
 pub struct RmsNormKernel {
     axis: i64,
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    warmed_signature: Mutex<Option<NormCaptureSignature>>,
     last_call_capture_safe: AtomicBool,
 }
 
@@ -552,9 +744,18 @@ impl RmsNormKernel {
         }
         let x = &inputs[0];
         let scale = &inputs[1];
-        require_f32(op, "X", x.dtype)?;
-        require_f32(op, "Scale", scale.dtype)?;
-        require_f32(op, "Y", outputs[0].dtype)?;
+        require_f16_or_f32(op, "X", x.dtype)?;
+        if x.dtype == DataType::Float32 {
+            require_f32(op, "Scale", scale.dtype)?;
+        } else {
+            require_f16_or_f32(op, "Scale", scale.dtype)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: Y dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous(op, "X", x.is_contiguous())?;
         require_contiguous(op, "Scale", scale.is_contiguous())?;
         require_contiguous(op, "Y", outputs[0].is_contiguous())?;
@@ -607,10 +808,36 @@ impl RmsNormKernel {
             i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
         );
         let eps = self.epsilon;
+        let signature = (num_groups == 1).then(|| NormCaptureSignature {
+            activation_dtype: x.dtype,
+            scale_dtype: scale.dtype,
+            bias_dtype: None,
+            input_shape: x.shape.to_vec(),
+            output_dtypes_and_shapes: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+        });
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self
+            .warmed_signature
+            .lock()
+            .expect("cuda_ep RMSNormalization capture signature poisoned");
+        if capturing && warmed_signature.as_ref() != signature.as_ref() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep RMSNormalization: dtype or shape changed during CUDA graph capture; warm the exact single-group signature before capture"
+                    .into(),
+            ));
+        }
 
+        let entry = if x.dtype == DataType::Float16 {
+            "rmsnorm_f16"
+        } else {
+            "rmsnorm_f32"
+        };
         let func = self
             .runtime
-            .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, "rmsnorm_f32")?;
+            .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, entry)?;
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
@@ -620,19 +847,27 @@ impl RmsNormKernel {
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
+        let scale_is_half = i32::from(scale.dtype == DataType::Float16);
         builder
             .arg(&x_ptr)
             .arg(&scale_ptr)
             .arg(&y_ptr)
             .arg(&invstd_ptr)
             .arg(&groups_i)
-            .arg(&norm_i)
-            .arg(&eps);
+            .arg(&norm_i);
+        if x.dtype == DataType::Float16 {
+            builder.arg(&scale_is_half).arg(&eps);
+        } else {
+            builder.arg(&eps);
+        }
         // SAFETY: `func` is the compiled rmsnorm entry; the argument list/ABI
         // match; pointers are live device allocations sized as validated.
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch rmsnorm_f32", e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if !capturing {
+            *warmed_signature = signature.clone();
+        }
         self.last_call_capture_safe
-            .store(num_groups == 1, Ordering::Relaxed);
+            .store(signature.is_some(), Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1186,7 +1421,9 @@ mod tests {
     #[test]
     fn sources_expose_their_entry_points() {
         assert!(LAYERNORM_SRC.contains("layernorm_f32"));
+        assert!(LAYERNORM_SRC.contains("layernorm_f16"));
         assert!(RMSNORM_SRC.contains("rmsnorm_f32"));
+        assert!(RMSNORM_SRC.contains("rmsnorm_f16"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
     }
