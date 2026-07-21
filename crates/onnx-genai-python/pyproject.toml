@@ -1,0 +1,82 @@
+# onnx-genai — Python packaging via maturin.
+#
+# `onnx-genai` ships the importable `onnx_genai` package: the ONNX Runtime-backed
+# text generation Engine. It mirrors the `nxrt.genai` API but runs on ONNX
+# Runtime, so it is ONNX Runtime compatible. `nxrt` provides the same `genai`
+# surface backed by the native nxrt runtime.
+#
+# The ONNX Runtime shared library is NOT bundled. It is loaded at import time
+# from the installed `onnxruntime` / `onnxruntime-gpu` wheel (see
+# python/onnx_genai/__init__.py), so the package automatically picks up whichever
+# execution providers the user installed.
+#
+# Wheel: stable ABI `abi3`, tagged `cp310-abi3`. The ABI floor is 3.10, but the
+# supported minimum is Python 3.11 (enforced by requires-python and the
+# `onnxruntime` dependency, which ships no cp310 wheels).
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "onnx-genai"
+description = "ONNX Runtime-backed text generation engine (same API as nxrt.genai)"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Justin Chu" }]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+]
+# Default runtime: the CPU ONNX Runtime wheel on every platform, which the loader
+# shim discovers to supply libonnxruntime. macOS additionally pulls the MLX
+# execution-provider plugin so Apple Silicon is fast out of the box. Install the
+# `cuda` extra (Windows/Linux) to swap in the GPU ONNX Runtime + CUDA runtime.
+dependencies = [
+    "onnxruntime>=1.27,<2",
+    "onnxruntime-ep-mlx>=0.27 ; platform_system == 'Darwin'",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# `pip install onnx-genai[cuda]` (Windows/Linux x86_64): CUDA is not bundled in
+# the wheel — this pulls the GPU ONNX Runtime plus its CUDA 13 / cuDNN 9 pip
+# runtime. onnxruntime-gpu installs the same `onnxruntime` import package as the
+# CPU wheel, so it effectively replaces the default CPU runtime.
+cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.27,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
+
+[project.urls]
+repository = "https://github.com/justinchuby/onnx-genai"
+
+[tool.maturin]
+# Mixed layout: the Python package lives in python/onnx_genai and the compiled
+# extension is installed as its private `_onnx_genai` submodule.
+python-source = "python"
+module-name = "onnx_genai._onnx_genai"
+# Build the stable-ABI wheel. `abi3-py310` builds against the limited API so the
+# wheel (tagged cp310-abi3) loads from a single build on any CPython >= 3.10. The
+# real minimum is 3.11 (see requires-python + the onnxruntime dependency); the
+# ABI floor is 3.10 because maturin's Windows abi3 path fixes the limited-API
+# config at 3.10.
+features = ["pyo3/abi3-py310", "pyo3/extension-module"]
+strip = true
+
+[tool.cibuildwheel]
+# Build once on CPython 3.11 (our supported minimum). maturin emits a single
+# cp310-abi3 wheel from the abi3 feature; requires-python (>=3.11) keeps it off
+# 3.10 at install time. That wheel remains installable on later CPython versions.
+build = "cp311-*"
+skip = "*-musllinux_*"
+# Import the package (which loads libonnxruntime from the onnxruntime wheel) to
+# prove the loader shim resolves the runtime.
+test-command = 'python -c "import onnx_genai; print(onnx_genai.__version__)"'
+
+[tool.cibuildwheel.linux]
+# Linux wheel builds run inside a manylinux container, so provision Rust. ONNX
+# Runtime headers/import library for the build come from the ort-sys auto-download.
+before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }

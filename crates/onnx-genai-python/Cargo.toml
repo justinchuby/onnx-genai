@@ -1,0 +1,52 @@
+# PyO3 extension module exposing the ONNX Runtime-backed genai Engine to Python
+# as `onnx_genai`.
+#
+# `onnx_genai` mirrors the `nxrt.genai` API (Engine / GenerateResult) but runs on
+# ONNX Runtime (via `onnx-genai-engine`'s default ORT backend), so it is ONNX
+# Runtime compatible. `nxrt.genai` exposes the same surface backed by the native
+# nxrt runtime instead.
+#
+# Wheels: stable-ABI (`abi3`, tag `cp310-abi3`, min Python 3.10) built from the
+# `abi3-py310` PyO3 feature. Because the ORT backend links `libonnxruntime`
+# dynamically, the wheel bundles that shared library at repair time
+# (auditwheel/delocate/delvewheel) — see pyproject.toml.
+[package]
+name = "onnx-genai-python"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+authors = ["Justin Chu"]
+repository = "https://github.com/justinchuby/onnx-genai"
+description = "Python (PyO3/abi3) binding for the ONNX Runtime-backed onnx-genai text generation engine"
+publish = false
+
+[lib]
+# The compiled extension is the private submodule `onnx_genai._onnx_genai`; the
+# public `onnx_genai` package (python-source) wraps it with a loader shim that
+# pulls libonnxruntime from the installed `onnxruntime` wheel at import time.
+name = "_onnx_genai"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Default features keep the engine on its ONNX Runtime backend (no native-backend).
+onnx-genai-engine = { workspace = true }
+
+[dependencies.pyo3]
+version = "0.29"
+# `abi3-py310` — build against CPython's stable/limited API. This is only the ABI
+# floor (it makes a single `cp310-abi3` wheel that loads on CPython 3.10+); the
+# actual supported minimum is 3.11, enforced by `requires-python = ">=3.11"` and
+# the `onnxruntime` runtime dependency (which ships no cp310 wheels). We pin the
+# ABI floor at 3.10 rather than 3.11 because maturin's Windows abi3 build path
+# fixes the limited-API config at 3.10; a 3.11 ABI floor adds nothing here.
+features = ["abi3-py310"]
+
+[features]
+default = []
+# Enable ONNX Runtime's built-in CUDAExecutionProvider (CUDA 13) plus the cudarc
+# GPU sampler. This does NOT bundle any CUDA libraries: the GPU ONNX Runtime is
+# provided at runtime by the `onnxruntime-gpu` wheel, installed via the
+# `onnx-genai[cuda]` pip extra. Runtime EP selection still goes through
+# `ONNX_GENAI_EP`; without this feature a `cuda` request falls back to CPU. The
+# Windows/Linux x86_64 wheels build with this feature; macOS does not.
+cuda = ["onnx-genai-engine/ort-cuda"]
