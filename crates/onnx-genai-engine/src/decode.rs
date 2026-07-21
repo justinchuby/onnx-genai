@@ -2135,6 +2135,7 @@ mod tests {
     fn empty_metadata() -> InferenceMetadata {
         InferenceMetadata {
             required_capabilities: vec![],
+            schema_version: None,
             model: None,
             kv_cache: None,
             quantization: None,
@@ -2143,6 +2144,8 @@ mod tests {
             speculative: None,
             structured_output: None,
             hardware_requirements: None,
+            generation: None,
+            tokens: None,
         }
     }
 
@@ -2162,6 +2165,7 @@ mod tests {
     fn shared_kv_from_gqa_fp16_native_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
@@ -2248,6 +2252,7 @@ mod tests {
     fn shared_kv_from_gqa_fp16_runtime_configurable_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(2048),
@@ -2271,6 +2276,7 @@ mod tests {
     fn no_shared_kv_when_not_gqa() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(AttentionConfig {
                     attention_type: "multi_head_attention".to_string(),
@@ -2297,6 +2303,7 @@ mod tests {
         // path (O(1)/token) rather than the growing ZeroCopyRebind path.
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
@@ -2318,6 +2325,7 @@ mod tests {
     fn shared_kv_from_gqa_bf16_native_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
@@ -2339,6 +2347,7 @@ mod tests {
     fn no_shared_kv_when_unsupported_kv_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
@@ -2360,6 +2369,7 @@ mod tests {
     fn no_shared_kv_when_max_sequence_length_absent() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: None,
@@ -2388,6 +2398,7 @@ mod tests {
         attention.sliding_window = Some(4096);
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
                 io: None,
                 attention: Some(attention),
                 max_sequence_length: Some(131_072),

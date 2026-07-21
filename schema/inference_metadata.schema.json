@@ -5,6 +5,17 @@
   "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
   "type": "object",
   "properties": {
+    "generation": {
+      "description": "Author-declared text-generation / search defaults.\n\nPopulated from an onnxruntime-genai `genai_config.json` `search` block.\nEvery field is optional; readers treat an absent value as \"use the\nruntime default\".",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GenerationDefaults"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "hardware_requirements": {
       "description": "Minimum and beneficial hardware capabilities used for distribution matching.",
       "anyOf": [
@@ -126,6 +137,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/StructuredOutputSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tokens": {
+      "description": "Special / control token ids declared by the model author.\n\nPopulated from the model-level token id fields of a `genai_config.json`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpecialTokens"
         },
         {
           "type": "null"
@@ -513,6 +535,120 @@
         }
       ]
     },
+    "GenerationDefaults": {
+      "description": "Author-declared text-generation defaults (sampling and beam search).\n\nMirrors the `search` section of an onnxruntime-genai `genai_config.json`.\nEvery field is optional so only values the author declared are carried over.",
+      "type": "object",
+      "properties": {
+        "diversity_penalty": {
+          "description": "Diversity penalty for diverse beam groups.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "do_sample": {
+          "description": "Whether to randomize sampling through `top_k`/`top_p` (else greedy).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "early_stopping": {
+          "description": "Whether beam search stops once enough beams have finished.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "length_penalty": {
+          "description": "Exponential length penalty used with beam search.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "max_length": {
+          "description": "Maximum final sequence length.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "min_length": {
+          "description": "Minimum final sequence length.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "no_repeat_ngram_size": {
+          "description": "Disallow repeating n-grams of this size (`0` = disabled).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "num_beams": {
+          "description": "Number of beams for beam search (`1` = no beam search).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "num_return_sequences": {
+          "description": "Number of sequences returned after search.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "repetition_penalty": {
+          "description": "Penalty applied to already-generated tokens (`1.0` = no penalty).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "temperature": {
+          "description": "Softmax temperature applied before sampling.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "top_k": {
+          "description": "Number of highest-probability tokens kept for top-k filtering.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "top_p": {
+          "description": "Nucleus (top-p) cumulative-probability threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
       "type": "object",
@@ -799,6 +935,15 @@
               "type": "null"
             }
           ]
+        },
+        "vocab_size": {
+          "description": "Vocabulary size (rows of the token-embedding / logits table).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
         }
       }
     },
@@ -808,6 +953,36 @@
       "properties": {
         "attention_mask_input": {
           "description": "Attention-mask input, if the graph takes one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "cross_kv_inputs": {
+          "description": "Cross-attention past-KV cache inputs for an encoder-decoder decoder, in\nthe SAME order as `cross_kv_outputs`. These are the encoder-derived KV\ntensors, distinct from the self-attention `kv_inputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "cross_kv_outputs": {
+          "description": "Cross-attention present-KV cache outputs (produced by the encoder for an\nencoder-decoder model), paired positionally with `cross_kv_inputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "encoder_hidden_states_input": {
+          "description": "Encoder-hidden-states input for an encoder-decoder (cross-attention)\ndecoder graph (e.g. `encoder_hidden_states`).",
           "type": [
             "string",
             "null"
@@ -1853,6 +2028,79 @@
       "required": [
         "name"
       ]
+    },
+    "SpecialTokens": {
+      "description": "Special / control token ids declared by a model author.\n\nEvery field is optional; `eos_token_id` is normalized to a list because\nonnxruntime-genai accepts either a scalar or an array for it.",
+      "type": "object",
+      "properties": {
+        "bos_token_id": {
+          "description": "Beginning-of-stream token id.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "decoder_start_token_id": {
+          "description": "Token an encoder-decoder model starts decoding with, when not `bos`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "eos_token_id": {
+          "description": "End-of-stream token ids (one or more).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "image_token_id": {
+          "description": "Image placeholder token id (VLMs).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "pad_token_id": {
+          "description": "Padding token id.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "sep_token_id": {
+          "description": "Separator token id.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "video_token_id": {
+          "description": "Video placeholder token id (VLMs).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "vision_start_token_id": {
+          "description": "Vision-segment start token id (VLMs).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
     },
     "SpeculativeModelInfo": {
       "description": "Build-time support for self-contained speculative decoding.",

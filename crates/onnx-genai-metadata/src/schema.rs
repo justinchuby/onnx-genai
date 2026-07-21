@@ -69,6 +69,118 @@ pub struct InferenceMetadata {
     /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
+
+    /// Author-declared text-generation / search defaults.
+    ///
+    /// Populated from an onnxruntime-genai `genai_config.json` `search` block.
+    /// Every field is optional; readers treat an absent value as "use the
+    /// runtime default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationDefaults>,
+
+    /// Special / control token ids declared by the model author.
+    ///
+    /// Populated from the model-level token id fields of a `genai_config.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<SpecialTokens>,
+}
+
+/// Author-declared text-generation defaults (sampling and beam search).
+///
+/// Mirrors the `search` section of an onnxruntime-genai `genai_config.json`.
+/// Every field is optional so only values the author declared are carried over.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct GenerationDefaults {
+    /// Whether to randomize sampling through `top_k`/`top_p` (else greedy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub do_sample: Option<bool>,
+
+    /// Softmax temperature applied before sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Number of highest-probability tokens kept for top-k filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+
+    /// Nucleus (top-p) cumulative-probability threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+
+    /// Penalty applied to already-generated tokens (`1.0` = no penalty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
+    /// Number of beams for beam search (`1` = no beam search).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_beams: Option<usize>,
+
+    /// Number of sequences returned after search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_return_sequences: Option<usize>,
+
+    /// Minimum final sequence length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<usize>,
+
+    /// Maximum final sequence length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<usize>,
+
+    /// Exponential length penalty used with beam search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_penalty: Option<f32>,
+
+    /// Disallow repeating n-grams of this size (`0` = disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_repeat_ngram_size: Option<usize>,
+
+    /// Diversity penalty for diverse beam groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diversity_penalty: Option<f32>,
+
+    /// Whether beam search stops once enough beams have finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_stopping: Option<bool>,
+}
+
+/// Special / control token ids declared by a model author.
+///
+/// Every field is optional; `eos_token_id` is normalized to a list because
+/// onnxruntime-genai accepts either a scalar or an array for it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct SpecialTokens {
+    /// Padding token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_token_id: Option<i64>,
+
+    /// Beginning-of-stream token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bos_token_id: Option<i64>,
+
+    /// End-of-stream token ids (one or more).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eos_token_id: Option<Vec<i64>>,
+
+    /// Separator token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sep_token_id: Option<i64>,
+
+    /// Token an encoder-decoder model starts decoding with, when not `bos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_start_token_id: Option<i64>,
+
+    /// Image placeholder token id (VLMs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_token_id: Option<i64>,
+
+    /// Video placeholder token id (VLMs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_token_id: Option<i64>,
+
+    /// Vision-segment start token id (VLMs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_start_token_id: Option<i64>,
 }
 
 /// Configuration published with a standalone speculative proposer model.
@@ -312,6 +424,11 @@ pub struct ModelCapabilities {
     #[schemars(range(min = 1))]
     pub max_sequence_length: Option<usize>,
 
+    /// Vocabulary size (rows of the token-embedding / logits table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub vocab_size: Option<usize>,
+
     /// Built-in draft-head or self-speculative model properties.
     pub speculative: Option<SpeculativeModelInfo>,
 
@@ -380,6 +497,25 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(length(min = 1)))]
     pub kv_outputs: Option<Vec<String>>,
+
+    /// Encoder-hidden-states input for an encoder-decoder (cross-attention)
+    /// decoder graph (e.g. `encoder_hidden_states`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub encoder_hidden_states_input: Option<String>,
+
+    /// Cross-attention past-KV cache inputs for an encoder-decoder decoder, in
+    /// the SAME order as `cross_kv_outputs`. These are the encoder-derived KV
+    /// tensors, distinct from the self-attention `kv_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub cross_kv_inputs: Option<Vec<String>>,
+
+    /// Cross-attention present-KV cache outputs (produced by the encoder for an
+    /// encoder-decoder model), paired positionally with `cross_kv_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub cross_kv_outputs: Option<Vec<String>>,
 }
 
 /// Build-time attention architecture and dimensions.

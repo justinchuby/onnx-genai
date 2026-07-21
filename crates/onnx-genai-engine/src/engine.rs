@@ -2362,6 +2362,7 @@ fn reject_native_request_speculation(options: &GenerateOptions) -> anyhow::Resul
 fn default_inference_metadata() -> InferenceMetadata {
     InferenceMetadata {
         required_capabilities: vec![],
+        schema_version: None,
         model: None,
         kv_cache: None,
         quantization: None,
@@ -2370,6 +2371,8 @@ fn default_inference_metadata() -> InferenceMetadata {
         speculative: None,
         structured_output: None,
         hardware_requirements: None,
+        generation: None,
+        tokens: None,
     }
 }
 
