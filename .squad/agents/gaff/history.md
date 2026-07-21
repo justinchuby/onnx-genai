@@ -102,3 +102,21 @@ Reviewed Deckard's fix for the cudarc CUDA-version-feature conflict. Verified al
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Rejected initial BitShift/OneHot/Compress, approved Sapper’s fix (`49d8827`), and approved the 975 conformance refresh (`eef2c81`).
+
+- 2026-07-19: Approved ConvTranspose. Rejected unmatched-thread benchmark comparisons, then approved Pris's pinned one-/eight-thread revision; the resulting medium-f32 MatMul gap is reproducibly ~17–21× versus ORT.
+
+
+### 2026-07-20 — Vendored MLAS CPU-GEMM parity
+
+Recorded approvals for the vendoring spike, corrected integration, and corrected multi-thread provenance (`556b0d8`, `85087ac`, `ee7a6cd`).
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Reviewed issue #40 Phase-1 slices: 1a 🟡 approved with two non-blocking pressure follow-ups; 1b 🟢 approved after those fixes and full BufferOwnership/concurrency conformance audit.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
+
+- Revised CPU kernel tracing so bytes/FLOPs are computed only with an active span and the tracer dependency is optional; the reviewed combined work landed as `61f4d2c`.

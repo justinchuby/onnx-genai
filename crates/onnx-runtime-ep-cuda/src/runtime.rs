@@ -18,6 +18,7 @@ use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
+use crate::dynamic_library::{CudaLibrary, require};
 use crate::error::{driver_err, nvrtc_err};
 use crate::graph::CudaGraphLifecycle;
 
@@ -171,6 +172,14 @@ pub struct CudaRuntime {
     nvrtc_cubin_fallback: AtomicBool,
     allocations: AtomicU64,
     frees: AtomicU64,
+    /// Persistent four-byte device word into which capture-safe kernels latch an
+    /// out-of-range bounds violation detected during CUDA-graph replay. It is set
+    /// (via `atomicOr`) by device kernels and never auto-cleared on the device;
+    /// only an explicit host [`CudaRuntime::reset_capture_error`] (invoked on
+    /// graph reset / re-capture) returns it to zero. The host reads it at the
+    /// existing per-step logits sync so a poisoned replay becomes a hard error
+    /// before the produced token is consumed.
+    capture_error: CUdeviceptr,
 }
 
 impl std::fmt::Debug for CudaRuntime {
@@ -187,6 +196,16 @@ impl CudaRuntime {
     /// stream, and a cuBLASLt handle. Returns an error (never panics) when no
     /// such device exists or the CUDA driver / cuBLASLt cannot be loaded.
     pub fn new(ordinal: u32) -> Result<Self> {
+        require(CudaLibrary::Driver).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
+        require(CudaLibrary::CublasLt).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let major = context
@@ -243,7 +262,7 @@ impl CudaRuntime {
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
         let graph = CudaGraphLifecycle::new(stream.clone());
-        Ok(Self {
+        Self {
             context,
             stream,
             graph,
@@ -257,7 +276,21 @@ impl CudaRuntime {
             nvrtc_cubin_fallback: AtomicBool::new(false),
             allocations: AtomicU64::new(0),
             frees: AtomicU64::new(0),
-        })
+            capture_error: 0,
+        }
+        .with_capture_error_word()
+    }
+
+    /// Allocate and zero the persistent capture-error latch word. Split out of
+    /// [`CudaRuntime::new`] so it can use the runtime's own bound-context
+    /// alloc/copy helpers.
+    fn with_capture_error_word(mut self) -> Result<Self> {
+        let ptr = self.alloc_raw(std::mem::size_of::<u32>())?;
+        // SAFETY: `ptr` is a fresh four-byte device allocation owned by this
+        // runtime; zeroing it establishes the un-latched initial state.
+        unsafe { self.htod(&0_u32.to_ne_bytes(), ptr) }?;
+        self.capture_error = ptr;
+        Ok(self)
     }
 
     /// The CUDA device ordinal this runtime drives.
@@ -317,6 +350,36 @@ impl CudaRuntime {
     /// Whether this runtime currently owns an instantiated graph executable.
     pub fn has_graph_executable(&self) -> Result<bool> {
         self.graph.has_executable()
+    }
+
+    /// Raw device pointer to the persistent capture-error latch word, passed to
+    /// capture-safe kernels so they can `atomicOr` a bounds-violation code into
+    /// it (and read it back to propagate the poison to later kernels/replays).
+    pub fn capture_error_ptr(&self) -> CUdeviceptr {
+        self.capture_error
+    }
+
+    /// Read the latching capture-error word device → host, returning the raw
+    /// violation bitmask (zero when no capture-safe kernel has tripped).
+    ///
+    /// This does not clear the latch: once set, every subsequent captured replay
+    /// stays poisoned until [`CudaRuntime::reset_capture_error`]. Callers invoke
+    /// this at the per-step logits D2H sync, so the trailing stream synchronize
+    /// is already satisfied and no additional serialization is introduced.
+    pub fn check_capture_error(&self) -> Result<u32> {
+        let mut bytes = [0_u8; std::mem::size_of::<u32>()];
+        // SAFETY: `capture_error` is a live four-byte device allocation owned by
+        // this runtime for its whole lifetime.
+        unsafe { self.dtoh(&mut bytes, self.capture_error) }?;
+        Ok(u32::from_ne_bytes(bytes))
+    }
+
+    /// Clear the latching capture-error word back to the un-poisoned state.
+    /// Invoked on graph reset / re-capture so a fresh generation starts clean.
+    pub fn reset_capture_error(&self) -> Result<()> {
+        // SAFETY: `capture_error` is a live four-byte device allocation owned by
+        // this runtime for its whole lifetime.
+        unsafe { self.htod(&0_u32.to_ne_bytes(), self.capture_error) }
     }
 
     /// Driver-reported capture status for the EP stream.
@@ -422,6 +485,11 @@ impl CudaRuntime {
         src: &str,
         entry: &str,
     ) -> Result<CudaFunction> {
+        require(CudaLibrary::Nvrtc).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
         self.bind()?;
         let module = {
             let mut cache = self.modules.lock().expect("cuda_ep module cache poisoned");
@@ -627,10 +695,13 @@ impl CudaRuntime {
     /// `src` is a live device allocation of at least `dst.len()` bytes.
     pub unsafe fn dtoh(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<()> {
         self.bind()?;
+        // Kernels enqueue work on the EP's dedicated non-default stream. Wait
+        // before issuing the synchronous driver copy so the host never observes
+        // bytes that were still being produced on that stream.
+        self.synchronize()?;
         // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyDtoH", e))?;
-        self.synchronize()
+            .map_err(|e| driver_err("cuMemcpyDtoH", e))
     }
 
     /// Copy `bytes` device → device (D2D).
@@ -642,6 +713,17 @@ impl CudaRuntime {
         // SAFETY: bound context; both endpoints cover `bytes` per the contract.
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
             .map_err(|e| driver_err("cuMemcpyDtoD", e))
+    }
+}
+
+impl Drop for CudaRuntime {
+    fn drop(&mut self) {
+        if self.capture_error != 0 {
+            // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
+            // in `with_capture_error_word` and is freed exactly once here.
+            let _ = unsafe { self.free_raw(self.capture_error) };
+            self.capture_error = 0;
+        }
     }
 }
 

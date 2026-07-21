@@ -8,7 +8,9 @@ use onnx_runtime_ep_api::{EpError, Result};
 /// CUDA graph capture paths must use this gate before beginning capture. A
 /// single incompatible kernel makes the entire subgraph ineligible.
 pub fn subgraph_graph_capturable(kernels: &[&dyn Kernel]) -> bool {
-    kernels.iter().all(|kernel| kernel.cuda_graph_compatible())
+    kernels
+        .iter()
+        .all(|kernel| kernel.capture_support().is_supported())
 }
 
 /// Reject a kernel sequence before stream capture unless every kernel has
@@ -17,23 +19,27 @@ pub fn require_subgraph_graph_capturable(kernels: &[&dyn Kernel]) -> Result<()> 
     let incompatible = kernels
         .iter()
         .enumerate()
-        .filter_map(|(index, kernel)| (!kernel.cuda_graph_compatible()).then_some(index))
+        .filter_map(|(index, kernel)| {
+            kernel
+                .capture_support()
+                .reason()
+                .map(|reason| format!("{index}: {reason}"))
+        })
         .collect::<Vec<_>>();
     if incompatible.is_empty() {
         return Ok(());
     }
 
     Err(EpError::KernelFailed(format!(
-        "cuda_ep: CUDA graph capture rejected before begin_capture: kernels at sequence indices \
-         {incompatible:?} are not graph-compatible (capture forbids device allocation/free, \
-         lazy NVRTC or library initialization, D2H validation, stream synchronization, and \
-         changing tensor shapes or addresses)"
+        "cuda_ep: CUDA graph capture rejected before begin_capture: kernel declines \
+         [{}]",
+        incompatible.join("; ")
     )))
 }
 
 #[cfg(test)]
 mod tests {
-    use onnx_runtime_ep_api::{Kernel, Result, TensorMut, TensorView};
+    use onnx_runtime_ep_api::{CaptureSupport, Kernel, Result, TensorMut, TensorView};
 
     use super::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 
@@ -46,8 +52,12 @@ mod tests {
             Ok(())
         }
 
-        fn cuda_graph_compatible(&self) -> bool {
-            self.capturable
+        fn capture_support(&self) -> CaptureSupport {
+            if self.capturable {
+                CaptureSupport::Supported
+            } else {
+                CaptureSupport::unsupported("test kernel requires a warmed fixed-shape path")
+            }
         }
     }
 
@@ -78,7 +88,6 @@ mod tests {
         let error = require_subgraph_graph_capturable(&[&compatible, &incompatible]).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("rejected before begin_capture"));
-        assert!(message.contains("[1]"));
-        assert!(message.contains("allocation/free"));
+        assert!(message.contains("1: test kernel requires a warmed fixed-shape path"));
     }
 }

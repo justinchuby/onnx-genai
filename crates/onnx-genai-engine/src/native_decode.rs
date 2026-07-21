@@ -4,13 +4,15 @@ use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
+use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim};
 use onnx_runtime_session::{
-    DeviceAllocationCounts, DeviceBindingTransferStats, DeviceGraphCaptureResult, DeviceIoBinding,
-    DevicePreference, InferenceSession, Tensor,
+    CaptureDeclineReport, DeviceAllocationCounts, DeviceBindingTransferStats,
+    DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
+use onnx_runtime_tracer::{TraceContext, capture_rejected};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,13 +44,15 @@ pub struct CudaKvDebugStats {
     pub graph: CudaGraphDebugStats,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CudaGraphDebugStats {
     pub enabled: bool,
     pub captures: u64,
     pub replays: u64,
     pub fallbacks: u64,
     pub allocation_counts: DeviceAllocationCounts,
+    /// Structured reasons from the most recent capture fallback.
+    pub fallback_report: Option<CaptureDeclineReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,11 +73,15 @@ struct DecodeCudaState {
     position_ids_binding: Option<usize>,
     logits_binding: usize,
     logits_shape: Vec<usize>,
+    logits_dtype: DataType,
+    greedy_result: DeviceIoBinding,
     graph_enabled: bool,
     graph_phase: DecodeCudaGraphPhase,
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    graph_fallback_reason: Option<String>,
+    graph_fallback_report: Option<CaptureDeclineReport>,
 }
 
 struct DecodeCudaIo<'a> {
@@ -81,6 +89,20 @@ struct DecodeCudaIo<'a> {
     attention_mask: &'a str,
     position_ids: Option<&'a str>,
     logits: &'a str,
+}
+
+fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
+    for decline in &report.entries {
+        if let Some(node_id) = decline.node_id {
+            capture_rejected(
+                trace,
+                node_id,
+                decline.op_type.as_str(),
+                decline.domain.as_str(),
+                decline.reason.as_str(),
+            );
+        }
+    }
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
@@ -94,6 +116,7 @@ pub struct NativeDecodeSession {
     present_to_past: HashMap<String, String>,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
+    trace: TraceContext,
     current_len: usize,
 }
 
@@ -272,6 +295,7 @@ impl NativeDecodeSession {
             present_to_past,
             past: HashMap::new(),
             cuda,
+            trace: TraceContext::noop(),
             current_len: 0,
         })
     }
@@ -288,6 +312,24 @@ impl NativeDecodeSession {
         self.cuda
             .as_ref()
             .map(|state| state.debug_stats(&self.session))
+    }
+
+    pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
+        self.cuda
+            .as_ref()
+            .and_then(|state| state.graph_fallback_reason.as_deref())
+    }
+
+    /// Structured reasons from the most recent CUDA graph fallback.
+    pub fn cuda_graph_fallback_report(&self) -> Option<&CaptureDeclineReport> {
+        self.cuda
+            .as_ref()
+            .and_then(|state| state.graph_fallback_report.as_ref())
+    }
+
+    /// Attach the shared runtime trace context used for capture-fallback events.
+    pub fn set_trace_context(&mut self, trace: TraceContext) {
+        self.trace = trace;
     }
 
     pub fn decode(
@@ -408,11 +450,23 @@ impl NativeDecodeSession {
 
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
-            if let Err(error) = state.run_one_token(&mut self.session) {
+            if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
                 bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
             }
             let logits = state.read_logits()?;
+            // Detection-before-consumption: the logits read above is the single
+            // per-step device→host sync. Piggyback on it to poll the shared
+            // capture-error word (no extra synchronize). If a captured replay
+            // violates a device-side bound, kernels latch the flag and avoid the
+            // unsafe access, so fail hard before consuming the produced token.
+            let capture_error = self.session.check_device_capture_error()?;
+            if capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
+                );
+            }
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
             }
@@ -480,6 +534,42 @@ impl NativeDecodeSession {
         self.current_len = total_len;
         Ok(logits)
     }
+
+    fn decode_cuda_greedy(
+        &mut self,
+        token_id: TokenId,
+        past_len: usize,
+    ) -> anyhow::Result<TokenId> {
+        let total_len = past_len
+            .checked_add(1)
+            .context("native decode context length overflow")?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.max_len {
+            bail!(
+                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
+                state.max_len
+            );
+        }
+        state.extend_mask(past_len, total_len)?;
+        state.write_decode_inputs(token_id, past_len)?;
+        if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+            let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+        }
+        let (token_id, capture_error) = state.read_greedy_result()?;
+        if capture_error != 0 {
+            let _ = state.invalidate_graph(&mut self.session);
+            bail!(
+                "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
+            );
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(token_id)
+    }
 }
 
 impl DecodeCudaState {
@@ -513,9 +603,10 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            if meta.dtype != DataType::Float32 || meta.shape.len() != 4 {
+            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
+            {
                 bail!(
-                    "CUDA KV input '{past}' must be rank-4 f32, got {:?} {:?}",
+                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
                     meta.dtype,
                     meta.shape
                 );
@@ -576,14 +667,17 @@ impl DecodeCudaState {
             .iter()
             .find(|meta| meta.name == io.logits)
             .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
-        if logits_meta.dtype != DataType::Float32 || logits_meta.shape.is_empty() {
+        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
+            || logits_meta.shape.is_empty()
+        {
             bail!(
-                "CUDA logits output '{}' must be non-scalar f32, got {:?} {:?}",
+                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
                 io.logits,
                 logits_meta.dtype,
                 logits_meta.shape
             );
         }
+        let logits_dtype = logits_meta.dtype;
         let logits_shape = logits_meta
             .shape
             .iter()
@@ -595,10 +689,16 @@ impl DecodeCudaState {
         let logits_binding = bindings.len();
         bindings.push(session.allocate_device_output_binding(
             io.logits,
-            DataType::Float32,
+            logits_dtype,
             logits_shape.clone(),
             logits_shape.clone(),
         )?);
+        let greedy_result = session.allocate_device_output_binding(
+            "__native_greedy_argmax",
+            DataType::Uint32,
+            vec![2],
+            vec![2],
+        )?;
 
         Ok(Self {
             logical_len: 0,
@@ -610,11 +710,15 @@ impl DecodeCudaState {
             position_ids_binding,
             logits_binding,
             logits_shape,
+            logits_dtype,
+            greedy_result,
             graph_enabled,
             graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            graph_fallback_reason: None,
+            graph_fallback_report: None,
         })
     }
 
@@ -661,7 +765,11 @@ impl DecodeCudaState {
         Ok(())
     }
 
-    fn run_one_token(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
+    fn run_one_token(
+        &mut self,
+        session: &mut InferenceSession,
+        trace: &TraceContext,
+    ) -> anyhow::Result<()> {
         if !self.graph_enabled {
             session.run_with_device_bindings(&[], &mut self.bindings)?;
             return Ok(());
@@ -681,9 +789,13 @@ impl DecodeCudaState {
                         self.graph_captures += 1;
                         self.graph_phase = DecodeCudaGraphPhase::Ready;
                     }
-                    DeviceGraphCaptureResult::NotCapturable(reason) => {
+                    DeviceGraphCaptureResult::NotCapturable(report) => {
                         self.graph_fallbacks += 1;
                         self.graph_phase = DecodeCudaGraphPhase::Unsupported;
+                        trace_capture_declines(trace, &report);
+                        let reason = report.to_string();
+                        self.graph_fallback_reason = Some(reason.clone());
+                        self.graph_fallback_report = Some(report);
                         tracing::warn!(
                             "native CUDA decode graph capture disabled for this generation: {reason}"
                         );
@@ -704,8 +816,26 @@ impl DecodeCudaState {
 
     fn read_logits(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
         let bytes = self.bindings[self.logits_binding].read_bytes()?;
-        let logits = Tensor::from_raw(DataType::Float32, self.logits_shape.clone(), &bytes)?;
+        let logits = Tensor::from_raw(self.logits_dtype, self.logits_shape.clone(), &bytes)?;
         extract_logits(&logits)
+    }
+
+    fn greedy_fastpath_supported(&self) -> bool {
+        self.bindings[self.logits_binding].device_argmax_supported()
+    }
+
+    fn read_greedy_result(&mut self) -> anyhow::Result<(TokenId, u32)> {
+        let vocab = *self
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        self.bindings[self.logits_binding].device_argmax(vocab, &mut self.greedy_result)?;
+        let mut bytes = [0_u8; 2 * std::mem::size_of::<u32>()];
+        self.greedy_result.read_bytes_into(&mut bytes)?;
+        Ok((
+            u32::from_ne_bytes(bytes[..4].try_into().expect("four token-id bytes")),
+            u32::from_ne_bytes(bytes[4..].try_into().expect("four capture-error bytes")),
+        ))
     }
 
     fn invalidate_graph(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
@@ -738,6 +868,7 @@ impl DecodeCudaState {
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+                fallback_report: self.graph_fallback_report.clone(),
             },
         }
     }
@@ -932,6 +1063,22 @@ impl DecodeLoopBackend for NativeLoopAdapter<'_> {
             .context("native decoder produced no logits")
     }
 
+    fn greedy_fastpath_supported(&self) -> bool {
+        self.session
+            .cuda
+            .as_ref()
+            .is_some_and(DecodeCudaState::greedy_fastpath_supported)
+    }
+
+    fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
+        if self.pending_tokens.len() != 1 {
+            return Ok(sample_greedy(&self.next_logits()?));
+        }
+        let past_len = self.session.current_len();
+        self.session
+            .decode_cuda_greedy(self.pending_tokens[0], past_len)
+    }
+
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
         self.pending_tokens.clear();
         self.pending_tokens.push(token_id);
@@ -1070,6 +1217,36 @@ fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
 mod tests {
     use super::*;
     use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, TensorData};
+
+    #[test]
+    fn capture_fallback_emits_each_structured_decline_to_tracer() {
+        let report = CaptureDeclineReport {
+            entries: vec![onnx_runtime_session::CaptureDecline {
+                node_id: Some(12),
+                op_type: "GroupQueryAttention".to_string(),
+                domain: "com.microsoft".to_string(),
+                reason:
+                    "requires warmed f32 q_seq==1 k_seq==1 fixed-capacity device-KV reference path"
+                        .to_string(),
+            }],
+        };
+        let (trace, events) = TraceContext::in_memory();
+
+        trace_capture_declines(&trace, &report);
+
+        let events = events.events();
+        assert_eq!(events.len(), 1);
+        let args = events[0].args.as_ref().unwrap();
+        assert_eq!(args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_NODE], 12);
+        assert_eq!(
+            args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_OP],
+            "GroupQueryAttention"
+        );
+        assert_eq!(
+            args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_REASON],
+            report.entries[0].reason
+        );
+    }
 
     fn insert_op(
         graph: &mut Graph,
@@ -1453,6 +1630,7 @@ mod tests {
         assert_eq!(eager_stats.graph.captures, 0);
         assert_eq!(eager_stats.graph.replays, 0);
         assert_eq!(eager_stats.graph.fallbacks, 0);
+        assert!(eager.cuda_graph_fallback_reason().is_none());
 
         let mut captured = capture_safe_cuda_decoder(true, MAX_LEN)?;
         let captured_addresses = binding_addresses(&captured);
@@ -1463,6 +1641,7 @@ mod tests {
         assert_eq!(first_stats.graph.captures, 1);
         assert_eq!(first_stats.graph.replays, TOKENS.len() as u64 - 2);
         assert_eq!(first_stats.graph.fallbacks, 0);
+        assert!(captured.cuda_graph_fallback_reason().is_none());
         assert_eq!(captured_first, eager_first);
         assert_eq!(
             captured_first,
@@ -1611,9 +1790,10 @@ mod tests {
             DeviceBindingTransferStats::default()
         );
         assert!(captured_after.graph.enabled);
-        assert_eq!(captured_after.graph.captures, 0);
-        assert_eq!(captured_after.graph.replays, 0);
-        assert_eq!(captured_after.graph.fallbacks, 1);
+        assert_eq!(captured_after.graph.captures, 1);
+        assert_eq!(captured_after.graph.replays, HORIZON as u64 - 2);
+        assert_eq!(captured_after.graph.fallbacks, 0);
+        assert!(captured.cuda_graph_fallback_reason().is_none());
 
         let eager_us = eager_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;
         let captured_us = captured_nanos as f64 / (HORIZON - 1) as f64 / 1000.0;

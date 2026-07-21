@@ -297,6 +297,14 @@ impl MatMulKernel {
         backend: CpuBackend,
     ) -> Result<()> {
         check_arity("MatMul", inputs, outputs, 2, 2, 1)?;
+        let geom = matmul_geometry(&inputs[0], &inputs[1])?;
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            (numel(&geom.batch_shape) as u64)
+                .saturating_mul(geom.m as u64)
+                .saturating_mul(geom.n as u64)
+                .saturating_mul(geom.k as u64)
+                .saturating_mul(2)
+        });
 
         // Direct f32 output fast path: when the output is a contiguous Float32
         // CPU tensor that does not alias either input, GEMM writes straight into
@@ -305,7 +313,6 @@ impl MatMulKernel {
         // other case (f16/bf16/f64, strided/non-contiguous, or a possibly
         // aliasing output) uses the owned-buffer fallback below unchanged.
         if output_is_direct_f32_eligible(&inputs[0], &inputs[1], &outputs[0]) {
-            let geom = matmul_geometry(&inputs[0], &inputs[1])?;
             let out = &mut outputs[0];
             // `validate()` confirms rank/dtype/offset invariants; it does NOT
             // prove backing-buffer bounds — that is the executor's `view_bounds`
@@ -695,6 +702,26 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![58., 64., 139., 154.]);
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn matmul_populates_active_trace_span_metrics() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3, 2], &[7., 8., 9., 10., 11., 12.]);
+        let mut out = Owned::zeros_f32(&[2, 2]);
+        let (trace, events) = onnx_runtime_tracer::TraceContext::in_memory();
+        {
+            let _span = trace.span("MatMul", "compute");
+            MatMulKernel::default()
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+        }
+
+        let events = events.events();
+        let args = events[0].args.as_ref().expect("MatMul trace args");
+        assert_eq!(args["bytes"], 64);
+        assert_eq!(args["flops"], 24);
     }
 
     #[test]

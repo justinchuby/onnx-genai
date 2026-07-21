@@ -43,12 +43,12 @@
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion,
+    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion, Kernel,
     KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking,
     TensorMut, TensorView, WeightHandle,
 };
@@ -62,11 +62,12 @@ use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
 
+use crate::SessionOutput;
 use crate::error::{Result, SessionError};
 use crate::sequence::{
-    SeqTensor, SequenceError, SequenceValue, SplitSpec, concat, split, stack_new_axis,
+    ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
-use crate::tensor::{DeviceIoBinding, Tensor};
+use crate::tensor::{DeviceIoBinding, SharedTensorBuffer, Tensor};
 
 fn profile_ops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -163,14 +164,144 @@ pub struct DeviceAllocationCounts {
     pub frees: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// One actionable reason a device-graph capture attempt was rejected.
+pub struct CaptureDecline {
+    /// Graph node id, or `None` for graph/capture-lifecycle requirements.
+    pub node_id: Option<u32>,
+    /// ONNX operator type, or `"<graph>"` for graph-level requirements.
+    pub op_type: String,
+    /// Canonical ONNX domain (`"ai.onnx"` by default), or `"nxrt"` graph-level.
+    pub domain: String,
+    /// Failed precondition and, where applicable, how to reach the capture path.
+    pub reason: String,
+}
+
+impl CaptureDecline {
+    fn node(node_id: NodeId, node: &Node, reason: impl Into<String>) -> Self {
+        Self {
+            node_id: Some(node_id.0),
+            op_type: node.op_type.clone(),
+            domain: canonical_domain(node),
+            reason: reason.into(),
+        }
+    }
+
+    fn graph(reason: impl Into<String>) -> Self {
+        Self {
+            node_id: None,
+            op_type: "<graph>".to_string(),
+            domain: "nxrt".to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Structured reasons a device graph could not be captured.
+pub struct CaptureDeclineReport {
+    /// All graph- and node-level declines found by the pre-capture audit.
+    pub entries: Vec<CaptureDecline>,
+}
+
+impl CaptureDeclineReport {
+    fn one(decline: CaptureDecline) -> Self {
+        Self {
+            entries: vec![decline],
+        }
+    }
+
+    /// Whether the capture audit found no declines.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// One node-level reason the requested execution provider declined placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProviderDecline {
+    /// Stable graph/subgraph node identity used in diagnostics.
+    pub node: String,
+    /// Canonical ONNX domain (`"ai.onnx"` for the default domain).
+    pub domain: String,
+    /// ONNX operator type.
+    pub op_type: String,
+    /// Actionable reason returned by [`ExecutionProvider::supports_op`].
+    pub reason: String,
+}
+
+/// Structured report for an accelerator request that executes on CPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProviderFallbackReport {
+    /// Requested provider name, such as `"cuda_ep"`.
+    pub requested_provider: String,
+    /// Provider that will execute the graph.
+    pub fallback_provider: String,
+    /// Number of executable graph/subgraph nodes assigned to the fallback EP.
+    pub assigned_node_count: usize,
+    /// Sorted distinct `domain::op` classes assigned to the fallback EP.
+    pub assigned_ops: Vec<String>,
+    /// Nodes the requested provider did not claim, with colocated reasons.
+    pub declines: Vec<ExecutionProviderDecline>,
+}
+
+impl std::fmt::Display for ExecutionProviderFallbackReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} nodes assigned to CPU (ops: {}) — GPU EP {} did not claim {} node(s): {}. \
+             Heterogeneous CUDA+CPU placement is unavailable, so the whole session uses {}",
+            self.assigned_node_count,
+            self.assigned_ops.join(", "),
+            self.requested_provider,
+            self.declines.len(),
+            format_cuda_coverage_issues(&self.declines),
+            self.fallback_provider,
+        )
+    }
+}
+
+impl std::fmt::Display for CaptureDeclineReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CUDA graph capture rejected")?;
+        for (index, decline) in self.entries.iter().enumerate() {
+            if index == 0 {
+                write!(f, ": ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+            match decline.node_id {
+                Some(node_id) => write!(
+                    f,
+                    "node {node_id} ({}::{}) — {}",
+                    decline.domain, decline.op_type, decline.reason
+                )?,
+                None => write!(f, "{} — {}", decline.op_type, decline.reason)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 pub enum DeviceGraphCaptureResult {
     Captured(Vec<Option<Tensor>>),
-    NotCapturable(String),
+    NotCapturable(CaptureDeclineReport),
 }
 
 enum ScopedRunResult {
-    Executed(Vec<Option<Tensor>>),
-    NotCapturable(String),
+    Executed(Vec<Option<SessionOutput>>),
+    NotCapturable(CaptureDeclineReport),
+}
+
+fn kernel_capture_decline(
+    node_id: NodeId,
+    node: &Node,
+    kernel: &dyn Kernel,
+) -> Option<CaptureDecline> {
+    kernel
+        .capture_support()
+        .reason()
+        .map(|reason| CaptureDecline::node(node_id, node, reason))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +470,12 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     sequence_values: HashSet<ValueId>,
+    /// Allocation owners promoted into ref-counted storage when a tensor enters
+    /// an ONNX Sequence. `buffers` retains a non-owning dispatch alias, while
+    /// sequence elements clone the owner Arc. At the next run boundary, after
+    /// all sequence handles are cleared, the unique owner is restored to
+    /// `buffers` before any input/output can be mutated.
+    shared_buffers: HashMap<ValueId, Arc<SharedTensorBuffer>>,
     /// Run-scoped storage for sequence values: `value id → SequenceValue`. A
     /// [`SequenceValue`] holds its elements as `Arc`-shared immutable tensors,
     /// so a sequence op that inserts/erases/etc. shares element `Arc`s with the
@@ -352,6 +489,7 @@ pub(crate) struct Executor {
     /// [`TensorView`] over the `Arc`'s bytes; it is materialized to owned bytes
     /// only at the graph-output/control-flow boundary. Cleared each run.
     seq_elem_values: HashMap<ValueId, SeqTensor>,
+    execution_provider_fallback_report: Option<ExecutionProviderFallbackReport>,
 }
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
@@ -392,13 +530,35 @@ struct ExternalValue {
     shape: Vec<usize>,
     ptr: *mut std::ffi::c_void,
     len: usize,
+    alignment: usize,
     device: onnx_runtime_ir::DeviceId,
+}
+
+impl ExternalValue {
+    fn writable_buffer(&self) -> Result<DeviceBuffer> {
+        // SAFETY: `prepare_external_bindings` obtains this pointer from a live
+        // `DeviceIoBinding` exclusively borrowed for the run. The binding owns
+        // the allocation, outlives this alias, and is not otherwise accessed
+        // until execution returns.
+        unsafe {
+            DeviceBuffer::from_borrowed_mut_parts(self.ptr, self.device, self.len, self.alignment)
+        }
+        .ok_or_else(|| SessionError::Internal("external output binding has a null pointer".into()))
+    }
 }
 
 #[derive(Default)]
 struct ExternalBindings {
     inputs: HashMap<ValueId, ExternalValue>,
     outputs: HashMap<ValueId, ExternalValue>,
+}
+
+impl ExternalBindings {
+    fn seed_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
+        for (&vid, value) in self.inputs.iter().chain(&self.outputs) {
+            resolved.entry(vid).or_insert_with(|| value.shape.clone());
+        }
+    }
 }
 
 /// Concrete child plan cached for one external-input dtype/shape signature.
@@ -811,37 +971,58 @@ fn run_ep_scoped_passes(
     Ok(())
 }
 
-fn validate_cuda_only_coverage(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+fn cuda_fallback_report(
+    graph: &Graph,
+    ep: &dyn ExecutionProvider,
+) -> Option<ExecutionProviderFallbackReport> {
     if ep.device_type() != DeviceType::Cuda {
-        return Ok(());
+        return None;
     }
 
     let mut issues = Vec::new();
     collect_cuda_coverage_issues(graph, graph, ep, "graph", &mut issues);
     if issues.is_empty() {
-        return Ok(());
+        return None;
     }
 
-    let unsupported_nodes = format_cuda_coverage_issues(issues);
-    Err(SessionError::HeterogeneousPlacementRequired { unsupported_nodes })
+    let mut assigned_ops = BTreeSet::new();
+    let assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);
+    Some(ExecutionProviderFallbackReport {
+        requested_provider: ep.name().to_string(),
+        fallback_provider: "cpu_ep".to_string(),
+        assigned_node_count,
+        assigned_ops: assigned_ops.into_iter().collect(),
+        declines: issues,
+    })
 }
 
-struct CudaCoverageIssue {
-    domain: String,
-    op_type: String,
-    reason: String,
-    node_identity: String,
+fn collect_executable_ops(graph: &Graph, ops: &mut BTreeSet<String>) -> usize {
+    let mut count = 0;
+    for (_, node) in graph.nodes.iter() {
+        if !onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
+            count += 1;
+            ops.insert(format!("{}::{}", canonical_domain(node), node.op_type));
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        count += collect_executable_ops(subgraph, ops);
+    }
+    count
 }
 
-fn format_cuda_coverage_issues(issues: Vec<CudaCoverageIssue>) -> String {
+fn format_cuda_coverage_issues(issues: &[ExecutionProviderDecline]) -> String {
     const MAX_EXAMPLES_PER_CLASS: usize = 3;
 
     let mut groups: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
     for issue in issues {
         groups
-            .entry((issue.domain, issue.op_type, issue.reason))
+            .entry((
+                issue.domain.clone(),
+                issue.op_type.clone(),
+                issue.reason.clone(),
+            ))
             .or_default()
-            .push(issue.node_identity);
+            .push(issue.node.clone());
     }
 
     groups
@@ -864,7 +1045,7 @@ fn collect_cuda_coverage_issues(
     opset_graph: &Graph,
     ep: &dyn ExecutionProvider,
     scope: &str,
-    issues: &mut Vec<CudaCoverageIssue>,
+    issues: &mut Vec<ExecutionProviderDecline>,
 ) {
     for (node_id, node) in graph.nodes.iter() {
         if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
@@ -906,11 +1087,11 @@ fn collect_cuda_coverage_issues(
         if let KernelMatch::Unsupported { reason } =
             ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
         {
-            issues.push(CudaCoverageIssue {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
                 op_type: node.op_type.clone(),
                 reason: reason.into_owned(),
-                node_identity: format_node_identity(scope, node_id, node),
             });
             continue;
         }
@@ -923,11 +1104,11 @@ fn collect_cuda_coverage_issues(
             continue;
         };
         if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
-            issues.push(CudaCoverageIssue {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
                 op_type: node.op_type.clone(),
                 reason: format!("kernel creation failed: {error}"),
-                node_identity: format_node_identity(scope, node_id, node),
             });
         }
     }
@@ -1013,15 +1194,46 @@ fn build_lazy_weight_handles(
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
-        mut graph: Graph,
+        graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
+        Self::build_with_cuda_requirement(
+            graph,
+            weights,
+            ep,
+            onnx_genai_runtime_config::runtime_config().require_cuda,
+        )
+    }
+
+    fn build_with_cuda_requirement(
+        mut graph: Graph,
+        weights: Arc<WeightStore>,
+        mut ep: Arc<dyn ExecutionProvider>,
+        require_cuda: bool,
+    ) -> Result<Self> {
         fuse_silu_patterns(&mut graph);
+        let graph_before_ep_passes = graph.clone();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
-        // Topological order up front: also validates the graph is a DAG.
+        let mut execution_provider_fallback_report = cuda_fallback_report(&graph, ep.as_ref());
+        if let Some(report) = &mut execution_provider_fallback_report {
+            if require_cuda {
+                return Err(SessionError::HeterogeneousPlacementRequired {
+                    unsupported_nodes: report.to_string(),
+                });
+            }
+            graph = graph_before_ep_passes;
+            ep = auto_detect_cpu_ep()?;
+            run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
+            let mut assigned_ops = BTreeSet::new();
+            report.assigned_node_count = collect_executable_ops(&graph, &mut assigned_ops);
+            report.assigned_ops = assigned_ops.into_iter().collect();
+            eprintln!(
+                "[onnx-genai-warning] {report}. Set ONNX_GENAI_REQUIRE_CUDA=1 to reject this fallback"
+            );
+        }
+        // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
-        validate_cuda_only_coverage(&graph, ep.as_ref())?;
         let weight_handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
 
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
@@ -1207,8 +1419,10 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            shared_buffers: HashMap::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
+            execution_provider_fallback_report,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -1233,6 +1447,7 @@ impl Executor {
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
         }
+        self.shared_buffers.remove(&vid);
         let numel = checked_numel(dims, || format!("value#{}", vid.0))?;
         let size = checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), dims)?;
         let buf = self
@@ -1434,6 +1649,12 @@ impl Executor {
         &self.graph
     }
 
+    pub(crate) fn execution_provider_fallback_report(
+        &self,
+    ) -> Option<&ExecutionProviderFallbackReport> {
+        self.execution_provider_fallback_report.as_ref()
+    }
+
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so
     /// the EPContext dump can encode initializers into the context model.
     pub(crate) fn weights(&self) -> &Arc<WeightStore> {
@@ -1542,6 +1763,21 @@ impl Executor {
 
     /// Sequential topological executor.
     pub(crate) fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
+        self.run_outputs(inputs)?
+            .into_iter()
+            .map(|output| {
+                match output {
+                    SessionOutput::Tensor(tensor) => Ok(tensor),
+                    SessionOutput::Sequence(_) => Err(SessionError::SequenceOp {
+                        op: "<graph output>".to_string(),
+                        reason: "the tensor-only run API received a Sequence graph output; use InferenceSession::run_outputs to preserve sequence values".to_string(),
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
         self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default())?
             .into_iter()
             .map(|output| {
@@ -1560,7 +1796,17 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         let external = self.prepare_external_bindings(bindings)?;
-        self.run_scoped(inputs, &HashMap::new(), &external)
+        self.run_scoped(inputs, &HashMap::new(), &external)?
+            .into_iter()
+            .map(|output| match output {
+                None => Ok(None),
+                Some(SessionOutput::Tensor(tensor)) => Ok(Some(tensor)),
+                Some(SessionOutput::Sequence(_)) => Err(SessionError::SequenceOp {
+                    op: "<graph output>".to_string(),
+                    reason: "run_with_device_bindings cannot return an unbound Sequence graph output; use run_outputs without tensor device bindings".to_string(),
+                }),
+            })
+            .collect()
     }
 
     pub(crate) fn try_capture_with_device_bindings(
@@ -1571,8 +1817,23 @@ impl Executor {
         let external = self.prepare_external_bindings(bindings)?;
         match self.run_scoped_mode(inputs, &HashMap::new(), &external, true)? {
             ScopedRunResult::Executed(outputs) => {
+                let mut tensors = Vec::with_capacity(outputs.len());
+                for output in outputs {
+                    match output {
+                        None => tensors.push(None),
+                        Some(SessionOutput::Tensor(tensor)) => tensors.push(Some(tensor)),
+                        Some(SessionOutput::Sequence(_)) => {
+                            self.reset_device_graph()?;
+                            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                                CaptureDeclineReport::one(CaptureDecline::graph(
+                                    "device graph capture cannot return a Sequence graph output",
+                                )),
+                            ));
+                        }
+                    }
+                }
                 self.device_graph_signature = Some(Self::binding_signature(bindings));
-                Ok(DeviceGraphCaptureResult::Captured(outputs))
+                Ok(DeviceGraphCaptureResult::Captured(tensors))
             }
             ScopedRunResult::NotCapturable(reason) => {
                 Ok(DeviceGraphCaptureResult::NotCapturable(reason))
@@ -1597,6 +1858,10 @@ impl Executor {
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
         self.device_graph_signature = None;
         Ok(self.ep.reset_device_graph()?)
+    }
+
+    pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
+        Ok(self.ep.check_device_capture_error()?)
     }
 
     pub(crate) fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
@@ -1631,6 +1896,7 @@ impl Executor {
             let dtype = binding.dtype;
             let shape = binding.physical_shape().to_vec();
             let len = binding.buffer().len();
+            let alignment = binding.buffer().alignment();
             let device = binding.buffer().device();
             if device != self.ep.device_id() {
                 return Err(SessionError::Internal(format!(
@@ -1650,6 +1916,7 @@ impl Executor {
                 shape: shape.clone(),
                 ptr,
                 len,
+                alignment,
                 device,
             };
             if bind_input {
@@ -1678,6 +1945,14 @@ impl Executor {
                             "device binding output not found: {output_name}"
                         ))
                     })?;
+                if self.sequence_values.contains(&output_vid) {
+                    return Err(SessionError::SequenceOp {
+                        op: "<graph output binding>".to_string(),
+                        reason: format!(
+                            "graph output '{output_name}' is a Sequence value and cannot be bound to tensor device storage"
+                        ),
+                    });
+                }
                 if self.value_dtypes[&output_vid] != dtype {
                     return Err(SessionError::DtypeMismatch {
                         name: output_name.clone(),
@@ -1705,7 +1980,7 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-    ) -> Result<Vec<Option<Tensor>>> {
+    ) -> Result<Vec<Option<SessionOutput>>> {
         match self.run_scoped_mode(inputs, outer_scope, external, false)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
@@ -1727,6 +2002,7 @@ impl Executor {
         // run-scoped (element Arcs from a prior run must not leak in).
         self.sequences.clear();
         self.seq_elem_values.clear();
+        self.restore_shared_buffers()?;
 
         // --- Resolve shapes from the actual bound inputs --------------------
         let bindings = self.bind_symbols(inputs, external)?;
@@ -1763,6 +2039,12 @@ impl Executor {
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
         let mut resolved = self.resolve_soft(&bindings);
+        if capture {
+            // Persistent bindings expose the physical geometry the captured
+            // kernels will actually read and write. Seed only unresolved values:
+            // statically/symbolically resolved shapes remain authoritative.
+            external.seed_capture_shapes(&mut resolved);
+        }
         let external_values = external
             .inputs
             .keys()
@@ -1773,6 +2055,7 @@ impl Executor {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
+            self.shared_buffers.remove(&vid);
             self.buffer_shapes.remove(&vid);
         }
         self.size_buffers_excluding(&resolved, &external_values)?;
@@ -1812,7 +2095,7 @@ impl Executor {
                     let result = if is_control_flow_op(&node.op_type, &node.domain) {
                         self.exec_control_flow(pi, &mut resolved, outer_scope)
                     } else if is_sequence_op(&node.op_type, &node.domain) {
-                        self.exec_sequence_node(pi, &mut resolved)
+                        self.exec_sequence_node(pi, &mut resolved, external)
                     } else {
                         self.exec_kernel_node(pi, &mut resolved, external)
                     };
@@ -1830,7 +2113,7 @@ impl Executor {
                     if is_control_flow_op(&node.op_type, &node.domain) {
                         self.exec_control_flow(pi, &mut resolved, outer_scope)?;
                     } else if is_sequence_op(&node.op_type, &node.domain) {
-                        self.exec_sequence_node(pi, &mut resolved)?;
+                        self.exec_sequence_node(pi, &mut resolved, external)?;
                     } else {
                         self.exec_kernel_node(pi, &mut resolved, external)?;
                     }
@@ -1844,14 +2127,16 @@ impl Executor {
             if let Err(error) = execution {
                 let _ = end;
                 let _ = self.ep.reset_device_graph();
-                return Ok(ScopedRunResult::NotCapturable(format!(
-                    "kernel execution rejected CUDA graph capture: {error}"
+                return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                    CaptureDecline::graph(format!(
+                        "kernel execution rejected CUDA graph capture: {error}"
+                    )),
                 )));
             }
             if let Err(error) = end {
                 let _ = self.ep.reset_device_graph();
-                return Ok(ScopedRunResult::NotCapturable(format!(
-                    "ending CUDA graph capture failed: {error}"
+                return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                    CaptureDecline::graph(format!("ending CUDA graph capture failed: {error}")),
                 )));
             }
             if let Err(error) = self.ep.replay_device_graph() {
@@ -1872,31 +2157,23 @@ impl Executor {
                 results.push(None);
                 continue;
             }
-            // A Sequence value cannot be returned through the tensor-typed
-            // `run` boundary. Diagnose it clearly instead of misreading it as
-            // tensor bytes; consumers extract tensors via SequenceAt /
-            // ConcatFromSequence before the graph output.
             if self.sequence_values.contains(&vid) {
-                let name = self
-                    .graph
-                    .try_value(vid)
-                    .and_then(|v| v.name.clone())
-                    .unwrap_or_else(|| format!("value#{}", vid.0));
-                return Err(SessionError::SequenceOp {
-                    op: "<graph output>".to_string(),
-                    reason: format!(
-                        "graph output {name} is a Sequence value, which cannot be \
-                         returned through the tensor `run` API. To fix: end the graph \
-                         with ConcatFromSequence or SequenceAt to produce tensor \
-                         output(s)"
-                    ),
-                });
+                let sequence = self.sequences.get(&vid).cloned().ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "sequence graph output value#{} has no live runtime value",
+                        vid.0
+                    ))
+                })?;
+                results.push(Some(SessionOutput::Sequence(sequence)));
+                continue;
             }
 
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-            results.push(Some(Tensor::from_raw(dtype, shape, &bytes)?));
+            results.push(Some(SessionOutput::Tensor(Tensor::from_raw(
+                dtype, shape, &bytes,
+            )?)));
         }
         Ok(ScopedRunResult::Executed(results))
     }
@@ -1905,38 +2182,45 @@ impl Executor {
         &self,
         resolved: &HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
-    ) -> std::result::Result<(), String> {
-        if self.plan.iter().any(|plan| {
-            let node = self.graph.node(plan.node_id);
-            is_control_flow_op(&node.op_type, &node.domain)
-                || is_sequence_op(&node.op_type, &node.domain)
-        }) {
-            return Err("control-flow and sequence nodes are not device-graph capturable".into());
-        }
+    ) -> std::result::Result<(), CaptureDeclineReport> {
+        let mut report = CaptureDeclineReport::default();
         if self
             .graph
             .outputs
             .iter()
             .any(|output| !external.outputs.contains_key(output))
         {
-            return Err(
-                "every graph output must use a persistent device binding during capture".into(),
-            );
+            report.entries.push(CaptureDecline::graph(
+                "every graph output must use a persistent device binding during capture",
+            ));
         }
 
         let mut kernels = Vec::<&dyn onnx_runtime_ep_api::Kernel>::with_capacity(self.plan.len());
         for plan in &self.plan {
+            let node = self.graph.node(plan.node_id);
+            if is_control_flow_op(&node.op_type, &node.domain)
+                || is_sequence_op(&node.op_type, &node.domain)
+            {
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "control-flow and sequence nodes are not device-graph capturable",
+                ));
+                continue;
+            }
             if plan
                 .outputs
                 .iter()
                 .any(|output| !resolved.contains_key(output))
             {
-                return Err(format!(
-                    "node {} has a data-dependent output shape that was unresolved before capture",
-                    plan.node_id.0
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "data-dependent output shape was unresolved before capture",
                 ));
+                continue;
             }
-            let input_shapes = plan
+            let Some(input_shapes) = plan
                 .inputs
                 .iter()
                 .map(|input| {
@@ -1945,27 +2229,42 @@ impl Executor {
                         .unwrap_or(Some(Vec::new()))
                 })
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    format!(
-                        "node {} has a data-dependent shape that was unresolved before capture",
-                        plan.node_id.0
-                    )
-                })?;
+            else {
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "data-dependent input shape was unresolved before capture",
+                ));
+                continue;
+            };
             let key = KernelKey {
                 node: plan.node_id.0,
                 shapes: input_shapes,
             };
-            let kernel = self.cache.entries.get(&key).ok_or_else(|| {
-                format!(
-                    "node {} has not been warmed for the requested capture shape",
-                    plan.node_id.0
-                )
-            })?;
+            let Some(kernel) = self.cache.entries.get(&key) else {
+                report.entries.push(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    "kernel has not been warmed for the requested capture shape",
+                ));
+                continue;
+            };
+            if let Some(decline) = kernel_capture_decline(plan.node_id, node, kernel.as_ref()) {
+                report.entries.push(decline);
+                continue;
+            }
             kernels.push(kernel.as_ref());
+        }
+        if !report.is_empty() {
+            return Err(report);
         }
         self.ep
             .begin_device_graph_capture(&kernels)
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                CaptureDeclineReport::one(CaptureDecline::graph(format!(
+                    "execution provider rejected begin_capture: {error}"
+                )))
+            })
     }
 
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
@@ -2082,24 +2381,28 @@ impl Executor {
                 continue;
             }
             // A tensor input backed by a shared sequence element (SequenceAt
-            // output) owns no DeviceBuffer: read it zero-copy through a
-            // contiguous view over the element's immutable `Arc` bytes. The Arc
-            // is held live in `self.seq_elem_values` for the whole run, so the
-            // pointer stays valid across this kernel dispatch.
+            // output) owns no DeviceBuffer: read its possibly-strided view
+            // directly over the immutable shared allocation.
             if let Some(elem) = self.seq_elem_values.get(&vid) {
                 let shape = input_shapes[i].clone();
-                let strides = compute_contiguous_strides(&shape);
-                let root_len = elem.as_bytes().len();
+                let strides = elem.layout.resolved_strides(&shape);
+                let root_len = elem.root_len();
                 let base_ptr = elem.as_ptr() as *const std::ffi::c_void;
-                view_bounds(&shape, &strides, 0, input_dtypes[i], root_len)?;
+                view_bounds(
+                    &shape,
+                    &strides,
+                    elem.byte_offset(),
+                    input_dtypes[i],
+                    root_len,
+                )?;
                 in_infos.push(InInfo {
                     present: true,
                     dtype: input_dtypes[i],
                     shape,
                     strides,
-                    byte_offset: 0,
+                    byte_offset: elem.byte_offset(),
                     base_ptr,
-                    device: onnx_runtime_ir::DeviceId::cpu(),
+                    device: elem.device(),
                     backing: TensorBacking::Opaque,
                     root_len,
                 });
@@ -2175,6 +2478,7 @@ impl Executor {
         let weight_handles = &self.weight_handles;
         let buffers = &mut self.buffers;
         let buffer_shapes = &mut self.buffer_shapes;
+        let shared_buffers = &mut self.shared_buffers;
         let views_meta = &mut self.views;
         let pinned = &mut self.pinned;
 
@@ -2273,6 +2577,7 @@ impl Executor {
                 if let Some(old) = buffers.remove(&ovid) {
                     ep.deallocate(old)?;
                 }
+                shared_buffers.remove(&ovid);
                 buffer_shapes.remove(&ovid);
                 views_meta.insert(
                     ovid,
@@ -2325,6 +2630,7 @@ impl Executor {
                 if let Some(old) = buffers.remove(&ovid) {
                     ep.deallocate(old)?;
                 }
+                shared_buffers.remove(&ovid);
                 let buf = ep.allocate(need, TensorLayout::contiguous().alignment)?;
                 buffers.insert(ovid, buf);
             }
@@ -2542,12 +2848,11 @@ impl Executor {
 // bytes, are cloned. `SequenceAt` yields the shared element `Arc` and backs its
 // output tensor value with that same allocation (`seq_elem_values`), so a
 // downstream kernel reads it through a zero-copy [`TensorView`] and no bytes are
-// copied out of the sequence until the graph-output boundary. The only copies
-// are unavoidable boundary crossings: a *tensor → sequence* entry (a produced
-// `DeviceBuffer`, reused across runs, cannot be aliased so its bytes are moved
-// into the element `Arc` exactly once) and the single-alloc `Split`/`Concat`
-// data movement. On a non-host EP, `SequenceAt` uploads the selected element to
-// an EP-owned buffer before any device kernel consumes it.
+// copied out of the sequence until the graph-output boundary. Tensor→sequence
+// entry promotes the existing `DeviceBuffer` into an Arc owner and leaves a
+// non-owning dispatch alias in the executor. `SplitToSequence` creates
+// shape/stride/offset views over that same owner. `ConcatFromSequence` is the
+// only sequence data op that materializes a new contiguous tensor.
 //
 // ## No-race design
 //
@@ -2560,6 +2865,7 @@ impl Executor {
         &mut self,
         pi: usize,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         let node_id = self.plan[pi].node_id;
         let inputs = self.plan[pi].inputs.clone();
@@ -2642,7 +2948,7 @@ impl Executor {
                         })?;
                 let pos = self.read_scalar_i64(pvid, resolved, &op)?;
                 let elem = seq.at(pos).map_err(seq_err)?;
-                self.store_seq_element_output(outputs[0], elem, resolved)
+                self.store_seq_element_output(outputs[0], elem, resolved, external)
             }
             "SequenceLength" => {
                 let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
@@ -2658,13 +2964,14 @@ impl Executor {
                     Vec::new(),
                     &len.to_le_bytes(),
                     resolved,
+                    external,
                 )
             }
             "SplitToSequence" => {
                 self.exec_split_to_sequence(node_id, &op, &inputs, &outputs, resolved)
             }
             "ConcatFromSequence" => {
-                self.exec_concat_from_sequence(node_id, &op, &inputs, &outputs, resolved)
+                self.exec_concat_from_sequence(node_id, &op, &inputs, &outputs, resolved, external)
             }
             other => Err(SessionError::SequenceOp {
                 op: other.to_string(),
@@ -2682,21 +2989,20 @@ impl Executor {
         outputs: &[ValueId],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
     ) -> Result<()> {
-        let node = self.graph.node(node_id);
-        let axis_attr = node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0);
-        let keepdims = node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0;
+        let (axis_attr, keepdims) = {
+            let node = self.graph.node(node_id);
+            (
+                node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0),
+                node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0,
+            )
+        };
 
         let ivid = inputs
             .first()
             .copied()
             .flatten()
             .ok_or_else(|| self.seq_missing_input(op))?;
-        let dtype = self.value_dtypes[&ivid];
-        let shape = resolved
-            .get(&ivid)
-            .cloned()
-            .ok_or_else(|| self.seq_unresolved(op, ivid))?;
-        let bytes = self.contiguous_bytes(ivid, &shape, dtype)?;
+        let input = self.read_seq_element(ivid, resolved)?;
 
         let split_input = match inputs.get(1).copied().flatten() {
             None => None,
@@ -2735,8 +3041,7 @@ impl Executor {
                 });
             }
         };
-        let sequence =
-            split(&bytes, dtype, &shape, axis_attr, split_spec, keepdims).map_err(seq_err)?;
+        let sequence = split_tensor(&input, axis_attr, split_spec, keepdims).map_err(seq_err)?;
         self.sequences.insert(outputs[0], sequence);
         Ok(())
     }
@@ -2750,6 +3055,7 @@ impl Executor {
         inputs: &[Option<ValueId>],
         outputs: &[ValueId],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         let node = self.graph.node(node_id);
         let axis_attr =
@@ -2763,24 +3069,43 @@ impl Executor {
         let new_axis = node.attr("new_axis").and_then(|a| a.as_int()).unwrap_or(0) != 0;
 
         let seq = self.get_sequence(inputs.first().copied().flatten(), op)?;
-        let elem = concat(&seq, axis_attr, new_axis).map_err(seq_err)?;
-        drop(seq);
-        self.store_raw_tensor_output(
+        let plan = ConcatPlan::new(&seq, axis_attr, new_axis).map_err(seq_err)?;
+        self.prepare_tensor_output(
             outputs[0],
-            elem.dtype,
-            elem.shape.clone(),
-            elem.as_bytes(),
+            plan.dtype,
+            plan.shape.clone(),
+            plan.bytes,
             resolved,
-        )
+            external,
+        )?;
+        let ep = Arc::clone(&self.ep);
+        if let Some(value) = external.outputs.get(&outputs[0]) {
+            let mut buffer = value.writable_buffer()?;
+            plan.write(&seq, |offset, bytes| {
+                ep.copy_from_host_at(bytes, &mut buffer, offset)?;
+                Ok(())
+            })?;
+        } else {
+            let buffer = self.buffers.get_mut(&outputs[0]).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "missing ConcatFromSequence output buffer for value#{}",
+                    outputs[0].0
+                ))
+            })?;
+            plan.write(&seq, |offset, bytes| {
+                ep.copy_from_host_at(bytes, buffer, offset)?;
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
-    /// Build (or share) a `SeqTensor` for a tensor value entering a
-    /// sequence. If the value is already a shared sequence element (a
-    /// `SequenceAt` result), its `Arc` is **shared** with no copy; otherwise its
-    /// contiguous bytes are moved into a fresh element once (the tensor→sequence
-    /// entry boundary).
+    /// Build (or share) a `SeqTensor` for a tensor value entering a sequence.
+    /// Existing sequence elements clone their Arc. Ordinary tensors promote the
+    /// existing allocation into a shared owner and keep a non-owning executor
+    /// alias, so no element bytes move.
     fn read_seq_element(
-        &self,
+        &mut self,
         vid: ValueId,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Result<SeqTensor> {
@@ -2801,8 +3126,63 @@ impl Executor {
             .get(&vid)
             .cloned()
             .ok_or_else(|| self.seq_unresolved("Sequence", vid))?;
-        let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-        SeqTensor::from_raw(dtype, shape, &bytes).map_err(SessionError::from)
+        let (root, layout, byte_offset) = match self.views.get(&vid) {
+            Some(view) => (
+                view.source,
+                TensorLayout::strided(view.strides.clone()),
+                view.byte_offset,
+            ),
+            None => (vid, TensorLayout::contiguous(), 0),
+        };
+        if !self.shared_buffers.contains_key(&root) {
+            let buffer = self
+                .buffers
+                .remove(&root)
+                .ok_or_else(|| SessionError::SequenceOp {
+                    op: "Sequence".to_string(),
+                    reason: format!("tensor value#{} has no live backing buffer", vid.0),
+                })?;
+            let storage = SharedTensorBuffer::new(Arc::clone(&self.ep), buffer);
+            self.buffers.insert(root, storage.alias());
+            self.shared_buffers.insert(root, storage);
+        }
+        self.pinned.insert(root);
+        SeqTensor::from_shared(
+            Arc::clone(&self.shared_buffers[&root]),
+            dtype,
+            shape,
+            layout,
+            byte_offset,
+        )
+        .map_err(SessionError::from)
+    }
+
+    fn restore_shared_buffers(&mut self) -> Result<()> {
+        let mut retained = Vec::new();
+        for (vid, storage) in self.shared_buffers.drain() {
+            if let Some(alias) = self.buffers.remove(&vid) {
+                self.ep.deallocate(alias)?;
+            }
+            match Arc::try_unwrap(storage) {
+                Ok(storage) => {
+                    self.buffers.insert(vid, storage.into_buffer());
+                }
+                Err(storage) if self.graph.initializers.contains_key(&vid) => {
+                    self.buffers.insert(vid, storage.alias());
+                    retained.push((vid, storage));
+                }
+                Err(storage) => {
+                    let replacement = self
+                        .ep
+                        .allocate(storage.buffer().len(), storage.buffer().alignment())?;
+                    self.buffers.insert(vid, replacement);
+                }
+            }
+        }
+        for (vid, storage) in retained {
+            self.shared_buffers.insert(vid, storage);
+        }
+        Ok(())
     }
 
     /// Fetch (clone) the sequence value bound to `vid` (cheap — `Arc` handle
@@ -2877,26 +3257,34 @@ impl Executor {
     }
 
     /// Back a tensor *output* value with a shared sequence element (SequenceAt).
-    /// Host EPs retain the zero-copy `Arc` alias. Non-host EPs upload the bytes
-    /// into an EP-owned buffer so device kernels never receive a host pointer.
+    /// The element retains its original device allocation and view metadata.
     fn store_seq_element_output(
         &mut self,
         vid: ValueId,
         elem: SeqTensor,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
-        if !self.ep.device_id().is_host_accessible() {
-            return self.store_raw_tensor_output(
-                vid,
-                elem.dtype,
-                elem.shape.clone(),
-                elem.as_bytes(),
-                resolved,
-            );
+        if elem.device() != self.ep.device_id() {
+            return Err(SessionError::SequenceOp {
+                op: "SequenceAt".to_string(),
+                reason: format!(
+                    "sequence element is on {:?}, but the active execution provider is on {:?}",
+                    elem.device(),
+                    self.ep.device_id()
+                ),
+            });
+        }
+        if external.outputs.contains_key(&vid) {
+            let dtype = elem.dtype;
+            let shape = elem.shape.clone();
+            let bytes = elem.contiguous_bytes().map_err(seq_err)?;
+            return self.store_raw_tensor_output(vid, dtype, shape, &bytes, resolved, external);
         }
         if let Some(old) = self.buffers.remove(&vid) {
             self.ep.deallocate(old)?;
         }
+        self.shared_buffers.remove(&vid);
         self.buffer_shapes.remove(&vid);
         self.views.remove(&vid);
         resolved.insert(vid, elem.shape.clone());
@@ -2915,30 +3303,60 @@ impl Executor {
         dims: Vec<usize>,
         bytes: &[u8],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
-        // A value that was seq-element-backed on a prior run must not shadow the
-        // fresh buffer we write here.
+        self.prepare_tensor_output(vid, dtype, dims, bytes.len(), resolved, external)?;
+        if let Some(value) = external.outputs.get(&vid) {
+            let mut buffer = value.writable_buffer()?;
+            self.ep.copy_from_host(bytes, &mut buffer)?;
+        } else {
+            let buffer = self.buffers.get_mut(&vid).ok_or_else(|| {
+                SessionError::Internal(format!("missing tensor output buffer for value#{}", vid.0))
+            })?;
+            self.ep.copy_from_host(bytes, buffer)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_tensor_output(
+        &mut self,
+        vid: ValueId,
+        dtype: DataType,
+        dims: Vec<usize>,
+        bytes: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
         self.seq_elem_values.remove(&vid);
         self.views.remove(&vid);
-        let need = bytes.len().max(1);
-        let fits = self
-            .buffers
-            .get(&vid)
-            .map(|b| b.len() == need)
-            .unwrap_or(false);
-        if !fits {
-            if let Some(old) = self.buffers.remove(&vid) {
-                self.ep.deallocate(old)?;
+        let need = bytes.max(1);
+        if let Some(value) = external.outputs.get(&vid) {
+            if value.dtype != dtype || value.shape != dims || value.len < need {
+                let name = self.graph.value(vid).name.as_deref().unwrap_or("<unnamed>");
+                return Err(SessionError::Internal(format!(
+                    "external output '{name}' has {:?} {:?} ({} bytes), sequence op requires {:?} {:?} ({need} bytes)",
+                    value.dtype, value.shape, value.len, dtype, dims
+                )));
             }
-            let buf = self
-                .ep
-                .allocate(need, TensorLayout::contiguous().alignment)?;
-            self.buffers.insert(vid, buf);
+        } else {
+            let fits = self
+                .buffers
+                .get(&vid)
+                .map(|buffer| buffer.len() == need)
+                .unwrap_or(false);
+            if !fits {
+                if let Some(old) = self.buffers.remove(&vid) {
+                    self.ep.deallocate(old)?;
+                }
+                self.shared_buffers.remove(&vid);
+                let buffer = self
+                    .ep
+                    .allocate(need, TensorLayout::contiguous().alignment)?;
+                self.buffers.insert(vid, buffer);
+            }
+            self.buffer_shapes.insert(vid, dims.clone());
         }
-        let buf = self.buffers.get_mut(&vid).expect("just ensured");
-        self.ep.copy_from_host(bytes, buf)?;
         self.value_dtypes.insert(vid, dtype);
-        self.buffer_shapes.insert(vid, dims.clone());
         resolved.insert(vid, dims);
         Ok(())
     }
@@ -3303,12 +3721,22 @@ impl ChildExecutor {
             .run_scoped(&inputs, outer_scope, &ExternalBindings::default())?
             .into_iter()
             .map(|output| {
-                output.ok_or_else(|| {
+                let output = output.ok_or_else(|| {
                     SessionError::Internal(format!(
                         "subgraph '{}' unexpectedly suppressed an output",
                         self.name
                     ))
-                })
+                })?;
+                match output {
+                    SessionOutput::Tensor(tensor) => Ok(tensor),
+                    SessionOutput::Sequence(_) => Err(SessionError::SequenceOp {
+                        op: "<control-flow output>".to_string(),
+                        reason: format!(
+                            "subgraph '{}' produced a Sequence output where this control-flow path requires a tensor",
+                            self.name
+                        ),
+                    }),
+                }
             })
             .collect()
     }
@@ -3374,7 +3802,7 @@ impl Executor {
         // the one materialization point where they are copied out (the boundary
         // back into owned tensors); the compute path reads them zero-copy.
         if let Some(elem) = self.seq_elem_values.get(&vid) {
-            let bytes = elem.as_bytes();
+            let bytes = elem.contiguous_bytes().map_err(SessionError::from)?;
             return Ok(bytes[..n.min(bytes.len())].to_vec());
         }
         if let Some(view) = self.views.get(&vid) {
@@ -3454,6 +3882,7 @@ impl Executor {
             if let Some(old) = self.buffers.remove(&vid) {
                 self.ep.deallocate(old)?;
             }
+            self.shared_buffers.remove(&vid);
             let buf = self
                 .ep
                 .allocate(need, TensorLayout::contiguous().alignment)?;
@@ -4557,6 +4986,7 @@ impl Drop for Executor {
         for (_, buf) in self.buffers.drain() {
             let _ = self.ep.deallocate(buf);
         }
+        self.shared_buffers.clear();
     }
 }
 
@@ -4574,10 +5004,84 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use onnx_runtime_ep_api::{
-        Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel, NegotiatedWeight,
+        CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
+        NegotiatedWeight,
     };
 
     use super::*;
+
+    struct CaptureDecliningKernel;
+
+    impl Kernel for CaptureDecliningKernel {
+        fn execute(
+            &self,
+            _inputs: &[TensorView],
+            _outputs: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            Ok(())
+        }
+
+        fn capture_support(&self) -> CaptureSupport {
+            CaptureSupport::unsupported(
+                "requires M==1 decode GEMV without group_indices; got a prefill signature",
+            )
+        }
+    }
+
+    #[test]
+    fn kernel_capture_reason_propagates_into_structured_report() {
+        let mut node = Node::new(NodeId(9), "MatMulNBits", vec![], vec![]);
+        node.domain = "com.microsoft".to_string();
+        let decline =
+            kernel_capture_decline(node.id, &node, &CaptureDecliningKernel).expect("decline");
+        let report = CaptureDeclineReport::one(decline);
+
+        assert_eq!(
+            report.entries,
+            vec![CaptureDecline {
+                node_id: Some(9),
+                op_type: "MatMulNBits".to_string(),
+                domain: "com.microsoft".to_string(),
+                reason: "requires M==1 decode GEMV without group_indices; got a prefill signature"
+                    .to_string(),
+            }]
+        );
+        assert!(report.to_string().contains("node 9"));
+        assert!(
+            report
+                .to_string()
+                .contains("requires M==1 decode GEMV without group_indices")
+        );
+    }
+
+    #[test]
+    fn capture_shapes_seed_unresolved_external_values_without_overwriting_resolved_shapes() {
+        let external_value = |shape| ExternalValue {
+            dtype: DataType::Float32,
+            shape,
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            alignment: 1,
+            device: onnx_runtime_ir::DeviceId::cpu(),
+        };
+        let mut external = ExternalBindings::default();
+        external
+            .inputs
+            .insert(ValueId(0), external_value(vec![1, 2]));
+        external
+            .outputs
+            .insert(ValueId(1), external_value(vec![1, 4, 128, 64]));
+        external
+            .outputs
+            .insert(ValueId(2), external_value(vec![1, 4, 128, 64]));
+
+        let mut resolved = HashMap::from([(ValueId(0), vec![1, 1])]);
+        external.seed_capture_shapes(&mut resolved);
+
+        assert_eq!(resolved[&ValueId(0)], vec![1, 1]);
+        assert_eq!(resolved[&ValueId(1)], vec![1, 4, 128, 64]);
+        assert_eq!(resolved[&ValueId(2)], vec![1, 4, 128, 64]);
+    }
 
     struct WeightDeliveryKernel {
         deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -5135,14 +5639,17 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
         );
         let report = || {
-            validate_cuda_only_coverage(&graph, &ep)
-                .unwrap_err()
+            cuda_fallback_report(&graph, &ep)
+                .expect("CUDA declines must produce a fallback report")
                 .to_string()
         };
         let first = report();
         let second = report();
 
         assert_eq!(first, second);
+        assert!(first.contains("13 nodes assigned to CPU"));
+        assert!(first.contains("GPU EP stock_test_ep did not claim 13 node(s)"));
+        assert!(first.contains("the whole session uses cpu_ep"));
         assert_eq!(first.matches("ai.onnx::RepeatedMissing:").count(), 1);
         assert!(first.contains("ai.onnx::RepeatedMissing: no handler"));
         assert!(first.contains("[count=4; examples: graph/node#0, graph/node#12, graph/node#2]"));
@@ -5170,6 +5677,62 @@ mod tests {
             );
         }
         assert!(!first.contains("more unsupported node"));
+    }
+
+    #[test]
+    fn cuda_decline_warns_and_falls_back_to_cpu_unless_strict() {
+        let graph = || {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), 17);
+            let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Static(1)]);
+            let output =
+                graph.create_named_value("output", DataType::Float32, vec![Dim::Static(1)]);
+            graph.add_input(input);
+            graph.add_output(output);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Relu",
+                vec![Some(input)],
+                vec![output],
+            ));
+            graph
+        };
+        let cuda_ep = || {
+            Arc::new(WeightDeliveryEp::with_device(
+                false,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                onnx_runtime_ir::DeviceId::cuda(0),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            )) as Arc<dyn ExecutionProvider>
+        };
+
+        let exec = Executor::build_with_cuda_requirement(
+            graph(),
+            Arc::new(WeightStore::new()),
+            cuda_ep(),
+            false,
+        )
+        .expect("default CUDA decline must use the CPU fallback");
+        assert_eq!(exec.device_id().device_type, DeviceType::Cpu);
+        let report = exec
+            .execution_provider_fallback_report()
+            .expect("fallback must remain observable");
+        assert_eq!(report.assigned_node_count, 1);
+        assert_eq!(report.assigned_ops, ["ai.onnx::Relu"]);
+        assert_eq!(report.declines.len(), 1);
+        assert_eq!(report.declines[0].op_type, "Relu");
+        assert!(report.declines[0].reason.contains("intentionally declines"));
+
+        let strict = Executor::build_with_cuda_requirement(
+            graph(),
+            Arc::new(WeightStore::new()),
+            cuda_ep(),
+            true,
+        )
+        .err()
+        .expect("strict CUDA must reject CPU fallback");
+        assert!(strict.to_string().contains("ONNX_GENAI_REQUIRE_CUDA=1"));
     }
 
     #[test]
@@ -5249,13 +5812,14 @@ mod tests {
         let output = executor.run(&[]).unwrap();
         assert_eq!(output[0].to_vec_f32(), vec![7.0, 8.0]);
 
-        let original = executor.sequences[&first_sequence].elements()[0].shared_tensor();
-        let first_at_arc = executor.seq_elem_values[&first_at].shared_tensor();
-        let inserted = executor.sequences[&inserted_sequence].elements()[1].shared_tensor();
-        let second_at_arc = executor.seq_elem_values[&second_at].shared_tensor();
-        assert!(Arc::ptr_eq(original, first_at_arc));
-        assert!(Arc::ptr_eq(original, inserted));
-        assert!(Arc::ptr_eq(original, second_at_arc));
+        let original = &executor.sequences[&first_sequence].elements()[0];
+        let first_at_arc = &executor.seq_elem_values[&first_at];
+        let inserted = &executor.sequences[&inserted_sequence].elements()[1];
+        let second_at_arc = &executor.seq_elem_values[&second_at];
+        assert!(original.shares_storage_with(first_at_arc));
+        assert!(original.shares_storage_with(inserted));
+        assert!(original.shares_storage_with(second_at_arc));
+        assert_eq!(original.as_ptr(), executor.buffers[&input].as_ptr());
     }
 
     #[test]

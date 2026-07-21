@@ -333,8 +333,14 @@ impl Kernel for ActivationKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        !matches!(self.op, ActivationOp::Clip { .. })
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if matches!(self.op, ActivationOp::Clip { .. }) {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Clip reads optional min/max scalars back to the host before launch",
+            )
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        }
     }
 }
 

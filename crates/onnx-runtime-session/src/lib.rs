@@ -24,7 +24,8 @@ pub use epcontext::{
 };
 pub use error::SessionError;
 pub use executor::{
-    CacheStats, ControlFlowStats, DeviceAllocationCounts, DeviceGraphCaptureResult,
+    CacheStats, CaptureDecline, CaptureDeclineReport, ControlFlowStats, DeviceAllocationCounts,
+    DeviceGraphCaptureResult, ExecutionProviderDecline, ExecutionProviderFallbackReport,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -35,6 +36,43 @@ mod epcontext;
 mod executor;
 pub mod sequence;
 mod tensor;
+
+/// A graph output produced by the runtime.
+#[derive(Debug)]
+pub enum SessionOutput {
+    Tensor(Tensor),
+    Sequence(sequence::SequenceValue),
+}
+
+impl SessionOutput {
+    pub fn as_tensor(&self) -> Option<&Tensor> {
+        match self {
+            Self::Tensor(tensor) => Some(tensor),
+            Self::Sequence(_) => None,
+        }
+    }
+
+    pub fn as_sequence(&self) -> Option<&sequence::SequenceValue> {
+        match self {
+            Self::Tensor(_) => None,
+            Self::Sequence(sequence) => Some(sequence),
+        }
+    }
+
+    pub fn into_tensor(self) -> Option<Tensor> {
+        match self {
+            Self::Tensor(tensor) => Some(tensor),
+            Self::Sequence(_) => None,
+        }
+    }
+
+    pub fn into_sequence(self) -> Option<sequence::SequenceValue> {
+        match self {
+            Self::Tensor(_) => None,
+            Self::Sequence(sequence) => Some(sequence),
+        }
+    }
+}
 
 /// Operator-set version associated with an operator dispatch failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,9 +149,8 @@ mod error {
         ExecutionProviderUnavailable(String),
 
         #[error(
-            "CUDA-only session cannot fully serve this model ({unsupported_nodes}). \
-             Heterogeneous CPU+CUDA placement is required and not yet available; \
-             use native CPU or the ORT backend"
+            "CUDA execution required by ONNX_GENAI_REQUIRE_CUDA=1, but CPU fallback is needed: \
+             {unsupported_nodes}"
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
@@ -780,6 +817,11 @@ impl InferenceSession {
         self.exec.run(inputs)
     }
 
+    /// Run inference and preserve tensor or sequence graph-output types.
+    pub fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
+        self.exec.run_outputs(inputs)
+    }
+
     /// Run with persistent device allocations supplying graph inputs and,
     /// optionally, aliasing graph outputs. Bound outputs are returned as `None`
     /// because their bytes remain resident in the caller-owned allocation.
@@ -850,12 +892,26 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Read (without clearing) any latching device capture-safety error recorded
+    /// during graph replay, as a raw violation bitmask (zero when none). Callers
+    /// poll this at the per-step logits sync to fail before consuming a token
+    /// produced from an out-of-range captured replay.
+    pub fn check_device_capture_error(&self) -> Result<u32> {
+        self.exec.check_device_capture_error()
+    }
+
     pub fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
         self.exec.device_allocation_counts()
     }
 
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
+    }
+
+    /// Report why an explicitly requested accelerator session was assigned to
+    /// CPU instead. `None` means the requested EP serves the whole graph.
+    pub fn execution_provider_fallback_report(&self) -> Option<&ExecutionProviderFallbackReport> {
+        self.exec.execution_provider_fallback_report()
     }
 
     /// Input metadata.

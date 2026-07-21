@@ -307,8 +307,11 @@ macro_rules! copy_factory {
             fn supports_strided_input(&self, _idx: usize) -> bool {
                 false
             }
-            fn cuda_graph_compatible(&self) -> bool {
-                false
+            fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+                onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                    "{} uses the copy path rather than a capture-validated zero-copy view",
+                    $op
+                ))
             }
         }
     };
@@ -361,8 +364,10 @@ impl Kernel for UnsqueezeKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Unsqueeze reads runtime axes on the host and uses a non-validated copy path",
+        )
     }
 }
 
@@ -410,8 +415,10 @@ impl Kernel for ExpandKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Expand allocates/uploads/frees per-call broadcast metadata and synchronizes the stream",
+        )
     }
 }
 
@@ -492,8 +499,10 @@ impl Kernel for TransposeKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Transpose allocates/uploads/frees per-call permutation metadata and synchronizes the stream",
+        )
     }
 }
 
@@ -697,8 +706,10 @@ impl Kernel for SliceKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Slice reads runtime bounds on the host, allocates per-call metadata, and synchronizes the stream",
+        )
     }
 }
 
@@ -760,8 +771,10 @@ impl Kernel for TileKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Tile reads repeats on the host, allocates per-call metadata, and synchronizes the stream",
+        )
     }
 }
 
@@ -859,8 +872,10 @@ impl Kernel for ConcatKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Concat performs a trailing host stream synchronization",
+        )
     }
 }
 
@@ -997,7 +1012,9 @@ impl Kernel for SplitKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Split reads runtime split sizes on the host and performs a trailing stream synchronization",
+        )
     }
 }

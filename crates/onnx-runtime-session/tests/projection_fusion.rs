@@ -137,11 +137,12 @@ fn projection_fusion_matches_unfused_and_concatenates_rows() {
     assert_eq!(fused_scale_data.dims, vec![4, 1]);
     for old_name in ["gate_B", "up_B", "gate_scales", "up_scales"] {
         assert!(
-            !fused
+            !fused.graph().initializers.keys().any(|value| fused
                 .graph()
-                .initializers
-                .keys()
-                .any(|value| fused.graph().value(*value).name.as_deref() == Some(old_name)),
+                .value(*value)
+                .name
+                .as_deref()
+                == Some(old_name)),
             "orphaned initializer {old_name} must be removed"
         );
     }

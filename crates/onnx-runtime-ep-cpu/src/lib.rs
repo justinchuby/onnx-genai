@@ -30,6 +30,7 @@ pub mod kernels;
 pub mod optimizer;
 pub mod provider;
 pub mod strided;
+mod trace;
 pub mod weight_offload;
 
 pub use backend::CpuBackend;

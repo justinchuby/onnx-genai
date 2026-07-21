@@ -1,6 +1,7 @@
 //! `Shape`: host-compute shape metadata and synchronously upload it to the GPU.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -17,6 +18,7 @@ impl KernelFactory for ShapeFactory {
             runtime: self.runtime.clone(),
             start: node.attr("start").and_then(|a| a.as_int()).unwrap_or(0),
             end: node.attr("end").and_then(|a| a.as_int()),
+            warmed: AtomicBool::new(false),
         }))
     }
 }
@@ -26,6 +28,7 @@ pub struct ShapeKernel {
     runtime: Arc<CudaRuntime>,
     start: i64,
     end: Option<i64>,
+    warmed: AtomicBool,
 }
 
 impl Kernel for ShapeKernel {
@@ -56,6 +59,11 @@ impl Kernel for ShapeKernel {
                 dims.len()
             )));
         }
+        if self.runtime.is_capturing()? {
+            // The shape-keyed kernel cache guarantees the same input geometry
+            // warmed this output, so its device metadata stays valid on replay.
+            return Ok(());
+        }
         let mut bytes = Vec::with_capacity(dims.len() * std::mem::size_of::<i64>());
         for &dim in dims {
             let dim = i64::try_from(dim).map_err(|_| {
@@ -71,10 +79,21 @@ impl Kernel for ShapeKernel {
                     .htod(&bytes, cuptr(output.data_ptr_mut::<u8>() as *const u8 as _))?
             };
         }
+        self.warmed.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
         true
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.warmed.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Shape output metadata must be warmed into its stable device buffer before capture",
+            )
+        }
     }
 }

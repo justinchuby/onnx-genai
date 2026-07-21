@@ -277,10 +277,10 @@ impl Kernel for MatMulKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // The per-call workspace alloc/free and heuristic query are not graph-
-        // capturable as written; revisit when the workspace is pooled (Phase 2b).
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "per-call workspace allocation/free and heuristic query are not capturable",
+        )
     }
 }
 

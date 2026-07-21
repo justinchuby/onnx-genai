@@ -27,3 +27,21 @@ Hired as an additional Code Reviewer (alongside Gaff) as the codebase grew to 9 
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Approved AffineGrid/Col2Im/CenterCropPad (`8e49948`) with a non-blocking Col2Im dilation-test nit.
+
+- 2026-07-19: Drove Unique through three rejection cycles: O(n²)/NaN/dtype shortcomings, unreachable String execution, then runtime-layer String UB. Approved after unsafe String handling was removed; final kernel supports safe numeric/bool/bf16 and reports String unsupported.
+
+## 2026-07-19T21:30:00Z — oneDNN removal review
+- 🟢 Approved Bryant's `453d280` oneDNN CPU GEMM removal after verifying clean references/submodule removal, 620 CPU-EP library tests, 28 tracer tests, and registry-count integrity.
+- 25 clippy lints observed remain pre-existing.
+
+
+### 2026-07-20 — Vendored MLAS CPU-GEMM parity
+
+Cross-agent update: vendored MLAS is now the opt-in CPU-GEMM parity path; follow-ups include buffer reuse, prepacked B, dtype coverage, int4, default flip, and Windows MASM.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Approved Sapper’s decode-pool residency and Roy’s guarded GQA parallelism after concurrency, numerical-order, opt-out, feature-gate, and E2E parity checks.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

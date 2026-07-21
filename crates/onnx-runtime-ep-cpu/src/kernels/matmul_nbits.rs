@@ -204,6 +204,16 @@ impl Kernel for MatMulNBitsKernel {
             && group_indices.is_none_or(|_| self.constant_inputs[4]);
         let activations = to_dense_f32(&inputs[0])?;
         let m = numel(&a_shape[..a_shape.len() - 1]);
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (m as u64)
+                .saturating_mul(self.n as u64)
+                .saturating_mul(self.k as u64)
+                .saturating_mul(2);
+            if bias.is_some() {
+                flops = flops.saturating_add((m as u64).saturating_mul(self.n as u64));
+            }
+            flops
+        });
         let mut result = vec![0.0f32; m * self.n];
         let dot_kernel = selected_dot_kernel();
         #[cfg(feature = "mlas")]

@@ -270,8 +270,10 @@ impl Kernel for FusedEpilogueKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "fused GEMM performs per-call workspace allocation/free",
+        )
     }
 }
 

@@ -124,6 +124,18 @@ impl Kernel for SoftmaxKernel {
             )));
         }
         let axis = axis as usize;
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let slices = if self.coerce_2d {
+                crate::trace::product(shape[..axis].iter().copied())
+            } else {
+                crate::trace::product(shape[..axis].iter().chain(&shape[axis + 1..]).copied())
+            };
+            // Per element: subtract, exp, sum and normalization multiply; one
+            // reciprocal per reduction slice. Max comparisons are not FLOPs.
+            (inputs[0].numel() as u64)
+                .saturating_mul(4)
+                .saturating_add(slices)
+        });
 
         let mut out = vec![0.0f32; numel(shape)];
         if self.coerce_2d {

@@ -327,8 +327,8 @@ impl Kernel for UnaryMathKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 
@@ -424,8 +424,8 @@ impl Kernel for NotKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 
@@ -740,8 +740,10 @@ impl Kernel for BinaryPredKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "binary predicate allocates/uploads/frees per-call broadcast metadata and synchronizes the stream",
+        )
     }
 }
 

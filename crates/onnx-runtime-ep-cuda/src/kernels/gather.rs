@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -11,11 +12,12 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
+pub const GATHER_CAPTURE_ERROR_INDEX: u32 = 64;
 const GATHER_SOURCE: &str = r#"
 extern "C" __global__ void gather_bytes(
     const unsigned char* data, const void* indices, unsigned char* output,
     int output_bytes, int elem_bytes, int axis_dim, int num_indices, int inner,
-    int index_is_i64) {
+    int index_is_i64, unsigned int* capture_error) {
   for (int byte = blockIdx.x * blockDim.x + threadIdx.x; byte < output_bytes;
        byte += gridDim.x * blockDim.x) {
     int element = byte / elem_bytes;
@@ -27,6 +29,10 @@ extern "C" __global__ void gather_bytes(
         ? ((const long long*)indices)[selected]
         : (long long)((const int*)indices)[selected];
     if (index < 0) index += axis_dim;
+    if (index < 0 || index >= axis_dim) {
+      if (capture_error) atomicOr(capture_error, 64u);
+      continue;
+    }
     output[byte] = data[((outer * axis_dim + index) * inner + inner_index) * elem_bytes + within];
   }
 }
@@ -41,6 +47,7 @@ impl KernelFactory for GatherFactory {
         Ok(Box::new(GatherKernel {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -49,6 +56,7 @@ impl KernelFactory for GatherFactory {
 pub struct GatherKernel {
     runtime: Arc<CudaRuntime>,
     axis: i64,
+    last_call_capture_safe: AtomicBool,
 }
 
 fn checked_product(dims: &[usize], what: &str) -> Result<usize> {
@@ -137,32 +145,35 @@ impl Kernel for GatherKernel {
                 "cuda_ep Gather: indices cannot select from an empty axis".into(),
             ));
         }
-        // A device-side out-of-range index would be an out-of-bounds load. Check
-        // the small index tensor on the host before launching so ONNX's required
-        // error is deterministic rather than relying on undefined device memory.
-        let index_bytes = indices.dtype.storage_bytes(num_indices);
-        let mut host_indices = vec![0u8; index_bytes];
-        if !host_indices.is_empty() {
-            // SAFETY: `indices` is a live contiguous device tensor and the host
-            // buffer is exactly its fixed-width storage size.
-            unsafe {
-                self.runtime.dtoh(
-                    &mut host_indices,
-                    cuptr(indices.data_ptr::<u8>() as *const c_void),
-                )?
-            };
-        }
-        for raw in host_indices.chunks_exact(indices.dtype.byte_size()) {
-            let raw = match indices.dtype {
-                DataType::Int32 => i32::from_ne_bytes(raw.try_into().unwrap()) as i64,
-                DataType::Int64 => i64::from_ne_bytes(raw.try_into().unwrap()),
-                _ => unreachable!("validated above"),
-            };
-            let normalized = if raw < 0 { raw + axis_dim as i64 } else { raw };
-            if normalized < 0 || normalized >= axis_dim as i64 {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep Gather: index {raw} out of range for axis dimension {axis_dim}"
-                )));
+        let capturing = self.runtime.is_capturing()?;
+        if !capturing {
+            // A device-side out-of-range index would be an out-of-bounds load.
+            // Eager execution reports it synchronously; captured execution uses
+            // the shared device error latch checked before token consumption.
+            let index_bytes = indices.dtype.storage_bytes(num_indices);
+            let mut host_indices = vec![0u8; index_bytes];
+            if !host_indices.is_empty() {
+                // SAFETY: `indices` is a live contiguous device tensor and the
+                // host buffer is exactly its fixed-width storage size.
+                unsafe {
+                    self.runtime.dtoh(
+                        &mut host_indices,
+                        cuptr(indices.data_ptr::<u8>() as *const c_void),
+                    )?
+                };
+            }
+            for raw in host_indices.chunks_exact(indices.dtype.byte_size()) {
+                let raw = match indices.dtype {
+                    DataType::Int32 => i32::from_ne_bytes(raw.try_into().unwrap()) as i64,
+                    DataType::Int64 => i64::from_ne_bytes(raw.try_into().unwrap()),
+                    _ => unreachable!("validated above"),
+                };
+                let normalized = if raw < 0 { raw + axis_dim as i64 } else { raw };
+                if normalized < 0 || normalized >= axis_dim as i64 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep Gather: index {raw} out of range for axis dimension {axis_dim}"
+                    )));
+                }
             }
         }
         let output_bytes = output.dtype.storage_bytes(output.numel());
@@ -189,10 +200,15 @@ impl Kernel for GatherKernel {
         let num_indices = num_indices as i32;
         let inner = inner as i32;
         let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
+        let capture_error = if capturing {
+            self.runtime.capture_error_ptr()
+        } else {
+            0
+        };
         let data_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
         let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let grid = (output_bytes as u32).div_ceil(BLOCK).min(65_535).max(1);
+        let grid = (output_bytes as u32).div_ceil(BLOCK).clamp(1, 65_535);
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder
@@ -204,7 +220,8 @@ impl Kernel for GatherKernel {
             .arg(&axis_dim)
             .arg(&num_indices)
             .arg(&inner)
-            .arg(&index_is_i64);
+            .arg(&index_is_i64)
+            .arg(&capture_error);
         // SAFETY: argument types and order match `gather_bytes`; all pointers refer
         // to live contiguous device allocations validated above.
         unsafe {
@@ -215,17 +232,25 @@ impl Kernel for GatherKernel {
             })
         }
         .map_err(|e| driver_err("launch gather_bytes", e))?;
-        self.runtime.synchronize()
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        if capturing {
+            Ok(())
+        } else {
+            self.runtime.synchronize()
+        }
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // Runtime index validation uses a synchronous D2H copy, and execution
-        // synchronizes the stream before returning. Neither is legal during
-        // CUDA graph capture.
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-shape int64-index Gather path with device-side bounds validation",
+            )
+        }
     }
 }

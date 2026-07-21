@@ -68,8 +68,15 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
         &ep,
         "RMSNormalization",
         23,
-        &[DataType::Float16, DataType::Float32],
+        &[DataType::BFloat16, DataType::Float32],
         1,
+    );
+    let fp16_dtypes = [DataType::Float16, DataType::Float32];
+    let (fp16_graph, fp16_id) = node("RMSNormalization", &fp16_dtypes, 1, None, &[]);
+    assert!(
+        ep.supports_op(fp16_graph.node(fp16_id), 23, &[], &fp16_dtypes, &[])
+            .is_supported(),
+        "RMSNormalization must claim fp16 activations with f32 scale"
     );
     assert_rejected(
         &ep,

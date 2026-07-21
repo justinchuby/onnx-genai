@@ -265,8 +265,14 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
             Ok(())
         }
 
-        fn cuda_graph_compatible(&self) -> bool {
-            self.capturable
+        fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+            if self.capturable {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            } else {
+                onnx_runtime_ep_api::CaptureSupport::unsupported(
+                    "test kernel is configured as non-capturable",
+                )
+            }
         }
     }
 

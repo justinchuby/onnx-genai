@@ -24,11 +24,65 @@ use crate::collector::{MemoryCollector, NoopCollector, TraceCollector};
 use crate::error::Result;
 use crate::event::{TraceEvent, TracePhase};
 use crate::format::{TraceFormat, TraceVerbosity};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static ACTIVE_SPANS: RefCell<Vec<Weak<Mutex<Args>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether the current thread has an active tracing span.
+///
+/// This is a cheap thread-local check with no allocation, locking, or argument
+/// construction, intended for guarding optional hot-path instrumentation.
+#[must_use]
+#[inline]
+pub fn tracing_active() -> bool {
+    ACTIVE_SPANS.with(|spans| !spans.borrow().is_empty())
+}
+
+fn current_span_args() -> Option<Arc<Mutex<Args>>> {
+    ACTIVE_SPANS.with(|spans| {
+        let mut spans = spans.borrow_mut();
+        loop {
+            match spans.last().and_then(Weak::upgrade) {
+                Some(active) => break Some(active),
+                None if !spans.is_empty() => {
+                    spans.pop();
+                }
+                None => break None,
+            }
+        }
+    })
+}
+
+/// Merge metadata into the innermost active span on the current thread.
+///
+/// Kernel implementations use this to enrich the executor-created operation
+/// span without needing a tracing handle in the kernel ABI. This is a no-op
+/// when no enabled span is active.
+pub fn annotate_current_span(args: Args) {
+    annotate_current_span_with(|| args);
+}
+
+/// Lazily build and merge metadata into the current thread's active span.
+///
+/// `build_args` is not called when no span is active, so callers can put shape
+/// scans and metric calculations inside the closure without disabled-path cost.
+pub fn annotate_current_span_with(build_args: impl FnOnce() -> Args) {
+    let Some(active) = current_span_args() else {
+        return;
+    };
+    let args = build_args();
+    active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .merge(args);
+}
 
 struct Inner {
     enabled: AtomicBool,
@@ -271,13 +325,15 @@ impl TraceContext {
         if !self.is_enabled() {
             return SpanGuard::inert();
         }
+        let args = Arc::new(Mutex::new(Args::new()));
+        ACTIVE_SPANS.with(|spans| spans.borrow_mut().push(Arc::downgrade(&args)));
         SpanGuard {
             state: Some(SpanState {
                 ctx: self.clone(),
                 name: name.into(),
                 cat: cat.into(),
                 start: Instant::now(),
-                args: None,
+                args,
             }),
         }
     }
@@ -339,7 +395,7 @@ struct SpanState {
     name: String,
     cat: String,
     start: Instant,
-    args: Option<Args>,
+    args: Arc<Mutex<Args>>,
 }
 
 /// An RAII guard that records a complete event covering its lifetime.
@@ -365,7 +421,10 @@ impl SpanGuard {
     /// Attach args to the span, consuming and returning the guard for chaining.
     pub fn with_args(mut self, args: Args) -> Self {
         if let Some(state) = self.state.as_mut() {
-            state.args = Some(args);
+            *state
+                .args
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = args;
         }
         self
     }
@@ -373,7 +432,10 @@ impl SpanGuard {
     /// Attach or replace the span's args in place.
     pub fn set_args(&mut self, args: Args) {
         if let Some(state) = self.state.as_mut() {
-            state.args = Some(args);
+            *state
+                .args
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = args;
         }
     }
 
@@ -393,10 +455,31 @@ impl SpanGuard {
 
     fn record(&mut self) {
         if let Some(state) = self.state.take() {
+            ACTIVE_SPANS.with(|spans| {
+                let mut spans = spans.borrow_mut();
+                if let Some(index) = spans.iter().rposition(|active| {
+                    active
+                        .upgrade()
+                        .is_some_and(|args| Arc::ptr_eq(&args, &state.args))
+                }) {
+                    spans.remove(index);
+                }
+            });
             let dur = state.start.elapsed();
+            let args = state
+                .args
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             state
                 .ctx
-                .complete(state.name, state.cat, state.start, dur, state.args);
+                .complete(
+                    state.name,
+                    state.cat,
+                    state.start,
+                    dur,
+                    (!args.is_empty()).then_some(args),
+                );
         }
     }
 }

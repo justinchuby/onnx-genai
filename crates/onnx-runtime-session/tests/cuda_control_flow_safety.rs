@@ -75,8 +75,7 @@ fn sequence_at_model() -> Vec<u8> {
         &[2],
         f32_bytes(&[3.0, 4.0]),
     );
-    let sequence =
-        graph.create_named_value("sequence", DataType::Float32, static_shape([]));
+    let sequence = graph.create_named_value("sequence", DataType::Float32, static_shape([]));
     graph.insert_node(Node::new(
         NodeId(0),
         "SequenceConstruct",

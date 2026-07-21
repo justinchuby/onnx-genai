@@ -7,7 +7,7 @@
 //! Present key/value outputs remain BNSH and preserve a fixed cache capacity.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -19,6 +19,8 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 use super::attention::{AttentionDtype, run_attention_phase2a};
 use super::flash_attention;
+use super::gqa_decode;
+use super::gqa_decode_fp16;
 
 const PREP_SRC: &str = r#"
 extern "C" __global__ void gqa_transpose_bsh_to_bnsh(
@@ -55,6 +57,57 @@ extern "C" __global__ void gqa_split_packed_qkv(
     }
 }
 
+extern "C" __global__ void gqa_prepare_metadata(
+    const int* seqlens_k, int* total_lengths, int* past_lengths,
+    int* query_starts, int batch, int current_key_length, int query_length,
+    int past_capacity, int present_capacity, const long long* position_ids,
+    int validate_positions, int cache_rows, int* error_flag)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    // Latch-first poison propagation: if any prior captured kernel (an earlier
+    // step, an earlier replay, or an earlier layer in this replay) already
+    // recorded a bounds violation, force this step into the sentinel/skip state
+    // deterministically. A later in-range step can therefore never resume writes
+    // over a KV row that a poisoned step skipped, so no stale hole can form.
+    // `atomicOr(flag, 0)` performs a coherent global read without mutating it.
+    if (error_flag && atomicOr(error_flag, 0) != 0) {
+        total_lengths[b] = -1;
+        past_lengths[b] = -1;
+        query_starts[b] = -1;
+        return;
+    }
+    const long long total = (long long)seqlens_k[b] + 1;
+    const long long past = total - current_key_length;
+    const long long query_start = total - query_length;
+    int error = 0;
+    if (total > 2147483647LL) error |= 1;
+    if (past < 0) error |= 2;
+    if (query_start < 0) error |= 4;
+    if (past > past_capacity) error |= 8;
+    if (total > present_capacity) error |= 16;
+    if (validate_positions) {
+        for (int s = 0; s < query_length; ++s) {
+            const long long position = position_ids
+                ? position_ids[b * query_length + s]
+                : past + s;
+            if (position < 0 || position >= (long long)cache_rows) {
+                error |= 32;
+            }
+        }
+    }
+    if (error) {
+        if (error_flag) atomicOr(error_flag, error);
+        total_lengths[b] = -1;
+        past_lengths[b] = -1;
+        query_starts[b] = -1;
+        return;
+    }
+    total_lengths[b] = (int)total;
+    past_lengths[b] = (int)past;
+    query_starts[b] = (int)query_start;
+}
+
 extern "C" __global__ void gqa_build_cache(
     const float* current, const float* past, float* present,
     const int* past_lengths, int batch, int seq, int heads, int dim,
@@ -68,6 +121,7 @@ extern "C" __global__ void gqa_build_cache(
     const int s = x % present_capacity; x /= present_capacity;
     const int h = x % heads; const int b = x / heads;
     const int past_len = past_lengths[b];
+    if (past_len < 0) return;
     float value = 0.0f;
     if (s < past_len && past) {
         value = past[((b * heads + h) * past_capacity + s) * dim + d];
@@ -90,6 +144,7 @@ extern "C" __global__ void gqa_append_cache(
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
     const int target_s = past_lengths[b] + s;
+    if (target_s < 0 || target_s >= present_capacity) return;
     present[((b * heads + h) * present_capacity + target_s) * dim + d] =
         current[((b * seq + s) * heads + h) * dim + d];
 }
@@ -98,8 +153,9 @@ extern "C" __global__ void gqa_rope_bnsh(
     float* tensor, const float* cos_cache, const float* sin_cache,
     const long long* position_ids, const int* past_lengths,
     int batch, int seq, int heads, int dim, int tensor_capacity,
-    int current_offset, int cache_rows, int interleaved)
+    int current_offset, int cache_rows, int interleaved, int cache_is_half)
 {
+    (void)cache_is_half;
     const int half = dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = batch * heads * seq * half;
@@ -108,10 +164,13 @@ extern "C" __global__ void gqa_rope_bnsh(
     const int k = x % half; x /= half;
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
-    const int pos = position_ids
-        ? (int)position_ids[b * seq + s]
-        : past_lengths[b] + s;
-    if (pos < 0 || pos >= cache_rows) return;
+    const int past = past_lengths[b];
+    if (past < 0) return;
+    const long long position = position_ids
+        ? position_ids[b * seq + s]
+        : (long long)past + s;
+    if (position < 0 || position >= (long long)cache_rows) return;
+    const int pos = (int)position;
     const int d0 = interleaved ? 2 * k : k;
     const int d1 = interleaved ? 2 * k + 1 : k + half;
     const int tensor_s = current_offset ? past_lengths[b] + s : s;
@@ -247,6 +306,13 @@ template <> __device__ __forceinline__ __nv_bfloat16 gqa_store<__nv_bfloat16>(fl
     return __float2bfloat16_rn(value);
 }
 
+__device__ __forceinline__ float gqa_load_cache(
+    const void* cache, int index, int cache_is_half) {
+    return cache_is_half
+        ? __half2float(reinterpret_cast<const __half*>(cache)[index])
+        : reinterpret_cast<const float*>(cache)[index];
+}
+
 template <typename T>
 __device__ void gqa_transpose_bsh_to_bnsh_body(
     const T* src, T* dst, int batch, int seq, int heads, int dim)
@@ -297,6 +363,7 @@ __device__ void gqa_build_cache_body(
     const int s = x % present_capacity; x /= present_capacity;
     const int h = x % heads; const int b = x / heads;
     const int past_len = past_lengths[b];
+    if (past_len < 0) return;
     T result = gqa_store<T>(0.0f);
     if (s < past_len && past) {
         result = past[((b * heads + h) * past_capacity + s) * dim + d];
@@ -320,16 +387,17 @@ __device__ void gqa_append_cache_body(
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
     const int target_s = past_lengths[b] + s;
+    if (target_s < 0 || target_s >= present_capacity) return;
     present[((b * heads + h) * present_capacity + target_s) * dim + d] =
         current[((b * seq + s) * heads + h) * dim + d];
 }
 
 template <typename T>
 __device__ void gqa_rope_bnsh_body(
-    T* tensor, const float* cos_cache, const float* sin_cache,
+    T* tensor, const void* cos_cache, const void* sin_cache,
     const long long* position_ids, const int* past_lengths,
     int batch, int seq, int heads, int dim, int tensor_capacity,
-    int current_offset, int cache_rows, int interleaved)
+    int current_offset, int cache_rows, int interleaved, int cache_is_half)
 {
     const int half = dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -339,18 +407,21 @@ __device__ void gqa_rope_bnsh_body(
     const int k = x % half; x /= half;
     const int s = x % seq; x /= seq;
     const int h = x % heads; const int b = x / heads;
-    const int pos = position_ids
-        ? (int)position_ids[b * seq + s]
-        : past_lengths[b] + s;
-    if (pos < 0 || pos >= cache_rows) return;
+    const int past = past_lengths[b];
+    if (past < 0) return;
+    const long long position = position_ids
+        ? position_ids[b * seq + s]
+        : (long long)past + s;
+    if (position < 0 || position >= (long long)cache_rows) return;
+    const int pos = (int)position;
     const int d0 = interleaved ? 2 * k : k;
     const int d1 = interleaved ? 2 * k + 1 : k + half;
     const int tensor_s = current_offset ? past_lengths[b] + s : s;
     const size_t base = ((size_t)(b * heads + h) * tensor_capacity + tensor_s) * dim;
     const float x0 = gqa_load<T>(tensor[base + d0]);
     const float x1 = gqa_load<T>(tensor[base + d1]);
-    const float c = cos_cache[pos * half + k];
-    const float sn = sin_cache[pos * half + k];
+    const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
+    const float sn = gqa_load_cache(sin_cache, pos * half + k, cache_is_half);
     tensor[base + d0] = gqa_store<T>(c * x0 - sn * x1);
     tensor[base + d1] = gqa_store<T>(sn * x0 + c * x1);
 }
@@ -394,13 +465,13 @@ extern "C" __global__ void gqa_append_cache_##SUFFIX( \
         current, present, past_lengths, batch, seq, heads, dim, present_capacity); \
 } \
 extern "C" __global__ void gqa_rope_bnsh_##SUFFIX( \
-    TYPE* tensor, const float* cos_cache, const float* sin_cache, \
+    TYPE* tensor, const void* cos_cache, const void* sin_cache, \
     const long long* position_ids, const int* past_lengths, \
     int batch, int seq, int heads, int dim, int tensor_capacity, \
-    int current_offset, int cache_rows, int interleaved) { \
+    int current_offset, int cache_rows, int interleaved, int cache_is_half) { \
     gqa_rope_bnsh_body<TYPE>(tensor, cos_cache, sin_cache, position_ids, past_lengths, \
                              batch, seq, heads, dim, tensor_capacity, current_offset, \
-                             cache_rows, interleaved); \
+                             cache_rows, interleaved, cache_is_half); \
 } \
 extern "C" __global__ void gqa_transpose_bnsh_to_bsh_##SUFFIX( \
     const TYPE* src, TYPE* dst, int batch, int seq, int heads, int dim) { \
@@ -414,6 +485,28 @@ DEFINE_GQA_HALF_KERNELS(__nv_bfloat16, bf16)
 const PREP_MODULE: &str = "group_query_attention_prep";
 const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v1";
 const BLOCK: u32 = 256;
+const WS_TOTALS: usize = 0;
+const WS_PAST_LENGTHS: usize = 1;
+const WS_QUERY_STARTS: usize = 2;
+const WS_PACKED_Q: usize = 3;
+const WS_PACKED_K: usize = 4;
+const WS_PACKED_V: usize = 5;
+const WS_Q_BNSH: usize = 6;
+const WS_OUT_BNSH: usize = 7;
+const WS_PRESENT_K: usize = 8;
+const WS_PRESENT_V: usize = 9;
+const WS_SCORES: usize = 10;
+const WS_COUNT: usize = 11;
+
+/// Bit flags a captured GQA prep kernel `atomicOr`s into the runtime's latching
+/// capture-error word when a decode-metadata invariant is violated during graph
+/// replay. Exposed so hosts (and tests) can identify which bound was breached.
+pub const GQA_CAPTURE_ERROR_TOTAL_OVERFLOW: u32 = 1;
+pub const GQA_CAPTURE_ERROR_PAST_NEGATIVE: u32 = 2;
+pub const GQA_CAPTURE_ERROR_QUERY_NEGATIVE: u32 = 4;
+pub const GQA_CAPTURE_ERROR_PAST_CAPACITY: u32 = 8;
+pub const GQA_CAPTURE_ERROR_PRESENT_CAPACITY: u32 = 16;
+pub const GQA_CAPTURE_ERROR_POSITION: u32 = 32;
 
 pub struct GroupQueryAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
@@ -508,26 +601,93 @@ pub struct GroupQueryAttentionKernel {
     local_window_size: i64,
     softcap: f32,
     backend: GroupQueryAttentionBackend,
+    workspace: Mutex<GqaWorkspace>,
+    last_capture_safe_signature: Mutex<Option<GqaCaptureSignature>>,
 }
 
-struct Scratch<'a> {
-    runtime: &'a CudaRuntime,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GqaCaptureSignature {
+    dtype: DataType,
+    batch: usize,
+    query_sequence_length: usize,
+    key_sequence_length: usize,
+    q_hidden: usize,
+    k_hidden: usize,
+    dim: usize,
+    past_capacity: usize,
+    present_capacity: usize,
+    packed_qkv: bool,
+    explicit_positions: bool,
+    cache_rows: usize,
+    input_shapes: Vec<Option<Vec<usize>>>,
+    output_shapes: Vec<Vec<usize>>,
+    backend: GroupQueryAttentionBackend,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkspaceSlot {
     ptr: CUdeviceptr,
+    bytes: usize,
 }
 
-impl<'a> Scratch<'a> {
-    fn new(runtime: &'a CudaRuntime, bytes: usize) -> Result<Self> {
-        Ok(Self {
+#[derive(Debug)]
+struct GqaWorkspace {
+    runtime: Arc<CudaRuntime>,
+    slots: [WorkspaceSlot; WS_COUNT],
+}
+
+impl GqaWorkspace {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
             runtime,
-            ptr: runtime.alloc_raw(bytes)?,
-        })
+            slots: [WorkspaceSlot::default(); WS_COUNT],
+        }
+    }
+
+    fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        let bytes = bytes.max(1);
+        let slot = self.slots[index];
+        if slot.bytes >= bytes {
+            return Ok(slot.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep GroupQueryAttention: workspace slot {index} requires {bytes} bytes during CUDA graph capture; warm the fixed decode shape before capture"
+            )));
+        }
+        let ptr = self.runtime.alloc_raw(bytes)?;
+        if slot.ptr != 0 {
+            // Dynamic prefill/growing-cache shapes may outgrow a slot. Preserve
+            // the fixed-capacity decode fast path (which never reaches here),
+            // but wait before replacing storage that queued work may still use.
+            if let Err(error) = self.runtime.synchronize() {
+                // SAFETY: `ptr` was allocated above and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+            // SAFETY: synchronization completed all prior users of `slot.ptr`,
+            // which is still exclusively owned by this workspace.
+            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
+                // SAFETY: `ptr` was allocated above and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.slots[index] = WorkspaceSlot { ptr, bytes };
+        Ok(ptr)
     }
 }
 
-impl Drop for Scratch<'_> {
+impl Drop for GqaWorkspace {
     fn drop(&mut self) {
-        // SAFETY: `ptr` is uniquely owned by this guard.
-        let _ = unsafe { self.runtime.free_raw(self.ptr) };
+        for slot in self.slots.iter_mut().rev() {
+            if slot.ptr != 0 {
+                // SAFETY: every live slot pointer was allocated by this runtime
+                // and remains exclusively owned by this workspace.
+                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
+                slot.ptr = 0;
+            }
+        }
     }
 }
 
@@ -537,6 +697,51 @@ fn checked_i32(value: usize, name: &str) -> Result<i32> {
             "cuda_ep GroupQueryAttention: {name} {value} exceeds i32"
         ))
     })
+}
+
+fn require_matching_capture_signature(
+    runtime: &CudaRuntime,
+    warmed: Option<&GqaCaptureSignature>,
+    current: Option<&GqaCaptureSignature>,
+) -> Result<()> {
+    if runtime.is_capturing()? && (current.is_none() || warmed != current) {
+        return Err(EpError::KernelFailed(
+            "cuda_ep GroupQueryAttention: dtype, decode mode, or shape changed during CUDA graph capture; warm the exact f32 one-token fixed device-KV signature before capture".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Human-readable description of the invariant(s) a captured GQA decode step
+/// latched into the runtime capture-error word, given its raw bitmask. Returns
+/// `None` for a zero (un-poisoned) mask.
+pub fn gqa_capture_error_description(error: u32) -> Option<String> {
+    if error == 0 {
+        return None;
+    }
+    let mut violations = Vec::new();
+    if error & GQA_CAPTURE_ERROR_TOTAL_OVERFLOW != 0 {
+        violations.push("seqlens_k + 1 overflows int32");
+    }
+    if error & GQA_CAPTURE_ERROR_PAST_NEGATIVE != 0 {
+        violations.push("seqlens_k + 1 is shorter than current key sequence");
+    }
+    if error & GQA_CAPTURE_ERROR_QUERY_NEGATIVE != 0 {
+        violations.push("seqlens_k + 1 is shorter than current query sequence");
+    }
+    if error & GQA_CAPTURE_ERROR_PAST_CAPACITY != 0 {
+        violations.push("effective past length exceeds past cache extent");
+    }
+    if error & GQA_CAPTURE_ERROR_PRESENT_CAPACITY != 0 {
+        violations.push("valid sequence length exceeds present cache capacity");
+    }
+    if error & GQA_CAPTURE_ERROR_POSITION != 0 {
+        violations.push("position_ids or implicit rotary position exceeds cache rows");
+    }
+    if violations.is_empty() {
+        violations.push("unrecognized capture-safety violation");
+    }
+    Some(violations.join("; "))
 }
 
 fn require_dense(view: &TensorView, name: &str, dtype: DataType) -> Result<()> {
@@ -580,13 +785,6 @@ fn read_i64(runtime: &CudaRuntime, view: &TensorView, name: &str) -> Result<Vec<
         .collect())
 }
 
-fn bytes_of_i32(values: &[i32]) -> &[u8] {
-    // SAFETY: i32 has no padding and the returned slice borrows `values`.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    }
-}
-
 macro_rules! launch_1d {
     ($runtime:expr, $module:expr, $source:expr, $entry:expr, $count:expr, $builder:ident, $args:block) => {{
         let function = $runtime.nvrtc_function($module, $source, $entry)?;
@@ -596,7 +794,8 @@ macro_rules! launch_1d {
         let mut $builder = $runtime.stream().launch_builder(&function);
         $args
         // SAFETY: each invocation supplies the argument ABI for its entry point;
-        // buffers and scalar arguments remain live through synchronization.
+        // input/output buffers outlive execution, and workspace buffers remain
+        // owned by the kernel while stream-ordered work is pending.
         unsafe {
             $builder.launch(LaunchConfig {
                 grid_dim: (grid, 1, 1),
@@ -632,6 +831,7 @@ impl GroupQueryAttentionKernel {
             ));
         }
         Ok(Self {
+            workspace: Mutex::new(GqaWorkspace::new(runtime.clone())),
             runtime,
             num_heads,
             kv_num_heads,
@@ -641,6 +841,7 @@ impl GroupQueryAttentionKernel {
             local_window_size,
             softcap,
             backend: GroupQueryAttentionBackend::Auto,
+            last_capture_safe_signature: Mutex::new(None),
         })
     }
 
@@ -674,6 +875,12 @@ impl GroupQueryAttentionKernel {
     }
 
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: capture signature lock poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
         if !(7..=14).contains(&inputs.len()) || !(1..=3).contains(&outputs.len()) {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep GroupQueryAttention: expected 7..14 inputs and 1..3 outputs, got {} and {}",
@@ -858,69 +1065,248 @@ impl GroupQueryAttentionKernel {
             0
         };
 
-        let seqlens = read_i32(&self.runtime, &inputs[5], "seqlens_k")?;
-        if inputs[5].shape != [batch] || seqlens.iter().any(|&x| x < 0) {
+        require_dense(&inputs[5], "seqlens_k", DataType::Int32)?;
+        if inputs[5].shape != [batch] {
             return Err(EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: seqlens_k must be non-negative int32 [batch_size]"
                     .into(),
             ));
         }
-        let total_scalar = read_i32(&self.runtime, &inputs[6], "total_sequence_length")?;
-        if total_scalar.len() != 1 || total_scalar[0] < 0 {
+        require_dense(&inputs[6], "total_sequence_length", DataType::Int32)?;
+        if inputs[6].numel() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: total_sequence_length must be one non-negative int32 scalar".into(),
             ));
         }
-        let total_sequence_length = total_scalar[0] as usize;
-        let totals: Vec<i32> = seqlens
-            .iter()
-            .map(|&length| length.checked_add(1))
-            .collect::<Option<_>>()
-            .ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: seqlens_k + 1 overflows int32".into(),
-                )
-            })?;
-        let valid_sequence_length = totals.iter().copied().max().unwrap_or(0) as usize;
-        if valid_sequence_length > total_sequence_length {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep GroupQueryAttention: valid sequence length {valid_sequence_length} exceeds physical total_sequence_length capacity {total_sequence_length}"
-            )));
-        }
         let current_key_length = checked_i32(k_seq, "key sequence length")?;
         let query_length = checked_i32(q_seq, "query sequence length")?;
-        let mut past_lengths = Vec::with_capacity(batch);
-        let mut query_starts = Vec::with_capacity(batch);
-        for &total in &totals {
-            let past = total.checked_sub(current_key_length).ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: seqlens_k + 1 is shorter than current key sequence"
-                        .into(),
+        let requested_present_capacity = outputs
+            .get(1)
+            .map(|output| output.shape.get(2).copied().unwrap_or(past_capacity));
+
+        let explicit_positions = inputs.get(9).filter(|view| !view.is_absent());
+        let (cos_ptr, sin_ptr, positions_ptr, cache_rows, cache_rows_usize, rope_cache_is_half) =
+            if self.do_rotary {
+                if !dim.is_multiple_of(2) {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: do_rotary requires an even head_size".into(),
+                    ));
+                }
+                if q_seq != k_seq {
+                    return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths".into(),
+                ));
+                }
+                let cos = inputs
+                    .get(7)
+                    .filter(|view| !view.is_absent())
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep GroupQueryAttention: do_rotary=1 requires cos_cache".into(),
+                        )
+                    })?;
+                let sin = inputs
+                    .get(8)
+                    .filter(|view| !view.is_absent())
+                    .ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep GroupQueryAttention: do_rotary=1 requires sin_cache".into(),
+                        )
+                    })?;
+                require_dense(cos, "cos_cache", DataType::Float32)
+                    .or_else(|_| require_dense(cos, "cos_cache", DataType::Float16))?;
+                let cache_dtype = cos.dtype;
+                let cache_is_half = match cache_dtype {
+                    DataType::Float32 => 0i32,
+                    DataType::Float16
+                        if matches!(q.dtype, DataType::Float16 | DataType::BFloat16) =>
+                    {
+                        1i32
+                    }
+                    other => {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep GroupQueryAttention: cos_cache/sin_cache dtype {other:?} unsupported for query dtype {:?}; expected Float32, or Float16 with half-precision queries",
+                            q.dtype
+                        )));
+                    }
+                };
+                require_dense(sin, "sin_cache", cache_dtype)?;
+                if cos.shape.len() != 2 || sin.shape != cos.shape || cos.shape[1] != dim / 2 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: cos_cache/sin_cache must have shape [max_sequence_length,{}]",
+                        dim / 2
+                    )));
+                }
+                let position_ptr = if let Some(position_ids) = explicit_positions {
+                    require_dense(position_ids, "position_ids", DataType::Int64)?;
+                    if position_ids.shape != [batch, q_seq] {
+                        return Err(EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
+                    ));
+                    }
+                    cuptr(position_ids.data_ptr::<u8>() as *const c_void)
+                } else {
+                    0
+                };
+                (
+                    cuptr(cos.data_ptr::<u8>() as *const c_void),
+                    cuptr(sin.data_ptr::<u8>() as *const c_void),
+                    position_ptr,
+                    checked_i32(cos.shape[0], "rotary cache rows")?,
+                    cos.shape[0],
+                    cache_is_half,
                 )
-            })?;
-            let query_start = total.checked_sub(query_length).ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: seqlens_k + 1 is shorter than current query sequence"
-                        .into(),
-                )
-            })?;
-            if past as usize > past_capacity {
+            } else {
+                (0, 0, 0, 0, 0, 0)
+            };
+
+        let structurally_valid_outputs = requested_present_capacity.is_some_and(|capacity| {
+            let expected = [batch, self.kv_num_heads, capacity, dim];
+            outputs.len() == 3
+                && outputs[1].dtype == q.dtype
+                && outputs[1].shape == expected
+                && outputs[1].is_contiguous()
+                && outputs[2].dtype == q.dtype
+                && outputs[2].shape == expected
+                && outputs[2].is_contiguous()
+        });
+        let aliased_device_kv = structurally_valid_outputs
+            && (outputs[1].data.0 as *mut u8)
+                .wrapping_add(outputs[1].byte_offset)
+                .cast_const()
+                == inputs[3].data_ptr::<u8>()
+            && (outputs[2].data.0 as *mut u8)
+                .wrapping_add(outputs[2].byte_offset)
+                .cast_const()
+                == inputs[4].data_ptr::<u8>();
+        let capture_candidate = requested_present_capacity
+            .filter(|&present_capacity| {
+                (q.dtype == DataType::Float32
+                    || (q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim)))
+                    && q_seq == 1
+                    && k_seq == 1
+                    && has_past_key
+                    && present_capacity >= 1
+                    && past_capacity == present_capacity
+                    && aliased_device_kv
+                    && self.selected_backend_for_shape(q.dtype, q_seq, present_capacity, dim)
+                        == GroupQueryAttentionBackend::Phase2a
+            })
+            .map(|present_capacity| GqaCaptureSignature {
+                dtype: q.dtype,
+                batch,
+                query_sequence_length: q_seq,
+                key_sequence_length: k_seq,
+                q_hidden,
+                k_hidden,
+                dim,
+                past_capacity,
+                present_capacity,
+                packed_qkv,
+                explicit_positions: explicit_positions.is_some(),
+                cache_rows: cache_rows_usize,
+                input_shapes: inputs
+                    .iter()
+                    .map(|input| (!input.is_absent()).then(|| input.shape.to_vec()))
+                    .collect(),
+                output_shapes: outputs.iter().map(|output| output.shape.to_vec()).collect(),
+                backend: GroupQueryAttentionBackend::Phase2a,
+            });
+        require_matching_capture_signature(
+            &self.runtime,
+            warmed_signature.as_ref(),
+            capture_candidate.as_ref(),
+        )?;
+        let capture_safe_decode = capture_candidate
+            .as_ref()
+            .is_some_and(|candidate| warmed_signature.as_ref() == Some(candidate));
+
+        let mut valid_sequence_length = None;
+        let mut validated_past_lengths = None;
+        let total_sequence_length = if capture_safe_decode {
+            None
+        } else {
+            let seqlens = read_i32(&self.runtime, &inputs[5], "seqlens_k")?;
+            if seqlens.iter().any(|&length| length < 0) {
                 return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: effective past length exceeds past cache extent"
+                    "cuda_ep GroupQueryAttention: seqlens_k must be non-negative int32 [batch_size]"
                         .into(),
                 ));
             }
-            past_lengths.push(past);
-            query_starts.push(query_start);
+            let total_scalar = read_i32(&self.runtime, &inputs[6], "total_sequence_length")?;
+            if total_scalar[0] < 0 {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: total_sequence_length must be one non-negative int32 scalar".into(),
+                ));
+            }
+            let total_sequence_length = total_scalar[0] as usize;
+            let totals: Vec<i32> = seqlens
+                .iter()
+                .map(|&length| length.checked_add(1))
+                .collect::<Option<_>>()
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: seqlens_k + 1 overflows int32".into(),
+                    )
+                })?;
+            let maximum = totals.iter().copied().max().unwrap_or(0) as usize;
+            if maximum > total_sequence_length {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: valid sequence length {maximum} exceeds physical total_sequence_length capacity {total_sequence_length}"
+                )));
+            }
+            let mut past_lengths = Vec::with_capacity(batch);
+            for &total in &totals {
+                let past = total.checked_sub(current_key_length).ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: seqlens_k + 1 is shorter than current key sequence"
+                            .into(),
+                    )
+                })?;
+                total.checked_sub(query_length).ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: seqlens_k + 1 is shorter than current query sequence"
+                            .into(),
+                    )
+                })?;
+                if past as usize > past_capacity {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: effective past length exceeds past cache extent"
+                            .into(),
+                    ));
+                }
+                past_lengths.push(past);
+            }
+            valid_sequence_length = Some(maximum);
+            validated_past_lengths = Some(past_lengths);
+            Some(total_sequence_length)
+        };
+
+        if !capture_safe_decode && self.do_rotary {
+            if let Some(position_ids) = explicit_positions {
+                let ids = read_i64(&self.runtime, position_ids, "position_ids")?;
+                let cache_rows_i64 = i64::from(cache_rows);
+                if ids
+                    .iter()
+                    .any(|&position| position < 0 || position >= cache_rows_i64)
+                {
+                    return Err(EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
+                    ));
+                }
+            } else if validated_past_lengths.as_ref().is_some_and(|lengths| {
+                lengths
+                    .iter()
+                    .any(|&past| past as usize + q_seq > cache_rows_usize)
+            }) {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: rotary position exceeds cache rows".into(),
+                ));
+            }
         }
-        let minimum_present_capacity = past_capacity.max(total_sequence_length);
-        let requested_present_capacity = outputs.get(1).map(|output| {
-            output
-                .shape
-                .get(2)
-                .copied()
-                .unwrap_or(minimum_present_capacity)
-        });
+
+        let minimum_present_capacity =
+            past_capacity.max(total_sequence_length.unwrap_or(past_capacity));
         let present_capacity = requested_present_capacity.unwrap_or(minimum_present_capacity);
         if present_capacity < minimum_present_capacity {
             return Err(EpError::KernelFailed(format!(
@@ -941,109 +1327,44 @@ impl GroupQueryAttentionKernel {
             }
         }
 
-        let explicit_positions = inputs.get(9).filter(|view| !view.is_absent());
-        let (cos_ptr, sin_ptr, positions_ptr, cache_rows) = if self.do_rotary {
-            if !dim.is_multiple_of(2) {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: do_rotary requires an even head_size".into(),
-                ));
-            }
-            if q_seq != k_seq {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths".into(),
-                ));
-            }
-            let cos = inputs
-                .get(7)
-                .filter(|view| !view.is_absent())
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: do_rotary=1 requires cos_cache".into(),
-                    )
-                })?;
-            let sin = inputs
-                .get(8)
-                .filter(|view| !view.is_absent())
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: do_rotary=1 requires sin_cache".into(),
-                    )
-                })?;
-            require_dense(cos, "cos_cache", DataType::Float32)?;
-            require_dense(sin, "sin_cache", DataType::Float32)?;
-            if cos.shape.len() != 2 || sin.shape != cos.shape || cos.shape[1] != dim / 2 {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep GroupQueryAttention: cos_cache/sin_cache must have shape [max_sequence_length,{}]",
-                    dim / 2
-                )));
-            }
-            let position_ptr = if let Some(position_ids) = explicit_positions {
-                let ids = read_i64(&self.runtime, position_ids, "position_ids")?;
-                if position_ids.shape != [batch, q_seq]
-                    || ids
-                        .iter()
-                        .any(|&position| position < 0 || position as usize >= cos.shape[0])
-                {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
-                    ));
-                }
-                cuptr(position_ids.data_ptr::<u8>() as *const c_void)
-            } else {
-                if past_lengths
-                    .iter()
-                    .any(|&past| past as usize + q_seq > cos.shape[0])
-                {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: rotary position exceeds cache rows".into(),
-                    ));
-                }
-                0
-            };
-            (
-                cuptr(cos.data_ptr::<u8>() as *const c_void),
-                cuptr(sin.data_ptr::<u8>() as *const c_void),
-                position_ptr,
-                checked_i32(cos.shape[0], "rotary cache rows")?,
-            )
+        let mut workspace = self.workspace.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GroupQueryAttention: workspace lock poisoned".into())
+        })?;
+        let metadata_bytes = batch * std::mem::size_of::<i32>();
+        let totals_gpu = workspace.reserve(WS_TOTALS, metadata_bytes)?;
+        let past_lengths_gpu = workspace.reserve(WS_PAST_LENGTHS, metadata_bytes)?;
+        let query_starts_gpu = workspace.reserve(WS_QUERY_STARTS, metadata_bytes)?;
+        let metadata_error_gpu = if capture_candidate.is_some() {
+            // Capture-safe decode steps latch any bounds violation into the
+            // runtime-shared word so every captured GQA layer poisons the same
+            // flag, and the host detects it once per step at the logits sync.
+            self.runtime.capture_error_ptr()
         } else {
-            (0, 0, 0, 0)
+            0
         };
-
-        let totals_gpu = Scratch::new(&self.runtime, totals.len() * 4)?;
-        let past_lengths_gpu = Scratch::new(&self.runtime, past_lengths.len() * 4)?;
-        let query_starts_gpu = Scratch::new(&self.runtime, query_starts.len() * 4)?;
-        // SAFETY: scratch allocations exactly match the uploaded slices.
-        unsafe {
-            self.runtime.htod(bytes_of_i32(&totals), totals_gpu.ptr)?;
-            self.runtime
-                .htod(bytes_of_i32(&past_lengths), past_lengths_gpu.ptr)?;
-            self.runtime
-                .htod(bytes_of_i32(&query_starts), query_starts_gpu.ptr)?;
-        }
         let packed_q = packed_qkv
-            .then(|| Scratch::new(&self.runtime, batch * q_seq * q_hidden * element_size))
+            .then(|| workspace.reserve(WS_PACKED_Q, batch * q_seq * q_hidden * element_size))
             .transpose()?;
         let packed_k = packed_qkv
-            .then(|| Scratch::new(&self.runtime, batch * k_seq * k_hidden * element_size))
+            .then(|| workspace.reserve(WS_PACKED_K, batch * k_seq * k_hidden * element_size))
             .transpose()?;
         let packed_v = packed_qkv
-            .then(|| Scratch::new(&self.runtime, batch * k_seq * k_hidden * element_size))
+            .then(|| workspace.reserve(WS_PACKED_V, batch * k_seq * k_hidden * element_size))
             .transpose()?;
-        let q_bnsh = Scratch::new(&self.runtime, batch * q_seq * q_hidden * element_size)?;
-        let out_bnsh = Scratch::new(&self.runtime, outputs[0].numel() * element_size)?;
+        let q_bnsh = workspace.reserve(WS_Q_BNSH, batch * q_seq * q_hidden * element_size)?;
+        let out_bnsh = workspace.reserve(WS_OUT_BNSH, outputs[0].numel() * element_size)?;
         let owned_present_k = (outputs.len() < 2)
             .then(|| {
-                Scratch::new(
-                    &self.runtime,
+                workspace.reserve(
+                    WS_PRESENT_K,
                     expected_cache_shape.iter().product::<usize>() * element_size,
                 )
             })
             .transpose()?;
         let owned_present_v = (outputs.len() < 3)
             .then(|| {
-                Scratch::new(
-                    &self.runtime,
+                workspace.reserve(
+                    WS_PRESENT_V,
                     expected_cache_shape.iter().product::<usize>() * element_size,
                 )
             })
@@ -1051,28 +1372,20 @@ impl GroupQueryAttentionKernel {
         let present_k_ptr = if let Some(output) = outputs.get_mut(1) {
             cuptr(output.data_ptr_mut::<u8>() as *const c_void)
         } else {
-            owned_present_k
-                .as_ref()
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: internal present-key allocation missing"
-                            .into(),
-                    )
-                })?
-                .ptr
+            *owned_present_k.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal present-key allocation missing".into(),
+                )
+            })?
         };
         let present_v_ptr = if let Some(output) = outputs.get_mut(2) {
             cuptr(output.data_ptr_mut::<u8>() as *const c_void)
         } else {
-            owned_present_v
-                .as_ref()
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: internal present-value allocation missing"
-                            .into(),
-                    )
-                })?
-                .ptr
+            *owned_present_v.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep GroupQueryAttention: internal present-value allocation missing".into(),
+                )
+            })?
         };
 
         let batch_i = checked_i32(batch, "batch")?;
@@ -1088,6 +1401,32 @@ impl GroupQueryAttentionKernel {
                 "cuda_ep GroupQueryAttention: local_window_size exceeds i32".into(),
             )
         })?;
+        let seqlens_ptr = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
+        let validate_positions_i: i32 = self.do_rotary.into();
+        launch_1d!(
+            self.runtime,
+            PREP_MODULE,
+            PREP_SRC,
+            "gqa_prepare_metadata",
+            batch,
+            builder,
+            {
+                builder
+                    .arg(&seqlens_ptr)
+                    .arg(&totals_gpu)
+                    .arg(&past_lengths_gpu)
+                    .arg(&query_starts_gpu)
+                    .arg(&batch_i)
+                    .arg(&current_key_length)
+                    .arg(&query_length)
+                    .arg(&past_capacity_i)
+                    .arg(&present_capacity_i)
+                    .arg(&positions_ptr)
+                    .arg(&validate_positions_i)
+                    .arg(&cache_rows)
+                    .arg(&metadata_error_gpu);
+            }
+        );
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         let (q_ptr, k_ptr, v_ptr) = if packed_qkv {
             let q_scratch = packed_q.as_ref().ok_or_else(|| {
@@ -1116,9 +1455,9 @@ impl GroupQueryAttentionKernel {
                 {
                     builder
                         .arg(&input_q_ptr)
-                        .arg(&q_scratch.ptr)
-                        .arg(&k_scratch.ptr)
-                        .arg(&v_scratch.ptr)
+                        .arg(q_scratch)
+                        .arg(k_scratch)
+                        .arg(v_scratch)
                         .arg(&batch_i)
                         .arg(&q_seq_i)
                         .arg(&heads_i)
@@ -1126,7 +1465,7 @@ impl GroupQueryAttentionKernel {
                         .arg(&dim_i);
                 }
             );
-            (q_scratch.ptr, k_scratch.ptr, v_scratch.ptr)
+            (*q_scratch, *k_scratch, *v_scratch)
         } else {
             (
                 input_q_ptr,
@@ -1144,7 +1483,7 @@ impl GroupQueryAttentionKernel {
             {
                 builder
                     .arg(&q_ptr)
-                    .arg(&q_bnsh.ptr)
+                    .arg(&q_bnsh)
                     .arg(&batch_i)
                     .arg(&q_seq_i)
                     .arg(&heads_i)
@@ -1178,7 +1517,7 @@ impl GroupQueryAttentionKernel {
                         builder
                             .arg(&current)
                             .arg(&present)
-                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&past_lengths_gpu)
                             .arg(&batch_i)
                             .arg(&k_seq_i)
                             .arg(&kv_heads_i)
@@ -1199,7 +1538,7 @@ impl GroupQueryAttentionKernel {
                             .arg(&current)
                             .arg(&past)
                             .arg(&present)
-                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&past_lengths_gpu)
                             .arg(&batch_i)
                             .arg(&k_seq_i)
                             .arg(&kv_heads_i)
@@ -1214,7 +1553,7 @@ impl GroupQueryAttentionKernel {
         if self.do_rotary {
             let interleaved_i: i32 = self.rotary_interleaved.into();
             for (tensor, seq_i, heads, capacity, current_offset) in [
-                (q_bnsh.ptr, q_seq_i, heads_i, q_seq_i, 0i32),
+                (q_bnsh, q_seq_i, heads_i, q_seq_i, 0i32),
                 (present_k_ptr, k_seq_i, kv_heads_i, present_capacity_i, 1i32),
             ] {
                 let count = batch * (heads as usize) * (seq_i as usize) * (dim / 2);
@@ -1231,7 +1570,7 @@ impl GroupQueryAttentionKernel {
                             .arg(&cos_ptr)
                             .arg(&sin_ptr)
                             .arg(&positions_ptr)
-                            .arg(&past_lengths_gpu.ptr)
+                            .arg(&past_lengths_gpu)
                             .arg(&batch_i)
                             .arg(&seq_i)
                             .arg(&heads)
@@ -1239,7 +1578,8 @@ impl GroupQueryAttentionKernel {
                             .arg(&capacity)
                             .arg(&current_offset)
                             .arg(&cache_rows)
-                            .arg(&interleaved_i);
+                            .arg(&interleaved_i)
+                            .arg(&rope_cache_is_half);
                     }
                 );
             }
@@ -1249,8 +1589,10 @@ impl GroupQueryAttentionKernel {
             .scale
             .filter(|&scale| scale != 0.0)
             .unwrap_or_else(|| 1.0 / (dim as f32).sqrt());
-        let use_fused = self.selected_backend_for_shape(q.dtype, q_seq, valid_sequence_length, dim)
-            == GroupQueryAttentionBackend::Fused;
+        let attention_sequence_length = valid_sequence_length.unwrap_or(present_capacity);
+        let use_fused =
+            self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim)
+                == GroupQueryAttentionBackend::Fused;
         if use_fused {
             flash_attention::run(
                 &self.runtime,
@@ -1260,19 +1602,68 @@ impl GroupQueryAttentionKernel {
                 true,
                 batch,
                 q_seq,
-                valid_sequence_length,
+                attention_sequence_length,
                 present_capacity,
                 dim,
                 self.num_heads / self.kv_num_heads,
                 scale,
-                q_bnsh.ptr,
+                q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh.ptr,
+                out_bnsh,
                 0,
                 0,
-                totals_gpu.ptr,
-                query_starts_gpu.ptr,
+                totals_gpu,
+                query_starts_gpu,
+                local_window_i,
+                self.softcap,
+            )?;
+        } else if q.dtype == DataType::Float32 && gqa_decode::supported(q_seq, dim) {
+            // Capture-safe warp-parallel single-token GQA decode. Reads the
+            // valid length on-device from `totals_gpu` and allocates no scratch,
+            // so it records/replays inside a CUDA graph. Keeps the reference
+            // kernel below for f32 prefill and unsupported head dims.
+            gqa_decode::run(
+                &self.runtime,
+                batch,
+                self.num_heads,
+                self.kv_num_heads,
+                q_seq,
+                dim,
+                present_capacity,
+                self.num_heads / self.kv_num_heads,
+                scale,
+                q_bnsh,
+                present_k_ptr,
+                present_v_ptr,
+                out_bnsh,
+                totals_gpu,
+                local_window_i,
+                self.softcap,
+            )?;
+        } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
+            // Capture-safe fp16 flash-decode sibling of the f32 `gqa_decode`
+            // branch above. Same launcher signature/units; passes the fp16
+            // device pointers for query/present-K/present-V/output. Reads the
+            // valid length on-device from `totals_gpu` and allocates only
+            // fixed-size dynamic shared memory, so it records/replays inside a
+            // CUDA graph. Unsupported fp16 shapes (e.g. prefill Sq>1) still fall
+            // through to the phase-2a path below.
+            gqa_decode_fp16::run(
+                &self.runtime,
+                batch,
+                self.num_heads,
+                self.kv_num_heads,
+                q_seq,
+                dim,
+                present_capacity,
+                self.num_heads / self.kv_num_heads,
+                scale,
+                q_bnsh,
+                present_k_ptr,
+                present_v_ptr,
+                out_bnsh,
+                totals_gpu,
                 local_window_i,
                 self.softcap,
             )?;
@@ -1292,7 +1683,7 @@ impl GroupQueryAttentionKernel {
                         "cuda_ep GroupQueryAttention: score scratch size overflow".into(),
                     )
                 })?;
-            let score_scratch = Scratch::new(&self.runtime, score_count.max(1) * 4)?;
+            let score_scratch = workspace.reserve(WS_SCORES, score_count.max(1) * 4)?;
             let attention_rows_u32 = u32::try_from(attention_rows).map_err(|_| {
                 EpError::KernelFailed(
                     "cuda_ep GroupQueryAttention: attention row count exceeds u32".into(),
@@ -1310,12 +1701,12 @@ impl GroupQueryAttentionKernel {
             )?;
             let mut builder = self.runtime.stream().launch_builder(&func);
             builder
-                .arg(&q_bnsh.ptr)
+                .arg(&q_bnsh)
                 .arg(&present_k_ptr)
                 .arg(&present_v_ptr)
-                .arg(&out_bnsh.ptr)
-                .arg(&score_scratch.ptr)
-                .arg(&totals_gpu.ptr)
+                .arg(&out_bnsh)
+                .arg(&score_scratch)
+                .arg(&totals_gpu)
                 .arg(&batch_i)
                 .arg(&heads_i)
                 .arg(&kv_heads_i)
@@ -1345,19 +1736,19 @@ impl GroupQueryAttentionKernel {
                 true,
                 batch,
                 q_seq,
-                valid_sequence_length,
+                attention_sequence_length,
                 dim,
                 present_capacity,
                 self.num_heads / self.kv_num_heads,
                 scale,
-                q_bnsh.ptr,
+                q_bnsh,
                 present_k_ptr,
                 present_v_ptr,
-                out_bnsh.ptr,
+                out_bnsh,
                 0,
                 0,
-                totals_gpu.ptr,
-                query_starts_gpu.ptr,
+                totals_gpu,
+                query_starts_gpu,
                 local_window_i,
                 self.softcap,
             )?;
@@ -1373,7 +1764,7 @@ impl GroupQueryAttentionKernel {
             builder,
             {
                 builder
-                    .arg(&out_bnsh.ptr)
+                    .arg(&out_bnsh)
                     .arg(&output_ptr)
                     .arg(&batch_i)
                     .arg(&q_seq_i)
@@ -1381,7 +1772,8 @@ impl GroupQueryAttentionKernel {
                     .arg(&dim_i);
             }
         );
-        self.runtime.synchronize()
+        *last_signature = capture_candidate;
+        Ok(())
     }
 }
 
@@ -1392,5 +1784,65 @@ impl Kernel for GroupQueryAttentionKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        // Eligibility is tied to the exact f32 one-token, fixed-capacity,
+        // in-place device-KV reference-attention signature warmed by the most
+        // recent successful call.
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed f32 q_seq==1 k_seq==1 fixed-capacity device-KV reference path; the current signature was not warmed as capture-safe",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "GroupQueryAttention capture signature is unavailable because its state lock was poisoned",
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> Option<Arc<CudaRuntime>> {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous_hook);
+        runtime
+    }
+
+    #[test]
+    fn persistent_workspace_reuses_fixed_shape_allocation() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping CUDA GQA workspace test: CUDA runtime unavailable");
+            return;
+        };
+        let before = runtime.allocation_counts();
+        let mut workspace = GqaWorkspace::new(runtime.clone());
+
+        let first = workspace.reserve(WS_Q_BNSH, 4096).unwrap();
+        let allocated = runtime.allocation_counts();
+        assert_eq!(allocated.allocations, before.allocations + 1);
+        assert_eq!(allocated.frees, before.frees);
+
+        assert_eq!(workspace.reserve(WS_Q_BNSH, 4096).unwrap(), first);
+        assert_eq!(workspace.reserve(WS_Q_BNSH, 2048).unwrap(), first);
+        assert_eq!(runtime.allocation_counts(), allocated);
+
+        let grown = workspace.reserve(WS_Q_BNSH, 8192).unwrap();
+        assert_ne!(grown, first);
+        let grown_counts = runtime.allocation_counts();
+        assert_eq!(grown_counts.allocations, before.allocations + 2);
+        assert_eq!(grown_counts.frees, before.frees + 1);
+
+        drop(workspace);
+        let after = runtime.allocation_counts();
+        assert_eq!(after.allocations, before.allocations + 2);
+        assert_eq!(after.frees, before.frees + 2);
     }
 }

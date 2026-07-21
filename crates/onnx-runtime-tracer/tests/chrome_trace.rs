@@ -8,8 +8,12 @@
 //! deliberately robust — we assert ordering and presence, never exact
 //! durations.
 
-use onnx_runtime_tracer::{Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase};
+use onnx_runtime_tracer::{
+    Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase, annotate_current_span,
+    annotate_current_span_with, tracing_active,
+};
 use serde_json::Value;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,6 +102,7 @@ fn span_guard_records_on_drop_with_monotonic_ts_and_dur() {
         let _s = ctx.span("layer_norm", "compute");
         thread::sleep(Duration::from_millis(2));
     }
+
     {
         let _s = ctx
             .span("softmax", "compute")
@@ -113,6 +118,35 @@ fn span_guard_records_on_drop_with_monotonic_ts_and_dur() {
     }
     assert!(events[0].ts <= events[1].ts);
     assert_eq!(events[1].args.as_ref().unwrap()["device"], "cpu");
+}
+
+#[test]
+fn active_span_accepts_kernel_metrics() {
+    let (ctx, mem) = TraceContext::in_memory();
+    {
+        let _span = ctx
+            .span("MatMul", "compute")
+            .with_args(Args::new().device("cpu"));
+        assert!(tracing_active());
+        annotate_current_span(Args::new().bytes(96).flops(48));
+    }
+
+    let events = mem.events();
+    let args = events[0].args.as_ref().expect("span args");
+    assert_eq!(args["device"], "cpu");
+    assert_eq!(args["bytes"], 96);
+    assert_eq!(args["flops"], 48);
+}
+
+#[test]
+fn inactive_span_skips_lazy_kernel_metrics() {
+    assert!(!tracing_active());
+    let formula_calls = Cell::new(0);
+    annotate_current_span_with(|| {
+        formula_calls.set(formula_calls.get() + 1);
+        Args::new().bytes(96).flops(48)
+    });
+    assert_eq!(formula_calls.get(), 0);
 }
 
 #[test]

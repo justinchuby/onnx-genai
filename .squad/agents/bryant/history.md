@@ -49,3 +49,29 @@
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Added LpPool/GlobalLpPool/SpaceToDepth (`62fcb62`) and refreshed backend conformance artifacts to 975/790/1765 (`eef2c81`).
+
+
+## 2026-07-19T20:10Z — CPU-EP op coverage Batch 4
+
+- Added deterministic Dropout opsets 13/22 and Split opsets 1/18 (`4565e68`); Chew approved.
+- Refreshed backend conformance artifacts to 1,012 passed / 753 failed / 1,765 skipped (`8c2a264`); Gaff approved.
+
+- 2026-07-19: Authored initial Unique CPU kernel. Review found O(n²) grouping, NaN semantics, and String coverage issues; revision ownership transferred under lockout. Final numeric/bool/bf16 implementation landed as 6a7755c after Pris/Deckard/Sapper revisions and Luv approval.
+
+## 2026-07-19T21:30:00Z — oneDNN backend removal
+- Removed the oneDNN CPU GEMM feature/kernel/build glue and submodule in `453d280`; merged to `origin/main`.
+- 620 CPU-EP library tests passed and registry count stayed intact; Luv approved the removal.
+
+## 2026-07-20T05:20:00Z — CPU MatMul warning cleanup
+
+- Removed the dead `out_start` binding and unused `mut` from `matmul.rs` (`984c239`), leaving default and `--features mlas` builds warning-clean; lightweight verification passed.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Authored the initial CUDA GQA flash-prefill integration; Chew rejected an `Sq != Sk` causal-origin defect and locked the artifact, after which Rachael owned and landed the correction.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Made MatMulNBits M=1 decode capture-safe (`a210703`) and closed GQA's final safety blocker with a sticky detect-before-consume error latch (`ca50bae`).
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

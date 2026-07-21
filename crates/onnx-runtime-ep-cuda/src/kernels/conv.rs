@@ -363,8 +363,10 @@ impl Kernel for ConvKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "convolution creates per-call cuDNN descriptors and performs a trailing host stream synchronization",
+        )
     }
 }
 

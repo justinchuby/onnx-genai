@@ -55,6 +55,108 @@ pub fn cpu_allocator() -> Arc<dyn ExecutionProvider> {
     shared_cpu_ep()
 }
 
+/// Ref-counted owner for one device allocation shared by immutable runtime
+/// tensor values such as ONNX Sequence elements.
+///
+/// The executor may keep a non-owning [`DeviceBuffer`] alias for ordinary
+/// kernel dispatch while sequence handles retain this owner. The allocation is
+/// released exactly once when the last owner drops.
+pub(crate) struct SharedTensorBuffer {
+    buffer: Option<DeviceBuffer>,
+    allocator: Arc<dyn ExecutionProvider>,
+    import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
+}
+
+impl SharedTensorBuffer {
+    pub(crate) fn new(allocator: Arc<dyn ExecutionProvider>, buffer: DeviceBuffer) -> Arc<Self> {
+        Arc::new(Self {
+            buffer: Some(buffer),
+            allocator,
+            import_guard: None,
+        })
+    }
+
+    fn with_guard(
+        allocator: Arc<dyn ExecutionProvider>,
+        buffer: DeviceBuffer,
+        import_guard: Option<Box<dyn core::any::Any + Send + Sync>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            buffer: Some(buffer),
+            allocator,
+            import_guard,
+        })
+    }
+
+    pub(crate) fn allocate_cpu(bytes: usize) -> Result<Arc<Self>> {
+        let allocator: Arc<dyn ExecutionProvider> = shared_cpu_ep();
+        let buffer = allocator.allocate(bytes.max(1), TensorLayout::contiguous().alignment)?;
+        Ok(Self::new(allocator, buffer))
+    }
+
+    pub(crate) fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("SharedTensorBuffer buffer taken only in Drop")
+    }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        self.buffer
+            .as_mut()
+            .expect("SharedTensorBuffer buffer taken only in Drop")
+    }
+
+    pub(crate) fn allocator(&self) -> &Arc<dyn ExecutionProvider> {
+        &self.allocator
+    }
+
+    /// Create a non-owning alias suitable for the executor's existing
+    /// `DeviceBuffer` dispatch path. The returned handle must not outlive `self`.
+    pub(crate) fn alias(&self) -> DeviceBuffer {
+        let buffer = self.buffer();
+        // SAFETY: `self` owns the allocation and the executor keeps an Arc<Self>
+        // alive for at least as long as this alias. The alias is never freed by
+        // the EP because it is marked borrowed.
+        unsafe {
+            DeviceBuffer::from_borrowed_parts(
+                buffer.as_ptr() as *mut std::ffi::c_void,
+                buffer.device(),
+                buffer.len(),
+                buffer.alignment(),
+            )
+        }
+    }
+
+    pub(crate) fn into_buffer(mut self) -> DeviceBuffer {
+        debug_assert!(
+            self.import_guard.is_none(),
+            "executor-promoted buffers never carry a foreign import guard"
+        );
+        self.buffer
+            .take()
+            .expect("SharedTensorBuffer buffer taken only by into_buffer or Drop")
+    }
+}
+
+impl std::fmt::Debug for SharedTensorBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedTensorBuffer")
+            .field("device", &self.buffer().device())
+            .field("len", &self.buffer().len())
+            .field("ptr", &self.buffer().as_ptr())
+            .finish()
+    }
+}
+
+impl Drop for SharedTensorBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.allocator.deallocate(buffer);
+        }
+        let _ = self.import_guard.take();
+    }
+}
+
 /// Borrow the raw bytes of a host-accessible device buffer.
 ///
 /// # Safety
@@ -218,10 +320,38 @@ impl DeviceIoBinding {
 
     pub fn read_bytes(&mut self) -> Result<Vec<u8>> {
         let mut bytes = vec![0; self.buffer().len()];
-        self.allocator.copy_to_host(self.buffer(), &mut bytes)?;
+        self.read_bytes_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub fn read_bytes_into(&mut self, bytes: &mut [u8]) -> Result<()> {
+        self.allocator.copy_to_host(self.buffer(), bytes)?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
-        Ok(bytes)
+        Ok(())
+    }
+
+    pub fn device_argmax_supported(&self) -> bool {
+        self.allocator.device_argmax_supported()
+    }
+
+    pub fn device_argmax(&self, elements: usize, result: &mut DeviceIoBinding) -> Result<()> {
+        if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
+            || result.dtype != DataType::Uint32
+        {
+            return Err(SessionError::Internal(format!(
+                "device argmax requires f32/f16 logits and u32 result, got {:?} and {:?}",
+                self.dtype, result.dtype
+            )));
+        }
+        if !Arc::ptr_eq(&self.allocator, &result.allocator) {
+            return Err(SessionError::Internal(
+                "device argmax bindings must belong to the same execution provider".into(),
+            ));
+        }
+        Ok(self
+            .allocator
+            .device_argmax(self.buffer(), elements, self.dtype, result.buffer_mut())?)
     }
 
     pub(crate) fn buffer(&self) -> &DeviceBuffer {
@@ -277,6 +407,41 @@ impl Drop for DeviceIoBinding {
 }
 
 impl Tensor {
+    pub(crate) fn allocate_cpu(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
+        let numel = shape.iter().try_fold(1usize, |product, &dim| {
+            product.checked_mul(dim).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "Tensor::allocate_cpu: element count overflows for shape {shape:?}"
+                ))
+            })
+        })?;
+        let bytes = dtype.checked_storage_bytes(numel).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "Tensor::allocate_cpu: byte count overflows for shape {shape:?} dtype {dtype:?}"
+            ))
+        })?;
+        let allocator: Arc<dyn ExecutionProvider> = shared_cpu_ep();
+        let layout = TensorLayout::contiguous();
+        let buffer = allocator.allocate(bytes.max(1), layout.alignment)?;
+        Ok(Self {
+            dtype,
+            shape,
+            layout,
+            device: buffer.device(),
+            buffer: Some(buffer),
+            allocator,
+            import_guard: None,
+        })
+    }
+
+    pub(crate) fn copy_from_host_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let buffer = self.buffer.as_mut().ok_or_else(|| {
+            SessionError::Internal("Tensor buffer is unavailable for writing".to_string())
+        })?;
+        self.allocator.copy_from_host_at(bytes, buffer, offset)?;
+        Ok(())
+    }
+
     /// Allocate a tensor from raw little-endian element bytes using `allocator`.
     ///
     /// `bytes` must hold exactly `storage_bytes(numel)` bytes for `dtype` and
@@ -331,6 +496,24 @@ impl Tensor {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         Self::from_raw(DataType::Int64, shape.to_vec(), &bytes)
+    }
+
+    pub(crate) fn into_shared_parts(
+        mut self,
+    ) -> (Arc<SharedTensorBuffer>, DataType, Vec<usize>, TensorLayout) {
+        let buffer = self
+            .buffer
+            .take()
+            .expect("Tensor buffer taken only by into_shared_parts or Drop");
+        let storage = SharedTensorBuffer::with_guard(
+            Arc::clone(&self.allocator),
+            buffer,
+            self.import_guard.take(),
+        );
+        let dtype = self.dtype;
+        let shape = std::mem::take(&mut self.shape);
+        let layout = std::mem::take(&mut self.layout);
+        (storage, dtype, shape, layout)
     }
 
     /// The device this tensor lives on.

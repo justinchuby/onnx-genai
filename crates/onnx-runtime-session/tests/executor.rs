@@ -6,8 +6,8 @@
 //! a fixed shape path — the executor is exercised as a generic Graph runner.
 
 use onnx_runtime_ir::{
-    static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId,
-    WeightRef,
+    Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
+    static_shape,
 };
 use onnx_runtime_session::{InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape};
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
@@ -539,18 +539,22 @@ fn warmup_validates_input_names() {
     g.add_output(y);
 
     let mut session = InferenceSession::from_graph(g).unwrap();
-    assert!(session
-        .warmup(&[WarmupShape {
-            input_name: "nope".into(),
-            shape: vec![1, 2],
-        }])
-        .is_err());
-    assert!(session
-        .warmup(&[WarmupShape {
-            input_name: "X".into(),
-            shape: vec![1, 2],
-        }])
-        .is_ok());
+    assert!(
+        session
+            .warmup(&[WarmupShape {
+                input_name: "nope".into(),
+                shape: vec![1, 2],
+            }])
+            .is_err()
+    );
+    assert!(
+        session
+            .warmup(&[WarmupShape {
+                input_name: "X".into(),
+                shape: vec![1, 2],
+            }])
+            .is_ok()
+    );
 }
 
 /// A missing required input is reported, not silently defaulted.
@@ -618,7 +622,10 @@ fn symbolic_batch_matmul_chain_runs_for_multiple_shapes() {
 
     // A symbolic graph is not compiled at build (no concrete shapes yet).
     let after_build = session.cache_stats();
-    assert_eq!(after_build.entries, 0, "no kernels compiled before first run");
+    assert_eq!(
+        after_build.entries, 0,
+        "no kernels compiled before first run"
+    );
     assert_eq!(after_build.misses, 0);
 
     let run_batch = |session: &mut InferenceSession, rows: usize, fill: f32| -> Vec<f32> {
@@ -644,7 +651,10 @@ fn symbolic_batch_matmul_chain_runs_for_multiple_shapes() {
     // batch = 3 → new resolved shape: re-resolves + re-plans (3 more entries).
     run_batch(&mut session, 3, 10.0);
     let s3 = session.cache_stats();
-    assert_eq!(s3.entries, 6, "batch=3 adds three distinct shape-keyed entries");
+    assert_eq!(
+        s3.entries, 6,
+        "batch=3 adds three distinct shape-keyed entries"
+    );
     assert_eq!(s3.misses, 6);
     assert_eq!(s3.hits, 0);
 

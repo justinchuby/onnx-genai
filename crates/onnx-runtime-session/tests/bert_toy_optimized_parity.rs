@@ -90,7 +90,11 @@ fn max_abs(actual: &[f32], reference: &[f32]) -> f32 {
 
 const CASES: [(&str, &str, &[usize]); 2] = [
     ("prediction_scores", "prediction_scores.bin", &[1, 8, 99]),
-    ("seq_relationship_score", "seq_relationship_score.bin", &[1, 2]),
+    (
+        "seq_relationship_score",
+        "seq_relationship_score.bin",
+        &[1, 2],
+    ),
 ];
 
 /// `"basic"` optimization (constant folding + dead-node elimination) is
@@ -128,7 +132,9 @@ fn basic_optimization_matches_reference_and_default() {
         overall_ref = overall_ref.max(vs_ref);
         overall_vs_off = overall_vs_off.max(vs_off);
 
-        eprintln!("{label}: opt=basic vs reference max_abs = {vs_ref:.3e}, vs opt-off max_abs = {vs_off:.3e}");
+        eprintln!(
+            "{label}: opt=basic vs reference max_abs = {vs_ref:.3e}, vs opt-off max_abs = {vs_off:.3e}"
+        );
 
         let n_fail = basic
             .iter()
@@ -210,7 +216,9 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
         overall_ref = overall_ref.max(vs_ref);
         overall_vs_off = overall_vs_off.max(vs_off);
 
-        eprintln!("{label}: opt=all vs reference max_abs = {vs_ref:.3e}, vs opt-off max_abs = {vs_off:.3e}");
+        eprintln!(
+            "{label}: opt=all vs reference max_abs = {vs_ref:.3e}, vs opt-off max_abs = {vs_off:.3e}"
+        );
 
         let n_fail = all
             .iter()

@@ -1,5 +1,6 @@
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
+use half::f16;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, Result, TensorMut,
     TensorView,
@@ -32,18 +33,12 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
 }
 
 #[test]
-fn standard_attention_and_rope_claim_only_f32_and_require_contiguous_inputs() {
+fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inputs() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
 
     for (op_type, opset, dtype, expected_reason) in [
         ("Attention", 23, DataType::Float16, "Attention: dtype f16"),
         ("Attention", 23, DataType::BFloat16, "Attention: dtype bf16"),
-        (
-            "RotaryEmbedding",
-            23,
-            DataType::Float16,
-            "RotaryEmbedding: dtype f16",
-        ),
         (
             "RotaryEmbedding",
             23,
@@ -83,10 +78,34 @@ fn standard_attention_and_rope_claim_only_f32_and_require_contiguous_inputs() {
         if op_type == "RotaryEmbedding" {
             assert!(
                 !kernel.cuda_graph_compatible(),
-                "RotaryEmbedding validates device position_ids with a host synchronization"
+                "RotaryEmbedding requires an exact warmed signature"
             );
         }
     }
+
+    let mut graph = Graph::new();
+    let inputs = (0..3)
+        .map(|i| {
+            graph.create_named_value(
+                format!("rope_input_{i}"),
+                DataType::Float16,
+                static_shape([1, 1, 1, 2]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output =
+        graph.create_named_value("rope_output", DataType::Float16, static_shape([1, 1, 1, 2]));
+    let node = Node::new(
+        NodeId(0),
+        "RotaryEmbedding",
+        inputs.into_iter().map(Some).collect(),
+        vec![output],
+    );
+    assert!(
+        ep.supports_op(&node, 23, &[], &[DataType::Float16; 3], &[])
+            .is_supported(),
+        "RotaryEmbedding must claim its fp16 activation path"
+    );
 }
 
 #[test]
@@ -305,6 +324,7 @@ fn run_result_core(
             )
         })
         .collect::<Vec<_>>();
+    let allocations_before = ep.runtime().allocation_counts();
     if let Err(error) = kernel.execute(&input_views, &mut output_views) {
         for buffer in input_buffers.into_iter().flatten() {
             ep.deallocate(buffer)?;
@@ -313,6 +333,17 @@ fn run_result_core(
             ep.deallocate(buffer)?;
         }
         return Err(error);
+    }
+    if op == "RotaryEmbedding" {
+        assert_eq!(
+            ep.runtime().allocation_counts(),
+            allocations_before,
+            "RotaryEmbedding launch path must not allocate or free CUDA memory"
+        );
+        assert!(
+            kernel.cuda_graph_compatible(),
+            "warmed RotaryEmbedding signature must be capture-supported"
+        );
     }
 
     let result = outputs
@@ -338,6 +369,13 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .collect()
+}
+
+fn f16s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|v| f16::from_bits(u16::from_ne_bytes(v.try_into().unwrap())).to_f32())
         .collect()
 }
 
@@ -396,6 +434,52 @@ fn rotary_embedding_reference_4d(
                     let sin = sin_cache[row * half + d];
                     y[offset + d] = cos * x[offset + d] - sin * x[offset + d + half];
                     y[offset + d + half] = sin * x[offset + d] + cos * x[offset + d + half];
+                }
+            }
+        }
+    }
+    y
+}
+
+fn rotary_embedding_reference_fp16(
+    x: &[f32],
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    head_size: usize,
+    cos_cache: &[f32],
+    sin_cache: &[f32],
+    position_ids: &[i64],
+    interleaved: bool,
+) -> Vec<f32> {
+    let half = head_size / 2;
+    let mut y = vec![0.0; x.len()];
+    for b in 0..batch {
+        for h in 0..heads {
+            for s in 0..seq {
+                let row = position_ids[b * seq + s] as usize;
+                let offset = ((b * heads + h) * seq + s) * head_size;
+                for d in 0..head_size {
+                    let (k, partner) = if interleaved {
+                        (d / 2, d ^ 1)
+                    } else if d < half {
+                        (d, d + half)
+                    } else {
+                        (d - half, d - half)
+                    };
+                    let cos = cos_cache[row * half + k];
+                    let sin = sin_cache[row * half + k];
+                    y[offset + d] = if interleaved {
+                        if d.is_multiple_of(2) {
+                            cos * x[offset + d] - sin * x[offset + partner]
+                        } else {
+                            sin * x[offset + partner] + cos * x[offset + d]
+                        }
+                    } else if d < half {
+                        cos * x[offset + d] - sin * x[offset + partner]
+                    } else {
+                        sin * x[offset + partner] + cos * x[offset + d]
+                    };
                 }
             }
         }
@@ -552,6 +636,73 @@ fn rotary_embedding_4d_multi_batch_multi_head_position_ids_matches_reference() {
         &f32s(&output[0]),
         &rotary_embedding_reference_4d(&x, 2, 2, 2, 2, &cos_cache, &sin_cache, &position_ids),
     );
+}
+
+#[test]
+fn rotary_embedding_fp16_matches_fp32_reference_for_both_rotation_layouts() {
+    let (batch, heads, seq, head_size) = (2, 2, 3, 8);
+    let x = (0..batch * heads * seq * head_size)
+        .map(|index| f16::from_f32(((index * 19 + 7) % 97) as f32 / 32.0 - 1.5))
+        .collect::<Vec<_>>();
+    let position_ids = [0_i64, 2, 4, 1, 3, 0];
+    let cache_rows = 5;
+    let half = head_size / 2;
+    let cos_cache = (0..cache_rows * half)
+        .map(|index| f16::from_f32((index as f32 * 0.17).cos()))
+        .collect::<Vec<_>>();
+    let sin_cache = (0..cache_rows * half)
+        .map(|index| f16::from_f32((index as f32 * 0.17).sin()))
+        .collect::<Vec<_>>();
+    let x_reference = x.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+    let cos_reference = cos_cache
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+    let sin_reference = sin_cache
+        .iter()
+        .map(|value| value.to_f32())
+        .collect::<Vec<_>>();
+
+    for interleaved in [false, true] {
+        let inputs = [
+            tensor(DataType::Float16, &[batch, heads, seq, head_size], &x),
+            tensor(DataType::Float16, &[cache_rows, half], &cos_cache),
+            tensor(DataType::Float16, &[cache_rows, half], &sin_cache),
+            tensor(DataType::Int64, &[batch, seq], &position_ids),
+        ];
+        let output = run(
+            "RotaryEmbedding",
+            23,
+            &inputs,
+            &[(DataType::Float16, vec![batch, heads, seq, head_size])],
+            &[("interleaved", Attribute::Int(i64::from(interleaved)))],
+        );
+        let got = f16s(&output[0]);
+        let expected = rotary_embedding_reference_fp16(
+            &x_reference,
+            batch,
+            heads,
+            seq,
+            head_size,
+            &cos_reference,
+            &sin_reference,
+            &position_ids,
+            interleaved,
+        );
+        let error = got
+            .iter()
+            .zip(&expected)
+            .map(|(&got, &expected)| {
+                assert!(got.is_finite(), "fp16 RoPE output contains NaN/Inf");
+                (got - expected).abs()
+            })
+            .fold(0.0f32, f32::max);
+        println!("fp16 RoPE interleaved={interleaved} max_abs_error={error:.9e}");
+        assert!(
+            error <= 1e-3,
+            "single fp32 rotation followed by fp16 output rounding exceeded tolerance"
+        );
+    }
 }
 
 #[test]

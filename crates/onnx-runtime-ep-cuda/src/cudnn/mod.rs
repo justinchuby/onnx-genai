@@ -18,6 +18,7 @@ use half::{bf16, f16};
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_ir::DataType;
 
+use crate::dynamic_library::{CudaLibrary, is_available};
 use crate::error::{cudnn_err, cudnn_unavailable, driver_err};
 
 /// cuDNN element types supported by the CUDA EP's library-backed kernels.
@@ -787,9 +788,7 @@ impl Drop for CudnnBackend {
 }
 
 fn cudnn_library_present() -> bool {
-    // SAFETY: this only asks cudarc to probe the platform loader for cuDNN and
-    // immediately unloads the probe handle. No cuDNN function is called.
-    unsafe { sys::is_culib_present() }
+    is_available(CudaLibrary::Cudnn)
 }
 
 fn ensure_cudnn_available(probe: impl FnOnce() -> bool) -> Result<()> {

@@ -1,4 +1,4 @@
-//! Fused **normalization** kernels on the GPU via runtime-compiled (NVRTC) f32
+//! Fused **normalization** kernels on the GPU via runtime-compiled (NVRTC)
 //! kernels: `LayerNormalization` (ai.onnx + `com.microsoft`),
 //! `SkipLayerNormalization` and `SimplifiedLayerNormalization` /
 //! `RMSNormalization` (`com.microsoft` / ai.onnx).
@@ -26,13 +26,14 @@
 //!
 //! ## Limits (actionable errors, never panics — RULES.md #1)
 //!
-//! * dtype other than f32 → deferred (names the dtype + op).
+//! * activation dtype other than f32/f16 → deferred (names the dtype + op).
 //! * `axis`/last-dim size 0, or a `scale`/`bias`/`gamma`/`beta` length that does
 //!   not match the normalized size → rejected, naming the offending length.
 //! * non-contiguous (strided) operands → "materialise first" error.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
@@ -51,6 +52,15 @@ use super::softmax::resolve_axis;
 /// normalized+affine output in a third pass. Optional `mean`/`inv_std` outputs
 /// are written when the pointers are non-null.
 const LAYERNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float load_layernorm_param(
+    const void* values, const int is_half, const int index) {
+    return is_half
+        ? __half2float(((const __half*)values)[index])
+        : ((const float*)values)[index];
+}
+
 extern "C" __global__ void layernorm_f32(
     const float* x,
     const float* scale,
@@ -111,12 +121,82 @@ extern "C" __global__ void layernorm_f32(
         y[base + j] = o;
     }
 }
+
+extern "C" __global__ void layernorm_f16(
+    const __half* x,
+    const void*   scale,
+    const void*   bias,
+    __half*       y,
+    float*        mean_out,
+    float*        invstd_out,
+    const int     num_groups,
+    const int     norm_size,
+    const int     scale_is_half,
+    const int     bias_is_half,
+    const int     has_bias,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    float s = 0.0f;
+    for (int j = tid; j < norm_size; j += nt)
+        s += __half2float(x[base + j]);
+    red[tid] = s;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float mean = red[0] / (float)norm_size;
+    __syncthreads();
+
+    float v = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        const float d = __half2float(x[base + j]) - mean;
+        v += d * d;
+    }
+    red[tid] = v;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std =
+        1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) mean_out[g] = mean;
+        if (invstd_out) invstd_out[g] = inv_std;
+    }
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const float xhat = (__half2float(x[base + j]) - mean) * inv_std;
+        float o = xhat * load_layernorm_param(scale, scale_is_half, j);
+        if (has_bias)
+            o += load_layernorm_param(bias, bias_is_half, j);
+        y[base + j] = __float2half_rn(o);
+    }
+}
 "#;
 
 /// NVRTC source for the fused f32 `RMSNormalization` /
 /// `SimplifiedLayerNormalization`: no mean subtraction, scale by the inverse
 /// root-mean-square.
 const RMSNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float load_rmsnorm_scale(
+    const void* values, const int is_half, const int index) {
+    return is_half
+        ? __half2float(((const __half*)values)[index])
+        : ((const float*)values)[index];
+}
+
 extern "C" __global__ void rmsnorm_f32(
     const float* x,
     const float* scale,
@@ -155,11 +235,60 @@ extern "C" __global__ void rmsnorm_f32(
     for (int j = tid; j < norm_size; j += nt)
         y[base + j] = x[base + j] * inv_std * scale[j];
 }
+
+extern "C" __global__ void rmsnorm_f16(
+    const __half* x,
+    const void*   scale,
+    __half*       y,
+    float*        invstd_out,
+    const int     num_groups,
+    const int     norm_size,
+    const int     scale_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        const float xv = __half2float(x[base + j]);
+        ss += xv * xv;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std =
+        1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0 && invstd_out) invstd_out[g] = inv_std;
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const float o = __half2float(x[base + j]) * inv_std
+            * load_rmsnorm_scale(scale, scale_is_half, j);
+        y[base + j] = __float2half_rn(o);
+    }
+}
 "#;
 
 /// NVRTC source for `com.microsoft::SkipSimplifiedLayerNormalization`.
 /// The residual sum supports right-aligned NumPy broadcasting for `skip`.
 const SKIP_RMSNORM_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float load_skip_val(
+    const void* values, const int is_half, const int index) {
+    return is_half
+        ? __half2float(((const __half*)values)[index])
+        : ((const float*)values)[index];
+}
+
 extern "C" __global__ void skip_rmsnorm_f32(
     const float* input,
     const float* skip,
@@ -218,6 +347,79 @@ extern "C" __global__ void skip_rmsnorm_f32(
     __syncthreads();
     for (int j = tid; j < norm_size; j += nt)
         y[base + j] = (y[base + j] * inv_std) * gamma[j];
+}
+
+extern "C" __global__ void skip_rmsnorm_f16(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,         // null when absent
+    __half*       y,
+    __half*       sum_out,      // null when not requested
+    void*         mean_out,     // null when not requested (always zero)
+    void*         invstd_out,   // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const unsigned long long* shape = metadata;
+    const unsigned long long* skip_strides = metadata + rank;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+
+    // fp32 accumulate over the fp16-rounded residual so the RMS matches the
+    // residual value stored into `sum_out` and reused by the next layer.
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        unsigned long long linear = (unsigned long long)base + j;
+        unsigned long long skip_index = 0;
+        for (int d = rank - 1; d >= 0; --d) {
+            const unsigned long long coord = linear % shape[d];
+            linear /= shape[d];
+            skip_index += coord * skip_strides[d];
+        }
+        float sv = __half2float(input[base + j]) + __half2float(skip[skip_index]);
+        if (has_bias) sv += load_skip_val(bias, bias_is_half, j);
+        const __half svh = __float2half_rn(sv);
+        y[base + j] = svh;
+        if (sum_out) sum_out[base + j] = svh;
+        const float svr = __half2float(svh);
+        ss += svr * svr;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) {
+            if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
+            else ((float*)mean_out)[g] = 0.0f;
+        }
+        if (invstd_out) {
+            if (stat_is_half) ((__half*)invstd_out)[g] = __float2half_rn(inv_std);
+            else ((float*)invstd_out)[g] = inv_std;
+        }
+    }
+    __syncthreads();
+    for (int j = tid; j < norm_size; j += nt) {
+        const float v = __half2float(y[base + j]) * inv_std
+            * load_skip_val(gamma, gamma_is_half, j);
+        y[base + j] = __float2half_rn(v);
+    }
 }
 "#;
 
@@ -301,8 +503,8 @@ extern "C" __global__ void skip_layernorm_f32(
 }
 "#;
 
-const LAYERNORM_MODULE: &str = "layernorm_f32";
-const RMSNORM_MODULE: &str = "rmsnorm_f32";
+const LAYERNORM_MODULE: &str = "layernorm_f16_v1";
+const RMSNORM_MODULE: &str = "rmsnorm_f16_v1";
 const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f32";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
@@ -314,6 +516,15 @@ fn require_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
     if dt != DataType::Float32 {
         return Err(not_implemented(format!(
             "{op} with {name} dtype {dt:?} (this slice is f32-only; f16/bf16 pending)"
+        )));
+    }
+    Ok(())
+}
+
+fn require_f16_or_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
+    if !matches!(dt, DataType::Float16 | DataType::Float32) {
+        return Err(not_implemented(format!(
+            "{op} with {name} dtype {dt:?} (expected f16 or f32)"
         )));
     }
     Ok(())
@@ -354,20 +565,34 @@ impl KernelFactory for LayerNormFactory {
             axis,
             epsilon,
             runtime: self.runtime.clone(),
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
 
-/// Fused f32 LayerNormalization kernel.
+/// Fused f32/f16 LayerNormalization kernel.
 #[derive(Debug)]
 pub struct LayerNormKernel {
     axis: i64,
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    warmed_signature: Mutex<Option<NormCaptureSignature>>,
+    last_call_capture_safe: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NormCaptureSignature {
+    activation_dtype: DataType,
+    scale_dtype: DataType,
+    bias_dtype: Option<DataType>,
+    input_shape: Vec<usize>,
+    output_dtypes_and_shapes: Vec<(DataType, Vec<usize>)>,
 }
 
 impl LayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         if !(2..=3).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 3 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep LayerNormalization: expected 2-3 inputs (X, Scale[, B]) and \
@@ -379,9 +604,18 @@ impl LayerNormKernel {
         let x = &inputs[0];
         let scale = &inputs[1];
         let bias = inputs.get(2);
-        require_f32("LayerNormalization", "X", x.dtype)?;
-        require_f32("LayerNormalization", "Scale", scale.dtype)?;
-        require_f32("LayerNormalization", "Y", outputs[0].dtype)?;
+        require_f16_or_f32("LayerNormalization", "X", x.dtype)?;
+        if x.dtype == DataType::Float32 {
+            require_f32("LayerNormalization", "Scale", scale.dtype)?;
+        } else {
+            require_f16_or_f32("LayerNormalization", "Scale", scale.dtype)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep LayerNormalization: Y dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous("LayerNormalization", "X", x.is_contiguous())?;
         require_contiguous("LayerNormalization", "Scale", scale.is_contiguous())?;
         require_contiguous("LayerNormalization", "Y", outputs[0].is_contiguous())?;
@@ -405,7 +639,11 @@ impl LayerNormKernel {
         let bias_ptr = match bias {
             None => 0u64,
             Some(b) => {
-                require_f32("LayerNormalization", "B", b.dtype)?;
+                if x.dtype == DataType::Float32 {
+                    require_f32("LayerNormalization", "B", b.dtype)?;
+                } else {
+                    require_f16_or_f32("LayerNormalization", "B", b.dtype)?;
+                }
                 require_contiguous("LayerNormalization", "B", b.is_contiguous())?;
                 if b.numel() != norm_size {
                     return Err(EpError::KernelFailed(format!(
@@ -442,10 +680,36 @@ impl LayerNormKernel {
         let has_bias: i32 = i32::from(bias_ptr != 0);
         let eps = self.epsilon;
         let groups_i = groups_u_i32(groups_u);
+        let signature = (num_groups == 1).then(|| NormCaptureSignature {
+            activation_dtype: x.dtype,
+            scale_dtype: scale.dtype,
+            bias_dtype: bias.map(|bias| bias.dtype),
+            input_shape: x.shape.to_vec(),
+            output_dtypes_and_shapes: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+        });
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self
+            .warmed_signature
+            .lock()
+            .expect("cuda_ep LayerNormalization capture signature poisoned");
+        if capturing && warmed_signature.as_ref() != signature.as_ref() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep LayerNormalization: dtype or shape changed during CUDA graph capture; warm the exact single-group signature before capture"
+                    .into(),
+            ));
+        }
 
+        let entry = if x.dtype == DataType::Float16 {
+            "layernorm_f16"
+        } else {
+            "layernorm_f32"
+        };
         let func = self
             .runtime
-            .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, "layernorm_f32")?;
+            .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, entry)?;
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
@@ -454,6 +718,8 @@ impl LayerNormKernel {
         )?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
+        let scale_is_half = i32::from(scale.dtype == DataType::Float16);
+        let bias_is_half = i32::from(bias.is_some_and(|bias| bias.dtype == DataType::Float16));
         builder
             .arg(&x_ptr)
             .arg(&scale_ptr)
@@ -462,15 +728,27 @@ impl LayerNormKernel {
             .arg(&mean_ptr)
             .arg(&invstd_ptr)
             .arg(&groups_i)
-            .arg(&norm_i)
-            .arg(&has_bias)
-            .arg(&eps);
+            .arg(&norm_i);
+        if x.dtype == DataType::Float16 {
+            builder
+                .arg(&scale_is_half)
+                .arg(&bias_is_half)
+                .arg(&has_bias)
+                .arg(&eps);
+        } else {
+            builder.arg(&has_bias).arg(&eps);
+        }
         // SAFETY: `func` is the compiled layernorm entry; the argument list and
         // ABI match its signature; every non-null pointer is a live device
         // allocation sized as validated above (X/Y: num_groups·norm_size;
         // scale/bias: norm_size; mean/invstd: num_groups).
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch layernorm_f32", e))?;
-        self.runtime.synchronize()
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if !capturing {
+            *warmed_signature = signature.clone();
+        }
+        self.last_call_capture_safe
+            .store(signature.is_some(), Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -481,8 +759,14 @@ impl Kernel for LayerNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "LayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -512,20 +796,25 @@ impl KernelFactory for RmsNormFactory {
             axis,
             epsilon,
             runtime: self.runtime.clone(),
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
 
-/// Fused f32 RMSNormalization / SimplifiedLayerNormalization kernel.
+/// Fused f32/f16 RMSNormalization / SimplifiedLayerNormalization kernel.
 #[derive(Debug)]
 pub struct RmsNormKernel {
     axis: i64,
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    warmed_signature: Mutex<Option<NormCaptureSignature>>,
+    last_call_capture_safe: AtomicBool,
 }
 
 impl RmsNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "RMSNormalization";
         if inputs.len() != 2 || outputs.is_empty() || outputs.len() > 2 {
             return Err(EpError::KernelFailed(format!(
@@ -537,9 +826,18 @@ impl RmsNormKernel {
         }
         let x = &inputs[0];
         let scale = &inputs[1];
-        require_f32(op, "X", x.dtype)?;
-        require_f32(op, "Scale", scale.dtype)?;
-        require_f32(op, "Y", outputs[0].dtype)?;
+        require_f16_or_f32(op, "X", x.dtype)?;
+        if x.dtype == DataType::Float32 {
+            require_f32(op, "Scale", scale.dtype)?;
+        } else {
+            require_f16_or_f32(op, "Scale", scale.dtype)?;
+        }
+        if outputs[0].dtype != x.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: Y dtype {:?} must match X dtype {:?}",
+                outputs[0].dtype, x.dtype
+            )));
+        }
         require_contiguous(op, "X", x.is_contiguous())?;
         require_contiguous(op, "Scale", scale.is_contiguous())?;
         require_contiguous(op, "Y", outputs[0].is_contiguous())?;
@@ -592,10 +890,36 @@ impl RmsNormKernel {
             i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
         );
         let eps = self.epsilon;
+        let signature = (num_groups == 1).then(|| NormCaptureSignature {
+            activation_dtype: x.dtype,
+            scale_dtype: scale.dtype,
+            bias_dtype: None,
+            input_shape: x.shape.to_vec(),
+            output_dtypes_and_shapes: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+        });
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self
+            .warmed_signature
+            .lock()
+            .expect("cuda_ep RMSNormalization capture signature poisoned");
+        if capturing && warmed_signature.as_ref() != signature.as_ref() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep RMSNormalization: dtype or shape changed during CUDA graph capture; warm the exact single-group signature before capture"
+                    .into(),
+            ));
+        }
 
+        let entry = if x.dtype == DataType::Float16 {
+            "rmsnorm_f16"
+        } else {
+            "rmsnorm_f32"
+        };
         let func = self
             .runtime
-            .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, "rmsnorm_f32")?;
+            .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, entry)?;
         let cfg = self.runtime.reduction_launch_config(
             &func,
             groups_u,
@@ -605,18 +929,28 @@ impl RmsNormKernel {
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
+        let scale_is_half = i32::from(scale.dtype == DataType::Float16);
         builder
             .arg(&x_ptr)
             .arg(&scale_ptr)
             .arg(&y_ptr)
             .arg(&invstd_ptr)
             .arg(&groups_i)
-            .arg(&norm_i)
-            .arg(&eps);
+            .arg(&norm_i);
+        if x.dtype == DataType::Float16 {
+            builder.arg(&scale_is_half).arg(&eps);
+        } else {
+            builder.arg(&eps);
+        }
         // SAFETY: `func` is the compiled rmsnorm entry; the argument list/ABI
         // match; pointers are live device allocations sized as validated.
-        unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch rmsnorm_f32", e))?;
-        self.runtime.synchronize()
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if !capturing {
+            *warmed_signature = signature.clone();
+        }
+        self.last_call_capture_safe
+            .store(signature.is_some(), Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -627,8 +961,14 @@ impl Kernel for RmsNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SimplifiedLayerNormalization/RMSNorm shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -648,6 +988,8 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
         Ok(Box::new(SkipSimplifiedLayerNormKernel {
             epsilon,
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(SkipBroadcastMetadataCache::new(self.runtime.clone())),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -657,10 +999,87 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
 pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    metadata: Mutex<SkipBroadcastMetadataCache>,
+    last_call_capture_safe: AtomicBool,
+}
+
+#[derive(Debug)]
+struct SkipBroadcastMetadataCache {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    input_shape: Vec<usize>,
+    skip_shape: Vec<usize>,
+}
+
+impl SkipBroadcastMetadataCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            input_shape: Vec::new(),
+            skip_shape: Vec::new(),
+        }
+    }
+
+    fn reserve(&mut self, input_shape: &[usize], skip_shape: &[usize]) -> Result<CUdeviceptr> {
+        if self.ptr != 0 && self.input_shape == input_shape && self.skip_shape == skip_shape {
+            return Ok(self.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep SkipSimplifiedLayerNormalization: broadcast metadata shape changed \
+                 during CUDA graph capture; warm the fixed decode shape before capture"
+                    .into(),
+            ));
+        }
+
+        let metadata = skip_broadcast_metadata(input_shape, skip_shape);
+        let metadata_bytes = u64_bytes(&metadata);
+        let ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        // SAFETY: `ptr` exactly covers the metadata byte slice.
+        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, ptr) } {
+            // SAFETY: `ptr` is still exclusively owned and no launch used it.
+            let _ = unsafe { self.runtime.free_raw(ptr) };
+            return Err(error);
+        }
+        if self.ptr != 0 {
+            // A dynamic shape change may replace metadata still referenced by
+            // queued work. Fixed-shape decode always takes the cache-hit path.
+            if let Err(error) = self.runtime.synchronize() {
+                // SAFETY: `ptr` is still exclusively owned and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+            // SAFETY: synchronization completed all prior users of `self.ptr`.
+            if let Err(error) = unsafe { self.runtime.free_raw(self.ptr) } {
+                // SAFETY: `ptr` is still exclusively owned and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.ptr = ptr;
+        self.input_shape.clear();
+        self.input_shape.extend_from_slice(input_shape);
+        self.skip_shape.clear();
+        self.skip_shape.extend_from_slice(skip_shape);
+        Ok(ptr)
+    }
+}
+
+impl Drop for SkipBroadcastMetadataCache {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            let _ = self.runtime.synchronize();
+            // SAFETY: this cache exclusively owns the persistent allocation.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
 }
 
 impl SkipSimplifiedLayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "SkipSimplifiedLayerNormalization";
         if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
@@ -673,14 +1092,32 @@ impl SkipSimplifiedLayerNormKernel {
         let skip = &inputs[1];
         let gamma = &inputs[2];
         let bias = inputs.get(3).filter(|bias| !bias.is_absent());
-        require_f32(op, "input", input.dtype)?;
-        require_f32(op, "skip", skip.dtype)?;
-        require_f32(op, "gamma", gamma.dtype)?;
-        require_f32(op, "output", outputs[0].dtype)?;
+        require_f16_or_f32(op, "input", input.dtype)?;
+        let is_half = input.dtype == DataType::Float16;
+        if skip.dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: skip dtype {:?} must match input dtype {:?}",
+                skip.dtype, input.dtype
+            )));
+        }
+        if outputs[0].dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: output dtype {:?} must match input dtype {:?}",
+                outputs[0].dtype, input.dtype
+            )));
+        }
+        if is_half {
+            require_f16_or_f32(op, "gamma", gamma.dtype)?;
+        } else {
+            require_f32(op, "gamma", gamma.dtype)?;
+        }
         require_contiguous(op, "input", input.is_contiguous())?;
         require_contiguous(op, "skip", skip.is_contiguous())?;
         require_contiguous(op, "gamma", gamma.is_contiguous())?;
         require_contiguous(op, "output", outputs[0].is_contiguous())?;
+        if is_half {
+            self.runtime.require_nvrtc_half_headers(op)?;
+        }
 
         let rank = input.shape.len();
         if rank == 0 {
@@ -701,7 +1138,7 @@ impl SkipSimplifiedLayerNormKernel {
                 gamma.shape
             )));
         }
-        let bias_ptr = optional_vec_ptr(op, "bias", bias, norm_size)?;
+        let bias_ptr = optional_norm_vec_ptr(op, "bias", bias, norm_size, is_half)?;
         let broadcast =
             onnx_runtime_ir::broadcast_shapes(input.shape, skip.shape).map_err(EpError::Ir)?;
         if broadcast != input.shape {
@@ -720,11 +1157,31 @@ impl SkipSimplifiedLayerNormKernel {
             return Ok(());
         }
 
-        let (mean_ptr, invstd_ptr) = optional_stat_ptrs(op, outputs, num_groups)?;
+        // Optional Mean/InvStdDev stat outputs may be f16 in a half graph (they
+        // are typically unused). Track their precision so the kernel narrows.
+        let gamma_is_half = i32::from(gamma.dtype == DataType::Float16);
+        let bias_is_half = i32::from(bias.is_some_and(|b| b.dtype == DataType::Float16));
+        let (mean_ptr, invstd_ptr, stat_is_half) = if is_half {
+            let mean = optional_half_stat_ptr(op, "Mean", outputs, 1, num_groups)?;
+            let invstd = optional_half_stat_ptr(op, "InvStdDev", outputs, 2, num_groups)?;
+            let stat_half = i32::from(
+                outputs.get(1).is_some_and(|t| t.dtype == DataType::Float16)
+                    || outputs.get(2).is_some_and(|t| t.dtype == DataType::Float16),
+            );
+            (mean, invstd, stat_half)
+        } else {
+            let (mean, invstd) = optional_stat_ptrs(op, outputs, num_groups)?;
+            (mean, invstd, 0)
+        };
         let sum_ptr = match outputs.get_mut(3) {
             None => 0u64,
             Some(t) => {
-                require_f32(op, "input_skip_bias_sum", t.dtype)?;
+                if t.dtype != input.dtype {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: input_skip_bias_sum dtype {:?} must match input dtype {:?}",
+                        t.dtype, input.dtype
+                    )));
+                }
                 if t.shape != input.shape {
                     return Err(EpError::KernelFailed(format!(
                         "cuda_ep {op}: input_skip_bias_sum shape {:?} must equal input shape {:?}",
@@ -734,64 +1191,67 @@ impl SkipSimplifiedLayerNormKernel {
                 cuptr(t.data_ptr_mut::<u8>() as *const c_void)
             }
         };
-        let metadata = skip_broadcast_metadata(input.shape, skip.shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
-            // SAFETY: metadata_ptr is still owned by this call and no launch occurred.
-            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
-            return Err(error);
-        }
-
-        let launch = (|| {
-            let (groups_u, norm_i) = (
-                u32::try_from(num_groups)
-                    .map_err(|_| dim_overflow(op, "num_groups", num_groups))?,
-                i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
-            );
-            let rank_i = i32::try_from(rank).map_err(|_| dim_overflow(op, "rank", rank))?;
-            let has_bias = i32::from(bias_ptr != 0);
-            let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
-            let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
-            let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
-            let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-            let func = self.runtime.nvrtc_function(
-                SKIP_RMSNORM_MODULE,
-                SKIP_RMSNORM_SRC,
-                "skip_rmsnorm_f32",
-            )?;
-            let stream = self.runtime.stream();
-            let mut builder = stream.launch_builder(&func);
-            let groups_i = groups_u_i32(groups_u);
+        let (groups_u, norm_i) = (
+            u32::try_from(num_groups).map_err(|_| dim_overflow(op, "num_groups", num_groups))?,
+            i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
+        );
+        let rank_i = i32::try_from(rank).map_err(|_| dim_overflow(op, "rank", rank))?;
+        let has_bias = i32::from(bias_ptr != 0);
+        let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+        let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let mut metadata = self
+            .metadata
+            .lock()
+            .expect("cuda_ep skip normalization metadata cache poisoned");
+        let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
+        let entry = if is_half {
+            "skip_rmsnorm_f16"
+        } else {
+            "skip_rmsnorm_f32"
+        };
+        let func = self
+            .runtime
+            .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, entry)?;
+        let stream = self.runtime.stream();
+        let mut builder = stream.launch_builder(&func);
+        let groups_i = groups_u_i32(groups_u);
+        builder
+            .arg(&input_ptr)
+            .arg(&skip_ptr)
+            .arg(&gamma_ptr)
+            .arg(&bias_ptr)
+            .arg(&y_ptr)
+            .arg(&sum_ptr)
+            .arg(&mean_ptr)
+            .arg(&invstd_ptr)
+            .arg(&metadata_ptr)
+            .arg(&rank_i)
+            .arg(&groups_i)
+            .arg(&norm_i)
+            .arg(&has_bias);
+        if is_half {
             builder
-                .arg(&input_ptr)
-                .arg(&skip_ptr)
-                .arg(&gamma_ptr)
-                .arg(&bias_ptr)
-                .arg(&y_ptr)
-                .arg(&sum_ptr)
-                .arg(&mean_ptr)
-                .arg(&invstd_ptr)
-                .arg(&metadata_ptr)
-                .arg(&rank_i)
-                .arg(&groups_i)
-                .arg(&norm_i)
-                .arg(&has_bias)
+                .arg(&gamma_is_half)
+                .arg(&bias_is_half)
+                .arg(&stat_is_half)
                 .arg(&self.epsilon);
-            // SAFETY: all pointers reference validated device buffers; metadata has
-            // two rank-length u64 arrays describing the output shape and skip strides.
-            let cfg = self.runtime.reduction_launch_config(
-                &func,
-                groups_u,
-                NORM_BLOCK,
-                std::mem::size_of::<f32>() as u32,
-            )?;
-            unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_f32", e))?;
-            self.runtime.synchronize()
-        })();
-        // SAFETY: the launch is synchronized before freeing this per-invocation metadata.
-        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
-        launch.and(free)
+        } else {
+            builder.arg(&self.epsilon);
+        }
+        // SAFETY: all pointers reference validated device buffers; metadata has
+        // two rank-length u64 arrays describing the output shape and skip strides.
+        let cfg = self.runtime.reduction_launch_config(
+            &func,
+            groups_u,
+            NORM_BLOCK,
+            std::mem::size_of::<f32>() as u32,
+        )?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -802,8 +1262,14 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SkipSimplifiedLayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -824,6 +1290,7 @@ impl KernelFactory for SkipLayerNormFactory {
         Ok(Box::new(SkipLayerNormKernel {
             epsilon,
             runtime: self.runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
@@ -837,10 +1304,12 @@ impl KernelFactory for SkipLayerNormFactory {
 pub struct SkipLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
+    last_call_capture_safe: AtomicBool,
 }
 
 impl SkipLayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "SkipLayerNormalization";
         if !(3..=5).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
@@ -966,7 +1435,9 @@ impl SkipLayerNormKernel {
         // validated (input/skip/output/sum: num_groups·norm_size; gamma/beta/
         // bias: norm_size; mean/invstd: num_groups).
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_layernorm_f32", e))?;
-        self.runtime.synchronize()
+        self.last_call_capture_safe
+            .store(num_groups == 1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -977,8 +1448,14 @@ impl Kernel for SkipLayerNormKernel {
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SkipLayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+            )
+        }
     }
 }
 
@@ -1068,6 +1545,60 @@ fn optional_vec_ptr(
     }
 }
 
+/// Optional length-`expect` input vector accepting either f16 or f32 (used by
+/// the half normalization paths, which pass a per-tensor `*_is_half` flag).
+fn optional_norm_vec_ptr(
+    op: &str,
+    name: &str,
+    t: Option<&TensorView>,
+    expect: usize,
+    allow_half: bool,
+) -> Result<CUdeviceptr> {
+    match t {
+        None => Ok(0),
+        Some(v) => {
+            if allow_half {
+                require_f16_or_f32(op, name, v.dtype)?;
+            } else {
+                require_f32(op, name, v.dtype)?;
+            }
+            require_contiguous(op, name, v.is_contiguous())?;
+            if v.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    v.numel()
+                )));
+            }
+            Ok(cuptr(v.data_ptr::<u8>() as *const c_void))
+        }
+    }
+}
+
+/// Optional per-group stat output (Mean/InvStdDev) accepting f16 or f32. Half
+/// graphs frequently declare these unused outputs in the model's activation
+/// dtype; the kernel narrows the stat write to match.
+fn optional_half_stat_ptr(
+    op: &str,
+    name: &str,
+    outputs: &mut [TensorMut],
+    idx: usize,
+    expect: usize,
+) -> Result<CUdeviceptr> {
+    match outputs.get_mut(idx) {
+        None => Ok(0),
+        Some(t) => {
+            require_f16_or_f32(op, name, t.dtype)?;
+            if t.numel() != expect {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: {name} has {} elements, expected {expect}",
+                    t.numel()
+                )));
+            }
+            Ok(cuptr(t.data_ptr_mut::<u8>() as *const c_void))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,7 +1606,9 @@ mod tests {
     #[test]
     fn sources_expose_their_entry_points() {
         assert!(LAYERNORM_SRC.contains("layernorm_f32"));
+        assert!(LAYERNORM_SRC.contains("layernorm_f16"));
         assert!(RMSNORM_SRC.contains("rmsnorm_f32"));
+        assert!(RMSNORM_SRC.contains("rmsnorm_f16"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
     }

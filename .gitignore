@@ -5,6 +5,22 @@ models/
 # (`*.onnx.textproto`), which is not matched by the `*.onnx` ignore above and is
 # therefore tracked. The line below documents that intent explicitly.
 !**/*.onnx.textproto
+# Binary fixture models that must stay tracked (not converted to textproto).
+!tests/fixtures/tiny-llm-scatter/model.onnx
+!tests/fixtures/tiny-llm-sharedbuffer/model.onnx
+!tests/fixtures/tiny-qwen35-mtp/model.onnx
+!tests/fixtures/tiny-eagle3/model.onnx
+!tests/fixtures/tiny-mtp-full/model.onnx
+!tests/fixtures/tiny-mtp-full/mtp/model.onnx
+!tests/fixtures/tiny-whisper/encoder.onnx
+!tests/fixtures/tiny-whisper/decoder.onnx
+!tests/fixtures/tiny-diffusion/denoiser.onnx
+!tests/fixtures/tiny-diffusion/vae.onnx
+!tests/fixtures/tiny-diffusion/denoiser_multi.onnx
+!tests/fixtures/tiny-diffusion/denoiser_dualcond.onnx
+!tests/fixtures/tiny-diffusion/denoiser_step.onnx
+!tests/fixtures/tiny-dit-diffusion/denoiser.onnx
+!tests/fixtures/tiny-masked-diffusion/lm.onnx
 # `speculator-eagle3/model.onnx` is an 8-byte placeholder (never loaded as a
 # model), kept as-is for model-directory resolution tests.
 !crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx

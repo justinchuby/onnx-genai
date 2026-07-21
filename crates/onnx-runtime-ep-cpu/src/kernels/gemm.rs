@@ -69,6 +69,18 @@ impl Kernel for GemmKernel {
             )));
         }
         let k = ka;
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            // Conventional roofline estimate: one multiply and one add per GEMM
+            // contraction, plus scale-and-add for each optional bias output.
+            let mut flops = (m as u64)
+                .saturating_mul(n as u64)
+                .saturating_mul(k as u64)
+                .saturating_mul(2);
+            if inputs.len() == 3 && self.beta != 0.0 {
+                flops = flops.saturating_add((m as u64).saturating_mul(n as u64).saturating_mul(2));
+            }
+            flops
+        });
 
         // Accessors into the row-major dense buffers, applying transposition.
         let a_at = |i: usize, p: usize| -> f32 {

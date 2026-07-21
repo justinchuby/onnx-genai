@@ -103,3 +103,30 @@ Added the preprocessing-side prompt token-expansion library for multi-tile VLM i
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Fixed OneHot out-of-range indices to all-off and required BitShift direction (`49d8827`); Gaff approved the correction.
+
+
+## 2026-07-19T20:10Z — CPU-EP op coverage Batch 4
+
+- Revised Deckard's rejected GridSample artifact: opset 16 now rejects rank-5 input while opset 20 retains 2-D/3-D support (`61d5e63`, landed in `9c250c6`); Gaff approved.
+
+- 2026-07-19: Kernel Criterion microbenchmarks, ten numeric regressions, and optional ORT baseline landed as d89a47e; thread-matched follow-up established a ~17–21× medium-f32 MatMul gap. Removed unsafe Unique String execution so the safe numeric/bool/bf16 kernel could land.
+
+
+### 2026-07-20 — Vendored MLAS CPU-GEMM parity
+
+Recorded MLAS ep-cpu integration (`d696b7a`) and the provenance README correction (`ee7a6cd`).
+
+
+## 2026-07-20T07:15Z — Bounded M=1 decode pool
+
+- Landed `d7a0819`: defaulted M=1 MatMulNBits decode to a bounded 8-thread Rayon pool, improving 18.75→23.46 tok/s (+26%); luv-33 reviewed 🟢.
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Landed persistent M=1 CPU decode-pool residency (`cbacb75`), avoiding repeated pool installs for a bit-identical +3–6% decode gain; Luv approved.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Made supported unary/binary elementwise decode paths capture-safe with persistent broadcast metadata; Deckard's exact-signature hardening completed the landed artifact (`85b6f4e`).
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

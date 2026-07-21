@@ -146,7 +146,9 @@ impl Kernel for WhereKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "Where allocates/uploads/frees per-call broadcast metadata and synchronizes the stream",
+        )
     }
 }

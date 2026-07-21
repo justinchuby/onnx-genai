@@ -70,3 +70,9 @@ Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a send
 ## 2026-07-16T15:39:27Z — Scribe session update
 
 - Fixed `onnx-runtime-python` `onnx_type_string` exhaustiveness for Undefined/Complex64/Complex128 (`f058594`); this main commit includes the completed onnx-rs full-spec merge.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
+
+- Integrated the end-to-end fp16 native CUDA decode path (`c8741ba`): coherent H200 Qwen output at about 344 tok/s with zero CUDA-graph fallbacks; f32 remained near 200 tok/s. Holden approved.

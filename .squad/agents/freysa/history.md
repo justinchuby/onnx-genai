@@ -14,3 +14,5 @@ Reviewed the unified string-serde surface as approve-with-notes.
 
 ### 2026-07-16T00:00:00Z — onnx-rs Python binding review cycle
 Rejected Batty's initial `onnx_rs` binding for lossy paths, an `exists()` preflight, and swallowed `__fspath__` exceptions. Cleared Deckard's `5b348b5` revision after targeted Rust tests and six Python regressions verified lossless paths and native filesystem errors.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

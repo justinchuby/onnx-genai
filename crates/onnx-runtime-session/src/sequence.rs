@@ -1,15 +1,16 @@
-//! ONNX sequence values and byte-oriented Split/Concat helpers.
+//! ONNX sequence values and zero-copy split views.
 //!
 //! Sequence elements reuse the session crate's [`Tensor`] representation. A
-//! [`SeqTensor`] is an immutable `Arc<Tensor>` handle, so constructing, inserting,
-//! erasing, and indexing a sequence only clone `Arc` handles; tensor storage is
-//! never deep-copied by those operations.
+//! [`SeqTensor`] is an immutable view over an `Arc`-owned device allocation, so
+//! constructing, inserting, erasing, indexing, and splitting a sequence only
+//! clone handles and metadata. Tensor storage is never deep-copied by those
+//! operations.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
-use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::{DataType, TensorLayout, compute_contiguous_strides};
 
+use crate::tensor::{SharedTensorBuffer, host_bytes};
 use crate::{SessionError, Tensor};
 
 /// Result type for sequence value and byte-helper operations.
@@ -38,6 +39,8 @@ pub enum SequenceError {
         "{op} index {index} is out of bounds for a sequence of length {len} (valid range {range})",
         range = if *insertion {
             format!("[{}, {}]", -(*len as i128), *len)
+        } else if *len == 0 {
+            "empty (no valid indices)".to_string()
         } else {
             format!("[{}, {}]", -(*len as i128), *len as i128 - 1)
         }
@@ -91,6 +94,15 @@ pub enum SequenceError {
     },
 
     #[error(
+        "SequenceTensor cannot borrow contiguous bytes for shape {shape:?} on {device}: {reason}; use contiguous_bytes() to materialize the view"
+    )]
+    ByteBorrowUnavailable {
+        shape: Vec<usize>,
+        device: String,
+        reason: &'static str,
+    },
+
+    #[error(
         "{op} received {actual} bytes for shape {shape:?} dtype {dtype:?}, expected {expected}"
     )]
     ByteLengthMismatch {
@@ -140,6 +152,7 @@ impl SequenceError {
             | Self::Allocation { op, .. }
             | Self::TensorCreation { op, .. } => op,
             Self::EmptyErase => "SequenceErase",
+            Self::ByteBorrowUnavailable { .. } => "SequenceTensor",
         }
     }
 }
@@ -160,50 +173,373 @@ impl From<SequenceError> for SessionError {
     }
 }
 
-/// An immutable tensor handle used as one sequence element.
+/// An immutable tensor view used as one sequence element.
 ///
-/// Cloning this type only bumps the `Arc` count. The contained [`Tensor`] and
-/// its device allocation are shared without copying.
+/// Cloning this type only bumps the backing allocation's `Arc` count. Shape,
+/// strides, and byte offset are metadata, so a split slice can share the source
+/// allocation even when it is not contiguous.
 #[derive(Clone, Debug)]
 pub struct SeqTensor {
-    tensor: Arc<Tensor>,
+    storage: Arc<SharedTensorBuffer>,
+    pub dtype: DataType,
+    pub shape: Vec<usize>,
+    pub layout: TensorLayout,
+    byte_offset: usize,
 }
 
 impl SeqTensor {
     /// Wrap an existing session tensor in an immutable shared handle.
     pub fn new(tensor: Tensor) -> Self {
+        let (storage, dtype, shape, layout) = tensor.into_shared_parts();
         Self {
-            tensor: Arc::new(tensor),
+            storage,
+            dtype,
+            shape,
+            layout,
+            byte_offset: 0,
         }
     }
 
     /// Build a host tensor from raw element bytes and share it as a sequence item.
     pub fn from_raw(dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> SequenceResult<Self> {
         validate_tensor_bytes("SequenceTensor", bytes, dtype, &shape)?;
-        Tensor::from_raw(dtype, shape, bytes)
-            .map(Self::new)
-            .map_err(|source| SequenceError::TensorCreation {
+        let mut storage = SharedTensorBuffer::allocate_cpu(bytes.len()).map_err(|source| {
+            SequenceError::TensorCreation {
                 op: "SequenceTensor",
                 source,
-            })
+            }
+        })?;
+        let allocator = Arc::clone(storage.allocator());
+        allocator
+            .copy_from_host(
+                bytes,
+                Arc::get_mut(&mut storage)
+                    .expect("fresh sequence storage is uniquely owned")
+                    .buffer_mut(),
+            )
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
+        Ok(Self {
+            storage,
+            dtype,
+            shape,
+            layout: TensorLayout::contiguous(),
+            byte_offset: 0,
+        })
     }
 
-    /// The shared session tensor. Use this with [`Arc::ptr_eq`] to verify sharing.
-    pub fn shared_tensor(&self) -> &Arc<Tensor> {
-        &self.tensor
+    pub(crate) fn from_shared(
+        storage: Arc<SharedTensorBuffer>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        layout: TensorLayout,
+        byte_offset: usize,
+    ) -> SequenceResult<Self> {
+        let strides = layout.resolved_strides(&shape);
+        validate_view_bounds(
+            "SequenceTensor",
+            &shape,
+            &strides,
+            byte_offset,
+            dtype,
+            storage.buffer().len(),
+        )?;
+        Ok(Self {
+            storage,
+            dtype,
+            shape,
+            layout,
+            byte_offset,
+        })
+    }
+
+    /// Whether two handles share the same underlying device allocation.
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.storage, &other.storage)
+    }
+
+    /// Number of live handles to the shared allocation.
+    pub fn storage_strong_count(&self) -> usize {
+        Arc::strong_count(&self.storage)
+    }
+
+    pub(crate) fn storage(&self) -> &Arc<SharedTensorBuffer> {
+        &self.storage
     }
 
     /// Base address of the shared tensor allocation.
     pub fn as_ptr(&self) -> *const std::ffi::c_void {
-        self.tensor.device_ptr()
+        self.storage.buffer().as_ptr()
     }
-}
 
-impl Deref for SeqTensor {
-    type Target = Tensor;
+    /// Byte offset of this view's logical origin from [`Self::as_ptr`].
+    pub fn byte_offset(&self) -> usize {
+        self.byte_offset
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.tensor
+    pub fn device(&self) -> onnx_runtime_ir::DeviceId {
+        self.storage.buffer().device()
+    }
+
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    pub(crate) fn root_len(&self) -> usize {
+        self.storage.buffer().len()
+    }
+
+    /// Materialize this logical tensor as contiguous host bytes.
+    pub fn contiguous_bytes(&self) -> SequenceResult<Vec<u8>> {
+        const OP: &str = "SequenceTensor";
+        let esize = self.dtype.byte_size();
+        if esize == 0 {
+            return Err(SequenceError::UnsupportedDtype {
+                op: OP,
+                dtype: self.dtype,
+            });
+        }
+        let mut copied;
+        let root = if self.device().is_host_accessible() {
+            host_bytes(self.storage.buffer())
+        } else {
+            copied = zeroed_bytes(OP, "device tensor download", self.root_len(), &self.shape)?;
+            self.storage
+                .allocator()
+                .copy_to_host(self.storage.buffer(), &mut copied)
+                .map_err(|source| SequenceError::TensorCreation {
+                    op: OP,
+                    source: source.into(),
+                })?;
+            &copied
+        };
+        let strides = self.layout.resolved_strides(&self.shape);
+        if onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
+            let bytes = self
+                .dtype
+                .checked_storage_bytes(self.numel())
+                .ok_or_else(|| overflow(OP, "tensor byte count", &self.shape))?;
+            let end = checked_add(
+                OP,
+                "tensor byte range",
+                self.byte_offset,
+                bytes,
+                &self.shape,
+            )?;
+            return Ok(root[self.byte_offset..end].to_vec());
+        }
+        gather_strided(
+            root,
+            &self.shape,
+            &strides,
+            self.byte_offset,
+            self.dtype,
+            esize,
+        )
+    }
+
+    fn write_contiguous_range<F>(
+        &self,
+        logical_offset: usize,
+        bytes: usize,
+        destination_offset: usize,
+        scratch: &mut [u8],
+        write: &mut F,
+        stats: &mut ConcatCopyStats,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(usize, &[u8]) -> crate::Result<()>,
+    {
+        const OP: &str = "ConcatFromSequence";
+        let esize = self.dtype.byte_size();
+        if esize == 0 {
+            return Err(SequenceError::UnsupportedDtype {
+                op: OP,
+                dtype: self.dtype,
+            }
+            .into());
+        }
+        let logical_bytes = self
+            .dtype
+            .checked_storage_bytes(checked_product(OP, "source element count", &self.shape)?)
+            .ok_or_else(|| overflow(OP, "source byte count", &self.shape))?;
+        let logical_end = checked_add(
+            OP,
+            "source logical byte range",
+            logical_offset,
+            bytes,
+            &self.shape,
+        )?;
+        if logical_end > logical_bytes || logical_offset % esize != 0 || bytes % esize != 0 {
+            return Err(SequenceError::ByteLengthMismatch {
+                op: OP,
+                dtype: self.dtype,
+                shape: self.shape.clone(),
+                expected: logical_bytes,
+                actual: logical_end,
+            }
+            .into());
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        let root = if self.device().is_host_accessible() {
+            host_bytes(self.storage.buffer())
+        } else {
+            let destination =
+                scratch
+                    .get_mut(..self.root_len())
+                    .ok_or_else(|| SequenceError::Allocation {
+                        op: OP,
+                        context: "device source materialization",
+                        bytes: self.root_len(),
+                    })?;
+            self.storage
+                .allocator()
+                .copy_to_host(self.storage.buffer(), destination)
+                .map_err(|source| SequenceError::TensorCreation {
+                    op: OP,
+                    source: source.into(),
+                })?;
+            stats.source_materializations += 1;
+            destination
+        };
+        let strides = self.layout.resolved_strides(&self.shape);
+        validate_view_bounds(
+            OP,
+            &self.shape,
+            &strides,
+            self.byte_offset,
+            self.dtype,
+            root.len(),
+        )?;
+        if onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
+            let source_offset = checked_add(
+                OP,
+                "contiguous source byte offset",
+                self.byte_offset,
+                logical_offset,
+                &self.shape,
+            )?;
+            let source_end = checked_add(
+                OP,
+                "contiguous source byte range",
+                source_offset,
+                bytes,
+                &self.shape,
+            )?;
+            let source = root
+                .get(source_offset..source_end)
+                .ok_or_else(|| overflow(OP, "contiguous source byte range", &self.shape))?;
+            write(destination_offset, source)?;
+            stats.destination_writes += 1;
+            return Ok(());
+        }
+
+        let logical_strides = compute_contiguous_strides(&self.shape);
+        let start_element = logical_offset / esize;
+        let elements = bytes / esize;
+        for element_offset in 0..elements {
+            let linear = checked_add(
+                OP,
+                "strided source logical index",
+                start_element,
+                element_offset,
+                &self.shape,
+            )?;
+            let mut remainder = linear;
+            let mut source_element = 0i128;
+            for dimension in 0..self.shape.len() {
+                let coordinate = if self.shape[dimension] == 0 {
+                    0
+                } else {
+                    remainder / logical_strides[dimension] as usize
+                };
+                if self.shape[dimension] != 0 {
+                    remainder %= logical_strides[dimension] as usize;
+                }
+                source_element += coordinate as i128 * strides[dimension] as i128;
+            }
+            let source_offset = (self.byte_offset as i128)
+                .checked_add(
+                    source_element
+                        .checked_mul(esize as i128)
+                        .ok_or_else(|| overflow(OP, "strided source byte offset", &self.shape))?,
+                )
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| overflow(OP, "strided source byte offset", &self.shape))?;
+            let source_end = checked_add(
+                OP,
+                "strided source byte range",
+                source_offset,
+                esize,
+                &self.shape,
+            )?;
+            let destination = checked_add(
+                OP,
+                "strided destination byte offset",
+                destination_offset,
+                checked_mul(
+                    OP,
+                    "strided destination element offset",
+                    element_offset,
+                    esize,
+                    &self.shape,
+                )?,
+                &self.shape,
+            )?;
+            let source = root
+                .get(source_offset..source_end)
+                .ok_or_else(|| overflow(OP, "strided source byte range", &self.shape))?;
+            write(destination, source)?;
+            stats.destination_writes += 1;
+        }
+        Ok(())
+    }
+
+    /// Borrow bytes directly when this is a contiguous host view.
+    pub fn as_bytes(&self) -> SequenceResult<&[u8]> {
+        const OP: &str = "SequenceTensor";
+        if !self.device().is_host_accessible() {
+            return Err(SequenceError::ByteBorrowUnavailable {
+                shape: self.shape.clone(),
+                device: format!("{:?}", self.device()),
+                reason: "the storage is not host-accessible",
+            });
+        }
+        let strides = self.layout.resolved_strides(&self.shape);
+        if !onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
+            return Err(SequenceError::ByteBorrowUnavailable {
+                shape: self.shape.clone(),
+                device: format!("{:?}", self.device()),
+                reason: "the view is strided",
+            });
+        }
+        validate_view_bounds(
+            OP,
+            &self.shape,
+            &strides,
+            self.byte_offset,
+            self.dtype,
+            self.root_len(),
+        )?;
+        let bytes = self
+            .dtype
+            .checked_storage_bytes(checked_product(OP, "tensor element count", &self.shape)?)
+            .ok_or_else(|| overflow(OP, "tensor byte count", &self.shape))?;
+        let end = checked_add(
+            OP,
+            "tensor byte range",
+            self.byte_offset,
+            bytes,
+            &self.shape,
+        )?;
+        host_bytes(self.storage.buffer())
+            .get(self.byte_offset..end)
+            .ok_or_else(|| overflow(OP, "tensor byte range", &self.shape))
     }
 }
 
@@ -332,7 +668,6 @@ impl SequenceValue {
     pub fn elements(&self) -> &[SeqTensor] {
         &self.items
     }
-
 }
 
 /// ONNX `SplitToSequence` split-input interpretation.
@@ -358,8 +693,22 @@ pub fn split(
     split: SplitSpec<'_>,
     keepdims: bool,
 ) -> SequenceResult<SequenceValue> {
+    let input = SeqTensor::from_raw(dtype, shape.to_vec(), data)?;
+    split_tensor(&input, axis, split, keepdims)
+}
+
+/// Split a shared tensor into metadata-only views over the same allocation.
+///
+/// No tensor bytes are copied. Every returned element owns an `Arc` clone of
+/// `input`'s storage and records its own shape, strides, and byte offset.
+pub fn split_tensor(
+    input: &SeqTensor,
+    axis: i64,
+    split: SplitSpec<'_>,
+    keepdims: bool,
+) -> SequenceResult<SequenceValue> {
     const OP: &str = "SplitToSequence";
-    let rank = shape.len();
+    let rank = input.shape.len();
     if rank == 0 {
         return Err(SequenceError::InvalidAxis {
             op: OP,
@@ -369,42 +718,101 @@ pub fn split(
         });
     }
     let axis = normalize_axis(OP, axis, rank, false)?;
-    validate_tensor_bytes(OP, data, dtype, shape)?;
-    let axis_dim = shape[axis];
+    let axis_dim = input.shape[axis];
+    let (sizes, squeeze) = split_sizes(OP, axis, axis_dim, split, keepdims, &input.shape)?;
+    let input_strides = input.layout.resolved_strides(&input.shape);
+    let esize = input.dtype.byte_size();
+    if esize == 0 {
+        return Err(SequenceError::UnsupportedDtype {
+            op: OP,
+            dtype: input.dtype,
+        });
+    }
 
-    let (sizes, squeeze) = match split {
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(sizes.len())
+        .map_err(|_| SequenceError::Allocation {
+            op: OP,
+            context: "sequence handles",
+            bytes: sizes.len().saturating_mul(std::mem::size_of::<SeqTensor>()),
+        })?;
+    let mut start = 0usize;
+    for size in sizes {
+        let delta_elements = (start as i128)
+            .checked_mul(input_strides[axis] as i128)
+            .ok_or_else(|| overflow(OP, "split view element offset", &input.shape))?;
+        let delta_bytes = delta_elements
+            .checked_mul(esize as i128)
+            .ok_or_else(|| overflow(OP, "split view byte offset", &input.shape))?;
+        let byte_offset = (input.byte_offset as i128)
+            .checked_add(delta_bytes)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| overflow(OP, "split view byte offset", &input.shape))?;
+
+        let mut shape = clone_shape(OP, &input.shape)?;
+        shape[axis] = size;
+        let mut strides = input_strides.clone();
+        if squeeze {
+            shape.remove(axis);
+            strides.remove(axis);
+        }
+        items.push(SeqTensor::from_shared(
+            Arc::clone(input.storage()),
+            input.dtype,
+            shape,
+            TensorLayout::strided(strides),
+            byte_offset,
+        )?);
+        start = checked_add(OP, "split axis cursor", start, size, &input.shape)?;
+    }
+    Ok(SequenceValue {
+        elem_dtype: input.dtype,
+        items,
+    })
+}
+
+fn split_sizes(
+    op: &'static str,
+    axis: usize,
+    axis_dim: usize,
+    split: SplitSpec<'_>,
+    keepdims: bool,
+    shape: &[usize],
+) -> SequenceResult<(Vec<usize>, bool)> {
+    match split {
         SplitSpec::Each => {
             let mut sizes = Vec::new();
             sizes
                 .try_reserve_exact(axis_dim)
                 .map_err(|_| SequenceError::Allocation {
-                    op: OP,
+                    op,
                     context: "split sizes",
                     bytes: axis_dim.saturating_mul(std::mem::size_of::<usize>()),
                 })?;
             sizes.resize(axis_dim, 1);
-            (sizes, !keepdims)
+            Ok((sizes, !keepdims))
         }
         SplitSpec::Chunk(chunk) => {
             if chunk <= 0 {
                 return Err(SequenceError::InvalidSplit {
-                    op: OP,
+                    op,
                     reason: format!("scalar chunk size {chunk} must be positive"),
                 });
             }
             let chunk = usize::try_from(chunk).map_err(|_| SequenceError::InvalidSplit {
-                op: OP,
+                op,
                 reason: format!("scalar chunk size {chunk} cannot be represented"),
             })?;
             let count = axis_dim
                 .checked_add(chunk - 1)
-                .ok_or_else(|| overflow(OP, "split chunk count", shape))?
+                .ok_or_else(|| overflow(op, "split chunk count", shape))?
                 / chunk;
             let mut sizes = Vec::new();
             sizes
                 .try_reserve_exact(count)
                 .map_err(|_| SequenceError::Allocation {
-                    op: OP,
+                    op,
                     context: "split sizes",
                     bytes: count.saturating_mul(std::mem::size_of::<usize>()),
                 })?;
@@ -414,147 +822,335 @@ pub fn split(
                 sizes.push(size);
                 remaining -= size;
             }
-            (sizes, false)
+            Ok((sizes, false))
         }
         SplitSpec::Sizes(values) => {
             let mut sizes = Vec::new();
             sizes
                 .try_reserve_exact(values.len())
                 .map_err(|_| SequenceError::Allocation {
-                    op: OP,
+                    op,
                     context: "split sizes",
                     bytes: values.len().saturating_mul(std::mem::size_of::<usize>()),
                 })?;
             let mut sum = 0usize;
             for &value in values {
                 let value = usize::try_from(value).map_err(|_| SequenceError::InvalidSplit {
-                    op: OP,
+                    op,
                     reason: format!("size {value} must be non-negative"),
                 })?;
                 sum = sum
                     .checked_add(value)
-                    .ok_or_else(|| overflow(OP, "split size sum", shape))?;
+                    .ok_or_else(|| overflow(op, "split size sum", shape))?;
                 sizes.push(value);
             }
             if sum != axis_dim {
                 return Err(SequenceError::InvalidSplit {
-                    op: OP,
+                    op,
                     reason: format!("sizes sum to {sum}, but axis {axis} has extent {axis_dim}"),
                 });
             }
-            (sizes, false)
+            Ok((sizes, false))
         }
-    };
-
-    let parts = split_axis(data, shape, axis, &sizes, dtype.byte_size())?;
-    let mut items = Vec::new();
-    items
-        .try_reserve_exact(parts.len())
-        .map_err(|_| SequenceError::Allocation {
-            op: OP,
-            context: "sequence handles",
-            bytes: parts.len().saturating_mul(std::mem::size_of::<SeqTensor>()),
-        })?;
-    for (mut part_shape, bytes) in parts {
-        if squeeze {
-            part_shape.remove(axis);
-        }
-        let tensor = Tensor::from_raw(dtype, part_shape, &bytes)
-            .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
-        items.push(SeqTensor::new(tensor));
     }
-    Ok(SequenceValue {
-        elem_dtype: dtype,
-        items,
-    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConcatCopyStats {
+    pub destination_writes: usize,
+    pub source_materializations: usize,
+}
+
+/// Fully validated geometry for `ConcatFromSequence`.
+pub(crate) struct ConcatPlan {
+    pub dtype: DataType,
+    pub shape: Vec<usize>,
+    pub bytes: usize,
+    axis: usize,
+    new_axis: bool,
+    outer: usize,
+    inner: usize,
+    total_axis: usize,
+}
+
+impl ConcatPlan {
+    pub(crate) fn new(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceResult<Self> {
+        const OP: &str = "ConcatFromSequence";
+        let first = sequence.items.first().ok_or(SequenceError::InvalidSplit {
+            op: OP,
+            reason: "cannot concatenate an empty sequence".to_string(),
+        })?;
+        let dtype = sequence.elem_dtype;
+        let esize = dtype.byte_size();
+        if esize == 0 {
+            return Err(SequenceError::UnsupportedDtype { op: OP, dtype });
+        }
+        let rank = first.shape.len();
+        let output_rank = rank
+            .checked_add(usize::from(new_axis))
+            .ok_or_else(|| overflow(OP, "concat output rank", &first.shape))?;
+        let axis = normalize_axis(OP, axis, output_rank, new_axis)?;
+
+        for (index, item) in sequence.items.iter().enumerate() {
+            if item.dtype != dtype {
+                return Err(SequenceError::DtypeMismatch {
+                    op: OP,
+                    index: Some(index),
+                    expected: dtype,
+                    actual: item.dtype,
+                });
+            }
+            let mismatch = if new_axis {
+                item.shape != first.shape
+            } else {
+                item.shape.len() != rank
+                    || item.shape.iter().enumerate().any(|(dimension, &extent)| {
+                        dimension != axis && extent != first.shape[dimension]
+                    })
+            };
+            if mismatch {
+                return Err(SequenceError::ShapeMismatch {
+                    op: OP,
+                    index,
+                    expected: clone_shape(OP, &first.shape)?,
+                    actual: clone_shape(OP, &item.shape)?,
+                    requirement: if new_axis {
+                        "new_axis=1 requires identical shapes"
+                    } else {
+                        "all dimensions except the concat axis must match"
+                    },
+                });
+            }
+            validate_view_bounds(
+                OP,
+                &item.shape,
+                &item.layout.resolved_strides(&item.shape),
+                item.byte_offset,
+                item.dtype,
+                item.root_len(),
+            )?;
+        }
+
+        if new_axis {
+            let outer = checked_product(OP, "stack outer element count", &first.shape[..axis])?;
+            let inner_elements =
+                checked_product(OP, "stack inner element count", &first.shape[axis..])?;
+            let inner = checked_mul(
+                OP,
+                "stack inner byte count",
+                inner_elements,
+                esize,
+                &first.shape,
+            )?;
+            let mut shape = Vec::new();
+            shape
+                .try_reserve_exact(output_rank)
+                .map_err(|_| SequenceError::Allocation {
+                    op: OP,
+                    context: "stack output shape",
+                    bytes: output_rank.saturating_mul(std::mem::size_of::<usize>()),
+                })?;
+            shape.extend_from_slice(&first.shape[..axis]);
+            shape.push(sequence.items.len());
+            shape.extend_from_slice(&first.shape[axis..]);
+            let bytes = checked_mul(
+                OP,
+                "stack output byte count",
+                checked_mul(
+                    OP,
+                    "stack output row count",
+                    outer,
+                    sequence.items.len(),
+                    &shape,
+                )?,
+                inner,
+                &shape,
+            )?;
+            Ok(Self {
+                dtype,
+                shape,
+                bytes,
+                axis,
+                new_axis,
+                outer,
+                inner,
+                total_axis: sequence.items.len(),
+            })
+        } else {
+            let outer = checked_product(OP, "concat outer element count", &first.shape[..axis])?;
+            let inner_elements =
+                checked_product(OP, "concat inner element count", &first.shape[axis + 1..])?;
+            let inner = checked_mul(
+                OP,
+                "concat inner byte count",
+                inner_elements,
+                esize,
+                &first.shape,
+            )?;
+            let mut total_axis = 0usize;
+            for item in &sequence.items {
+                total_axis = checked_add(
+                    OP,
+                    "concat axis extent",
+                    total_axis,
+                    item.shape[axis],
+                    &first.shape,
+                )?;
+            }
+            let mut shape = clone_shape(OP, &first.shape)?;
+            shape[axis] = total_axis;
+            let bytes = checked_mul(
+                OP,
+                "concat output byte count",
+                checked_mul(OP, "concat output row count", outer, total_axis, &shape)?,
+                inner,
+                &shape,
+            )?;
+            Ok(Self {
+                dtype,
+                shape,
+                bytes,
+                axis,
+                new_axis,
+                outer,
+                inner,
+                total_axis,
+            })
+        }
+    }
+
+    pub(crate) fn write<F>(
+        &self,
+        sequence: &SequenceValue,
+        mut write: F,
+    ) -> crate::Result<ConcatCopyStats>
+    where
+        F: FnMut(usize, &[u8]) -> crate::Result<()>,
+    {
+        const OP: &str = "ConcatFromSequence";
+        let max_root = sequence
+            .items
+            .iter()
+            .filter(|item| !item.device().is_host_accessible())
+            .map(SeqTensor::root_len)
+            .max()
+            .unwrap_or(0);
+        let mut scratch = if max_root == 0 {
+            Vec::new()
+        } else {
+            zeroed_bytes(OP, "device source materialization", max_root, &self.shape)?
+        };
+        let mut stats = ConcatCopyStats::default();
+        if self.new_axis {
+            for outer_index in 0..self.outer {
+                for (item_index, item) in sequence.items.iter().enumerate() {
+                    let source_offset = checked_mul(
+                        OP,
+                        "stack source offset",
+                        outer_index,
+                        self.inner,
+                        &item.shape,
+                    )?;
+                    let destination_row = checked_add(
+                        OP,
+                        "stack destination row",
+                        checked_mul(
+                            OP,
+                            "stack destination outer offset",
+                            outer_index,
+                            self.total_axis,
+                            &self.shape,
+                        )?,
+                        item_index,
+                        &self.shape,
+                    )?;
+                    let destination_offset = checked_mul(
+                        OP,
+                        "stack destination byte offset",
+                        destination_row,
+                        self.inner,
+                        &self.shape,
+                    )?;
+                    item.write_contiguous_range(
+                        source_offset,
+                        self.inner,
+                        destination_offset,
+                        &mut scratch,
+                        &mut write,
+                        &mut stats,
+                    )?;
+                }
+            }
+        } else {
+            for outer_index in 0..self.outer {
+                let mut axis_cursor = 0usize;
+                for item in &sequence.items {
+                    let copy_bytes = checked_mul(
+                        OP,
+                        "concat copy width",
+                        item.shape[self.axis],
+                        self.inner,
+                        &item.shape,
+                    )?;
+                    let source_offset = checked_mul(
+                        OP,
+                        "concat source byte offset",
+                        outer_index,
+                        copy_bytes,
+                        &item.shape,
+                    )?;
+                    let destination_row = checked_add(
+                        OP,
+                        "concat destination row",
+                        checked_mul(
+                            OP,
+                            "concat destination outer offset",
+                            outer_index,
+                            self.total_axis,
+                            &self.shape,
+                        )?,
+                        axis_cursor,
+                        &self.shape,
+                    )?;
+                    let destination_offset = checked_mul(
+                        OP,
+                        "concat destination byte offset",
+                        destination_row,
+                        self.inner,
+                        &self.shape,
+                    )?;
+                    item.write_contiguous_range(
+                        source_offset,
+                        copy_bytes,
+                        destination_offset,
+                        &mut scratch,
+                        &mut write,
+                        &mut stats,
+                    )?;
+                    axis_cursor = checked_add(
+                        OP,
+                        "concat axis cursor",
+                        axis_cursor,
+                        item.shape[self.axis],
+                        &self.shape,
+                    )?;
+                }
+            }
+        }
+        Ok(stats)
+    }
 }
 
 /// Concatenate a sequence along an existing axis or stack it on a new axis.
 pub fn concat(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceResult<SeqTensor> {
     const OP: &str = "ConcatFromSequence";
-    let first = sequence.items.first().ok_or(SequenceError::InvalidSplit {
-        op: OP,
-        reason: "cannot concatenate an empty sequence".to_string(),
-    })?;
-    let dtype = sequence.elem_dtype;
-    let esize = dtype.byte_size();
-    if esize == 0 {
-        return Err(SequenceError::UnsupportedDtype { op: OP, dtype });
-    }
-    let rank = first.shape.len();
-    let output_rank = rank
-        .checked_add(usize::from(new_axis))
-        .ok_or_else(|| overflow(OP, "concat output rank", &first.shape))?;
-    let axis = normalize_axis(OP, axis, output_rank, new_axis)?;
-
-    let mut shapes = Vec::new();
-    let mut elements = Vec::new();
-    shapes
-        .try_reserve_exact(sequence.items.len())
-        .map_err(|_| SequenceError::Allocation {
-            op: OP,
-            context: "element shapes",
-            bytes: sequence
-                .items
-                .len()
-                .saturating_mul(std::mem::size_of::<Vec<usize>>()),
-        })?;
-    elements
-        .try_reserve_exact(sequence.items.len())
-        .map_err(|_| SequenceError::Allocation {
-            op: OP,
-            context: "element byte slices",
-            bytes: sequence
-                .items
-                .len()
-                .saturating_mul(std::mem::size_of::<&[u8]>()),
-        })?;
-    for (index, item) in sequence.items.iter().enumerate() {
-        if !item.device().is_host_accessible() {
-            return Err(SequenceError::NonHostTensor {
-                op: OP,
-                index,
-                device: format!("{:?}", item.device()),
-            });
-        }
-        validate_tensor_bytes(OP, item.as_bytes(), item.dtype, &item.shape)?;
-        shapes.push(clone_shape(OP, &item.shape)?);
-        elements.push(item.as_bytes());
-    }
-
-    let (shape, bytes) = if new_axis {
-        for (index, shape) in shapes.iter().enumerate().skip(1) {
-            if shape != &shapes[0] {
-                return Err(SequenceError::ShapeMismatch {
-                    op: OP,
-                    index,
-                    expected: clone_shape(OP, &shapes[0])?,
-                    actual: clone_shape(OP, shape)?,
-                    requirement: "new_axis=1 requires identical shapes",
-                });
-            }
-        }
-        stack_new_axis(&elements, &shapes[0], axis, esize)?
-    } else {
-        for (index, shape) in shapes.iter().enumerate().skip(1) {
-            let mismatch = shape.len() != rank
-                || shape.iter().enumerate().any(|(dimension, &extent)| {
-                    dimension != axis && extent != shapes[0][dimension]
-                });
-            if mismatch {
-                return Err(SequenceError::ShapeMismatch {
-                    op: OP,
-                    index,
-                    expected: clone_shape(OP, &shapes[0])?,
-                    actual: clone_shape(OP, shape)?,
-                    requirement: "all dimensions except the concat axis must match",
-                });
-            }
-        }
-        concat_axis(&elements, &shapes, axis, esize)?
-    };
-    let tensor = Tensor::from_raw(dtype, shape, &bytes)
+    let plan = ConcatPlan::new(sequence, axis, new_axis)?;
+    let mut tensor = Tensor::allocate_cpu(plan.dtype, plan.shape.clone())
         .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
+    plan.write(sequence, |offset, bytes| {
+        tensor.copy_from_host_at(offset, bytes)
+    })
+    .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
     Ok(SeqTensor::new(tensor))
 }
 
@@ -734,232 +1330,109 @@ fn validate_tensor_bytes(
     Ok(())
 }
 
-/// Split already-validated contiguous bytes along one normalized axis.
-pub(crate) fn split_axis(
-    data: &[u8],
+fn validate_view_bounds(
+    op: &'static str,
     shape: &[usize],
-    axis: usize,
-    sizes: &[usize],
-    esize: usize,
-) -> SequenceResult<Vec<(Vec<usize>, Vec<u8>)>> {
-    const OP: &str = "SplitToSequence";
-    if axis >= shape.len() {
-        return Err(SequenceError::InvalidAxis {
-            op: OP,
-            axis: i64::try_from(axis).unwrap_or(i64::MAX),
-            rank: shape.len(),
-            new_axis: false,
+    strides: &[i64],
+    byte_offset: usize,
+    dtype: DataType,
+    root_len: usize,
+) -> SequenceResult<()> {
+    if shape.len() != strides.len() {
+        return Err(SequenceError::InvalidSplit {
+            op,
+            reason: format!(
+                "view rank mismatch: shape has {} dims but strides has {}",
+                shape.len(),
+                strides.len()
+            ),
         });
     }
+    let esize = dtype.byte_size();
     if esize == 0 {
-        return Err(SequenceError::InvalidSplit {
-            op: OP,
-            reason: "element byte size must be positive".to_string(),
-        });
+        return Err(SequenceError::UnsupportedDtype { op, dtype });
     }
-    let axis_dim = shape[axis];
-    let mut size_sum = 0usize;
-    for &size in sizes {
-        size_sum = checked_add(OP, "split size sum", size_sum, size, shape)?;
+    if shape.contains(&0) {
+        return Ok(());
     }
-    if size_sum != axis_dim {
-        return Err(SequenceError::InvalidSplit {
-            op: OP,
-            reason: format!("sizes sum to {size_sum}, but axis {axis} has extent {axis_dim}"),
-        });
-    }
-
-    let outer = checked_product(OP, "split outer element count", &shape[..axis])?;
-    let inner_elements = checked_product(OP, "split inner element count", &shape[axis + 1..])?;
-    let inner = checked_mul(OP, "split inner byte count", inner_elements, esize, shape)?;
-    let input_rows = checked_mul(OP, "split input row count", outer, axis_dim, shape)?;
-    let input_bytes = checked_mul(OP, "split input byte count", input_rows, inner, shape)?;
-    addressable(OP, "split input byte count", input_bytes, shape)?;
-    if data.len() != input_bytes {
-        return Err(SequenceError::ByteLengthMismatch {
-            op: OP,
-            dtype: DataType::Uint8,
-            shape: clone_shape(OP, shape)?,
-            expected: input_bytes,
-            actual: data.len(),
-        });
-    }
-
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(sizes.len())
-        .map_err(|_| SequenceError::Allocation {
-            op: OP,
-            context: "split outputs",
-            bytes: sizes
-                .len()
-                .saturating_mul(std::mem::size_of::<(Vec<usize>, Vec<u8>)>()),
-        })?;
-    let mut start = 0usize;
-    for &size in sizes {
-        let output_rows = checked_mul(OP, "split output row count", outer, size, shape)?;
-        let output_bytes = checked_mul(OP, "split output byte count", output_rows, inner, shape)?;
-        let mut bytes = zeroed_bytes(OP, "split output", output_bytes, shape)?;
-        if inner != 0 && size != 0 {
-            let copy_bytes = checked_mul(OP, "split copy width", size, inner, shape)?;
-            for outer_index in 0..outer {
-                let source_row = checked_add(
-                    OP,
-                    "split source row",
-                    checked_mul(
-                        OP,
-                        "split source outer offset",
-                        outer_index,
-                        axis_dim,
-                        shape,
-                    )?,
-                    start,
-                    shape,
-                )?;
-                let source_offset =
-                    checked_mul(OP, "split source byte offset", source_row, inner, shape)?;
-                let source_end = checked_add(
-                    OP,
-                    "split source byte range",
-                    source_offset,
-                    copy_bytes,
-                    shape,
-                )?;
-                let destination_offset = checked_mul(
-                    OP,
-                    "split destination byte offset",
-                    outer_index,
-                    copy_bytes,
-                    shape,
-                )?;
-                let destination_end = checked_add(
-                    OP,
-                    "split destination byte range",
-                    destination_offset,
-                    copy_bytes,
-                    shape,
-                )?;
-                bytes[destination_offset..destination_end]
-                    .copy_from_slice(&data[source_offset..source_end]);
-            }
+    let mut min_element = 0i128;
+    let mut max_element = 0i128;
+    for (&dim, &stride) in shape.iter().zip(strides) {
+        let span = (dim.saturating_sub(1) as i128)
+            .checked_mul(stride as i128)
+            .ok_or_else(|| overflow(op, "view stride span", shape))?;
+        if span < 0 {
+            min_element = min_element
+                .checked_add(span)
+                .ok_or_else(|| overflow(op, "view minimum offset", shape))?;
+        } else {
+            max_element = max_element
+                .checked_add(span)
+                .ok_or_else(|| overflow(op, "view maximum offset", shape))?;
         }
-        let mut output_shape = clone_shape(OP, shape)?;
-        output_shape[axis] = size;
-        output.push((output_shape, bytes));
-        start = checked_add(OP, "split axis cursor", start, size, shape)?;
     }
-    Ok(output)
+    let origin = byte_offset as i128;
+    let min_byte = origin
+        .checked_add(
+            min_element
+                .checked_mul(esize as i128)
+                .ok_or_else(|| overflow(op, "view minimum byte offset", shape))?,
+        )
+        .ok_or_else(|| overflow(op, "view minimum byte offset", shape))?;
+    let end_byte = origin
+        .checked_add(
+            max_element
+                .checked_mul(esize as i128)
+                .ok_or_else(|| overflow(op, "view maximum byte offset", shape))?,
+        )
+        .and_then(|offset| offset.checked_add(esize as i128))
+        .ok_or_else(|| overflow(op, "view byte range", shape))?;
+    if min_byte < 0 || end_byte > root_len as i128 {
+        return Err(SequenceError::InvalidSplit {
+            op,
+            reason: format!(
+                "view byte range [{min_byte}, {end_byte}) exceeds backing allocation of {root_len} bytes"
+            ),
+        });
+    }
+    Ok(())
 }
 
-/// Concatenate already-validated contiguous element bytes along an existing axis.
-pub(crate) fn concat_axis(
-    elements: &[&[u8]],
-    shapes: &[Vec<usize>],
-    axis: usize,
+fn gather_strided(
+    root: &[u8],
+    shape: &[usize],
+    strides: &[i64],
+    byte_offset: usize,
+    dtype: DataType,
     esize: usize,
-) -> SequenceResult<(Vec<usize>, Vec<u8>)> {
-    const OP: &str = "ConcatFromSequence";
-    let base = shapes.first().ok_or(SequenceError::InvalidSplit {
-        op: OP,
-        reason: "cannot concatenate an empty sequence".to_string(),
-    })?;
-    if elements.len() != shapes.len() || axis >= base.len() || esize == 0 {
-        return Err(SequenceError::InvalidSplit {
-            op: OP,
-            reason: "invalid element/shape count, axis, or element byte size".to_string(),
-        });
+) -> SequenceResult<Vec<u8>> {
+    const OP: &str = "SequenceTensor";
+    validate_view_bounds(OP, shape, strides, byte_offset, dtype, root.len())?;
+    let numel = checked_product(OP, "view element count", shape)?;
+    let bytes = checked_mul(OP, "view byte count", numel, esize, shape)?;
+    let mut output = zeroed_bytes(OP, "strided tensor materialization", bytes, shape)?;
+    if numel == 0 {
+        return Ok(output);
     }
-    let outer = checked_product(OP, "concat outer element count", &base[..axis])?;
-    let inner_elements = checked_product(OP, "concat inner element count", &base[axis + 1..])?;
-    let inner = checked_mul(OP, "concat inner byte count", inner_elements, esize, base)?;
-    let mut total_axis = 0usize;
-    for shape in shapes {
-        total_axis = checked_add(OP, "concat axis extent", total_axis, shape[axis], base)?;
-    }
-    let output_rows = checked_mul(OP, "concat output row count", outer, total_axis, base)?;
-    let output_bytes = checked_mul(OP, "concat output byte count", output_rows, inner, base)?;
-    let mut bytes = zeroed_bytes(OP, "concat output", output_bytes, base)?;
-
-    for (index, (element, shape)) in elements.iter().zip(shapes).enumerate() {
-        let rows = checked_mul(OP, "concat source row count", outer, shape[axis], shape)?;
-        let expected = checked_mul(OP, "concat source byte count", rows, inner, shape)?;
-        addressable(OP, "concat source byte count", expected, shape)?;
-        if element.len() != expected {
-            return Err(SequenceError::ByteLengthMismatch {
-                op: OP,
-                dtype: DataType::Uint8,
-                shape: clone_shape(OP, shape)?,
-                expected,
-                actual: element.len(),
-            });
-        }
-        if shape.len() != base.len() {
-            return Err(SequenceError::ShapeMismatch {
-                op: OP,
-                index,
-                expected: clone_shape(OP, base)?,
-                actual: clone_shape(OP, shape)?,
-                requirement: "ranks must match",
-            });
-        }
-    }
-
-    if inner != 0 && total_axis != 0 {
-        for outer_index in 0..outer {
-            let mut axis_cursor = 0usize;
-            for (element, shape) in elements.iter().zip(shapes) {
-                let size = shape[axis];
-                let copy_bytes = checked_mul(OP, "concat copy width", size, inner, base)?;
-                let source_offset = checked_mul(
-                    OP,
-                    "concat source byte offset",
-                    outer_index,
-                    copy_bytes,
-                    base,
-                )?;
-                let source_end = checked_add(
-                    OP,
-                    "concat source byte range",
-                    source_offset,
-                    copy_bytes,
-                    base,
-                )?;
-                let destination_row = checked_add(
-                    OP,
-                    "concat destination row",
-                    checked_mul(
-                        OP,
-                        "concat destination outer offset",
-                        outer_index,
-                        total_axis,
-                        base,
-                    )?,
-                    axis_cursor,
-                    base,
-                )?;
-                let destination_offset = checked_mul(
-                    OP,
-                    "concat destination byte offset",
-                    destination_row,
-                    inner,
-                    base,
-                )?;
-                let destination_end = checked_add(
-                    OP,
-                    "concat destination byte range",
-                    destination_offset,
-                    copy_bytes,
-                    base,
-                )?;
-                bytes[destination_offset..destination_end]
-                    .copy_from_slice(&element[source_offset..source_end]);
-                axis_cursor = checked_add(OP, "concat axis cursor", axis_cursor, size, base)?;
+    let logical_strides = compute_contiguous_strides(shape);
+    for linear in 0..numel {
+        let mut remainder = linear;
+        let mut source_element = 0i128;
+        for dimension in 0..shape.len() {
+            let coordinate = if shape[dimension] == 0 {
+                0
+            } else {
+                remainder / logical_strides[dimension] as usize
+            };
+            if shape[dimension] != 0 {
+                remainder %= logical_strides[dimension] as usize;
             }
+            source_element += coordinate as i128 * strides[dimension] as i128;
         }
+        let source = (byte_offset as i128 + source_element * esize as i128) as usize;
+        output[linear * esize..(linear + 1) * esize].copy_from_slice(&root[source..source + esize]);
     }
-    let mut output_shape = clone_shape(OP, base)?;
-    output_shape[axis] = total_axis;
-    Ok((output_shape, bytes))
+    Ok(output)
 }
 
 /// Stack already-validated contiguous element bytes along a new axis.
@@ -1092,27 +1565,60 @@ mod tests {
     fn value_ops_share_tensor_arcs_without_copying() {
         let original = elem(DataType::Uint8, &[1], &[7]);
         let sequence = SequenceValue::construct(vec![original.clone()]).expect("construct");
-        assert!(Arc::ptr_eq(
-            original.shared_tensor(),
-            sequence.elements()[0].shared_tensor()
-        ));
+        assert!(original.shares_storage_with(&sequence.elements()[0]));
 
         let inserted = elem(DataType::Uint8, &[1], &[9]);
         let sequence = sequence.insert(inserted.clone(), Some(-1)).expect("insert");
-        assert!(Arc::ptr_eq(
-            inserted.shared_tensor(),
-            sequence.at(0).expect("at").shared_tensor()
-        ));
-        assert!(Arc::ptr_eq(
-            original.shared_tensor(),
-            sequence.at(1).expect("at").shared_tensor()
-        ));
+        assert!(inserted.shares_storage_with(&sequence.at(0).expect("at")));
+        assert!(original.shares_storage_with(&sequence.at(1).expect("at")));
 
         let erased = sequence.erase(Some(0)).expect("erase");
-        assert!(Arc::ptr_eq(
-            original.shared_tensor(),
-            erased.at(-1).expect("negative at").shared_tensor()
+        assert!(original.shares_storage_with(&erased.at(-1).expect("negative at")));
+    }
+
+    #[test]
+    fn moving_tensor_into_sequence_preserves_allocation_pointer() {
+        let tensor = Tensor::from_raw(DataType::Uint8, vec![2], &[4, 5]).unwrap();
+        let pointer = tensor.device_ptr();
+        let element = SeqTensor::new(tensor);
+        assert_eq!(element.as_ptr(), pointer);
+        let sequence = SequenceValue::construct(vec![element.clone()]).unwrap();
+        assert_eq!(sequence.at(0).unwrap().as_ptr(), pointer);
+        assert_eq!(element.storage_strong_count(), 2);
+    }
+
+    #[test]
+    fn split_produces_shared_strided_views_without_copying() {
+        let input = elem(DataType::Uint8, &[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let sequence = split_tensor(&input, 1, SplitSpec::Sizes(&[1, 2]), true).expect("split");
+        assert_eq!(sequence.length(), 2);
+        assert!(input.shares_storage_with(&sequence.elements()[0]));
+        assert!(input.shares_storage_with(&sequence.elements()[1]));
+        assert_eq!(sequence.elements()[0].byte_offset(), 0);
+        assert_eq!(sequence.elements()[1].byte_offset(), 1);
+        assert_eq!(
+            sequence.elements()[0].contiguous_bytes().unwrap(),
+            vec![0, 3]
+        );
+        assert_eq!(
+            sequence.elements()[1].contiguous_bytes().unwrap(),
+            vec![1, 2, 4, 5]
+        );
+    }
+
+    #[test]
+    fn strided_split_element_byte_borrow_is_fallible_without_panicking() {
+        let input = elem(DataType::Uint8, &[2, 3], &[0, 1, 2, 3, 4, 5]);
+        let sequence = split_tensor(&input, 1, SplitSpec::Sizes(&[1, 2]), true).expect("split");
+        let element = &sequence.elements()[0];
+        assert!(matches!(
+            element.as_bytes(),
+            Err(SequenceError::ByteBorrowUnavailable {
+                reason: "the view is strided",
+                ..
+            })
         ));
+        assert_eq!(element.contiguous_bytes().unwrap(), vec![0, 3]);
     }
 
     #[test]
@@ -1129,12 +1635,26 @@ mod tests {
             .insert(elem(DataType::Uint8, &[1], &[3]), Some(2))
             .unwrap();
         assert_eq!(three.length(), 3);
-        assert_eq!(three.at(0).unwrap().as_bytes(), &[2]);
-        assert_eq!(three.at(-1).unwrap().as_bytes(), &[3]);
+        assert_eq!(three.at(0).unwrap().as_bytes().unwrap(), &[2]);
+        assert_eq!(three.at(-1).unwrap().as_bytes().unwrap(), &[3]);
         let erased = three.erase(Some(-2)).unwrap();
         assert_eq!(erased.length(), 2);
-        assert_eq!(erased.at(0).unwrap().as_bytes(), &[2]);
-        assert_eq!(erased.at(1).unwrap().as_bytes(), &[3]);
+        assert_eq!(erased.at(0).unwrap().as_bytes().unwrap(), &[2]);
+        assert_eq!(erased.at(1).unwrap().as_bytes().unwrap(), &[3]);
+    }
+
+    #[test]
+    fn empty_sequence_edges_are_clean_errors() {
+        let empty = SequenceValue::empty(DataType::Uint8);
+        assert!(matches!(empty.erase(None), Err(SequenceError::EmptyErase)));
+        assert!(matches!(
+            empty.at(0),
+            Err(SequenceError::IndexOutOfBounds { len: 0, .. })
+        ));
+        assert!(matches!(
+            concat(&empty, 0, false),
+            Err(SequenceError::InvalidSplit { .. })
+        ));
     }
 
     #[test]
@@ -1162,37 +1682,23 @@ mod tests {
             (vec![3, 4], 1, true),
             (vec![3, 4], 0, false),
         ] {
-            let sequence = split(
-                &data,
-                DataType::Uint8,
-                &shape,
-                axis,
-                SplitSpec::Each,
-                keepdims,
-            )
-            .unwrap();
+            let input = elem(DataType::Uint8, &shape, &data);
+            let sequence = split_tensor(&input, axis, SplitSpec::Each, keepdims).unwrap();
             let concat_axis = if keepdims { axis } else { 0 };
             let rebuilt = concat(&sequence, concat_axis, !keepdims).unwrap();
             assert_eq!(rebuilt.shape, shape);
-            assert_eq!(rebuilt.as_bytes(), data);
+            assert_eq!(rebuilt.as_bytes().unwrap(), data);
         }
     }
 
     #[test]
     fn split_concat_roundtrip_explicit_sizes() {
         let data: Vec<u8> = (0..12).collect();
-        let sequence = split(
-            &data,
-            DataType::Uint8,
-            &[3, 4],
-            1,
-            SplitSpec::Sizes(&[1, 3]),
-            false,
-        )
-        .unwrap();
+        let input = elem(DataType::Uint8, &[3, 4], &data);
+        let sequence = split_tensor(&input, 1, SplitSpec::Sizes(&[1, 3]), false).unwrap();
         let rebuilt = concat(&sequence, 1, false).unwrap();
         assert_eq!(rebuilt.shape, vec![3, 4]);
-        assert_eq!(rebuilt.as_bytes(), data);
+        assert_eq!(rebuilt.as_bytes().unwrap(), data);
     }
 
     #[test]
@@ -1202,15 +1708,44 @@ mod tests {
         let sequence = SequenceValue::construct(vec![a, b]).unwrap();
         let front = concat(&sequence, 0, true).unwrap();
         assert_eq!(front.shape, vec![2, 2]);
-        assert_eq!(front.as_bytes(), &[1, 2, 3, 4]);
+        assert_eq!(front.as_bytes().unwrap(), &[1, 2, 3, 4]);
         let back = concat(&sequence, 1, true).unwrap();
         assert_eq!(back.shape, vec![2, 2]);
-        assert_eq!(back.as_bytes(), &[1, 3, 2, 4]);
+        assert_eq!(back.as_bytes().unwrap(), &[1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn concat_plan_uses_one_final_destination_without_source_materialization() {
+        let a = elem(DataType::Uint8, &[2], &[1, 2]);
+        let b = elem(DataType::Uint8, &[2], &[3, 4]);
+        let sequence = SequenceValue::construct(vec![a, b]).unwrap();
+        let plan = ConcatPlan::new(&sequence, 0, false).unwrap();
+        let mut destination_allocations = 0;
+        let mut destination = {
+            destination_allocations += 1;
+            vec![0; plan.bytes]
+        };
+        let stats = plan
+            .write(&sequence, |offset, bytes| {
+                destination[offset..offset + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(destination_allocations, 1);
+        assert_eq!(stats.source_materializations, 0);
+        assert_eq!(stats.destination_writes, 2);
+        assert_eq!(destination, vec![1, 2, 3, 4]);
     }
 
     #[test]
     fn byte_count_above_isize_max_is_rejected() {
-        let error = split_axis(&[], &[isize::MAX as usize + 1, 1], 1, &[1], 1).unwrap_err();
+        let error = validate_tensor_bytes(
+            "SplitToSequence",
+            &[],
+            DataType::Uint8,
+            &[isize::MAX as usize + 1, 1],
+        )
+        .unwrap_err();
         assert!(matches!(error, SequenceError::ShapeOverflow { .. }));
     }
 

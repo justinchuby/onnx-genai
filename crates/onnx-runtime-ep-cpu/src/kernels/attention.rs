@@ -423,6 +423,28 @@ impl Kernel for AttentionKernel {
             )));
         }
         let group = q_heads / kv_heads;
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            // Dominant SDPA work: QKᵀ and probability·V MACs (two FLOPs each),
+            // plus the standalone softmax estimate over every score.
+            let score_elements = (batch as u64)
+                .saturating_mul(q_heads as u64)
+                .saturating_mul(q_seq as u64)
+                .saturating_mul(total_seq as u64);
+            let qk_flops = score_elements
+                .saturating_mul(head_size as u64)
+                .saturating_mul(2);
+            let pv_flops = score_elements
+                .saturating_mul(v_head_size as u64)
+                .saturating_mul(2);
+            let softmax_flops = score_elements.saturating_mul(4).saturating_add(
+                (batch as u64)
+                    .saturating_mul(q_heads as u64)
+                    .saturating_mul(q_seq as u64),
+            );
+            qk_flops
+                .saturating_add(pv_flops)
+                .saturating_add(softmax_flops)
+        });
 
         let scale = self
             .scale

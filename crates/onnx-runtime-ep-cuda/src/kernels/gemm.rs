@@ -363,10 +363,10 @@ impl Kernel for GemmKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // Per-call workspace alloc/free is not capturable (same follow-up as
-        // MatMul: pool the workspace on the stream in a later slice).
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::unsupported(
+            "per-call workspace allocation/free is not capturable",
+        )
     }
 }
 

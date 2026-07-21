@@ -23,9 +23,9 @@
 //! `"optimization"` is a generic, model-agnostic option.
 
 use onnx_runtime_ir::{
-    static_shape, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+    DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
-use onnx_runtime_loader::{encode_model, Model};
+use onnx_runtime_loader::{Model, encode_model};
 use onnx_runtime_session::{InferenceSession, Tensor};
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
@@ -59,7 +59,11 @@ fn node(
     inputs: &[ValueId],
     out_dims: &[usize],
 ) -> ValueId {
-    let out = g.create_named_value(name, DataType::Float32, static_shape(out_dims.iter().copied()));
+    let out = g.create_named_value(
+        name,
+        DataType::Float32,
+        static_shape(out_dims.iter().copied()),
+    );
     g.insert_node(Node::new(
         NodeId(0),
         op_type,

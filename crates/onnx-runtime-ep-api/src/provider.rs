@@ -70,10 +70,11 @@ pub struct DeviceBuffer {
     ///
     /// [`BufferOwner::Owned`] (the default for [`DeviceBuffer::from_raw_parts`])
     /// is the original contract: the owning EP must free it exactly once in
-    /// `deallocate`. [`BufferOwner::Borrowed`] (from
-    /// [`DeviceBuffer::from_borrowed_parts`]) aliases memory owned by *someone
-    /// else* (e.g. an mmap'd weight file) — `deallocate` must **not** free it
-    /// and it must never be written through.
+    /// `deallocate`. Borrowed handles alias memory owned by *someone else*.
+    /// Read-only aliases come from [`DeviceBuffer::from_borrowed_parts`];
+    /// exclusive writable aliases come from
+    /// [`DeviceBuffer::from_borrowed_mut_parts`]. `deallocate` must **not** free
+    /// either kind.
     owner: BufferOwner,
 }
 
@@ -86,6 +87,9 @@ enum BufferOwner {
     /// This handle aliases foreign memory (e.g. an mmap). `deallocate` must be
     /// a no-op free; the real owner must outlive the buffer and every use of it.
     Borrowed,
+    /// This handle has temporary exclusive write access to an allocation owned
+    /// elsewhere. Deallocation remains a no-op.
+    BorrowedMut,
 }
 
 impl DeviceBuffer {
@@ -162,10 +166,41 @@ impl DeviceBuffer {
         }
     }
 
+    /// Wrap foreign memory in a non-owning, exclusively writable buffer handle.
+    ///
+    /// This is intended for persistent external output bindings: the real owner
+    /// retains the allocation while an executor temporarily writes through this
+    /// alias.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee all of:
+    /// * `ptr` names a non-null writable allocation of at least `size` bytes on
+    ///   `device`, aligned to at least `align` bytes.
+    /// * The real owner outlives this handle and every operation using it.
+    /// * No other writer accesses the allocation while this handle is live.
+    /// * This handle is never used to free the allocation; `deallocate` treats
+    ///   it as borrowed.
+    pub unsafe fn from_borrowed_mut_parts(
+        ptr: *mut c_void,
+        device: DeviceId,
+        size: usize,
+        align: usize,
+    ) -> Option<Self> {
+        debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+        Some(Self {
+            device,
+            size,
+            align,
+            ptr: NonNull::new(ptr)?,
+            owner: BufferOwner::BorrowedMut,
+        })
+    }
+
     /// Whether this handle merely *borrows* (aliases) foreign memory rather than
     /// owning it. A borrowed buffer must never be freed by `deallocate`.
     pub fn is_borrowed(&self) -> bool {
-        matches!(self.owner, BufferOwner::Borrowed)
+        matches!(self.owner, BufferOwner::Borrowed | BufferOwner::BorrowedMut)
     }
 
     /// The device this allocation lives on (and whose EP must free it).
@@ -298,6 +333,28 @@ pub trait ExecutionProvider: Send + Sync {
     /// Asynchronous copy; returns a [`Fence`] to await.
     fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence>;
 
+    /// Whether this EP can select the first maximum f32 element on-device and
+    /// return the token id together with its capture-error status.
+    fn device_argmax_supported(&self) -> bool {
+        false
+    }
+
+    /// Launch an allocation-free device argmax over `elements` contiguous
+    /// `dtype` values (Float32 or Float16). `result` receives two native-endian
+    /// u32 values: token id, then the latching device capture-error bitmask.
+    fn device_argmax(
+        &self,
+        _logits: &DeviceBuffer,
+        _elements: usize,
+        _dtype: DataType,
+        _result: &mut DeviceBuffer,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device argmax is not supported",
+            self.name()
+        )))
+    }
+
     /// Begin recording the supplied, already-compiled kernel sequence into a
     /// device graph. EPs without graph support reject the request.
     fn begin_device_graph_capture(&self, _kernels: &[&dyn Kernel]) -> Result<()> {
@@ -327,6 +384,17 @@ pub trait ExecutionProvider: Send + Sync {
     /// are released.
     fn reset_device_graph(&self) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Read (without clearing) any latching device-side capture-safety error a
+    /// captured kernel recorded during graph replay, as a raw violation bitmask
+    /// (zero when none). EPs without device graphs report no error.
+    ///
+    /// The decode loop calls this at the per-step logits device→host sync so an
+    /// out-of-range bounds violation becomes a hard error before the produced
+    /// token is consumed, without adding a separate synchronization.
+    fn check_device_capture_error(&self) -> Result<u32> {
+        Ok(0)
     }
 
     /// Explicit device allocation/free counters, when the EP exposes them.
@@ -566,5 +634,29 @@ mod tests {
         assert!(backing.iter().all(|&b| b == 7));
         backing[0] = 9;
         assert_eq!(backing[0], 9);
+    }
+
+    #[test]
+    fn borrowed_mut_buffer_writes_without_owning() {
+        let mut backing = vec![0u8; 8];
+        let ptr = backing.as_mut_ptr() as *mut c_void;
+        // SAFETY: `backing` exclusively owns this writable region and outlives
+        // the temporary alias.
+        let mut buffer =
+            unsafe { DeviceBuffer::from_borrowed_mut_parts(ptr, DeviceId::cpu(), 8, 1) }
+                .expect("non-null backing");
+        assert!(buffer.is_borrowed());
+        // SAFETY: the alias has exclusive access to all eight backing bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping([1u8, 2, 3].as_ptr(), buffer.as_mut_ptr().cast(), 3);
+        }
+        assert_eq!(buffer.into_raw(), ptr);
+        assert_eq!(&backing[..3], &[1, 2, 3]);
+        assert!(
+            unsafe {
+                DeviceBuffer::from_borrowed_mut_parts(std::ptr::null_mut(), DeviceId::cpu(), 0, 1)
+            }
+            .is_none()
+        );
     }
 }

@@ -339,8 +339,8 @@ impl Kernel for SoftmaxKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        onnx_runtime_ep_api::CaptureSupport::Supported
     }
 }
 

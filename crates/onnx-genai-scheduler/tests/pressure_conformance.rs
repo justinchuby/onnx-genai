@@ -479,7 +479,7 @@ fn drain_to_clean(governor: &HostGovernor, tickets: Vec<PressureTicket>) {
         }
     }
     drop(tickets); // pending tickets post a lossless CancelPending on drop
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
     for allocation in claimed {
         governor.release_host_pages(allocation).expect("release");
     }
@@ -523,7 +523,7 @@ fn campaign_cancel_pending_and_granted() {
         .request_host_pages(HostPageRequest::pageable(dev(0), 10, 0))
         .unwrap();
     drop(pending);
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
 
     // Free some, grant a fresh ticket, then drop it unclaimed -> CancelGranted.
     governor.reclaim(dev(0), 10).unwrap();
@@ -532,7 +532,7 @@ fn campaign_cancel_pending_and_granted() {
         .unwrap();
     assert_eq!(governor.snapshot().unwrap().reserved_bytes, 10);
     drop(granted);
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
     assert_eq!(governor.snapshot().unwrap().reserved_bytes, 0);
 
     drain_to_clean(&governor, vec![]);
@@ -645,7 +645,7 @@ fn campaign_mailbox_saturation() {
     // Drop them all at once (saturates the pre-reserved slots); no cancel lost.
     drop(tickets);
     // One drain applies all 64 cancellations losslessly.
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
     let snapshot = governor.snapshot().unwrap();
     assert_eq!(snapshot.pending, 0);
     assert_eq!(snapshot.free_bytes, 0); // capacity still fully reclaimable-charged
@@ -748,7 +748,7 @@ fn campaign_two_devices_under_pressure() {
     drop(a);
     drop(b);
     drop(c);
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
 
     let snapshot = governor.snapshot().unwrap();
     assert_eq!(snapshot.pending, 0);
@@ -804,7 +804,7 @@ fn run_seeded_campaign(seed: u64) -> Vec<ProtocolTraceEvent> {
                     let idx = rng.below(tickets.len() as u64) as usize;
                     let ticket = tickets.swap_remove(idx);
                     drop(ticket);
-                    governor.process_cancellations();
+                    governor.process_cancellations().unwrap();
                 }
             }
             3 => {
@@ -839,7 +839,7 @@ fn run_seeded_campaign(seed: u64) -> Vec<ProtocolTraceEvent> {
         }
     }
     drop(tickets);
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
     for alloc in claimed {
         governor.release_host_pages(alloc).unwrap();
     }
@@ -882,7 +882,7 @@ fn valid_small_trace() -> (HostGovernorConfig, Vec<ProtocolTraceEvent>) {
         governor.release_host_pages(alloc).unwrap();
     }
     drop(ticket);
-    governor.process_cancellations();
+    governor.process_cancellations().unwrap();
     (config, collector.snapshot().events)
 }
 

@@ -12,7 +12,9 @@ categories = ["science", "text-processing"]
 default = []
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
+    "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-session",
+    "dep:onnx-runtime-tracer",
 ]
 mlas = [
     "native-backend",
@@ -28,6 +30,12 @@ cuda = [
     "onnx-runtime-session?/cuda",
     "dep:onnx-runtime-ep-cuda",
 ]
+# ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
+# selection and the cudarc GPU sampler in `onnx-genai-ort`, WITHOUT pulling the
+# nxrt-native CUDA kernel crate (`onnx-runtime-ep-cuda`) or the native backend.
+# This is what the ONNX Runtime-backed `onnx-genai` wheel builds with; GPU comes
+# from the `onnxruntime-gpu` runtime wheel (installed via the `[cuda]` extra).
+ort-cuda = ["onnx-genai-ort/cuda", "onnx-genai-ort/cuda-13000"]
 # Legacy passthroughs for graphs that configure `onnx-genai-ort` separately.
 # Do not combine a 12.x passthrough with `cuda`; the engine CUDA EP requires 13.0.
 cuda-12060 = ["onnx-genai-ort/cuda-12060"]
@@ -40,13 +48,14 @@ onnx-genai-metadata = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.2", default-features = false }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
+onnx-runtime-tracer = { workspace = true, optional = true }
 prost = { version = "0.13" }
 memmap2 = "0.9"
 tokio = { workspace = true }

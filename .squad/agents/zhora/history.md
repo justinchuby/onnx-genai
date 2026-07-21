@@ -103,3 +103,5 @@ Added Rayon N-range partitioning for native CPU MatMulNBits.
 
 ## 2026-07-16T14:20:00Z — onnx-rs full-spec serde revision
 - Full-spec serde attempt was 🔴 rejected by Rachael: stale IR10 vendor proto and a base64 sidecar did not meet current ONNX IR13 or authoritative native-text requirements. Locked out; Batty is revising.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

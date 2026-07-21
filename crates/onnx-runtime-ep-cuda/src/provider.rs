@@ -320,6 +320,20 @@ impl ExecutionProvider for CudaExecutionProvider {
         Ok(Fence::default())
     }
 
+    fn device_argmax_supported(&self) -> bool {
+        true
+    }
+
+    fn device_argmax(
+        &self,
+        logits: &DeviceBuffer,
+        elements: usize,
+        dtype: DataType,
+        result: &mut DeviceBuffer,
+    ) -> Result<()> {
+        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, dtype, result)
+    }
+
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
         assert_eq!(
             dst.device(),
@@ -410,7 +424,16 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn reset_device_graph(&self) -> Result<bool> {
-        self.runtime.reset_graph()
+        // Graph invalidation (reset / rewind / KV-capacity or shape change /
+        // re-capture) is the explicit host reset point for the capture-error
+        // latch, so a fresh generation always starts un-poisoned.
+        let invalidated = self.runtime.reset_graph()?;
+        self.runtime.reset_capture_error()?;
+        Ok(invalidated)
+    }
+
+    fn check_device_capture_error(&self) -> Result<u32> {
+        self.runtime.check_capture_error()
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

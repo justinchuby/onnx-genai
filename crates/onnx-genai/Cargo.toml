@@ -27,7 +27,7 @@ onnx-genai-metadata = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-engine = { workspace = true }
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.2", default-features = false }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false }
 onnx-genai-preprocess = { workspace = true }
 onnx-genai-comfyui-config = { workspace = true }
 anyhow = { workspace = true }
@@ -37,10 +37,6 @@ serde_json = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.9"
 rand_distr = "0.5"
-
-[[bin]]
-name = "onnx-genai"
-path = "src/bin/onnx-genai.rs"
 
 [[bin]]
 name = "run_comfyui"

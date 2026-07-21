@@ -12,20 +12,22 @@ use onnx_runtime_loader::proto::onnx;
 use onnx_runtime_session::{InferenceSession, Tensor};
 
 fn tensor_type(dims: &[i64]) -> onnx::TypeProto {
-    use onnx::tensor_shape_proto::{dimension::Value as DV, Dimension};
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
     onnx::TypeProto {
-        value: Some(onnx::type_proto::Value::TensorType(onnx::type_proto::Tensor {
-            elem_type: 1, // FLOAT
-            shape: Some(onnx::TensorShapeProto {
-                dim: dims
-                    .iter()
-                    .map(|&n| Dimension {
-                        value: Some(DV::DimValue(n)),
-                        ..Default::default()
-                    })
-                    .collect(),
-            }),
-        })),
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type: 1, // FLOAT
+                shape: Some(onnx::TensorShapeProto {
+                    dim: dims
+                        .iter()
+                        .map(|&n| Dimension {
+                            value: Some(DV::DimValue(n)),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }),
+            },
+        )),
         ..Default::default()
     }
 }

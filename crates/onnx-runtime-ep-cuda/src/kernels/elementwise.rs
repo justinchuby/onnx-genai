@@ -18,9 +18,9 @@
 //! trivially bandwidth-bound and matches a PyTorch pointwise kernel's shape.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -155,6 +155,8 @@ DEFINE_BINARY_I64(mul, a[ai] * b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
+DEFINE_UNARY(silu, __half, f16)
+DEFINE_UNARY(silu, __nv_bfloat16, bf16)
 #endif
 "#;
 
@@ -306,6 +308,7 @@ impl KernelFactory for UnaryFactory {
         Ok(Box::new(UnaryKernel {
             op: self.op,
             runtime: self.runtime.clone(),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -315,10 +318,23 @@ impl KernelFactory for UnaryFactory {
 pub struct UnaryKernel {
     op: UnaryOp,
     runtime: Arc<CudaRuntime>,
+    last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnaryCaptureSignature {
+    dtype: FloatDtype,
+    shape: Vec<usize>,
 }
 
 impl UnaryKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep unary elementwise capture signature lock was poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
         let op = self.op.op_name();
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -329,12 +345,6 @@ impl UnaryKernel {
         }
         let x = &inputs[0];
         let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
-        if self.op == UnaryOp::Silu && dtype != FloatDtype::F32 {
-            return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (supported: Float32)",
-                x.dtype
-            )));
-        }
         if dtype != FloatDtype::F32 {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
@@ -361,6 +371,16 @@ impl UnaryKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let entry = self.op.entry(dtype);
+        let current_signature = is_fixed_decode_shape(x.shape).then(|| UnaryCaptureSignature {
+            dtype,
+            shape: x.shape.to_vec(),
+        });
+        require_matching_capture_signature(
+            &self.runtime,
+            op,
+            warmed_signature.as_ref(),
+            current_signature.as_ref(),
+        )?;
 
         let func = self
             .runtime
@@ -376,7 +396,8 @@ impl UnaryKernel {
         // SAFETY: the entry's pointer types match the validated dtype and both
         // allocations cover `n` elements.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        self.runtime.synchronize()
+        *last_signature = current_signature;
+        Ok(())
     }
 }
 
@@ -389,10 +410,20 @@ impl Kernel for UnaryKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        // No per-call alloc/free; a pure launch is capturable. (The one-time
-        // NVRTC compile happens on the first non-captured call.)
-        true
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        // Eligibility is tied to the exact dtype and shape warmed by the most
+        // recent successful call, not a reusable boolean.
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} shape/dtype signature does not match the warmed fixed-decode capture signature",
+                self.op.op_name()
+            )),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} capture signature is unavailable because its state lock was poisoned",
+                self.op.op_name()
+            )),
+        }
     }
 }
 
@@ -407,6 +438,8 @@ impl KernelFactory for BinaryFactory {
         Ok(Box::new(BinaryKernel {
             op: self.op,
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -416,10 +449,105 @@ impl KernelFactory for BinaryFactory {
 pub struct BinaryKernel {
     op: BinaryOp,
     runtime: Arc<CudaRuntime>,
+    metadata: Mutex<BroadcastMetadataCache>,
+    last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BroadcastMetadataKey {
+    a_shape: Vec<usize>,
+    b_shape: Vec<usize>,
+    out_shape: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BinaryCaptureSignature {
+    dtype: DataType,
+    shapes: BroadcastMetadataKey,
+}
+
+#[derive(Debug)]
+struct BroadcastMetadataCache {
+    runtime: Arc<CudaRuntime>,
+    key: Option<BroadcastMetadataKey>,
+    ptr: CUdeviceptr,
+}
+
+impl BroadcastMetadataCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            key: None,
+            ptr: 0,
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        a_shape: &[usize],
+        b_shape: &[usize],
+        out_shape: &[usize],
+    ) -> Result<CUdeviceptr> {
+        let key = BroadcastMetadataKey {
+            a_shape: a_shape.to_vec(),
+            b_shape: b_shape.to_vec(),
+            out_shape: out_shape.to_vec(),
+        };
+        if self.key.as_ref() == Some(&key) {
+            return Ok(self.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep binary elementwise: broadcast metadata shape changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
+            ));
+        }
+        if self.ptr != 0 {
+            self.runtime.synchronize()?;
+        }
+
+        let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
+        let metadata_bytes = u64_bytes(&metadata);
+        let ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
+        // SAFETY: allocation exactly covers the metadata byte slice.
+        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, ptr) } {
+            // SAFETY: `ptr` is still owned by this cache and no launch used it.
+            let _ = unsafe { self.runtime.free_raw(ptr) };
+            return Err(error);
+        }
+        if self.ptr != 0 {
+            // SAFETY: synchronization completed all prior launches using the old
+            // pointer, which remains exclusively owned by this cache.
+            if let Err(error) = unsafe { self.runtime.free_raw(self.ptr) } {
+                // SAFETY: the replacement has not escaped or been launched.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.key = Some(key);
+        self.ptr = ptr;
+        Ok(ptr)
+    }
+}
+
+impl Drop for BroadcastMetadataCache {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: the live pointer was allocated by this runtime and remains
+            // exclusively owned by this cache.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
 }
 
 impl BinaryKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep binary elementwise capture signature lock was poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
         let op = self.op.op_name();
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -471,18 +599,27 @@ impl BinaryKernel {
             Some(dtype) => self.op.entry(dtype),
             None => format!("{}_i64", self.op.stem()),
         };
+        let current_signature = is_fixed_decode_shape(&out_shape).then(|| BinaryCaptureSignature {
+            dtype: a.dtype,
+            shapes: BroadcastMetadataKey {
+                a_shape: a.shape.to_vec(),
+                b_shape: b.shape.to_vec(),
+                out_shape: out_shape.clone(),
+            },
+        });
+        require_matching_capture_signature(
+            &self.runtime,
+            op,
+            warmed_signature.as_ref(),
+            current_signature.as_ref(),
+        )?;
         let func = self
             .runtime
             .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
-        let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
-        // SAFETY: allocation exactly covers the metadata byte slice.
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
-            // SAFETY: metadata_ptr is still owned by this call and no launch occurred.
-            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
-            return Err(error);
-        }
+        let mut metadata = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep binary elementwise metadata lock was poisoned".into())
+        })?;
+        let metadata_ptr = metadata.prepare(a.shape, b.shape, &out_shape)?;
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -502,12 +639,9 @@ impl BinaryKernel {
             .arg(&n_u64);
         // SAFETY: pointer types match the dtype; metadata contains three
         // rank-length u64 arrays; broadcast strides keep all reads in bounds.
-        let launch =
-            unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        // SAFETY: metadata_ptr is owned by this call and the launch is synchronized.
-        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
-        sync.and(free)
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        *last_signature = current_signature;
+        Ok(())
     }
 }
 
@@ -520,9 +654,39 @@ impl Kernel for BinaryKernel {
         false
     }
 
-    fn cuda_graph_compatible(&self) -> bool {
-        false
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        // Only the exact fixed-row signature recorded by the most recent
+        // successful call may enter capture, including integer metadata ops.
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} broadcast shape/dtype signature does not match the warmed capture signature",
+                self.op.op_name()
+            )),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} capture signature is unavailable because its state lock was poisoned",
+                self.op.op_name()
+            )),
+        }
     }
+}
+
+fn require_matching_capture_signature<T: PartialEq>(
+    runtime: &CudaRuntime,
+    op: &str,
+    warmed: Option<&T>,
+    current: Option<&T>,
+) -> Result<()> {
+    if runtime.is_capturing()? && (current.is_none() || warmed != current) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: dtype or shape changed during CUDA graph capture; warm the exact fixed decode signature before capture"
+        )));
+    }
+    Ok(())
+}
+
+fn is_fixed_decode_shape(shape: &[usize]) -> bool {
+    !shape.is_empty() && shape[..shape.len() - 1].iter().product::<usize>() == 1
 }
 
 pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {

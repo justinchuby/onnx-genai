@@ -20,8 +20,8 @@ use onnx_runtime_ep_api::{
     KernelMatch, Result as EpResult,
 };
 use onnx_runtime_ir::{
-    Attribute, DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape,
-    TensorLayout, ValueId, static_shape,
+    Attribute, DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
+    static_shape,
 };
 use onnx_runtime_loader::{
     EpContextDumpConfig, Model, ep_context_nodes as loader_ep_context_nodes, load_model,
@@ -203,8 +203,7 @@ fn add_epctx_node(
 /// A fresh graph with a single `X` input `[2,4]`.
 fn graph_with_input() -> (Graph, ValueId) {
     let mut g = Graph::new();
-    g.opset_imports
-        .insert("com.microsoft".to_string(), 1);
+    g.opset_imports.insert("com.microsoft".to_string(), 1);
     let x = g.create_named_value("X", DataType::Float32, static_shape([2usize, 4]));
     g.add_input(x);
     (g, x)
@@ -501,7 +500,9 @@ fn output_names(g: &Graph, id: NodeId) -> Vec<String> {
 
 /// A non-UTF-8 compiled blob so the round-trip proves byte-exact preservation.
 fn compiled_blob() -> Vec<u8> {
-    vec![0x00, 0x01, 0x80, 0xFE, 0xFF, b'c', b'x', 0xC3, 0x28, 0x00, 0x7F]
+    vec![
+        0x00, 0x01, 0x80, 0xFE, 0xFF, b'c', b'x', 0xC3, 0x28, 0x00, 0x7F,
+    ]
 }
 
 /// embed_mode=1 round-trip: dump → reload the `*_ctx.onnx` through the consume
@@ -529,7 +530,11 @@ fn dump_embed_round_trip_is_byte_exact() {
     }];
 
     let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
-    assert_eq!(out, dir.join("mymodel_ctx.onnx"), "default <stem>_ctx.onnx path");
+    assert_eq!(
+        out,
+        dir.join("mymodel_ctx.onnx"),
+        "default <stem>_ctx.onnx path"
+    );
     assert!(out.exists(), "context model written");
 
     // Reload the produced ctx model through the production loader.
@@ -537,10 +542,22 @@ fn dump_embed_round_trip_is_byte_exact() {
 
     // Exactly one EPContext node replaced the two Relus.
     let ids: Vec<NodeId> = loader_ep_context_nodes(&g2).map(|n| n.node).collect();
-    assert_eq!(ids.len(), 1, "the partition collapsed to one EPContext node");
+    assert_eq!(
+        ids.len(),
+        1,
+        "the partition collapsed to one EPContext node"
+    );
     let ep_id = ids[0];
-    assert_eq!(input_names(&g2, ep_id), vec!["X".to_string()], "boundary input");
-    assert_eq!(output_names(&g2, ep_id), vec!["Y".to_string()], "boundary output");
+    assert_eq!(
+        input_names(&g2, ep_id),
+        vec!["X".to_string()],
+        "boundary input"
+    );
+    assert_eq!(
+        output_names(&g2, ep_id),
+        vec!["Y".to_string()],
+        "boundary output"
+    );
     // No ordinary Relu survives — the subgraph was fully replaced.
     assert!(
         g2.nodes.values().all(|n| n.op_type == "EPContext"),
@@ -587,8 +604,15 @@ fn dump_external_round_trip_via_sidecar_bin() {
 
     // A sidecar `.bin` holding the blob was written next to the ctx model.
     let sidecar = dir.join("net_ctx_p0_MOCK_part0.bin");
-    assert!(sidecar.exists(), "external sidecar written next to ctx model");
-    assert_eq!(std::fs::read(&sidecar).unwrap(), payload, "sidecar holds the blob");
+    assert!(
+        sidecar.exists(),
+        "external sidecar written next to ctx model"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap(),
+        payload,
+        "sidecar holds the blob"
+    );
 
     // Reload + consume: the external path resolves relative to the model dir.
     let g2 = load_model(&out).expect("reload ctx model");
@@ -656,7 +680,11 @@ fn dump_disabled_config_is_a_no_op() {
     }];
 
     let out = dump_session_ep_context(&model, &orig, &parts, &config).expect("dump");
-    assert_eq!(out, dir.join("mymodel_ctx.onnx"), "returns the would-be path");
+    assert_eq!(
+        out,
+        dir.join("mymodel_ctx.onnx"),
+        "returns the would-be path"
+    );
     assert!(!out.exists(), "disabled config writes no ctx model");
     let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
     assert!(entries.is_empty(), "disabled config writes no files at all");
@@ -728,7 +756,11 @@ fn builder_options_drive_export_byte_exact() {
     // Reload + consume: the embedded blob round-trips byte-exact.
     let g2 = load_model(&out).expect("reload ctx model");
     let ids: Vec<NodeId> = loader_ep_context_nodes(&g2).map(|n| n.node).collect();
-    assert_eq!(ids.len(), 1, "the partition collapsed to one EPContext node");
+    assert_eq!(
+        ids.len(),
+        1,
+        "the partition collapsed to one EPContext node"
+    );
 
     let mock = MockCompiledEp::new();
     let placement = load_ep_context_nodes(&g2, &dir, &eps(&mock)).expect("consume");
@@ -775,7 +807,9 @@ fn builder_disabled_export_writes_nothing() {
         covered_nodes: covered,
     }];
 
-    let out = session.export_ep_context(&orig, &parts).expect("export no-op");
+    let out = session
+        .export_ep_context(&orig, &parts)
+        .expect("export no-op");
     assert_eq!(out, dir.join("orig_ctx.onnx"), "returns the would-be path");
     assert!(!out.exists(), "disabled config writes no ctx model");
 
@@ -784,5 +818,9 @@ fn builder_disabled_export_writes_nothing() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, vec!["orig.onnx".to_string()], "no extra files written");
+    assert_eq!(
+        names,
+        vec!["orig.onnx".to_string()],
+        "no extra files written"
+    );
 }

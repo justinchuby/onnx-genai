@@ -13,6 +13,7 @@ bench-native = [
     "onnx-genai-engine/native-backend",
     "dep:onnx-genai-ort",
     "dep:onnx-runtime-ep-cpu",
+    "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-ep-cuda",
     "dep:onnx-runtime-ir",
     "dep:onnx-runtime-loader",
@@ -28,14 +29,18 @@ cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
 # on-device argmax/sampler in `onnx-genai-ort` WITHOUT the pure-Rust
 # `onnx-runtime-ep-cuda` (which pins a different cudarc CUDA version and would
 # collide). Use this to benchmark the captured decode / device sampling path.
-cuda-ort = ["bench-ort", "onnx-genai-ort/cuda"]
+cuda-ort = [
+    "bench-ort",
+    "onnx-genai-ort/cuda",
+    "onnx-genai-ort/cuda-12060",
+]
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-kv = { workspace = true }
-onnx-genai-ort = { workspace = true, optional = true }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false, optional = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }

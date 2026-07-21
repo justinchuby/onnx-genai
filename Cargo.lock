@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-bench"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1708,15 +1708,29 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-capi"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "onnx-genai-engine",
 ]
 
 [[package]]
+name = "onnx-genai-cli"
+version = "0.1.0-dev.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "onnx-genai",
+ "onnx-genai-engine",
+ "onnx-genai-server",
+ "pyo3",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "onnx-genai-comfyui-config"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-genai-metadata",
  "serde",
@@ -1726,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-engine"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1746,6 +1760,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "onnx-runtime-session",
+ "onnx-runtime-tracer",
  "prost",
  "rand 0.9.5",
  "serde",
@@ -1760,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-genai-config"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-genai-metadata",
  "serde",
@@ -1770,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-kv"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "async-trait",
  "onnx-genai-metadata",
@@ -1781,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-metadata"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "schemars",
  "serde",
@@ -1792,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-ort"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "cudarc",
  "half",
@@ -1812,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-ort-sys"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "bindgen",
  "sha2",
@@ -1821,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-preprocess"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "hound",
@@ -1832,8 +1847,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-python"
+version = "0.1.0-dev.3"
+dependencies = [
+ "onnx-genai-engine",
+ "pyo3",
+]
+
+[[package]]
 name = "onnx-genai-router"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1857,21 +1880,22 @@ dependencies = [
 
 [[package]]
 name = "onnx-genai-runtime-config"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 
 [[package]]
 name = "onnx-genai-scheduler"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-genai-kv",
  "onnx-runtime-protocol-trace",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]
 
 [[package]]
 name = "onnx-genai-server"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1898,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-rs"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1913,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-rs-python"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-rs",
  "onnx-runtime-loader",
@@ -1922,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-capi"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -1932,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-comm"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "async-trait",
  "half",
@@ -1942,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-cpuinfo"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "bindgen",
  "cc",
@@ -1952,11 +1976,11 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-dlpack"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 
 [[package]]
 name = "onnx-runtime-eager"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
@@ -1967,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-api"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-optimizer",
@@ -1976,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ep-cpu"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "criterion",
  "half",
@@ -1987,16 +2011,18 @@ dependencies = [
  "onnx-runtime-loader",
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
+ "onnx-runtime-tracer",
  "rayon",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "onnx-runtime-ep-cuda"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "cudarc",
  "half",
+ "libloading 0.8.9",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
@@ -2007,14 +2033,14 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-ir"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "onnx-runtime-loader"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "memmap2",
  "onnx-runtime-ir",
@@ -2028,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-memory"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.18",
@@ -2036,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-optimizer"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -2045,11 +2071,15 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-protocol-trace"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "onnx-runtime-python"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-genai-engine",
  "onnx-runtime-dlpack",
@@ -2065,12 +2095,13 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-quantization"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 
 [[package]]
 name = "onnx-runtime-session"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
+ "onnx-genai-runtime-config",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
@@ -2084,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-shape-inference"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
@@ -2093,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "onnx-runtime-tracer"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 dependencies = [
  "ittapi",
  "libloading 0.8.9",

@@ -679,6 +679,17 @@ Whether the H2D copies are outside the graph or captured memcpy nodes depends on
 the final pinned-memory design, but source and destination addresses must remain
 stable.
 
+### 6.5 M4 end-to-end validation
+
+H200 validation on Qwen2.5-0.5B int4 used prompt
+`"The capital of France is"`, greedy decoding, device KV, two warmups, and three
+measured runs. At 256 tokens, capture produced 5 captures / 1,265 replays / 0
+fallbacks and 70.33 tok/s versus 19.99 tok/s eager (+251.83%). At 1,024 tokens,
+it produced 5 captures / 5,105 replays / 0 fallbacks and 24.25 tok/s versus
+11.73 tok/s eager (+106.73%). CUDA-graph ON/OFF token IDs were exactly identical
+at both lengths. Output began: `" Paris. It is the largest city in the country
+and the capital of France..."`.
+
 ## 7. Op dispatch and fallback
 
 ### 7.1 Existing dispatch

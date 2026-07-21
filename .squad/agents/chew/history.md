@@ -88,3 +88,20 @@ At 2026-07-14T19:05:00Z, fixed clippy findings and corrected Python pytest count
 ## 2026-07-19T18:20:00Z — CPU-EP op coverage 936→975
 
 - Rejected Bryant’s initial pooling/layout implementation, then approved Deckard’s SpaceToDepth and ceil-mode fixes (`014cf02`).
+
+- 2026-07-19: Rejected fused QMoE integration after it clobbered `_group_topk_selection` and broke grouped routing. Approved after Deckard restored the original signature and group-mask implementation.
+
+
+### 2026-07-20 — Vendored MLAS CPU-GEMM parity
+
+Recorded the integration rejection and subsequent approval after dependency metadata and SIMD guard fixes (`85087ac`).
+
+
+## 2026-07-20T13:35:00Z — Multistream performance and issue #40
+
+- Reviewed both CUDA flash paths: standard Attention 🟡 approved with coverage notes; initial GQA fusion 🔴 rejected, then Rachael’s 40-scenario causal-origin correction 🟢 approved.
+
+## 2026-07-21T03:15:00Z — CUDA graph M4 validated
+- Drove multi-round capture-safety review to final green: required real replay coverage, exact elementwise signatures, GQA detect-before-consume poisoning, and corrected Qwen smoke assertions before the zero-fallback M4 track landed.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

@@ -36,3 +36,5 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 
 - 🟢 Approved Holden's `030faa1` after verifying no GLM over-rejection, correct omitted-optional handling, standard-domain scoping, and CPU/GLM/CUDA parity for audited ops.
 - Reported CUDA EP suite success: 238 passed, 0 failed.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.

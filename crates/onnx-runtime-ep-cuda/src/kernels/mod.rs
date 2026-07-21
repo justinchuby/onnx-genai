@@ -32,11 +32,14 @@ pub mod conv;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumsum;
+pub(crate) mod device_argmax;
 pub mod elementwise;
 mod flash_attention;
 pub mod fused_gemm;
 pub mod gather;
 pub mod gemm;
+mod gqa_decode;
+mod gqa_decode_fp16;
 pub mod group_query_attention;
 pub mod indexing;
 pub mod matmul;
@@ -393,7 +396,7 @@ pub fn build_cuda_registry_with_metrics(
     }
 
     // Elementwise unary activations (NVRTC pointwise). `Gelu` and `Silu` are
-    // `com.microsoft` contrib ops; Silu matches the CPU EP's f32-only coverage.
+    // `com.microsoft` contrib ops; all activations run f32/f16/bf16 on the EP.
     for (op_type, domain, op) in [
         ("Relu", "", UnaryOp::Relu),
         ("Sqrt", "", UnaryOp::Sqrt),
