@@ -1324,7 +1324,7 @@ The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
 mechanism with a closed form. This path does not affect the single-AR-decoder TTS
 path or any other modality.
 
-**Real Qwen3-TTS export — build + codec-token validation DONE; engine/emitter WIP.**
+**Real Qwen3-TTS export — build + validation + engine pre-embedder DONE; emitter WIP.**
 A real 1.7B Qwen3-TTS package (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) now **builds
 and runs end to end at the codec-token level** via Mobius (`examples/qwen3_tts.py`):
 the 3-model package (`embedding`, `talker`, `code_predictor`) produces valid multi-group
@@ -1346,26 +1346,72 @@ end *inside the onnx-genai engine*:
   vocoder** in the package — the codes are decoded to a waveform by a *separate*
   codec model (e.g. Mimi / `qwen3_tts_tokenizer_12hz`), so the `final_only` vocoder
   stage in the fixture would instead be a second, externally-supplied package.
-- **The talker input is loop-constructed, not a dataflow edge.** The talker's
-  `inputs_embeds` is assembled *inside the generation loop* per step, mixing text,
-  codec, and speaker embeddings in "talker-hidden space" (see `_tts.py`
-  `_build_code_predictor` docstring). The current `nested_autoregressive` seeds the
-  talker directly and only threads the *inner* decoder's per-code embedding; it does
-  **not** model the outer talker's per-step embedding construction. Closing this
-  needs either an engine extension (a per-outer-step embedding builder) or a Mobius
-  pre-embedding component that materializes the talker `inputs_embeds` sequence.
+- **The talker input is loop-constructed — now materialized via a `pre_embedder`
+  (DONE).** The talker's per-step `inputs_embeds` is assembled *inside the generation
+  loop*, mixing codec and text embeddings in "talker-hidden space":
+  `inputs_embeds = codec_sum(+ text_embed)`, where
+  `codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`. This is now
+  **materialized into an ONNX component** (`talker_step_embedder`, inputs
+  `frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch,1,hidden]]` →
+  output `inputs_embeds [batch,1,hidden]`) so the engine stays generic, and the
+  `nested_autoregressive` strategy gained an **optional `pre_embedder` field**
+  (backward compatible — absent ⇒ the legacy `input_ids`-driven outer loop). See the
+  `pre_embedder` contract note below.
 - **Build path:** the 1.7B model builds only via the custom `examples/qwen3_tts.py`
   pipeline (not the standard `mobius build` CLI), which does not currently call
   `write_onnx_genai_config`. So `write_onnx_genai_config` deliberately **fails
   loudly** on a `talker + code_predictor` package (`_looks_like_multi_decoder_tts`)
   rather than emit speculative metadata.
 
-Completing real Qwen3-TTS is therefore a focused, monitored effort. The build and
-codec-token validation are **done** (above); the remaining, ordered work is: (1) extend
-the engine's outer-loop embedding path (or add a Mobius pre-embedding component) to model
-the real talker `inputs_embeds` construction against its confirmed I/O, then (2) add the
-`build_tts_pipeline_metadata` emitter — in that order, since the exact wiring is now
-confirmable against the real, validated export.
+Completing real Qwen3-TTS is therefore a focused, monitored effort. The build +
+codec-token validation, the Mobius `talker_step_embedder` pre-embedding component, and
+the engine `pre_embedder`-driven outer loop are **done**; the remaining work is the
+Mobius `build_tts_pipeline_metadata` emitter (so the package self-describes this wiring)
+and, as a follow-up, threading the real trailing-text `text_embed` and prefill embeds
+(the engine currently feeds `text_embed` zeros and a zero frame-0 seed — see the
+`pre_embedder` note).
+
+##### The `pre_embedder` extension to `nested_autoregressive`
+
+`nested_autoregressive` gained one **optional** field, `pre_embedder` (a component
+name), keeping the contract minimal and backward compatible:
+
+```yaml
+strategy:
+  kind: nested_autoregressive
+  outer: talker            # driven by inputs_embeds when pre_embedder is set
+  inner: code_predictor
+  pre_embedder: talker_step_embedder   # NEW (optional)
+  num_code_groups: 16
+  max_tokens: 2000
+# required wiring when pre_embedder is set:
+dataflow:
+  - {from: talker_step_embedder.inputs_embeds, to: talker.inputs_embeds}
+```
+
+1. **Semantics.** When `pre_embedder` is absent the outer loop is `input_ids`-driven
+   (unchanged legacy behavior). When set, each frame the engine assembles
+   `frame_codes = [outer_code_0, inner_code_1, …, inner_code_{G-1}]` from the *previous*
+   frame, runs the named pre-embedder to materialize the outer decoder's single-position
+   `inputs_embeds`, and feeds it to the talker (which consumes `inputs_embeds`, not
+   `input_ids`).
+2. **Wiring resolution.** The pre-embedder must be a declared model, distinct from
+   `outer`/`inner`, wired by a **required** dataflow edge
+   `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`. Its `frame_codes` input (the
+   sole int64 input) and optional `text_embed` input (a second float input) are resolved
+   from the loaded session at runtime; the hidden size comes from the outer decoder's
+   `inputs_embeds` input. The pre-embedder is a loop-internal component (`run_on:
+   on_demand`), excluded from prompt/final phase classification.
+3. **Follow-up (documented TODO).** The engine currently feeds a **zero `text_embed`**
+   and a zero frame-0 seed; real trailing-text threading and prefill-embeds
+   materialization (the role/codec-tag/speaker/first-text interleaving) are the remaining
+   piece before bit-accurate real-package playback.
+
+Proven by the synthetic fixture `tests/fixtures/tiny-tts-nested-preembed/` (built by
+`scripts/build_tiny_tts_nested_preembed.py`) and
+`crates/onnx-genai-engine/tests/tts_nested_preembed_pipeline_e2e.rs`, which drives the
+talker through `talker_step_embedder` and asserts a distinct code stream from the
+`input_ids` path — with zero regression to the legacy `tiny-tts-nested` fixture.
 
 #### Speech-to-Text (ASR / Whisper-style)
 
