@@ -28,9 +28,14 @@ const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
+const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
 const GEMV_F16_SMALL_THREADS: u32 = 64;
 const GEMV_F16_LARGE_THREADS: u32 = 256;
 const GEMV_F16_SMALL_N_MAX: usize = 1152;
+const GEMV_F16_DOWN_K: usize = 4864;
+const GEMV_F16_DOWN_N: usize = 896;
+const GEMV_F16_DOWN_THREADS: u32 = 256;
+const GEMV_F16_DOWN_COLUMNS_PER_BLOCK: usize = 8;
 
 const DEQUANT_SRC: &str = r#"
 extern "C" __global__ void matmul_nbits_dequant_f32(
@@ -422,14 +427,8 @@ __device__ __forceinline__ float dot_int4x8_f16(
     return dot;
 }
 
-__device__ __forceinline__ void accumulate_int4x8_f16(
-    const unsigned int packed,
-    const __half* __restrict__ activation,
-    const __half scale,
-    __half2& sum0,
-    __half2& sum1,
-    __half2& sum2,
-    __half2& sum3)
+__device__ __forceinline__ uint4 permute_activation_f16x8(
+    const __half* __restrict__ activation)
 {
     const uint4 a = *reinterpret_cast<const uint4*>(activation);
     constexpr unsigned int low_halves = 0x5410;
@@ -443,26 +442,109 @@ __device__ __forceinline__ void accumulate_int4x8_f16(
                  : "=r"(permuted.z) : "r"(a.y), "r"(a.w), "r"(low_halves));
     asm volatile("prmt.b32 %0, %1, %2, %3;\n"
                  : "=r"(permuted.w) : "r"(a.y), "r"(a.w), "r"(high_halves));
+    return permuted;
+}
 
+__device__ __forceinline__ void accumulate_int4x8_f16_permuted(
+    const unsigned int packed,
+    const uint4& activation,
+    const __half scale,
+    __half2& sum0,
+    __half2& sum1,
+    __half2& sum2,
+    __half2& sum3)
+{
     __half2 q[4];
     int4x8_to_half2x4(packed, q);
     const __half2 scale2 = __halves2half2(scale, scale);
     sum0 = __hfma2(
         __hmul2(q[0], scale2),
-        *reinterpret_cast<const __half2*>(&permuted.x),
+        *reinterpret_cast<const __half2*>(&activation.x),
         sum0);
     sum1 = __hfma2(
         __hmul2(q[1], scale2),
-        *reinterpret_cast<const __half2*>(&permuted.y),
+        *reinterpret_cast<const __half2*>(&activation.y),
         sum1);
     sum2 = __hfma2(
         __hmul2(q[2], scale2),
-        *reinterpret_cast<const __half2*>(&permuted.z),
+        *reinterpret_cast<const __half2*>(&activation.z),
         sum2);
     sum3 = __hfma2(
         __hmul2(q[3], scale2),
-        *reinterpret_cast<const __half2*>(&permuted.w),
+        *reinterpret_cast<const __half2*>(&activation.w),
         sum3);
+}
+
+__device__ __forceinline__ void accumulate_int4x8_dot_f16(
+    const unsigned int packed,
+    const uint4& activation,
+    const __half2 scale2,
+    __half2& sum)
+{
+    __half2 q[4];
+    int4x8_to_half2x4(packed, q);
+    sum = __hfma2(
+        __hmul2(q[0], scale2),
+        *reinterpret_cast<const __half2*>(&activation.x),
+        sum);
+    sum = __hfma2(
+        __hmul2(q[1], scale2),
+        *reinterpret_cast<const __half2*>(&activation.y),
+        sum);
+    sum = __hfma2(
+        __hmul2(q[2], scale2),
+        *reinterpret_cast<const __half2*>(&activation.z),
+        sum);
+    sum = __hfma2(
+        __hmul2(q[3], scale2),
+        *reinterpret_cast<const __half2*>(&activation.w),
+        sum);
+}
+
+__device__ __forceinline__ float dot_int4x32_f16_permuted_scaled(
+    const uint4& packed,
+    const uint4& activation0,
+    const uint4& activation1,
+    const uint4& activation2,
+    const uint4& activation3,
+    const __half scale)
+{
+    const __half2 scale2 = __halves2half2(scale, scale);
+    __half2 sum0 = __float2half2_rn(0.0f);
+    __half2 sum1 = __float2half2_rn(0.0f);
+    __half2 sum2 = __float2half2_rn(0.0f);
+    __half2 sum3 = __float2half2_rn(0.0f);
+    accumulate_int4x8_dot_f16(packed.x, activation0, scale2, sum0);
+    accumulate_int4x8_dot_f16(packed.y, activation1, scale2, sum1);
+    accumulate_int4x8_dot_f16(packed.z, activation2, scale2, sum2);
+    accumulate_int4x8_dot_f16(packed.w, activation3, scale2, sum3);
+    const float2 value0 = __half22float2(sum0);
+    const float2 value1 = __half22float2(sum1);
+    const float2 value2 = __half22float2(sum2);
+    const float2 value3 = __half22float2(sum3);
+    float value = value0.x;
+    value += value1.x;
+    value += value2.x;
+    value += value3.x;
+    value += value0.y;
+    value += value1.y;
+    value += value2.y;
+    value += value3.y;
+    return value;
+}
+
+__device__ __forceinline__ void accumulate_int4x8_f16(
+    const unsigned int packed,
+    const __half* __restrict__ activation,
+    const __half scale,
+    __half2& sum0,
+    __half2& sum1,
+    __half2& sum2,
+    __half2& sum3)
+{
+    const uint4 permuted = permute_activation_f16x8(activation);
+    accumulate_int4x8_f16_permuted(
+        packed, permuted, scale, sum0, sum1, sum2, sum3);
 }
 
 // One warp per output column; `columns_per_block` (== blockDim.x / 32) columns
@@ -628,7 +710,123 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
         output[column] = __float2half(value);
     }
 }
+
+// Down projection specialization: a 256-thread CTA computes eight columns and
+// parallelizes over block-32 K tiles. The activation is staged once in the
+// permuted half2 layout, then reused by all eight columns.
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int scales_fp16)
+{
+    (void)block_size;
+    (void)scales_fp16;
+    extern __shared__ uint4 activation_shared[];
+    __shared__ float warp_sums[8][8];
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int column_base = (int)blockIdx.x * 8;
+
+    for (int vector = tid; vector * 8 < k; vector += (int)blockDim.x) {
+        activation_shared[vector] =
+            permute_activation_f16x8(activation + vector * 8);
+    }
+    __syncthreads();
+
+    float values[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int block = tid; block < k_blocks; block += (int)blockDim.x) {
+        const uint4 activation0 = activation_shared[block * 4];
+        const uint4 activation1 = activation_shared[block * 4 + 1];
+        const uint4 activation2 = activation_shared[block * 4 + 2];
+        const uint4 activation3 = activation_shared[block * 4 + 3];
+#pragma unroll
+        for (int tile_column = 0; tile_column < 8; ++tile_column) {
+            const int column = column_base + tile_column;
+            if (column < n) {
+                const long packed_start =
+                    ((long)column * k_blocks + block) * blob_size;
+                const uint4 packed_weights =
+                    *reinterpret_cast<const uint4*>(packed + packed_start);
+                const __half scale = scales[(long)column * k_blocks + block];
+                values[tile_column] += dot_int4x32_f16_permuted_scaled(
+                    packed_weights,
+                    activation0,
+                    activation1,
+                    activation2,
+                    activation3,
+                    scale);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int tile_column = 0; tile_column < 8; ++tile_column) {
+        const float value = warp_sum(values[tile_column]);
+        if (lane == 0) {
+            warp_sums[warp][tile_column] = value;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane < 8) {
+        const int column = column_base + lane;
+        float value = warp_sums[0][lane];
+        value += warp_sums[1][lane];
+        value += warp_sums[2][lane];
+        value += warp_sums[3][lane];
+        value += warp_sums[4][lane];
+        value += warp_sums[5][lane];
+        value += warp_sums[6][lane];
+        value += warp_sums[7][lane];
+        if (bias) {
+            value += __half2float(bias[column]);
+        }
+        output[column] = __float2half(value);
+    }
+}
 "#;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum F16GemvVariant {
+    General,
+    DownProjection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct F16GemvSelection {
+    variant: F16GemvVariant,
+    reason: &'static str,
+}
+
+fn select_f16_gemv_variant(
+    k: usize,
+    n: usize,
+    block_size: usize,
+    scales_fp16: bool,
+) -> F16GemvSelection {
+    if k == GEMV_F16_DOWN_K && n == GEMV_F16_DOWN_N && block_size == 32 && scales_fp16 {
+        F16GemvSelection {
+            variant: F16GemvVariant::DownProjection,
+            reason: "variant=down_projection;K=4864;N=896;block_size=32;scales=fp16",
+        }
+    } else {
+        F16GemvSelection {
+            variant: F16GemvVariant::General,
+            reason: "variant=general;predicate=not(K=4864,N=896,block_size=32,scales=fp16)",
+        }
+    }
+}
 
 pub struct MatMulNBitsFactory {
     pub runtime: Arc<CudaRuntime>,
@@ -1023,12 +1221,39 @@ impl MatMulNBitsKernel {
         k_blocks: usize,
         blob_size: usize,
     ) -> Result<()> {
+        let selection = select_f16_gemv_variant(self.k, self.n, self.block_size, scales_fp16);
+        self.launch_f16_gemv_variant(
+            activation,
+            packed,
+            scales,
+            scales_fp16,
+            bias,
+            output,
+            k_blocks,
+            blob_size,
+            selection,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_f16_gemv_variant(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+        selection: F16GemvSelection,
+    ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 GEMV")?;
-        let entry = if scales_fp16 {
-            GEMV_F16_SCALES_F16_ENTRY
-        } else {
-            GEMV_F16_ENTRY
+        let entry = match selection.variant {
+            F16GemvVariant::DownProjection => GEMV_F16_DOWN_ENTRY,
+            F16GemvVariant::General if scales_fp16 => GEMV_F16_SCALES_F16_ENTRY,
+            F16GemvVariant::General => GEMV_F16_ENTRY,
         };
         let function = self
             .runtime
@@ -1046,12 +1271,21 @@ impl MatMulNBitsKernel {
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
         let scales_fp16_flag: i32 = scales_fp16 as i32;
-        let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
-            GEMV_F16_SMALL_THREADS
-        } else {
-            GEMV_F16_LARGE_THREADS
+        let (threads, columns_per_block, shared_mem_bytes) = match selection.variant {
+            F16GemvVariant::DownProjection => (
+                GEMV_F16_DOWN_THREADS,
+                GEMV_F16_DOWN_COLUMNS_PER_BLOCK,
+                (self.k * std::mem::size_of::<half::f16>()) as u32,
+            ),
+            F16GemvVariant::General => {
+                let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+                    GEMV_F16_SMALL_THREADS
+                } else {
+                    GEMV_F16_LARGE_THREADS
+                };
+                (threads, (threads / 32) as usize, 0)
+            }
         };
-        let columns_per_block = (threads / 32) as usize;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&activation_ptr)
@@ -1067,18 +1301,23 @@ impl MatMulNBitsKernel {
             .arg(&scales_fp16_flag);
         // SAFETY: this path is restricted to symmetric block-32 M=1 fp16 inputs;
         // all tensors were dtype/shape/contiguity validated above, the scalar ABI
-        // matches the selected fp16 GEMV entry point, and the kernel uses only
-        // registers (no per-call alloc or sync), so the launch is legal to record
-        // into and replay from a CUDA graph.
+        // matches the selected fp16 GEMV entry point. Both variants use only
+        // registers and launch-time shared memory (no per-call alloc or sync), so
+        // the launch is legal to record into and replay from a CUDA graph.
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
                 block_dim: (threads, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes,
             })
         }
         .map(|_| ())
-        .map_err(|err| driver_err("launch MatMulNBits fp16 GEMV", err))
+        .map_err(|err| {
+            driver_err(
+                &format!("launch MatMulNBits fp16 GEMV ({})", selection.reason),
+                err,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1362,8 +1601,8 @@ impl Kernel for MatMulNBitsKernel {
         // shape-fixed persistent accuracy-4 activation workspace; it performs no
         // per-call allocation, D2H, or synchronization. The direct fp16 GEMV is
         // likewise capture-safe: fixed grid/block geometry from the shape
-        // signature and register-only scratch. Prefill GEMM and g_idx validation
-        // retain their non-capturable behavior.
+        // signature and register/launch-time-shared scratch. Prefill GEMM and
+        // g_idx validation retain their non-capturable behavior.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
@@ -1726,6 +1965,187 @@ mod tests {
             max_out = max_out.max(e.abs());
         }
         (worst_abs, worst_rel, max_out, all_finite)
+    }
+
+    #[test]
+    fn fp16_down_projection_matches_general_gemv() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping down-projection GEMV parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping down-projection GEMV parity test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        let k = GEMV_F16_DOWN_K;
+        let n = GEMV_F16_DOWN_N;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+
+        let activation: Vec<f16> = (0..k)
+            .map(|i| f16::from_f32(((i * 17 % 257) as f32 - 128.0) / 128.0))
+            .collect();
+        let packed: Vec<u8> = (0..n * k_blocks * blob_size)
+            .map(|i| ((i * 29 + i / 7 + 13) & 0xff) as u8)
+            .collect();
+        let scales: Vec<f16> = (0..n * k_blocks)
+            .map(|i| f16::from_f32(0.01 + (i % 17) as f32 * 0.0005))
+            .collect();
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let general_output_dev = runtime.alloc_raw(n * 2).unwrap();
+        let down_output_dev = runtime.alloc_raw(n * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let activation_view = TensorView::new(
+            device_ptr(activation_dev),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let packed_view = TensorView::new(
+            device_ptr(packed_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_view = TensorView::new(
+            device_ptr(scales_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let mut general_output = TensorMut::new(
+            device_ptr_mut(general_output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut down_output = TensorMut::new(
+            device_ptr_mut(down_output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        kernel
+            .launch_f16_gemv_variant(
+                &activation_view,
+                &packed_view,
+                &scales_view,
+                true,
+                None,
+                &mut general_output,
+                k_blocks,
+                blob_size,
+                F16GemvSelection {
+                    variant: F16GemvVariant::General,
+                    reason: "variant=general;test=forced_reference",
+                },
+            )
+            .unwrap();
+        kernel
+            .launch_f16_gemv_variant(
+                &activation_view,
+                &packed_view,
+                &scales_view,
+                true,
+                None,
+                &mut down_output,
+                k_blocks,
+                blob_size,
+                select_f16_gemv_variant(k, n, block_size, true),
+            )
+            .unwrap();
+        runtime.synchronize().unwrap();
+        drop((general_output, down_output));
+
+        let mut general = vec![f16::ZERO; n];
+        let mut down = vec![f16::ZERO; n];
+        // SAFETY: both output allocations hold `n` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut general), general_output_dev)
+                .unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut down), down_output_dev)
+                .unwrap();
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(general_output_dev).unwrap();
+            runtime.free_raw(down_output_dev).unwrap();
+        }
+
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (reference, specialized) in general.iter().zip(&down) {
+            let reference = reference.to_f32();
+            let specialized = specialized.to_f32();
+            let abs = (reference - specialized).abs();
+            max_abs = max_abs.max(abs);
+            max_rel = max_rel.max(abs / reference.abs().max(1.0));
+        }
+        eprintln!(
+            "down-projection specialized/general parity: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+        );
+        assert!(
+            max_abs <= 0.01 && max_rel <= 5e-3,
+            "down-projection specialization diverged: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+        );
+    }
+
+    #[test]
+    fn fp16_gemv_variant_selection_is_shape_specific() {
+        let selected = select_f16_gemv_variant(4864, 896, 32, true);
+        assert_eq!(selected.variant, F16GemvVariant::DownProjection);
+        assert_eq!(
+            selected.reason,
+            "variant=down_projection;K=4864;N=896;block_size=32;scales=fp16"
+        );
+
+        for (k, n) in [(896, 4864), (896, 1152), (896, 896), (896, 151_936)] {
+            let selection = select_f16_gemv_variant(k, n, 32, true);
+            assert_eq!(
+                selection.variant,
+                F16GemvVariant::General,
+                "K={k}, N={n} must retain the general GEMV"
+            );
+        }
     }
 
     #[test]
