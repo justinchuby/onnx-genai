@@ -2010,6 +2010,7 @@ dependencies = [
  "onnx-runtime-loader",
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
+ "onnx-runtime-tracer",
  "rayon",
  "thiserror 2.0.18",
 ]

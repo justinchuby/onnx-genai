@@ -82,6 +82,7 @@ pub fn broadcast_apply<T: Copy>(
 impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Add", inputs, outputs, 2, 2, 1)?;
+        crate::trace::record_kernel_metrics(inputs, outputs, outputs[0].numel() as u64);
         dispatch_arith!(inputs[0].dtype, "Add", T => add_typed::<T>(inputs, outputs))
     }
 

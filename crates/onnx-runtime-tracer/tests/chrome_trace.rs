@@ -8,7 +8,9 @@
 //! deliberately robust — we assert ordering and presence, never exact
 //! durations.
 
-use onnx_runtime_tracer::{Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase};
+use onnx_runtime_tracer::{
+    Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase, annotate_current_span,
+};
 use serde_json::Value;
 use std::sync::Arc;
 use std::thread;
@@ -97,6 +99,23 @@ fn span_guard_records_on_drop_with_monotonic_ts_and_dur() {
     {
         let _s = ctx.span("layer_norm", "compute");
         thread::sleep(Duration::from_millis(2));
+    }
+
+    #[test]
+    fn active_span_accepts_kernel_metrics() {
+        let (ctx, mem) = TraceContext::in_memory();
+        {
+            let _span = ctx
+                .span("MatMul", "compute")
+                .with_args(Args::new().device("cpu"));
+            annotate_current_span(Args::new().bytes(96).flops(48));
+        }
+
+        let events = mem.events();
+        let args = events[0].args.as_ref().expect("span args");
+        assert_eq!(args["device"], "cpu");
+        assert_eq!(args["bytes"], 96);
+        assert_eq!(args["flops"], 48);
     }
     {
         let _s = ctx

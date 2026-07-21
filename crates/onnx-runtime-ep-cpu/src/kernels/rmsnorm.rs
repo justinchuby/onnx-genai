@@ -60,6 +60,18 @@ impl Kernel for RmsNormKernel {
                 outputs[0].dtype, inputs[0].dtype
             )));
         }
+        let elements = inputs[0].numel() as u64;
+        let rank = inputs[0].shape.len() as i64;
+        let axis = if self.axis < 0 { self.axis + rank } else { self.axis };
+        let groups = if axis >= 0 && axis < rank {
+            crate::trace::product(inputs[0].shape[..axis as usize].iter().copied())
+        } else {
+            0
+        };
+        // x²+sum and two output multiplies are four operations/element;
+        // mean, epsilon, sqrt and reciprocal are four operations/group.
+        let flops = elements.saturating_mul(4).saturating_add(groups.saturating_mul(4));
+        crate::trace::record_kernel_metrics(inputs, outputs, flops);
         let x = to_dense_f32_widen("RMSNormalization", &inputs[0])?;
         let scale = to_dense_f32_widen("RMSNormalization", &inputs[1])?;
         let y = rms_norm_dense(

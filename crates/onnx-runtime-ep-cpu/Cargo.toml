@@ -19,6 +19,7 @@ onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
 mlas-sys = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
+onnx-runtime-tracer = { workspace = true }
 thiserror = { workspace = true }
 half = "2"
 rayon = "1"

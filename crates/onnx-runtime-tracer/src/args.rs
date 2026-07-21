@@ -101,6 +101,13 @@ impl Args {
         self.with("flops", flops)
     }
 
+    /// Merge another args object into this one.
+    ///
+    /// Values from `other` replace existing values with the same key.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
     /// Record that an **optimized kernel existed** for this op but was **not**
     /// selected (the "missed fast path" contract, §46.6).
     ///
