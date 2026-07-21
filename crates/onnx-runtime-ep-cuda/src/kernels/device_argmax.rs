@@ -8,7 +8,19 @@ use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
+const VALUES_PER_THREAD: usize = 4;
+const MAX_PARTIALS: usize = 256;
 const RESULT_BYTES: usize = 2 * std::mem::size_of::<u32>();
+
+pub(crate) fn partial_count(elements: usize) -> usize {
+    elements
+        .div_ceil(BLOCK as usize * VALUES_PER_THREAD)
+        .clamp(1, MAX_PARTIALS)
+}
+
+pub(crate) fn scratch_words(elements: usize) -> usize {
+    2 * partial_count(elements)
+}
 
 const SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -26,68 +38,120 @@ __device__ __forceinline__ float argmax_load<__half>(__half value) {
   return __half2float(value);
 }
 
+__device__ __forceinline__ void argmax_update(
+    float candidate,
+    unsigned int candidate_index,
+    float& best,
+    unsigned int& best_index) {
+  if (candidate > best ||
+      (candidate == best && candidate_index < best_index)) {
+    best = candidate;
+    best_index = candidate_index;
+  }
+}
+
+__device__ __forceinline__ void warp_argmax(
+    float& best,
+    unsigned int& best_index) {
+  for (unsigned int offset = 16; offset > 0; offset >>= 1) {
+    float candidate = __shfl_down_sync(0xffffffffu, best, offset);
+    unsigned int candidate_index =
+        __shfl_down_sync(0xffffffffu, best_index, offset);
+    argmax_update(candidate, candidate_index, best, best_index);
+  }
+}
+
 template <typename T>
-__device__ __forceinline__ void greedy_argmax_impl(
+__device__ __forceinline__ void greedy_argmax_partials_impl(
     const T* logits,
     unsigned long long elements,
-    const unsigned int* capture_error,
-    unsigned int* result) {
-  extern __shared__ unsigned char shared_bytes[];
-  float* best_values = reinterpret_cast<float*>(shared_bytes);
-  unsigned int* best_indices =
-      reinterpret_cast<unsigned int*>(best_values + blockDim.x);
-
+    float* partial_values,
+    unsigned int* partial_indices) {
   float best = -1.0f / 0.0f;
   unsigned int best_index = 0;
-  for (unsigned long long i = threadIdx.x; i < elements; i += blockDim.x) {
+  unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  unsigned long long stride =
+      static_cast<unsigned long long>(blockDim.x) * gridDim.x;
+  for (; i < elements; i += stride) {
     float value = argmax_load<T>(logits[i]);
     if (isnan(value)) continue;
     unsigned int index = static_cast<unsigned int>(i);
-    if (value > best || (value == best && index < best_index)) {
-      best = value;
-      best_index = index;
-    }
+    argmax_update(value, index, best, best_index);
   }
 
-  best_values[threadIdx.x] = best;
-  best_indices[threadIdx.x] = best_index;
+  warp_argmax(best, best_index);
+  __shared__ float warp_values[32];
+  __shared__ unsigned int warp_indices[32];
+  unsigned int lane = threadIdx.x & 31;
+  unsigned int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    warp_values[warp] = best;
+    warp_indices[warp] = best_index;
+  }
   __syncthreads();
 
-  for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      float candidate = best_values[threadIdx.x + stride];
-      unsigned int candidate_index = best_indices[threadIdx.x + stride];
-      if (candidate > best ||
-          (candidate == best && candidate_index < best_index)) {
-        best = candidate;
-        best_index = candidate_index;
-        best_values[threadIdx.x] = candidate;
-        best_indices[threadIdx.x] = candidate_index;
-      }
+  if (warp == 0) {
+    unsigned int warp_count = (blockDim.x + 31) >> 5;
+    best = lane < warp_count ? warp_values[lane] : -1.0f / 0.0f;
+    best_index = lane < warp_count ? warp_indices[lane] : 0;
+    warp_argmax(best, best_index);
+    if (lane == 0) {
+      partial_values[blockIdx.x] = best;
+      partial_indices[blockIdx.x] = best_index;
     }
-    __syncthreads();
-  }
-
-  if (threadIdx.x == 0) {
-    result[0] = best_indices[0];
-    result[1] = *capture_error;
   }
 }
 
-extern "C" __global__ void greedy_argmax_f32(
+extern "C" __global__ void greedy_argmax_partials_f32(
     const float* logits,
     unsigned long long elements,
-    const unsigned int* capture_error,
-    unsigned int* result) {
-  greedy_argmax_impl<float>(logits, elements, capture_error, result);
+    float* partial_values,
+    unsigned int* partial_indices) {
+  greedy_argmax_partials_impl<float>(
+      logits, elements, partial_values, partial_indices);
 }
 
-extern "C" __global__ void greedy_argmax_f16(
+extern "C" __global__ void greedy_argmax_partials_f16(
     const __half* logits,
     unsigned long long elements,
+    float* partial_values,
+    unsigned int* partial_indices) {
+  greedy_argmax_partials_impl<__half>(
+      logits, elements, partial_values, partial_indices);
+}
+
+extern "C" __global__ void greedy_argmax_finalize(
+    const float* partial_values,
+    const unsigned int* partial_indices,
+    unsigned int partial_count,
     const unsigned int* capture_error,
     unsigned int* result) {
-  greedy_argmax_impl<__half>(logits, elements, capture_error, result);
+  float best = -1.0f / 0.0f;
+  unsigned int best_index = 0;
+  for (unsigned int i = threadIdx.x; i < partial_count; i += blockDim.x) {
+    argmax_update(partial_values[i], partial_indices[i], best, best_index);
+  }
+  warp_argmax(best, best_index);
+  __shared__ float warp_values[32];
+  __shared__ unsigned int warp_indices[32];
+  unsigned int lane = threadIdx.x & 31;
+  unsigned int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    warp_values[warp] = best;
+    warp_indices[warp] = best_index;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    unsigned int warp_count = (blockDim.x + 31) >> 5;
+    best = lane < warp_count ? warp_values[lane] : -1.0f / 0.0f;
+    best_index = lane < warp_count ? warp_indices[lane] : 0;
+    warp_argmax(best, best_index);
+    if (lane == 0) {
+      result[0] = best_index;
+      result[1] = *capture_error;
+    }
+  }
 }
 "#;
 
@@ -109,8 +173,8 @@ pub(crate) fn launch(
         )));
     }
     let (entry, elem_size) = match dtype {
-        DataType::Float32 => ("greedy_argmax_f32", std::mem::size_of::<f32>()),
-        DataType::Float16 => ("greedy_argmax_f16", std::mem::size_of::<u16>()),
+        DataType::Float32 => ("greedy_argmax_partials_f32", std::mem::size_of::<f32>()),
+        DataType::Float16 => ("greedy_argmax_partials_f16", std::mem::size_of::<u16>()),
         other => {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep device argmax: unsupported logits dtype {other:?}; expected Float32 or Float16"
@@ -126,9 +190,16 @@ pub(crate) fn launch(
             logits.len()
         )));
     }
-    if result.len() < RESULT_BYTES {
+    let partial_count = partial_count(elements);
+    let required_result_bytes = RESULT_BYTES
+        + scratch_words(elements)
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| {
+                EpError::KernelFailed("cuda_ep device argmax: scratch byte size overflows".into())
+            })?;
+    if result.len() < required_result_bytes {
         return Err(EpError::KernelFailed(format!(
-            "cuda_ep device argmax: result buffer has {} bytes, need {RESULT_BYTES}",
+            "cuda_ep device argmax: result buffer has {} bytes, need {required_result_bytes}",
             result.len()
         )));
     }
@@ -141,27 +212,49 @@ pub(crate) fn launch(
     if dtype == DataType::Float16 {
         runtime.require_nvrtc_half_headers("device argmax")?;
     }
-    let function = runtime.nvrtc_function("native_device_argmax", SOURCE, entry)?;
+    let partial_function = runtime.nvrtc_function("native_device_argmax", SOURCE, entry)?;
+    let final_function =
+        runtime.nvrtc_function("native_device_argmax", SOURCE, "greedy_argmax_finalize")?;
     let logits_ptr = cuptr(logits.as_ptr());
     let elements = elements as u64;
+    let scratch_ptr = unsafe { result.as_mut_ptr().add(RESULT_BYTES) };
+    let partial_values_ptr = cuptr(scratch_ptr);
+    let partial_indices_ptr =
+        cuptr(unsafe { scratch_ptr.add(partial_count * std::mem::size_of::<f32>()) });
     let capture_error_ptr = runtime.capture_error_ptr();
     let result_ptr = cuptr(result.as_mut_ptr());
-    let mut builder = runtime.stream().launch_builder(&function);
+    let mut builder = runtime.stream().launch_builder(&partial_function);
     builder
         .arg(&logits_ptr)
         .arg(&elements)
+        .arg(&partial_values_ptr)
+        .arg(&partial_indices_ptr);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (partial_count as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map_err(|error| driver_err("launch native device argmax partials", error))?;
+
+    let partial_count = partial_count as u32;
+    let mut builder = runtime.stream().launch_builder(&final_function);
+    builder
+        .arg(&partial_values_ptr)
+        .arg(&partial_indices_ptr)
+        .arg(&partial_count)
         .arg(&capture_error_ptr)
         .arg(&result_ptr);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: BLOCK
-                * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>()) as u32,
+            shared_mem_bytes: 0,
         })
     }
     .map(|_| ())
-    .map_err(|error| driver_err("launch native device argmax", error))
+    .map_err(|error| driver_err("launch native device argmax finalize", error))
 }
 
 #[cfg(test)]
@@ -188,13 +281,17 @@ mod tests {
             .unwrap_or(0) as u32
     }
 
+    fn result_bytes(elements: usize) -> usize {
+        RESULT_BYTES + scratch_words(elements) * std::mem::size_of::<u32>()
+    }
+
     fn run_case(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
         let bytes = logits
             .iter()
             .flat_map(|value| value.to_ne_bytes())
             .collect::<Vec<_>>();
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
-        let mut output = ep.allocate(RESULT_BYTES, 256).unwrap();
+        let mut output = ep.allocate(result_bytes(logits.len()), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ep.device_argmax(&input, logits.len(), DataType::Float32, &mut output)
             .unwrap();
@@ -215,7 +312,7 @@ mod tests {
             .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
             .collect::<Vec<_>>();
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
-        let mut output = ep.allocate(RESULT_BYTES, 256).unwrap();
+        let mut output = ep.allocate(result_bytes(logits.len()), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
         ep.device_argmax(&input, logits.len(), DataType::Float16, &mut output)
             .unwrap();
@@ -231,10 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn device_argmax_matches_host_for_random_ties_nan_and_odd_width() {
+    fn device_argmax_matches_host_for_151936_random_ties_and_nan() {
         let Some(ep) = gpu() else { return };
         let mut seed = 0x1234_5678_u32;
-        let mut logits = (0..151_937)
+        let mut logits = (0..151_936)
             .map(|_| {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 (seed as i32) as f32 / i32::MAX as f32
@@ -265,12 +362,13 @@ mod tests {
     }
 
     #[test]
-    fn device_argmax_f16_matches_host_for_finite_and_non_finite() {
+    fn device_argmax_f16_matches_host_for_151936_ties_and_nan() {
         let Some(ep) = gpu() else { return };
-        let mut logits = (0..4096)
+        let mut logits = (0..151_936)
             .map(|i| ((i % 37) as f32 - 18.0) * 0.25)
             .collect::<Vec<_>>();
         logits[1234] = 9.5;
+        logits[130_001] = 9.5;
         logits[77] = f32::NAN;
         // Reference argmax over the fp16-rounded values, matching kernel input.
         let rounded = logits
