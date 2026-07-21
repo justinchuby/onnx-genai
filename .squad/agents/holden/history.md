@@ -117,3 +117,6 @@ Cleared Deckard's `f795d45` executor EP-polymorphism refactor: it preserves CPU-
 
 ## 2026-07-21 — Wave-2 and CI milestone
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
+
+## 2026-07-21T11:15:00Z — Long-context GQA review
+- 🟢 Approved Sebastian's 16-way split-K change after verifying exact scratch bounds, deterministic merge order, capture safety, parity, and SM portability. Reproduced about 693 tok/s at 1024 tokens versus 647 baseline with no 256 regression.

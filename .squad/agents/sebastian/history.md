@@ -80,3 +80,6 @@ Replaced Rachael's rejected `RefCell`/unsendable Python genai Engine with a send
 
 ## 2026-07-21 — Wave-2 and CI milestone
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
+
+## 2026-07-21T11:15:00Z — Wave-3 long-context GQA
+- Raised capture-safe fp16 GQA `MAX_SPLITS` 8→16; Holden approved and `3b972bf` merged. Independent H200 review measured about 647→693 tok/s at 1024 tokens (+7.1%), flat at 256, with identical tokens and zero fallbacks.

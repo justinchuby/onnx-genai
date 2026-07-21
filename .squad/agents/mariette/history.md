@@ -38,3 +38,6 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 - Reported CUDA EP suite success: 238 passed, 0 failed.
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-21T11:15:00Z — Wave-3 SwiGLU fusion
+- Fused `silu(gate) * up` into one capture-safe CUDA kernel, halving activation launches from 48 to 24/token. Pris approved; `12e48b8` merged and measured about 673→689 tok/s at 256 tokens with zero fallbacks.
