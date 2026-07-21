@@ -63,7 +63,8 @@ use onnx_runtime_ir::{
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{
-    DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, SymbolInterner, TypeInfo,
+    DimExpr, InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy, NodeIo, ShapeData,
+    SymbolInterner, TypeInfo,
 };
 use onnx_runtime_tracer::{TraceContext, annotate_current_span_with};
 
@@ -985,6 +986,22 @@ fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
         ),
         _ => None,
     }
+}
+
+/// Whether a runtime input is small enough to materialize as shape-propagation
+/// data. Keep this gate ahead of `contiguous_bytes`: unsupported tensors must
+/// degrade to absent shape-data without allocating or copying their contents.
+fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
+    if !matches!(dtype, DataType::Int32 | DataType::Int64) {
+        return false;
+    }
+    if shape.len() > 1 {
+        return false;
+    }
+    shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+        .is_some_and(|count| count <= MAX_SHAPE_DATA_ELEMS)
 }
 
 /// Compute concrete output shapes from already-resolved input shapes and the
@@ -2822,7 +2839,7 @@ impl Executor {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
-                    v.and_then(|vid| self.input_i64(vid, &input_shapes[i], input_dtypes[i]))
+                    v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
             let node = self.graph.node(node_id);
@@ -3359,6 +3376,30 @@ impl Executor {
     fn input_i64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<i64>> {
         let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
         bytes_as_i64(&bytes, dtype)
+    }
+
+    /// Bounded integer reader for dynamic shape propagation. Views and sequence
+    /// elements can have a tiny logical shape backed by a much larger root
+    /// allocation, so cap that allocation before `contiguous_bytes` can copy it.
+    fn shape_input_i64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<i64>> {
+        if !bounded_shape_input(dtype, shape) {
+            return None;
+        }
+        let max_bytes = MAX_SHAPE_DATA_ELEMS.checked_mul(dtype.byte_size())?;
+        if let Some(view) = self.views.get(&vid) {
+            let source = self.buffers.get(&view.source)?;
+            if source.len() > max_bytes {
+                return None;
+            }
+        }
+        if self
+            .seq_elem_values
+            .get(&vid)
+            .is_some_and(|elem| elem.root_len() > max_bytes)
+        {
+            return None;
+        }
+        self.input_i64(vid, shape, dtype)
     }
 }
 

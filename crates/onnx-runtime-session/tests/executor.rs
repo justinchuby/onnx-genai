@@ -5,12 +5,22 @@
 //! reference computed here in the test. Nothing below names a model or bakes in
 //! a fixed shape path — the executor is exercised as a generic Graph runner.
 
-use onnx_runtime_ir::{
-    Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
-    static_shape,
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
+
+use onnx_runtime_ep_api::{
+    DeviceBuffer, EpConfig, ExecutionProvider, Fence, Kernel, KernelMatch, Result as EpResult,
+};
+use onnx_runtime_ep_cpu::CpuExecutionProvider;
+use onnx_runtime_ir::{
+    Attribute, DataType, DeviceId, DeviceType, Dim, Graph, Node, NodeId, Shape, TensorData,
+    TensorLayout, ValueId, WeightRef, static_shape,
+};
+use onnx_runtime_loader::{Model, encode_model};
 use onnx_runtime_session::{InferenceSession, OpsetVersion, SessionError, Tensor, WarmupShape};
-use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
+use onnx_runtime_shape_inference::{InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy};
 
 // This synthetic name must remain unregistered so unsupported-op error tests cannot go stale.
 const UNSUPPORTED_OP_SENTINEL: &str = "NxrtNeverRegisteredSentinelOp";
@@ -89,6 +99,189 @@ fn input_shaped(g: &mut Graph, name: &str, dtype: DataType, shape: Shape) -> Val
 fn i32_tensor(shape: &[usize], data: &[i32]) -> Tensor {
     let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
     Tensor::from_raw(DataType::Int32, shape.to_vec(), &bytes).unwrap()
+}
+
+fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
+    let bytes: Vec<u8> = data.iter().flat_map(|value| value.to_le_bytes()).collect();
+    Tensor::from_raw(DataType::Int64, shape.to_vec(), &bytes).unwrap()
+}
+
+struct HostDownloadCountingEp {
+    cpu: CpuExecutionProvider,
+    host_downloads: Arc<AtomicUsize>,
+}
+
+impl HostDownloadCountingEp {
+    fn new(host_downloads: Arc<AtomicUsize>) -> Self {
+        let mut cpu = CpuExecutionProvider::new();
+        cpu.initialize(&EpConfig::default()).unwrap();
+        Self {
+            cpu,
+            host_downloads,
+        }
+    }
+}
+
+impl ExecutionProvider for HostDownloadCountingEp {
+    fn name(&self) -> &str {
+        "host_download_counting_ep"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        self.cpu.device_type()
+    }
+
+    fn device_id(&self) -> DeviceId {
+        self.cpu.device_id()
+    }
+
+    fn initialize(&mut self, config: &EpConfig) -> EpResult<()> {
+        self.cpu.initialize(config)
+    }
+
+    fn shutdown(&mut self) -> EpResult<()> {
+        self.cpu.shutdown()
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        self.cpu
+            .supports_op(op, opset, shapes, input_dtypes, layouts)
+    }
+
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> EpResult<Box<dyn Kernel>> {
+        self.cpu.get_kernel(op, shapes, opset)
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
+        self.cpu.allocate(size, alignment)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> EpResult<()> {
+        self.cpu.deallocate(buffer)
+    }
+
+    fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> EpResult<()> {
+        self.cpu.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> EpResult<Fence> {
+        self.cpu.copy_async(src, dst, size)
+    }
+
+    fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> EpResult<()> {
+        self.cpu.copy_from_host(src, dst)
+    }
+
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> EpResult<()> {
+        self.host_downloads.fetch_add(1, Ordering::Relaxed);
+        self.cpu.copy_to_host(src, dst)
+    }
+
+    fn sync(&self) -> EpResult<()> {
+        self.cpu.sync()
+    }
+}
+
+fn unresolved_unsqueeze_model(axes_dtype: DataType, axes_shape: &[usize]) -> Vec<u8> {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let data = input(&mut g, "data", DataType::Float32, &[2]);
+    let axes = input(&mut g, "axes", axes_dtype, axes_shape);
+    let dynamic = g.intern_symbol("dynamic_unsqueeze_extent");
+    let output = g.create_named_value("output", DataType::Float32, vec![Dim::Symbolic(dynamic)]);
+    g.mark_value_shape_unknown(output);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Unsqueeze",
+        vec![Some(data), Some(axes)],
+        vec![output],
+    ));
+    g.add_output(output);
+    encode_model(&Model::new(&g)).expect("encode unresolved Unsqueeze model")
+}
+
+fn unresolved_unsqueeze_from_large_slice_model() -> Vec<u8> {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let len = MAX_SHAPE_DATA_ELEMS + 1;
+    let source = input(&mut g, "source", DataType::Int64, &[len]);
+    let starts = i64_init(&mut g, "starts", &[1], &[0]);
+    let ends = i64_init(&mut g, "ends", &[1], &[1]);
+    let axes = i64_init(&mut g, "slice_axes", &[1], &[0]);
+    let steps = i64_init(&mut g, "steps", &[1], &[1]);
+    let sliced = g.create_named_value("sliced", DataType::Int64, static_shape([1]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Slice",
+        vec![
+            Some(source),
+            Some(starts),
+            Some(ends),
+            Some(axes),
+            Some(steps),
+        ],
+        vec![sliced],
+    ));
+
+    let data = input(&mut g, "data", DataType::Float32, &[2]);
+    let dynamic = g.intern_symbol("dynamic_unsqueeze_extent");
+    let output = g.create_named_value("output", DataType::Float32, vec![Dim::Symbolic(dynamic)]);
+    g.mark_value_shape_unknown(output);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Unsqueeze",
+        vec![Some(data), Some(sliced)],
+        vec![output],
+    ));
+    g.add_output(output);
+    encode_model(&Model::new(&g)).expect("encode large-source Slice to Unsqueeze model")
+}
+
+fn assert_shape_input_rejected_without_materialization(
+    axes_dtype: DataType,
+    axes_shape: &[usize],
+    axes_bytes: &[u8],
+) {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = Arc::new(HostDownloadCountingEp::new(Arc::clone(&downloads)));
+    let model = unresolved_unsqueeze_model(axes_dtype, axes_shape);
+    let mut session = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep)
+        .build()
+        .expect("build unresolved Unsqueeze session");
+    let data = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+    let axes = Tensor::from_raw(axes_dtype, axes_shape.to_vec(), axes_bytes).unwrap();
+
+    let error = session
+        .run(&[("data", &data), ("axes", &axes)])
+        .expect_err("rejected shape input must leave the output unresolved");
+    assert!(
+        matches!(error, SessionError::UnresolvedShape { .. }),
+        "expected graceful unresolved shape, got {error}"
+    );
+    assert_eq!(
+        downloads.load(Ordering::Relaxed),
+        0,
+        "shape-propagation rejection must happen before copy_to_host"
+    );
 }
 
 fn gqa_cache_graph(past_capacity: usize) -> Graph {
@@ -265,6 +458,97 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_and_comparison_broadcast() {
     assert_eq!(outputs[0].shape, vec![3, 2]);
     assert_eq!(outputs[0].dtype, DataType::Bool);
     assert_eq!(outputs[0].as_bytes(), &[1, 1, 0, 1, 0, 0]);
+}
+
+#[test]
+fn oversized_shape_input_is_rejected_before_host_materialization() {
+    let len = MAX_SHAPE_DATA_ELEMS + 1;
+    assert_shape_input_rejected_without_materialization(
+        DataType::Int64,
+        &[len],
+        &vec![0u8; len * std::mem::size_of::<i64>()],
+    );
+}
+
+#[test]
+fn non_integer_shape_input_is_rejected_before_host_materialization() {
+    assert_shape_input_rejected_without_materialization(
+        DataType::Float32,
+        &[1],
+        &0.0f32.to_le_bytes(),
+    );
+}
+
+#[test]
+fn rank_two_shape_input_is_rejected_before_host_materialization() {
+    assert_shape_input_rejected_without_materialization(
+        DataType::Int64,
+        &[1, 1],
+        &0i64.to_le_bytes(),
+    );
+}
+
+#[test]
+fn small_shape_view_with_oversized_source_is_rejected_before_host_materialization() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = Arc::new(HostDownloadCountingEp::new(Arc::clone(&downloads)));
+    let model = unresolved_unsqueeze_from_large_slice_model();
+    let mut session = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep)
+        .build()
+        .expect("build large-source Slice to Unsqueeze session");
+    let len = MAX_SHAPE_DATA_ELEMS + 1;
+    let source = i64_tensor(&[len], &vec![0; len]);
+    let data = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
+
+    let error = session
+        .run(&[("source", &source), ("data", &data)])
+        .expect_err("oversized view source must leave the output unresolved");
+    assert!(
+        matches!(error, SessionError::UnresolvedShape { .. }),
+        "expected graceful unresolved shape, got {error}"
+    );
+    assert_eq!(
+        downloads.load(Ordering::Relaxed),
+        0,
+        "shape-propagation rejection must happen before copying a view's source buffer"
+    );
+}
+
+#[test]
+fn scalar_integer_shape_inputs_still_propagate_range_extent() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+    let start = input(&mut g, "start", DataType::Int64, &[]);
+    let limit = input(&mut g, "limit", DataType::Int64, &[]);
+    let delta = input(&mut g, "delta", DataType::Int64, &[]);
+    let dynamic = g.intern_symbol("dynamic_range_extent");
+    let output = g.create_named_value("output", DataType::Int64, vec![Dim::Symbolic(dynamic)]);
+    g.mark_value_shape_unknown(output);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Range",
+        vec![Some(start), Some(limit), Some(delta)],
+        vec![output],
+    ));
+    g.add_output(output);
+
+    let mut session = InferenceSession::from_graph(g).expect("build dynamic Range session");
+    let start = i64_tensor(&[], &[2]);
+    let limit = i64_tensor(&[], &[8]);
+    let delta = i64_tensor(&[], &[2]);
+    let outputs = session
+        .run(&[("start", &start), ("limit", &limit), ("delta", &delta)])
+        .expect("scalar Range shape propagation succeeds");
+
+    assert_eq!(outputs[0].shape, vec![3]);
+    assert_eq!(outputs[0].dtype, DataType::Int64);
+    let expected: Vec<u8> = [2i64, 4, 6]
+        .into_iter()
+        .flat_map(i64::to_le_bytes)
+        .collect();
+    assert_eq!(outputs[0].as_bytes(), expected);
 }
 
 /// Insert an op node whose single output carries an explicit (possibly
