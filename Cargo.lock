@@ -2005,6 +2005,7 @@ dependencies = [
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
  "thiserror 2.0.18",
 ]

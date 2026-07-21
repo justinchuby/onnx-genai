@@ -62,6 +62,7 @@ mod dynamic_library;
 pub mod error;
 mod graph;
 pub mod kernels;
+mod optimizer;
 pub mod provider;
 pub mod runtime;
 

@@ -16,6 +16,7 @@ cuda = []
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-optimizer = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
 thiserror = { workspace = true }
 half = "2"

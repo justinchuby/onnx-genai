@@ -23,9 +23,10 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
+use crate::optimizer::SILU_MUL_FUSION_ATTR;
 use crate::runtime::{CudaRuntime, cuptr};
 
 /// Threads per block for the 1-D pointwise grids (a full warp-multiple block).
@@ -112,6 +113,15 @@ extern "C" __global__ void NAME##_##SUFFIX( \
     } \
 }
 
+#define DEFINE_SILU_MUL(TYPE, SUFFIX) \
+extern "C" __global__ void silu_mul_##SUFFIX( \
+    const TYPE* a, const TYPE* b, TYPE* y, const unsigned long long n) { \
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+         i += (unsigned long long)gridDim.x * blockDim.x) \
+        y[i] = store_float<TYPE>( \
+            __fmul_rn(op_silu(load_float<TYPE>(a[i])), load_float<TYPE>(b[i]))); \
+}
+
 #define DEFINE_BINARY_I64(NAME, EXPR) \
 extern "C" __global__ void NAME##_i64( \
     const long long* a, const long long* b, long long* y, \
@@ -149,6 +159,7 @@ DEFINE_BINARY(max, TYPE, SUFFIX)
 
 DEFINE_FOR_TYPE(float, f32)
 DEFINE_UNARY(silu, float, f32)
+DEFINE_SILU_MUL(float, f32)
 DEFINE_BINARY_I64(add, a[ai] + b[bi])
 DEFINE_BINARY_I64(sub, a[ai] - b[bi])
 DEFINE_BINARY_I64(mul, a[ai] * b[bi])
@@ -157,13 +168,47 @@ DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
 DEFINE_UNARY(silu, __half, f16)
 DEFINE_UNARY(silu, __nv_bfloat16, bf16)
+DEFINE_SILU_MUL(__nv_bfloat16, bf16)
+
+extern "C" __global__ void silu_mul_f16(
+    const __half* a, const __half* b, __half* y, const unsigned long long n) {
+    const unsigned long long thread =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long stride =
+        (unsigned long long)gridDim.x * blockDim.x;
+    const bool half2_aligned =
+        ((((unsigned long long)a | (unsigned long long)b | (unsigned long long)y) & 3ull) == 0ull);
+    if (half2_aligned) {
+        const __half2* a2 = reinterpret_cast<const __half2*>(a);
+        const __half2* b2 = reinterpret_cast<const __half2*>(b);
+        __half2* y2 = reinterpret_cast<__half2*>(y);
+        const unsigned long long pairs = n / 2;
+        for (unsigned long long i = thread; i < pairs; i += stride) {
+            const float2 av = __half22float2(a2[i]);
+            const float2 bv = __half22float2(b2[i]);
+            y2[i] = __floats2half2_rn(
+                __fmul_rn(op_silu(av.x), bv.x),
+                __fmul_rn(op_silu(av.y), bv.y));
+        }
+        if (thread == 0 && (n & 1ull) != 0ull) {
+            const unsigned long long i = n - 1;
+            y[i] = __float2half_rn(
+                __fmul_rn(op_silu(__half2float(a[i])), __half2float(b[i])));
+        }
+    } else {
+        for (unsigned long long i = thread; i < n; i += stride) {
+            y[i] = __float2half_rn(
+                __fmul_rn(op_silu(__half2float(a[i])), __half2float(b[i])));
+        }
+    }
+}
 #endif
 "#;
 
 /// NVRTC module names (one module holds all unary / all binary entries so a
 /// runtime compiles each source string at most once — see
 /// [`CudaRuntime::nvrtc_function`]).
-const POINTWISE_MODULE: &str = "elementwise_float_v2";
+const POINTWISE_MODULE: &str = "elementwise_float_v3";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatDtype {
@@ -371,6 +416,12 @@ impl UnaryKernel {
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let entry = self.op.entry(dtype);
+        if self.op == UnaryOp::Silu {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "silu_separate",
+                "CUDA SwiGLU fusion was not selected because this Silu does not feed one eligible equal-shape Mul exclusively"
+            );
+        }
         let current_signature = is_fixed_decode_shape(x.shape).then(|| UnaryCaptureSignature {
             dtype,
             shape: x.shape.to_vec(),
@@ -434,7 +485,15 @@ pub struct BinaryFactory {
 }
 
 impl KernelFactory for BinaryFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        if self.op == BinaryOp::Mul
+            && node.attr(SILU_MUL_FUSION_ATTR).and_then(Attribute::as_int) == Some(1)
+        {
+            return Ok(Box::new(SiluMulKernel {
+                runtime: self.runtime.clone(),
+                last_capture_safe_signature: Mutex::new(None),
+            }));
+        }
         Ok(Box::new(BinaryKernel {
             op: self.op,
             runtime: self.runtime.clone(),
@@ -599,6 +658,12 @@ impl BinaryKernel {
             Some(dtype) => self.op.entry(dtype),
             None => format!("{}_i64", self.op.stem()),
         };
+        if self.op == BinaryOp::Mul {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "mul_separate",
+                "CUDA SwiGLU fusion was not selected because this Mul is not an eligible equal-shape, single-consumer Mul(Silu(gate), up) pattern"
+            );
+        }
         let current_signature = is_fixed_decode_shape(&out_shape).then(|| BinaryCaptureSignature {
             dtype: a.dtype,
             shapes: BroadcastMetadataKey {
@@ -671,6 +736,115 @@ impl Kernel for BinaryKernel {
     }
 }
 
+/// Fused equal-shape `silu(gate) * up` pointwise kernel.
+#[derive(Debug)]
+struct SiluMulKernel {
+    runtime: Arc<CudaRuntime>,
+    last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+}
+
+impl SiluMulKernel {
+    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep fused SiluMul capture signature lock was poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
+        const OP: &str = "SiluMul";
+        if inputs.len() != 2 || outputs.len() != 1 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {OP}: expected 2 inputs and 1 output, got {} and {}",
+                inputs.len(),
+                outputs.len()
+            )));
+        }
+        let gate = &inputs[0];
+        let up = &inputs[1];
+        let dtype = FloatDtype::from_onnx(OP, "gate", gate.dtype)?;
+        if dtype != FloatDtype::F32 {
+            self.runtime.require_nvrtc_half_headers(OP)?;
+        }
+        if up.dtype != gate.dtype || outputs[0].dtype != gate.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {OP}: gate/up/output dtypes must match, got {:?}/{:?}/{:?}",
+                gate.dtype, up.dtype, outputs[0].dtype
+            )));
+        }
+        if gate.shape != up.shape || outputs[0].shape != gate.shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {OP}: gate/up/output shapes must match exactly, got {:?}/{:?}/{:?}",
+                gate.shape, up.shape, outputs[0].shape
+            )));
+        }
+        require_contiguous(OP, "gate", gate.is_contiguous())?;
+        require_contiguous(OP, "up", up.is_contiguous())?;
+        require_contiguous(OP, "output", outputs[0].is_contiguous())?;
+
+        let n = gate.numel();
+        let n_u64 = u64::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep {OP}: {n} elements exceed u64")))?;
+        let current_signature = is_fixed_decode_shape(gate.shape).then(|| UnaryCaptureSignature {
+            dtype,
+            shape: gate.shape.to_vec(),
+        });
+        require_matching_capture_signature(
+            &self.runtime,
+            OP,
+            warmed_signature.as_ref(),
+            current_signature.as_ref(),
+        )?;
+
+        let entry = format!("silu_mul_{}", dtype.suffix());
+        let func = self
+            .runtime
+            .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
+        let gate_ptr = cuptr(gate.data_ptr::<u8>() as *const c_void);
+        let up_ptr = cuptr(up.data_ptr::<u8>() as *const c_void);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let cfg = LaunchConfig {
+            grid_dim: (grid_for(n), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        onnx_runtime_ep_api::record_kernel_variant!(
+            "silu_mul_fused",
+            "equal-shape {:?} Mul(Silu(gate), up) uses one capture-safe pointwise launch; fp16 uses aligned half2 with a scalar tail",
+            gate.dtype
+        );
+        let stream = self.runtime.stream();
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&gate_ptr).arg(&up_ptr).arg(&y_ptr).arg(&n_u64);
+        // SAFETY: all pointers cover the same validated `n` elements and the
+        // selected entry matches their common floating-point dtype.
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        *last_signature = current_signature;
+        Ok(())
+    }
+}
+
+impl Kernel for SiluMulKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs)
+    }
+
+    fn supports_strided_input(&self, _idx: usize) -> bool {
+        false
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SiluMul shape/dtype signature does not match the warmed fixed-decode capture signature",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "SiluMul capture signature is unavailable because its state lock was poisoned",
+            ),
+        }
+    }
+}
+
 fn require_matching_capture_signature<T: PartialEq>(
     runtime: &CudaRuntime,
     op: &str,
@@ -728,6 +902,9 @@ pub(crate) fn u64_bytes(values: &[u64]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::DeviceId;
 
     #[test]
     fn unary_entry_points_are_distinct_and_named() {
@@ -768,6 +945,9 @@ mod tests {
                 op.op_name()
             );
         }
+        assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(float, f32)"));
+        assert!(POINTWISE_SRC.contains("silu_mul_f16("));
+        assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(__nv_bfloat16, bf16)"));
     }
 
     #[test]
@@ -809,5 +989,103 @@ mod tests {
         assert_eq!(broadcast_strides(&[4, 1, 3], &[4, 5, 3]), [3, 0, 1]);
         assert_eq!(broadcast_strides(&[1, 5, 3], &[4, 5, 3]), [0, 3, 1]);
         assert_eq!(broadcast_strides(&[3], &[4, 5, 3]), [0, 0, 1]);
+    }
+
+    #[test]
+    fn silu_mul_f16_matches_reference_with_half2_tail() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous_hook);
+        let Some(runtime) = runtime else {
+            eprintln!("skipping fused SiluMul fp16 parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("SiluMul").is_err() {
+            eprintln!("skipping fused SiluMul fp16 parity test: fp16 headers unavailable");
+            return;
+        }
+
+        let gate = [-8.0f32, -2.0, -0.25, -0.0, 0.0, 0.125, 1.0, 3.0, 9.0].map(f16::from_f32);
+        let up = [-1.5f32, 0.5, 2.0, -3.0, 4.0, -0.75, 1.25, 0.25, -2.0].map(f16::from_f32);
+        let mut output = [f16::ZERO; 9];
+        let bytes = std::mem::size_of_val(&gate);
+        let gate_dev = runtime.alloc_raw(bytes).unwrap();
+        let up_dev = runtime.alloc_raw(bytes).unwrap();
+        let output_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |values: &[f16]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&gate), gate_dev).unwrap();
+            runtime.htod(as_bytes(&up), up_dev).unwrap();
+        }
+
+        let shape = [1usize, gate.len()];
+        let strides = [gate.len() as i64, 1];
+        let device = DeviceId::cuda(0);
+        let inputs = [
+            TensorView::new(
+                DevicePtr(gate_dev as usize as *const c_void),
+                DataType::Float16,
+                &shape,
+                &strides,
+                device,
+            ),
+            TensorView::new(
+                DevicePtr(up_dev as usize as *const c_void),
+                DataType::Float16,
+                &shape,
+                &strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(output_dev as usize as *mut c_void),
+            DataType::Float16,
+            &shape,
+            &strides,
+            device,
+        )];
+        SiluMulKernel {
+            runtime: runtime.clone(),
+            last_capture_safe_signature: Mutex::new(None),
+        }
+        .execute(&inputs, &mut outputs)
+        .unwrap();
+        runtime.synchronize().unwrap();
+        let output_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                output.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(&output),
+            )
+        };
+        unsafe { runtime.dtoh(output_bytes, output_dev).unwrap() };
+
+        for (index, ((&a, &b), &actual)) in gate.iter().zip(&up).zip(&output).enumerate() {
+            let x = a.to_f32();
+            let silu = if x >= 0.0 {
+                x / (1.0 + (-f64::from(x)).exp() as f32)
+            } else {
+                let e = f64::from(x).exp() as f32;
+                (x * e) / (1.0 + e)
+            };
+            let expected = f16::from_f32(silu * b.to_f32()).to_f32();
+            let error = (actual.to_f32() - expected).abs();
+            assert!(
+                error <= 2.0e-3,
+                "index {index}: silu({x}) * {} expected {expected}, got {} (error {error})",
+                b.to_f32(),
+                actual.to_f32()
+            );
+        }
+
+        unsafe {
+            runtime.free_raw(gate_dev).unwrap();
+            runtime.free_raw(up_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
     }
 }

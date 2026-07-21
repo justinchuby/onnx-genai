@@ -30,6 +30,7 @@ use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout}
 
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
+use crate::optimizer::cuda_optimization_passes;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 /// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
@@ -250,6 +251,10 @@ impl ExecutionProvider for CudaExecutionProvider {
                 opset,
             })?;
         factory.create(op, shapes)
+    }
+
+    fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
+        cuda_optimization_passes()
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
