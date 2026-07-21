@@ -36,6 +36,8 @@ const GEMV_F16_DOWN_K: usize = 4864;
 const GEMV_F16_DOWN_N: usize = 896;
 const GEMV_F16_DOWN_THREADS: u32 = 256;
 const GEMV_F16_DOWN_COLUMNS_PER_BLOCK: usize = 8;
+const GATE_UP_SWIGLU_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu";
+const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
 extern "C" __global__ void matmul_nbits_dequant_f32(
@@ -345,6 +347,31 @@ __device__ __forceinline__ float warp_sum(float value)
     return value;
 }
 
+// Fp16 GEMV bias epilogue. The fp32 accumulator is always rounded to fp16 for
+// the base output. When a bias is present:
+//   * `bias_post_round == 0` (native MatMulNBits bias): add in fp32 and round
+//     once — `fp16(acc + bias)` — matching an ORT-style fused epilogue.
+//   * `bias_post_round != 0` (a folded standalone `Add`): round the accumulator
+//     to fp16 first, then add the fp16 bias with a second fp16 round —
+//     `fp16(fp16(acc) + bias)` — reproducing the original two-op path so greedy
+//     tokens stay byte-identical.
+__device__ __forceinline__ __half fold_bias_f16(
+    const float value,
+    const __half* __restrict__ bias,
+    const int column,
+    const int bias_post_round)
+{
+    const __half rounded = __float2half(value);
+    if (!bias) {
+        return rounded;
+    }
+    const float b = __half2float(bias[column]);
+    if (bias_post_round) {
+        return __float2half(__half2float(rounded) + b);
+    }
+    return __float2half(value + b);
+}
+
 __device__ __forceinline__ void int4x8_to_half2x4(
     const unsigned int packed,
     __half2* values)
@@ -564,7 +591,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
     const int block_size,
     const int k_blocks,
     const int blob_size,
-    const int scales_fp16)
+    const int scales_fp16,
+    const int bias_post_round)
 {
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
@@ -616,10 +644,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
 
     value = warp_sum(value);
     if (lane == 0 && column < n) {
-        if (bias) {
-            value += __half2float(bias[column]);
-        }
-        output[column] = __float2half(value);
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
     }
 }
 
@@ -634,7 +659,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
     const int block_size,
     const int k_blocks,
     const int blob_size,
-    const int scales_fp16)
+    const int scales_fp16,
+    const int bias_post_round)
 {
     (void)block_size;
     (void)scales_fp16;
@@ -704,10 +730,149 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
     value += value37.y;
     value = warp_sum(value);
     if (lane == 0 && column < n) {
-        if (bias) {
-            value += __half2float(bias[column]);
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// SwiGLU activation, byte-identical to the standalone `op_silu` in the
+// elementwise kernels: silu(x) = x * sigmoid(x), evaluated in the same
+// rounding-stable form so the paired epilogue reproduces the two-op tokens.
+__device__ __forceinline__ float gate_up_silu_f32(float x)
+{
+    if (x >= 0.0f) {
+        const float denominator = __fadd_rn(1.0f, (float)exp((double)-x));
+        return __fdiv_rn(x, denominator);
+    }
+    const float e = (float)exp((double)x);
+    const float numerator = __fmul_rn(x, e);
+    return __fdiv_rn(numerator, __fadd_rn(1.0f, e));
+}
+
+// Paired gate/up projection + SwiGLU. One warp computes column `column` of BOTH
+// the gate and up projections (which share the same activation and the block-32
+// fp16 layout of `matmul_nbits_gemv_f16_scales_f16`), then writes
+// silu(gate)*up directly. The activation is permuted once per K-tile and reused
+// by both accumulators, so the two GEMVs read the activation from registers
+// exactly once. The epilogue reproduces the standalone two-op numerics
+// (`fp16(gate_acc)`, `fp16(up_acc)`, then `fp16(silu(gate_h)*up_h)`) so greedy
+// decoding stays byte-identical. Register-only + warp shuffles: no shared
+// memory, so it is portable to sm_53+ and safe on small SMs (no >48KB opt-in).
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    __half2 g0 = __float2half2_rn(0.0f);
+    __half2 g1 = __float2half2_rn(0.0f);
+    __half2 g2 = __float2half2_rn(0.0f);
+    __half2 g3 = __float2half2_rn(0.0f);
+    __half2 u0 = __float2half2_rn(0.0f);
+    __half2 u1 = __float2half2_rn(0.0f);
+    __half2 u2 = __float2half2_rn(0.0f);
+    __half2 u3 = __float2half2_rn(0.0f);
+    float gate_tail = 0.0f;
+    float up_tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        const __half* activation_ptr = activation + lane_depth;
+        const unsigned char* packed_gate_ptr =
+            packed_gate + (long)column * k_blocks * blob_size + lane * 4;
+        const unsigned char* packed_up_ptr =
+            packed_up + (long)column * k_blocks * blob_size + lane * 4;
+        const __half* scale_gate_ptr =
+            scales_gate + (long)column * k_blocks + (lane >> 2);
+        const __half* scale_up_ptr =
+            scales_up + (long)column * k_blocks + (lane >> 2);
+        int depth_base = 0;
+        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+            // Permute the shared activation once; both projections reuse it.
+            const uint4 permuted = permute_activation_f16x8(activation_ptr);
+            const unsigned int gate_word =
+                *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
+            accumulate_int4x8_f16_permuted(
+                gate_word, permuted, *scale_gate_ptr, g0, g1, g2, g3);
+            const unsigned int up_word =
+                *reinterpret_cast<const unsigned int*>(packed_up_ptr);
+            accumulate_int4x8_f16_permuted(
+                up_word, permuted, *scale_up_ptr, u0, u1, u2, u3);
+            activation_ptr += 256;
+            packed_gate_ptr += 128;
+            packed_up_ptr += 128;
+            scale_gate_ptr += 8;
+            scale_up_ptr += 8;
         }
-        output[column] = __float2half(value);
+        const int tail_depth = depth_base + lane_depth;
+        if (tail_depth < k) {
+            const unsigned int gate_word =
+                *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
+            const unsigned int up_word =
+                *reinterpret_cast<const unsigned int*>(packed_up_ptr);
+            const float gate_scale = __half2float(*scale_gate_ptr);
+            const float up_scale = __half2float(*scale_up_ptr);
+            const int valid = min(8, k - tail_depth);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < valid) {
+                    const float a = __half2float(activation_ptr[i]);
+                    const int qg = (int)((gate_word >> (i * 4)) & 15u) - 8;
+                    const int qu = (int)((up_word >> (i * 4)) & 15u) - 8;
+                    gate_tail += (float)qg * a * gate_scale;
+                    up_tail += (float)qu * a * up_scale;
+                }
+            }
+        }
+    }
+    // Reduce each accumulator in the exact term order of the standalone
+    // `matmul_nbits_gemv_f16_scales_f16` epilogue so the pre-round sums match.
+    const float2 g04 = __half22float2(g0);
+    const float2 g15 = __half22float2(g1);
+    const float2 g26 = __half22float2(g2);
+    const float2 g37 = __half22float2(g3);
+    float gate_value = gate_tail + g04.x;
+    gate_value += g15.x;
+    gate_value += g26.x;
+    gate_value += g37.x;
+    gate_value += g04.y;
+    gate_value += g15.y;
+    gate_value += g26.y;
+    gate_value += g37.y;
+    gate_value = warp_sum(gate_value);
+
+    const float2 u04 = __half22float2(u0);
+    const float2 u15 = __half22float2(u1);
+    const float2 u26 = __half22float2(u2);
+    const float2 u37 = __half22float2(u3);
+    float up_value = up_tail + u04.x;
+    up_value += u15.x;
+    up_value += u26.x;
+    up_value += u37.x;
+    up_value += u04.y;
+    up_value += u15.y;
+    up_value += u26.y;
+    up_value += u37.y;
+    up_value = warp_sum(up_value);
+
+    if (lane == 0 && column < n) {
+        // Round each projection to fp16 first (matching the separate GEMV
+        // stores), then compute silu(gate)*up and round once — identical to the
+        // standalone silu_mul_f16 kernel fed by the two GEMV outputs.
+        const float gate_h = __half2float(__float2half(gate_value));
+        const float up_h = __half2float(__float2half(up_value));
+        output[column] =
+            __float2half_rn(__fmul_rn(gate_up_silu_f32(gate_h), up_h));
     }
 }
 
@@ -725,7 +890,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     const int block_size,
     const int k_blocks,
     const int blob_size,
-    const int scales_fp16)
+    const int scales_fp16,
+    const int bias_post_round)
 {
     (void)block_size;
     (void)scales_fp16;
@@ -789,10 +955,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
         value += warp_sums[5][lane];
         value += warp_sums[6][lane];
         value += warp_sums[7][lane];
-        if (bias) {
-            value += __half2float(bias[column]);
-        }
-        output[column] = __float2half(value);
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
     }
 }
 "#;
@@ -874,6 +1037,14 @@ impl KernelFactory for MatMulNBitsFactory {
             block_size,
             accuracy_level,
             accuracy4_workspace,
+            fold_bias_post_round: node
+                .attr(crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR)
+                .and_then(onnx_runtime_ir::Attribute::as_int)
+                == Some(1),
+            gate_up_swiglu: node
+                .attr(crate::optimizer::GATE_UP_SWIGLU_FUSION_ATTR)
+                .and_then(onnx_runtime_ir::Attribute::as_int)
+                == Some(1),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -919,6 +1090,15 @@ pub struct MatMulNBitsKernel {
     block_size: usize,
     accuracy_level: i64,
     accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
+    /// Set when this node's bias input came from folding a standalone `Add`
+    /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
+    /// then reproduces the two-op `fp16(fp16(acc) + bias)` rounding.
+    fold_bias_post_round: bool,
+    /// Set on a synthetic node produced by
+    /// [`crate::optimizer::CudaGateUpSwiGluFusion`]: inputs are
+    /// `[x, W_gate, scales_gate, W_up, scales_up]` and the kernel writes
+    /// `silu(gate) * up` directly (see [`GATE_UP_SWIGLU_ENTRY`]).
+    gate_up_swiglu: bool,
     last_call_capture_safe: AtomicBool,
 }
 
@@ -933,6 +1113,9 @@ impl MatMulNBitsKernel {
             )));
         }
         if inputs[0].dtype == DataType::Float16 {
+            if self.gate_up_swiglu {
+                return self.run_f16_gate_up_swiglu(inputs, outputs);
+            }
             return self.run_f16(inputs, outputs);
         }
         require_dtype("A", inputs[0].dtype, DataType::Float32)?;
@@ -1233,6 +1416,152 @@ impl MatMulNBitsKernel {
         )
     }
 
+    /// Paired gate/up projection + SwiGLU decode path (see
+    /// [`crate::optimizer::CudaGateUpSwiGluFusion`]). Inputs are
+    /// `[x, W_gate, scales_gate, W_up, scales_up]`; the kernel reads the shared
+    /// activation once, runs both int4 GEMVs, and writes `silu(gate)*up`. Gated
+    /// to the exact validated fp16 block-32 M=1 decode shape by the optimizer,
+    /// re-validated here before launch.
+    fn run_f16_gate_up_swiglu(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        if inputs.len() != 5 || outputs.len() != 1 {
+            return Err(error(format!(
+                "gate/up SwiGLU fusion expects 5 inputs [x, W_gate, scales_gate, W_up, \
+                 scales_up] and 1 output, got {} inputs and {} outputs",
+                inputs.len(),
+                outputs.len()
+            )));
+        }
+        require_dtype("A", inputs[0].dtype, DataType::Float16)?;
+        require_dtype("W_gate", inputs[1].dtype, DataType::Uint8)?;
+        require_dtype("scales_gate", inputs[2].dtype, DataType::Float16)?;
+        require_dtype("W_up", inputs[3].dtype, DataType::Uint8)?;
+        require_dtype("scales_up", inputs[4].dtype, DataType::Float16)?;
+        require_dtype("Y", outputs[0].dtype, DataType::Float16)?;
+
+        let a_shape = inputs[0].shape;
+        if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
+            return Err(error(format!(
+                "A must have rank >= 1 and last dimension K={}, got {:?}",
+                self.k, a_shape
+            )));
+        }
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        if m != 1 || self.block_size != 32 {
+            return Err(error(
+                "gate/up SwiGLU fusion is only supported for the block-32 M=1 fp16 decode GEMV",
+            ));
+        }
+        let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
+        if outputs[0].shape != expected_output_shape {
+            return Err(error(format!(
+                "Y must have shape {expected_output_shape:?}, got {:?}",
+                outputs[0].shape
+            )));
+        }
+
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size / 2;
+        require_shape("W_gate", inputs[1].shape, &[self.n, k_blocks, blob_size])?;
+        require_shape("W_up", inputs[3].shape, &[self.n, k_blocks, blob_size])?;
+        require_flat_or_matrix_shape("scales_gate", inputs[2].shape, self.n, k_blocks)?;
+        require_flat_or_matrix_shape("scales_up", inputs[4].shape, self.n, k_blocks)?;
+
+        for (name, contiguous) in [
+            ("A", inputs[0].is_contiguous()),
+            ("W_gate", inputs[1].is_contiguous()),
+            ("scales_gate", inputs[2].is_contiguous()),
+            ("W_up", inputs[3].is_contiguous()),
+            ("scales_up", inputs[4].is_contiguous()),
+            ("Y", outputs[0].is_contiguous()),
+        ] {
+            if !contiguous {
+                return Err(error(format!(
+                    "{name} must be contiguous on the CUDA execution provider"
+                )));
+            }
+        }
+
+        onnx_runtime_ep_api::record_kernel_variant!(
+            "gate_up_swiglu_fused",
+            "fp16 block-32 M==1 decode: fused paired gate/up int4 GEMV + SwiGLU \
+             (silu(gate)*up) in one capture-safe kernel; reproduces the two-op fp16 \
+             rounding for byte-identical greedy tokens"
+        );
+
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        self.launch_gate_up_swiglu(
+            &inputs[0],
+            &inputs[1],
+            &inputs[2],
+            &inputs[3],
+            &inputs[4],
+            &mut outputs[0],
+            k_blocks,
+            blob_size,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_swiglu(
+        &self,
+        activation: &TensorView,
+        packed_gate: &TensorView,
+        scales_gate: &TensorView,
+        packed_up: &TensorView,
+        scales_up: &TensorView,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU GEMV")?;
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, GATE_UP_SWIGLU_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_gate_ptr = cuptr(packed_gate.data_ptr::<u8>() as *const c_void);
+        let scales_gate_ptr = cuptr(scales_gate.data_ptr::<u8>() as *const c_void);
+        let packed_up_ptr = cuptr(packed_up.data_ptr::<u8>() as *const c_void);
+        let scales_up_ptr = cuptr(scales_up.data_ptr::<u8>() as *const c_void);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let blob_size = as_i32("block blob size", blob_size)?;
+        let threads = GATE_UP_SWIGLU_THREADS;
+        let columns_per_block = (threads / 32) as usize;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_gate_ptr)
+            .arg(&scales_gate_ptr)
+            .arg(&packed_up_ptr)
+            .arg(&scales_up_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks)
+            .arg(&blob_size);
+        // SAFETY: restricted to fp16 block-32 M=1 inputs validated above; both
+        // persistent weight/scale sets and the output are fixed device pointers,
+        // the scalar ABI matches the paired entry point, and the kernel uses only
+        // registers + warp shuffles (no per-call alloc, shared memory, or sync),
+        // so the launch is legal to record into and replay from a CUDA graph.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits fp16 gate/up SwiGLU GEMV", err))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_f16_gemv(
         &self,
@@ -1255,6 +1584,22 @@ impl MatMulNBitsKernel {
             "fp16-activation x int4 M==1 decode GEMV: {}",
             selection.reason
         );
+        if bias.is_some() {
+            if self.fold_bias_post_round {
+                onnx_runtime_ep_api::record_kernel_variant_stage!(
+                    "bias",
+                    "qkv_bias_fused",
+                    "folded standalone Add(MatMulNBits, bias) into GEMV epilogue with \
+                     fp16-after-round semantics fp16(fp16(acc)+bias) (token-identity preserved)"
+                );
+            } else {
+                onnx_runtime_ep_api::record_kernel_variant_stage!(
+                    "bias",
+                    "bias_native",
+                    "native MatMulNBits bias: single-round epilogue fp16(acc+bias)"
+                );
+            }
+        }
         self.launch_f16_gemv_variant(
             activation,
             packed,
@@ -1304,6 +1649,7 @@ impl MatMulNBitsKernel {
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
         let scales_fp16_flag: i32 = scales_fp16 as i32;
+        let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
         let (threads, columns_per_block, shared_mem_bytes) = match selection.variant {
             F16GemvVariant::DownProjection => (
                 GEMV_F16_DOWN_THREADS,
@@ -1331,7 +1677,8 @@ impl MatMulNBitsKernel {
             .arg(&block_size)
             .arg(&k_blocks)
             .arg(&blob_size)
-            .arg(&scales_fp16_flag);
+            .arg(&scales_fp16_flag)
+            .arg(&bias_post_round_flag);
         // SAFETY: this path is restricted to symmetric block-32 M=1 fp16 inputs;
         // all tensors were dtype/shape/contiguity validated above, the scalar ABI
         // matches the selected fp16 GEMV entry point. Both variants use only
@@ -1954,6 +2301,8 @@ mod tests {
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
             last_call_capture_safe: AtomicBool::new(false),
         };
         kernel.run(&inputs, &mut outputs).unwrap();
@@ -2092,6 +2441,8 @@ mod tests {
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
             last_call_capture_safe: AtomicBool::new(false),
         };
         kernel
@@ -2211,5 +2562,505 @@ mod tests {
             worst_rel < 5e-2,
             "fp16 GEMV diverged from dequant reference: max_rel={worst_rel:.3e}"
         );
+    }
+
+    /// Folding a standalone `Add(MatMulNBits, bias)` into the GEMV epilogue must
+    /// stay **byte-identical** to the original two-op path so greedy decode
+    /// tokens do not shift. The two-op path is `fp16(fp16(acc) + bias)`: the
+    /// GEMV first rounds its accumulator to fp16, then the elementwise `Add`
+    /// rounds again after an fp16 add. This reproduces that exactly by running
+    /// the real kernel with no bias (the fp16 GEMV output) and adding the fp16
+    /// bias on the host, then asserting the folded-bias kernel matches bit-for-
+    /// bit across every output column.
+    #[test]
+    fn fp16_folded_bias_is_bit_exact_to_two_op_path() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping folded-bias bit-exactness test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping folded-bias bit-exactness test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        // QKV decode shape: K=896, N=1152, symmetric block-32, fp16 scales.
+        let k = 896usize;
+        let n = 1152usize;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(next())).collect();
+        let mut quant = vec![0u8; n * k];
+        for value in quant.iter_mut() {
+            *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                for pair in 0..blob_size {
+                    let low = quant[col * k + block * block_size + pair * 2] & 15;
+                    let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                    packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                }
+            }
+        }
+        let scales: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        // Bias with a wide magnitude range so the second fp16 round is exercised.
+        let bias: Vec<f16> = (0..n).map(|_| f16::from_f32(next() * 4.0)).collect();
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let bias_dev = runtime.alloc_raw(bias.len() * 2).unwrap();
+        let nobias_output_dev = runtime.alloc_raw(n * 2).unwrap();
+        let fused_output_dev = runtime.alloc_raw(n * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+            runtime.htod(as_bytes(&bias), bias_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let bias_shape = [n];
+        let bias_strides = [1i64];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let activation_view = TensorView::new(
+            device_ptr(activation_dev),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let packed_view = TensorView::new(
+            device_ptr(packed_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_view = TensorView::new(
+            device_ptr(scales_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let bias_view = TensorView::new(
+            device_ptr(bias_dev),
+            DataType::Float16,
+            &bias_shape,
+            &bias_strides,
+            device,
+        );
+        let mut nobias_output = TensorMut::new(
+            device_ptr_mut(nobias_output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut fused_output = TensorMut::new(
+            device_ptr_mut(fused_output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+
+        let selection = select_f16_gemv_variant(k, n, block_size, true);
+        let kernel_nobias = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        let kernel_fold = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: true,
+            gate_up_swiglu: false,
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        kernel_nobias
+            .launch_f16_gemv_variant(
+                &activation_view,
+                &packed_view,
+                &scales_view,
+                true,
+                None,
+                &mut nobias_output,
+                k_blocks,
+                blob_size,
+                selection,
+            )
+            .unwrap();
+        kernel_fold
+            .launch_f16_gemv_variant(
+                &activation_view,
+                &packed_view,
+                &scales_view,
+                true,
+                Some(&bias_view),
+                &mut fused_output,
+                k_blocks,
+                blob_size,
+                selection,
+            )
+            .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut gemv_out = vec![f16::ZERO; n];
+        let mut fused_out = vec![f16::ZERO; n];
+        // SAFETY: both output allocations hold `n` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut gemv_out), nobias_output_dev)
+                .unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut fused_out), fused_output_dev)
+                .unwrap();
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(bias_dev).unwrap();
+            runtime.free_raw(nobias_output_dev).unwrap();
+            runtime.free_raw(fused_output_dev).unwrap();
+        }
+
+        for col in 0..n {
+            // Two-op reference: fp16(fp16(acc) + bias). gemv_out is already the
+            // fp16-rounded accumulator, so add the fp16 bias in f32 and round.
+            let two_op = f16::from_f32(gemv_out[col].to_f32() + bias[col].to_f32());
+            assert_eq!(
+                fused_out[col].to_bits(),
+                two_op.to_bits(),
+                "folded bias diverged at column {col}: fused={:?} two_op={:?} (gemv={:?} bias={:?})",
+                fused_out[col],
+                two_op,
+                gemv_out[col],
+                bias[col]
+            );
+        }
+    }
+
+    // Faithful replica of the elementwise `silu_mul_f16` scalar path (which is
+    // byte-identical to its half2 path): `fp16(silu(f32(g)) * f32(u))`. Used to
+    // build the two-op reference the paired kernel must reproduce bit-for-bit.
+    const REF_SILU_MUL_SRC: &str = r#"
+#include <cuda_fp16.h>
+__device__ float ref_op_silu(float x) {
+    if (x >= 0.0f) {
+        const float denominator = __fadd_rn(1.0f, (float)exp((double)-x));
+        return __fdiv_rn(x, denominator);
+    }
+    const float e = (float)exp((double)x);
+    const float numerator = __fmul_rn(x, e);
+    return __fdiv_rn(numerator, __fadd_rn(1.0f, e));
+}
+extern "C" __global__ void ref_silu_mul_f16(
+    const __half* g, const __half* u, __half* y, const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = __float2half_rn(
+            __fmul_rn(ref_op_silu(__half2float(g[i])), __half2float(u[i])));
+    }
+}
+"#;
+
+    /// The paired gate/up SwiGLU kernel must be byte-identical to running the two
+    /// standalone projection GEMVs and then `silu_mul_f16`, at the exact decode
+    /// shape (K=896, N=4864, block-32, fp16). This is the on-device token-identity
+    /// guarantee for Substep B.
+    #[test]
+    fn fp16_gate_up_swiglu_is_bit_exact_to_two_op_path() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping gate/up SwiGLU bit-exactness test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping gate/up SwiGLU bit-exactness test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        let k = GEMV_F16_DOWN_N; // 896
+        let n = GEMV_F16_DOWN_K; // 4864
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+
+        let mut state = 0x0bad_c0de_dead_beefu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
+            let mut quant = vec![0u8; n * k];
+            for value in quant.iter_mut() {
+                *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            }
+            let mut packed = vec![0u8; n * k_blocks * blob_size];
+            for col in 0..n {
+                for block in 0..k_blocks {
+                    for pair in 0..blob_size {
+                        let low = quant[col * k + block * block_size + pair * 2] & 15;
+                        let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                        packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                    }
+                }
+            }
+            packed
+        };
+
+        let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(next())).collect();
+        let packed_gate = pack(&mut next);
+        let scales_gate: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        let packed_up = pack(&mut next);
+        let scales_up: Vec<f16> = (0..n * k_blocks)
+            .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+        let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+        let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+        let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+        let gate_out_dev = runtime.alloc_raw(n * 2).unwrap();
+        let up_out_dev = runtime.alloc_raw(n * 2).unwrap();
+        let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
+        let fused_out_dev = runtime.alloc_raw(n * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+            runtime
+                .htod(as_bytes(&scales_gate), scales_gate_dev)
+                .unwrap();
+            runtime.htod(&packed_up, packed_up_dev).unwrap();
+            runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let activation_view = TensorView::new(
+            device_ptr(activation_dev),
+            DataType::Float16,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let packed_gate_view = TensorView::new(
+            device_ptr(packed_gate_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_gate_view = TensorView::new(
+            device_ptr(scales_gate_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let packed_up_view = TensorView::new(
+            device_ptr(packed_up_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_up_view = TensorView::new(
+            device_ptr(scales_up_dev),
+            DataType::Float16,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let mut gate_out = TensorMut::new(
+            device_ptr_mut(gate_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut up_out = TensorMut::new(
+            device_ptr_mut(up_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut fused_out = TensorMut::new(
+            device_ptr_mut(fused_out_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+
+        let selection = select_f16_gemv_variant(k, n, block_size, true);
+        assert_eq!(
+            selection.variant,
+            F16GemvVariant::General,
+            "gate/up projections must use the general GEMV as the reference"
+        );
+        let gemv_kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        // Reference: two standalone projection GEMVs...
+        gemv_kernel
+            .launch_f16_gemv_variant(
+                &activation_view,
+                &packed_gate_view,
+                &scales_gate_view,
+                true,
+                None,
+                &mut gate_out,
+                k_blocks,
+                blob_size,
+                selection,
+            )
+            .unwrap();
+        gemv_kernel
+            .launch_f16_gemv_variant(
+                &activation_view,
+                &packed_up_view,
+                &scales_up_view,
+                true,
+                None,
+                &mut up_out,
+                k_blocks,
+                blob_size,
+                selection,
+            )
+            .unwrap();
+        // ...then the reference silu_mul (byte-identical to silu_mul_f16).
+        let ref_function = runtime
+            .nvrtc_function(
+                "matmul_nbits_ref_silu_mul",
+                REF_SILU_MUL_SRC,
+                "ref_silu_mul_f16",
+            )
+            .unwrap();
+        let gate_out_ptr = cuptr(device_ptr(gate_out_dev).0);
+        let up_out_ptr = cuptr(device_ptr(up_out_dev).0);
+        let ref_out_ptr = cuptr(device_ptr(ref_out_dev).0);
+        let n_i32 = n as i32;
+        let mut ref_builder = runtime.stream().launch_builder(&ref_function);
+        ref_builder
+            .arg(&gate_out_ptr)
+            .arg(&up_out_ptr)
+            .arg(&ref_out_ptr)
+            .arg(&n_i32);
+        // SAFETY: all three buffers hold `n` fp16 values on this device.
+        unsafe {
+            ref_builder.launch(LaunchConfig {
+                grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .unwrap();
+
+        // Subject: the fused paired kernel.
+        gemv_kernel
+            .launch_gate_up_swiglu(
+                &activation_view,
+                &packed_gate_view,
+                &scales_gate_view,
+                &packed_up_view,
+                &scales_up_view,
+                &mut fused_out,
+                k_blocks,
+                blob_size,
+            )
+            .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut reference = vec![f16::ZERO; n];
+        let mut fused = vec![f16::ZERO; n];
+        // SAFETY: both output allocations hold `n` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
+                .unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut fused), fused_out_dev)
+                .unwrap();
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_gate_dev).unwrap();
+            runtime.free_raw(scales_gate_dev).unwrap();
+            runtime.free_raw(packed_up_dev).unwrap();
+            runtime.free_raw(scales_up_dev).unwrap();
+            runtime.free_raw(gate_out_dev).unwrap();
+            runtime.free_raw(up_out_dev).unwrap();
+            runtime.free_raw(ref_out_dev).unwrap();
+            runtime.free_raw(fused_out_dev).unwrap();
+        }
+
+        for col in 0..n {
+            assert_eq!(
+                fused[col].to_bits(),
+                reference[col].to_bits(),
+                "paired gate/up SwiGLU diverged at column {col}: fused={:?} reference={:?}",
+                fused[col],
+                reference[col]
+            );
+        }
     }
 }
