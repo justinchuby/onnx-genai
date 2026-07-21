@@ -63,7 +63,7 @@ pub(super) const MAX_HEAD_DIM: usize = 128;
 /// the flash merge cheap (a 4-way reduction in shared memory).
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
-const MAX_SPLITS: usize = 8;
+pub(super) const MAX_SPLITS: usize = 8;
 
 /// Whether the fp16 flash-decode kernel handles this shape. Single query token
 /// (`Sq=1`) with an **even** `head_dim` within [`MAX_HEAD_DIM`] (the `half2`

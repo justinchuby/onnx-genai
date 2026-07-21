@@ -1638,6 +1638,14 @@ impl GroupQueryAttentionKernel {
         );
         let input_q_ptr = cuptr(q.data_ptr::<u8>() as *const c_void);
         if fuse_prep {
+            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                "prep",
+                "gqa_prep_fused",
+                "decode prep fused into one launch: Sq==1, k_seq==1, even head_dim={}, \
+                 aliased device-KV, past_capacity==present_capacity={}",
+                dim,
+                present_capacity
+            );
             // Fused single-token decode prep. One launch subsumes the packed
             // split, BSH->BNSH query transpose, in-place K/V cache append, and
             // Q/present-K RoPE that the branch below performs as six separate
@@ -1689,6 +1697,20 @@ impl GroupQueryAttentionKernel {
                 }
             );
         } else {
+            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                "prep",
+                "gqa_prep_unfused",
+                "decode prep unfused (split/transpose/append/rope as separate launches): \
+                 single_token={}, k_seq={}, even_head_dim={}, has_past_key={}, \
+                 aliased_device_kv={}, past==present_capacity={}, prep_fusion_disabled={}",
+                single_token,
+                k_seq,
+                dim.is_multiple_of(2),
+                has_past_key,
+                aliased_device_kv,
+                past_capacity == present_capacity,
+                self.prep_fusion_disabled
+            );
             let (q_ptr, k_ptr, v_ptr) = if packed_qkv {
                 let q_scratch = packed_q.as_ref().ok_or_else(|| {
                     EpError::KernelFailed(
@@ -1855,10 +1877,20 @@ impl GroupQueryAttentionKernel {
             .filter(|&scale| scale != 0.0)
             .unwrap_or_else(|| 1.0 / (dim as f32).sqrt());
         let attention_sequence_length = valid_sequence_length.unwrap_or(present_capacity);
-        let use_fused =
-            self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim)
-                == GroupQueryAttentionBackend::Fused;
+        let selected_backend =
+            self.selected_backend_for_shape(q.dtype, q_seq, attention_sequence_length, dim);
+        let use_fused = selected_backend == GroupQueryAttentionBackend::Fused;
         if use_fused {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "attention_flash_fused",
+                "fused flash attention: backend={:?}, dtype={:?}, q_seq={}, \
+                 valid_seq_len={}, head_dim={} passed the fused-support + measured-win gates",
+                self.backend,
+                q.dtype,
+                q_seq,
+                attention_sequence_length,
+                dim
+            );
             flash_attention::run(
                 &self.runtime,
                 q.dtype,
@@ -1884,6 +1916,14 @@ impl GroupQueryAttentionKernel {
                 self.softcap,
             )?;
         } else if q.dtype == DataType::Float32 && gqa_decode::supported(q_seq, dim) {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "attention_gqa_decode_f32",
+                "capture-safe f32 warp-parallel single-token decode: q_seq={}, head_dim={}; \
+                 flash backend={:?} not selected",
+                q_seq,
+                dim,
+                selected_backend
+            );
             // Capture-safe warp-parallel single-token GQA decode. Reads the
             // valid length on-device from `totals_gpu` and allocates no scratch,
             // so it records/replays inside a CUDA graph. Keeps the reference
@@ -1907,6 +1947,14 @@ impl GroupQueryAttentionKernel {
                 self.softcap,
             )?;
         } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "attention_gqa_decode_fp16_splitk",
+                "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=128); \
+                 active split count (1/2/4/8, max {}) chosen on-device from valid length",
+                q_seq,
+                dim,
+                gqa_decode_fp16::MAX_SPLITS
+            );
             // Capture-safe fp16 flash-decode sibling of the f32 `gqa_decode`
             // branch above. Same launcher signature/units; passes the fp16
             // device pointers for query/present-K/present-V/output. Reads the
@@ -1933,6 +1981,15 @@ impl GroupQueryAttentionKernel {
                 self.softcap,
             )?;
         } else if q.dtype == DataType::Float32 {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "attention_reference_f32",
+                "f32 reference attention: flash backend={:?} for q_seq={}, valid_seq_len={}, \
+                 head_dim={}; capture-safe gqa_decode does not support this shape",
+                selected_backend,
+                q_seq,
+                attention_sequence_length,
+                dim
+            );
             let attention_rows = batch
                 .checked_mul(self.num_heads)
                 .and_then(|rows| rows.checked_mul(q_seq))
@@ -1993,6 +2050,15 @@ impl GroupQueryAttentionKernel {
             }
             .map_err(|error| driver_err("launch GQA reference attention", error))?;
         } else {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "attention_phase2a",
+                "phase2a general attention: dtype={:?}, q_seq={}, valid_seq_len={}, head_dim={} \
+                 not selected for fused flash or a capture-safe dtype-specific decode kernel",
+                q.dtype,
+                q_seq,
+                attention_sequence_length,
+                dim
+            );
             run_attention_phase2a(
                 &self.runtime,
                 dtype,

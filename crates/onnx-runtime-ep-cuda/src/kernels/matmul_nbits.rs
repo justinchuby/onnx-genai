@@ -1028,6 +1028,11 @@ impl MatMulNBitsKernel {
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
             if self.accuracy_level == 4 && self.block_size == 32 && zero_points.is_none() {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_accuracy4_int8",
+                    "M==1 decode: accuracy_level==4, block_size==32, symmetric (no zero_points) \
+                     → int8-quantized-activation capture-safe GEMV"
+                );
                 return self.launch_accuracy4_gemv(
                     &inputs[0],
                     &inputs[1],
@@ -1038,6 +1043,11 @@ impl MatMulNBitsKernel {
                 );
             }
             if self.accuracy_level != 4 {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_f32",
+                    "M==1 decode: accuracy_level={} (non-accuracy4) → direct f32 GEMV",
+                    self.accuracy_level
+                );
                 return self.launch_f32_gemv(
                     &inputs[0],
                     &inputs[1],
@@ -1052,6 +1062,11 @@ impl MatMulNBitsKernel {
             }
         }
         if self.accuracy_level == 4 && group_indices.is_none() {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gemm_tiled_accuracy4",
+                "M={} (GEMV requires M==1), accuracy_level==4, no g_idx → tiled accuracy4 GEMM",
+                m
+            );
             return self.launch_accuracy4(
                 &inputs[0],
                 &inputs[1],
@@ -1065,6 +1080,15 @@ impl MatMulNBitsKernel {
                 zp_row_bytes,
             );
         }
+
+        onnx_runtime_ep_api::record_kernel_variant!(
+            "dequant_cublas_gemm",
+            "M={}, accuracy_level={}, g_idx={} → dequantize weights to f32 then cuBLAS GEMM \
+             (general prefill / grouped path)",
+            m,
+            self.accuracy_level,
+            group_indices.is_some()
+        );
 
         let weight = self.runtime.alloc_raw(self.k * self.n * 4)?;
         let workspace = match self.runtime.alloc_raw(WORKSPACE_BYTES) {
@@ -1222,6 +1246,15 @@ impl MatMulNBitsKernel {
         blob_size: usize,
     ) -> Result<()> {
         let selection = select_f16_gemv_variant(self.k, self.n, self.block_size, scales_fp16);
+        let variant_name = match selection.variant {
+            F16GemvVariant::DownProjection => "gemv_f16_down_projection",
+            F16GemvVariant::General => "gemv_f16_general",
+        };
+        onnx_runtime_ep_api::record_kernel_variant!(
+            variant_name,
+            "fp16-activation x int4 M==1 decode GEMV: {}",
+            selection.reason
+        );
         self.launch_f16_gemv_variant(
             activation,
             packed,

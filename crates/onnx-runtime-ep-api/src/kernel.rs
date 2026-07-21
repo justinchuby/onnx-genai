@@ -156,6 +156,129 @@ impl CaptureSupport {
     }
 }
 
+/// The concrete implementation selected by a kernel's internal dispatcher.
+///
+/// Unlike [`KernelMatch`] (the EP's claim over a node) and [`CaptureSupport`]
+/// (graph-capture eligibility), this records **which** implementation ran for an
+/// already-claimed node and **why** the dispatch predicate chose it. A single
+/// claimed op (e.g. `MatMulNBits`) can pick materially different kernels for the
+/// same shape family, so node-level claims alone do not explain what executed.
+/// The reason travels with the variant so a trace explains both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelVariantSelection {
+    /// Stable implementation name suitable for filtering and aggregation.
+    pub variant: &'static str,
+    /// Human-readable explanation of the dispatch predicate that selected it.
+    pub reason: Cow<'static, str>,
+}
+
+impl KernelVariantSelection {
+    /// Construct a selected variant with its dispatch reason.
+    pub fn new(variant: &'static str, reason: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            variant,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Trace-argument key carrying the selected kernel implementation.
+pub const ARG_KERNEL_VARIANT: &str = "kernel_variant";
+/// Trace-argument key carrying why the kernel variant was selected.
+pub const ARG_KERNEL_VARIANT_REASON: &str = "kernel_variant_reason";
+
+/// Whether kernel-variant trace annotations would currently be recorded.
+///
+/// This is true only when an enabled executor op-span is active on the current
+/// thread, so callers can guard shape-dependent reason formatting behind it and
+/// keep the disabled dispatch path allocation-free. It is the cheap thread-local
+/// check that closes the "dead write" gap: without a live span, an annotation
+/// has nothing to attach to, so there is no point formatting a reason.
+#[must_use]
+#[inline]
+pub fn kernel_variant_tracing_enabled() -> bool {
+    onnx_runtime_tracer::tracing_active()
+}
+
+/// Record a selected kernel variant on the active runtime trace span.
+///
+/// The annotation enriches the per-op span the executor opens for a traced run,
+/// so it carries the node identity already. Callers should normally use
+/// [`record_kernel_variant!`] so formatted reasons are built only when a span is
+/// active.
+#[inline]
+pub fn record_kernel_variant_selection(selection: &KernelVariantSelection) {
+    if !kernel_variant_tracing_enabled() {
+        return;
+    }
+    onnx_runtime_tracer::annotate_current_span_with(|| {
+        onnx_runtime_tracer::Args::new()
+            .with(ARG_KERNEL_VARIANT, selection.variant)
+            .with(ARG_KERNEL_VARIANT_REASON, selection.reason.as_ref())
+    });
+}
+
+/// Record a selected kernel variant for a named *sub-decision* of the current
+/// op.
+///
+/// A single claimed node can make several independent kernel-path choices in
+/// sequence (e.g. `GroupQueryAttention` picks a prep-fusion path *and* an
+/// attention-backend path). Recording each under the shared
+/// [`ARG_KERNEL_VARIANT`] key would let a later choice overwrite an earlier one
+/// on the same span, so each sub-decision is namespaced by `stage` into
+/// `kernel_variant.<stage>` / `kernel_variant_reason.<stage>`. Use the plain
+/// [`record_kernel_variant_selection`] for the node's terminal/primary variant.
+#[inline]
+pub fn record_kernel_variant_stage_selection(stage: &str, selection: &KernelVariantSelection) {
+    if !kernel_variant_tracing_enabled() {
+        return;
+    }
+    let variant_key = format!("{ARG_KERNEL_VARIANT}.{stage}");
+    let reason_key = format!("{ARG_KERNEL_VARIANT_REASON}.{stage}");
+    onnx_runtime_tracer::annotate_current_span_with(|| {
+        onnx_runtime_tracer::Args::new()
+            .with(variant_key, selection.variant)
+            .with(reason_key, selection.reason.as_ref())
+    });
+}
+
+/// Record a selected kernel implementation and lazily formatted reason on the
+/// active executor op-span.
+///
+/// Formatting is skipped entirely unless a span is active
+/// ([`kernel_variant_tracing_enabled`]), so instrumented dispatch sites stay
+/// allocation-free on the hot decode path when tracing is off.
+#[macro_export]
+macro_rules! record_kernel_variant {
+    ($variant:expr, $($arg:tt)+) => {{
+        if $crate::kernel_variant_tracing_enabled() {
+            let selection = $crate::KernelVariantSelection::new(
+                $variant,
+                ::std::format!($($arg)+),
+            );
+            $crate::record_kernel_variant_selection(&selection);
+        }
+    }};
+}
+
+/// Record a named *sub-decision* kernel variant on the active executor op-span.
+///
+/// Like [`record_kernel_variant!`] but namespaces the annotation under `$stage`
+/// so multiple kernel-path choices made while executing one node do not clobber
+/// each other. Formatting is skipped entirely unless a span is active.
+#[macro_export]
+macro_rules! record_kernel_variant_stage {
+    ($stage:expr, $variant:expr, $($arg:tt)+) => {{
+        if $crate::kernel_variant_tracing_enabled() {
+            let selection = $crate::KernelVariantSelection::new(
+                $variant,
+                ::std::format!($($arg)+),
+            );
+            $crate::record_kernel_variant_stage_selection($stage, &selection);
+        }
+    }};
+}
+
 /// Decline the current capture-support query with an actionable reason.
 ///
 /// Formatting is evaluated only on the decline path.
@@ -394,6 +517,79 @@ mod tests {
         let rejected = require_positive(-2);
         assert_eq!(rejected.reason(), Some("value must be positive, got -2"));
         assert!(require_positive(2).is_supported());
+    }
+
+    #[test]
+    fn kernel_variant_selection_carries_winner_and_reason() {
+        let selection =
+            KernelVariantSelection::new("gemv", "M==1 decode uses the packed int4 GEMV path");
+        assert_eq!(selection.variant, "gemv");
+        assert_eq!(
+            selection.reason,
+            "M==1 decode uses the packed int4 GEMV path"
+        );
+    }
+
+    #[test]
+    fn record_kernel_variant_without_active_span_skips_formatting() {
+        // No executor span is open here, so `tracing_active()` is false: the
+        // macro must not evaluate its format arguments (the dead-write guard).
+        let formatted = AtomicBool::new(false);
+        record_kernel_variant!("gemv", "{}", {
+            formatted.store(true, Ordering::Relaxed);
+            "M==1 decode"
+        });
+        assert!(!formatted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn record_kernel_variant_annotates_active_span() {
+        use onnx_runtime_tracer::TraceContext;
+        let (trace, events) = TraceContext::in_memory();
+        {
+            let _span = trace.span("MatMulNBits", "op");
+            record_kernel_variant!(
+                "gemv_f16",
+                "K={}, N={} chose the vectorized GEMV",
+                4864,
+                896
+            );
+        }
+        let events = events.events();
+        assert_eq!(events.len(), 1);
+        let args = events[0].args.as_ref().unwrap();
+        assert_eq!(args[ARG_KERNEL_VARIANT], "gemv_f16");
+        assert!(
+            args[ARG_KERNEL_VARIANT_REASON]
+                .as_str()
+                .unwrap()
+                .contains("K=4864, N=896")
+        );
+    }
+
+    #[test]
+    fn record_kernel_variant_stage_namespaces_multiple_subdecisions() {
+        use onnx_runtime_tracer::TraceContext;
+        let (trace, events) = TraceContext::in_memory();
+        {
+            let _span = trace.span("GroupQueryAttention", "op");
+            // Two independent sub-decisions on the same node: the staged prep
+            // choice must survive the terminal attention-backend choice rather
+            // than being overwritten by the shared key.
+            record_kernel_variant_stage!("prep", "gqa_prep_fused", "Sq==1, even head_dim");
+            record_kernel_variant!("attention_gqa_decode_fp16_splitk", "split-K decode");
+        }
+        let events = events.events();
+        assert_eq!(events.len(), 1);
+        let args = events[0].args.as_ref().unwrap();
+        assert_eq!(args[ARG_KERNEL_VARIANT], "attention_gqa_decode_fp16_splitk");
+        assert_eq!(args["kernel_variant.prep"], "gqa_prep_fused");
+        assert!(
+            args["kernel_variant_reason.prep"]
+                .as_str()
+                .unwrap()
+                .contains("even head_dim")
+        );
     }
 
     struct DecliningCaptureKernel;

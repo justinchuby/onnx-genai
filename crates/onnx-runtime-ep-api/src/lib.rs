@@ -27,13 +27,15 @@ pub mod registry;
 pub mod tensor;
 pub mod weight;
 
-pub use epcontext::{build_ep_context_registry, EpContext, EpContextRegistry};
+pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
-pub use kernel::{CaptureSupport, Cost, Kernel, KernelInput, KernelMatch, ViewOutput};
-pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
-pub use provider::{
-    DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OrtPluginExport,
+pub use kernel::{
+    ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON, CaptureSupport, Cost, Kernel, KernelInput,
+    KernelMatch, KernelVariantSelection, ViewOutput, kernel_variant_tracing_enabled,
+    record_kernel_variant_selection, record_kernel_variant_stage_selection,
 };
+pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
+pub use provider::{DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OrtPluginExport};
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,

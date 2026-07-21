@@ -63,6 +63,7 @@ use onnx_runtime_ir::{
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
+use onnx_runtime_tracer::{TraceContext, annotate_current_span_with};
 
 use crate::SessionOutput;
 use crate::error::{Result, SessionError};
@@ -356,6 +357,48 @@ enum RunMode {
     Replay,
 }
 
+/// The device-graph capture disposition of a single op, used to annotate its
+/// trace span with **why** it was or was not captured. Carries a borrowed
+/// reason string rather than an owned one so an untraced run never allocates.
+#[derive(Clone, Copy)]
+enum OpCaptureTrace<'a> {
+    /// Plain eager run — no capture attempt is in progress for this op.
+    Eager,
+    /// The op was recorded into a captured device-graph segment.
+    Captured,
+    /// The op runs eagerly as a capture seam; `reason` explains why it could
+    /// not be recorded into a device graph (which kernel/predicate declined).
+    Rejected(&'a str),
+}
+
+/// Trace-arg key: whether an op was captured into a device graph.
+const ARG_CAPTURE_STATUS: &str = "capture_status";
+/// Trace-arg key: why an op was not captured into a device graph.
+const ARG_CAPTURE_REASON: &str = "capture_reason";
+
+impl OpCaptureTrace<'_> {
+    /// Annotate the active op-span with this capture disposition. A no-op for
+    /// [`OpCaptureTrace::Eager`] (nothing was being captured) and when no span
+    /// is active.
+    fn annotate(self) {
+        match self {
+            OpCaptureTrace::Eager => {}
+            OpCaptureTrace::Captured => {
+                annotate_current_span_with(|| {
+                    onnx_runtime_tracer::Args::new().with(ARG_CAPTURE_STATUS, "captured")
+                });
+            }
+            OpCaptureTrace::Rejected(reason) => {
+                annotate_current_span_with(|| {
+                    onnx_runtime_tracer::Args::new()
+                        .with(ARG_CAPTURE_STATUS, "rejected")
+                        .with(ARG_CAPTURE_REASON, reason)
+                });
+            }
+        }
+    }
+}
+
 /// Scope guard that guarantees an in-progress segment capture is always ended
 /// before its enclosing function returns.
 ///
@@ -630,6 +673,12 @@ pub(crate) struct Executor {
     /// only at the graph-output/control-flow boundary. Cleared each run.
     seq_elem_values: HashMap<ValueId, SeqTensor>,
     execution_provider_fallback_report: Option<ExecutionProviderFallbackReport>,
+    /// Shared runtime trace context. Defaults to a disabled [`TraceContext::noop`]
+    /// so an untraced run pays only a single relaxed atomic load per op when
+    /// deciding whether to open a span. When enabled, the executor opens one
+    /// span per executed op so kernels can attach kernel-variant and
+    /// capture-rejection reasons via [`annotate_current_span_with`].
+    trace: TraceContext,
 }
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
@@ -735,6 +784,8 @@ pub(crate) struct ChildExecutor {
     compiled: Vec<CompiledChildPlan>,
     builds: u64,
     runs: u64,
+    /// Shared trace context, propagated to every compiled child plan's executor.
+    trace: TraceContext,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1565,6 +1616,7 @@ impl Executor {
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
+            trace: TraceContext::noop(),
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -1795,6 +1847,17 @@ impl Executor {
         &self,
     ) -> Option<&ExecutionProviderFallbackReport> {
         self.execution_provider_fallback_report.as_ref()
+    }
+
+    /// Attach the shared runtime trace context. When enabled, the executor opens
+    /// one span per executed op so kernels can attach kernel-variant and
+    /// capture-rejection reasons. Propagated to any already-built child
+    /// (control-flow subgraph) executors so nested ops are traced too.
+    pub(crate) fn set_trace_context(&mut self, trace: TraceContext) {
+        for child in self.subgraph_execs.values_mut() {
+            child.set_trace_context(trace.clone());
+        }
+        self.trace = trace;
     }
 
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so
@@ -2514,16 +2577,32 @@ impl Executor {
 
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
     /// leaf kernel). Shared by the eager loop and the segmented runner.
+    ///
+    /// When tracing is enabled, opens one span per op so the dispatched kernel
+    /// can attach kernel-variant and capture-rejection reasons via
+    /// [`annotate_current_span_with`]; `capture` records the node's device-graph
+    /// disposition onto that span. When tracing is disabled this costs a single
+    /// relaxed atomic load and never allocates.
     fn exec_plan_node(
         &mut self,
         pi: usize,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
+        capture: OpCaptureTrace<'_>,
     ) -> Result<()> {
         let node = self.graph.node(self.plan[pi].node_id);
         let op_type = node.op_type.clone();
         let domain = node.domain.clone();
+        // Open the span only when tracing is live so an untraced decode step
+        // never allocates a span name or touches the thread-local span stack.
+        let _span = self.trace.is_enabled().then(|| {
+            let span = self.trace.span(op_type.clone(), "op");
+            // Span is now active on this thread; stamp the capture disposition
+            // (and let the kernel below stamp its selected variant).
+            capture.annotate();
+            span
+        });
         if is_control_flow_op(&op_type, &domain) {
             self.exec_control_flow(pi, resolved, outer_scope)
         } else if is_sequence_op(&op_type, &domain) {
@@ -2546,7 +2625,8 @@ impl Executor {
             for pi in 0..self.plan.len() {
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
                 let start = Instant::now();
-                let result = self.exec_plan_node(pi, resolved, outer_scope, external);
+                let result =
+                    self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager);
                 let elapsed = start.elapsed();
                 let entry = timings.entry(op_type).or_insert((Duration::ZERO, 0));
                 entry.0 += elapsed;
@@ -2556,7 +2636,7 @@ impl Executor {
             print_op_profile(run_start.elapsed(), timings);
         } else {
             for pi in 0..self.plan.len() {
-                self.exec_plan_node(pi, resolved, outer_scope, external)?;
+                self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
             }
         }
         Ok(())
@@ -2602,7 +2682,13 @@ impl Executor {
                         // `end_device_graph_capture()` on the success path.
                         let mut capture_guard = SegmentCaptureGuard::arm(ep.as_ref());
                         for pi in seg.start..seg.end {
-                            self.exec_plan_node(pi, resolved, outer_scope, external)?;
+                            self.exec_plan_node(
+                                pi,
+                                resolved,
+                                outer_scope,
+                                external,
+                                OpCaptureTrace::Captured,
+                            )?;
                         }
                         capture_guard.disarm();
                         ep.end_device_graph_capture()?;
@@ -2617,7 +2703,22 @@ impl Executor {
                 }
             } else {
                 for pi in seg.start..seg.end {
-                    self.exec_plan_node(pi, resolved, outer_scope, external)?;
+                    // Seam node: eager because some kernel/predicate declined
+                    // capture. Surface that reason on the node's span.
+                    let node_id = self.plan[pi].node_id.0;
+                    let reason = schedule
+                        .boundaries
+                        .iter()
+                        .find(|decline| decline.node_id == Some(node_id))
+                        .map(|decline| decline.reason.as_str())
+                        .unwrap_or("non-capturable seam node (no recorded reason)");
+                    self.exec_plan_node(
+                        pi,
+                        resolved,
+                        outer_scope,
+                        external,
+                        OpCaptureTrace::Rejected(reason),
+                    )?;
                 }
             }
         }
@@ -3950,6 +4051,7 @@ impl ChildExecutor {
             compiled: Vec::new(),
             builds: 0,
             runs: 0,
+            trace: TraceContext::noop(),
         })
     }
 
@@ -3958,6 +4060,15 @@ impl ChildExecutor {
             builds: self.builds,
             runs: self.runs,
         }
+    }
+
+    /// Attach the shared trace context, propagating it to every already-compiled
+    /// child plan and to plans compiled later.
+    pub(crate) fn set_trace_context(&mut self, trace: TraceContext) {
+        for plan in &mut self.compiled {
+            plan.exec.set_trace_context(trace.clone());
+        }
+        self.trace = trace;
     }
 
     fn compile(&self, externals: &[&Tensor]) -> Result<CompiledChildPlan> {
@@ -4004,7 +4115,11 @@ impl ChildExecutor {
         registry.infer_graph(&mut graph, &self.inherited_opsets, MergePolicy::Permissive)?;
 
         Ok(CompiledChildPlan {
-            exec: Executor::build(graph, self.weights.clone(), self.ep.clone())?,
+            exec: {
+                let mut exec = Executor::build(graph, self.weights.clone(), self.ep.clone())?;
+                exec.set_trace_context(self.trace.clone());
+                exec
+            },
             signature: externals
                 .iter()
                 .map(|tensor| ChildInputSignature {
@@ -4320,13 +4435,14 @@ impl Executor {
                         prepared.key.0.0, prepared.key.1
                     ))
                 })?;
-            let child = ChildExecutor::new(
+            let mut child = ChildExecutor::new(
                 format!("node#{}/{}", prepared.key.0.0, prepared.key.1),
                 body,
                 self.graph.opset_imports.clone(),
                 self.weights.clone(),
                 self.ep.clone(),
             )?;
+            child.set_trace_context(self.trace.clone());
             self.subgraph_execs.insert(prepared.key.clone(), child);
         }
 
@@ -5809,6 +5925,108 @@ mod tests {
             executor.is_ok(),
             "an omitted optional input must reach supports_op as DataType::Undefined"
         );
+    }
+
+    #[test]
+    fn executor_opens_per_op_span_only_when_tracing_enabled() {
+        use onnx_runtime_tracer::TraceContext;
+
+        // Disabled (default noop): no spans recorded, hot path stays quiet.
+        {
+            let (graph, weights, path) = weight_delivery_fixture();
+            let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ep: Arc<dyn ExecutionProvider> =
+                Arc::new(WeightDeliveryEp::new(false, Arc::clone(&deliveries)));
+            let mut executor = Executor::build(graph, weights, ep).unwrap();
+            let (trace, events) = TraceContext::in_memory();
+            trace.set_enabled(false);
+            executor.set_trace_context(trace);
+            let _ = executor.run(&[]).unwrap();
+            drop(executor);
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                events.events().is_empty(),
+                "a disabled trace context must not open op spans"
+            );
+        }
+
+        // Enabled: exactly one op span per executed node, named by op type.
+        {
+            let (graph, weights, path) = weight_delivery_fixture();
+            let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ep: Arc<dyn ExecutionProvider> =
+                Arc::new(WeightDeliveryEp::new(false, Arc::clone(&deliveries)));
+            let mut executor = Executor::build(graph, weights, ep).unwrap();
+            let (trace, events) = TraceContext::in_memory();
+            executor.set_trace_context(trace);
+            let _ = executor.run(&[]).unwrap();
+            drop(executor);
+            std::fs::remove_file(path).unwrap();
+            let spans = events.events();
+            assert_eq!(spans.len(), 1, "one op span per executed node");
+            assert_eq!(spans[0].name, "BlockQuantizedMoE");
+            assert_eq!(spans[0].cat, "op");
+        }
+    }
+
+    #[test]
+    fn op_capture_trace_annotates_span_with_status_and_reason() {
+        use onnx_runtime_tracer::TraceContext;
+
+        // Rejected: both a status and the actionable why-not reason land on the
+        // active op-span. This is the branch a production model that declines
+        // capture would hit; the qwen fixture captures cleanly so it is proven
+        // here directly rather than in the live trace.
+        {
+            let (trace, events) = TraceContext::in_memory();
+            {
+                let _span = trace.span("MatMulNBits", "op");
+                OpCaptureTrace::Rejected(
+                    "kernel declares CaptureSupport::Unsupported: per-call workspace alloc",
+                )
+                .annotate();
+            }
+            let recorded = events.events();
+            assert_eq!(recorded.len(), 1);
+            let args = recorded[0].args.as_ref().unwrap();
+            assert_eq!(args[ARG_CAPTURE_STATUS], "rejected");
+            assert!(
+                args[ARG_CAPTURE_REASON]
+                    .as_str()
+                    .unwrap()
+                    .contains("CaptureSupport::Unsupported")
+            );
+        }
+
+        // Captured: status only, no reason (nothing was declined).
+        {
+            let (trace, events) = TraceContext::in_memory();
+            {
+                let _span = trace.span("MatMulNBits", "op");
+                OpCaptureTrace::Captured.annotate();
+            }
+            let recorded = events.events();
+            let args = recorded[0].args.as_ref().unwrap();
+            assert_eq!(args[ARG_CAPTURE_STATUS], "captured");
+        }
+
+        // Eager: no capture attempt, so no capture annotation at all.
+        {
+            let (trace, events) = TraceContext::in_memory();
+            {
+                let _span = trace.span("MatMulNBits", "op");
+                OpCaptureTrace::Eager.annotate();
+            }
+            let recorded = events.events();
+            assert!(
+                recorded[0]
+                    .args
+                    .as_ref()
+                    .map(|a| a.get(ARG_CAPTURE_STATUS).is_none())
+                    .unwrap_or(true),
+                "eager ops carry no capture status"
+            );
+        }
     }
 
     #[test]

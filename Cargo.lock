@@ -1701,6 +1701,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "onnx-runtime-session",
+ "onnx-runtime-tracer",
  "serde_json",
  "tokenizers",
  "tokio",
@@ -1971,6 +1972,7 @@ version = "0.1.0-dev.3"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-optimizer",
+ "onnx-runtime-tracer",
  "thiserror 2.0.18",
 ]
 
@@ -2085,6 +2087,7 @@ dependencies = [
  "onnx-runtime-loader",
  "onnx-runtime-optimizer",
  "onnx-runtime-shape-inference",
+ "onnx-runtime-tracer",
  "prost",
  "thiserror 2.0.18",
 ]

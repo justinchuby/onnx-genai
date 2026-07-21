@@ -823,6 +823,14 @@ impl InferenceSession {
         self.exec.run(inputs)
     }
 
+    /// Attach the shared runtime trace context. When enabled, the executor opens
+    /// one span per executed op so kernels can attach kernel-variant and
+    /// capture-rejection reasons to a live span. Defaults to a disabled no-op
+    /// context, so untraced runs pay only a single relaxed atomic load per op.
+    pub fn set_trace_context(&mut self, trace: onnx_runtime_tracer::TraceContext) {
+        self.exec.set_trace_context(trace);
+    }
+
     /// Run inference and preserve tensor or sequence graph-output types.
     pub fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
         self.exec.run_outputs(inputs)

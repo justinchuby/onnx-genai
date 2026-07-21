@@ -327,8 +327,10 @@ impl NativeDecodeSession {
             .and_then(|state| state.graph_fallback_report.as_ref())
     }
 
-    /// Attach the shared runtime trace context used for capture-fallback events.
+    /// Attach the shared runtime trace context used for capture-fallback events
+    /// and per-op executor spans (kernel-variant + capture-rejection reasons).
     pub fn set_trace_context(&mut self, trace: TraceContext) {
+        self.session.set_trace_context(trace.clone());
         self.trace = trace;
     }
 

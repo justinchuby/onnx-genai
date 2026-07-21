@@ -38,6 +38,13 @@ struct Args {
     ep: ExecutionProvider,
     #[arg(long, default_value = "Hello")]
     prompt: String,
+    /// When set, capture an `onnx-runtime-tracer` timeline of a single traced
+    /// generation and write it as Chrome JSON to this path. Surfaces the per-op
+    /// executor spans with `kernel_variant` / `capture_status` fields. Tracing
+    /// is left OFF for the timed warmup/measurement runs so throughput is
+    /// unaffected.
+    #[arg(long)]
+    trace: Option<PathBuf>,
 }
 
 fn model_file(path: &Path) -> PathBuf {
@@ -132,6 +139,34 @@ fn main() -> Result<()> {
         args.warmups,
         args.runs
     );
+    if let Some(trace_path) = args.trace.as_ref() {
+        // Capture one *traced* generation before the timed runs. Enabling the
+        // tracer opens a per-op executor span for every node it dispatches,
+        // which is what lets the CUDA kernels attach their `kernel_variant` /
+        // `capture_status` annotations. This traced pass exercises the graph
+        // capture path (which runs every op eagerly through `exec_plan_node`),
+        // so the resulting timeline contains real decode-op variant + capture
+        // reasons. We disable tracing again immediately afterwards so the timed
+        // warmup/measurement loops below run with zero tracing overhead.
+        let (ctx, collector) = onnx_runtime_tracer::TraceContext::in_memory();
+        session.set_trace_context(ctx);
+        std::hint::black_box(generate(
+            &mut session,
+            &prompt_tokens,
+            &tokenizer,
+            args.tokens,
+        )?);
+        session.set_trace_context(onnx_runtime_tracer::TraceContext::noop());
+        let json = collector.to_chrome_json();
+        std::fs::write(trace_path, &json)
+            .with_context(|| format!("failed to write trace to {}", trace_path.display()))?;
+        println!(
+            "profile_native: wrote {} trace events to {}",
+            collector.len(),
+            trace_path.display()
+        );
+    }
+
     for _ in 0..args.warmups {
         std::hint::black_box(generate(
             &mut session,

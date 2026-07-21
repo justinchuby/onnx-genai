@@ -11,4 +11,5 @@ categories = ["science", "hardware-support"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }
+onnx-runtime-tracer = { workspace = true }
 thiserror = { workspace = true }
