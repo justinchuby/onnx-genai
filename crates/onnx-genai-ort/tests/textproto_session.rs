@@ -3,7 +3,7 @@
 //! counterpart.
 //!
 //! ORT cannot read protobuf TextFormat from disk, so [`Session::new`] detects
-//! the `.textproto` suffix, converts the model to binary bytes (via onnx-rs),
+//! the `.textproto` suffix, converts the model to binary bytes (via onnx-std),
 //! and creates the session from memory with `CreateSessionFromArray`. Because
 //! that path has no model-directory context, textproto fixtures inline all
 //! weights.

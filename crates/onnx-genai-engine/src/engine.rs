@@ -2753,7 +2753,7 @@ mod tests {
         weight_floats: usize,
     ) -> std::path::PathBuf {
         use onnx::ir::{DataType, Dim, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
-        use onnx_rs as onnx;
+        use onnx_std as onnx;
         use prost::Message;
 
         let mut graph = Graph::new();

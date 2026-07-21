@@ -3,8 +3,8 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "onnx-rs"
-description = "Python bindings for onnx-rs model serialization"
+name = "onnx-std"
+description = "Python bindings for onnx-std model serialization"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Justin Chu" }]

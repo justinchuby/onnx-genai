@@ -1,6 +1,6 @@
 [package]
-name = "onnx-rs-python"
-description = "Python (PyO3/abi3) bindings for onnx-rs model serialization"
+name = "onnx-std-python"
+description = "Python (PyO3/abi3) bindings for onnx-std model serialization"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,11 @@ repository.workspace = true
 publish = false
 
 [lib]
-name = "onnx_rs"
+name = "onnx_std"
 crate-type = ["cdylib"]
 
 [dependencies]
-onnx-rs = { workspace = true }
+onnx-std = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 
 [dependencies.pyo3]

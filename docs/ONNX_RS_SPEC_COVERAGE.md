@@ -1,6 +1,6 @@
-# `onnx-rs` ONNX IR v13 specification coverage
+# `onnx-std` ONNX IR v13 specification coverage
 
-This audit binds `onnx-rs` to **ONNX v1.20.0 / IR version 13**. The vendored
+This audit binds `onnx-std` to **ONNX v1.20.0 / IR version 13**. The vendored
 schema declares IR 13 and the `UINT2`/`INT2` additions
 ([`onnx.proto3:115-125`](../crates/onnx-runtime-loader/proto/onnx.proto3#L115-L125)).
 The authoritative comparison inputs are:
@@ -24,22 +24,22 @@ The bound schema includes the ONNX-ML type delta:
 
 All standard-ONNX wire, TextProto, and JSON ✅ entries below come from one
 generated descriptor
-([`proto_serde.rs:11-33`](../crates/onnx-rs/src/proto_serde.rs#L11-L33),
-[`json/mod.rs:11-24`](../crates/onnx-rs/src/json/mod.rs#L11-L24),
-[`textproto/mod.rs:10-23`](../crates/onnx-rs/src/textproto/mod.rs#L10-L23)).
+([`proto_serde.rs:11-33`](../crates/onnx-std/src/proto_serde.rs#L11-L33),
+[`json/mod.rs:11-24`](../crates/onnx-std/src/json/mod.rs#L11-L24),
+[`textproto/mod.rs:10-23`](../crates/onnx-std/src/textproto/mod.rs#L10-L23)).
 `Model` retains the exact decoded proto and returns it unchanged
-([`model.rs:58-62`](../crates/onnx-rs/src/model.rs#L58-L62),
-[`model.rs:99-131`](../crates/onnx-rs/src/model.rs#L99-L131)).
+([`model.rs:58-62`](../crates/onnx-std/src/model.rs#L58-L62),
+[`model.rs:99-131`](../crates/onnx-std/src/model.rs#L99-L131)).
 
 Readable Text natively owns the model IR/opset header and graph syntax, then
 appends a protobuf-TextFormat residual for fields outside that DSL
-([`text/ser.rs:54-79`](../crates/onnx-rs/src/text/ser.rs#L54-L79),
-[`text/extensions.rs:16-66`](../crates/onnx-rs/src/text/extensions.rs#L16-L66)).
+([`text/ser.rs:54-79`](../crates/onnx-std/src/text/ser.rs#L54-L79),
+[`text/extensions.rs:16-66`](../crates/onnx-std/src/text/extensions.rs#L16-L66)).
 Therefore “⚠️ extension” is still lossless, but is not a first-class DSL form.
 
 The descriptor inventory, every bound dtype, all textual codecs, binary model
 I/O, and dedicated multi-device paths are exercised in
-[`full_spec_serde.rs:483-895`](../crates/onnx-rs/tests/full_spec_serde.rs#L483-L895).
+[`full_spec_serde.rs:483-895`](../crates/onnx-std/tests/full_spec_serde.rs#L483-L895).
 
 ## Priority backlog
 
@@ -48,9 +48,9 @@ I/O, and dedicated multi-device paths are exercised in
 | Closed | ✅ **ONNX-ML `TypeProto.Opaque` is bound** (`Opaque.domain = 1`, `Opaque.name = 2`, `opaque_type = 7`). | Binary, JSON, TextProto, and readable-Text extension round-trips are lossless. |
 | P0 | ⚠️ **The checker is substantially expanded but is not yet the full ONNX checker.** Round 3 added function declaration, topology/SSA, attribute-reference, import, recursion, IR-version, and packed-padding checks. As in official ONNX v1.20, local-function call-site consistency remains unenforced. | Most malformed inference-model protobuf structures are rejected; training validation is explicitly out of scope. Local-function call-site consistency, graph-wide parity, and the full schema catalog remain. |
 | P0 | ⚠️ **The operator schema catalog now contains 63 high-value operators / 70 versioned entries.** Round 6 added `Tile` (13), `Pad` (25), `ScatterND` (18), `ScatterElements` (18), and `ConstantOfShape` (25); `Slice` (13), `Concat` (13), and `Expand` (13) were already registered. | Common transformer/CNN/indexing/shape-computation graphs validate, but this is not yet the complete standard or ONNX-ML schema catalog. |
-| P1 | ⚠️ **Full-schema programmatic mutation is proto-first only.** The execution IR does not own training info, local functions, sparse initializers, quantization annotations, metadata on every object, or distributed annotations. `make_graph_authoritative` drops such fields ([`model.rs:134-141`](../crates/onnx-rs/src/model.rs#L134-L141)). | Loaded models are lossless, but graph rewrites cannot preserve every construct unless callers edit/rebuild a `ModelProto`. |
+| P1 | ⚠️ **Full-schema programmatic mutation is proto-first only.** The execution IR does not own training info, local functions, sparse initializers, quantization annotations, metadata on every object, or distributed annotations. `make_graph_authoritative` drops such fields ([`model.rs:134-141`](../crates/onnx-std/src/model.rs#L134-L141)). | Loaded models are lossless, but graph rewrites cannot preserve every construct unless callers edit/rebuild a `ModelProto`. |
 | P1 | ⚠️ **Readable Text is not a native full-spec grammar.** Many fields, including all multi-device messages, are carried in the extension block. | Round-trip is correct, but direct human editing is split between the graph DSL and TextFormat. |
-| P1 | ⚠️ **Every operator currently present in the 63-op schema catalog has shape inference.** Round 6 adds checked Slice clamping, Concat dimension merging, Tile multiplication, bidirectional Expand, input-driven Pad, Scatter rank validation, and ConstantOfShape shape-data handling. Dynamic value inputs leave affected extents or the whole output unresolved rather than fabricating concrete shapes. Unsupported operators outside the schema catalog remain unknown ([`shape.rs:28-50`](../crates/onnx-rs/src/shape.rs#L28-L50)). | The catalog-local gap is closed; full ONNX shape-inference parity still depends on completing the operator catalog and adding sequence/optional/control-flow rules beyond `If`. |
+| P1 | ⚠️ **Every operator currently present in the 63-op schema catalog has shape inference.** Round 6 adds checked Slice clamping, Concat dimension merging, Tile multiplication, bidirectional Expand, input-driven Pad, Scatter rank validation, and ConstantOfShape shape-data handling. Dynamic value inputs leave affected extents or the whole output unresolved rather than fabricating concrete shapes. Unsupported operators outside the schema catalog remain unknown ([`shape.rs:28-50`](../crates/onnx-std/src/shape.rs#L28-L50)). | The catalog-local gap is closed; full ONNX shape-inference parity still depends on completing the operator catalog and adding sequence/optional/control-flow rules beyond `If`. |
 | Closed | ✅ **Dense and sparse payload structural validation is implemented.** | Checked arithmetic covers element/byte counts, sub-byte packing and zero padding bits, segments, external offsets/lengths, sparse NNZ/index shape/order/uniqueness/bounds, and storage-field/dtype compatibility. |
 | P2 | ⚠️ **Version conversion is not full ONNX conversion.** Built-ins cover `Reshape` v5/v13→v14 and the official `Softmax`/`LogSoftmax` v12→v13 last-axis rewrite or Shape/Flatten/op/Reshape decomposition. | Most opset transitions and all downgrades remain unsupported even when the wire schema is supported. |
 
@@ -113,7 +113,7 @@ The IR enum and ONNX integer conversions cover all standard v1.20/IR-13 values
 ([`dtype.rs:9-37`](../crates/onnx-runtime-ir/src/dtype.rs#L9-L37),
 [`dtype.rs:151-190`](../crates/onnx-runtime-ir/src/dtype.rs#L151-L190)).
 Readable Text has a spelling for every value
-([`text/ser.rs:345-375`](../crates/onnx-rs/src/text/ser.rs#L345-L375)).
+([`text/ser.rs:345-375`](../crates/onnx-std/src/text/ser.rs#L345-L375)).
 
 | Value | Number | Wire | Checker | Text | TextProto | JSON |
 |---|---:|---:|---:|---:|---:|---:|
@@ -154,7 +154,7 @@ a protobuf `bytes` field.
 All concrete attribute kinds are represented in the shared IR
 ([`node.rs:81-107`](../crates/onnx-runtime-ir/src/node.rs#L81-L107)) and matched
 by schema checking
-([`check/rules.rs:1171-1188`](../crates/onnx-rs/src/check/rules.rs#L1171-L1188)).
+([`check/rules.rs:1171-1188`](../crates/onnx-std/src/check/rules.rs#L1171-L1188)).
 The protobuf checker also validates names, discriminators, populated-union
 conflicts, required message payloads, reference attributes, and duplicate names.
 
@@ -189,8 +189,8 @@ validated, and likewise projects to an unknown execution placeholder.
 
 ## Multi-device implementation status
 
-The public `onnx-rs` API re-exports the exact generated IR-13 types
-([`model.rs:33-41`](../crates/onnx-rs/src/model.rs#L33-L41)):
+The public `onnx-std` API re-exports the exact generated IR-13 types
+([`model.rs:33-41`](../crates/onnx-std/src/model.rs#L33-L41)):
 
 - `DeviceConfigurationProto`
 - `IntIntListEntryProto`
@@ -216,7 +216,7 @@ The exact field wiring is:
 names/counts, device name cardinality, node configuration references,
 tensor-name references, known-rank axis ranges, optional dimension-oneof
 handling, and required positive shard counts
-([`check/rules.rs:667-992`](../crates/onnx-rs/src/check/rules.rs#L667-L992)).
+([`check/rules.rs:667-992`](../crates/onnx-std/src/check/rules.rs#L667-L992)).
 It recursively checks main/nested/training graphs and function nodes.
 
 Deferred multi-device checker items:

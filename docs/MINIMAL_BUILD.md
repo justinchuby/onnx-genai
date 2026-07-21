@@ -31,13 +31,13 @@ sequence.
   its current coverage differs. Therefore native-EP operator stripping is under
   this project's control; it no longer inherently requires an upstream ORT
   change.
-- `onnx-rs` already provides most analyzer building blocks:
-  [`SchemaRegistry`](../crates/onnx-rs/src/schema/mod.rs) resolves
+- `onnx-std` already provides most analyzer building blocks:
+  [`SchemaRegistry`](../crates/onnx-std/src/schema/mod.rs) resolves
   `(domain, op_type, opset)` schemas; the
-  [checker](../crates/onnx-rs/src/check/mod.rs) walks models and its schema rule
+  [checker](../crates/onnx-std/src/check/mod.rs) walks models and its schema rule
   recursively walks graph nodes and subgraphs
-  ([`check_graph_schemas`](../crates/onnx-rs/src/check/rules.rs)); and
-  [`shape::infer_shapes`](../crates/onnx-rs/src/shape.rs) validates/informs the
+  ([`check_graph_schemas`](../crates/onnx-std/src/check/rules.rs)); and
+  [`shape::infer_shapes`](../crates/onnx-std/src/shape.rs) validates/informs the
   graph pipeline. A required-op collector is therefore a small addition, not a
   new model parser.
 
@@ -97,7 +97,7 @@ dependent group is enabled.
 This is the intended user-facing answer for a truly minimal build. A planned
 `cargo xtask minimal-build` command accepts one or more `.onnx` files:
 
-1. Load each model through `onnx-rs`.
+1. Load each model through `onnx-std`.
 2. Run the standard checker and resolve every node against `SchemaRegistry`,
    recursively including subgraphs and functions.
 3. Collect normalized `(domain, op_type, opset)` requirements.
@@ -266,7 +266,7 @@ All phases are **NOT YET IMPLEMENTED**.
 
 ### Phase 2 — model-driven analyzer and codegen
 
-- Add recursive required-op collection to `onnx-rs`, reusing its schema/checker
+- Add recursive required-op collection to `onnx-std`, reusing its schema/checker
   graph traversal and shape pipeline.
 - Add the deterministic selection manifest and `cargo xtask minimal-build`.
 - Generate the registry root, compute optimizer/fusion closure, embed the build

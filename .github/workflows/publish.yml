@@ -153,7 +153,7 @@ jobs:
           publish_crate onnx-runtime-ir
           publish_crate onnx-runtime-shape-inference
           publish_crate onnx-runtime-loader
-          publish_crate onnx-rs
+          publish_crate onnx-std
           publish_crate onnx-runtime-ep-api
           publish_crate onnx-runtime-ep-cpu
           publish_crate onnx-runtime-optimizer

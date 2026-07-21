@@ -1634,7 +1634,7 @@ struct ShardingSpec {
   They don't specify communication — that's the `Communicator`'s job.
 - If Mobius or other exporters annotate models with sharding specs, the partitioner
   can skip expensive graph analysis and use the hints directly.
-- The `onnx-rs` crate already validates these annotations (`MultiDeviceConfigurationRule`)
+- The `onnx-std` crate already validates these annotations (`MultiDeviceConfigurationRule`)
   but the runtime IR (`onnx-runtime-ir`) currently drops them after parsing. The
   loader should preserve them into `NodeDeviceHints` when present.
 - Without annotations, the runtime falls back to automatic placement — no regression.
@@ -1645,7 +1645,7 @@ match the current runtime topology. The runtime MUST NOT silently produce incorr
 results from stale hints — validation catches mismatches and falls back to automatic
 placement with a diagnostic warning.
 
-**Current status:** `onnx-rs` validates; IR/loader do not yet propagate. Low priority
+**Current status:** `onnx-std` validates; IR/loader do not yet propagate. Low priority
 until real models with sharding annotations exist.
 
 ### D7: Host RAM and disk are per-machine shared resources, not per-device

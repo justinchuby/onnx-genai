@@ -1,11 +1,11 @@
-# onnx-rs — ONNX in Rust
+# onnx-std — ONNX in Rust
 
 > A pure-Rust replacement for the `onnx` Python package and C++ reference implementation.
 > High-performance model I/O, validation, transformation, and tooling — no protobuf
 > compiler, no C++ build, no numpy dependency.
 
 **Scope:** The ONNX standard library (load/save/validate/transform models). NOT a runtime.
-nxrt consumes onnx-rs as a library; they are separate concerns.
+nxrt consumes onnx-std as a library; they are separate concerns.
 
 ---
 
@@ -59,7 +59,7 @@ This is the **standard library** for working with ONNX models as data.
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │                     Python Bindings (PyO3)                      │
-│                     `pip install onnx-rs`                       │
+│                     `pip install onnx-std`                       │
 ├────────────────────────────────────────────────────────────────┤
 │                                                                │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │
@@ -249,7 +249,7 @@ impl WeightBackend for SafetensorsBackend {
 ### 3.6 Example: Custom GGUF Format (User-Provided)
 
 ```rust
-/// User registers GGUF support — onnx-rs doesn't need to know about it.
+/// User registers GGUF support — onnx-std doesn't need to know about it.
 struct GgufFormat;
 
 impl ModelFormat for GgufFormat {
@@ -383,7 +383,7 @@ convert), not for runtime execution.
 
 ### 4.1 What's Shared vs. What's Different
 
-| Concept | onnx-rs IR | onnx-runtime-ir (nxrt) |
+| Concept | onnx-std IR | onnx-runtime-ir (nxrt) |
 |---------|-----------|------------------------|
 | Graph, Node, Value | ✅ Same core types | ✅ Same |
 | TensorLayout / strides | ❌ Not needed | ✅ Runtime concern |
@@ -396,7 +396,7 @@ convert), not for runtime execution.
 
 ### 4.2 Design Choice: Shared Crate or Separate?
 
-**Option A: onnx-rs has its own IR, nxrt converts on load.**
+**Option A: onnx-std has its own IR, nxrt converts on load.**
 - Pro: Each IR is optimal for its purpose
 - Con: Conversion cost, two representations to maintain
 
@@ -466,8 +466,8 @@ Round-trip JSON serialization for web tooling, APIs, and interchange with non-pr
 ecosystems.
 
 ```rust
-let json = onnx_rs::json::to_json(&model)?;
-let model = onnx_rs::json::from_json(&json)?;
+let json = onnx_std::json::to_json(&model)?;
+let model = onnx_std::json::from_json(&json)?;
 ```
 
 JSON uses the canonical protobuf JSON mapping. The current serializer is
@@ -478,12 +478,12 @@ deterministically pretty-printed, so it does not need format-specific options.
 For compatibility with protobuf text format tooling.
 
 ```rust
-let text = onnx_rs::textproto::to_textproto(&model)?;
-let model = onnx_rs::textproto::from_textproto(&text)?;
+let text = onnx_std::textproto::to_textproto(&model)?;
+let model = onnx_std::textproto::from_textproto(&text)?;
 ```
 
-**Implemented.** The functions live in `onnx_rs::textproto`, alongside the
-existing `onnx_rs::json` module, rather than behind a zero-sized
+**Implemented.** The functions live in `onnx_std::textproto`, alongside the
+existing `onnx_std::json` module, rather than behind a zero-sized
 `OnnxTextProto` type. Free functions are more idiomatic for stateless format
 conversion and make the two protobuf interchange APIs predictable.
 
@@ -833,7 +833,7 @@ checker.add_rule(MaxGraphDepthRule { max_depth: 5 });
 ### 9.1 Delegates to Existing Crate
 
 Shape inference reuses `onnx-runtime-shape-inference` (already being built for nxrt).
-onnx-rs wraps it with a higher-level API:
+onnx-std wraps it with a higher-level API:
 
 ```rust
 /// Run shape inference on a model, populating all value type/shape info.
@@ -872,7 +872,7 @@ pub fn register_shape_inference(
 
 ## 10. Version Converter
 
-**Status: ✅ Implemented (initial framework and built-ins).** `onnx-rs::version` provides
+**Status: ✅ Implemented (initial framework and built-ins).** `onnx-std::version` provides
 transactional recursive conversion, custom adapter registration, Reshape v5/v13→v14
 `allowzero` rewriting, and schema-backed compatible bumps only where an explicit schema
 upper bound proves compatibility. Unsupported downgrades and unproven targets reject without
@@ -1041,7 +1041,7 @@ All Python bindings use **PyO3 abi3 mode** targeting the stable limited API. Thi
 - Future Python versions work without recompilation
 
 ```toml
-# onnx-rs-python/Cargo.toml
+# onnx-std-python/Cargo.toml
 [dependencies]
 pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
 ```
@@ -1057,8 +1057,8 @@ and register with the Rust core — the Rust side calls back into Python via PyO
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                   Python user code                       │
-│   class GgufFormat(onnx_rs.ModelFormat): ...             │
-│   onnx_rs.register_format(GgufFormat())                  │
+│   class GgufFormat(onnx_std.ModelFormat): ...             │
+│   onnx_std.register_format(GgufFormat())                  │
 ├─────────────────────────────────────────────────────────┤
 │                   PyO3 bridge layer                       │
 │   PyModelFormat wraps Python object, implements          │
@@ -1120,10 +1120,10 @@ impl ModelFormat for PyModelFormat {
 #### Python User API
 
 ```python
-import onnx_rs
+import onnx_std
 
 # --- Custom model format ---
-class GgufFormat(onnx_rs.ModelFormat):
+class GgufFormat(onnx_std.ModelFormat):
     def id(self) -> str:
         return "gguf"
 
@@ -1134,17 +1134,17 @@ class GgufFormat(onnx_rs.ModelFormat):
         with open(path, "rb") as f:
             return f.read(4) == b"GGUF"
 
-    def load(self, path: str) -> onnx_rs.Model:
-        # Parse GGUF → construct onnx_rs.Model
+    def load(self, path: str) -> onnx_std.Model:
+        # Parse GGUF → construct onnx_std.Model
         ...
 
-    def save(self, model: onnx_rs.Model, path: str):
+    def save(self, model: onnx_std.Model, path: str):
         raise NotImplementedError("GGUF save not supported")
 
-onnx_rs.register_format(GgufFormat())
+onnx_std.register_format(GgufFormat())
 
 # --- Custom validation rule ---
-class MaxNodeCount(onnx_rs.ValidationRule):
+class MaxNodeCount(onnx_std.ValidationRule):
     def __init__(self, max_nodes: int = 10000):
         self.max_nodes = max_nodes
 
@@ -1154,10 +1154,10 @@ class MaxNodeCount(onnx_rs.ValidationRule):
     def severity(self) -> str:
         return "warning"  # "error" | "warning" | "info"
 
-    def check(self, model: onnx_rs.Model) -> list[onnx_rs.Violation]:
+    def check(self, model: onnx_std.Model) -> list[onnx_std.Violation]:
         count = model.graph.node_count()
         if count > self.max_nodes:
-            return [onnx_rs.Violation(
+            return [onnx_std.Violation(
                 rule_id=self.id(),
                 severity=self.severity(),
                 message=f"Graph has {count} nodes, exceeds max {self.max_nodes}",
@@ -1165,10 +1165,10 @@ class MaxNodeCount(onnx_rs.ValidationRule):
             )]
         return []
 
-onnx_rs.checker.add_rule(MaxNodeCount(5000))
+onnx_std.checker.add_rule(MaxNodeCount(5000))
 
 # --- Custom weight backend ---
-class RedisWeightBackend(onnx_rs.WeightBackend):
+class RedisWeightBackend(onnx_std.WeightBackend):
     def __init__(self, redis_url: str):
         self.client = redis.Redis.from_url(redis_url)
 
@@ -1185,31 +1185,31 @@ class RedisWeightBackend(onnx_rs.WeightBackend):
         return [k.decode().removeprefix("weight:")
                 for k in self.client.keys("weight:*")]
 
-onnx_rs.register_weight_backend(RedisWeightBackend("redis://localhost:6379"))
+onnx_std.register_weight_backend(RedisWeightBackend("redis://localhost:6379"))
 
 # --- Custom version converter adapter ---
-class MyOpV1ToV2(onnx_rs.OpAdapter):
+class MyOpV1ToV2(onnx_std.OpAdapter):
     def source(self) -> tuple[str, str, int]:
         return ("com.mycompany", "MyOp", 1)
 
     def target_version(self) -> int:
         return 2
 
-    def adapt(self, node: onnx_rs.Node, graph: onnx_rs.Graph) -> str:
+    def adapt(self, node: onnx_std.Node, graph: onnx_std.Graph) -> str:
         # Rewrite node attributes for v2 semantics
         node.set_attr("new_attr", node.get_attr("old_attr", 0))
         node.remove_attr("old_attr")
         return "rewritten"  # "compatible" | "rewritten" | "incompatible"
 
-onnx_rs.version_converter.register(MyOpV1ToV2())
+onnx_std.version_converter.register(MyOpV1ToV2())
 
 # --- Custom shape inference ---
-class MyOpShapeInference(onnx_rs.ShapeInferenceHandler):
-    def infer(self, node: onnx_rs.Node, input_types: list) -> list:
+class MyOpShapeInference(onnx_std.ShapeInferenceHandler):
+    def infer(self, node: onnx_std.Node, input_types: list) -> list:
         # Output shape = input shape
         return [input_types[0]] if input_types else []
 
-onnx_rs.register_shape_inference("com.mycompany", "MyOp", MyOpShapeInference())
+onnx_std.register_shape_inference("com.mycompany", "MyOp", MyOpShapeInference())
 ```
 
 #### Bridge Traits Summary
@@ -1218,11 +1218,11 @@ Every extensible Rust trait has a corresponding Python base class and PyO3 bridg
 
 | Rust Trait | Python Base Class | PyO3 Bridge Struct | GIL Strategy |
 |-----------|-------------------|-------------------|---------------|
-| `ModelFormat` | `onnx_rs.ModelFormat` | `PyModelFormat` | Cache id/extensions; GIL on load/save |
-| `WeightBackend` | `onnx_rs.WeightBackend` | `PyWeightBackend` | GIL on get/put |
-| `ValidationRule` | `onnx_rs.ValidationRule` | `PyValidationRule` | Cache id/severity; GIL on check |
-| `OpAdapter` | `onnx_rs.OpAdapter` | `PyOpAdapter` | Cache source/target; GIL on adapt |
-| `ShapeInferenceHandler` | `onnx_rs.ShapeInferenceHandler` | `PyShapeInferenceHandler` | GIL on infer |
+| `ModelFormat` | `onnx_std.ModelFormat` | `PyModelFormat` | Cache id/extensions; GIL on load/save |
+| `WeightBackend` | `onnx_std.WeightBackend` | `PyWeightBackend` | GIL on get/put |
+| `ValidationRule` | `onnx_std.ValidationRule` | `PyValidationRule` | Cache id/severity; GIL on check |
+| `OpAdapter` | `onnx_std.OpAdapter` | `PyOpAdapter` | Cache source/target; GIL on adapt |
+| `ShapeInferenceHandler` | `onnx_std.ShapeInferenceHandler` | `PyShapeInferenceHandler` | GIL on infer |
 
 #### Performance Considerations
 
@@ -1244,7 +1244,7 @@ Python-backed trait objects are `Send + Sync` by wrapping in `PyObject` (which i
 ### 12.3 Drop-in Compatibility Goal
 
 ```python
-import onnx_rs as onnx  # Drop-in for common use cases
+import onnx_std as onnx  # Drop-in for common use cases
 
 # Load / save (including custom-registered formats)
 model = onnx.load("model.onnx")
@@ -1272,7 +1272,7 @@ onnx.registry.register_from_yaml("my_ops/")
 
 Things intentionally NOT replicated:
 - `onnx.helper.make_*()` — use onnxscript or direct IR construction instead
-- `onnx.numpy_helper` — use `onnx_rs.tensor_to_numpy()` / DLPack
+- `onnx.numpy_helper` — use `onnx_std.tensor_to_numpy()` / DLPack
 - `onnx.compose` — if needed, add as separate feature
 - TensorProto direct manipulation — use IR API
 
@@ -1281,7 +1281,7 @@ Things intentionally NOT replicated:
 ## 13. Crate Structure
 
 ```
-onnx-rs/                          # Workspace root
+onnx-std/                          # Workspace root
 ├── onnx-ir/                      # Core IR (shared with nxrt via feature flags)
 │   ├── src/
 │   │   ├── graph.rs
@@ -1330,10 +1330,10 @@ onnx-rs/                          # Workspace root
 │   │   ├── converter.rs
 │   │   └── chain.rs
 │   └── Cargo.toml
-├── onnx-rs/                      # Umbrella crate (re-exports everything)
+├── onnx-std/                      # Umbrella crate (re-exports everything)
 │   ├── src/lib.rs
 │   └── Cargo.toml
-├── onnx-rs-python/               # Python bindings (PyO3)
+├── onnx-std-python/               # Python bindings (PyO3)
 │   ├── src/lib.rs
 │   └── pyproject.toml
 └── onnx-cli/                     # CLI tool
@@ -1347,7 +1347,7 @@ onnx-rs/                          # Workspace root
 
 ```
                    ┌───────────────────────┐
-                   │       onnx-rs         │
+                   │       onnx-std         │
                    │  (standard library)   │
                    │                       │
                    │  load/save/check/     │
@@ -1374,11 +1374,11 @@ onnx-rs/                          # Workspace root
                    └───────────────────────┘
 ```
 
-- `onnx-ir` is the shared dependency — both onnx-rs and nxrt use the same IR types
+- `onnx-ir` is the shared dependency — both onnx-std and nxrt use the same IR types
 - nxrt's loader can delegate to `onnx-proto` for parsing
-- nxrt's shape inference IS `onnx-runtime-shape-inference`, which onnx-rs wraps
+- nxrt's shape inference IS `onnx-runtime-shape-inference`, which onnx-std wraps
 - nxrt adds runtime-specific layers (layout, device, memory) on top of the shared IR
-- onnx-rs never depends on nxrt; nxrt may optionally depend on onnx-rs components
+- onnx-std never depends on nxrt; nxrt may optionally depend on onnx-std components
 
 ---
 
@@ -1391,7 +1391,7 @@ onnx-rs/                          # Workspace root
 - [ ] `onnx-proto`: Safetensors weight backend
 - [ ] `onnx-proto`: ModelSaver with WeightStrategy
 - [ ] `onnx-ir`: Factor out shared IR from `onnx-runtime-ir` (or decide to keep one crate)
-- [ ] `onnx-rs`: Umbrella crate, `onnx_rs::load()` / `onnx_rs::save()`
+- [ ] `onnx-std`: Umbrella crate, `onnx_std::load()` / `onnx_std::save()`
 - [ ] Basic round-trip test: load .onnx → save .onnx → binary identical
 
 ### Phase 2: Schema + Checker
@@ -1410,7 +1410,7 @@ onnx-rs/                          # Workspace root
 - [ ] `onnx-text`: Parser (.onnxtxt → Model)
 - [ ] `onnx-text`: Round-trip tests
 - [ ] `onnx-json`: JSON serialization
-- [x] `onnx-rs::textproto`: protobuf TextFormat support
+- [x] `onnx-std::textproto`: protobuf TextFormat support
 - [ ] `onnx-cli`: `onnx check`, `onnx print`, `onnx info` commands
 
 ### Phase 4: Version Converter + Polish
@@ -1419,7 +1419,7 @@ onnx-rs/                          # Workspace root
 - [x] `onnx-version-converter`: Initial core adapter (Reshape v5/v13 → v14) + schema-compatible bumps
 - [x] Custom op registration API
 - [ ] Shape inference integration (wrap `onnx-runtime-shape-inference`)
-- [ ] `onnx-rs-python`: PyO3 bindings
+- [ ] `onnx-std-python`: PyO3 bindings
 - [ ] `onnx-cli`: `onnx convert`, `onnx diff` commands
 - [ ] Benchmark: load time vs Python `onnx.load()` on large models
 - [ ] crates.io publish
@@ -1428,17 +1428,17 @@ onnx-rs/                          # Workspace root
 
 ## 16. Open Questions
 
-1. **Repo location:** Separate repo (`onnx-rs/onnx-rs`) or inside `onnx-genai`? Separate
+1. **Repo location:** Separate repo (`onnx-std/onnx-std`) or inside `onnx-genai`? Separate
    is cleaner (it's a standard library, not a runtime), but mono-repo is easier during
    early development.
 
-2. **`onnx-ir` ownership:** Does `onnx-rs` own the IR crate, or does `nxrt`? Or is it a
+2. **`onnx-ir` ownership:** Does `onnx-std` own the IR crate, or does `nxrt`? Or is it a
    standalone crate both depend on? Affects publish order and semver coordination.
 
 3. **YAML schema maintenance:** Who keeps YAML files in sync with upstream ONNX spec
    releases? Automated CI job that diffs `onnx.defs` against YAML and flags drift?
 
-4. **Compatibility with `onnx` Python package:** Can `onnx-rs-python` load models saved
+4. **Compatibility with `onnx` Python package:** Can `onnx-std-python` load models saved
    by `onnx` and vice versa? What's the protobuf wire compatibility story?
 
 5. **ONNX spec conformance tests:** Does ONNX have an official checker test suite? If so,
@@ -1448,8 +1448,8 @@ onnx-rs/                          # Workspace root
    graphs, gradient ops, etc. Out of scope for v1?
 
 7. **Text format standardization:** Should .onnxtxt be proposed as an ONNX standard
-   format? Or keep it as an onnx-rs extension?
+   format? Or keep it as an onnx-std extension?
 
-8. **Performance target:** What's the target for `onnx_rs.load()` on a 70B model? Current
+8. **Performance target:** What's the target for `onnx_std.load()` on a 70B model? Current
    Python `onnx.load()` takes 30-60s and peaks at 2x model size in memory. Target: <5s,
    constant memory (mmap).

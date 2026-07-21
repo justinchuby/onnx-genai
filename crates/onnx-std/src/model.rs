@@ -1,6 +1,6 @@
 //! Owned model type and ergonomic model I/O (ONNX_RS §3 / §4).
 //!
-//! `onnx-rs` deliberately does **not** own an IR: the graph, node, value, tensor
+//! `onnx-std` deliberately does **not** own an IR: the graph, node, value, tensor
 //! and weight types all come from the shared [`onnx_runtime_ir`] crate
 //! (ONNX_RS §4.1 "Shared Crate"), and the protobuf parse/encode stack is reused
 //! from [`onnx_runtime_loader`] (ONNX_RS §3.4 "Built-in: Protobuf Format").
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_structure_and_metadata() {
         let meta = ModelMetadata {
-            producer_name: "onnx-rs-test".to_string(),
+            producer_name: "onnx-std-test".to_string(),
             graph_name: "g".to_string(),
             metadata_props: vec![("author".to_string(), "deckard".to_string())],
             ..Default::default()
@@ -329,12 +329,12 @@ mod tests {
 
         let dir = std::env::current_dir().unwrap().join("target");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("onnx_rs_roundtrip_test.onnx");
+        let path = dir.join("onnx_std_roundtrip_test.onnx");
         save_model(&model, &path).unwrap();
 
         let loaded = load_model(&path).unwrap();
         assert_eq!(loaded.graph.num_nodes(), 1);
-        assert_eq!(loaded.metadata.producer_name, "onnx-rs-test");
+        assert_eq!(loaded.metadata.producer_name, "onnx-std-test");
         assert_eq!(loaded.metadata.graph_name, "g");
         assert_eq!(
             loaded.metadata.metadata_props,

@@ -477,7 +477,7 @@ The repository already has important pieces:
   and can dump `*_ctx.onnx` from `ep.context_*` session options. The current
   concrete executor auto-detects only the CPU EP, so real compiled-EP reuse
   awaits a compiled EP.
-- `onnx-rs::load_model`/`save_model` share the runtime IR and retain the live
+- `onnx-std::load_model`/`save_model` share the runtime IR and retain the live
   `WeightStore`.
 - `onnx-genai-engine::Engine::from_dir` currently resolves a flat
   `ModelDirectory`, loads an ORT-backed session, prefers native inference
@@ -487,7 +487,7 @@ The repository already has important pieces:
   for the metadata compatibility path.
 
 One design/code mismatch must be explicit: `docs/ONNX_RS.md` specifies
-`ModelFormat` and `FormatRegistry`, but the current `onnx-rs` crate does not yet
+`ModelFormat` and `FormatRegistry`, but the current `onnx-std` crate does not yet
 implement or export them. Package work should land the generic registry seam
 before registering `ModelPackageFormat`; it must not create a package-only
 parallel dispatcher.
@@ -499,7 +499,7 @@ Proposed ownership:
 | Crate | Responsibility |
 |---|---|
 | `onnx-model-package` (new, leaf) | Pure-Rust ORT 1.x manifest parsing/authoring, path resolver, hashing, validation, archive envelope, typed package/component/variant views. No session dependency. |
-| `onnx-rs` | Register `ModelPackageFormat`; graph-only inspection; save/pack entry points built on shared IR. |
+| `onnx-std` | Register `ModelPackageFormat`; graph-only inspection; save/pack entry points built on shared IR. |
 | `onnx-runtime-loader` | Load the selected model path, external weights, and EPContext blobs through already-resolved package paths; preserve `mmap`. |
 | `onnx-runtime-ep-api` | EP compatibility validation contract and compiled-context save/load. |
 | `onnx-runtime-session` | Device intent, variant ranking, EPContext validation/reuse, generic fallback selection, and session lifetime ownership of the package handle/cache lease. |
