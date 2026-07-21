@@ -1377,20 +1377,28 @@ text (see the `pre_embedder` note) toward fully bit-accurate real-package playba
 
 ##### The `pre_embedder` / `prefill_embedder` extension to `nested_autoregressive`
 
-`nested_autoregressive` gained two **optional** fields, `pre_embedder` and
-`prefill_embedder` (component names), keeping the contract minimal and backward
-compatible:
+`nested_autoregressive` gained two **optional** structured fields, `pre_embedder` and
+`prefill_embedder`, keeping the contract minimal and backward compatible. Every
+graph-specific port is declared **explicitly in metadata** — the engine makes **no
+assumptions about tensor names** (a firm runtime rule):
 
 ```yaml
 strategy:
   kind: nested_autoregressive
   outer: talker            # driven by inputs_embeds when pre_embedder is set
   inner: code_predictor
-  pre_embedder: talker_step_embedder       # NEW (optional)
-  prefill_embedder: talker_prefill_embedder # NEW (optional; needs pre_embedder)
   num_code_groups: 16
   max_tokens: 2000
-# required wiring when pre_embedder is set:
+  pre_embedder:                          # NEW (optional)
+    component: talker_step_embedder
+    frame_codes_input: frame_codes       # int64 [1,G] — previous frame's codes
+    text_embed_input: text_embed         # optional float [1,1,H] — trailing text
+  prefill_embedder:                      # NEW (optional; requires pre_embedder)
+    component: talker_prefill_embedder
+    prompt_input: text_ids               # receives the tokenized prompt
+    prefill_output: prefill_embeds       # [1,P,H] fed to the talker on frame 0
+    trailing_output: trailing_text_embeds # [1,T,H] sliced per frame into text_embed
+# required wiring when pre_embedder is set (declares its output port too):
 dataflow:
   - {from: talker_step_embedder.inputs_embeds, to: talker.inputs_embeds}
 ```
@@ -1401,23 +1409,22 @@ dataflow:
    frame, runs the named pre-embedder to materialize the outer decoder's single-position
    `inputs_embeds`, and feeds it to the talker (which consumes `inputs_embeds`, not
    `input_ids`).
-2. **Wiring resolution.** The pre-embedder must be a declared model, distinct from
-   `outer`/`inner`, wired by a **required** dataflow edge
-   `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`. Its `frame_codes` input (the
-   sole int64 input) and optional `text_embed` input (a second float input) are resolved
-   from the loaded session at runtime; the hidden size comes from the outer decoder's
-   `inputs_embeds` input. The pre-embedder is a loop-internal component (`run_on:
-   on_demand`), excluded from prompt/final phase classification.
+2. **Wiring resolution — all from metadata, no name guessing.** The pre-embedder must be
+   a declared model, distinct from `outer`/`inner`, wired by a **required** dataflow edge
+   `{component}.{output} -> {outer}.inputs_embeds` (which declares both the pre-embedder's
+   output port and the talker's input port). Its `frame_codes_input` and optional
+   `text_embed_input` port names come from the `pre_embedder` spec; the hidden size comes
+   from the outer decoder's `inputs_embeds` input. The pre-embedder is a loop-internal
+   component (`run_on: on_demand`), excluded from prompt/final phase classification.
 3. **Prefill + trailing-text (`prefill_embedder`, optional; requires `pre_embedder`).**
-   Names a `prompt_only` component (`text_ids -> prefill_embeds [1,P,H] +
-   trailing_text_embeds [1,T,H]`) whose `text_ids` are auto-seeded with the tokenized
-   prompt. The engine reads its pooled outputs (resolved by name) and: on **frame 0**
-   feeds the multi-position `prefill_embeds` directly to the talker (advancing the past
-   length by `P`, *not* running the pre-embedder); on **frames k≥1** threads
-   `trailing_text_embeds[:, k-1, :]` as the pre-embedder's `text_embed` (zeros once the
-   text is exhausted). This moves the whole Qwen3-TTS prefill/trailing-text construction
-   into ONNX, keeping the engine generic. When absent, the engine feeds a zero frame-0
-   seed + zero `text_embed` (the earlier behavior).
+   Names a `prompt_only` component with explicit `prompt_input` / `prefill_output` /
+   `trailing_output` ports. The engine seeds the declared `prompt_input` with the tokenized
+   prompt, reads the two named pooled outputs, and: on **frame 0** feeds the multi-position
+   `prefill_output` directly to the talker (advancing the past length by `P`, *not* running
+   the pre-embedder); on **frames k≥1** threads `trailing_output[:, k-1, :]` as the
+   pre-embedder's `text_embed_input` (zeros once the text is exhausted). This moves the
+   whole Qwen3-TTS prefill/trailing-text construction into ONNX, keeping the engine
+   generic. When absent, the engine feeds a zero frame-0 seed + zero `text_embed`.
 4. **Remaining follow-ups.** Speaker / language / instruct prefill branches (the
    `talker_prefill_embedder` currently materializes the Auto / no-speaker / no-instruct
    path) and the exact `tts_pad` embedding for exhausted trailing text — refinements
