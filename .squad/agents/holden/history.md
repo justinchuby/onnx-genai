@@ -120,3 +120,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T11:15:00Z — Long-context GQA review
 - 🟢 Approved Sebastian's 16-way split-K change after verifying exact scratch bounds, deterministic merge order, capture safety, parity, and SM portability. Reproduced about 693 tok/s at 1024 tokens versus 647 baseline with no 256 regression.
+
+## 2026-07-21T13:15:00Z — GQA metadata-fold review
+- 🟢 Approved Luv’s batch-1 metadata fold after verifying exact metadata parity, poison/latch safety, capture behavior, portability, zero fallbacks, and the independent throughput win.

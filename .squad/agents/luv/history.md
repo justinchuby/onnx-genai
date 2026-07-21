@@ -49,3 +49,6 @@ Cross-agent update: vendored MLAS is now the opt-in CPU-GEMM parity path; follow
 
 ## 2026-07-21 — Wave-2 and CI milestone
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
+
+## 2026-07-21T13:15:00Z — GQA metadata fold landed
+- Folded batch-1 GQA metadata into fused prep, removing 24 launches/token while preserving bounds/latch semantics and exact tokens. Holden approved; merged as `bd30e6c`, moving the stack from ~691 to ~710 tok/s at 256.

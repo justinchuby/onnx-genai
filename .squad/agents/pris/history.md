@@ -114,3 +114,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T11:15:00Z — SwiGLU fusion review
 - 🟢 Approved Mariette's CUDA `Mul(Silu(gate), up)` fusion after verifying guards, fp16 parity, tracing, capture safety, and portability. Reproduced a real 256-token gain with zero fallbacks.
+
+## 2026-07-21T13:15:00Z — MatMul fusion review
+- 🟢 Approved Rachael’s QKV-bias and paired gate/up+SwiGLU fusion after bit-exactness, misfire guards, portability, capture safety, and H200 performance checks; stacked throughput reached ~759 tok/s at 256 and ~789 at 1024.
