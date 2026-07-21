@@ -1,0 +1,49 @@
+{
+  "processor": {
+    "transforms": [
+      {
+        "operation": {
+          "type": "DecodeImage",
+          "attrs": {
+            "color_space": "RGB"
+          }
+        }
+      },
+      {
+        "operation": {
+          "type": "Resize",
+          "attrs": {
+            "width": 960,
+            "height": 672,
+            "smart_resize": 1
+          }
+        }
+      },
+      {
+        "operation": {
+          "type": "Rescale",
+          "attrs": {
+            "rescale_factor": 0.00392156862745098
+          }
+        }
+      },
+      {
+        "operation": {
+          "type": "Normalize",
+          "attrs": {
+            "mean": [0.5, 0.5, 0.5],
+            "std": [0.5, 0.5, 0.5]
+          }
+        }
+      },
+      {
+        "operation": {
+          "type": "PatchImage",
+          "attrs": {
+            "patch_size": 16
+          }
+        }
+      }
+    ]
+  }
+}

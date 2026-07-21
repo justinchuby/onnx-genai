@@ -114,7 +114,11 @@ fn run_static(session: &Session, args: &Args) -> onnx_genai_ort::Result<()> {
     Ok(())
 }
 
-fn run_past_present(session: &Session, args: &Args, shared_buffer: bool) -> onnx_genai_ort::Result<()> {
+fn run_past_present(
+    session: &Session,
+    args: &Args,
+    shared_buffer: bool,
+) -> onnx_genai_ort::Result<()> {
     let options = if shared_buffer {
         DecodeSessionOptions {
             batch_size: 1,

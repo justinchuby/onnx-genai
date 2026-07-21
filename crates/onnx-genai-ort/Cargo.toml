@@ -41,6 +41,7 @@ libloading = { version = "0.8", optional = true }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"], optional = true }
 minijinja = { version = "2", features = ["json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+onnx-genai-genai-config = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }

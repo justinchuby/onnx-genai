@@ -588,45 +588,46 @@ impl Session {
         // files. Both steps can fail for a requested non-CPU provider, so keep
         // them together behind one closure that can be retried with CPU-only
         // options.
-        let create_session = |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
-            let session_options = RawSessionOptions::new(env, opts)?;
-            let mut ptr = std::ptr::null_mut();
-            match &model_bytes {
-                Some(bytes) => {
-                    let create = api
-                        .CreateSessionFromArray
-                        .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
-                    // SAFETY: `env` and `session_options` are valid ORT handles,
-                    // `bytes` outlives the call, and `ptr` is an out-param.
-                    crate::error::check_status(unsafe {
-                        create(
-                            env.as_ptr(),
-                            bytes.as_ptr() as *const std::ffi::c_void,
-                            bytes.len(),
-                            session_options.as_ptr(),
-                            &mut ptr,
-                        )
-                    })?;
+        let create_session =
+            |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
+                let session_options = RawSessionOptions::new(env, opts)?;
+                let mut ptr = std::ptr::null_mut();
+                match &model_bytes {
+                    Some(bytes) => {
+                        let create = api
+                            .CreateSessionFromArray
+                            .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+                        // SAFETY: `env` and `session_options` are valid ORT handles,
+                        // `bytes` outlives the call, and `ptr` is an out-param.
+                        crate::error::check_status(unsafe {
+                            create(
+                                env.as_ptr(),
+                                bytes.as_ptr() as *const std::ffi::c_void,
+                                bytes.len(),
+                                session_options.as_ptr(),
+                                &mut ptr,
+                            )
+                        })?;
+                    }
+                    None => {
+                        let create = api
+                            .CreateSession
+                            .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
+                        // SAFETY: `env` and `session_options` are valid ORT handles,
+                        // `path_c` is NUL-terminated for the call, and `ptr` is an
+                        // out-param.
+                        crate::error::check_status(unsafe {
+                            create(
+                                env.as_ptr(),
+                                path_c.as_ptr(),
+                                session_options.as_ptr(),
+                                &mut ptr,
+                            )
+                        })?;
+                    }
                 }
-                None => {
-                    let create = api
-                        .CreateSession
-                        .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
-                    // SAFETY: `env` and `session_options` are valid ORT handles,
-                    // `path_c` is NUL-terminated for the call, and `ptr` is an
-                    // out-param.
-                    crate::error::check_status(unsafe {
-                        create(
-                            env.as_ptr(),
-                            path_c.as_ptr(),
-                            session_options.as_ptr(),
-                            &mut ptr,
-                        )
-                    })?;
-                }
-            }
-            Ok(ptr)
-        };
+                Ok(ptr)
+            };
 
         // Auto-selected providers (e.g. the macOS MLX default) always fall back
         // to CPU; explicitly requested providers only fall back when they are

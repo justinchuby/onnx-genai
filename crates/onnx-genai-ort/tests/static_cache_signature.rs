@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use onnx_genai_ort::{DataType, Environment, Session, SessionOptions};
 
 fn tiny_scatter_llm() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
 }
 
 #[test]

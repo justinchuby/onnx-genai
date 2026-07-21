@@ -3,8 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use onnx_genai_genai_config::{
+    GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo, pipeline_inference_metadata_from_dir,
+};
 use onnx_genai_metadata::{
-    PipelineSpec, SpeculatorDescriptor, detect_speculator, load_pipeline_spec,
+    PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator, load_metadata,
+    load_pipeline_spec,
 };
 
 use crate::{Environment, OrtError, Result, Session, SessionOptions, Tokenizer};
@@ -85,6 +89,8 @@ pub struct PipelineModelDirectory {
     pub root: PathBuf,
     pub metadata_path: PathBuf,
     pub spec: PipelineSpec,
+    /// Typed preprocessing synthesized from compatibility config or loaded natively.
+    pub preprocessing: Option<PreprocessingSpec>,
     pub model_paths: BTreeMap<String, PathBuf>,
     pub tokenizer_paths: PipelineTokenizerPaths,
 }
@@ -100,9 +106,18 @@ impl PipelineModelDirectory {
             )));
         }
 
-        let metadata_path = resolve_metadata_path(root)?;
-        let spec = load_pipeline_spec(&metadata_path)
-            .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
+        let native_metadata_path = find_metadata_path(root);
+        let (metadata_path, spec, preprocessing) = if let Some(metadata_path) = native_metadata_path
+        {
+            let spec = load_pipeline_spec(&metadata_path)
+                .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
+            let preprocessing = load_metadata(&metadata_path)
+                .map_err(|err| OrtError::InvalidArgument(err.to_string()))?
+                .preprocessing;
+            (metadata_path, spec, preprocessing)
+        } else {
+            load_compatibility_pipeline(root)?
+        };
 
         let mut model_paths = BTreeMap::new();
         let mut per_component_tokenizers = BTreeMap::new();
@@ -129,6 +144,7 @@ impl PipelineModelDirectory {
             root: root.to_path_buf(),
             metadata_path,
             spec,
+            preprocessing,
             model_paths,
             tokenizer_paths,
         })
@@ -258,7 +274,7 @@ fn is_onnx_model_file(path: &Path) -> bool {
     }
 }
 
-fn resolve_metadata_path(root: &Path) -> Result<PathBuf> {
+fn find_metadata_path(root: &Path) -> Option<PathBuf> {
     [
         "inference_metadata.yaml",
         "inference_metadata.yml",
@@ -267,12 +283,161 @@ fn resolve_metadata_path(root: &Path) -> Result<PathBuf> {
     .iter()
     .map(|name| root.join(name))
     .find(|path| path.is_file())
-    .ok_or_else(|| {
+}
+
+fn load_compatibility_pipeline(
+    root: &Path,
+) -> Result<(PathBuf, PipelineSpec, Option<PreprocessingSpec>)> {
+    let genai_path = onnx_genai_genai_config::find_in_dir(root).ok_or_else(|| {
         OrtError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("pipeline metadata not found in {}", root.display()),
+            format!(
+                "pipeline metadata not found in {}; expected inference_metadata.{{yaml,yml,json}} \
+                 or a complete genai_config.json compatibility package",
+                root.display()
+            ),
         ))
+    })?;
+    let config = onnx_genai_genai_config::load(&genai_path)
+        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+    let vision =
+        config.model.vision.as_ref().ok_or_else(|| {
+            incomplete_compatibility_error(root, "model.vision in genai_config.json")
+        })?;
+    let embedding = config.model.embedding.as_ref().ok_or_else(|| {
+        incomplete_compatibility_error(root, "model.embedding in genai_config.json")
+    })?;
+    let vision_filename =
+        compatibility_filename(root, vision.filename.as_deref(), "model.vision.filename")?;
+    let embedding_filename = compatibility_filename(
+        root,
+        embedding.filename.as_deref(),
+        "model.embedding.filename",
+    )?;
+    let decoder_filename = compatibility_filename(
+        root,
+        config.model.decoder.filename.as_deref(),
+        "model.decoder.filename",
+    )?;
+    let graphs = PipelineGraphInfo {
+        vision: inspect_model_graph(&vision_filename, "vision")?,
+        embedding: inspect_model_graph(&embedding_filename, "embedding")?,
+        decoder: inspect_model_graph(&decoder_filename, "decoder")?,
+    };
+    let metadata = pipeline_inference_metadata_from_dir(root, &graphs)
+        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
+        .ok_or_else(|| {
+            incomplete_compatibility_error(
+                root,
+                "a multimodal genai_config.json with vision, embedding, and decoder components",
+            )
+        })?;
+    let preprocessing = metadata.preprocessing;
+    let spec = metadata
+        .pipeline
+        .ok_or_else(|| incomplete_compatibility_error(root, "the synthesized metadata pipeline"))?;
+    onnx_genai_metadata::validate_pipeline_spec(&spec)
+        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+    Ok((genai_path, spec, preprocessing))
+}
+
+fn compatibility_filename(root: &Path, value: Option<&str>, field: &str) -> Result<PathBuf> {
+    let filename = value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| incomplete_compatibility_error(root, field))?;
+    resolve_relative_file(root, filename, field)
+}
+
+fn incomplete_compatibility_error(root: &Path, missing: &str) -> OrtError {
+    OrtError::InvalidArgument(format!(
+        "cannot synthesize compatibility pipeline metadata for {}: missing required semantics: \
+         {missing}. Why: compatibility loading uses only explicit genai_config.json, config.json, \
+         processor-config, and ONNX graph facts; it never guesses from model.type or a model name. \
+         How to fix: regenerate the package with native inference_metadata.json (preferred), or \
+         export a complete compatibility package that declares the missing facts",
+        root.display()
+    ))
+}
+
+fn inspect_model_graph(path: &Path, component: &str) -> Result<ModelGraphInfo> {
+    let model = onnx_std::load_model(path).map_err(|error| {
+        OrtError::InvalidArgument(format!(
+            "failed to inspect {component} ONNX graph at {} while synthesizing compatibility \
+             pipeline metadata: {error}",
+            path.display()
+        ))
+    })?;
+    let graph = &model.graph;
+    let inputs = graph
+        .inputs
+        .iter()
+        .map(|id| graph_tensor_info(graph.value(*id), component, "input"))
+        .collect::<Result<Vec<_>>>()?;
+    let outputs = graph
+        .outputs
+        .iter()
+        .map(|id| graph_tensor_info(graph.value(*id), component, "output"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ModelGraphInfo { inputs, outputs })
+}
+
+fn graph_tensor_info(
+    value: &onnx_std::ir::Value,
+    component: &str,
+    direction: &str,
+) -> Result<GraphTensorInfo> {
+    let name = value.name.clone().ok_or_else(|| {
+        OrtError::InvalidArgument(format!(
+            "{component} ONNX graph has an unnamed {direction}; compatibility loading requires \
+             explicit graph-port names"
+        ))
+    })?;
+    let dimensions = value
+        .shape
+        .iter()
+        .map(|dimension| match dimension {
+            onnx_std::ir::Dim::Static(value) => Some(*value),
+            onnx_std::ir::Dim::Symbolic(_) => None,
+        })
+        .collect();
+    Ok(GraphTensorInfo {
+        name,
+        dtype: graph_dtype_name(value.dtype).to_owned(),
+        dimensions,
     })
+}
+
+fn graph_dtype_name(dtype: onnx_std::ir::DataType) -> &'static str {
+    use onnx_std::ir::DataType;
+    match dtype {
+        DataType::Undefined => "undefined",
+        DataType::Float32 => "float32",
+        DataType::Uint8 => "uint8",
+        DataType::Int8 => "int8",
+        DataType::Uint16 => "uint16",
+        DataType::Int16 => "int16",
+        DataType::Int32 => "int32",
+        DataType::Int64 => "int64",
+        DataType::String => "string",
+        DataType::Bool => "bool",
+        DataType::Float16 => "float16",
+        DataType::Float64 => "float64",
+        DataType::Uint32 => "uint32",
+        DataType::Uint64 => "uint64",
+        DataType::Complex64 => "complex64",
+        DataType::Complex128 => "complex128",
+        DataType::BFloat16 => "bfloat16",
+        DataType::Float8E4M3FN => "float8_e4m3fn",
+        DataType::Float8E4M3FNUZ => "float8_e4m3fnuz",
+        DataType::Float8E5M2 => "float8_e5m2",
+        DataType::Float8E5M2FNUZ => "float8_e5m2fnuz",
+        DataType::Uint4 => "uint4",
+        DataType::Int4 => "int4",
+        DataType::Float4E2M1 => "float4_e2m1",
+        DataType::Float8E8M0 => "float8_e8m0",
+        DataType::Uint2 => "uint2",
+        DataType::Int2 => "int2",
+    }
 }
 
 fn resolve_relative_file(root: &Path, relative: &str, description: &str) -> Result<PathBuf> {

@@ -27,10 +27,10 @@
 //! `genai_config.json`) is passed in by the caller, so this crate only depends
 //! on `serde`/`serde_json` and the metadata spec — never on `onnx-genai-ort`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use onnx_genai_metadata::{InferenceMetadata, SCHEMA_VERSION};
+use onnx_genai_metadata::{InferenceMetadata, SCHEMA_VERSION, capabilities};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -55,6 +55,20 @@ pub enum GenAiConfigError {
     /// The file was not valid JSON or did not match the expected shape.
     #[error("failed to parse genai_config.json: {0}")]
     Parse(#[from] serde_json::Error),
+    /// A compatibility package omitted semantics needed by the typed pipeline.
+    #[error(
+        "cannot synthesize compatibility pipeline metadata: missing required semantics: {missing}. \
+         Why: compatibility loading is allowed only when genai_config.json, config.json, \
+         processor config, and ONNX graph interfaces explicitly describe every pipeline, \
+         preprocessing, position, KV-cache, and fixed-state behavior; the loader never guesses \
+         from model.type or a model name. How to fix: regenerate the package with native \
+         inference_metadata.json (preferred), or export a complete compatibility package that \
+         declares the missing facts"
+    )]
+    IncompletePipeline {
+        /// Missing or inconsistent semantic facts.
+        missing: String,
+    },
 }
 
 /// Forward-compatible view of an onnxruntime-genai `genai_config.json`.
@@ -259,6 +273,12 @@ pub struct GenAiVision {
     #[serde(default)]
     pub filename: Option<String>,
     #[serde(default)]
+    pub config_filename: Option<String>,
+    #[serde(default)]
+    pub spatial_merge_size: Option<usize>,
+    #[serde(default)]
+    pub patch_size: Option<usize>,
+    #[serde(default)]
     pub inputs: VisionInputs,
     #[serde(default)]
     pub outputs: VisionOutputs,
@@ -278,6 +298,34 @@ pub struct VisionInputs {
 #[serde(default)]
 pub struct VisionOutputs {
     pub image_features: Option<String>,
+}
+
+/// One graph tensor declaration supplied by the package loader.
+///
+/// This inventory comes from the ONNX graph interface itself, so compatibility
+/// conversion can preserve actual sparse ports, ranks, and dtypes instead of
+/// expanding architecture-sized guesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphTensorInfo {
+    pub name: String,
+    pub dtype: String,
+    /// One entry per axis; `None` denotes a symbolic dimension.
+    pub dimensions: Vec<Option<usize>>,
+}
+
+/// Explicit input/output inventory for one ONNX component.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelGraphInfo {
+    pub inputs: Vec<GraphTensorInfo>,
+    pub outputs: Vec<GraphTensorInfo>,
+}
+
+/// ONNX graph inventories required to synthesize a strict multimodal pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelineGraphInfo {
+    pub vision: ModelGraphInfo,
+    pub embedding: ModelGraphInfo,
+    pub decoder: ModelGraphInfo,
 }
 
 /// The `model.speech` section (audio embedder).
@@ -321,7 +369,7 @@ pub struct GenAiSearch {
     /// Whether the runtime may own a single shared, max-length KV buffer that is
     /// aliased `present.* -> past_key_values.*` across decode steps.
     #[serde(default)]
-    pub past_present_share_buffer: bool,
+    pub past_present_share_buffer: Option<bool>,
     /// Maximum generated length declared by the model author.
     #[serde(default)]
     pub max_length: Option<usize>,
@@ -349,6 +397,54 @@ pub struct GenAiSearch {
     pub diversity_penalty: Option<f32>,
     #[serde(default)]
     pub early_stopping: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompatibilityConfig {
+    #[serde(default)]
+    text_config: Option<CompatibilityTextConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompatibilityTextConfig {
+    #[serde(default)]
+    rope_parameters: Option<CompatibilityRopeParameters>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompatibilityRopeParameters {
+    #[serde(default)]
+    mrope_section: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessorConfig {
+    processor: Processor,
+}
+
+#[derive(Debug, Deserialize)]
+struct Processor {
+    transforms: Vec<ProcessorTransform>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessorTransform {
+    operation: ProcessorOperation,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessorOperation {
+    #[serde(rename = "type")]
+    operation_type: String,
+    #[serde(default)]
+    attrs: Map<String, Value>,
+}
+
+struct DecoderStateMetadata {
+    kv_inputs: Vec<String>,
+    kv_outputs: Vec<String>,
+    state_pairs: Vec<Value>,
+    kv_dtype: String,
 }
 
 /// Coarse structural family a `genai_config.json` describes.
@@ -402,7 +498,7 @@ impl GenAiConfig {
 
     /// Whether this model advertises the runtime-owned shared KV buffer path.
     pub fn shared_kv_buffer_supported(&self) -> bool {
-        self.search.past_present_share_buffer
+        self.search.past_present_share_buffer == Some(true)
             && self.uses_group_query_attention_op()
             && self.max_sequence_length().is_some()
     }
@@ -445,7 +541,11 @@ impl GenAiConfig {
 
         let mut model = Map::new();
         model.insert("attention".into(), self.attention_json());
-        insert_usize(&mut model, "max_sequence_length", self.max_sequence_length());
+        insert_usize(
+            &mut model,
+            "max_sequence_length",
+            self.max_sequence_length(),
+        );
         insert_usize(&mut model, "vocab_size", self.model.vocab_size);
 
         if shape == ModelShape::SingleDecoder {
@@ -526,15 +626,13 @@ impl GenAiConfig {
         let layers = dec.num_hidden_layers;
         let mut io = Map::new();
 
-        // Token vs embeds input are mutually exclusive: an `inputs_embeds` port
-        // means the graph is embeds-driven; otherwise it is token-driven.
+        if let Some(token) = dec.inputs.input_ids.as_deref() {
+            io.insert("token_input".into(), json!(token));
+        }
         if let Some(embeds) = dec.inputs.inputs_embeds.as_deref() {
             io.insert("inputs_embeds_input".into(), json!(embeds));
-        } else {
-            io.insert(
-                "token_input".into(),
-                json!(dec.inputs.input_ids.as_deref().unwrap_or(DEFAULT_INPUT_IDS)),
-            );
+        } else if dec.inputs.input_ids.is_none() {
+            io.insert("token_input".into(), json!(DEFAULT_INPUT_IDS));
         }
         if let Some(mask) = dec.inputs.attention_mask.as_deref() {
             io.insert("attention_mask_input".into(), json!(mask));
@@ -612,38 +710,60 @@ impl GenAiConfig {
         if let Some(vision) = &self.model.vision {
             models.insert(
                 "vision_encoder".into(),
-                component_json(filename_or(&vision.filename, "vision.onnx"), "encoder", None),
+                component_json(
+                    filename_or(&vision.filename, "vision.onnx"),
+                    "encoder",
+                    None,
+                ),
             );
             phases.insert("vision_encoder".into(), run_on("prompt_only"));
             prompt_encoder.get_or_insert_with(|| "vision_encoder".into());
             if self.model.embedding.is_some() {
-                let from = vision.outputs.image_features.as_deref().unwrap_or("image_features");
+                let from = vision
+                    .outputs
+                    .image_features
+                    .as_deref()
+                    .unwrap_or("image_features");
                 let to = self
                     .model
                     .embedding
                     .as_ref()
                     .and_then(|e| e.inputs.image_features.as_deref())
                     .unwrap_or("image_features");
-                dataflow.push(edge(&format!("vision_encoder.{from}"), &format!("embedding.{to}")));
+                dataflow.push(edge(
+                    &format!("vision_encoder.{from}"),
+                    &format!("embedding.{to}"),
+                ));
             }
         }
 
         if let Some(speech) = &self.model.speech {
             models.insert(
                 "audio_encoder".into(),
-                component_json(filename_or(&speech.filename, "speech.onnx"), "encoder", None),
+                component_json(
+                    filename_or(&speech.filename, "speech.onnx"),
+                    "encoder",
+                    None,
+                ),
             );
             phases.insert("audio_encoder".into(), run_on("prompt_only"));
             prompt_encoder.get_or_insert_with(|| "audio_encoder".into());
             if self.model.embedding.is_some() {
-                let from = speech.outputs.audio_features.as_deref().unwrap_or("audio_features");
+                let from = speech
+                    .outputs
+                    .audio_features
+                    .as_deref()
+                    .unwrap_or("audio_features");
                 let to = self
                     .model
                     .embedding
                     .as_ref()
                     .and_then(|e| e.inputs.audio_features.as_deref())
                     .unwrap_or("audio_features");
-                dataflow.push(edge(&format!("audio_encoder.{from}"), &format!("embedding.{to}")));
+                dataflow.push(edge(
+                    &format!("audio_encoder.{from}"),
+                    &format!("embedding.{to}"),
+                ));
             }
         }
 
@@ -655,11 +775,19 @@ impl GenAiConfig {
             let io = (!io.is_empty()).then_some(Value::Object(io));
             models.insert(
                 "embedding".into(),
-                component_json(filename_or(&embedding.filename, "embedding.onnx"), "embedding", io),
+                component_json(
+                    filename_or(&embedding.filename, "embedding.onnx"),
+                    "embedding",
+                    io,
+                ),
             );
             phases.insert("embedding".into(), run_on("every_step"));
 
-            let from = embedding.outputs.inputs_embeds.as_deref().unwrap_or("inputs_embeds");
+            let from = embedding
+                .outputs
+                .inputs_embeds
+                .as_deref()
+                .unwrap_or("inputs_embeds");
             let to = self
                 .model
                 .decoder
@@ -674,7 +802,11 @@ impl GenAiConfig {
         let decoder_io = (!decoder_io.is_empty()).then_some(Value::Object(decoder_io));
         models.insert(
             "decoder".into(),
-            component_json(filename_or(&self.model.decoder.filename, "decoder.onnx"), "decoder", decoder_io),
+            component_json(
+                filename_or(&self.model.decoder.filename, "decoder.onnx"),
+                "decoder",
+                decoder_io,
+            ),
         );
         phases.insert("decoder".into(), run_on("every_step"));
 
@@ -709,7 +841,11 @@ impl GenAiConfig {
         let decoder_io = (!decoder_io.is_empty()).then_some(Value::Object(decoder_io));
         models.insert(
             "decoder".into(),
-            component_json(filename_or(&self.model.decoder.filename, "decoder.onnx"), "decoder", decoder_io),
+            component_json(
+                filename_or(&self.model.decoder.filename, "decoder.onnx"),
+                "decoder",
+                decoder_io,
+            ),
         );
 
         let enc_hidden = encoder
@@ -753,7 +889,11 @@ impl GenAiConfig {
                 let role = pipeline_stage_role(name);
                 models.insert(
                     name.clone(),
-                    component_json(filename_or(&spec.filename, &format!("{name}.onnx")), role, None),
+                    component_json(
+                        filename_or(&spec.filename, &format!("{name}.onnx")),
+                        role,
+                        None,
+                    ),
                 );
                 last_stage = Some(name.clone());
             }
@@ -797,7 +937,11 @@ impl GenAiConfig {
             m.insert("eos_token_id".into(), json!(eos.to_vec()));
         }
         insert_i64(&mut m, "sep_token_id", model.sep_token_id);
-        insert_i64(&mut m, "decoder_start_token_id", model.decoder_start_token_id);
+        insert_i64(
+            &mut m,
+            "decoder_start_token_id",
+            model.decoder_start_token_id,
+        );
         insert_i64(&mut m, "image_token_id", model.image_token_id);
         insert_i64(&mut m, "video_token_id", model.video_token_id);
         insert_i64(&mut m, "vision_start_token_id", model.vision_start_token_id);
@@ -831,7 +975,782 @@ pub fn inference_metadata_from_dir(
     Ok(Some(config.to_inference_metadata(kv_native_dtype)?))
 }
 
+/// Strict compatibility conversion for an existing multimodal ORT-GenAI package.
+///
+/// Unlike [`inference_metadata_from_dir`], this entry point never fills missing
+/// VLM semantics from conventions or layer counts. The JSON files provide the
+/// semantic contract while `graphs` provides the authoritative ONNX port list,
+/// rank, shape, and dtype facts.
+pub fn pipeline_inference_metadata_from_dir(
+    model_dir: &Path,
+    graphs: &PipelineGraphInfo,
+) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
+    let Some(path) = find_in_dir(model_dir) else {
+        return Ok(None);
+    };
+    let config = load(&path)?;
+    if config.shape() != ModelShape::Multimodal {
+        return Ok(None);
+    }
+    Ok(Some(config.to_strict_pipeline_metadata(model_dir, graphs)?))
+}
+
+impl GenAiConfig {
+    fn to_strict_pipeline_metadata(
+        &self,
+        model_dir: &Path,
+        graphs: &PipelineGraphInfo,
+    ) -> Result<InferenceMetadata, GenAiConfigError> {
+        let vision = required_ref(self.model.vision.as_ref(), "model.vision")?;
+        let embedding = required_ref(self.model.embedding.as_ref(), "model.embedding")?;
+        let vision_filename = required_str(vision.filename.as_deref(), "model.vision.filename")?;
+        let embedding_filename =
+            required_str(embedding.filename.as_deref(), "model.embedding.filename")?;
+        let decoder_filename = required_str(
+            self.model.decoder.filename.as_deref(),
+            "model.decoder.filename",
+        )?;
+        let processor_filename = required_str(
+            vision.config_filename.as_deref(),
+            "model.vision.config_filename",
+        )?;
+
+        let compatibility_config: CompatibilityConfig =
+            load_auxiliary_json(&model_dir.join("config.json"), "config.json")?;
+        let processor: ProcessorConfig = load_auxiliary_json(
+            &model_dir.join(processor_filename),
+            "processor config declared by model.vision.config_filename",
+        )?;
+
+        let vision_pixel = required_str(
+            vision.inputs.pixel_values.as_deref(),
+            "model.vision.inputs.pixel_values",
+        )?;
+        let vision_grid = required_str(
+            vision.inputs.image_grid_thw.as_deref(),
+            "model.vision.inputs.image_grid_thw",
+        )?;
+        let vision_features = required_str(
+            vision.outputs.image_features.as_deref(),
+            "model.vision.outputs.image_features",
+        )?;
+        let embedding_tokens = required_str(
+            embedding.inputs.input_ids.as_deref(),
+            "model.embedding.inputs.input_ids",
+        )?;
+        let embedding_image = required_str(
+            embedding.inputs.image_features.as_deref(),
+            "model.embedding.inputs.image_features",
+        )?;
+        let embedding_output = required_str(
+            embedding.outputs.inputs_embeds.as_deref(),
+            "model.embedding.outputs.inputs_embeds",
+        )?;
+        let decoder_embeds = required_str(
+            self.model.decoder.inputs.inputs_embeds.as_deref(),
+            "model.decoder.inputs.inputs_embeds",
+        )?;
+        let decoder_mask = required_str(
+            self.model.decoder.inputs.attention_mask.as_deref(),
+            "model.decoder.inputs.attention_mask",
+        )?;
+        let decoder_position = required_str(
+            self.model.decoder.inputs.position_ids.as_deref(),
+            "model.decoder.inputs.position_ids",
+        )?;
+        let decoder_logits = required_str(
+            self.model.decoder.outputs.logits.as_deref(),
+            "model.decoder.outputs.logits",
+        )?;
+        let image_token_id = required_copy(self.model.image_token_id, "model.image_token_id")?;
+        let past_present_share_buffer = required_copy(
+            self.search.past_present_share_buffer,
+            "search.past_present_share_buffer",
+        )?;
+        required_positive(vision.spatial_merge_size, "model.vision.spatial_merge_size")?;
+        required_positive(vision.patch_size, "model.vision.patch_size")?;
+
+        let vision_pixel_info = require_graph_input(&graphs.vision, vision_pixel, "vision")?;
+        let vision_grid_info = require_graph_input(&graphs.vision, vision_grid, "vision")?;
+        let vision_features_info = require_graph_output(&graphs.vision, vision_features, "vision")?;
+        require_graph_input(&graphs.embedding, embedding_tokens, "embedding")?;
+        let embedding_image_info =
+            require_graph_input(&graphs.embedding, embedding_image, "embedding")?;
+        let embedding_output_info =
+            require_graph_output(&graphs.embedding, embedding_output, "embedding")?;
+        let decoder_embeds_info = require_graph_input(&graphs.decoder, decoder_embeds, "decoder")?;
+        require_graph_input(&graphs.decoder, decoder_mask, "decoder")?;
+        let position_info = require_graph_input(&graphs.decoder, decoder_position, "decoder")?;
+        require_graph_output(&graphs.decoder, decoder_logits, "decoder")?;
+
+        require_same_dtype(
+            vision_features_info,
+            embedding_image_info,
+            "vision image-features dataflow",
+        )?;
+        require_same_dtype(
+            embedding_output_info,
+            decoder_embeds_info,
+            "embedding-to-decoder dataflow",
+        )?;
+
+        let sections = compatibility_config
+            .text_config
+            .and_then(|text| text.rope_parameters)
+            .and_then(|rope| rope.mrope_section);
+        if position_info.dimensions.len() != 3 {
+            return Err(incomplete(format!(
+                "decoder position input rank 3 required by the declared image_grid_thw processor summary (got rank {})",
+                position_info.dimensions.len()
+            )));
+        }
+        if sections.is_none() {
+            return Err(incomplete(
+                "config.json text_config.rope_parameters.mrope_section for the multi-axis position input",
+            ));
+        }
+        if let Some(sections) = &sections
+            && sections.len() != position_info.dimensions.len()
+        {
+            return Err(incomplete(format!(
+                "position section count ({}) does not match the ONNX position rank ({})",
+                sections.len(),
+                position_info.dimensions.len()
+            )));
+        }
+        if sections
+            .as_ref()
+            .is_some_and(|sections| sections.contains(&0))
+        {
+            return Err(incomplete(
+                "config.json text_config.rope_parameters.mrope_section entries must be greater than zero",
+            ));
+        }
+
+        let DecoderStateMetadata {
+            kv_inputs,
+            kv_outputs,
+            state_pairs,
+            kv_dtype,
+        } = self.strict_decoder_state(graphs)?;
+        let has_state_pairs = !state_pairs.is_empty();
+        let preprocessing =
+            processor_program_json(&processor, vision, vision_pixel_info, vision_grid_info)?;
+
+        let mut decoder_io = Map::new();
+        if let Some(token) = self.model.decoder.inputs.input_ids.as_deref() {
+            require_graph_input(&graphs.decoder, token, "decoder")?;
+            decoder_io.insert("token_input".into(), json!(token));
+        }
+        decoder_io.insert("inputs_embeds_input".into(), json!(decoder_embeds));
+        decoder_io.insert("attention_mask_input".into(), json!(decoder_mask));
+        decoder_io.insert("position_ids_input".into(), json!(decoder_position));
+        decoder_io.insert("logits_output".into(), json!(decoder_logits));
+        decoder_io.insert("kv_inputs".into(), json!(kv_inputs));
+        decoder_io.insert("kv_outputs".into(), json!(kv_outputs));
+        decoder_io.insert(
+            "kv_update".into(),
+            json!(if past_present_share_buffer {
+                "shared_buffer"
+            } else {
+                "append"
+            }),
+        );
+        if has_state_pairs {
+            decoder_io.insert("state_pairs".into(), Value::Array(state_pairs));
+        }
+
+        let mut embedding_io = Map::new();
+        embedding_io.insert("token_input".into(), json!(embedding_tokens));
+
+        let mut models = Map::new();
+        models.insert(
+            "vision_encoder".into(),
+            component_json(vision_filename.to_owned(), "vision_encoder", None),
+        );
+        models.insert(
+            "embedding".into(),
+            component_json(
+                embedding_filename.to_owned(),
+                "embedding",
+                Some(Value::Object(embedding_io)),
+            ),
+        );
+        models.insert(
+            "decoder".into(),
+            component_json(
+                decoder_filename.to_owned(),
+                "decoder",
+                Some(Value::Object(decoder_io)),
+            ),
+        );
+
+        let dataflow = vec![
+            edge_with_dtype(
+                &format!("vision_encoder.{vision_features}"),
+                &format!("embedding.{embedding_image}"),
+                &vision_features_info.dtype,
+            ),
+            edge_with_dtype(
+                &format!("embedding.{embedding_output}"),
+                &format!("decoder.{decoder_embeds}"),
+                &embedding_output_info.dtype,
+            ),
+        ];
+        let mut phases = Map::new();
+        phases.insert("vision_encoder".into(), run_on("prompt_only"));
+        phases.insert("embedding".into(), run_on("every_step"));
+        phases.insert("decoder".into(), run_on("every_step"));
+
+        let strategy = json!({
+            "kind": "composite",
+            "stages": [
+                {
+                    "name": "encode_vision",
+                    "run_on": "prompt_only",
+                    "strategy": { "kind": "single_pass", "model": "vision_encoder" }
+                },
+                {
+                    "name": "embed_tokens",
+                    "run_on": "every_step",
+                    "strategy": { "kind": "single_pass", "model": "embedding" }
+                },
+                {
+                    "name": "decode",
+                    "run_on": "every_step",
+                    "strategy": { "kind": "autoregressive", "decoder": "decoder" }
+                }
+            ]
+        });
+
+        let positions = json!({
+            "input": decoder_position,
+            "rank": position_info.dimensions.len(),
+            "axes": ["temporal", "height", "width"],
+            "sections": sections,
+            "dtype": position_info.dtype,
+            "continuation": "from_grid",
+            "processor_summaries": [vision_grid]
+        });
+
+        let mut pipeline = Map::new();
+        pipeline.insert("models".into(), Value::Object(models));
+        pipeline.insert("dataflow".into(), Value::Array(dataflow));
+        pipeline.insert("strategy".into(), strategy);
+        pipeline.insert("phases".into(), Value::Object(phases));
+        pipeline.insert(
+            "vision".into(),
+            json!({
+                "image_placeholder_token_id": image_token_id,
+                "image_token_id": image_token_id,
+                "token_count_source": "from_grid",
+                "placeholder_per_image": true
+            }),
+        );
+        pipeline.insert("positions".into(), positions);
+
+        let mut required_capabilities = vec![
+            capabilities::IMAGE_PREPROCESSING_PROGRAM,
+            capabilities::POSITION_PROGRAM,
+        ];
+        if preprocessing["image"]["outputs"]
+            .as_array()
+            .is_some_and(|outputs| outputs.len() > 1)
+        {
+            required_capabilities.push(capabilities::PACKED_IMAGE_OUTPUTS);
+        }
+        required_capabilities.push(capabilities::MULTI_AXIS_POSITIONS);
+        if has_state_pairs {
+            required_capabilities.push(capabilities::LOOP_CARRIED_STATE);
+        }
+
+        let mut model = Map::new();
+        model.insert("attention".into(), self.attention_json());
+        insert_usize(
+            &mut model,
+            "max_sequence_length",
+            self.max_sequence_length(),
+        );
+        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
+
+        let mut root = Map::new();
+        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+        root.insert("required_capabilities".into(), json!(required_capabilities));
+        root.insert("model".into(), Value::Object(model));
+        root.insert("preprocessing".into(), preprocessing);
+        root.insert("pipeline".into(), Value::Object(pipeline));
+        if let Some(generation) = self.generation_json() {
+            root.insert("generation".into(), generation);
+        }
+        if let Some(tokens) = self.tokens_json() {
+            root.insert("tokens".into(), tokens);
+        }
+        if past_present_share_buffer && is_share_buffer_kv_dtype(&kv_dtype) {
+            root.insert("kv_cache".into(), json!({ "native_dtype": kv_dtype }));
+        }
+
+        Ok(serde_json::from_value(Value::Object(root))?)
+    }
+
+    fn strict_decoder_state(
+        &self,
+        graphs: &PipelineGraphInfo,
+    ) -> Result<DecoderStateMetadata, GenAiConfigError> {
+        let decoder = &self.model.decoder;
+        let past_key = required_str(
+            decoder.inputs.past_key_names.as_deref(),
+            "model.decoder.inputs.past_key_names",
+        )?;
+        let past_value = required_str(
+            decoder.inputs.past_value_names.as_deref(),
+            "model.decoder.inputs.past_value_names",
+        )?;
+        let present_key = required_str(
+            decoder.outputs.present_key_names.as_deref(),
+            "model.decoder.outputs.present_key_names",
+        )?;
+        let present_value = required_str(
+            decoder.outputs.present_value_names.as_deref(),
+            "model.decoder.outputs.present_value_names",
+        )?;
+
+        let past_key_names = match_indexed_tensors(&graphs.decoder.inputs, past_key)?;
+        let past_value_names = match_indexed_tensors(&graphs.decoder.inputs, past_value)?;
+        let present_key_names = match_indexed_tensors(&graphs.decoder.outputs, present_key)?;
+        let present_value_names = match_indexed_tensors(&graphs.decoder.outputs, present_value)?;
+        let indices = exact_index_set(
+            &[
+                &past_key_names,
+                &past_value_names,
+                &present_key_names,
+                &present_value_names,
+            ],
+            "actual sparse key/value graph ports",
+        )?;
+        if indices.is_empty() {
+            return Err(incomplete(
+                "at least one actual decoder key/value graph-port pair",
+            ));
+        }
+
+        let mut kv_inputs = Vec::with_capacity(indices.len() * 2);
+        let mut kv_outputs = Vec::with_capacity(indices.len() * 2);
+        let mut kv_dtype = None;
+        for index in indices {
+            let past_key = past_key_names[&index];
+            let past_value = past_value_names[&index];
+            let present_key = present_key_names[&index];
+            let present_value = present_value_names[&index];
+            require_same_dtype(past_key, present_key, "key cache input/output")?;
+            require_same_dtype(past_value, present_value, "value cache input/output")?;
+            require_same_dtype(past_key, past_value, "key/value cache")?;
+            kv_dtype.get_or_insert_with(|| past_key.dtype.clone());
+            kv_inputs.extend([past_key.name.clone(), past_value.name.clone()]);
+            kv_outputs.extend([present_key.name.clone(), present_value.name.clone()]);
+        }
+
+        let past_prefix = common_pattern_prefix(past_key, past_value)?;
+        let present_prefix = common_pattern_prefix(present_key, present_value)?;
+        let kv_input_names = kv_inputs
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let kv_output_names = kv_outputs
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let state_inputs = suffix_tensor_map(
+            &graphs.decoder.inputs,
+            past_prefix,
+            &kv_input_names,
+            "fixed-state inputs",
+        )?;
+        let state_outputs = suffix_tensor_map(
+            &graphs.decoder.outputs,
+            present_prefix,
+            &kv_output_names,
+            "fixed-state outputs",
+        )?;
+        if state_inputs.keys().collect::<Vec<_>>() != state_outputs.keys().collect::<Vec<_>>() {
+            return Err(incomplete(format!(
+                "fixed-state input/output suffixes do not pair exactly (inputs: {:?}, outputs: {:?})",
+                state_inputs.keys().collect::<Vec<_>>(),
+                state_outputs.keys().collect::<Vec<_>>()
+            )));
+        }
+        let mut state_pairs = Vec::with_capacity(state_inputs.len());
+        for (suffix, input) in state_inputs {
+            let output = state_outputs[&suffix];
+            require_same_dtype(input, output, "fixed-state input/output")?;
+            if input.dimensions != output.dimensions {
+                return Err(incomplete(format!(
+                    "fixed-state pair '{}'/'{}' has different ONNX shapes",
+                    input.name, output.name
+                )));
+            }
+            state_pairs.push(json!({
+                "input": input.name,
+                "output": output.name,
+                "init": "zeros",
+                "update": "replace"
+            }));
+        }
+
+        Ok(DecoderStateMetadata {
+            kv_inputs,
+            kv_outputs,
+            state_pairs,
+            kv_dtype: kv_dtype.expect("non-empty KV indices establish a dtype"),
+        })
+    }
+}
+
 // ---- helpers -------------------------------------------------------------
+
+fn incomplete(missing: impl Into<String>) -> GenAiConfigError {
+    GenAiConfigError::IncompletePipeline {
+        missing: missing.into(),
+    }
+}
+
+fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, GenAiConfigError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| incomplete(field))
+}
+
+fn required_ref<'a, T>(value: Option<&'a T>, field: &str) -> Result<&'a T, GenAiConfigError> {
+    value.ok_or_else(|| incomplete(field))
+}
+
+fn required_copy<T: Copy>(value: Option<T>, field: &str) -> Result<T, GenAiConfigError> {
+    value.ok_or_else(|| incomplete(field))
+}
+
+fn required_positive(value: Option<usize>, field: &str) -> Result<usize, GenAiConfigError> {
+    value
+        .filter(|value| *value > 0)
+        .ok_or_else(|| incomplete(format!("{field} must be greater than zero")))
+}
+
+fn load_auxiliary_json<T>(path: &Path, description: &str) -> Result<T, GenAiConfigError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        incomplete(format!(
+            "{description} at {} could not be read: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&content).map_err(|error| {
+        incomplete(format!(
+            "{description} at {} is not valid for compatibility conversion: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn require_graph_input<'a>(
+    graph: &'a ModelGraphInfo,
+    name: &str,
+    component: &str,
+) -> Result<&'a GraphTensorInfo, GenAiConfigError> {
+    graph
+        .inputs
+        .iter()
+        .find(|tensor| tensor.name == name)
+        .ok_or_else(|| incomplete(format!("{component} ONNX input '{name}'")))
+}
+
+fn require_graph_output<'a>(
+    graph: &'a ModelGraphInfo,
+    name: &str,
+    component: &str,
+) -> Result<&'a GraphTensorInfo, GenAiConfigError> {
+    graph
+        .outputs
+        .iter()
+        .find(|tensor| tensor.name == name)
+        .ok_or_else(|| incomplete(format!("{component} ONNX output '{name}'")))
+}
+
+fn require_same_dtype(
+    left: &GraphTensorInfo,
+    right: &GraphTensorInfo,
+    description: &str,
+) -> Result<(), GenAiConfigError> {
+    if left.dtype == right.dtype {
+        Ok(())
+    } else {
+        Err(incomplete(format!(
+            "{description} dtype agreement: '{}' is {}, but '{}' is {}",
+            left.name, left.dtype, right.name, right.dtype
+        )))
+    }
+}
+
+fn processor_program_json(
+    processor: &ProcessorConfig,
+    vision: &GenAiVision,
+    pixel_info: &GraphTensorInfo,
+    grid_info: &GraphTensorInfo,
+) -> Result<Value, GenAiConfigError> {
+    let mut transforms = Vec::new();
+    let mut seen = BTreeSet::new();
+    for transform in &processor.processor.transforms {
+        let operation = &transform.operation;
+        match operation.operation_type.as_str() {
+            "DecodeImage" | "ConvertRGB" => {
+                if seen.insert("decode_rgb") {
+                    transforms.push(json!({ "op": "decode_rgb" }));
+                }
+            }
+            "Resize" => {
+                let width = required_attr_u32(&operation.attrs, "width", "Resize")?;
+                let height = required_attr_u32(&operation.attrs, "height", "Resize")?;
+                let mode = if operation
+                    .attrs
+                    .get("smart_resize")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|value| value != 0)
+                {
+                    "smart"
+                } else {
+                    "stretch"
+                };
+                transforms.push(json!({
+                    "op": "resize",
+                    "size": { "width": width, "height": height },
+                    "mode": mode
+                }));
+                seen.insert("resize");
+            }
+            "Rescale" => {
+                let scale = operation
+                    .attrs
+                    .get("rescale_factor")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| incomplete("processor Rescale.attrs.rescale_factor"))?;
+                transforms.push(json!({ "op": "rescale", "scale": scale }));
+                seen.insert("rescale");
+            }
+            "Normalize" => {
+                let mean = required_attr_f32_array(&operation.attrs, "mean", "Normalize")?;
+                let std = required_attr_f32_array(&operation.attrs, "std", "Normalize")?;
+                transforms.push(json!({ "op": "normalize", "mean": mean, "std": std }));
+                seen.insert("normalize");
+            }
+            "PatchImage" => {
+                let patch_size = required_attr_usize(&operation.attrs, "patch_size", "PatchImage")?;
+                required_attr_usize(&operation.attrs, "temporal_patch_size", "PatchImage")?;
+                let merge_size = required_attr_usize(&operation.attrs, "merge_size", "PatchImage")?;
+                if vision.patch_size != Some(patch_size) {
+                    return Err(incomplete(format!(
+                        "processor PatchImage patch_size ({patch_size}) must match model.vision.patch_size ({:?})",
+                        vision.patch_size
+                    )));
+                }
+                if vision.spatial_merge_size != Some(merge_size) {
+                    return Err(incomplete(format!(
+                        "processor PatchImage merge_size ({merge_size}) must match model.vision.spatial_merge_size ({:?})",
+                        vision.spatial_merge_size
+                    )));
+                }
+                transforms.push(json!({
+                    "op": "patchify",
+                    "patch_size": patch_size,
+                    "flatten": true
+                }));
+                seen.insert("patchify");
+            }
+            other => {
+                return Err(incomplete(format!(
+                    "processor operation '{other}' has no typed compatibility mapping"
+                )));
+            }
+        }
+    }
+    for required in ["decode_rgb", "resize", "rescale", "normalize", "patchify"] {
+        if !seen.contains(required) {
+            return Err(incomplete(format!(
+                "processor transform program operation '{required}'"
+            )));
+        }
+    }
+
+    let pixel_name = required_str(
+        vision.inputs.pixel_values.as_deref(),
+        "model.vision.inputs.pixel_values",
+    )?;
+    let grid_name = required_str(
+        vision.inputs.image_grid_thw.as_deref(),
+        "model.vision.inputs.image_grid_thw",
+    )?;
+    let outputs = vec![
+        json!({
+            "name": pixel_name,
+            "content": "pixels",
+            "dtype": pixel_info.dtype
+        }),
+        json!({
+            "name": grid_name,
+            "content": "grid_dimensions",
+            "dtype": grid_info.dtype
+        }),
+    ];
+    Ok(json!({
+        "image": {
+            "transforms": transforms,
+            "outputs": outputs
+        }
+    }))
+}
+
+fn required_attr_u32(
+    attrs: &Map<String, Value>,
+    name: &str,
+    operation: &str,
+) -> Result<u32, GenAiConfigError> {
+    let value = required_attr_usize(attrs, name, operation)?;
+    u32::try_from(value)
+        .map_err(|_| incomplete(format!("processor {operation}.attrs.{name} fits in u32")))
+}
+
+fn required_attr_usize(
+    attrs: &Map<String, Value>,
+    name: &str,
+    operation: &str,
+) -> Result<usize, GenAiConfigError> {
+    attrs
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| incomplete(format!("processor {operation}.attrs.{name}")))
+}
+
+fn required_attr_f32_array(
+    attrs: &Map<String, Value>,
+    name: &str,
+    operation: &str,
+) -> Result<Vec<f32>, GenAiConfigError> {
+    attrs
+        .get(name)
+        .and_then(Value::as_array)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(|value| value.as_f64().map(|value| value as f32))
+                .collect()
+        })
+        .ok_or_else(|| incomplete(format!("processor {operation}.attrs.{name}")))
+}
+
+fn split_indexed_pattern(pattern: &str) -> Result<(&str, &str), GenAiConfigError> {
+    let Some((prefix, suffix)) = pattern.split_once("%d") else {
+        return Err(incomplete(format!(
+            "indexed tensor pattern '{pattern}' must contain %d"
+        )));
+    };
+    if suffix.contains("%d") {
+        return Err(incomplete(format!(
+            "indexed tensor pattern '{pattern}' must contain exactly one %d"
+        )));
+    }
+    Ok((prefix, suffix))
+}
+
+fn match_indexed_tensors<'a>(
+    tensors: &'a [GraphTensorInfo],
+    pattern: &str,
+) -> Result<BTreeMap<usize, &'a GraphTensorInfo>, GenAiConfigError> {
+    let (prefix, suffix) = split_indexed_pattern(pattern)?;
+    let mut matched = BTreeMap::new();
+    for tensor in tensors {
+        let Some(index) = tensor
+            .name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        let index = index.parse::<usize>().map_err(|_| {
+            incomplete(format!(
+                "ONNX tensor '{}' matches pattern '{pattern}' but has a non-numeric index",
+                tensor.name
+            ))
+        })?;
+        if matched.insert(index, tensor).is_some() {
+            return Err(incomplete(format!(
+                "ONNX graph has duplicate tensors for pattern '{pattern}' index {index}"
+            )));
+        }
+    }
+    Ok(matched)
+}
+
+fn exact_index_set(
+    maps: &[&BTreeMap<usize, &GraphTensorInfo>],
+    description: &str,
+) -> Result<Vec<usize>, GenAiConfigError> {
+    let Some(first) = maps.first() else {
+        return Ok(Vec::new());
+    };
+    let expected = first.keys().copied().collect::<Vec<_>>();
+    if maps
+        .iter()
+        .skip(1)
+        .all(|map| map.keys().copied().eq(expected.iter().copied()))
+    {
+        Ok(expected)
+    } else {
+        Err(incomplete(format!(
+            "{description} do not have identical layer indices"
+        )))
+    }
+}
+
+fn common_pattern_prefix<'a>(first: &'a str, second: &'a str) -> Result<&'a str, GenAiConfigError> {
+    let (first_prefix, _) = split_indexed_pattern(first)?;
+    let (second_prefix, _) = split_indexed_pattern(second)?;
+    if first_prefix == second_prefix {
+        Ok(first_prefix)
+    } else {
+        Err(incomplete(format!(
+            "key/value patterns '{first}' and '{second}' must share the same state prefix"
+        )))
+    }
+}
+
+fn suffix_tensor_map<'a>(
+    tensors: &'a [GraphTensorInfo],
+    prefix: &str,
+    excluded: &BTreeSet<&str>,
+    description: &str,
+) -> Result<BTreeMap<String, &'a GraphTensorInfo>, GenAiConfigError> {
+    let mut matched = BTreeMap::new();
+    for tensor in tensors {
+        if excluded.contains(tensor.name.as_str()) {
+            continue;
+        }
+        let Some(suffix) = tensor.name.strip_prefix(prefix) else {
+            continue;
+        };
+        if suffix.is_empty() {
+            return Err(incomplete(format!(
+                "{description} contains an empty suffix for '{}'",
+                tensor.name
+            )));
+        }
+        if matched.insert(suffix.to_owned(), tensor).is_some() {
+            return Err(incomplete(format!(
+                "{description} contains duplicate suffix '{suffix}'"
+            )));
+        }
+    }
+    Ok(matched)
+}
 
 fn expand_pattern(pattern: &str, layers: usize) -> Vec<String> {
     (0..layers)
@@ -870,7 +1789,11 @@ fn expand_kv(
 
 /// Expand a cross-attention KV name pattern; requires both key and value to be
 /// declared (no default injection). Interleaves `[key_i, value_i]` per layer.
-fn expand_cross_kv(key: Option<&str>, value: Option<&str>, layers: Option<usize>) -> Option<Vec<String>> {
+fn expand_cross_kv(
+    key: Option<&str>,
+    value: Option<&str>,
+    layers: Option<usize>,
+) -> Option<Vec<String>> {
     let (key, value, layers) = (key?, value?, layers?);
     if layers == 0 {
         return None;
@@ -895,6 +1818,10 @@ fn component_json(filename: String, role: &str, io: Option<Value>) -> Value {
 
 fn edge(from: &str, to: &str) -> Value {
     json!({ "from": from, "to": to })
+}
+
+fn edge_with_dtype(from: &str, to: &str, dtype: &str) -> Value {
+    json!({ "from": from, "to": to, "dtype": dtype })
 }
 
 fn run_on(phase: &str) -> Value {
@@ -1038,7 +1965,7 @@ mod tests {
     #[test]
     fn omits_kv_cache_when_share_buffer_disabled() {
         let mut cfg = qwen_config();
-        cfg.search.past_present_share_buffer = false;
+        cfg.search.past_present_share_buffer = Some(false);
         let md = cfg.to_inference_metadata(Some("float16")).unwrap();
         assert!(md.kv_cache.is_none());
     }
@@ -1132,8 +2059,14 @@ mod tests {
         assert_eq!(
             io.kv_outputs.as_deref(),
             Some(
-                &["present_0", "present_1", "present_2", "present_3", "present_4"]
-                    .map(String::from)[..]
+                &[
+                    "present_0",
+                    "present_1",
+                    "present_2",
+                    "present_3",
+                    "present_4"
+                ]
+                .map(String::from)[..]
             )
         );
         // No inputs_embeds -> token-driven with the conventional default name.
@@ -1213,7 +2146,10 @@ mod tests {
             io.cross_kv_outputs.as_deref(),
             Some(&["present_key_cross_0", "present_value_cross_0"].map(String::from)[..])
         );
-        assert_eq!(io.encoder_hidden_states_input.as_deref(), Some("encoder_hidden_states"));
+        assert_eq!(
+            io.encoder_hidden_states_input.as_deref(),
+            Some("encoder_hidden_states")
+        );
 
         // Generation defaults come from `search`.
         let generation = md.generation.as_ref().expect("generation");
@@ -1267,7 +2203,10 @@ mod tests {
         assert_eq!(tokens.video_token_id, Some(151_656));
         assert_eq!(tokens.vision_start_token_id, Some(151_652));
         // eos as array normalizes to a vec.
-        assert_eq!(tokens.eos_token_id.as_deref(), Some(&[151_645, 151_643][..]));
+        assert_eq!(
+            tokens.eos_token_id.as_deref(),
+            Some(&[151_645, 151_643][..])
+        );
     }
 
     #[test]

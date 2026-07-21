@@ -170,8 +170,11 @@ impl<'a> SharedKvProposerSession<'a> {
         let seq_i64 = i64::try_from(seq_len)
             .map_err(|_| OrtError::InvalidArgument("seq_len exceeds i64".into()))?;
 
-        let embeds =
-            Value::from_f32_slice_as(inputs_embeds, &[self.batch_size, seq_i64, width as i64], self.signature.dtype)?;
+        let embeds = Value::from_f32_slice_as(
+            inputs_embeds,
+            &[self.batch_size, seq_i64, width as i64],
+            self.signature.dtype,
+        )?;
 
         // Build the shared-KV tensors, validating them against the graph specs.
         let mut kv_values = Vec::with_capacity(self.signature.shared_kv.len() * 2);
@@ -265,8 +268,7 @@ impl<'a> SharedKvProposerSession<'a> {
             if *name == self.logits_output {
                 logits = Some(last_row_f32(&value, self.signature.vocab_size)?);
             } else if *name == self.projected_state_output {
-                projected_state =
-                    Some(last_row_f32(&value, self.signature.backbone_hidden_size)?);
+                projected_state = Some(last_row_f32(&value, self.signature.backbone_hidden_size)?);
             }
         }
         Ok(SharedKvProposerStepOutput {

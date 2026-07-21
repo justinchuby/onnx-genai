@@ -1,0 +1,63 @@
+{
+  "processor": {
+    "name": "generic_explicit_processor",
+    "transforms": [
+      {
+        "operation": {
+          "name": "decode",
+          "type": "DecodeImage",
+          "attrs": {
+            "color_space": "RGB"
+          }
+        }
+      },
+      {
+        "operation": {
+          "name": "convert",
+          "type": "ConvertRGB"
+        }
+      },
+      {
+        "operation": {
+          "name": "resize",
+          "type": "Resize",
+          "attrs": {
+            "width": 960,
+            "height": 672,
+            "smart_resize": 1
+          }
+        }
+      },
+      {
+        "operation": {
+          "name": "rescale",
+          "type": "Rescale",
+          "attrs": {
+            "rescale_factor": 0.00392156862745098
+          }
+        }
+      },
+      {
+        "operation": {
+          "name": "normalize",
+          "type": "Normalize",
+          "attrs": {
+            "mean": [0.5, 0.5, 0.5],
+            "std": [0.5, 0.5, 0.5]
+          }
+        }
+      },
+      {
+        "operation": {
+          "name": "patch",
+          "type": "PatchImage",
+          "attrs": {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2
+          }
+        }
+      }
+    ]
+  }
+}
