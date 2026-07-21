@@ -162,6 +162,8 @@ jobs:
           publish_crate onnx-runtime-memory
           publish_crate onnx-runtime-tracer
           publish_crate onnx-runtime-ep-api
+          publish_crate mlas-sys
+          publish_crate onnx-runtime-quantization
           publish_crate onnx-runtime-ep-cpu
           publish_crate onnx-runtime-eager
           publish_crate onnx-runtime-ep-cuda
@@ -175,6 +177,7 @@ jobs:
           publish_crate onnx-genai-genai-config
           publish_crate onnx-genai-comfyui-config
           publish_crate onnx-genai-kv
+          publish_crate onnx-runtime-protocol-trace
           publish_crate onnx-genai-scheduler
           publish_crate onnx-genai-ort
           publish_crate onnx-genai-engine
