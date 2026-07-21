@@ -1324,7 +1324,7 @@ The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
 mechanism with a closed form. This path does not affect the single-AR-decoder TTS
 path or any other modality.
 
-**Real Qwen3-TTS export — build + validation + engine pre-embedder DONE; emitter WIP.**
+**Real Qwen3-TTS export — build + validation + engine pre-embedder + emitter DONE.**
 A real 1.7B Qwen3-TTS package (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) now **builds
 and runs end to end at the codec-token level** via Mobius (`examples/qwen3_tts.py`):
 the 3-model package (`embedding`, `talker`, `code_predictor`) produces valid multi-group
@@ -1357,19 +1357,22 @@ end *inside the onnx-genai engine*:
   `nested_autoregressive` strategy gained an **optional `pre_embedder` field**
   (backward compatible — absent ⇒ the legacy `input_ids`-driven outer loop). See the
   `pre_embedder` contract note below.
-- **Build path:** the 1.7B model builds only via the custom `examples/qwen3_tts.py`
-  pipeline (not the standard `mobius build` CLI), which does not currently call
-  `write_onnx_genai_config`. So `write_onnx_genai_config` deliberately **fails
-  loudly** on a `talker + code_predictor` package (`_looks_like_multi_decoder_tts`)
-  rather than emit speculative metadata.
+- **Build path:** the 1.7B model builds via the custom `examples/qwen3_tts.py`
+  pipeline (not the standard `mobius build` CLI). Calling `write_onnx_genai_config`
+  on the built package now **emits** the `pre_embedder`-driven contract when the
+  package carries `talker_step_embedder`; a `talker + code_predictor` package
+  *without* the pre-embedder still **fails loudly** (`_looks_like_multi_decoder_tts`
+  + `_has_tts_pre_embedder`) rather than emit speculative metadata.
 
 Completing real Qwen3-TTS is therefore a focused, monitored effort. The build +
-codec-token validation, the Mobius `talker_step_embedder` pre-embedding component, and
-the engine `pre_embedder`-driven outer loop are **done**; the remaining work is the
-Mobius `build_tts_pipeline_metadata` emitter (so the package self-describes this wiring)
-and, as a follow-up, threading the real trailing-text `text_embed` and prefill embeds
-(the engine currently feeds `text_embed` zeros and a zero frame-0 seed — see the
-`pre_embedder` note).
+codec-token validation, the Mobius `talker_step_embedder` pre-embedding component, the
+engine `pre_embedder`-driven outer loop, **and the Mobius
+`build_tts_pipeline_metadata` emitter are done** — the real 1.7B
+`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` package now self-describes the
+`pre_embedder`-driven `nested_autoregressive` contract and validates against the
+committed JSON schema. The remaining work is threading the real trailing-text
+`text_embed` and prefill embeds (the engine currently feeds `text_embed` zeros and a
+zero frame-0 seed — see the `pre_embedder` note) for bit-accurate real-package playback.
 
 ##### The `pre_embedder` extension to `nested_autoregressive`
 
