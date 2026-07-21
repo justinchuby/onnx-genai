@@ -211,10 +211,20 @@ fn scatter_elements(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
     require_one_of(
         input_dtypes,
         0,
-        &[DataType::Float32, DataType::Int64],
+        &[
+            DataType::Float16,
+            DataType::Float32,
+            DataType::BFloat16,
+            DataType::Int64,
+        ],
         "data",
     )?;
-    require_dtype(input_dtypes, 1, DataType::Int64, "indices")?;
+    require_one_of(
+        input_dtypes,
+        1,
+        &[DataType::Int32, DataType::Int64],
+        "indices",
+    )?;
     require_dtype(input_dtypes, 2, input_dtypes[0], "updates")?;
     match node.attr("reduction") {
         None => Ok(()),

@@ -734,6 +734,26 @@ impl CudaRuntime {
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
             .map_err(|e| driver_err("cuMemcpyDtoD", e))
     }
+
+    /// Enqueue a device → device copy on the EP stream.
+    ///
+    /// # Safety
+    /// Both pointers are live allocations of at least `bytes` bytes and remain
+    /// live until the stream has completed the copy.
+    pub unsafe fn dtod_async(
+        &self,
+        src: CUdeviceptr,
+        dst: CUdeviceptr,
+        bytes: usize,
+    ) -> Result<()> {
+        self.bind()?;
+        // SAFETY: bound context; both endpoints cover `bytes` and the runtime
+        // owns the stream on which the copy is ordered.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())
+        }
+        .map_err(|e| driver_err("cuMemcpyDtoDAsync", e))
+    }
 }
 
 impl Drop for CudaRuntime {

@@ -78,6 +78,7 @@ pub use kernels::group_query_attention::{
     GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GroupQueryAttentionBackend, GroupQueryAttentionKernel,
     gqa_capture_error_description,
 };
+pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
