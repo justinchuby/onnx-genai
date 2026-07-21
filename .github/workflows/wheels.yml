@@ -135,11 +135,9 @@ jobs:
             os: windows-latest
             archs: AMD64
             config_settings: "build-args=--features build-args=cuda"
-          # macos-15-intel is GitHub's final hosted Intel runner line.
-          - name: macOS x86_64
-            os: macos-15-intel
-            archs: x86_64
-            config_settings: ""
+          # macOS ships only Apple Silicon: ONNX Runtime 1.27 publishes no
+          # osx-x86_64 native archive (the ort-sys auto-download 404s), and MLX
+          # is Apple-Silicon only, so we build just the arm64 wheel.
           # macos-14 is the GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
             os: macos-14
