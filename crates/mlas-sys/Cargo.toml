@@ -1,13 +1,13 @@
 [package]
 name = "mlas-sys"
-version = "0.0.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
-publish = false
-description = "FEASIBILITY SPIKE: FFI bindings to a vendored subset of ONNX Runtime's MLAS f32 SGEMM. Not wired into the workspace."
+repository = "https://github.com/justinchuby/onnx-genai"
+description = "FFI bindings to a vendored subset of ONNX Runtime's MLAS SGEMM kernels (opt-in, x86-64 Linux)."
 
-# Intentionally NOT a workspace member (see docs/MLAS_SYS_SPIKE.md). Kept
-# isolated so the spike cannot affect the default build.
+# Kept out of `default-members` (see root Cargo.toml) so the opt-in vendored
+# C++/asm build cannot affect the default `cargo build`/`cargo test`.
 [lints]
 
 [dependencies]
