@@ -1,6 +1,6 @@
 //! Model directory resolution for Phase 1 runtime loading.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{
@@ -200,7 +200,7 @@ impl PipelineModels {
 
 fn resolve_model_path(root: &Path) -> Result<PathBuf> {
     // Prefer a conventionally named decoder, in either binary or textproto form.
-    for candidate in ["decoder.onnx.textproto", "decoder.onnx"] {
+    for candidate in ["decoder.onnx", "decoder.onnx.textproto"] {
         let path = root.join(candidate);
         if path.is_file() {
             return Ok(path);
@@ -212,6 +212,7 @@ fn resolve_model_path(root: &Path) -> Result<PathBuf> {
         .filter(|path| path.is_file() && is_onnx_model_file(path))
         .collect::<Vec<_>>();
     onnx_files.sort();
+    prefer_binary_onnx_twins(&mut onnx_files);
 
     match onnx_files.as_slice() {
         [only] => Ok(only.clone()),
@@ -225,6 +226,23 @@ fn resolve_model_path(root: &Path) -> Result<PathBuf> {
             many
         ))),
     }
+}
+
+fn prefer_binary_onnx_twins(paths: &mut Vec<PathBuf>) {
+    let binary_paths = paths
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("onnx"))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    paths.retain(|path| {
+        path.extension()
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("textproto"))
+            || !binary_paths.contains(&path.with_extension(""))
+    });
 }
 
 /// Whether `path` names an ONNX model file: a binary `*.onnx` or a git-friendly
@@ -277,5 +295,21 @@ fn resolve_relative_file(root: &Path, relative: &str, description: &str) -> Resu
             std::io::ErrorKind::NotFound,
             format!("{description} file not found: {}", path.display()),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_stem_binary_and_textproto_are_one_logical_model() {
+        let binary = PathBuf::from("/models/model.onnx");
+        let textproto = PathBuf::from("/models/model.onnx.textproto");
+        let mut paths = vec![binary.clone(), textproto];
+
+        prefer_binary_onnx_twins(&mut paths);
+
+        assert_eq!(paths, vec![binary]);
     }
 }
