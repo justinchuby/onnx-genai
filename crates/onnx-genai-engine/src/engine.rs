@@ -2435,20 +2435,7 @@ fn native_speculation_plan(
 }
 
 fn default_inference_metadata() -> InferenceMetadata {
-    InferenceMetadata {
-        required_capabilities: vec![],
-        schema_version: None,
-        model: None,
-        kv_cache: None,
-        quantization: None,
-        pipeline: None,
-        strategy: None,
-        speculative: None,
-        structured_output: None,
-        hardware_requirements: None,
-        generation: None,
-        tokens: None,
-    }
+    InferenceMetadata::default()
 }
 
 /// Optional cap (in tokens) on the runtime-owned fixed-capacity KV buffer,

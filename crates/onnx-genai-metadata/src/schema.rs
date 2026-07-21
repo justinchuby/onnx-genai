@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer};
 ///
 /// Every top-level section is optional for incremental adoption. Unknown fields
 /// are allowed and must be ignored by readers for forward compatibility.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[schemars(
     title = "ONNX Inference Metadata",
     description = "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
@@ -767,7 +767,7 @@ pub struct QuantizationOverride {
 }
 
 /// Multi-model pipeline represented as a directed acyclic dataflow graph.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PipelineSpec {
     /// Named model components in the pipeline DAG; at least one component is required.
     #[schemars(extend("minProperties" = 1))]
@@ -916,7 +916,7 @@ pub struct PipelineVisionConfig {
 }
 
 /// Declared, architecture-neutral input preprocessing programs.
-#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 pub struct PreprocessingSpec {
     /// Typed image preprocessing transform program and its named tensor outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1146,7 +1146,7 @@ impl<'de> Deserialize<'de> for PhaseRunOn {
 }
 
 /// Parameterized execution strategy for a pipeline or composite stage.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PipelineStrategy {
     /// Strategy family; determines which strategy-specific fields are meaningful.
     pub kind: PipelineStrategyKind,
@@ -1447,13 +1447,14 @@ pub struct SchedulerSpec {
 /// Pipeline execution strategy family.
 ///
 /// Known values are enumerated while future strings remain valid.
-#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(
     with = "String",
     transform = schema_helpers::pipeline_strategy_kind
 )]
 pub enum PipelineStrategyKind {
     /// Token-by-token autoregressive generation.
+    #[default]
     Autoregressive,
     /// Repeated denoising or another bounded iterative loop.
     Iterative,
