@@ -131,6 +131,7 @@ pub struct RuntimeConfig {
     /// `ONNX_GENAI_SHARED_KV_PRESENT_BINDING` (`bool`, default: false): opts unverified EPs into fixed-capacity present binding.
     pub shared_kv_present_binding: bool,
     /// `ONNX_GENAI_METAL_EP_LIB` (`PathBuf`, default: unset): points to the external Metal EP dynamic library.
+    /// Also accepts the alias `ONNX_GENAI_MLX_EP_LIBRARY` (set by the Python packages).
     pub metal_ep_lib: Option<PathBuf>,
     /// `ONNX_GENAI_EP_LIBRARY` (`PathBuf`, default: unset): points to a generic
     /// ORT execution-provider plugin shared library (e.g. the
@@ -245,6 +246,8 @@ impl RuntimeConfig {
                 false,
             ),
             metal_ep_lib: env_path(&lookup, "ONNX_GENAI_METAL_EP_LIB")
+                .filter(|path| !path.as_os_str().is_empty())
+                .or_else(|| env_path(&lookup, "ONNX_GENAI_MLX_EP_LIBRARY"))
                 .filter(|path| !path.as_os_str().is_empty()),
             ep_library: env_path(&lookup, "ONNX_GENAI_EP_LIBRARY")
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -720,5 +723,39 @@ mod tests {
         let empty = config(&[("ONNX_GENAI_METAL_EP_LIB", ""), ("ONNX_GENAI_TRACE", "")]);
         assert_eq!(empty.metal_ep_lib, None);
         assert_eq!(empty.trace, None);
+    }
+
+    #[test]
+    fn metal_ep_lib_accepts_the_mlx_library_alias() {
+        // The Python packages export ONNX_GENAI_MLX_EP_LIBRARY; it must feed the
+        // same metal_ep_lib slot as ONNX_GENAI_METAL_EP_LIB.
+        let alias = config(&[(
+            "ONNX_GENAI_MLX_EP_LIBRARY",
+            "/opt/lib/libonnxruntime_mlx.dylib",
+        )]);
+        assert_eq!(
+            alias.metal_ep_lib,
+            Some(PathBuf::from("/opt/lib/libonnxruntime_mlx.dylib"))
+        );
+
+        // The canonical variable wins when both are set.
+        let both = config(&[
+            ("ONNX_GENAI_METAL_EP_LIB", "/opt/lib/canonical.dylib"),
+            ("ONNX_GENAI_MLX_EP_LIBRARY", "/opt/lib/alias.dylib"),
+        ]);
+        assert_eq!(
+            both.metal_ep_lib,
+            Some(PathBuf::from("/opt/lib/canonical.dylib"))
+        );
+
+        // An empty canonical variable falls through to the alias.
+        let empty_canonical = config(&[
+            ("ONNX_GENAI_METAL_EP_LIB", ""),
+            ("ONNX_GENAI_MLX_EP_LIBRARY", "/opt/lib/alias.dylib"),
+        ]);
+        assert_eq!(
+            empty_canonical.metal_ep_lib,
+            Some(PathBuf::from("/opt/lib/alias.dylib"))
+        );
     }
 }

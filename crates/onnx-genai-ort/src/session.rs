@@ -335,6 +335,11 @@ pub struct SessionOptions {
     /// when a WebGPU execution provider is selected. Validation is a
     /// debug-oriented overhead layer; disabling it is safe for trusted graphs.
     pub webgpu_disable_validation: bool,
+    /// Whether the non-CPU execution provider was auto-selected for this platform
+    /// (e.g. the macOS MLX/Metal default) rather than explicitly requested. An
+    /// auto-selected provider must fall back to CPU on load failure, even if the
+    /// provider would otherwise be strict.
+    pub auto_selected: bool,
 }
 
 impl Default for SessionOptions {
@@ -342,9 +347,41 @@ impl Default for SessionOptions {
         let mut options = Self::cpu();
         if let Some(execution_providers) = execution_providers_from_env() {
             options.execution_providers = execution_providers;
+        } else if let Some(execution_providers) = auto_default_execution_providers() {
+            options.execution_providers = execution_providers;
+            options.auto_selected = true;
         }
         options.apply_provider_defaults();
         options
+    }
+}
+
+/// Execution providers to use by default when the user did not set
+/// `ONNX_GENAI_EP`.
+///
+/// On macOS, when the MLX/Metal execution-provider plugin library is available
+/// (its path is exposed through `ONNX_GENAI_METAL_EP_LIB` /
+/// `ONNX_GENAI_MLX_EP_LIBRARY`, which the Python packages set automatically),
+/// prefer it over plain CPU for speed on Apple Silicon. The selection is
+/// non-strict: if the plugin fails to load, session creation falls back to CPU.
+/// On every other platform, or when no MLX library is configured, this returns
+/// `None` (keep the CPU default).
+fn auto_default_execution_providers() -> Option<Vec<ResolvedEp>> {
+    #[cfg(target_os = "macos")]
+    {
+        let library = runtime_config().metal_ep_lib.clone()?;
+        if library.as_os_str().is_empty() || !library.is_file() {
+            return None;
+        }
+        tracing::info!(
+            "Auto-selecting the MLX/Metal execution provider (macOS default) from {}",
+            library.display()
+        );
+        return Some(vec![resolve_execution_provider(&ep_selection("metal"))]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -357,6 +394,7 @@ impl SessionOptions {
             inter_op_num_threads: 0,
             graph_capture: false,
             webgpu_disable_validation: false,
+            auto_selected: false,
         }
     }
 
@@ -515,7 +553,6 @@ impl Session {
             )));
         }
 
-        let session_options = RawSessionOptions::new(env, &options)?;
         #[cfg(windows)]
         let path_c: Vec<u16> = {
             use std::os::windows::ffi::OsStrExt;
@@ -527,44 +564,50 @@ impl Session {
         #[cfg(not(windows))]
         let path_c = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| OrtError::InvalidArgument("model path contains NUL".into()))?;
-        let mut ptr = std::ptr::null_mut();
         let api = crate::error::api()?;
         let create = api
             .CreateSession
             .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
-        // SAFETY: `env` and `session_options` are valid ORT handles, `path_c` is
-        // NUL-terminated for the duration of the call, and `ptr` is an out-param.
-        let create_result = crate::error::check_status(unsafe {
-            create(
-                env.as_ptr(),
-                path_c.as_ptr(),
-                session_options.as_ptr(),
-                &mut ptr,
-            )
-        });
-        let mut effective_providers = options.execution_providers.clone();
-        if let Err(err) = create_result {
-            if requested_non_cpu_provider(&options) && !requested_strict_provider(&options) {
+
+        // Build session options (which registers/appends execution providers)
+        // and create the session. Both steps can fail for a requested non-CPU
+        // provider, so keep them together behind one closure that can be retried
+        // with CPU-only options.
+        let create_session = |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
+            let session_options = RawSessionOptions::new(env, opts)?;
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: `env` and `session_options` are valid ORT handles, `path_c`
+            // is NUL-terminated for the duration of the call, and `ptr` is an
+            // out-param.
+            crate::error::check_status(unsafe {
+                create(
+                    env.as_ptr(),
+                    path_c.as_ptr(),
+                    session_options.as_ptr(),
+                    &mut ptr,
+                )
+            })?;
+            Ok(ptr)
+        };
+
+        // Auto-selected providers (e.g. the macOS MLX default) always fall back
+        // to CPU; explicitly requested providers only fall back when they are
+        // non-strict.
+        let allow_cpu_fallback = options.auto_selected
+            || (requested_non_cpu_provider(&options) && !requested_strict_provider(&options));
+
+        let (ptr, effective_providers) = match create_session(&options) {
+            Ok(ptr) => (ptr, options.execution_providers.clone()),
+            Err(err) if allow_cpu_fallback => {
                 tracing::warn!(
                     "ORT session creation failed with requested execution provider(s): {err}; retrying with CPU"
                 );
                 let cpu_options = SessionOptions::cpu();
-                let cpu_session_options = RawSessionOptions::new(env, &cpu_options)?;
-                ptr = std::ptr::null_mut();
-                // SAFETY: same invariants as above, with fresh CPU-only options.
-                crate::error::check_status(unsafe {
-                    create(
-                        env.as_ptr(),
-                        path_c.as_ptr(),
-                        cpu_session_options.as_ptr(),
-                        &mut ptr,
-                    )
-                })?;
-                effective_providers = cpu_options.execution_providers;
-            } else {
-                return Err(err);
+                let ptr = create_session(&cpu_options)?;
+                (ptr, cpu_options.execution_providers)
             }
-        }
+            Err(err) => return Err(err),
+        };
         let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
         let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
         let outputs = query_io(ptr.as_ptr(), IoKind::Output)?;
@@ -2166,6 +2209,14 @@ mod tests {
         let cpu = SessionOptions::cpu();
         assert!(!requested_non_cpu_provider(&cpu));
         assert!(!requested_strict_provider(&cpu));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn auto_default_providers_are_macos_only() {
+        // MLX/Metal auto-selection is gated to macOS; every other platform keeps
+        // the plain CPU default regardless of environment.
+        assert!(super::auto_default_execution_providers().is_none());
     }
 
     #[cfg(not(feature = "cuda"))]
