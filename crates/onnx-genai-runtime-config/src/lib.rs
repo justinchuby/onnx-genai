@@ -118,6 +118,9 @@ pub struct RuntimeConfig {
     pub webgpu_graph_capture: bool,
     /// `ONNX_GENAI_CUDA_GRAPH` (`bool`, default: false): enables CUDA graph capture.
     pub cuda_graph: bool,
+    /// `ONNX_GENAI_REQUIRE_CUDA` (`bool`, default: false): rejects a session when
+    /// CUDA cannot claim every executable node instead of falling back to CPU.
+    pub require_cuda: bool,
     /// Whether `ONNX_GENAI_CUDA_GRAPH` was explicitly set in the environment.
     ///
     /// Lets callers distinguish "unset" (so they may auto-enable CUDA graph
@@ -237,6 +240,7 @@ impl RuntimeConfig {
             webgpu_validation: env_bool(&lookup, "ONNX_GENAI_WEBGPU_VALIDATION", false),
             webgpu_graph_capture: env_bool(&lookup, "ONNX_GENAI_WEBGPU_GRAPH_CAPTURE", false),
             cuda_graph: env_bool(&lookup, "ONNX_GENAI_CUDA_GRAPH", false),
+            require_cuda: env_bool(&lookup, "ONNX_GENAI_REQUIRE_CUDA", false),
             cuda_graph_explicit: lookup("ONNX_GENAI_CUDA_GRAPH").is_some(),
             device_kv: env_bool(&lookup, "ONNX_GENAI_DEVICE_KV", false),
             shared_kv_present_binding: env_bool(
@@ -500,12 +504,14 @@ mod tests {
                 ("ONNX_GENAI_WEBGPU_VALIDATION", truthy),
                 ("ONNX_GENAI_WEBGPU_GRAPH_CAPTURE", truthy),
                 ("ONNX_GENAI_CUDA_GRAPH", truthy),
+                ("ONNX_GENAI_REQUIRE_CUDA", truthy),
                 ("ONNX_GENAI_DEVICE_KV", truthy),
                 ("ONNX_GENAI_SHARED_KV_PRESENT_BINDING", truthy),
             ]);
             assert!(actual.webgpu_validation);
             assert!(actual.webgpu_graph_capture);
             assert!(actual.cuda_graph);
+            assert!(actual.require_cuda);
             assert!(actual.device_kv);
             assert!(actual.shared_kv_present_binding);
         }

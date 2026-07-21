@@ -25,7 +25,7 @@ pub use epcontext::{
 pub use error::SessionError;
 pub use executor::{
     CacheStats, CaptureDecline, CaptureDeclineReport, ControlFlowStats, DeviceAllocationCounts,
-    DeviceGraphCaptureResult,
+    DeviceGraphCaptureResult, ExecutionProviderDecline, ExecutionProviderFallbackReport,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -149,9 +149,8 @@ mod error {
         ExecutionProviderUnavailable(String),
 
         #[error(
-            "CUDA-only session cannot fully serve this model ({unsupported_nodes}). \
-             Heterogeneous CPU+CUDA placement is required and not yet available; \
-             use native CPU or the ORT backend"
+            "CUDA execution required by ONNX_GENAI_REQUIRE_CUDA=1, but CPU fallback is needed: \
+             {unsupported_nodes}"
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
@@ -912,6 +911,12 @@ impl InferenceSession {
 
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
+    }
+
+    /// Report why an explicitly requested accelerator session was assigned to
+    /// CPU instead. `None` means the requested EP serves the whole graph.
+    pub fn execution_provider_fallback_report(&self) -> Option<&ExecutionProviderFallbackReport> {
+        self.exec.execution_provider_fallback_report()
     }
 
     /// Input metadata.

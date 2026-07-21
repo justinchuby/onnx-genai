@@ -2075,6 +2075,7 @@ version = "0.1.0-dev.2"
 name = "onnx-runtime-session"
 version = "0.1.0-dev.2"
 dependencies = [
+ "onnx-genai-runtime-config",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",

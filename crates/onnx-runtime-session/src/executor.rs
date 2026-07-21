@@ -43,7 +43,7 @@
 //! refuses to dispatch on failure. That check is the sole thing that makes
 //! ep-cpu's unchecked pointer derefs sound.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -214,6 +214,50 @@ impl CaptureDeclineReport {
     /// Whether the capture audit found no declines.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// One node-level reason the requested execution provider declined placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProviderDecline {
+    /// Stable graph/subgraph node identity used in diagnostics.
+    pub node: String,
+    /// Canonical ONNX domain (`"ai.onnx"` for the default domain).
+    pub domain: String,
+    /// ONNX operator type.
+    pub op_type: String,
+    /// Actionable reason returned by [`ExecutionProvider::supports_op`].
+    pub reason: String,
+}
+
+/// Structured report for an accelerator request that executes on CPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProviderFallbackReport {
+    /// Requested provider name, such as `"cuda_ep"`.
+    pub requested_provider: String,
+    /// Provider that will execute the graph.
+    pub fallback_provider: String,
+    /// Number of executable graph/subgraph nodes assigned to the fallback EP.
+    pub assigned_node_count: usize,
+    /// Sorted distinct `domain::op` classes assigned to the fallback EP.
+    pub assigned_ops: Vec<String>,
+    /// Nodes the requested provider did not claim, with colocated reasons.
+    pub declines: Vec<ExecutionProviderDecline>,
+}
+
+impl std::fmt::Display for ExecutionProviderFallbackReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} nodes assigned to CPU (ops: {}) — GPU EP {} did not claim {} node(s): {}. \
+             Heterogeneous CUDA+CPU placement is unavailable, so the whole session uses {}",
+            self.assigned_node_count,
+            self.assigned_ops.join(", "),
+            self.requested_provider,
+            self.declines.len(),
+            format_cuda_coverage_issues(&self.declines),
+            self.fallback_provider,
+        )
     }
 }
 
@@ -445,6 +489,7 @@ pub(crate) struct Executor {
     /// [`TensorView`] over the `Arc`'s bytes; it is materialized to owned bytes
     /// only at the graph-output/control-flow boundary. Cleared each run.
     seq_elem_values: HashMap<ValueId, SeqTensor>,
+    execution_provider_fallback_report: Option<ExecutionProviderFallbackReport>,
 }
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
@@ -926,37 +971,58 @@ fn run_ep_scoped_passes(
     Ok(())
 }
 
-fn validate_cuda_only_coverage(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+fn cuda_fallback_report(
+    graph: &Graph,
+    ep: &dyn ExecutionProvider,
+) -> Option<ExecutionProviderFallbackReport> {
     if ep.device_type() != DeviceType::Cuda {
-        return Ok(());
+        return None;
     }
 
     let mut issues = Vec::new();
     collect_cuda_coverage_issues(graph, graph, ep, "graph", &mut issues);
     if issues.is_empty() {
-        return Ok(());
+        return None;
     }
 
-    let unsupported_nodes = format_cuda_coverage_issues(issues);
-    Err(SessionError::HeterogeneousPlacementRequired { unsupported_nodes })
+    let mut assigned_ops = BTreeSet::new();
+    let assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);
+    Some(ExecutionProviderFallbackReport {
+        requested_provider: ep.name().to_string(),
+        fallback_provider: "cpu_ep".to_string(),
+        assigned_node_count,
+        assigned_ops: assigned_ops.into_iter().collect(),
+        declines: issues,
+    })
 }
 
-struct CudaCoverageIssue {
-    domain: String,
-    op_type: String,
-    reason: String,
-    node_identity: String,
+fn collect_executable_ops(graph: &Graph, ops: &mut BTreeSet<String>) -> usize {
+    let mut count = 0;
+    for (_, node) in graph.nodes.iter() {
+        if !onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
+            count += 1;
+            ops.insert(format!("{}::{}", canonical_domain(node), node.op_type));
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        count += collect_executable_ops(subgraph, ops);
+    }
+    count
 }
 
-fn format_cuda_coverage_issues(issues: Vec<CudaCoverageIssue>) -> String {
+fn format_cuda_coverage_issues(issues: &[ExecutionProviderDecline]) -> String {
     const MAX_EXAMPLES_PER_CLASS: usize = 3;
 
     let mut groups: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
     for issue in issues {
         groups
-            .entry((issue.domain, issue.op_type, issue.reason))
+            .entry((
+                issue.domain.clone(),
+                issue.op_type.clone(),
+                issue.reason.clone(),
+            ))
             .or_default()
-            .push(issue.node_identity);
+            .push(issue.node.clone());
     }
 
     groups
@@ -979,7 +1045,7 @@ fn collect_cuda_coverage_issues(
     opset_graph: &Graph,
     ep: &dyn ExecutionProvider,
     scope: &str,
-    issues: &mut Vec<CudaCoverageIssue>,
+    issues: &mut Vec<ExecutionProviderDecline>,
 ) {
     for (node_id, node) in graph.nodes.iter() {
         if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
@@ -1021,11 +1087,11 @@ fn collect_cuda_coverage_issues(
         if let KernelMatch::Unsupported { reason } =
             ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
         {
-            issues.push(CudaCoverageIssue {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
                 op_type: node.op_type.clone(),
                 reason: reason.into_owned(),
-                node_identity: format_node_identity(scope, node_id, node),
             });
             continue;
         }
@@ -1038,11 +1104,11 @@ fn collect_cuda_coverage_issues(
             continue;
         };
         if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
-            issues.push(CudaCoverageIssue {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
                 op_type: node.op_type.clone(),
                 reason: format!("kernel creation failed: {error}"),
-                node_identity: format_node_identity(scope, node_id, node),
             });
         }
     }
@@ -1128,15 +1194,46 @@ fn build_lazy_weight_handles(
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(
-        mut graph: Graph,
+        graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
     ) -> Result<Self> {
+        Self::build_with_cuda_requirement(
+            graph,
+            weights,
+            ep,
+            onnx_genai_runtime_config::runtime_config().require_cuda,
+        )
+    }
+
+    fn build_with_cuda_requirement(
+        mut graph: Graph,
+        weights: Arc<WeightStore>,
+        mut ep: Arc<dyn ExecutionProvider>,
+        require_cuda: bool,
+    ) -> Result<Self> {
         fuse_silu_patterns(&mut graph);
+        let graph_before_ep_passes = graph.clone();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
-        // Topological order up front: also validates the graph is a DAG.
+        let mut execution_provider_fallback_report = cuda_fallback_report(&graph, ep.as_ref());
+        if let Some(report) = &mut execution_provider_fallback_report {
+            if require_cuda {
+                return Err(SessionError::HeterogeneousPlacementRequired {
+                    unsupported_nodes: report.to_string(),
+                });
+            }
+            graph = graph_before_ep_passes;
+            ep = auto_detect_cpu_ep()?;
+            run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
+            let mut assigned_ops = BTreeSet::new();
+            report.assigned_node_count = collect_executable_ops(&graph, &mut assigned_ops);
+            report.assigned_ops = assigned_ops.into_iter().collect();
+            eprintln!(
+                "[onnx-genai-warning] {report}. Set ONNX_GENAI_REQUIRE_CUDA=1 to reject this fallback"
+            );
+        }
+        // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
-        validate_cuda_only_coverage(&graph, ep.as_ref())?;
         let weight_handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
 
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
@@ -1325,6 +1422,7 @@ impl Executor {
             shared_buffers: HashMap::new(),
             sequences: HashMap::new(),
             seq_elem_values: HashMap::new(),
+            execution_provider_fallback_report,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -1549,6 +1647,12 @@ impl Executor {
     /// context-cache model with compiled partitions spliced out.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub(crate) fn execution_provider_fallback_report(
+        &self,
+    ) -> Option<&ExecutionProviderFallbackReport> {
+        self.execution_provider_fallback_report.as_ref()
     }
 
     /// Live weight bytes backing the graph, needed alongside [`Self::graph`] so
@@ -5535,14 +5639,17 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
         );
         let report = || {
-            validate_cuda_only_coverage(&graph, &ep)
-                .unwrap_err()
+            cuda_fallback_report(&graph, &ep)
+                .expect("CUDA declines must produce a fallback report")
                 .to_string()
         };
         let first = report();
         let second = report();
 
         assert_eq!(first, second);
+        assert!(first.contains("13 nodes assigned to CPU"));
+        assert!(first.contains("GPU EP stock_test_ep did not claim 13 node(s)"));
+        assert!(first.contains("the whole session uses cpu_ep"));
         assert_eq!(first.matches("ai.onnx::RepeatedMissing:").count(), 1);
         assert!(first.contains("ai.onnx::RepeatedMissing: no handler"));
         assert!(first.contains("[count=4; examples: graph/node#0, graph/node#12, graph/node#2]"));
@@ -5570,6 +5677,62 @@ mod tests {
             );
         }
         assert!(!first.contains("more unsupported node"));
+    }
+
+    #[test]
+    fn cuda_decline_warns_and_falls_back_to_cpu_unless_strict() {
+        let graph = || {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(String::new(), 17);
+            let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Static(1)]);
+            let output =
+                graph.create_named_value("output", DataType::Float32, vec![Dim::Static(1)]);
+            graph.add_input(input);
+            graph.add_output(output);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Relu",
+                vec![Some(input)],
+                vec![output],
+            ));
+            graph
+        };
+        let cuda_ep = || {
+            Arc::new(WeightDeliveryEp::with_device(
+                false,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+                onnx_runtime_ir::DeviceId::cuda(0),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            )) as Arc<dyn ExecutionProvider>
+        };
+
+        let exec = Executor::build_with_cuda_requirement(
+            graph(),
+            Arc::new(WeightStore::new()),
+            cuda_ep(),
+            false,
+        )
+        .expect("default CUDA decline must use the CPU fallback");
+        assert_eq!(exec.device_id().device_type, DeviceType::Cpu);
+        let report = exec
+            .execution_provider_fallback_report()
+            .expect("fallback must remain observable");
+        assert_eq!(report.assigned_node_count, 1);
+        assert_eq!(report.assigned_ops, ["ai.onnx::Relu"]);
+        assert_eq!(report.declines.len(), 1);
+        assert_eq!(report.declines[0].op_type, "Relu");
+        assert!(report.declines[0].reason.contains("intentionally declines"));
+
+        let strict = Executor::build_with_cuda_requirement(
+            graph(),
+            Arc::new(WeightStore::new()),
+            cuda_ep(),
+            true,
+        )
+        .err()
+        .expect("strict CUDA must reject CPU fallback");
+        assert!(strict.to_string().contains("ONNX_GENAI_REQUIRE_CUDA=1"));
     }
 
     #[test]
