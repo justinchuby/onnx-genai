@@ -4,9 +4,18 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-21T13:15Z — native CUDA fp16 decode wave-4 reaches **~759 tok/s @256** and **~789 tok/s @1024** on H200 (0 fallbacks, coherent decode), about 15% ahead of ORT-genai's 657 tok/s reference at 256. CI tests and warning-gates all 27 pure-offline crates (1,921 tests) across Linux x86_64, Windows x86_64/ARM64, and macOS ARM64._
+_Last updated: 2026-07-22T05:00Z — VLM enablement (WP2 image processor, WP3/WP4 positions+fixed-state through the pipeline), ScatterElements (fp16/bf16/fp32/int64), DeepSeek DS-3 MLA (qk≠v) conformance, generic fp16 GQA empty-present K/V, and the Leon KV logical-shape fix all merged to main. Gemma4-E2B now places AND executes all 1,299 nodes on CUDA; warm native decode diagnosed at **10.76 tok/s** with a single dominant bottleneck (auxiliary graph output unbound → CUDA-graph capture rejected → 291 alloc/free per token), fix in flight._
 
-**Current `origin/main` implementation HEAD:** `102fee9`.
+**Current `origin/main` implementation HEAD:** `9032253`.
+
+## 2026-07-22 — VLM enablement + DeepSeek MLA + Gemma4 native placement + warm-decode diagnosis
+
+- **Gemma4-E2B warm native-CUDA decode diagnosed ✅ (`22e66c0` harness, merged `9032253`):** the cold-probe 0.32 tok/s was first-run compile/probe overhead; **warm steady-state is 10.76 tok/s median** on shared H200. Strict CUDA placement passes (no CPU fallback), device KV works (zero KV H2D/D2H), NVRTC does not recompile per step. The single dominant cost is **291 `cuMemAlloc` + 291 `cuMemFree` per token (~69% of wall time)** because CUDA-graph capture is rejected: the auxiliary `projected_state` graph output has no persistent device binding, and the capture precondition requires **every** graph output to be device-bound. Nsight's 5.22 ms/token useful-kernel sum implies a ~192 tok/s ceiling once capture works. Generic fix (bind every declared graph output by contract, never by model name; estimated **100–180 tok/s**) in flight. (Sebastian diagnose; measurement harness `profile_native` warm-window mode merged.)
+- **Leon KV logical-shape fix ✅ (`4de2ee2`):** the session executor now exposes the **logical** KV sequence length (not physical buffer capacity) to kernel bindings, unblocking native standard-Attention prefill. Logical-geometry is threaded through `tensor.rs`; capacity-bounded aliased outputs and the GQA inputs-3/4 exception are preserved. (Leon build → Gaff 🟢 opus, DeepSeek tokens exact-match.)
+- **Generic fp16 GroupQueryAttention empty-present K/V + shared past cache ✅ (`33f4de9`):** decode zero-append path with shared past cache, no model-specific assumptions. (Pris 🟡, merged.)
+- **DeepSeek DS-3 MLA conformance ✅ (`794c527`):** tests cover `qk_head_dim != v_head_dim` — present-K uses QK width, present-V uses V width — for both prefill and decode parity. (Gaff 🟡, merged.)
+- **VLM WP2/WP3/WP4 ✅ (`5c48ba5`, `a1cab6b`):** native image processor (bit-exact, 36 tests) plus multimodal positions and fixed-state pairs threaded through the PipelineEngine public path. WP5 (server multimodal bundle + admission ordering) and WP6 (genai_config compat loader) in flight.
+- **ScatterElements ✅ (`5b01a01`):** fp16/bf16/fp32/int64 data × int32/int64 indices, SM-portable serial reduction.
 
 ## 2026-07-21 — Native CUDA fp16 decode wave-4 (759 @256 / 789 @1024)
 
