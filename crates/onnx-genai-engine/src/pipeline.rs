@@ -1,8 +1,8 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, clone_value, extract_next_token_logits, is_present_output, is_token_input_name,
-    run_decode_step_with_extra,
+    DecodeState, clone_value, extract_next_token_logits_with_io, is_present_output,
+    is_token_input_name, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -199,7 +199,16 @@ impl PipelineEngine {
                 })?;
                 let _kv_model =
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
-                (Some(DecodeState::new(decoder)?), ar.decoder.clone())
+                let decoder_io = models
+                    .directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                (
+                    Some(DecodeState::new_with_io(decoder, decoder_io)?),
+                    ar.decoder.clone(),
+                )
             }
             // A nested-AR (multi-decoder TTS) pipeline drives its own outer/inner
             // decode loops with per-loop `DecodeState`s built inside the driver,
@@ -1863,7 +1872,11 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             past_len,
             &extras,
         )?;
-        extract_next_token_logits(self.decoder, outputs)
+        extract_next_token_logits_with_io(
+            self.decoder,
+            outputs,
+            self.decoder_state.io.logits_output.as_deref(),
+        )
     }
 
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
@@ -4349,6 +4362,7 @@ mod tests {
             role: role.to_string(),
             device_preference: None,
             tokenizer: None,
+            io: None,
         }
     }
 

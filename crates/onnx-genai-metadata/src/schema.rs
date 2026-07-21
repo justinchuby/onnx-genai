@@ -308,6 +308,69 @@ pub struct ModelCapabilities {
 
     /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
+
+    /// Explicit graph I/O port bindings for the single-decoder LLM path.
+    ///
+    /// When present, the runtime binds decode-step inputs and outputs from the
+    /// declared names instead of inferring them from tensor-name conventions.
+    /// When absent, the runtime falls back to the historical name conventions
+    /// (a temporary, transitional behavior).
+    #[serde(default)]
+    pub io: Option<ModelIoSpec>,
+}
+
+/// Explicit binding of the graph ports the decode step reads and writes.
+///
+/// Every field is optional so a model package can declare only the ports its
+/// graph exposes. Any port left unset falls back to the runtime's historical
+/// tensor-name convention (a temporary, transitional behavior removed once all
+/// emitters populate this block). Declaring an `io` block lets a graph use
+/// arbitrary tensor names — the runtime never infers a port by name or dtype
+/// for a declared port.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct ModelIoSpec {
+    /// Token-id input (e.g. `input_ids`). Mutually exclusive with
+    /// `inputs_embeds_input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub token_input: Option<String>,
+
+    /// Pre-embedded input (e.g. `inputs_embeds`) for embeds-driven decoders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub inputs_embeds_input: Option<String>,
+
+    /// Attention-mask input, if the graph takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub attention_mask_input: Option<String>,
+
+    /// Position-ids input, if the graph takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub position_ids_input: Option<String>,
+
+    /// Logits output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub logits_output: Option<String>,
+
+    /// Per-token hidden-state output for embedding / VLM hidden extraction, if
+    /// the graph exposes a distinct hidden output (e.g. `last_hidden_state`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub hidden_output: Option<String>,
+
+    /// Past-KV cache inputs, in the SAME order as `kv_outputs` (positional
+    /// pairing). Length must match `kv_outputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub kv_inputs: Option<Vec<String>>,
+
+    /// Present-KV cache outputs, paired positionally with `kv_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub kv_outputs: Option<Vec<String>>,
 }
 
 /// Build-time attention architecture and dimensions.
@@ -555,6 +618,15 @@ pub struct PipelineComponentSpec {
     /// If absent, loaders may use a shared top-level `tokenizer.json`.
     #[schemars(length(min = 1), example = &"tokenizer.json")]
     pub tokenizer: Option<String>,
+
+    /// Explicit graph I/O port bindings for this pipeline component.
+    ///
+    /// When present, the runtime binds decode-step ports from the declared
+    /// names instead of inferring them from tensor-name conventions. When
+    /// absent, the runtime falls back to the historical name conventions (a
+    /// temporary, transitional behavior).
+    #[serde(default)]
+    pub io: Option<ModelIoSpec>,
 }
 
 /// Directed connection between two pipeline component ports.

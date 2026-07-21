@@ -751,6 +751,17 @@
             }
           ]
         },
+        "io": {
+          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nWhen present, the runtime binds decode-step inputs and outputs from the\ndeclared names instead of inferring them from tensor-name conventions.\nWhen absent, the runtime falls back to the historical name conventions\n(a temporary, transitional behavior).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
           "type": [
@@ -781,6 +792,82 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "ModelIoSpec": {
+      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. Any port left unset falls back to the runtime's historical\ntensor-name convention (a temporary, transitional behavior removed once all\nemitters populate this block). Declaring an `io` block lets a graph use\narbitrary tensor names — the runtime never infers a port by name or dtype\nfor a declared port.",
+      "type": "object",
+      "properties": {
+        "attention_mask_input": {
+          "description": "Attention-mask input, if the graph takes one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "hidden_output": {
+          "description": "Per-token hidden-state output for embedding / VLM hidden extraction, if\nthe graph exposes a distinct hidden output (e.g. `last_hidden_state`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "inputs_embeds_input": {
+          "description": "Pre-embedded input (e.g. `inputs_embeds`) for embeds-driven decoders.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "kv_inputs": {
+          "description": "Past-KV cache inputs, in the SAME order as `kv_outputs` (positional\npairing). Length must match `kv_outputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "kv_outputs": {
+          "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "logits_output": {
+          "description": "Logits output.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "position_ids_input": {
+          "description": "Position-ids input, if the graph takes one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "token_input": {
+          "description": "Token-id input (e.g. `input_ids`). Mutually exclusive with\n`inputs_embeds_input`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
         }
       }
     },
@@ -931,6 +1018,17 @@
             "decoder.onnx"
           ],
           "minLength": 1
+        },
+        "io": {
+          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nWhen present, the runtime binds decode-step ports from the declared\nnames instead of inferring them from tensor-name conventions. When\nabsent, the runtime falls back to the historical name conventions (a\ntemporary, transitional behavior).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tokenizer": {
           "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",

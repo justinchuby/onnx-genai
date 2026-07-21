@@ -7,7 +7,7 @@
 use crate::TokenId;
 use crate::config::{MtpCacheScope, MtpHiddenLayout};
 use crate::decode::{
-    apply_paged_sliding_window, extract_logits_sequence, next_session_token_logits,
+    apply_paged_sliding_window, extract_logits_sequence_with_io, next_session_token_logits,
     next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
     propose_draft_tokens, run_decode_session_logits, run_decode_step,
 };
@@ -1428,11 +1428,12 @@ impl Engine {
                         state.decode_state.sink_tokens(),
                     )?;
                 }
-                extract_logits_sequence(
+                extract_logits_sequence_with_io(
                     self.session
                         .as_deref()
                         .expect("ORT backend must own a decoder session"),
                     outputs,
+                    state.decode_state.io.logits_output.as_deref(),
                 )?
             };
 

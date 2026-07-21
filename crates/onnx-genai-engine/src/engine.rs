@@ -1514,13 +1514,16 @@ impl Engine {
             .session
             .as_deref()
             .context("ORT decoder session is unavailable")?;
+        // Bind ports from an explicit `model.io` block when the package declares
+        // one; otherwise DecodeState falls back to tensor-name conventions.
+        let io = self.metadata.model.as_ref().and_then(|model| model.io.as_ref());
         if matches!(
             &self.speculative_mode,
             SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
         ) {
-            DecodeState::new(session)
+            DecodeState::new_with_io(session, io)
         } else {
-            DecodeState::new_for_path(session, &self.decode_path)
+            DecodeState::new_for_path_with_io(session, &self.decode_path, io)
         }
     }
 

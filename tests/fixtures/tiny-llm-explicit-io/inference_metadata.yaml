@@ -1,0 +1,17 @@
+# Explicit-io regression fixture: same graph as tiny-llm, but every decode-step
+# port is renamed to a NON-conventional name. The runtime can only bind these
+# ports from the `model.io` block below, proving the engine never infers a port
+# by tensor name. See ModelIoSpec in crates/onnx-genai-metadata/src/schema.rs.
+model:
+  max_sequence_length: 16
+  io:
+    token_input: tokens
+    attention_mask_input: attn_mask_port
+    position_ids_input: pos_port
+    logits_output: out_logits
+    kv_inputs:
+      - cache_k_in.0
+      - cache_v_in.0
+    kv_outputs:
+      - cache_k_out.0
+      - cache_v_out.0
