@@ -1045,6 +1045,37 @@ impl Engine {
         }
         options.max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+
+        // Speculation ON (implemented greedy prompt-lookup) → the native
+        // speculative driver. Every other request stays on the untouched plain
+        // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+        if let Some(plan) = native_speculation_plan(&options, &chain) {
+            let mut stats = SpeculativeStats::default();
+            let native_session = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            let mut driver = crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
+                native_session,
+                plan.ngram,
+                plan.max_tokens,
+                plan.width,
+            )?;
+            let result = augment_backend_error(
+                driver.generate(
+                    &prompt_tokens,
+                    &options,
+                    &chain,
+                    &self.tokenizer,
+                    &mut stats,
+                    callback,
+                ),
+                EngineDecodeBackend::Native,
+            );
+            self.last_speculative_stats = stats;
+            return result;
+        }
+
         let native_session = self
             .native_session
             .as_mut()
@@ -2338,25 +2369,69 @@ fn model_proto_requires_native_backend(model: &onnx_runtime_loader::proto::Model
 
 #[cfg(feature = "native-backend")]
 fn reject_native_request_speculation(options: &GenerateOptions) -> anyhow::Result<()> {
-    let requested_mode = match options.speculative_mode.as_ref() {
-        None | Some(SpeculativeMode::None) => None,
+    // Prompt-lookup is now implemented on the native path (WP2); only the
+    // not-yet-ported proposer families are rejected.
+    let unsupported = match options.speculative_mode.as_ref() {
+        None | Some(SpeculativeMode::None) | Some(SpeculativeMode::PromptLookup { .. }) => None,
         Some(SpeculativeMode::DraftModel) => Some("draft-model"),
-        Some(SpeculativeMode::PromptLookup { .. }) => Some("prompt-lookup"),
         Some(SpeculativeMode::Mtp(_)) => Some("MTP"),
         Some(SpeculativeMode::Eagle3(_)) => Some("EAGLE-3"),
         Some(SpeculativeMode::SharedKv(_)) => Some("shared-KV"),
     };
-    if let Some(mode) = requested_mode {
+    if let Some(mode) = unsupported {
         anyhow::bail!(
-            "native decoder backend does not support per-request {mode} speculative decoding"
+            "native decoder backend does not yet support per-request {mode} speculative decoding (only prompt-lookup is implemented)"
         );
     }
-    if options.num_speculative_tokens.is_some() {
+    // `num_speculative_tokens` only has meaning alongside an implemented native
+    // speculative mode; reject it when no such mode selects native speculation.
+    if options.num_speculative_tokens.is_some()
+        && !matches!(
+            options.speculative_mode.as_ref(),
+            Some(SpeculativeMode::PromptLookup { .. })
+        )
+    {
         anyhow::bail!(
-            "native decoder backend does not support the per-request num_speculative_tokens option"
+            "native decoder backend does not support the per-request num_speculative_tokens option without a prompt-lookup speculative_mode"
         );
     }
     Ok(())
+}
+
+/// Prompt-lookup speculation parameters resolved for a native request.
+#[cfg(feature = "native-backend")]
+struct NativeSpeculationPlan {
+    ngram: usize,
+    max_tokens: usize,
+    width: usize,
+}
+
+/// Decide whether a native request should run through the speculative driver.
+///
+/// Returns `Some` only for an implemented, greedy prompt-lookup request with no
+/// processor chain and no logprobs — the exact regime in which host-argmax
+/// acceptance reproduces plain greedy selection. Every other request (including
+/// non-greedy, processor-chain, logprobs, or the default `None` mode) returns
+/// `None` and stays on the untouched plain fast path.
+#[cfg(feature = "native-backend")]
+fn native_speculation_plan(
+    options: &GenerateOptions,
+    chain: &crate::logits::ProcessorChain,
+) -> Option<NativeSpeculationPlan> {
+    let (ngram, max_tokens) = match options.speculative_mode.as_ref()? {
+        SpeculativeMode::PromptLookup { ngram, max_tokens } => (*ngram, *max_tokens),
+        _ => return None,
+    };
+    let greedy = options.greedy || options.temperature == 0.0;
+    if !greedy || !chain.is_empty() || options.top_logprobs.is_some() {
+        return None;
+    }
+    let width = options.num_speculative_tokens.unwrap_or(max_tokens).max(1);
+    Some(NativeSpeculationPlan {
+        ngram,
+        max_tokens,
+        width,
+    })
 }
 
 fn default_inference_metadata() -> InferenceMetadata {

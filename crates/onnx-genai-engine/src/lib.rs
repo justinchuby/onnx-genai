@@ -19,6 +19,8 @@ pub(crate) mod kv_bridge;
 pub mod logits;
 #[cfg(feature = "native-backend")]
 pub mod native_decode;
+#[cfg(feature = "native-backend")]
+pub(crate) mod native_speculative;
 pub mod pipeline;
 pub(crate) mod processors;
 pub mod sampling;

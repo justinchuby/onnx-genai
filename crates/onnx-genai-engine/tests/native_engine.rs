@@ -38,7 +38,8 @@ fn engine_generates_through_explicit_native_backend() -> anyhow::Result<()> {
 }
 
 #[test]
-fn native_backend_rejects_request_level_speculation() -> anyhow::Result<()> {
+fn native_backend_rejects_unimplemented_speculation_but_allows_prompt_lookup() -> anyhow::Result<()>
+{
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
     let mut engine = Engine::from_dir(
@@ -48,21 +49,34 @@ fn native_backend_rejects_request_level_speculation() -> anyhow::Result<()> {
             ..EngineConfig::default()
         },
     )?;
+
+    // Prompt-lookup is implemented on the native path (WP2): it must NOT be
+    // rejected, and it must produce the same greedy stream as the plain path.
     let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+    request.options.max_new_tokens = 3;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
     request.options.speculative_mode = Some(SpeculativeMode::PromptLookup {
         ngram: 2,
         max_tokens: 2,
     });
+    let result = engine.generate(request)?;
+    assert_eq!(result.token_ids, vec![1, 1, 1]);
 
+    // Draft-model speculation is not yet ported to native and must be rejected.
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+    request.options.speculative_mode = Some(SpeculativeMode::DraftModel);
     let error = engine
         .generate(request)
-        .expect_err("native backend must reject request-level speculation");
+        .expect_err("native backend must reject draft-model speculation");
     assert!(
         error
             .to_string()
-            .contains("does not support per-request prompt-lookup speculative decoding")
+            .contains("does not yet support per-request draft-model speculative decoding"),
+        "unexpected error: {error}"
     );
 
+    // A bare speculative width without a native speculative mode is meaningless.
     let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
     request.options.num_speculative_tokens = Some(2);
     let error = engine
@@ -71,7 +85,8 @@ fn native_backend_rejects_request_level_speculation() -> anyhow::Result<()> {
     assert!(
         error
             .to_string()
-            .contains("does not support the per-request num_speculative_tokens option")
+            .contains("does not support the per-request num_speculative_tokens option"),
+        "unexpected error: {error}"
     );
     Ok(())
 }
