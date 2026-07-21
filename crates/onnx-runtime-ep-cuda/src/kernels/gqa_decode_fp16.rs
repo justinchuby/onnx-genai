@@ -2,28 +2,26 @@
 //!
 //! This is the fp16 sibling of [`super::gqa_decode`]. Where the f32 kernel
 //! assigns **one warp per query row** (only ~4 CTAs/layer for Qwen's 14 heads),
-//! this kernel matches ORT GenAI's decode geometry: **one multi-warp CTA per
-//! query head** (≈14 CTAs/layer), with the warps of a CTA cooperatively
-//! **split-K**-reducing across the sequence via an online (running max/sum)
-//! flash softmax. Q/K/V and the output are `__half`; every softmax statistic and
-//! the value accumulator are kept in **fp32** for numerical stability (the
-//! standard flash pattern). K/V are read with **vectorized `half2` loads**.
+//! this kernel launches up to eight multi-warp CTAs per query head. Each CTA
+//! owns a contiguous KV slice and writes a partial online-softmax state; a
+//! second kernel merges those states in fixed split order. Q/K/V and the output
+//! are `__half`; every softmax statistic and value accumulator stays in fp32.
 //!
 //! Model shape this targets (Qwen2.5-0.5B): 14 Q heads / 2 KV heads
 //! (`group_size = 7`), `head_dim = 64`, `Sq = 1`.
 //!
 //! ## Reduction strategy
 //!
-//! For a CTA that owns query head `h`:
-//!   * warp `w` walks key positions `local_start + w, +warps, +2*warps, …` to the
-//!     device-resident causal limit, maintaining its own running `(max, sum, acc)`
-//!     over that strided subset (a partial flash softmax);
+//! For a CTA that owns query head `h` and sequence split `s`:
+//!   * warp `w` walks key positions `split_start + w, +warps, +2*warps, …` to the
+//!     end of split `s`, maintaining its own running `(max, sum, acc)`;
 //!   * within a warp, the `QK` dot is spread across the 32 lanes over `head_dim`
 //!     and finished with a `__shfl_xor_sync` butterfly (every lane owns `acc` for
 //!     its `head2` slots);
-//!   * warps then publish `(max, sum, acc)` to dynamic shared memory and warp 0
-//!     performs the flash **merge** across warps — rescaling each warp's partial
-//!     by `exp(max_w - M)` — and writes the fp16 output.
+//!   * warp 0 merges the CTA's warp states and writes one partial state to
+//!     module-global scratch;
+//!   * the merge kernel combines splits with the standard flash rescale and
+//!     writes the normalized fp16 output.
 //!
 //! ## RoPE
 //!
@@ -36,15 +34,13 @@
 //! The launch path is legal to record inside a CUDA graph and to replay with
 //! only device-buffer contents changing:
 //!   * No `stream.synchronize()` or any device sync on the launch path.
-//!   * No per-call `cudaMalloc`/`cudaFree`. The only scratch is **dynamic shared
-//!     memory** whose size is derived from the shape signature (`head_dim`,
-//!     `WARPS_PER_BLOCK`), never allocated in global memory per call.
-//!   * Fixed launch geometry: grid `= batch * query_heads * query_seq` and block
-//!     `= WARPS_PER_BLOCK * 32` are sized purely from the (fixed-for-decode)
-//!     shape signature, never from the runtime valid sequence length. The kernel
-//!     loops to the device-resident valid length read from `total_lengths` — the
-//!     same tensor the reference kernel reads — so replays observe the updated
-//!     length with no relaunch or resize.
+//!   * No per-call `cudaMalloc`/`cudaFree`. Cross-CTA scratch is a fixed
+//!     module-global allocation created when NVRTC loads the module, before
+//!     capture; per-CTA scratch is dynamic shared memory.
+//!   * Fixed launch geometry uses the maximum split count. The device-resident
+//!     valid length selects 1/2/4/8 active splits, so replay observes updated
+//!     lengths without a host round trip or graph update. Inactive split CTAs
+//!     return before loading Q/K/V.
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -53,8 +49,9 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f16_v1";
+const MODULE_KEY: &str = "gqa_decode_attention_f16_v2";
 const ENTRY: &str = "gqa_decode_attention_f16";
+const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
 /// `ceil(head_dim / 2 / 32)` `half2` slots (2 dims each) in registers, capped at
@@ -66,6 +63,7 @@ pub(super) const MAX_HEAD_DIM: usize = 128;
 /// the flash merge cheap (a 4-way reduction in shared memory).
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
+const MAX_SPLITS: usize = 8;
 
 /// Whether the fp16 flash-decode kernel handles this shape. Single query token
 /// (`Sq=1`) with an **even** `head_dim` within [`MAX_HEAD_DIM`] (the `half2`
@@ -79,6 +77,23 @@ const DECODE_SRC: &str = r#"
 
 #define GQA_WARP_SIZE 32
 #define GQA_MAX_H2PL 2   // half2 slots per lane; head_dim <= 2 * 2 * 32 == 128
+#define GQA_MAX_HEAD_SIZE 128
+#define GQA_MAX_SPLITS 8
+#define GQA_MAX_SCRATCH_ROWS 256
+#define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
+
+// Module globals are allocated when the NVRTC module is loaded, before graph
+// capture. All GQA layers share the same stream and therefore reuse this
+// scratch sequentially. Shapes above the row cap retain the old one-CTA path.
+__device__ __align__(16) float gqa_split_scratch[
+    GQA_MAX_SCRATCH_ROWS * GQA_MAX_SPLITS * GQA_SCRATCH_STRIDE];
+
+__device__ __forceinline__ int gqa_active_splits(const int sequence_length) {
+    if (sequence_length <= 64) return 1;
+    if (sequence_length <= 128) return 2;
+    if (sequence_length <= 256) return 4;
+    return GQA_MAX_SPLITS;
+}
 
 extern "C" __global__ void gqa_decode_attention_f16(
     const __half* __restrict__ query,
@@ -108,8 +123,10 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const int lane = threadIdx.x % GQA_WARP_SIZE;
     const int warp_in_block = threadIdx.x / GQA_WARP_SIZE;
 
-    // One CTA per (batch, query_head, query_pos) row. Fixed grid == shape.
-    const int row = blockIdx.x;
+    // Fixed maximum split grid. The current device length determines how many
+    // splits do real work; inactive CTAs return before touching Q/K/V.
+    const int row = blockIdx.x / GQA_MAX_SPLITS;
+    const int split = blockIdx.x % GQA_MAX_SPLITS;
     const int rows = batch * query_heads * query_seq;
     if (row >= rows) return;
 
@@ -124,6 +141,14 @@ extern "C" __global__ void gqa_decode_attention_f16(
         (local_window > 0 && causal_limit + 1 > local_window)
             ? causal_limit + 1 - local_window
             : 0;
+    const int sequence_length = max(0, causal_limit + 1 - local_start);
+    const int active_splits =
+        (row < GQA_MAX_SCRATCH_ROWS) ? gqa_active_splits(sequence_length) : 1;
+    if (split >= active_splits) return;
+    const int keys_per_split =
+        (sequence_length + active_splits - 1) / active_splits;
+    const int split_start = local_start + split * keys_per_split;
+    const int split_end = min(causal_limit + 1, split_start + keys_per_split);
 
     const long q_base =
         ((long)(batch_index * query_heads + query_head) * query_seq + query_pos)
@@ -147,8 +172,9 @@ extern "C" __global__ void gqa_decode_attention_f16(
     float running_max = negative_infinity;
     float running_sum = 0.0f;
 
-    // Split-K: each warp strides through a disjoint subset of key positions.
-    for (int key_pos = local_start + warp_in_block; key_pos <= causal_limit;
+    // Intra-CTA split-K: each warp strides through a disjoint subset of this
+    // CTA's contiguous sequence slice.
+    for (int key_pos = split_start + warp_in_block; key_pos < split_end;
          key_pos += warps_per_block) {
         const long kv_off = kv_plane + (long)key_pos * (long)head_size;
         const half2* k2 = reinterpret_cast<const half2*>(key + kv_off);
@@ -201,7 +227,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
     }
     __syncthreads();
 
-    // Warp 0 merges all warps' partials (flash combine) and writes fp16 output.
+    // Warp 0 merges the CTA's warp partials in fixed order.
     if (warp_in_block != 0) {
         return;
     }
@@ -213,9 +239,20 @@ extern "C" __global__ void gqa_decode_attention_f16(
     for (int w = 0; w < warps_per_block; ++w) {
         denom += warp_sum[w] * expf(warp_max[w] - global_max);
     }
-    const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-
+    // Rows beyond the bounded module scratch retain the original one-CTA
+    // implementation, preserving the supported() contract for unusual shapes.
+    const bool direct_output = row >= GQA_MAX_SCRATCH_ROWS;
     half2* out2 = reinterpret_cast<half2*>(output + q_base);
+    float* split_state = direct_output
+        ? nullptr
+        : gqa_split_scratch
+            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+    if (lane == 0 && !direct_output) {
+        split_state[0] = global_max;
+        split_state[1] = denom;
+    }
+    const float inverse_sum =
+        (direct_output && denom > 0.0f) ? (1.0f / denom) : 0.0f;
 #pragma unroll
     for (int i = 0; i < GQA_MAX_H2PL; ++i) {
         const int j = lane + i * GQA_WARP_SIZE;
@@ -226,6 +263,71 @@ extern "C" __global__ void gqa_decode_attention_f16(
                 const float weight = expf(warp_max[w] - global_max);
                 ox += warp_acc[w * head_size + 2 * j] * weight;
                 oy += warp_acc[w * head_size + 2 * j + 1] * weight;
+            }
+            if (direct_output) {
+                out2[j] = __floats2half2_rn(ox * inverse_sum, oy * inverse_sum);
+            } else {
+                split_state[2 + 2 * j] = ox;
+                split_state[2 + 2 * j + 1] = oy;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void gqa_decode_attention_f16_merge(
+    __half* __restrict__ output,
+    const int* __restrict__ total_lengths,
+    const int batch,
+    const int query_heads,
+    const int query_seq,
+    const int head_size,
+    const int local_window)
+{
+    const int row = blockIdx.x;
+    const int rows = batch * query_heads * query_seq;
+    if (row >= rows || row >= GQA_MAX_SCRATCH_ROWS) return;
+
+    const int lane = threadIdx.x;
+    const int query_pos = row % query_seq;
+    const int batch_index = row / (query_heads * query_seq);
+    const int total = total_lengths[batch_index];
+    const int causal_limit = total - query_seq + query_pos;
+    const int local_start =
+        (local_window > 0 && causal_limit + 1 > local_window)
+            ? causal_limit + 1 - local_window
+            : 0;
+    const int sequence_length = max(0, causal_limit + 1 - local_start);
+    const int active_splits = gqa_active_splits(sequence_length);
+
+    float global_max = __int_as_float(0xff800000);
+    for (int split = 0; split < active_splits; ++split) {
+        const float* state = gqa_split_scratch
+            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        global_max = fmaxf(global_max, state[0]);
+    }
+    float denom = 0.0f;
+    for (int split = 0; split < active_splits; ++split) {
+        const float* state = gqa_split_scratch
+            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        denom += state[1] * expf(state[0] - global_max);
+    }
+    const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+
+    const int h2 = head_size >> 1;
+    const long q_base = (long)row * (long)head_size;
+    half2* out2 = reinterpret_cast<half2*>(output + q_base);
+#pragma unroll
+    for (int i = 0; i < GQA_MAX_H2PL; ++i) {
+        const int j = lane + i * GQA_WARP_SIZE;
+        if (j < h2) {
+            float ox = 0.0f;
+            float oy = 0.0f;
+            for (int split = 0; split < active_splits; ++split) {
+                const float* state = gqa_split_scratch
+                    + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+                const float weight = expf(state[0] - global_max);
+                ox += state[2 + 2 * j] * weight;
+                oy += state[2 + 2 * j + 1] * weight;
             }
             out2[j] = __floats2half2_rn(ox * inverse_sum, oy * inverse_sum);
         }
@@ -282,7 +384,15 @@ pub(super) fn run(
         .ok_or_else(|| {
             EpError::KernelFailed("cuda_ep GQA fp16 decode: row count overflow".into())
         })?;
-    let grid_x = u32::try_from(rows.max(1)).map_err(|_| {
+    let partial_blocks = rows.checked_mul(MAX_SPLITS).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep GQA fp16 decode: split grid overflow".into())
+    })?;
+    let grid_x = u32::try_from(partial_blocks.max(1)).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "cuda_ep GQA fp16 decode: {partial_blocks} split blocks exceed CUDA grid.x"
+        ))
+    })?;
+    let merge_grid_x = u32::try_from(rows.max(1)).map_err(|_| {
         EpError::KernelFailed(format!(
             "cuda_ep GQA fp16 decode: {rows} rows exceed CUDA grid.x"
         ))
@@ -321,9 +431,9 @@ pub(super) fn run(
         .arg(&softcap);
     // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
     // caller (present K/V span `cache_capacity` rows, query/output span
-    // `query_seq` tokens). The only scratch is fixed-size dynamic shared memory
-    // and the kernel never syncs, so the launch is legal to record into and
-    // replay from a CUDA graph.
+    // `query_seq` tokens). Scratch is fixed module-global plus dynamic shared
+    // memory, and the kernel never device-syncs, so the launch is legal to record
+    // into and replay from a CUDA graph.
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (grid_x, 1, 1),
@@ -332,6 +442,28 @@ pub(super) fn run(
         })
     }
     .map_err(|error| driver_err("launch GQA fp16 flash-decode attention", error))?;
+
+    let merge_function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, MERGE_ENTRY)?;
+    let mut merge_builder = runtime.stream().launch_builder(&merge_function);
+    merge_builder
+        .arg(&output)
+        .arg(&total_lengths)
+        .arg(&batch_i)
+        .arg(&heads_i)
+        .arg(&query_seq_i)
+        .arg(&dim_i)
+        .arg(&local_window);
+    // SAFETY: the partial launch immediately above writes every active split
+    // state consumed by this same-stream merge launch. Module-global scratch is
+    // persistent for the loaded module and both launches are graph-recordable.
+    unsafe {
+        merge_builder.launch(LaunchConfig {
+            grid_dim: (merge_grid_x, 1, 1),
+            block_dim: (WARP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map_err(|error| driver_err("launch GQA fp16 split-K merge", error))?;
     Ok(())
 }
 
@@ -437,7 +569,7 @@ mod tests {
         let num_heads = 14usize;
         let num_kv_heads = 2usize;
         let head_dim = 64usize;
-        let cache_capacity = 256usize;
+        let cache_capacity = 1024usize;
         let group = num_heads / num_kv_heads;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -493,7 +625,8 @@ mod tests {
         let mut worst_abs = 0.0f32;
         let mut worst_rel = 0.0f32;
         let mut all_finite = true;
-        for total in [1usize, 7, 64, 200, 255] {
+        let allocations_before = runtime.allocation_counts();
+        for total in [1usize, 64, 65, 128, 129, 256, 257, 1023] {
             let totals = [total as i32];
             // SAFETY: `totals_dev` holds `batch` i32 values.
             unsafe {
@@ -527,6 +660,36 @@ mod tests {
                     .dtoh(as_bytes_mut(&mut got_f16), output_dev)
                     .unwrap();
             }
+            run(
+                &runtime,
+                batch,
+                num_heads,
+                num_kv_heads,
+                1,
+                head_dim,
+                cache_capacity,
+                group,
+                scale,
+                query_dev,
+                key_dev,
+                value_dev,
+                output_dev,
+                totals_dev,
+                0,
+                0.0,
+            )
+            .unwrap();
+            let mut repeated_f16 = vec![f16::ZERO; num_heads * head_dim];
+            // SAFETY: `output_dev` holds `num_heads * head_dim` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut repeated_f16), output_dev)
+                    .unwrap();
+            }
+            assert_eq!(
+                got_f16, repeated_f16,
+                "split-K output changed across identical launches at total={total}"
+            );
 
             let expected = cpu_reference(
                 &q_ref,
@@ -551,6 +714,54 @@ mod tests {
                 worst_rel = worst_rel.max(rel);
             }
         }
+        assert_eq!(
+            runtime.allocation_counts(),
+            allocations_before,
+            "fp16 split-K launch path must not allocate or free device memory"
+        );
+
+        runtime.begin_graph_capture(&[]).unwrap();
+        run(
+            &runtime,
+            batch,
+            num_heads,
+            num_kv_heads,
+            1,
+            head_dim,
+            cache_capacity,
+            group,
+            scale,
+            query_dev,
+            key_dev,
+            value_dev,
+            output_dev,
+            totals_dev,
+            0,
+            0.0,
+        )
+        .unwrap();
+        runtime.end_graph_capture().unwrap();
+        runtime.replay_graph().unwrap();
+        let mut replayed_once = vec![f16::ZERO; num_heads * head_dim];
+        // SAFETY: `output_dev` holds `num_heads * head_dim` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut replayed_once), output_dev)
+                .unwrap();
+        }
+        runtime.replay_graph().unwrap();
+        let mut replayed_twice = vec![f16::ZERO; num_heads * head_dim];
+        // SAFETY: `output_dev` holds `num_heads * head_dim` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut replayed_twice), output_dev)
+                .unwrap();
+        }
+        assert_eq!(
+            replayed_once, replayed_twice,
+            "captured split-K replay must be deterministic"
+        );
+        runtime.reset_graph().unwrap();
 
         // SAFETY: each pointer came from this runtime's `alloc_raw` and is freed once.
         unsafe {

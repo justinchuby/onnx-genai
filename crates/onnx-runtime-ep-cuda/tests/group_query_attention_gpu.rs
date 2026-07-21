@@ -1266,6 +1266,59 @@ fn gqa_gpu_forced_fused_matches_baseline_parity_matrix() {
 }
 
 #[test]
+fn gqa_gpu_fp16_decode_split_k_long_context_is_deterministic_and_matches_baseline() {
+    let Some(ep) = gpu() else { return };
+    let case = ParityCase {
+        name: "float16-gqa-decode-split-k-long-rope".into(),
+        dtype: DataType::Float16,
+        batch: 1,
+        heads: 14,
+        kv_heads: 2,
+        q_seq: 1,
+        k_seq: 1,
+        dim: 64,
+        past_capacity: 1024,
+        capacity: 1024,
+        totals: vec![1024],
+        rope: true,
+        local_window: -1,
+        softcap: 0.0,
+        magnitude: 1.0,
+        seed: 971,
+    };
+    let (attrs, inputs, output_shapes) = parity_fixture(&case);
+    let first = run_available(run_with_backend(
+        &ep,
+        &attrs,
+        &inputs,
+        &output_shapes,
+        Some(GroupQueryAttentionBackend::Fused),
+    ))
+    .unwrap();
+    let second = run_available(run_with_backend(
+        &ep,
+        &attrs,
+        &inputs,
+        &output_shapes,
+        Some(GroupQueryAttentionBackend::Fused),
+    ))
+    .unwrap();
+    let baseline = run_available(run_with_backend(
+        &ep,
+        &attrs,
+        &inputs,
+        &output_shapes,
+        Some(GroupQueryAttentionBackend::Phase2a),
+    ))
+    .unwrap();
+    assert_eq!(first, second, "fp16 split-K decode must be deterministic");
+    let (atol, rtol) = parity_tolerances(case.dtype);
+    assert_close(&first[0], &baseline[0], atol, rtol);
+    assert_eq!(first[1], baseline[1]);
+    assert_eq!(first[2], baseline[2]);
+}
+
+#[test]
 fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
     let Some(ep) = gpu() else { return };
     for case in [
