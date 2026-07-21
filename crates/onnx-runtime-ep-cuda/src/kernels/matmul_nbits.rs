@@ -27,9 +27,10 @@ const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
 const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
-const GEMV_F16_THREADS: u32 = 256;
-const GEMV_F16_COLUMNS_PER_BLOCK: usize = 8;
-const GEMV_F16_TILE_BLOCKS: usize = 32;
+const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
+const GEMV_F16_SMALL_THREADS: u32 = 64;
+const GEMV_F16_LARGE_THREADS: u32 = 256;
+const GEMV_F16_SMALL_N_MAX: usize = 1152;
 
 const DEQUANT_SRC: &str = r#"
 extern "C" __global__ void matmul_nbits_dequant_f32(
@@ -324,13 +325,10 @@ extern "C" __global__ void matmul_nbits_accuracy4(
 
 // Direct fp16-activation x packed-int4 GEMV (decode M=1). Unlike the
 // accuracy_level=4 path this performs NO separate int8 activation-quantization
-// pass: fp16 activations are staged in shared memory and each int4 weight is
-// dequantized on the fly to `w = (q - 8) * scale`. Products are accumulated in
-// **fp32** for stability; the result is rounded to fp16 on write. The weight
-// packing/indexing is bit-for-bit the same symmetric block-32 layout the f32
-// kernels use: `packed[((col * k_blocks + block) * blob_size) + within/2]`, low
-// nibble for even `within`, high nibble for odd. Scales are per (col, block) and
-// may be stored as fp16 or f32 (dequant math is fp32 regardless).
+// pass. Packed nibbles are converted in registers and multiplied by fp16
+// activations directly. The common fp16-scale path uses half2 accumulation,
+// matching the storage precision before an fp32 warp reduction; f32 scales use
+// fp32 block accumulation. Both paths round once more to fp16 on write.
 const GEMV_F16_SRC: &str = r#"
 #include <cuda_fp16.h>
 
@@ -342,13 +340,137 @@ __device__ __forceinline__ float warp_sum(float value)
     return value;
 }
 
+__device__ __forceinline__ void int4x8_to_half2x4(
+    const unsigned int packed,
+    __half2* values)
+{
+    unsigned int* h = reinterpret_cast<unsigned int*>(values);
+    constexpr unsigned int bottom_mask = 0x000f000f;
+    constexpr unsigned int top_mask = 0x00f000f0;
+    constexpr unsigned int fp16_magic = 0x64006400;
+    constexpr unsigned int lop3_lut = (0xf0 & 0xcc) | 0xaa;
+    const unsigned int top = packed >> 8;
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[0])
+                 : "r"(packed), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[1])
+                 : "r"(packed), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[2])
+                 : "r"(top), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[3])
+                 : "r"(top), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+
+    constexpr unsigned int fp16_1024 = 0x64006400;
+    constexpr unsigned int fp16_one_sixteenth = 0x2c002c00;
+    constexpr unsigned int fp16_neg64 = 0xd400d400;
+    constexpr unsigned int fp16_eight = 0x48004800;
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[0]) : "r"(h[0]), "r"(fp16_1024));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[1])
+                 : "r"(h[1]), "r"(fp16_one_sixteenth), "r"(fp16_neg64));
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[2]) : "r"(h[2]), "r"(fp16_1024));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[3])
+                 : "r"(h[3]), "r"(fp16_one_sixteenth), "r"(fp16_neg64));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        asm volatile("sub.f16x2 %0, %1, %2;\n"
+                     : "=r"(h[i]) : "r"(h[i]), "r"(fp16_eight));
+    }
+}
+
+__device__ __forceinline__ float dot_int4x8_f16(
+    const unsigned int packed,
+    const __half* __restrict__ activation)
+{
+    const uint4 a = *reinterpret_cast<const uint4*>(activation);
+    constexpr unsigned int low_halves = 0x5410;
+    constexpr unsigned int high_halves = 0x7632;
+    uint4 permuted;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.x) : "r"(a.x), "r"(a.z), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.y) : "r"(a.x), "r"(a.z), "r"(high_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.z) : "r"(a.y), "r"(a.w), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.w) : "r"(a.y), "r"(a.w), "r"(high_halves));
+
+    __half2 q[4];
+    int4x8_to_half2x4(packed, q);
+    const float2 q04 = __half22float2(q[0]);
+    const float2 q15 = __half22float2(q[1]);
+    const float2 q26 = __half22float2(q[2]);
+    const float2 q37 = __half22float2(q[3]);
+    const float2 a04 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.x));
+    const float2 a15 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.y));
+    const float2 a26 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.z));
+    const float2 a37 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.w));
+    float dot = q04.x * a04.x;
+    dot += q15.x * a15.x;
+    dot += q26.x * a26.x;
+    dot += q37.x * a37.x;
+    dot += q04.y * a04.y;
+    dot += q15.y * a15.y;
+    dot += q26.y * a26.y;
+    dot += q37.y * a37.y;
+    return dot;
+}
+
+__device__ __forceinline__ void accumulate_int4x8_f16(
+    const unsigned int packed,
+    const __half* __restrict__ activation,
+    const __half scale,
+    __half2& sum0,
+    __half2& sum1,
+    __half2& sum2,
+    __half2& sum3)
+{
+    const uint4 a = *reinterpret_cast<const uint4*>(activation);
+    constexpr unsigned int low_halves = 0x5410;
+    constexpr unsigned int high_halves = 0x7632;
+    uint4 permuted;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.x) : "r"(a.x), "r"(a.z), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.y) : "r"(a.x), "r"(a.z), "r"(high_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.z) : "r"(a.y), "r"(a.w), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.w) : "r"(a.y), "r"(a.w), "r"(high_halves));
+
+    __half2 q[4];
+    int4x8_to_half2x4(packed, q);
+    const __half2 scale2 = __halves2half2(scale, scale);
+    sum0 = __hfma2(
+        __hmul2(q[0], scale2),
+        *reinterpret_cast<const __half2*>(&permuted.x),
+        sum0);
+    sum1 = __hfma2(
+        __hmul2(q[1], scale2),
+        *reinterpret_cast<const __half2*>(&permuted.y),
+        sum1);
+    sum2 = __hfma2(
+        __hmul2(q[2], scale2),
+        *reinterpret_cast<const __half2*>(&permuted.z),
+        sum2);
+    sum3 = __hfma2(
+        __hmul2(q[3], scale2),
+        *reinterpret_cast<const __half2*>(&permuted.w),
+        sum3);
+}
+
 // One warp per output column; `columns_per_block` (== blockDim.x / 32) columns
-// per CTA. Activations for a 32-block tile are staged once in shared memory and
-// reused by every warp of the CTA. Within a warp each lane owns one whole block
-// (block_size contraction elements): it reads blob_size packed bytes with a
-// single uint4 (16-byte) load when block_size == 32, dequantizes each nibble,
-// and accumulates `sum((q-8)*a)` in fp32 before scaling by the block scale. The
-// 32 lane partials (32 blocks) are then reduced with a warp butterfly.
+// per CTA. Four adjacent lanes split each block-32 weight blob into aligned
+// uint32 loads, so every warp issues contiguous 128-byte packed-weight
+// transactions. Each lane also reads eight activations with one uint4 load.
+// Register-only nibble conversion and four-lane shuffle reduction reconstruct
+// each block dot product before applying its scale.
 extern "C" __global__ void matmul_nbits_gemv_f16(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -362,7 +484,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
     const int blob_size,
     const int scales_fp16)
 {
-    extern __shared__ __half activation_tile[];
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -370,42 +491,135 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
     const int column = (int)blockIdx.x * columns_per_block + warp;
 
     float value = 0.0f;
-    for (int tile_block = 0; tile_block < k_blocks; tile_block += 32) {
-        const int tile_blocks = min(32, k_blocks - tile_block);
-        const int tile_depths = tile_blocks * block_size;
-        const int tile_base = tile_block * block_size;
-        for (int i = tid; i < tile_depths; i += (int)blockDim.x) {
-            const int depth = tile_base + i;
-            activation_tile[i] = depth < k ? activation[depth] : __float2half(0.0f);
-        }
-        __syncthreads();
-
-        const int block = tile_block + lane;
-        if (column < n && block < k_blocks) {
-            float scale;
-            if (scales_fp16) {
-                scale = __half2float(
-                    reinterpret_cast<const __half*>(scales)[(long)column * k_blocks + block]);
-            } else {
-                scale = reinterpret_cast<const float*>(scales)[(long)column * k_blocks + block];
+    if (column < n) {
+        const int quarter = lane & 3;
+        for (int block_base = 0; block_base < k_blocks; block_base += 8) {
+            const int block = block_base + (lane >> 2);
+            float block_partial = 0.0f;
+            if (block < k_blocks) {
+                const int depth = block * block_size + quarter * 8;
+                const long packed_start =
+                    ((long)column * k_blocks + block) * blob_size + quarter * 4;
+                const unsigned int packed_word =
+                    *reinterpret_cast<const unsigned int*>(packed + packed_start);
+                if (depth + 8 <= k) {
+                    block_partial = dot_int4x8_f16(packed_word, activation + depth);
+                } else if (depth < k) {
+                    const int valid = min(8, k - depth);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - 8;
+                            block_partial +=
+                                (float)q * __half2float(activation[depth + i]);
+                        }
+                    }
+                }
             }
-            const long packed_start = ((long)column * k_blocks + block) * blob_size;
-            const __half2* activation_block =
-                reinterpret_cast<const __half2*>(activation_tile + lane * block_size);
-            float dot = 0.0f;
-            const int nibble_pairs = block_size >> 1;
-            for (int pair = 0; pair < nibble_pairs; ++pair) {
-                const unsigned char byte = packed[packed_start + pair];
-                const int q0 = (int)(byte & 15) - 8;
-                const int q1 = (int)(byte >> 4) - 8;
-                const float2 a = __half22float2(activation_block[pair]);
-                dot += (float)q0 * a.x + (float)q1 * a.y;
+            block_partial += __shfl_down_sync(0xffffffffu, block_partial, 2, 4);
+            block_partial += __shfl_down_sync(0xffffffffu, block_partial, 1, 4);
+            if (quarter == 0 && block < k_blocks) {
+                float scale;
+                if (scales_fp16) {
+                    scale = __half2float(
+                        reinterpret_cast<const __half*>(scales)[(long)column * k_blocks + block]);
+                } else {
+                    scale =
+                        reinterpret_cast<const float*>(scales)[(long)column * k_blocks + block];
+                }
+                value += block_partial * scale;
             }
-            value += dot * scale;
         }
-        __syncthreads();
     }
 
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        if (bias) {
+            value += __half2float(bias[column]);
+        }
+        output[column] = __float2half(value);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int scales_fp16)
+{
+    (void)block_size;
+    (void)scales_fp16;
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column_base = (int)blockIdx.x * columns_per_block;
+    const int column = column_base + warp;
+
+    __half2 sum0 = __float2half2_rn(0.0f);
+    __half2 sum1 = __float2half2_rn(0.0f);
+    __half2 sum2 = __float2half2_rn(0.0f);
+    __half2 sum3 = __float2half2_rn(0.0f);
+    float tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        const __half* activation_ptr = activation + lane_depth;
+        const unsigned char* packed_ptr =
+            packed + (long)column * k_blocks * blob_size + lane * 4;
+        const __half* scale_ptr =
+            scales + (long)column * k_blocks + (lane >> 2);
+        int depth_base = 0;
+        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            accumulate_int4x8_f16(
+                packed_word,
+                activation_ptr,
+                *scale_ptr,
+                sum0,
+                sum1,
+                sum2,
+                sum3);
+            activation_ptr += 256;
+            packed_ptr += 128;
+            scale_ptr += 8;
+        }
+        const int tail_depth = depth_base + lane_depth;
+        if (tail_depth < k) {
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            const float scale = __half2float(*scale_ptr);
+            const int valid = min(8, k - tail_depth);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < valid) {
+                    const int q = (int)((packed_word >> (i * 4)) & 15u) - 8;
+                    tail += (float)q * __half2float(activation_ptr[i]) * scale;
+                }
+            }
+        }
+    }
+    const float2 value04 = __half22float2(sum0);
+    const float2 value15 = __half22float2(sum1);
+    const float2 value26 = __half22float2(sum2);
+    const float2 value37 = __half22float2(sum3);
+    float value = tail + value04.x;
+    value += value15.x;
+    value += value26.x;
+    value += value37.x;
+    value += value04.y;
+    value += value15.y;
+    value += value26.y;
+    value += value37.y;
     value = warp_sum(value);
     if (lane == 0 && column < n) {
         if (bias) {
@@ -811,9 +1025,14 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 GEMV")?;
-        let function =
-            self.runtime
-                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, GEMV_F16_ENTRY)?;
+        let entry = if scales_fp16 {
+            GEMV_F16_SCALES_F16_ENTRY
+        } else {
+            GEMV_F16_ENTRY
+        };
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -827,13 +1046,12 @@ impl MatMulNBitsKernel {
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
         let scales_fp16_flag: i32 = scales_fp16 as i32;
-        // Shared-memory tile: 32 blocks x block_size fp16 activations, staged once
-        // per CTA and reused by every warp. Sized purely from the (fixed-for-
-        // decode) block_size, so it is constant across capture/replay.
-        let shared_mem_bytes = as_i32(
-            "fp16 GEMV shared bytes",
-            GEMV_F16_TILE_BLOCKS * self.block_size * std::mem::size_of::<u16>(),
-        )? as u32;
+        let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+            GEMV_F16_SMALL_THREADS
+        } else {
+            GEMV_F16_LARGE_THREADS
+        };
+        let columns_per_block = (threads / 32) as usize;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&activation_ptr)
@@ -849,14 +1067,14 @@ impl MatMulNBitsKernel {
             .arg(&scales_fp16_flag);
         // SAFETY: this path is restricted to symmetric block-32 M=1 fp16 inputs;
         // all tensors were dtype/shape/contiguity validated above, the scalar ABI
-        // matches `matmul_nbits_gemv_f16`, and the only scratch is fixed-size
-        // dynamic shared memory (no per-call alloc or sync), so the launch is
-        // legal to record into and replay from a CUDA graph.
+        // matches the selected fp16 GEMV entry point, and the kernel uses only
+        // registers (no per-call alloc or sync), so the launch is legal to record
+        // into and replay from a CUDA graph.
         unsafe {
             builder.launch(LaunchConfig {
-                grid_dim: (self.n.div_ceil(GEMV_F16_COLUMNS_PER_BLOCK) as u32, 1, 1),
-                block_dim: (GEMV_F16_THREADS, 1, 1),
-                shared_mem_bytes,
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
             })
         }
         .map(|_| ())
@@ -1143,9 +1361,9 @@ impl Kernel for MatMulNBitsKernel {
         // The m=1 no-g_idx GEMV uses only launch-time shared memory and a
         // shape-fixed persistent accuracy-4 activation workspace; it performs no
         // per-call allocation, D2H, or synchronization. The direct fp16 GEMV is
-        // likewise capture-safe: fixed grid/block/shared geometry from the shape
-        // signature and no scratch beyond dynamic shared memory. Prefill GEMM and
-        // g_idx validation retain their non-capturable behavior.
+        // likewise capture-safe: fixed grid/block geometry from the shape
+        // signature and register-only scratch. Prefill GEMM and g_idx validation
+        // retain their non-capturable behavior.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
@@ -1268,8 +1486,8 @@ mod tests {
 
     /// Direct fp16 GEMV parity against an f32/f64 dequant-and-matmul oracle that
     /// is fed the **same fp16-rounded** activations and the same (fp16- or
-    /// f32-) rounded scales, so the only residual the test sees is the kernel's
-    /// fp32 accumulation and its fp16 output rounding — not input quantization,
+    /// f32-) rounded scales, so the residual covers only the kernel's documented
+    /// accumulation precision and fp16 output rounding — not input quantization,
     /// which both sides share.
     fn run_parity(scales_fp16: bool, with_bias: bool) -> (f32, f32, f32, bool) {
         let Some(runtime) = runtime() else {

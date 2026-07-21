@@ -1,3 +1,4 @@
+use half::f16;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
@@ -357,6 +358,108 @@ fn run_case(
     Ok(bytes
         .chunks_exact(4)
         .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+        .collect())
+}
+
+fn run_f16_case(
+    ep: &CudaExecutionProvider,
+    activations: &[f16],
+    packed: &[u8],
+    scales: &[f16],
+    k: usize,
+    n: usize,
+) -> onnx_runtime_ep_api::Result<Vec<f16>> {
+    let block_size = 32usize;
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let a = graph.create_named_value("A", DataType::Float16, static_shape([1, k]));
+    let b = graph.create_named_value("B", DataType::Uint8, static_shape([n, blocks, blob_size]));
+    let scales_value =
+        graph.create_named_value("scales", DataType::Float16, static_shape([n, blocks]));
+    for value in [a, b, scales_value] {
+        graph.add_input(value);
+    }
+    let output = graph.create_named_value("Y", DataType::Float16, static_shape([1, n]));
+    let mut node = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(a), Some(b), Some(scales_value)],
+        vec![output],
+    );
+    node.domain = "com.microsoft".into();
+    node.attributes.insert("K".into(), Attribute::Int(k as i64));
+    node.attributes.insert("N".into(), Attribute::Int(n as i64));
+    node.attributes.insert("bits".into(), Attribute::Int(4));
+    node.attributes
+        .insert("block_size".into(), Attribute::Int(block_size as i64));
+    node.attributes
+        .insert("accuracy_level".into(), Attribute::Int(4));
+    let node = graph.insert_node(node);
+    graph.add_output(output);
+    let model = Model::new(&graph);
+    let kernel = ep.get_kernel(model.graph.node(node), &[], 1)?;
+    assert!(!kernel.cuda_graph_compatible());
+
+    let inputs = [
+        tensor(DataType::Float16, &[1, k], activations),
+        tensor(DataType::Uint8, &[n, blocks, blob_size], packed),
+        tensor(DataType::Float16, &[n, blocks], scales),
+    ];
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let mut input_buffers = Vec::<DeviceBuffer>::new();
+    for input in &inputs {
+        let buffer = ep.allocate(input.bytes.len(), 256)?;
+        // SAFETY: allocation size equals the source byte length.
+        unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+        input_buffers.push(buffer);
+    }
+    let input_strides: Vec<_> = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect();
+    let input_views: Vec<_> = inputs
+        .iter()
+        .zip(&input_buffers)
+        .zip(&input_strides)
+        .map(|((input, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                input.dtype,
+                &input.shape,
+                strides,
+                device,
+            )
+        })
+        .collect();
+    let mut output_buffer = ep.allocate(n * 2, 256)?;
+    let output_shape = [1, n];
+    let output_strides = compute_contiguous_strides(&output_shape);
+    kernel.execute(
+        &input_views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float16,
+            &output_shape,
+            &output_strides,
+            device,
+        )],
+    )?;
+    assert!(kernel.cuda_graph_compatible());
+
+    let mut bytes = vec![0u8; n * 2];
+    // SAFETY: output allocation contains `n` fp16 values.
+    unsafe { runtime.dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))? };
+    drop(input_views);
+    for buffer in input_buffers {
+        ep.deallocate(buffer)?;
+    }
+    ep.deallocate(output_buffer)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|value| f16::from_bits(u16::from_ne_bytes(value.try_into().unwrap())))
         .collect())
 }
 
@@ -883,6 +986,98 @@ fn matmul_nbits_gpu_accuracy4_real_decode_widths_match_current_algorithm() {
         eprintln!(
             "accuracy_level=4 K={k},N={n} sampled current-algorithm parity \
              max_abs_diff={max_abs:e} max_rel_diff={max_rel:e}"
+        );
+    }
+}
+
+fn f16_reference_column(
+    activations: &[f16],
+    packed: &[u8],
+    scales: &[f16],
+    k: usize,
+    column: usize,
+) -> f32 {
+    let blocks = k.div_ceil(32);
+    let mut value = 0.0f32;
+    for block in 0..blocks {
+        let mut block_dot = 0.0f32;
+        for within in 0..32 {
+            let depth = block * 32 + within;
+            if depth >= k {
+                break;
+            }
+            let byte = packed[(column * blocks + block) * 16 + within / 2];
+            let quantized = if within & 1 == 0 {
+                byte & 15
+            } else {
+                byte >> 4
+            };
+            block_dot += (i32::from(quantized) - 8) as f32 * activations[depth].to_f32();
+        }
+        value += block_dot * scales[column * blocks + block].to_f32();
+    }
+    value
+}
+
+#[test]
+fn matmul_nbits_gpu_fp16_vectorized_block32_matches_reference() {
+    let Some(ep) = gpu() else { return };
+    let (k, n) = (4096usize, 73usize);
+    let blocks = k / 32;
+    let activations: Vec<f16> = (0..k)
+        .map(|index| f16::from_f32(((index * 29 % 257) as f32 - 128.0) / 97.0))
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * 16)
+        .map(|index| ((index * 37 + index / 11 + 19) & 255) as u8)
+        .collect();
+    let scales: Vec<f16> = (0..n * blocks)
+        .map(|index| f16::from_f32(0.008 + (index * 17 % 31) as f32 * 0.0007))
+        .collect();
+    let actual = run_f16_case(&ep, &activations, &packed, &scales, k, n).unwrap();
+    for (column, got) in actual.iter().enumerate() {
+        let expected = f16_reference_column(&activations, &packed, &scales, k, column);
+        let tolerance = 0.2f32.max(expected.abs() * 2e-3);
+        assert!(
+            (got.to_f32() - expected).abs() <= tolerance,
+            "column {column}: got={} expected={expected} tolerance={tolerance}",
+            got.to_f32()
+        );
+    }
+}
+
+#[test]
+fn matmul_nbits_gpu_fp16_lm_head_width_is_deterministic() {
+    let Some(ep) = gpu() else { return };
+    let (k, n) = (64usize, 151_936usize);
+    let blocks = k / 32;
+    let activations: Vec<f16> = (0..k)
+        .map(|index| f16::from_f32(((index * 13 % 67) as f32 - 33.0) / 29.0))
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * 16)
+        .map(|index| ((index * 43 + index / 7 + 5) & 255) as u8)
+        .collect();
+    let scales: Vec<f16> = (0..n * blocks)
+        .map(|index| f16::from_f32(0.01 + (index * 11 % 23) as f32 * 0.0009))
+        .collect();
+    let first = run_f16_case(&ep, &activations, &packed, &scales, k, n).unwrap();
+    let second = run_f16_case(&ep, &activations, &packed, &scales, k, n).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        second
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+    for column in [0, 1, 63, 895, 4863, n - 1] {
+        let expected = f16_reference_column(&activations, &packed, &scales, k, column);
+        let got = first[column].to_f32();
+        let tolerance = 0.03f32.max(expected.abs() * 2e-3);
+        assert!(
+            (got - expected).abs() <= tolerance,
+            "column {column}: got={got} expected={expected} tolerance={tolerance}"
         );
     }
 }
