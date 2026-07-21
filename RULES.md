@@ -24,8 +24,19 @@ See [`docs/ORT2.md` §35](docs/ORT2.md#35-error-recovery--debug-experience), esp
 - Kernels are shape-driven, dtype-parameterized, and architecture-gated; model dimensions and attention parameters are runtime data.
 - Generic loader, IR, session, optimizer, and dispatch code must not special-case model families, op attribute names, vendor strings, or EP names.
 - EP selection uses declared capabilities and registry/config keys. An unavailable match produces a clear error rather than a guess or silent fallback.
+- **No hardcoded model architecture, anywhere.** Neither inference metadata nor any runtime implementation may bake in a specific model's architecture (layer counts, hidden/intermediate sizes, head counts, exact tensor shapes, magic dimension constants, etc.). Architecture is runtime data derived from the model and its metadata.
+- **All assumptions are declared explicitly as metadata.** If a code path depends on an architectural property (shared KV layout, RoPE variant, block-quant size, attention scheme, sliding-window, and so on), that property must be surfaced as explicit, inspectable metadata—never inferred from a model name or silently assumed. Missing metadata fails clearly.
 
-See [`docs/ORT2.md` §15.1](docs/ORT2.md#151-decision-summary), §55.6, and [`docs/PROGRESS.md`](docs/PROGRESS.md).
+### 2.1 Graph fusion must be generic and EP-internal
+
+**Fusion detects structural patterns, never model identity, and lives inside the EP.**
+
+- Fusion decisions are driven by **op/topology patterns** (e.g. `Add(MatMulNBits, [N]-bias)`, paired gate/up `MatMulNBits` feeding `Mul(Silu(gate), up)`)—never by model name, vendor, or any model-specific hint.
+- A fusion must generalize across every model that exhibits the pattern. Optimize **per pattern category**, not for a single model. Correctness is guarded by dtype/shape **compatibility** checks (divisibility, supported block size, supported dtype), **not** by hardcoded magic dimensions (e.g. a specific `K`/`N`). Hardcoded shape constants that only match one model are a review-blocking finding.
+- Fusion happens **inside the EP** (as part of its claim/compile), not in generic graph code. The EP may use the IR crate to perform it.
+- The IR crate is the sanctioned home for a reusable **pattern-matcher + rewriter**; building that infrastructure there and calling it from EPs is approved and preferred over ad-hoc per-EP string/shape matching.
+
+See [`docs/ORT2.md` §15.1](docs/ORT2.md#151-decision-summary), §55.6, [`docs/MODEL_METADATA.md`](docs/MODEL_METADATA.md), and [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## 3. Make pre-release changes cleanly
 
