@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-21T08:25Z — native CUDA fp16 decode wave-2 **stacked to 663–672 tok/s** on H200 (0 fallbacks, token-identical), up from ~556 entering the wave and **beating ORT-genai's 657 tok/s**. CI now tests and warning-gates all 27 pure-offline crates (1,921 tests) across Linux x86_64, Windows x86_64/ARM64, and macOS ARM64._
+_Last updated: 2026-07-21T10:30Z — native CUDA fp16 decode wave-3 reaches **~689 tok/s @256** and **~693 tok/s @1024** on H200 (0 fallbacks, coherent decode), beating ORT-genai's 657 tok/s reference at 256. CI tests and warning-gates all 27 pure-offline crates (1,921 tests) across Linux x86_64, Windows x86_64/ARM64, and macOS ARM64._
 
-**Current `origin/main` implementation HEAD:** `f099215`.
+**Current `origin/main` implementation HEAD:** `12e48b8`.
+
+## 2026-07-21 — Native CUDA fp16 decode wave-3 (689 @256 / 693 @1024)
+
+Two stacked kernel levers moved decode beyond wave-2: long-context GQA split increased `MAX_SPLITS` from 8 to 16 (**~647 → ~693 tok/s @1024**, 256 flat), while fused `silu(gate) * up` SwiGLU halved MLP launches from 48 to 24/token (**~673 → ~689 tok/s @256**). Both remain CUDA-graph-safe with **0 fallbacks** and coherent decode; 256-token throughput beats the identical-model ORT-genai reference of **657 tok/s**. A fresh shared-H200 re-profile (five samples) measured median/best **691.23/694.63 tok/s @256** and **712.86/715.21 tok/s @1024**.
 
 ## 2026-07-21 — Native CUDA fp16 decode wave-2 beats ORT (556 → 671 tok/s)
 
