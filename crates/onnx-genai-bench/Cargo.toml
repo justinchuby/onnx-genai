@@ -13,6 +13,7 @@ bench-native = [
     "onnx-genai-engine/native-backend",
     "dep:onnx-genai-ort",
     "dep:onnx-runtime-ep-cpu",
+    "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-ep-cuda",
     "dep:onnx-runtime-ir",
     "dep:onnx-runtime-loader",

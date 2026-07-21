@@ -12,6 +12,7 @@ categories = ["science", "text-processing"]
 default = []
 native-backend = [
     "dep:onnx-runtime-ep-cpu",
+    "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-session",
     "dep:onnx-runtime-tracer",
 ]
