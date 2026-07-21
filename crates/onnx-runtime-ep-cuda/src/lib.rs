@@ -58,6 +58,7 @@
 pub mod blas;
 pub mod capture;
 pub mod cudnn;
+mod dynamic_library;
 pub mod error;
 mod graph;
 pub mod kernels;

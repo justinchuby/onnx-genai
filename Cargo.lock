@@ -1998,6 +1998,7 @@ version = "0.1.0-dev.2"
 dependencies = [
  "cudarc",
  "half",
+ "libloading 0.8.9",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",

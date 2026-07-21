@@ -19,6 +19,7 @@ onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-quantization = { workspace = true }
 thiserror = { workspace = true }
 half = "2"
+libloading = "0.8"
 
 # cudarc: pure-Rust CUDA bindings (docs/ORT2.md §15.2). Pinned to the CUDA 13.0
 # API set (the runtime libs on the target host are libcublasLt.so.13 / cudart 13)

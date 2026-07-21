@@ -18,6 +18,7 @@ use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
+use crate::dynamic_library::{CudaLibrary, require};
 use crate::error::{driver_err, nvrtc_err};
 use crate::graph::CudaGraphLifecycle;
 
@@ -195,6 +196,16 @@ impl CudaRuntime {
     /// stream, and a cuBLASLt handle. Returns an error (never panics) when no
     /// such device exists or the CUDA driver / cuBLASLt cannot be loaded.
     pub fn new(ordinal: u32) -> Result<Self> {
+        require(CudaLibrary::Driver).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
+        require(CudaLibrary::CublasLt).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let major = context
@@ -474,6 +485,11 @@ impl CudaRuntime {
         src: &str,
         entry: &str,
     ) -> Result<CudaFunction> {
+        require(CudaLibrary::Nvrtc).map_err(|message| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: {message}; CPU execution remains available"
+            ))
+        })?;
         self.bind()?;
         let module = {
             let mut cache = self.modules.lock().expect("cuda_ep module cache poisoned");
