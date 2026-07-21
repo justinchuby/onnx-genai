@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-21T10:30Z — native CUDA fp16 decode wave-3 reaches **~689 tok/s @256** and **~693 tok/s @1024** on H200 (0 fallbacks, coherent decode), beating ORT-genai's 657 tok/s reference at 256. CI tests and warning-gates all 27 pure-offline crates (1,921 tests) across Linux x86_64, Windows x86_64/ARM64, and macOS ARM64._
+_Last updated: 2026-07-21T13:15Z — native CUDA fp16 decode wave-4 reaches **~759 tok/s @256** and **~789 tok/s @1024** on H200 (0 fallbacks, coherent decode), about 15% ahead of ORT-genai's 657 tok/s reference at 256. CI tests and warning-gates all 27 pure-offline crates (1,921 tests) across Linux x86_64, Windows x86_64/ARM64, and macOS ARM64._
 
-**Current `origin/main` implementation HEAD:** `12e48b8`.
+**Current `origin/main` implementation HEAD:** `102fee9`.
+
+## 2026-07-21 — Native CUDA fp16 decode wave-4 (759 @256 / 789 @1024)
+
+Two stacked launch-reduction levers moved decode to **~759 tok/s @256** and **~789 tok/s @1024**: batch-1 GQA metadata was folded into fused prep, and MatMul-adjacent fusion folded QKV bias while pairing gate/up projection with SwiGLU. The path remains CUDA-graph-safe with **0 fallbacks**, coherent decode, and about **227 launches/token**, giving a roughly **15% lead** over the identical-model ORT-genai **657 tok/s @256** reference. A fresh shared-H200 three-sample re-profile measured median/best **762.31/774.43 tok/s @256** and **783.52/791.81 tok/s @1024**. A binding-cache lever was also evaluated and dropped as within-noise.
 
 ## 2026-07-21 — Native CUDA fp16 decode wave-3 (689 @256 / 693 @1024)
 
