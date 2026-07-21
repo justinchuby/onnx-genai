@@ -1,0 +1,290 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-vlm-multibinding fixture"
+graph {
+  node {
+    input: "gate_table"
+    input: "input_ids"
+    output: "gate_embed"
+    name: "node_Gather_0"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "inputs_embeds"
+    input: "aux"
+    output: "embeds_plus_aux"
+    name: "node_Add_1"
+    op_type: "Add"
+  }
+  node {
+    input: "embeds_plus_aux"
+    input: "gate_embed"
+    output: "combined"
+    name: "node_Add_2"
+    op_type: "Add"
+  }
+  node {
+    input: "combined"
+    input: "lm_head"
+    output: "logits_base"
+    name: "node_MatMul_3"
+    op_type: "MatMul"
+  }
+  node {
+    input: "logits_base"
+    input: "tie_bias"
+    output: "logits"
+    name: "node_Add_4"
+    op_type: "Add"
+  }
+  node {
+    output: "kv_axis"
+    name: "node_Constant_5"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "kv_axis_value"
+        raw_data: "\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "combined"
+    input: "kv_axis"
+    output: "current_key"
+    name: "node_Unsqueeze_6"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "current_key"
+    input: "value_offset"
+    output: "current_value"
+    name: "node_Add_7"
+    op_type: "Add"
+  }
+  node {
+    input: "past_key_values.0.key"
+    input: "current_key"
+    output: "present.0.key"
+    name: "node_Concat_8"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  node {
+    input: "past_key_values.0.value"
+    input: "current_value"
+    output: "present.0.value"
+    name: "node_Concat_9"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  name: "tiny_vlm_multibinding_decoder"
+  initializer {
+    dims: 8
+    dims: 8
+    data_type: 1
+    name: "gate_table"
+    raw_data: "\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\232\231\031?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 8
+    dims: 8
+    data_type: 1
+    name: "lm_head"
+    raw_data: "\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    dims: 1
+    dims: 8
+    data_type: 1
+    name: "tie_bias"
+    raw_data: "\000\000\000\000o\022\203:o\022\003;\246\233D;o\022\203;\013\327\243;\246\233\304;B`\345;"
+  }
+  initializer {
+    data_type: 1
+    name: "value_offset"
+    raw_data: "\000\000\000?"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "inputs_embeds"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "aux"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

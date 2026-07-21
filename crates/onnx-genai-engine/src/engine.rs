@@ -2448,6 +2448,7 @@ fn default_inference_metadata() -> InferenceMetadata {
         hardware_requirements: None,
         generation: None,
         tokens: None,
+        preprocessing: None,
     }
 }
 

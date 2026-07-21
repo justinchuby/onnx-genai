@@ -23,8 +23,8 @@ use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Named tensors supplied to or produced by pipeline components.
 ///
@@ -194,9 +194,9 @@ impl PipelineEngine {
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
         let (decoder_state, tokenizer_component) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
-                let decoder = models.session(&ar.decoder).with_context(|| {
-                    format!("pipeline decoder '{}' was not loaded", ar.decoder)
-                })?;
+                let decoder = models
+                    .session(&ar.decoder)
+                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
                 let _kv_model =
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
                 let decoder_io = models
@@ -368,18 +368,19 @@ impl PipelineEngine {
 
         let mut tensors = pipeline_request.inputs;
         // Seed the prompt token ids into the shared pool so a prompt-phase
-        // fusion component (Gemma4-style `embedding`) can consume `input_ids`.
+        // component that consumes `input_ids` (e.g. a text encoder) can run.
         self.seed_prompt_token_inputs(&ar.prompt_components, &prompt_tokens, &mut tensors)?;
         self.run_prompt_phase_components(&ar.prompt_components, &mut tensors, "prologue", None)?;
-        // A decoder whose prompt input is `inputs_embeds` (not `input_ids`) needs
-        // the fusion component re-run each step to embed the running token; the
-        // routed prompt embeddings are otherwise stale after prefill.
-        let embeds_binding = self.embeds_step_binding(&ar.decoder, &tensors)?;
-        let decoder_extras = self.decoder_extra_inputs(
-            &ar.decoder,
-            &tensors,
-            embeds_binding.as_ref().map(|b| b.decoder_input.as_str()),
-        )?;
+
+        // Static routing from prompt-phase and per-step producers into the
+        // decoder. Every non-self edge into the decoder is recomputed from the
+        // shared pool on each step, so `every_step` outputs are always fresh and
+        // `prompt_only` conditioning stays cached (it is simply re-read).
+        let decoder_in_edges = self.decoder_in_edges(&ar.decoder)?;
+        // Owned per-step component bindings (paired with their sessions below).
+        // Built before `decoder_state` is taken mutably so the immutable borrow
+        // used to enumerate graph ports is released first.
+        let step_bindings = self.build_step_bindings(&ar.step_components)?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
         self.decoder_state = Some({
@@ -394,19 +395,20 @@ impl PipelineEngine {
             .models
             .session(&ar.decoder)
             .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-        let embed_session = match &embeds_binding {
-            Some(binding) => Some(
-                self.models
-                    .session(&binding.component)
-                    .with_context(|| {
-                        format!(
-                            "pipeline embedding component '{}' was not loaded",
-                            binding.component
-                        )
-                    })?,
-            ),
-            None => None,
-        };
+        // Pair every `every_step` binding with its loaded session. This is the
+        // generic replacement for the old one-output `inputs_embeds` fusion.
+        let step_components = step_bindings
+            .into_iter()
+            .map(|binding| {
+                let session = self.models.session(&binding.component).with_context(|| {
+                    format!(
+                        "pipeline every_step component '{}' was not loaded",
+                        binding.component
+                    )
+                })?;
+                Ok((binding, session))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let tokenizer = self
             .models
             .tokenizer_for(&self.tokenizer_component)
@@ -419,9 +421,9 @@ impl PipelineEngine {
                 .decoder_state
                 .as_mut()
                 .expect("autoregressive pipeline has decode state"),
-            decoder_extras: &decoder_extras,
-            embed_session,
-            embeds_binding,
+            pool: &mut tensors,
+            step_components,
+            decoder_in_edges,
             context_tokens: prompt_tokens,
             prompt_len: 0,
             generated_count: 0,
@@ -707,40 +709,42 @@ impl PipelineEngine {
             let outer_outputs = if let Some(pre) = &pre_embed {
                 // Build (or, on frame 0 with a prefill embedder, look up) the
                 // talker's per-step `inputs_embeds`.
-                let (inputs_embeds, positions) = if let Some(prefill) =
-                    prefill.as_ref().filter(|_| _frame == 0)
-                {
-                    // Frame 0 PREFILL: feed the prefill embedder's multi-position
-                    // `prefill_embeds` DIRECTLY to the talker (do NOT run the
-                    // pre-embedder), advancing the KV past by `prefill_len`.
-                    (clone_value(&prefill.prefill_embeds)?, prefill.prefill_len)
-                } else {
-                    // Build this frame's `frame_codes` from the previous frame's
-                    // code tuple (frame 0 without a prefill embedder uses a zero
-                    // seed), run the pre-embedder to materialize a single-position
-                    // `inputs_embeds`. With a prefill embedder, frames `k >= 1`
-                    // feed `text_embed = trailing_text_embeds[:, k-1, :]` (zeros
-                    // once the trailing text is exhausted — a close stand-in for
-                    // the reference's tts_pad embedding; exact tts_pad is a
-                    // documented refinement).
-                    let frame_codes = prev_frame_codes
-                        .clone()
-                        .unwrap_or_else(|| vec![0i64; plan.num_code_groups]);
-                    let text_embed = match prefill.as_ref() {
-                        Some(prefill) => {
-                            let idx = _frame - 1;
-                            let hidden = prefill.hidden;
-                            let slice = if idx < prefill.trailing_len {
-                                prefill.trailing[idx * hidden..(idx + 1) * hidden].to_vec()
-                            } else {
-                                vec![0.0f32; hidden]
-                            };
-                            Some(slice)
-                        }
-                        None => None,
+                let (inputs_embeds, positions) =
+                    if let Some(prefill) = prefill.as_ref().filter(|_| _frame == 0) {
+                        // Frame 0 PREFILL: feed the prefill embedder's multi-position
+                        // `prefill_embeds` DIRECTLY to the talker (do NOT run the
+                        // pre-embedder), advancing the KV past by `prefill_len`.
+                        (clone_value(&prefill.prefill_embeds)?, prefill.prefill_len)
+                    } else {
+                        // Build this frame's `frame_codes` from the previous frame's
+                        // code tuple (frame 0 without a prefill embedder uses a zero
+                        // seed), run the pre-embedder to materialize a single-position
+                        // `inputs_embeds`. With a prefill embedder, frames `k >= 1`
+                        // feed `text_embed = trailing_text_embeds[:, k-1, :]` (zeros
+                        // once the trailing text is exhausted — a close stand-in for
+                        // the reference's tts_pad embedding; exact tts_pad is a
+                        // documented refinement).
+                        let frame_codes = prev_frame_codes
+                            .clone()
+                            .unwrap_or_else(|| vec![0i64; plan.num_code_groups]);
+                        let text_embed = match prefill.as_ref() {
+                            Some(prefill) => {
+                                let idx = _frame - 1;
+                                let hidden = prefill.hidden;
+                                let slice = if idx < prefill.trailing_len {
+                                    prefill.trailing[idx * hidden..(idx + 1) * hidden].to_vec()
+                                } else {
+                                    vec![0.0f32; hidden]
+                                };
+                                Some(slice)
+                            }
+                            None => None,
+                        };
+                        (
+                            run_pre_embedder(pre, &frame_codes, text_embed.as_deref())?,
+                            1,
+                        )
                     };
-                    (run_pre_embedder(pre, &frame_codes, text_embed.as_deref())?, 1)
-                };
                 let mut step_extras = Vec::with_capacity(outer_extras.len() + 1);
                 for (name, value) in &outer_extras {
                     step_extras.push((name.clone(), clone_value(value)?));
@@ -907,10 +911,7 @@ impl PipelineEngine {
     /// components run once. `guidance_scale` is carried but not yet applied —
     /// classifier-free guidance and timestep/sigma schedules are supplied by the
     /// scheduler-registry follow-up.
-    fn run_iterative(
-        &self,
-        request: PipelineGenerateRequest,
-    ) -> anyhow::Result<PipelineTensors> {
+    fn run_iterative(&self, request: PipelineGenerateRequest) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::Iterative(plan) = &self.plan else {
             anyhow::bail!("internal error: run_iterative on a non-iterative plan");
         };
@@ -1064,7 +1065,10 @@ impl PipelineEngine {
                     })?
                 } else {
                     carried.get(in_port).with_context(|| {
-                        format!("loop-carried input '{}.{in_port}' was not produced", plan.denoiser)
+                        format!(
+                            "loop-carried input '{}.{in_port}' was not produced",
+                            plan.denoiser
+                        )
                     })?
                 };
                 raw_samples.insert(in_port.clone(), clone_value(raw)?);
@@ -1139,7 +1143,10 @@ impl PipelineEngine {
                 let mut combined: HashMap<String, Value> = HashMap::new();
                 for (port, cond_value) in &cond_out {
                     let uncond_value = uncond_out.get(port).with_context(|| {
-                        format!("unconditional pass did not produce '{}.{port}'", plan.denoiser)
+                        format!(
+                            "unconditional pass did not produce '{}.{port}'",
+                            plan.denoiser
+                        )
                     })?;
                     let cond_v = cond_value.to_vec_f32_lossy()?;
                     let uncond_v = uncond_value.to_vec_f32_lossy()?;
@@ -1148,7 +1155,10 @@ impl PipelineEngine {
                         .zip(&cond_v)
                         .map(|(u, c)| u + scale * (c - u))
                         .collect();
-                    combined.insert(port.clone(), Value::from_slice_f32(&guided, cond_value.shape())?);
+                    combined.insert(
+                        port.clone(),
+                        Value::from_slice_f32(&guided, cond_value.shape())?,
+                    );
                 }
                 combined
             } else {
@@ -1161,14 +1171,21 @@ impl PipelineEngine {
             // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
             for (out_port, in_port) in &plan.loop_edges {
                 let model_output = out_map.get(out_port).with_context(|| {
-                    format!("denoiser did not produce loop output '{}.{out_port}'", plan.denoiser)
+                    format!(
+                        "denoiser did not produce loop output '{}.{out_port}'",
+                        plan.denoiser
+                    )
                 })?;
                 let next = if let Some(scheduler) = scheduler {
                     let sample = raw_samples.get(in_port).with_context(|| {
-                        format!("missing loop-carried sample for '{}.{in_port}'", plan.denoiser)
+                        format!(
+                            "missing loop-carried sample for '{}.{in_port}'",
+                            plan.denoiser
+                        )
                     })?;
                     if scheduler.needs_noise() {
-                        let noise = self.step_noise(plan, num_steps, &constants, in_port, step, sample)?;
+                        let noise =
+                            self.step_noise(plan, num_steps, &constants, in_port, step, sample)?;
                         scheduler.step_with_noise(
                             step,
                             num_steps,
@@ -1245,7 +1262,10 @@ impl PipelineEngine {
             // scheduler's per-step input scaling (Euler) and CFG's unconditional
             // conditioning embedding.
             if let Some((_, over_value)) = overrides.iter().find(|(p, _)| *p == port) {
-                inputs.push((port.to_string(), coerce_value_to_dtype(over_value, info.dtype)?));
+                inputs.push((
+                    port.to_string(),
+                    coerce_value_to_dtype(over_value, info.dtype)?,
+                ));
                 continue;
             }
             // Per-step timestep injection takes precedence for its port. Honor
@@ -1266,9 +1286,9 @@ impl PipelineEngine {
                         format!("missing iterative pipeline seed '{endpoint}' at start step")
                     })?
                 } else {
-                    carried
-                        .get(port)
-                        .with_context(|| format!("loop-carried input '{endpoint}' was not produced"))?
+                    carried.get(port).with_context(|| {
+                        format!("loop-carried input '{endpoint}' was not produced")
+                    })?
                 }
             } else {
                 let routed = plan
@@ -1288,7 +1308,10 @@ impl PipelineEngine {
             .map(|(name, value)| (name.as_str(), value))
             .collect::<Vec<_>>();
         let outputs = denoiser.run(&refs).map_err(|e| {
-            anyhow::anyhow!("ORT denoiser '{}' failed at step {step}: {e}", plan.denoiser)
+            anyhow::anyhow!(
+                "ORT denoiser '{}' failed at step {step}: {e}",
+                plan.denoiser
+            )
         })?;
         let mut out_map: HashMap<String, Value> = HashMap::new();
         for (name, value) in denoiser.output_names().iter().zip(outputs) {
@@ -1338,10 +1361,7 @@ impl PipelineEngine {
     /// once, in declared order, over a shared tensor pool. A stage's model reads
     /// its inputs from the pool (routed by the pipeline dataflow) and writes its
     /// outputs back, so an earlier stage's outputs feed later stages.
-    fn run_composite(
-        &self,
-        request: PipelineGenerateRequest,
-    ) -> anyhow::Result<PipelineTensors> {
+    fn run_composite(&self, request: PipelineGenerateRequest) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::Composite(plan) = &self.plan else {
             anyhow::bail!("internal error: run_composite on a non-composite plan");
         };
@@ -1361,10 +1381,7 @@ impl PipelineEngine {
         Ok(tensors)
     }
 
-    fn run_single_pass(
-        &self,
-        request: PipelineGenerateRequest,
-    ) -> anyhow::Result<PipelineTensors> {
+    fn run_single_pass(&self, request: PipelineGenerateRequest) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::SinglePass(plan) = &self.plan else {
             anyhow::bail!("internal error: run_single_pass on a non-single-pass plan");
         };
@@ -1516,104 +1533,91 @@ impl PipelineEngine {
         Ok(())
     }
 
-    /// Detect a decoder whose per-step sequence input is `inputs_embeds` (fused
-    /// image + text embeddings) rather than `input_ids`, and bind the fusion
-    /// component that must re-embed the running token on every decode step.
+    /// Precompute the static routing edges feeding the autoregressive `decoder`.
     ///
-    /// Returns `None` for a conventional decoder that carries its own token
-    /// input (and embeds internally). When `Some`, the decode loop re-runs the
-    /// fusion component each step with the running token so the decoder receives
-    /// a single-token `inputs_embeds`; cross-conditioning inputs (image features)
-    /// are resolved once and re-supplied unchanged.
-    fn embeds_step_binding(
-        &self,
-        decoder: &str,
-        tensors: &PipelineTensors,
-    ) -> anyhow::Result<Option<EmbedsStepBinding>> {
-        let session = self
-            .models
-            .session(decoder)
-            .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
-        // A decoder with its own token input embeds internally: nothing to bind.
-        if session
-            .inputs()
-            .iter()
-            .any(|info| is_token_input_name(&info.name.to_ascii_lowercase()))
-        {
-            return Ok(None);
-        }
-        let Some(embeds_input) = session.inputs().iter().find(|info| {
-            let lower = info.name.to_ascii_lowercase();
-            lower == "inputs_embeds" || lower.ends_with(".inputs_embeds")
-        }) else {
-            return Ok(None);
-        };
-        let decoder_input = embeds_input.name.clone();
-        let endpoint = format!("{decoder}.{decoder_input}");
-        let edge = self
+    /// Returns `(source_endpoint, decoder_input_port)` for every dataflow edge
+    /// into the decoder whose source is a **different** component (self-edges are
+    /// loop-carried KV / recurrent state, resolved inside the decode step). Both
+    /// `every_step` producers and cached `prompt_only` conditioning route through
+    /// this list; the values are re-read from the shared pool on every step, so
+    /// per-step outputs stay fresh while fixed conditioning is simply reused.
+    fn decoder_in_edges(&self, decoder: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut edges = Vec::new();
+        for edge in self
             .plan
-            .dataflow()
-            .iter()
-            .find(|edge| edge.to == endpoint)
-            .with_context(|| {
-                format!(
-                    "decoder '{decoder}' consumes '{decoder_input}' but no dataflow edge feeds \
-                     it; a Gemma4-style VLM needs an embedding fusion component routed to \
-                     '{endpoint}'"
-                )
-            })?;
-        let (component, output) = parse_endpoint(&edge.from)?;
-        let component = component.to_string();
-        let output = output.to_string();
-        let embed_session = self.models.session(&component).with_context(|| {
-            format!("pipeline embedding component '{component}' was not loaded")
-        })?;
-
-        // The fusion component's token input carries the running token each step;
-        // every other input (e.g. image_features) is fixed conditioning resolved
-        // once here from the shared pool (directly or via a dataflow edge).
-        let mut token_input = None;
-        let mut conditioning = Vec::new();
-        for info in embed_session.inputs() {
-            if is_token_input_name(&info.name.to_ascii_lowercase()) {
-                token_input = Some(info.name.clone());
-                continue;
-            }
-            let cond_endpoint = format!("{component}.{}", info.name);
-            let routed = self
-                .plan
-                .dataflow()
-                .iter()
-                .find(|edge| edge.to == cond_endpoint)
-                .and_then(|edge| tensors.get(&edge.from));
-            let value = tensors
-                .get(&cond_endpoint)
-                .or(routed)
-                .with_context(|| format!("missing embedding fusion input '{cond_endpoint}'"))?;
-            conditioning.push((info.name.clone(), coerce_value_to_dtype(value, info.dtype)?));
+            .edges_to_component(decoder)
+            .filter(|edge| endpoint_component(&edge.from).is_some_and(|from| from != decoder))
+        {
+            let (_, input) = parse_endpoint(&edge.to)?;
+            edges.push((edge.from.clone(), input.to_string()));
         }
-        let token_input = token_input.with_context(|| {
-            format!(
-                "embedding fusion component '{component}' must consume a token input (input_ids) \
-                 so the decode loop can embed the running token each step"
-            )
-        })?;
-        let prefill = clone_value(tensors.get(&edge.from).with_context(|| {
-            format!(
-                "prompt-phase embeddings '{}' were not produced; the fusion component must run \
-                 in the prompt phase to seed prefill",
-                edge.from
-            )
-        })?)?;
+        Ok(edges)
+    }
 
-        Ok(Some(EmbedsStepBinding {
-            decoder_input,
-            component,
-            output,
-            token_input,
-            conditioning,
-            prefill,
-        }))
+    /// Bind each declared `every_step` component to its generic input contract.
+    ///
+    /// The single running-token port comes from the component's explicit
+    /// `io.token_input` metadata — never a tensor-name heuristic. Every other
+    /// input is resolved from the shared pool on each step (directly by endpoint
+    /// or through a dataflow edge), so cross-conditioning (e.g. image features)
+    /// and chained per-step outputs both work without special-casing. This is
+    /// the generic replacement for the former one-output `inputs_embeds` fusion
+    /// binding: on prefill every component runs over the full prompt, on decode
+    /// over the single running token, and all of its outputs are published back
+    /// into the pool for routing into the decoder. Returns owned bindings so the
+    /// caller can pair each with its loaded session without extending the borrow.
+    fn build_step_bindings(
+        &self,
+        step_components: &[String],
+    ) -> anyhow::Result<Vec<StepComponentBinding>> {
+        let mut bindings = Vec::with_capacity(step_components.len());
+        for component in step_components {
+            let session = self.models.session(component).with_context(|| {
+                format!("pipeline every_step component '{component}' was not loaded")
+            })?;
+            let token_input = self
+                .models
+                .directory
+                .spec
+                .models
+                .get(component)
+                .and_then(|spec| spec.io.as_ref())
+                .and_then(|io| io.token_input.clone());
+            if let Some(port) = &token_input
+                && !session.inputs().iter().any(|info| &info.name == port)
+            {
+                anyhow::bail!(
+                    "every_step component '{component}' declares io.token_input '{port}' but \
+                     the graph does not expose it; graph inputs: {:?}",
+                    session.input_names()
+                );
+            }
+            let mut routed_inputs = Vec::new();
+            for info in session.inputs() {
+                if token_input.as_deref() == Some(info.name.as_str()) {
+                    continue;
+                }
+                let endpoint = format!("{component}.{}", info.name);
+                let routed_from = self
+                    .plan
+                    .dataflow()
+                    .iter()
+                    .find(|edge| edge.to == endpoint)
+                    .map(|edge| edge.from.clone());
+                routed_inputs.push(StepComponentInput {
+                    port: info.name.clone(),
+                    endpoint,
+                    routed_from,
+                    dtype: info.dtype,
+                });
+            }
+            bindings.push(StepComponentBinding {
+                component: component.clone(),
+                token_input,
+                routed_inputs,
+            });
+        }
+        Ok(bindings)
     }
 }
 
@@ -1670,17 +1674,12 @@ fn expand_image_placeholders_count_based(
     };
 
     if tokens_per_tile == 0 {
-        anyhow::bail!(
-            "pipeline metadata tokens_per_tile is 0; must be at least 1"
-        );
+        anyhow::bail!("pipeline metadata tokens_per_tile is 0; must be at least 1");
     }
 
-    let placeholder_id: TokenId = u32::try_from(placeholder_i64)
-        .with_context(|| {
-            format!(
-                "image_placeholder_token_id {placeholder_i64} is out of range for token ID (u32)"
-            )
-        })?;
+    let placeholder_id: TokenId = u32::try_from(placeholder_i64).with_context(|| {
+        format!("image_placeholder_token_id {placeholder_i64} is out of range for token ID (u32)")
+    })?;
 
     let placeholder_count = prompt_tokens
         .iter()
@@ -1700,9 +1699,9 @@ fn expand_image_placeholders_count_based(
         );
     }
 
-    let expansion: usize = tokens_per_tile
-        .checked_mul(num_tiles)
-        .context("image token expansion overflow: tokens_per_tile * num_image_tiles is too large")?;
+    let expansion: usize = tokens_per_tile.checked_mul(num_tiles).context(
+        "image token expansion overflow: tokens_per_tile * num_image_tiles is too large",
+    )?;
 
     // The single placeholder expands to `expansion` copies; all other tokens are kept.
     let new_len = prompt_tokens
@@ -1736,104 +1735,123 @@ fn expand_image_placeholders_count_based(
     Ok(expanded)
 }
 
-/// Per-step embedding fusion for a decoder whose prompt input is `inputs_embeds`
-/// (Gemma4-style VLM) rather than `input_ids`. Built by
-/// [`PipelineEngine::embeds_step_binding`].
+/// One generic `every_step` pipeline component and its declared input contract.
 ///
-/// The decoder has no token input of its own, so each decode step re-runs the
-/// fusion component to embed the running token into a single-token
-/// `inputs_embeds`. The prompt (prefill) step reuses the full-prompt embeddings
-/// already produced in the prompt phase.
-struct EmbedsStepBinding {
-    /// Decoder input port that receives the fused embeddings (`inputs_embeds`).
-    decoder_input: String,
-    /// Prompt-phase fusion component that produces the embeddings.
+/// Built by [`PipelineEngine::build_step_bindings`]. On every autoregressive
+/// step the component runs over the current token seed (the full prompt during
+/// prefill, the single running token during decode) and all of its outputs are
+/// published back into the shared pool, from where the decoder's routed inputs
+/// are refreshed. This is the architecture-neutral replacement for the former
+/// one-output `inputs_embeds` fusion special case: it refreshes every declared
+/// sequence-dependent output, and never inspects tensor names to decide roles.
+struct StepComponentBinding {
+    /// Component name (pool endpoints are `component.port`).
     component: String,
-    /// The fusion component's output port routed to `decoder_input`.
-    output: String,
-    /// The fusion component's token input port (`input_ids`).
-    token_input: String,
-    /// Fusion conditioning (e.g. `image_features`) resolved once from the pool
-    /// and re-supplied unchanged on every decode step.
-    conditioning: Vec<(String, Value)>,
-    /// Full-prompt embeddings from the prompt phase, reused for the prefill step.
-    prefill: Value,
+    /// The port seeded with the running token(s), from explicit `io.token_input`
+    /// metadata. `None` when the component takes no running-token input (all of
+    /// its inputs are routed / fixed conditioning).
+    token_input: Option<String>,
+    /// Every non-token input, resolved from the shared pool on each step.
+    routed_inputs: Vec<StepComponentInput>,
+}
+
+/// A single non-token input of a [`StepComponentBinding`], resolved from the
+/// shared pool each step (directly by `endpoint`, else via the `routed_from`
+/// dataflow source).
+struct StepComponentInput {
+    /// Graph input port name on the component.
+    port: String,
+    /// This port's own pool endpoint (`component.port`).
+    endpoint: String,
+    /// Dataflow-edge source endpoint feeding this port, if any.
+    routed_from: Option<String>,
+    /// Declared graph-input dtype to coerce the routed value to.
+    dtype: DataType,
 }
 
 struct PipelineDecodeLoopBackend<'a> {
     decoder: &'a Session,
     decoder_state: &'a mut DecodeState,
-    decoder_extras: &'a [(String, Value)],
-    /// Fusion component session, present iff `embeds_binding` is `Some`.
-    embed_session: Option<&'a Session>,
-    /// Per-step `inputs_embeds` fusion binding for a Gemma4-style VLM decoder.
-    embeds_binding: Option<EmbedsStepBinding>,
+    /// Shared tensor pool: external inputs + prompt-phase outputs + the
+    /// per-step outputs of the `every_step` components (refreshed each step).
+    pool: &'a mut PipelineTensors,
+    /// Declared `every_step` components (with their loaded sessions), executed in
+    /// topological order on every step before the decoder runs.
+    step_components: Vec<(StepComponentBinding, &'a Session)>,
+    /// `(source_endpoint, decoder_input_port)` routing recomputed each step.
+    decoder_in_edges: Vec<(String, String)>,
     context_tokens: Vec<TokenId>,
     prompt_len: usize,
     generated_count: usize,
 }
 
 impl PipelineDecodeLoopBackend<'_> {
-    /// Build this step's decoder extra inputs. When an [`EmbedsStepBinding`] is
-    /// active, append a freshly-computed `inputs_embeds`: the full-prompt
-    /// embeddings on prefill, or the re-embedded running token on later steps.
-    fn step_extras(&self) -> anyhow::Result<Vec<(String, Value)>> {
-        let Some(binding) = &self.embeds_binding else {
-            return self
-                .decoder_extras
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), clone_value(value)?)))
-                .collect();
-        };
-        let embeds = if self.generated_count == 0 {
-            clone_value(&binding.prefill)?
-        } else {
-            // Re-embed only the running (last generated) token. It is text-only
-            // with no image placeholder, so the fusion yields the pure token
-            // embedding; image conditioning is re-supplied but contributes zero.
-            let embed_session = self
-                .embed_session
-                .expect("embeds binding implies a loaded fusion session");
-            let last = *self
-                .context_tokens
-                .last()
-                .expect("a decode step always has a prior token");
+    /// Run every declared `every_step` component over `seed` (the full prompt on
+    /// prefill, the single running token on decode), publishing all of their
+    /// outputs into the shared pool. Topological order ensures a component sees
+    /// any upstream `every_step` output produced earlier in the same step.
+    fn run_step_components(&mut self, seed: &[TokenId]) -> anyhow::Result<()> {
+        if self.step_components.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = seed.iter().map(|&t| i64::from(t)).collect();
+        let seq = ids.len() as i64;
+        for (binding, session) in &self.step_components {
             let mut inputs: Vec<(String, Value)> =
-                Vec::with_capacity(binding.conditioning.len() + 1);
-            inputs.push((
-                binding.token_input.clone(),
-                Value::from_slice_i64(&[i64::from(last)], &[1, 1])?,
-            ));
-            for (name, value) in &binding.conditioning {
-                inputs.push((name.clone(), clone_value(value)?));
+                Vec::with_capacity(binding.routed_inputs.len() + 1);
+            for routed in &binding.routed_inputs {
+                let value = self
+                    .pool
+                    .get(&routed.endpoint)
+                    .or_else(|| {
+                        routed
+                            .routed_from
+                            .as_deref()
+                            .and_then(|from| self.pool.get(from))
+                    })
+                    .with_context(|| {
+                        format!(
+                            "missing input '{}' for every_step component '{}'",
+                            routed.endpoint, binding.component
+                        )
+                    })?;
+                inputs.push((
+                    routed.port.clone(),
+                    coerce_value_to_dtype(value, routed.dtype)?,
+                ));
+            }
+            if let Some(port) = &binding.token_input {
+                inputs.push((port.clone(), Value::from_slice_i64(&ids, &[1, seq])?));
             }
             let refs = inputs
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
                 .collect::<Vec<_>>();
-            let outputs = embed_session.run(&refs).map_err(|e| {
+            let outputs = session.run(&refs).map_err(|e| {
                 anyhow::anyhow!(
-                    "ORT embedding fusion '{}' failed during decode: {e}",
+                    "ORT every_step component '{}' failed: {e}",
                     binding.component
                 )
             })?;
-            let index = embed_session
-                .output_names()
-                .iter()
-                .position(|name| name == &binding.output)
-                .with_context(|| {
-                    format!(
-                        "embedding fusion component '{}' has no output '{}'",
-                        binding.component, binding.output
-                    )
-                })?;
-            clone_value(&outputs[index])?
-        };
-        let mut extras = Vec::with_capacity(self.decoder_extras.len() + 1);
-        for (name, value) in self.decoder_extras {
-            extras.push((name.clone(), clone_value(value)?));
+            for (name, value) in session.output_names().iter().zip(outputs) {
+                self.pool
+                    .insert(format!("{}.{}", binding.component, name), value);
+            }
         }
-        extras.push((binding.decoder_input.clone(), embeds));
+        Ok(())
+    }
+
+    /// Build this step's decoder extra inputs by re-reading every routed source
+    /// endpoint from the shared pool. `every_step` outputs are already fresh
+    /// (just re-run); cached `prompt_only` conditioning is simply re-read.
+    fn decoder_extras(&self) -> anyhow::Result<Vec<(String, Value)>> {
+        let mut extras = Vec::with_capacity(self.decoder_in_edges.len());
+        for (from, port) in &self.decoder_in_edges {
+            let value = self.pool.get(from).with_context(|| {
+                format!("missing routed pipeline tensor '{from}' for decoder input '{port}'")
+            })?;
+            extras.push((port.clone(), clone_value(value)?));
+        }
         Ok(extras)
     }
 }
@@ -1864,7 +1882,11 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         } else {
             self.context_tokens.clone()
         };
-        let extras = self.step_extras()?;
+        // Refresh every `every_step` component over exactly the tokens the
+        // decoder is about to consume, then route their (and any cached) outputs
+        // into the decoder for this step.
+        self.run_step_components(&input_tokens)?;
+        let extras = self.decoder_extras()?;
         let outputs = run_decode_step_with_extra(
             self.decoder,
             self.decoder_state,
@@ -1943,6 +1965,16 @@ enum CompositeStageKind {
 struct AutoregressivePlan {
     decoder: String,
     prompt_components: Vec<String>,
+    /// Upstream components declared `every_step`: run on **every** autoregressive
+    /// step — over the full expanded prompt during prefill and over the single
+    /// running token during decode — in topological order, with all of their
+    /// outputs routed into the decoder for that same step. This is the generic
+    /// per-step component contract that replaces the former one-output
+    /// `inputs_embeds` fusion special case: it refreshes every declared output
+    /// (e.g. both `inputs_embeds` and a second sequence-dependent tensor), never
+    /// just one, and never inspects tensor names to do so. Empty for a
+    /// conventional text decoder.
+    step_components: Vec<String>,
     /// Single-pass components declared `final_only`: run once, in declared
     /// order, after the decode loop completes (e.g. a TTS vocoder). Empty for a
     /// conventional text decoder or a Whisper-style ASR pipeline.
@@ -2117,7 +2149,8 @@ fn dump_iterative_step(denoiser: &str, port: &str, step: usize, value: &Value, s
             .map(|data| serde_json::json!({"dtype": "f32", "shape": shape, "data": data, "step_ms": step_ms})),
     };
     if let Some(payload) = payload {
-        let path = std::path::Path::new(&dir).join(format!("step_{step:04}_{denoiser}_{port}.json"));
+        let path =
+            std::path::Path::new(&dir).join(format!("step_{step:04}_{denoiser}_{port}.json"));
         let _ = std::fs::write(path, payload.to_string());
     }
 }
@@ -2596,7 +2629,9 @@ impl Scheduler for MaskedDiffusion {
                 output[row_start + offset] = self.mask_token_id;
             }
         }
-        Value::from_slice_i64(&output, &shape).map(Some).map_err(Into::into)
+        Value::from_slice_i64(&output, &shape)
+            .map(Some)
+            .map_err(Into::into)
     }
 
     fn step(
@@ -2622,7 +2657,10 @@ impl Scheduler for MaskedDiffusion {
         // and the transfer schedule are computed independently per sequence
         // (matching LLaDA's per-batch-row `topk`). Rank-1 inputs are one row.
         let sequence_length = *token_shape.last().unwrap_or(&(sequence_count as i64)) as usize;
-        let batch = sequence_count.checked_div(sequence_length).unwrap_or(0).max(1);
+        let batch = sequence_count
+            .checked_div(sequence_length)
+            .unwrap_or(0)
+            .max(1);
 
         // Capture each sequence's generation-region start on the first step.
         self.ensure_generation_start(&tokens, batch, sequence_length);
@@ -2709,8 +2747,7 @@ impl Scheduler for MaskedDiffusion {
                             continue;
                         }
                         if last_step_in_block || unmask_uniform(step, position) < unmask_prob {
-                            let logit_row =
-                                &all_logits[position * vocab..(position + 1) * vocab];
+                            let logit_row = &all_logits[position * vocab..(position + 1) * vocab];
                             output[position] = self.sample_token(logit_row, step, position, vocab);
                         }
                     }
@@ -2776,9 +2813,7 @@ impl DdimSchedule {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
         }
         if num_steps == 0 || num_steps > num_train_timesteps {
-            anyhow::bail!(
-                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
-            );
+            anyhow::bail!("scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}");
         }
         // Beta schedule -> cumulative product of alphas.
         //   linear:        beta_i = lerp(beta_start, beta_end)
@@ -2854,8 +2889,12 @@ impl Scheduler for DdimSchedule {
         model_output: &Value,
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
-        let stepped =
-            DdimSchedule::step(self, step, &sample.to_vec_f32_lossy()?, &model_output.to_vec_f32_lossy()?)?;
+        let stepped = DdimSchedule::step(
+            self,
+            step,
+            &sample.to_vec_f32_lossy()?,
+            &model_output.to_vec_f32_lossy()?,
+        )?;
         Value::from_slice_f32(&stepped, &shape).map_err(Into::into)
     }
 
@@ -2891,15 +2930,21 @@ impl EulerSchedule {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
         }
         if num_steps == 0 || num_steps > num_train_timesteps {
-            anyhow::bail!(
-                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
-            );
+            anyhow::bail!("scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}");
         }
-        if let Some(sigmas) =
-            spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
-        {
+        if let Some(sigmas) = spacing_sigmas(
+            spacing,
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule,
+            num_steps,
+        )? {
             let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
-            let timesteps = sigmas[..num_steps].iter().map(|&s| sigma_to_t(&train, s)).collect();
+            let timesteps = sigmas[..num_steps]
+                .iter()
+                .map(|&s| sigma_to_t(&train, s))
+                .collect();
             return Ok(Self { sigmas, timesteps });
         }
         let denom = (num_train_timesteps - 1) as f32;
@@ -2923,7 +2968,11 @@ impl EulerSchedule {
         }
         // "linspace" timesteps: evenly spaced over [0, N-1], taken descending,
         // with sigmas linearly interpolated at each (fractional) timestep.
-        let ts_denom = if num_steps > 1 { (num_steps - 1) as f32 } else { 1.0 };
+        let ts_denom = if num_steps > 1 {
+            (num_steps - 1) as f32
+        } else {
+            1.0
+        };
         let interp = |t: f32| -> f32 {
             let low = t.floor().max(0.0) as usize;
             let high = (low + 1).min(num_train_timesteps - 1);
@@ -3031,7 +3080,10 @@ impl EulerAncestral {
             num_steps,
             spacing,
         )?;
-        Ok(Self { sigmas: euler.sigmas, timesteps: euler.timesteps })
+        Ok(Self {
+            sigmas: euler.sigmas,
+            timesteps: euler.timesteps,
+        })
     }
 }
 
@@ -3069,9 +3121,15 @@ impl Scheduler for EulerAncestral {
             .sqrt();
         let sigma_down = (sigma_to * sigma_to - sigma_up * sigma_up).max(0.0).sqrt();
         let dt = sigma_down - sigma_from;
-        let noise = noise.context("euler_ancestral requires per-step noise")?.to_vec_f32_lossy()?;
+        let noise = noise
+            .context("euler_ancestral requires per-step noise")?
+            .to_vec_f32_lossy()?;
         if noise.len() != x.len() {
-            anyhow::bail!("euler_ancestral noise length {} != sample {}", noise.len(), x.len());
+            anyhow::bail!(
+                "euler_ancestral noise length {} != sample {}",
+                noise.len(),
+                x.len()
+            );
         }
         let out: Vec<f32> = (0..x.len())
             .map(|i| x[i] + eps[i] * dt + noise[i] * sigma_up)
@@ -3086,7 +3144,11 @@ impl Scheduler for EulerAncestral {
         sample: &Value,
     ) -> anyhow::Result<Option<Value>> {
         let factor = (self.sigmas[step] * self.sigmas[step] + 1.0).sqrt();
-        let scaled: Vec<f32> = sample.to_vec_f32_lossy()?.iter().map(|&x| x / factor).collect();
+        let scaled: Vec<f32> = sample
+            .to_vec_f32_lossy()?
+            .iter()
+            .map(|&x| x / factor)
+            .collect();
         Ok(Some(Value::from_slice_f32(&scaled, sample.shape())?))
     }
 
@@ -3131,15 +3193,21 @@ impl Dpmpp2m {
             anyhow::bail!("scheduler num_train_timesteps must be >= 2");
         }
         if num_steps == 0 || num_steps > num_train_timesteps {
-            anyhow::bail!(
-                "scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}"
-            );
+            anyhow::bail!("scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}");
         }
-        if let Some(sigmas) =
-            spacing_sigmas(spacing, num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps)?
-        {
+        if let Some(sigmas) = spacing_sigmas(
+            spacing,
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule,
+            num_steps,
+        )? {
             let train = training_sigmas(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
-            let timesteps = sigmas[..num_steps].iter().map(|&s| sigma_to_t(&train, s)).collect();
+            let timesteps = sigmas[..num_steps]
+                .iter()
+                .map(|&s| sigma_to_t(&train, s))
+                .collect();
             return Ok(Self {
                 sigmas,
                 timesteps,
@@ -3228,7 +3296,10 @@ fn training_sigmas(
 /// timesteps are not the sigma indices.
 fn sigma_to_t(train: &[f32], sigma: f32) -> f32 {
     let log_sigma = sigma.max(1e-10).ln();
-    let count = train.iter().filter(|&&s| s.max(1e-10).ln() <= log_sigma).count();
+    let count = train
+        .iter()
+        .filter(|&&s| s.max(1e-10).ln() <= log_sigma)
+        .count();
     let low_idx = count.saturating_sub(1).min(train.len().saturating_sub(2));
     let high_idx = low_idx + 1;
     let low = train[low_idx].max(1e-10).ln();
@@ -3299,9 +3370,7 @@ fn sigma_spacing(cfg: &SchedulerSpec) -> anyhow::Result<&'static str> {
     let karras = cfg.use_karras_sigmas.unwrap_or(false);
     let exponential = cfg.use_exponential_sigmas.unwrap_or(false);
     if karras && exponential {
-        anyhow::bail!(
-            "scheduler cannot set both use_karras_sigmas and use_exponential_sigmas"
-        );
+        anyhow::bail!("scheduler cannot set both use_karras_sigmas and use_exponential_sigmas");
     }
     Ok(if karras {
         "karras"
@@ -3324,10 +3393,18 @@ fn spacing_sigmas(
 ) -> anyhow::Result<Option<Vec<f32>>> {
     match spacing {
         "karras" => Ok(Some(karras_sigmas(
-            num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps,
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule,
+            num_steps,
         )?)),
         "exponential" => Ok(Some(exponential_sigmas(
-            num_train_timesteps, beta_start, beta_end, beta_schedule, num_steps,
+            num_train_timesteps,
+            beta_start,
+            beta_end,
+            beta_schedule,
+            num_steps,
         )?)),
         "linspace" | "" => Ok(None),
         other => anyhow::bail!("unsupported sigma spacing '{other}' (karras/exponential/linspace)"),
@@ -3346,7 +3423,11 @@ impl Scheduler for Dpmpp2m {
         let x = sample.to_vec_f32_lossy()?;
         let eps = model_output.to_vec_f32_lossy()?;
         if x.len() != eps.len() {
-            anyhow::bail!("dpm++ sample/eps length mismatch: {} vs {}", x.len(), eps.len());
+            anyhow::bail!(
+                "dpm++ sample/eps length mismatch: {} vs {}",
+                x.len(),
+                eps.len()
+            );
         }
 
         let sigma = self.sigmas[step];
@@ -3456,10 +3537,12 @@ impl PipelinePlan {
             anyhow::bail!("pipeline decoder '{decoder}' is not declared in models");
         }
         let prompt_components = prompt_phase_components(spec, &decoder)?;
+        let step_components = step_phase_components(spec, &decoder)?;
         let post_decode_components = post_decode_components(spec, &decoder)?;
         Ok(Self::Autoregressive(AutoregressivePlan {
             decoder,
             prompt_components,
+            step_components,
             post_decode_components,
             dataflow: spec.dataflow.clone(),
         }))
@@ -3726,7 +3809,10 @@ impl PipelinePlan {
             let kind = match stage.strategy.kind {
                 PipelineStrategyKind::SinglePass => {
                     let model = stage.strategy.model.clone().with_context(|| {
-                        format!("composite stage '{}' (single_pass) is missing 'model'", stage.name)
+                        format!(
+                            "composite stage '{}' (single_pass) is missing 'model'",
+                            stage.name
+                        )
                     })?;
                     if !spec.models.contains_key(&model) {
                         anyhow::bail!(
@@ -3866,7 +3952,11 @@ impl PipelinePlan {
             timestep_input: spec.strategy.timestep_input.clone(),
             start_step,
             timesteps: spec.strategy.timesteps.clone(),
-            scheduler: build_scheduler(spec.strategy.scheduler_config.as_ref(), num_steps, schedulers)?,
+            scheduler: build_scheduler(
+                spec.strategy.scheduler_config.as_ref(),
+                num_steps,
+                schedulers,
+            )?,
             cfg_conditioning_input: spec.strategy.cfg_conditioning_input.clone(),
             dataflow: spec.dataflow.clone(),
             scheduler_spec: spec.strategy.scheduler_config.clone(),
@@ -3918,6 +4008,30 @@ fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result
         }
     }
     Ok(prompt_components)
+}
+
+/// Collect the `every_step`-phase components (excluding the `decoder` itself) in
+/// topological order.
+///
+/// These upstream components run on **every** autoregressive step: over the full
+/// expanded prompt during prefill and over the single running token during
+/// decode. Their outputs are routed into the decoder for that same step, so a
+/// component that emits several sequence-dependent tensors (for example both
+/// `inputs_embeds` and a per-layer conditioning tensor) has all of them
+/// refreshed generically — the engine never special-cases a single output or
+/// infers roles from tensor names. Topological order lets one `every_step`
+/// component consume an earlier one's freshly produced output within the step.
+fn step_phase_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<Vec<String>> {
+    let mut step = Vec::new();
+    for component in topological_components(spec)? {
+        if component == decoder {
+            continue;
+        }
+        if let PhaseRunOn::EveryStep = component_phase(spec, &component, decoder) {
+            step.push(component);
+        }
+    }
+    Ok(step)
 }
 
 /// Collect the `final_only`-phase components in dataflow order: single-pass
@@ -4233,7 +4347,11 @@ mod tests {
         assert!((n0[0] - std::f32::consts::SQRT_2).abs() < 1e-5, "{}", n0[0]);
         // x=1, e=1 -> x0_hat = (1 - sqrt(0.5))/sqrt(0.5) = sqrt(2) - 1 ~= 0.41421356
         let n1 = sched.step(0, &[1.0], &[1.0]).unwrap();
-        assert!((n1[0] - (std::f32::consts::SQRT_2 - 1.0)).abs() < 1e-5, "{}", n1[0]);
+        assert!(
+            (n1[0] - (std::f32::consts::SQRT_2 - 1.0)).abs() < 1e-5,
+            "{}",
+            n1[0]
+        );
     }
 
     #[test]
@@ -4250,8 +4368,9 @@ mod tests {
         // uses `linspace(0, num_train-1, num_steps+1).round()[::-1][:-1]`.
         let num_train = 1000usize;
         let num_steps = 25usize;
-        let sched = Dpmpp2m::with_schedule(num_train, 0.00085, 0.012, "scaled_linear", num_steps, "")
-            .expect("schedule builds");
+        let sched =
+            Dpmpp2m::with_schedule(num_train, 0.00085, 0.012, "scaled_linear", num_steps, "")
+                .expect("schedule builds");
         let timesteps = sched.timesteps().expect("dpm++ exposes timesteps");
         let denom = (num_train - 1) as f32;
         let mut expected: Vec<f32> = (0..=num_steps)
@@ -4260,7 +4379,11 @@ mod tests {
         expected.reverse();
         expected.pop();
         assert_eq!(timesteps.len(), num_steps);
-        assert!((timesteps[0] - 999.0).abs() < 1e-3, "first timestep {}", timesteps[0]);
+        assert!(
+            (timesteps[0] - 999.0).abs() < 1e-3,
+            "first timestep {}",
+            timesteps[0]
+        );
         for (got, want) in timesteps.iter().zip(&expected) {
             assert!((got - want).abs() < 1e-3, "timestep {got} != {want}");
         }
@@ -4309,7 +4432,9 @@ mod tests {
             sched.reset();
             let mut value = Value::from_slice_i64(&seed, &[1, seq as i64]).expect("seed");
             for step in 0..num_steps {
-                value = sched.step(step, num_steps, &value, &logits_value).expect("step");
+                value = sched
+                    .step(step, num_steps, &value, &logits_value)
+                    .expect("step");
             }
             value.to_vec_i64().expect("tokens")
         };
@@ -4317,7 +4442,10 @@ mod tests {
         let out = run(&sched);
         assert_eq!(&out[..prompt_len], &[1, 2], "prompt prefix preserved");
         for (pos, &tok) in out.iter().enumerate() {
-            assert_ne!(tok, mask_id, "position {pos} still masked / emitted the mask token");
+            assert_ne!(
+                tok, mask_id,
+                "position {pos} still masked / emitted the mask token"
+            );
         }
         for (offset, &token) in out[prompt_len..seq].iter().enumerate() {
             let pos = prompt_len + offset;
@@ -4353,7 +4481,11 @@ mod tests {
             sample = sched.step(step, num_steps, &sample, &eps).unwrap();
         }
         assert!(
-            sample.to_vec_f32().unwrap().iter().all(|value| value.is_finite()),
+            sample
+                .to_vec_f32()
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite()),
             "final dpm++ sample must be finite"
         );
     }
@@ -4555,6 +4687,7 @@ pipeline:
                 ),
             ]),
             vision: None,
+            positions: None,
         };
 
         let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
@@ -4634,6 +4767,7 @@ pipeline:
             },
             phases: BTreeMap::new(),
             vision: None,
+            positions: None,
         };
 
         let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
@@ -4678,6 +4812,7 @@ pipeline:
             },
             phases: BTreeMap::new(),
             vision: None,
+            positions: None,
         };
         let error = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin()).unwrap_err();
         assert!(
@@ -4690,6 +4825,7 @@ pipeline:
         PipelineVisionConfig {
             image_placeholder_token_id: Some(placeholder_id),
             tokens_per_tile: Some(tpt),
+            ..Default::default()
         }
     }
 
@@ -4698,8 +4834,7 @@ pipeline:
         // [1, PLACEHOLDER, 2] with 2 tiles × 3 tokens/tile → [1, IMG, IMG, IMG, IMG, IMG, IMG, 2]
         let tokens: Vec<TokenId> = vec![1, 100, 2];
         let cfg = vision_config(100, 3);
-        let expanded =
-            expand_image_placeholders_count_based(tokens, Some(2), Some(&cfg)).unwrap();
+        let expanded = expand_image_placeholders_count_based(tokens, Some(2), Some(&cfg)).unwrap();
         assert_eq!(expanded, vec![1, 100, 100, 100, 100, 100, 100, 2]);
     }
 
@@ -4708,10 +4843,10 @@ pipeline:
         // Count-based path only supports a single placeholder; >1 must error.
         let tokens: Vec<TokenId> = vec![100, 5, 100];
         let cfg = vision_config(100, 4);
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
         assert!(
-            err.to_string().contains("multi-image count-based expansion is not supported"),
+            err.to_string()
+                .contains("multi-image count-based expansion is not supported"),
             "unexpected error: {err}"
         );
     }
@@ -4720,15 +4855,15 @@ pipeline:
     fn image_placeholder_expansion_none_tiles_is_noop() {
         let tokens: Vec<TokenId> = vec![1, 100, 2];
         let cfg = vision_config(100, 256);
-        let result = expand_image_placeholders_count_based(tokens.clone(), None, Some(&cfg)).unwrap();
+        let result =
+            expand_image_placeholders_count_based(tokens.clone(), None, Some(&cfg)).unwrap();
         assert_eq!(result, tokens);
     }
 
     #[test]
     fn image_placeholder_expansion_no_vision_config_with_tiles_errors() {
         let tokens: Vec<TokenId> = vec![1, 100, 2];
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(1), None).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(1), None).unwrap_err();
         assert!(err.to_string().contains("no vision section"));
     }
 
@@ -4738,9 +4873,9 @@ pipeline:
         let cfg = PipelineVisionConfig {
             image_placeholder_token_id: Some(100),
             tokens_per_tile: None,
+            ..Default::default()
         };
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
         assert!(err.to_string().contains("vision contract is incomplete"));
     }
 
@@ -4748,8 +4883,7 @@ pipeline:
     fn image_placeholder_expansion_missing_placeholder_errors() {
         let tokens: Vec<TokenId> = vec![1, 2, 3];
         let cfg = vision_config(100, 4);
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
         assert!(err.to_string().contains("no image placeholder token"));
     }
 
@@ -4759,9 +4893,9 @@ pipeline:
         let cfg = PipelineVisionConfig {
             image_placeholder_token_id: Some(-1),
             tokens_per_tile: Some(4),
+            ..Default::default()
         };
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
         assert!(err.to_string().contains("out of range"));
     }
 
@@ -4769,8 +4903,7 @@ pipeline:
     fn image_placeholder_expansion_tokens_per_tile_zero_errors() {
         let tokens: Vec<TokenId> = vec![1, 100, 2];
         let cfg = vision_config(100, 0);
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(1), Some(&cfg)).unwrap_err();
         assert!(
             err.to_string().contains("tokens_per_tile is 0"),
             "unexpected error: {err}"
@@ -4782,8 +4915,7 @@ pipeline:
         // tokens_per_tile=4, num_tiles=0 → expansion=0 → prompt becomes empty
         let tokens: Vec<TokenId> = vec![100];
         let cfg = vision_config(100, 4);
-        let err =
-            expand_image_placeholders_count_based(tokens, Some(0), Some(&cfg)).unwrap_err();
+        let err = expand_image_placeholders_count_based(tokens, Some(0), Some(&cfg)).unwrap_err();
         assert!(
             err.to_string().contains("empty token sequence"),
             "unexpected error: {err}"

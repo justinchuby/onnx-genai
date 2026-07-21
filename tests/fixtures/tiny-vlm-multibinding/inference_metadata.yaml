@@ -1,0 +1,35 @@
+# Tiny VLM multi-binding pipeline fixture (VLM WP3).
+# Built by scripts/build_tiny_vlm_multibinding.py. The every_step `embedding`
+# component emits TWO sequence-dependent tensors (inputs_embeds AND aux), both
+# routed into a decoder that ALSO consumes the raw input_ids token stream. The
+# generic executor refreshes every declared output each step; the running-token
+# port is declared explicitly via io.token_input (no tensor-name heuristics).
+pipeline:
+  models:
+    embedding:
+      filename: embedding.onnx.textproto
+      type: encoder
+      io:
+        token_input: input_ids
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+  dataflow:
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+    - from: embedding.aux
+      to: decoder.aux
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+    max_tokens: 4
+  phases:
+    embedding:
+      run_on: every_step
+    decoder:
+      run_on: every_step
