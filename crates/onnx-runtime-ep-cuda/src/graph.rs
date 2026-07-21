@@ -11,10 +11,10 @@ use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
 
-enum GraphState {
+/// Whether the lifecycle is currently recording a segment, and on which thread.
+enum CaptureState {
     Idle,
     Capturing(ThreadId),
-    Ready(CapturedGraph),
 }
 
 /// Owns the graph and graph-exec handles created from one runtime stream.
@@ -99,20 +99,32 @@ impl Drop for CapturedGraph {
     }
 }
 
-/// Owns the captured graph installed on one EP runtime stream.
+/// Owns the captured graph segments installed on one EP runtime stream.
 ///
 /// `CapturedGraph` is intentionally neither `Send` nor `Sync`. CUDA permits graph
 /// objects to cross threads only when every access is externally serialized.
 /// This wrapper enforces that rule with one mutex and never exposes a graph
 /// handle or performs graph work without holding its guard.
+///
+/// A whole-subgraph capture installs exactly one segment. Segmented capture —
+/// used when only parts of a claimed subgraph are device-graph capturable —
+/// installs one segment per maximal capturable run; the non-capturable seam
+/// nodes execute eagerly between segment replays. Segments launch in capture
+/// order and each is destroyed exactly once on reset/drop.
 pub(crate) struct CudaGraphLifecycle {
     stream: Arc<CudaStream>,
-    state: Mutex<GraphState>,
+    state: Mutex<LifecycleState>,
 }
 
-// SAFETY: all access to the non-Send/non-Sync `CudaGraph` is confined to
-// `state`, every method holds that mutex for the complete CUDA graph API call,
-// and the graph always launches on its single owning `stream`.
+/// The capture flag and the ordered list of installed segment executables.
+struct LifecycleState {
+    capture: CaptureState,
+    segments: Vec<CapturedGraph>,
+}
+
+// SAFETY: all access to the non-Send/non-Sync `CapturedGraph` handles is
+// confined to `state`, every method holds that mutex for the complete CUDA graph
+// API call, and every segment launches on its single owning `stream`.
 unsafe impl Send for CudaGraphLifecycle {}
 // SAFETY: the same serialized-access invariant covers shared references.
 unsafe impl Sync for CudaGraphLifecycle {}
@@ -121,30 +133,29 @@ impl CudaGraphLifecycle {
     pub(crate) fn new(stream: Arc<CudaStream>) -> Self {
         Self {
             stream,
-            state: Mutex::new(GraphState::Idle),
+            state: Mutex::new(LifecycleState {
+                capture: CaptureState::Idle,
+                segments: Vec::new(),
+            }),
         }
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, GraphState>> {
+    fn lock(&self) -> Result<MutexGuard<'_, LifecycleState>> {
         self.state.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep: CUDA graph lifecycle lock was poisoned".into())
         })
     }
 
+    /// Begin recording a new segment. Additional segments may be captured while
+    /// earlier ones are already installed (segmented capture); only a second
+    /// concurrent capture is rejected.
     pub(crate) fn begin(&self) -> Result<()> {
         let mut state = self.lock()?;
-        match &*state {
-            GraphState::Idle => {}
-            GraphState::Capturing(_) => {
+        match state.capture {
+            CaptureState::Idle => {}
+            CaptureState::Capturing(_) => {
                 return Err(EpError::KernelFailed(
                     "cuda_ep: cannot begin CUDA graph capture while capture is already active"
-                        .into(),
-                ));
-            }
-            GraphState::Ready(_) => {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep: cannot begin CUDA graph capture while an executable is installed; \
-                     reset the captured graph first"
                         .into(),
                 ));
             }
@@ -153,31 +164,33 @@ impl CudaGraphLifecycle {
         self.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|error| driver_err("begin CUDA graph stream capture", error))?;
-        *state = GraphState::Capturing(std::thread::current().id());
+        state.capture = CaptureState::Capturing(std::thread::current().id());
         Ok(())
     }
 
+    /// End the active segment capture, instantiate it, and append it to the
+    /// ordered segment list.
     pub(crate) fn end(&self) -> Result<()> {
         let mut state = self.lock()?;
-        match &*state {
-            GraphState::Capturing(owner) if *owner == std::thread::current().id() => {}
-            GraphState::Capturing(_) => {
+        match state.capture {
+            CaptureState::Capturing(owner) if owner == std::thread::current().id() => {}
+            CaptureState::Capturing(_) => {
                 return Err(EpError::KernelFailed(
                     "cuda_ep: CUDA graph capture must end on the thread that began the \
                      thread-local capture"
                         .into(),
                 ));
             }
-            _ => {
+            CaptureState::Idle => {
                 return Err(EpError::KernelFailed(
                     "cuda_ep: cannot end CUDA graph capture because capture is not active".into(),
                 ));
             }
         }
 
-        // Return to Idle even when end/instantiate fails. CUDA has ended or
-        // invalidated the capture at that point, and no executable is usable.
-        *state = GraphState::Idle;
+        // Clear the capture flag even when end/instantiate fails. CUDA has ended
+        // or invalidated the capture at that point, and no executable is usable.
+        state.capture = CaptureState::Idle;
         let graph = CapturedGraph::end_capture(
             &self.stream,
             CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
@@ -191,38 +204,108 @@ impl CudaGraphLifecycle {
         graph
             .upload()
             .map_err(|error| driver_err("upload CUDA graph executable", error))?;
-        *state = GraphState::Ready(graph);
+        state.segments.push(graph);
         Ok(())
     }
 
+    /// Replay every installed segment in capture order. For a whole-subgraph
+    /// capture this is the single installed graph.
     pub(crate) fn replay(&self) -> Result<()> {
         let state = self.lock()?;
-        let GraphState::Ready(graph) = &*state else {
+        if state.segments.is_empty() {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cannot replay CUDA graph because no executable is installed".into(),
             ));
-        };
+        }
+        for graph in &state.segments {
+            graph
+                .launch()
+                .map_err(|error| driver_err("launch CUDA graph executable", error))?;
+        }
+        Ok(())
+    }
+
+    /// Replay one installed segment by its zero-based capture-order index. The
+    /// executor drives this per segment, running the non-capturable seam nodes
+    /// eagerly between replays.
+    pub(crate) fn replay_segment(&self, index: usize) -> Result<()> {
+        let state = self.lock()?;
+        let graph = state.segments.get(index).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: cannot replay CUDA graph segment {index}; only {} segment(s) installed",
+                state.segments.len()
+            ))
+        })?;
         graph
             .launch()
-            .map_err(|error| driver_err("launch CUDA graph executable", error))
+            .map_err(|error| driver_err("launch CUDA graph segment", error))
+    }
+
+    /// Abort an in-progress segment capture: terminate the stream capture,
+    /// discard any half-recorded graph, and return the lifecycle to `Idle`.
+    ///
+    /// This is the recovery path when a node fails mid-record during segmented
+    /// capture. `cuStreamEndCapture` **must** be called to take the stream out
+    /// of capture mode even after the capture was invalidated — otherwise the
+    /// stream stays wedged and every later launch fails with
+    /// `STREAM_CAPTURE_INVALIDATED`. The invariant callers rely on is "capture
+    /// is always ended before [`reset`]", so this leaves the lifecycle in a
+    /// state where [`reset`] succeeds and the session can cleanly decline to an
+    /// eager run.
+    ///
+    /// Legal only while `Capturing` on the owning thread; a no-op when idle.
+    pub(crate) fn abort(&self) -> Result<()> {
+        let mut state = self.lock()?;
+        match state.capture {
+            CaptureState::Capturing(owner) if owner == std::thread::current().id() => {}
+            CaptureState::Capturing(_) => {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep: CUDA graph capture must abort on the thread that began the \
+                     thread-local capture"
+                        .into(),
+                ));
+            }
+            CaptureState::Idle => return Ok(()),
+        }
+
+        // Clear the flag unconditionally: once we call end_capture the stream is
+        // no longer capturing regardless of whether a usable graph came back.
+        state.capture = CaptureState::Idle;
+        // End the stream capture to drain the half-recorded graph, then drop it.
+        // A mid-capture failure invalidates the capture, so end_capture may
+        // report an error — but it still takes the stream out of capture mode,
+        // which is the whole point, so that outcome is swallowed here.
+        match CapturedGraph::end_capture(
+            &self.stream,
+            CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+        ) {
+            Ok(Some(graph)) => drop(graph),
+            Ok(None) | Err(_) => {}
+        }
+        Ok(())
     }
 
     pub(crate) fn reset(&self) -> Result<bool> {
         let mut state = self.lock()?;
-        if matches!(*state, GraphState::Capturing(_)) {
+        if matches!(state.capture, CaptureState::Capturing(_)) {
             return Err(EpError::KernelFailed(
                 "cuda_ep: cannot reset CUDA graph while stream capture is active; end capture \
                  first"
                     .into(),
             ));
         }
-        let had_graph = matches!(*state, GraphState::Ready(_));
-        *state = GraphState::Idle;
+        let had_graph = !state.segments.is_empty();
+        state.segments.clear();
         Ok(had_graph)
     }
 
     pub(crate) fn has_executable(&self) -> Result<bool> {
-        Ok(matches!(*self.lock()?, GraphState::Ready(_)))
+        Ok(!self.lock()?.segments.is_empty())
+    }
+
+    /// Number of installed segment executables (1 for a whole-subgraph capture).
+    pub(crate) fn segment_count(&self) -> Result<usize> {
+        Ok(self.lock()?.segments.len())
     }
 
     pub(crate) fn capture_status(&self) -> Result<CUstreamCaptureStatus> {
@@ -380,6 +463,168 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         assert!(!runtime.has_graph_executable().unwrap());
         assert!(!runtime.reset_graph().unwrap());
         // SAFETY: reset dropped graph ownership before either captured buffer is freed.
+        unsafe {
+            runtime.free_raw(output_ptr).unwrap();
+            runtime.free_raw(input_ptr).unwrap();
+        }
+    }
+
+    #[test]
+    fn segmented_capture_interleaves_two_graphs_with_an_eager_seam() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping segmented CUDA graph test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+        let n = 48usize;
+        let size = n * std::mem::size_of::<f32>();
+        // buf0 --seg0(captured)--> buf1 --eager seam--> buf2 --seg1(captured)--> buf3
+        let buf0 = runtime.alloc_raw(size).unwrap();
+        let buf1 = runtime.alloc_raw(size).unwrap();
+        let buf2 = runtime.alloc_raw(size).unwrap();
+        let buf3 = runtime.alloc_raw(size).unwrap();
+
+        let initial = (0..n).map(|i| i as f32).collect::<Vec<_>>();
+        // SAFETY: buf0 covers the complete host slice.
+        unsafe { runtime.htod(bytes(&initial), buf0) }.unwrap();
+
+        // Eager reference: three chained add_one launches (input + 3).
+        launch_add_one(&runtime, &function, buf0, buf1, n);
+        launch_add_one(&runtime, &function, buf1, buf2, n);
+        launch_add_one(&runtime, &function, buf2, buf3, n);
+        runtime.synchronize().unwrap();
+        let eager = read_f32(&runtime, buf3, n);
+        assert_eq!(eager, initial.iter().map(|v| v + 3.0).collect::<Vec<_>>());
+
+        let capturable = TestKernel { capturable: true };
+        let allocation_counts = runtime.allocation_counts();
+
+        // --- Capture pass: record two segments around an eager seam ---------
+        // Segment 0: buf0 -> buf1.
+        runtime.begin_graph_capture(&[&capturable]).unwrap();
+        launch_add_one(&runtime, &function, buf0, buf1, n);
+        runtime.end_graph_capture().unwrap();
+        // Materialize segment 0 so the eager seam reads real bytes (as the
+        // executor does after ending each captured segment).
+        runtime.replay_graph_segment(0).unwrap();
+        // Eager seam: buf1 -> buf2 (non-capturable node runs on the stream).
+        launch_add_one(&runtime, &function, buf1, buf2, n);
+        // Segment 1: buf2 -> buf3.
+        runtime.begin_graph_capture(&[&capturable]).unwrap();
+        launch_add_one(&runtime, &function, buf2, buf3, n);
+        runtime.end_graph_capture().unwrap();
+        runtime.replay_graph_segment(1).unwrap();
+        runtime.synchronize().unwrap();
+
+        assert_eq!(runtime.graph_segment_count().unwrap(), 2);
+        assert!(runtime.has_graph_executable().unwrap());
+        // Token-exact: segmented capture pass equals the eager reference.
+        assert_eq!(read_f32(&runtime, buf3, n), eager);
+
+        // --- Replay steps: relaunch segments, re-run the eager seam ---------
+        let mutated = (0..n).map(|i| 500.0 + i as f32).collect::<Vec<_>>();
+        // SAFETY: buf0 remains the same live allocation captured by segment 0.
+        unsafe { runtime.htod(bytes(&mutated), buf0) }.unwrap();
+        runtime.replay_graph_segment(0).unwrap();
+        launch_add_one(&runtime, &function, buf1, buf2, n);
+        runtime.replay_graph_segment(1).unwrap();
+        runtime.synchronize().unwrap();
+        let replayed = read_f32(&runtime, buf3, n);
+        assert_eq!(
+            replayed,
+            mutated.iter().map(|v| v + 3.0).collect::<Vec<_>>()
+        );
+        assert_ne!(replayed, eager);
+        // No per-step device allocations across capture + replay.
+        assert_eq!(runtime.allocation_counts(), allocation_counts);
+
+        assert!(runtime.reset_graph().unwrap());
+        assert!(!runtime.has_graph_executable().unwrap());
+        assert_eq!(runtime.graph_segment_count().unwrap(), 0);
+        // SAFETY: reset dropped all segment ownership before the buffers are freed.
+        unsafe {
+            runtime.free_raw(buf3).unwrap();
+            runtime.free_raw(buf2).unwrap();
+            runtime.free_raw(buf1).unwrap();
+            runtime.free_raw(buf0).unwrap();
+        }
+    }
+
+    #[test]
+    fn mid_segment_capture_failure_is_recoverable_via_abort() {
+        // Regression: a node failing mid-record during segmented capture must
+        // leave the CUDA stream/lifecycle RECOVERABLE. The old cleanup called
+        // reset() without ending the capture, but reset() is rejected while the
+        // stream is still capturing, so the stream stayed wedged in capture mode
+        // and every later launch failed with STREAM_CAPTURE_INVALIDATED. The fix
+        // ends/aborts the capture before reset, restoring the invariant "capture
+        // is always ended before reset".
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping mid-capture recovery test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "add_one").unwrap();
+        let n = 32usize;
+        let size = n * std::mem::size_of::<f32>();
+        let input_ptr = runtime.alloc_raw(size).unwrap();
+        let output_ptr = runtime.alloc_raw(size).unwrap();
+        let initial = (0..n).map(|i| i as f32).collect::<Vec<_>>();
+        // SAFETY: input_ptr covers the complete host slice.
+        unsafe { runtime.htod(bytes(&initial), input_ptr) }.unwrap();
+        let expected = initial.iter().map(|v| v + 1.0).collect::<Vec<_>>();
+
+        let capturable = TestKernel { capturable: true };
+
+        // --- Reproduce a mid-segment kernel failure during capture ----------
+        // Begin recording and launch one node into the segment, then trip the
+        // exact illegal operation a Supported-but-unconditionally-syncing kernel
+        // would perform inside a captured segment: a stream synchronize during
+        // capture. This invalidates the capture (CUDA_ERROR_STREAM_CAPTURE_*),
+        // which is the error that reaches the executor's cleanup path.
+        runtime.begin_graph_capture(&[&capturable]).unwrap();
+        launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
+        assert!(runtime.is_capturing().unwrap());
+        assert!(
+            runtime.synchronize().is_err(),
+            "a stream synchronize mid-capture is illegal and must error"
+        );
+
+        // The wedge: while the stream is still (invalidly) capturing, reset is
+        // rejected. The OLD path stopped here, leaving the stream stuck.
+        assert!(
+            runtime.reset_graph().is_err(),
+            "reset must be rejected while the stream is still capturing"
+        );
+
+        // The fix: abort ends the stream capture and returns the lifecycle to
+        // idle, so a subsequent reset succeeds and the session can decline
+        // cleanly to eager execution.
+        runtime.abort_graph_capture().unwrap();
+        assert!(
+            !runtime.is_capturing().unwrap(),
+            "abort must take the stream out of capture mode"
+        );
+        assert!(
+            !runtime.reset_graph().unwrap(),
+            "reset succeeds after abort; no executable was installed"
+        );
+        assert!(!runtime.has_graph_executable().unwrap());
+
+        // (a)/(b) The same stream runs eager work again — no wedge.
+        launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
+        runtime.synchronize().unwrap();
+        assert_eq!(read_f32(&runtime, output_ptr, n), expected);
+
+        // And a fresh capture/replay cycle succeeds on the recovered stream.
+        runtime.begin_graph_capture(&[&capturable]).unwrap();
+        launch_add_one(&runtime, &function, input_ptr, output_ptr, n);
+        runtime.end_graph_capture().unwrap();
+        runtime.replay_graph().unwrap();
+        runtime.synchronize().unwrap();
+        assert_eq!(read_f32(&runtime, output_ptr, n), expected);
+        assert!(runtime.reset_graph().unwrap());
+
+        // SAFETY: reset dropped graph ownership before either buffer is freed.
         unsafe {
             runtime.free_raw(output_ptr).unwrap();
             runtime.free_raw(input_ptr).unwrap();

@@ -32,6 +32,10 @@ const ORT_ARCHIVE_CHECKSUMS: &[(&str, &str)] = &[
         "onnxruntime-win-x64-1.27.0.zip",
         "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc",
     ),
+    (
+        "onnxruntime-win-arm64-1.27.0.zip",
+        "a32f2650575b3c20df462e337519fd1cc4105356130d11dba9771c6f374d952f",
+    ),
 ];
 
 fn main() {
@@ -371,7 +375,11 @@ fn prebuilt_target() -> (&'static str, &'static str) {
             ("osx-x86_64", "tgz")
         }
     } else if target_os() == "windows" {
-        ("win-x64", "zip")
+        if target_arch() == "aarch64" {
+            ("win-arm64", "zip")
+        } else {
+            ("win-x64", "zip")
+        }
     } else {
         panic!("Unsupported platform for automatic ORT download");
     }

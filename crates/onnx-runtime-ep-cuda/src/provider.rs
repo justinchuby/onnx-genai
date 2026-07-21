@@ -419,8 +419,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.end_graph_capture()
     }
 
+    fn abort_device_graph_capture(&self) -> Result<()> {
+        self.runtime.abort_graph_capture()
+    }
+
     fn replay_device_graph(&self) -> Result<()> {
         self.runtime.replay_graph()
+    }
+
+    fn replay_device_graph_segment(&self, index: usize) -> Result<()> {
+        self.runtime.replay_graph_segment(index)
     }
 
     fn reset_device_graph(&self) -> Result<bool> {

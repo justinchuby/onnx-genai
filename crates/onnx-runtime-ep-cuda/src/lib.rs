@@ -80,4 +80,9 @@ pub use kernels::group_query_attention::{
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
+
+/// Number of additional u32 words required by the CUDA device argmax result buffer.
+pub fn device_argmax_scratch_words(elements: usize) -> usize {
+    kernels::device_argmax::scratch_words(elements)
+}
 pub use runtime::{CudaAllocationCounts, CudaRuntime};

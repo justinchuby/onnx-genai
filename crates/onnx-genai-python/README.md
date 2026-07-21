@@ -29,9 +29,10 @@ metadata (`inference_metadata.yaml` or `genai_config.json`).
 ## Wheels
 
 Distributed as stable-ABI (`abi3`) wheels tagged `cp310-abi3`, so a single wheel
-per platform loads on CPython 3.10 and newer. The bundled ONNX Runtime shared
-library is vendored into the wheel, so no separate ONNX Runtime installation is
-required.
+per platform loads on CPython 3.10 and newer. ONNX Runtime is **not** bundled:
+`onnx_genai` loads `libonnxruntime` from the installed `onnxruntime` (CPU) or
+`onnxruntime-gpu` (CUDA) wheel at import time, so it uses whichever execution
+providers you installed.
 
 ## Related packages
 

@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       publish_onnx_genai:
-        description: Publish the onnx-genai / onnx-genai-server sdists to PyPI
+        description: Publish the onnx-genai / onnx-genai-server sdists and wheels to PyPI
         required: false
         type: boolean
         default: false
@@ -205,6 +205,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
 
   publish-onnx-genai-sdist:
     name: Publish onnx-genai sdists to PyPI
@@ -233,3 +234,124 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true
+
+  # Build the onnx-genai / onnx-genai-server wheels here (rather than in
+  # wheels.yml) so they publish under publish.yml's PyPI trusted publisher, the
+  # same one that already publishes the sdists. These wheels deliberately DO NOT
+  # bundle libonnxruntime: it is loaded at runtime from the installed onnxruntime
+  # / onnxruntime-gpu pip wheel. Windows/Linux wheels compile the `cuda` Cargo
+  # feature (dynamically loaded ORT CUDAExecutionProvider); the nvidia runtime is
+  # a `[cuda]` pip extra. macOS is Apple Silicon only.
+  build-onnx-genai-wheels:
+    name: Build ${{ matrix.package }} (${{ matrix.platform.name }})
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_onnx_genai)
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [onnx-genai, onnx-genai-server]
+        platform:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+            cuda: true
+          - name: Windows AMD64
+            os: windows-latest
+            archs: AMD64
+            cuda: true
+          # Windows on ARM has no CUDA, so build a CPU-only wheel on the native
+          # arm64 runner.
+          - name: Windows ARM64
+            os: windows-11-arm
+            archs: ARM64
+            cuda: false
+          # ONNX Runtime 1.27 publishes no osx-x86_64 native archive (ort-sys
+          # 404s) and MLX is Apple-Silicon only, so we build just arm64.
+          - name: macOS arm64
+            os: macos-14
+            archs: arm64
+            cuda: false
+        include:
+          - package: onnx-genai
+            package_dir: crates/onnx-genai-python
+          - package: onnx-genai-server
+            package_dir: crates/onnx-genai-cli
+    runs-on: ${{ matrix.platform.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.platform.archs }}
+      CIBW_BUILD: "cp311-*"
+      CIBW_SKIP: "*-musllinux_*"
+      # Do NOT vendor libonnxruntime. Windows/macOS wheel tags are already valid
+      # for PyPI, so skip repair there; on Linux auditwheel retags the wheel
+      # manylinux-compliant but excludes libonnxruntime so it stays an unresolved
+      # runtime dependency the loader shim satisfies from the onnxruntime package.
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: ""
+      CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libonnxruntime.so.1 -w {dest_dir} {wheel}"
+      # macOS wheels still bake an absolute ONNX Runtime install-name that needs a
+      # runtime fixup, so skip the on-macOS smoke test until that lands. Windows
+      # arm64 has no guaranteed onnxruntime wheel in the test env, so skip there too.
+      CIBW_TEST_SKIP: "*-macosx_* *-win_arm64"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+
+      # maturin's CLI --features REPLACES pyproject [tool.maturin] features, so
+      # when we add `cuda` we must re-add every feature the package needs to build
+      # its pyo3 module. onnx-genai (extension) has non-optional pyo3, so `cuda`
+      # alone is enough. onnx-genai-server (CLI) has optional pyo3 behind the
+      # `python` feature, so it needs `python,cuda` or maturin sees no bindings and
+      # fails installing cffi. macOS builds no cuda feature (pyproject applies).
+      - name: Select build features
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform.cuda }}" != "true" ]; then
+            echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
+          elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,cuda" >> "$GITHUB_ENV"
+          else
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and smoke-test wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: ${{ matrix.package_dir }}
+          output-dir: wheelhouse
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-genai-wheels-${{ matrix.package }}-${{ matrix.platform.os }}-${{ matrix.platform.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish-onnx-genai-wheels:
+    name: Publish onnx-genai wheels to PyPI
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_onnx_genai)
+    needs: [build-onnx-genai-wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download onnx-genai wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: onnx-genai-wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish onnx-genai wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

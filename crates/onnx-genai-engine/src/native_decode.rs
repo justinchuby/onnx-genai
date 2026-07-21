@@ -693,10 +693,14 @@ impl DecodeCudaState {
             logits_shape.clone(),
             logits_shape.clone(),
         )?);
+        let vocab = *logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        let argmax_words = 2 + onnx_runtime_ep_cuda::device_argmax_scratch_words(vocab);
         let greedy_result = session.allocate_device_output_binding(
             "__native_greedy_argmax",
             DataType::Uint32,
-            vec![2],
+            vec![argmax_words],
             vec![2],
         )?;
 

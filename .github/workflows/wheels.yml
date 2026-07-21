@@ -114,104 +114,9 @@ jobs:
           path: wheelhouse/*.whl
           if-no-files-found: error
 
-  # onnx-genai (ORT-backed genai extension) and onnx-genai-server (the unified
-  # CLI). These wheels deliberately DO NOT bundle libonnxruntime: it is loaded
-  # at runtime from the installed onnxruntime / onnxruntime-gpu pip wheel, so a
-  # user's CUDA (or MLX) install is picked up automatically. Windows and Linux
-  # wheels are compiled with the `cuda` Cargo feature (dynamically loaded ORT
-  # CUDAExecutionProvider); the multi-GB nvidia runtime is a `[cuda]` pip extra.
-  onnx-genai-wheels:
-    name: ${{ matrix.package }} (${{ matrix.platform.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        package: [onnx-genai, onnx-genai-server]
-        platform:
-          - name: Linux x86_64
-            os: ubuntu-latest
-            archs: x86_64
-            cuda: true
-          - name: Windows AMD64
-            os: windows-latest
-            archs: AMD64
-            cuda: true
-          # macOS ships only Apple Silicon: ONNX Runtime 1.27 publishes no
-          # osx-x86_64 native archive (the ort-sys auto-download 404s), and MLX
-          # is Apple-Silicon only, so we build just the arm64 wheel.
-          # macos-14 is the GitHub-hosted Apple Silicon runner.
-          - name: macOS arm64
-            os: macos-14
-            archs: arm64
-            cuda: false
-        include:
-          - package: onnx-genai
-            package_dir: crates/onnx-genai-python
-          - package: onnx-genai-server
-            package_dir: crates/onnx-genai-cli
-    runs-on: ${{ matrix.platform.os }}
-    env:
-      CIBW_ARCHS: ${{ matrix.platform.archs }}
-      CIBW_BUILD: "cp311-*"
-      CIBW_SKIP: "*-musllinux_*"
-      # CIBW_CONFIG_SETTINGS (the maturin `--features`) is computed per package in
-      # the "Select build features" step below: it differs by package because the
-      # CLI's pyo3 module is behind an optional `python` feature, while the
-      # extension crate's pyo3 is non-optional.
-      # Do NOT vendor libonnxruntime into the wheel. Windows/macOS wheel tags are
-      # already valid for PyPI, so skip repair there entirely. On Linux we still
-      # need auditwheel to retag the wheel manylinux-compliant, but we exclude
-      # libonnxruntime so it stays an unresolved runtime dependency the loader
-      # shim satisfies from the onnxruntime package.
-      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: ""
-      CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
-      CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libonnxruntime.so.1 -w {dest_dir} {wheel}"
-      # macOS wheels still bake an absolute ONNX Runtime install-name that needs
-      # a runtime fixup, so skip the on-macOS smoke test until that lands. The
-      # wheel is still built and uploaded for iteration.
-      CIBW_TEST_SKIP: "*-macosx_*"
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Compute the maturin --features per package. maturin's CLI --features
-      # REPLACES pyproject [tool.maturin] features, so when we add `cuda` we must
-      # re-add every feature the package needs to build its pyo3 module:
-      #   * onnx-genai (extension): pyo3 is non-optional, so `cuda` alone is enough
-      #     (maturin still detects pyo3 and auto-adds extension-module).
-      #   * onnx-genai-server (CLI): pyo3 is optional behind the `python` feature,
-      #     so we must pass `python,cuda` or maturin sees no bindings and fails
-      #     trying to install cffi. abi3-py310 comes from the Cargo.toml pyo3 dep.
-      # macOS builds no CUDA feature, so config-settings stays empty and the
-      # pyproject features apply unchanged.
-      - name: Select build features
-        shell: bash
-        run: |
-          if [ "${{ matrix.platform.cuda }}" != "true" ]; then
-            echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
-          elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
-            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,cuda" >> "$GITHUB_ENV"
-          else
-            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build and smoke-test wheel
-        uses: pypa/cibuildwheel@v4.1.0
-        with:
-          package-dir: ${{ matrix.package_dir }}
-          output-dir: wheelhouse
-
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: onnx-genai-wheels-${{ matrix.package }}-${{ matrix.platform.os }}-${{ matrix.platform.archs }}
-          path: wheelhouse/*.whl
-          if-no-files-found: error
+  # onnx-genai / onnx-genai-server wheels are built AND published from publish.yml
+  # (the workflow PyPI trusts for these projects). Keeping them there lets the
+  # wheels reuse the existing trusted publisher without a second PyPI registration.
 
   publish-cpu:
     name: Publish nxrt CPU wheels
@@ -236,30 +141,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: wheelhouse
-
-  # Publishing onnx-genai / onnx-genai-server is deliberately independent of the
-  # nxrt cpu-wheels job so a failure in that separate package never blocks the
-  # onnx-genai release.
-  publish-onnx-genai:
-    name: Publish onnx-genai wheels
-    if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: [onnx-genai-wheels]
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-
-    steps:
-      - name: Download onnx-genai wheels
-        uses: actions/download-artifact@v4
-        with:
-          pattern: onnx-genai-wheels-*
-          path: wheelhouse
-          merge-multiple: true
-
-      - name: Publish with PyPI Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: wheelhouse
+          skip-existing: true
