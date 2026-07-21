@@ -373,9 +373,27 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// Replay the installed device graph.
+    ///
+    /// When the EP holds multiple captured **segments** (segmented capture), this
+    /// replays every installed segment in capture order. For the single-graph
+    /// fast path (one whole-subgraph capture) that is exactly the one graph.
     fn replay_device_graph(&self) -> Result<()> {
         Err(EpError::KernelFailed(format!(
             "{}: device graph replay is not supported",
+            self.name()
+        )))
+    }
+
+    /// Replay one captured **segment** by its zero-based capture-order index.
+    ///
+    /// Segmented capture claims a whole subgraph even when only parts are
+    /// device-graph capturable: the executor captures each maximal capturable
+    /// run as its own segment and, at replay time, launches the segment graphs
+    /// in order while running the non-capturable seam nodes eagerly in between.
+    /// EPs without segmented graph support reject the request.
+    fn replay_device_graph_segment(&self, _index: usize) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: segmented device graph replay is not supported",
             self.name()
         )))
     }

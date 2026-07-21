@@ -335,8 +335,21 @@ impl CudaRuntime {
     }
 
     /// Launch the installed graph executable on the same EP stream.
+    ///
+    /// Replays every installed segment in capture order (one graph for a
+    /// whole-subgraph capture).
     pub fn replay_graph(&self) -> Result<()> {
         self.graph.replay()
+    }
+
+    /// Launch one installed segment by its zero-based capture-order index.
+    pub fn replay_graph_segment(&self, index: usize) -> Result<()> {
+        self.graph.replay_segment(index)
+    }
+
+    /// Number of installed captured segments (1 for a whole-subgraph capture).
+    pub fn graph_segment_count(&self) -> Result<usize> {
+        self.graph.segment_count()
     }
 
     /// Destroy the installed graph and graph-exec handles.

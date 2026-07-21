@@ -897,6 +897,23 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Number of captured device-graph segments installed by the most recent
+    /// [`Self::try_capture_with_device_bindings`] call.
+    ///
+    /// `1` for a whole-subgraph capture; `>= 2` when the CUDA EP claimed the
+    /// subgraph but split it into segments around non-capturable seam nodes.
+    pub fn captured_graph_segment_count(&self) -> usize {
+        self.exec.captured_segment_count()
+    }
+
+    /// Structured, transparent segment boundaries from the most recent capture:
+    /// one entry per non-capturable seam node the EP ran eagerly between captured
+    /// segments (with its `CaptureSupport` decline reason). Empty for a
+    /// whole-subgraph capture.
+    pub fn capture_segmentation(&self) -> &[CaptureDecline] {
+        self.exec.capture_segmentation()
+    }
+
     /// Read (without clearing) any latching device capture-safety error recorded
     /// during graph replay, as a raw violation bitmask (zero when none). Callers
     /// poll this at the per-step logits sync to fail before consuming a token
@@ -1146,6 +1163,150 @@ mod device_binding_tests {
         session.replay_device_graph(&mut bindings).unwrap();
         assert_eq!(read_bound_f32(&mut bindings[1]), 47.0);
         assert!(session.reset_device_graph().unwrap());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn segmented_cuda_graph_claims_whole_subgraph_around_eager_seam() {
+        let Ok(mut ep) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) else {
+            eprintln!("skipping segmented session CUDA graph test: CUDA runtime unavailable");
+            return;
+        };
+        onnx_runtime_ep_api::ExecutionProvider::initialize(&mut ep, &Default::default()).unwrap();
+
+        // A decoder-like chain with a deliberately non-capturable node in the
+        // middle: input -> Cast(f32) -> Clip(min/max attrs) -> Cast(i64) -> out.
+        // Cast is CUDA-graph capture-safe (it skips its trailing sync while the
+        // stream is capturing); Clip declines capture, so it forces a segment
+        // boundary while remaining CUDA-placed. Over integer inputs and a wide
+        // clip the chain round-trips to the identity.
+        let n = 4usize;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("".into(), 13);
+        let input = graph.create_named_value("input", DataType::Int64, static_shape([n]));
+        graph.add_input(input);
+        let as_float = graph.create_named_value("as_float", DataType::Float32, static_shape([n]));
+        let mut cast_in = Node::new(NodeId(0), "Cast", vec![Some(input)], vec![as_float]);
+        cast_in
+            .attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+        graph.insert_node(cast_in);
+        let clipped = graph.create_named_value("clipped", DataType::Float32, static_shape([n]));
+        let mut clip = Node::new(NodeId(1), "Clip", vec![Some(as_float)], vec![clipped]);
+        clip.attributes
+            .insert("min".into(), Attribute::Float(-1000.0));
+        clip.attributes
+            .insert("max".into(), Attribute::Float(1000.0));
+        graph.insert_node(clip);
+        let output = graph.create_named_value("output", DataType::Int64, static_shape([n]));
+        let mut cast_out = Node::new(NodeId(2), "Cast", vec![Some(clipped)], vec![output]);
+        cast_out
+            .attributes
+            .insert("to".into(), Attribute::Int(DataType::Int64 as i64));
+        graph.insert_node(cast_out);
+        graph.add_output(output);
+
+        let mut session = InferenceSession::from_parts(
+            graph,
+            std::sync::Arc::new(onnx_runtime_loader::WeightStore::new()),
+            Path::new("."),
+            EpContextDumpConfig::default(),
+            ModelMetadata::default(),
+            std::sync::Arc::new(ep),
+        )
+        .unwrap();
+
+        let input_binding = session
+            .allocate_device_binding("input", None::<String>, DataType::Int64, vec![n], vec![n])
+            .unwrap();
+        let output_binding = session
+            .allocate_device_output_binding("output", DataType::Int64, vec![n], vec![n])
+            .unwrap();
+        let mut bindings = vec![input_binding, output_binding];
+
+        // Warmup / eager reference for input A (also warms the shape-keyed
+        // kernels the capture pass requires).
+        let values_a = [-2i64, 3, -4, 5];
+        write_bound_i64(&mut bindings[0], &values_a);
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let eager_a = read_bound_i64_vec(&mut bindings[1]);
+        assert_eq!(
+            eager_a,
+            values_a.to_vec(),
+            "Cast∘Clip∘Cast round-trips ints"
+        );
+
+        // Segmented capture: the whole subgraph is still claimed and run on the
+        // CUDA EP even though Clip is not capturable.
+        match session
+            .try_capture_with_device_bindings(&[], &mut bindings)
+            .unwrap()
+        {
+            DeviceGraphCaptureResult::Captured(outputs) => {
+                assert!(
+                    outputs.iter().all(Option::is_none),
+                    "device-bound outputs must not materialize to host"
+                );
+            }
+            DeviceGraphCaptureResult::NotCapturable(report) => {
+                panic!(
+                    "expected the CUDA EP to claim the whole subgraph via segmented capture, \
+                     got a full decline: {report}"
+                );
+            }
+        }
+        // Whole-subgraph claim, split into two captured segments around one seam.
+        assert_eq!(
+            session.captured_graph_segment_count(),
+            2,
+            "Clip should split the plan into two captured Cast segments"
+        );
+        let seams = session.capture_segmentation();
+        assert_eq!(seams.len(), 1, "exactly one eager seam node (Clip)");
+        assert_eq!(seams[0].op_type, "Clip");
+        // Token-exact: the segmented capture pass matches the eager reference.
+        assert_eq!(read_bound_i64_vec(&mut bindings[1]), eager_a);
+
+        // Segmented replay for a new input B interleaves the two captured Cast
+        // segment graphs with the eager Clip seam, and stays token-exact.
+        let values_b = [7i64, -1, 0, -8];
+        write_bound_i64(&mut bindings[0], &values_b);
+        session.replay_device_graph(&mut bindings).unwrap();
+        let replay_b = read_bound_i64_vec(&mut bindings[1]);
+
+        // Independent eager reference for input B.
+        assert!(session.reset_device_graph().unwrap());
+        write_bound_i64(&mut bindings[0], &values_b);
+        session
+            .run_with_device_bindings(&[], &mut bindings)
+            .unwrap();
+        let eager_b = read_bound_i64_vec(&mut bindings[1]);
+        assert_eq!(
+            replay_b, eager_b,
+            "segmented replay must be bit-identical to eager execution"
+        );
+        assert_eq!(replay_b, values_b.to_vec());
+    }
+
+    #[cfg(feature = "cuda")]
+    fn write_bound_i64(binding: &mut DeviceIoBinding, values: &[i64]) {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        binding.write_bytes(0, &bytes).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_bound_i64_vec(binding: &mut DeviceIoBinding) -> Vec<i64> {
+        binding
+            .read_bytes()
+            .unwrap()
+            .chunks_exact(8)
+            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
     }
 
     #[cfg(feature = "cuda")]

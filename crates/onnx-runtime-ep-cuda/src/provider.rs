@@ -423,6 +423,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.replay_graph()
     }
 
+    fn replay_device_graph_segment(&self, index: usize) -> Result<()> {
+        self.runtime.replay_graph_segment(index)
+    }
+
     fn reset_device_graph(&self) -> Result<bool> {
         // Graph invalidation (reset / rewind / KV-capacity or shape change /
         // re-capture) is the explicit host reset point for the capture-error

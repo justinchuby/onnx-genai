@@ -103,6 +103,30 @@ fn print_op_profile(total: Duration, timings: HashMap<String, (Duration, usize)>
     }
 }
 
+/// Print, to stderr, how the capture pass split a claimed subgraph into captured
+/// device-graph segments and eager seam nodes, and why each seam exists. Gated
+/// by `ONNX_GENAI_LOG_CAPTURE_SEGMENTS` for transparency into segmentation.
+fn log_capture_segmentation(schedule: &CaptureSchedule) {
+    let captured = schedule.captured_segments();
+    let seams = schedule.segments.len() - captured;
+    eprintln!(
+        "[onnx-genai-capture] segmented CUDA graph: {captured} captured segment(s), \
+         {seams} eager seam(s)"
+    );
+    for boundary in &schedule.boundaries {
+        match boundary.node_id {
+            Some(id) => eprintln!(
+                "[onnx-genai-capture]   seam node {id} ({}::{}) ran eagerly: {}",
+                boundary.domain, boundary.op_type, boundary.reason
+            ),
+            None => eprintln!(
+                "[onnx-genai-capture]   seam ({}): {}",
+                boundary.op_type, boundary.reason
+            ),
+        }
+    }
+}
+
 /// A per-node compiled entry: the structural facts the run loop needs without
 /// re-deriving them from the graph. Shapes are **not** baked here — they are
 /// resolved per run from the bound inputs (see module docs).
@@ -304,6 +328,73 @@ fn kernel_capture_decline(
         .map(|reason| CaptureDecline::node(node_id, node, reason))
 }
 
+/// Whether verbose segmented-capture diagnostics are printed to stderr.
+///
+/// Gated identically to op profiling so a run can surface exactly where the
+/// CUDA EP split a claimed subgraph into captured segments and eager seam nodes.
+fn capture_segmentation_logging_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_LOG_CAPTURE_SEGMENTS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// How a scoped run drives the device-graph lifecycle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunMode {
+    /// No capture: execute every node eagerly on the stream.
+    Eager,
+    /// First capture pass: partition the plan into segments, record each
+    /// capturable segment into its own device graph, and run the non-capturable
+    /// seam nodes eagerly in between.
+    Capture,
+    /// Subsequent steps: replay each captured segment graph in order, re-running
+    /// only the eager seam nodes.
+    Replay,
+}
+
+/// One contiguous run of plan nodes that either share a captured device graph or
+/// all execute eagerly (a non-capturable seam).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScheduledSegment {
+    /// First plan index (inclusive).
+    start: usize,
+    /// One past the last plan index (exclusive).
+    end: usize,
+    /// `true` when `[start, end)` is captured into a device graph; `false` for an
+    /// eager seam of non-capturable (but still device-placed or CPU) nodes.
+    captured: bool,
+    /// Capture-order index of this segment's graph in the EP, set only when
+    /// `captured`.
+    graph_index: usize,
+}
+
+/// The plan's partition into captured segments and eager seams, plus the
+/// structured reason each segment boundary exists (which node forced the split).
+///
+/// Recorded once during the capture pass and reused for every subsequent replay
+/// so the interleaving of graph replays and eager seam execution is stable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CaptureSchedule {
+    segments: Vec<ScheduledSegment>,
+    /// One entry per non-capturable seam node, explaining why it forced a
+    /// boundary (its `CaptureSupport::Unsupported` reason or structural cause).
+    boundaries: Vec<CaptureDecline>,
+}
+
+impl CaptureSchedule {
+    /// Number of captured device-graph segments (1 for a whole-subgraph capture).
+    fn captured_segments(&self) -> usize {
+        self.segments.iter().filter(|seg| seg.captured).count()
+    }
+
+    /// Whether the whole plan captured as a single graph (no eager seams).
+    fn is_single_graph(&self) -> bool {
+        self.segments.len() == 1 && self.segments[0].captured
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeviceBindingSignature {
     input_name: String,
@@ -454,6 +545,13 @@ pub(crate) struct Executor {
     subgraph_execs: HashMap<(NodeId, String), ChildExecutor>,
     control_flow_stats: ControlFlowStats,
     device_graph_signature: Option<Vec<DeviceBindingSignature>>,
+    /// The captured-segment schedule from the most recent successful capture,
+    /// reused to interleave segment replays with eager seam nodes on each
+    /// subsequent step. `None` when no device graph is installed.
+    capture_schedule: Option<CaptureSchedule>,
+    /// Structured segment-boundary reasons from the most recent capture, retained
+    /// for diagnostics after `capture_schedule` is taken for replay.
+    capture_segmentation: Vec<CaptureDecline>,
     /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
     /// a strided view aliasing another value's buffer (a layout/movement-op
     /// output such as `Slice`) rather than an owner in [`Self::buffers`]. Built
@@ -1416,6 +1514,8 @@ impl Executor {
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
             device_graph_signature: None,
+            capture_schedule: None,
+            capture_segmentation: Vec::new(),
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
@@ -1815,7 +1915,7 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
         let external = self.prepare_external_bindings(bindings)?;
-        match self.run_scoped_mode(inputs, &HashMap::new(), &external, true)? {
+        match self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture)? {
             ScopedRunResult::Executed(outputs) => {
                 let mut tensors = Vec::with_capacity(outputs.len());
                 for output in outputs {
@@ -1842,7 +1942,7 @@ impl Executor {
     }
 
     pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<()> {
-        self.prepare_external_bindings(bindings)?;
+        let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.device_graph_signature.as_ref() != Some(&signature) {
             self.reset_device_graph()?;
@@ -1851,13 +1951,50 @@ impl Executor {
                     .into(),
             ));
         }
-        self.ep.replay_device_graph()?;
-        Ok(())
+        // Whole-subgraph capture (a single graph, no eager seams) keeps the
+        // zero-host-work fast path: just relaunch the one installed graph.
+        // Segmented capture must re-establish the run context and interleave
+        // segment replays with eager seam-node execution, so it routes through
+        // the scoped runner in replay mode.
+        let single_graph = self
+            .capture_schedule
+            .as_ref()
+            .is_none_or(CaptureSchedule::is_single_graph);
+        if single_graph {
+            self.ep.replay_device_graph()?;
+            return Ok(());
+        }
+        match self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay)? {
+            ScopedRunResult::Executed(_) => Ok(()),
+            ScopedRunResult::NotCapturable(reason) => {
+                self.reset_device_graph()?;
+                Err(SessionError::Internal(format!(
+                    "segmented device graph replay lost its schedule: {reason}"
+                )))
+            }
+        }
     }
 
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
         self.device_graph_signature = None;
+        self.capture_schedule = None;
         Ok(self.ep.reset_device_graph()?)
+    }
+
+    /// Structured segment-boundary reasons from the most recent capture: one
+    /// entry per non-capturable seam node the CUDA EP ran eagerly between
+    /// captured segments. Empty for a whole-subgraph (single-graph) capture.
+    pub(crate) fn capture_segmentation(&self) -> &[CaptureDecline] {
+        &self.capture_segmentation
+    }
+
+    /// Number of captured device-graph segments installed by the most recent
+    /// capture (1 for a whole-subgraph capture, >=2 when seams split it).
+    pub(crate) fn captured_segment_count(&self) -> usize {
+        self.capture_schedule
+            .as_ref()
+            .map(CaptureSchedule::captured_segments)
+            .unwrap_or(0)
     }
 
     pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
@@ -1981,7 +2118,7 @@ impl Executor {
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
     ) -> Result<Vec<Option<SessionOutput>>> {
-        match self.run_scoped_mode(inputs, outer_scope, external, false)? {
+        match self.run_scoped_mode(inputs, outer_scope, external, RunMode::Eager)? {
             ScopedRunResult::Executed(outputs) => Ok(outputs),
             ScopedRunResult::NotCapturable(_) => unreachable!("eager runs are always executed"),
         }
@@ -1992,7 +2129,7 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-        capture: bool,
+        mode: RunMode,
     ) -> Result<ScopedRunResult> {
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
@@ -2039,7 +2176,7 @@ impl Executor {
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
         let mut resolved = self.resolve_soft(&bindings);
-        if capture {
+        if mode != RunMode::Eager {
             // Persistent bindings expose the physical geometry the captured
             // kernels will actually read and write. Seed only unresolved values:
             // statically/symbolically resolved shapes remain authoritative.
@@ -2070,81 +2207,65 @@ impl Executor {
             self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
 
-        let capture_started = if capture {
-            match self.begin_device_graph_capture(&resolved, external) {
-                Ok(()) => true,
-                Err(reason) => return Ok(ScopedRunResult::NotCapturable(reason)),
-            }
-        } else {
-            false
-        };
-
         // --- Execute nodes ---------------------------------------------------
         // Iterate by index so a control-flow node can take `&mut self` (it must
         // build/reuse child executors) while an ordinary kernel node uses the
         // disjoint-field borrow split inside `exec_kernel_node`.
-        let execution = (|| -> Result<()> {
-            if profile_ops_enabled() {
-                let run_start = Instant::now();
-                let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
-                for pi in 0..self.plan.len() {
-                    let node_id = self.plan[pi].node_id;
-                    let node = self.graph.node(node_id);
-                    let op_type = node.op_type.clone();
-                    let start = Instant::now();
-                    let result = if is_control_flow_op(&node.op_type, &node.domain) {
-                        self.exec_control_flow(pi, &mut resolved, outer_scope)
-                    } else if is_sequence_op(&node.op_type, &node.domain) {
-                        self.exec_sequence_node(pi, &mut resolved, external)
-                    } else {
-                        self.exec_kernel_node(pi, &mut resolved, external)
-                    };
-                    let elapsed = start.elapsed();
-                    let entry = timings.entry(op_type).or_insert((Duration::ZERO, 0));
-                    entry.0 += elapsed;
-                    entry.1 += 1;
-                    result?;
+        match mode {
+            RunMode::Eager => {
+                self.run_plan_eager(&mut resolved, outer_scope, external)?;
+            }
+            RunMode::Capture => {
+                // Partition the claimed subgraph into maximal capturable segments
+                // separated by non-capturable seam nodes. Only a graph-level hard
+                // decline (e.g. no persistent output binding, or nothing
+                // capturable at all) falls back to a fully eager run.
+                let schedule = match self.plan_capture_segments(&resolved, external) {
+                    Ok(schedule) => schedule,
+                    Err(report) => return Ok(ScopedRunResult::NotCapturable(report)),
+                };
+                if let Err(error) = self.run_plan_segmented(
+                    &schedule,
+                    RunMode::Capture,
+                    &mut resolved,
+                    outer_scope,
+                    external,
+                ) {
+                    let _ = self.ep.reset_device_graph();
+                    self.capture_schedule = None;
+                    self.capture_segmentation.clear();
+                    return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                        CaptureDecline::graph(format!(
+                            "segmented CUDA graph capture failed: {error}"
+                        )),
+                    )));
                 }
-                print_op_profile(run_start.elapsed(), timings);
-            } else {
-                for pi in 0..self.plan.len() {
-                    let node_id = self.plan[pi].node_id;
-                    let node = self.graph.node(node_id);
-                    if is_control_flow_op(&node.op_type, &node.domain) {
-                        self.exec_control_flow(pi, &mut resolved, outer_scope)?;
-                    } else if is_sequence_op(&node.op_type, &node.domain) {
-                        self.exec_sequence_node(pi, &mut resolved, external)?;
-                    } else {
-                        self.exec_kernel_node(pi, &mut resolved, external)?;
-                    }
+                self.capture_segmentation = schedule.boundaries.clone();
+                if capture_segmentation_logging_enabled() {
+                    log_capture_segmentation(&schedule);
                 }
+                self.capture_schedule = Some(schedule);
             }
-            Ok(())
-        })();
-
-        if capture_started {
-            let end = self.ep.end_device_graph_capture();
-            if let Err(error) = execution {
-                let _ = end;
-                let _ = self.ep.reset_device_graph();
-                return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
-                    CaptureDecline::graph(format!(
-                        "kernel execution rejected CUDA graph capture: {error}"
-                    )),
-                )));
+            RunMode::Replay => {
+                // Move the schedule out so the segmented runner can take `&mut
+                // self`; restore it afterwards for the next step's replay.
+                let Some(schedule) = self.capture_schedule.take() else {
+                    return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                        CaptureDecline::graph(
+                            "segmented device graph replay requested without a capture schedule",
+                        ),
+                    )));
+                };
+                let result = self.run_plan_segmented(
+                    &schedule,
+                    RunMode::Replay,
+                    &mut resolved,
+                    outer_scope,
+                    external,
+                );
+                self.capture_schedule = Some(schedule);
+                result?;
             }
-            if let Err(error) = end {
-                let _ = self.ep.reset_device_graph();
-                return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
-                    CaptureDecline::graph(format!("ending CUDA graph capture failed: {error}")),
-                )));
-            }
-            if let Err(error) = self.ep.replay_device_graph() {
-                let _ = self.ep.reset_device_graph();
-                return Err(error.into());
-            }
-        } else {
-            execution?;
         }
 
         // --- Collect graph outputs into owned tensors -----------------------
@@ -2178,49 +2299,148 @@ impl Executor {
         Ok(ScopedRunResult::Executed(results))
     }
 
-    fn begin_device_graph_capture(
+    /// Classify why one plan node cannot be recorded into a device graph, or
+    /// `None` when it is capturable. Mirrors the per-node predicates the
+    /// all-or-nothing audit used, but returns the reason instead of aborting so
+    /// the caller can form segments around each non-capturable seam node.
+    fn node_capture_reason(
+        &self,
+        plan: &NodePlan,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Option<CaptureDecline> {
+        let node = self.graph.node(plan.node_id);
+        if is_control_flow_op(&node.op_type, &node.domain)
+            || is_sequence_op(&node.op_type, &node.domain)
+        {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                "control-flow and sequence nodes are not device-graph capturable",
+            ));
+        }
+        if plan
+            .outputs
+            .iter()
+            .any(|output| !resolved.contains_key(output))
+        {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                "data-dependent output shape was unresolved before capture",
+            ));
+        }
+        let Some(input_shapes) = plan
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| resolved.get(&value).cloned())
+                    .unwrap_or(Some(Vec::new()))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                "data-dependent input shape was unresolved before capture",
+            ));
+        };
+        let key = KernelKey {
+            node: plan.node_id.0,
+            shapes: input_shapes,
+        };
+        let Some(kernel) = self.cache.entries.get(&key) else {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                "kernel has not been warmed for the requested capture shape",
+            ));
+        };
+        kernel_capture_decline(plan.node_id, node, kernel.as_ref())
+    }
+
+    /// Partition the plan into maximal contiguous captured segments separated by
+    /// eager (non-capturable) seam nodes.
+    ///
+    /// The CUDA EP keeps ownership of the whole claimed subgraph: this never
+    /// declines a run because *some* node is non-capturable. It only returns a
+    /// hard [`CaptureDeclineReport`] for a graph-level precondition (outputs must
+    /// land in persistent device bindings) or when *nothing* is capturable — in
+    /// which case a device graph adds no value and the caller runs fully eager
+    /// (still on the CUDA EP, so placement is unchanged).
+    fn plan_capture_segments(
         &self,
         resolved: &HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
-    ) -> std::result::Result<(), CaptureDeclineReport> {
-        let mut report = CaptureDeclineReport::default();
+    ) -> std::result::Result<CaptureSchedule, CaptureDeclineReport> {
         if self
             .graph
             .outputs
             .iter()
             .any(|output| !external.outputs.contains_key(output))
         {
-            report.entries.push(CaptureDecline::graph(
+            return Err(CaptureDeclineReport::one(CaptureDecline::graph(
                 "every graph output must use a persistent device binding during capture",
-            ));
+            )));
         }
 
-        let mut kernels = Vec::<&dyn onnx_runtime_ep_api::Kernel>::with_capacity(self.plan.len());
-        for plan in &self.plan {
-            let node = self.graph.node(plan.node_id);
-            if is_control_flow_op(&node.op_type, &node.domain)
-                || is_sequence_op(&node.op_type, &node.domain)
-            {
-                report.entries.push(CaptureDecline::node(
-                    plan.node_id,
-                    node,
-                    "control-flow and sequence nodes are not device-graph capturable",
-                ));
-                continue;
+        let declines: Vec<Option<CaptureDecline>> = self
+            .plan
+            .iter()
+            .map(|plan| self.node_capture_reason(plan, resolved))
+            .collect();
+
+        let mut segments: Vec<ScheduledSegment> = Vec::new();
+        let mut boundaries: Vec<CaptureDecline> = Vec::new();
+        let mut next_graph_index = 0usize;
+        let mut pi = 0usize;
+        while pi < declines.len() {
+            let captured = declines[pi].is_none();
+            let start = pi;
+            while pi < declines.len() && declines[pi].is_none() == captured {
+                if let Some(decline) = &declines[pi] {
+                    boundaries.push(decline.clone());
+                }
+                pi += 1;
             }
-            if plan
-                .outputs
-                .iter()
-                .any(|output| !resolved.contains_key(output))
-            {
-                report.entries.push(CaptureDecline::node(
-                    plan.node_id,
-                    node,
-                    "data-dependent output shape was unresolved before capture",
-                ));
-                continue;
-            }
-            let Some(input_shapes) = plan
+            let graph_index = if captured {
+                let index = next_graph_index;
+                next_graph_index += 1;
+                index
+            } else {
+                0
+            };
+            segments.push(ScheduledSegment {
+                start,
+                end: pi,
+                captured,
+                graph_index,
+            });
+        }
+
+        if next_graph_index == 0 {
+            return Err(CaptureDeclineReport {
+                entries: boundaries,
+            });
+        }
+
+        Ok(CaptureSchedule {
+            segments,
+            boundaries,
+        })
+    }
+
+    /// Gather the warmed, capturable kernels backing one captured segment, in
+    /// plan order, ready to hand to the EP's `begin_device_graph_capture` audit.
+    fn collect_segment_kernels(
+        &self,
+        seg: &ScheduledSegment,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<Vec<&dyn onnx_runtime_ep_api::Kernel>> {
+        let mut kernels = Vec::with_capacity(seg.end - seg.start);
+        for pi in seg.start..seg.end {
+            let plan = &self.plan[pi];
+            let input_shapes = plan
                 .inputs
                 .iter()
                 .map(|input| {
@@ -2229,42 +2449,128 @@ impl Executor {
                         .unwrap_or(Some(Vec::new()))
                 })
                 .collect::<Option<Vec<_>>>()
-            else {
-                report.entries.push(CaptureDecline::node(
-                    plan.node_id,
-                    node,
-                    "data-dependent input shape was unresolved before capture",
-                ));
-                continue;
-            };
+                .ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "segment kernel node {} lost its resolved input shape before capture",
+                        plan.node_id.0
+                    ))
+                })?;
             let key = KernelKey {
                 node: plan.node_id.0,
                 shapes: input_shapes,
             };
-            let Some(kernel) = self.cache.entries.get(&key) else {
-                report.entries.push(CaptureDecline::node(
-                    plan.node_id,
-                    node,
-                    "kernel has not been warmed for the requested capture shape",
-                ));
-                continue;
-            };
-            if let Some(decline) = kernel_capture_decline(plan.node_id, node, kernel.as_ref()) {
-                report.entries.push(decline);
-                continue;
-            }
+            let kernel = self.cache.entries.get(&key).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "segment kernel node {} was not warmed before capture",
+                    plan.node_id.0
+                ))
+            })?;
             kernels.push(kernel.as_ref());
         }
-        if !report.is_empty() {
-            return Err(report);
+        Ok(kernels)
+    }
+
+    /// Dispatch one plan node to its execution path (control-flow, sequence, or
+    /// leaf kernel). Shared by the eager loop and the segmented runner.
+    fn exec_plan_node(
+        &mut self,
+        pi: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        let node = self.graph.node(self.plan[pi].node_id);
+        let op_type = node.op_type.clone();
+        let domain = node.domain.clone();
+        if is_control_flow_op(&op_type, &domain) {
+            self.exec_control_flow(pi, resolved, outer_scope)
+        } else if is_sequence_op(&op_type, &domain) {
+            self.exec_sequence_node(pi, resolved, external)
+        } else {
+            self.exec_kernel_node(pi, resolved, external)
         }
-        self.ep
-            .begin_device_graph_capture(&kernels)
-            .map_err(|error| {
-                CaptureDeclineReport::one(CaptureDecline::graph(format!(
-                    "execution provider rejected begin_capture: {error}"
-                )))
-            })
+    }
+
+    /// Execute every plan node eagerly on the stream (no capture).
+    fn run_plan_eager(
+        &mut self,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        if profile_ops_enabled() {
+            let run_start = Instant::now();
+            let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
+            for pi in 0..self.plan.len() {
+                let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
+                let start = Instant::now();
+                let result = self.exec_plan_node(pi, resolved, outer_scope, external);
+                let elapsed = start.elapsed();
+                let entry = timings.entry(op_type).or_insert((Duration::ZERO, 0));
+                entry.0 += elapsed;
+                entry.1 += 1;
+                result?;
+            }
+            print_op_profile(run_start.elapsed(), timings);
+        } else {
+            for pi in 0..self.plan.len() {
+                self.exec_plan_node(pi, resolved, outer_scope, external)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the plan against a [`CaptureSchedule`], interleaving captured device
+    /// graphs with eager seam nodes.
+    ///
+    /// * [`RunMode::Capture`] records each captured segment into its own device
+    ///   graph, then immediately replays it so the following eager seam node
+    ///   reads real bytes from the stable seam buffers. Eager seam nodes execute
+    ///   normally on the stream (not recorded).
+    /// * [`RunMode::Replay`] launches each captured segment's installed graph in
+    ///   order and re-runs only the eager seam nodes.
+    ///
+    /// Seam correctness relies on the executor's per-value buffer reuse: for a
+    /// fixed decode shape, intermediate buffers keep the same device address
+    /// every step, so a captured segment and the eager node on either side of a
+    /// seam always read and write the same stable buffers.
+    fn run_plan_segmented(
+        &mut self,
+        schedule: &CaptureSchedule,
+        mode: RunMode,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        let ep = Arc::clone(&self.ep);
+        for seg in &schedule.segments {
+            if seg.captured {
+                match mode {
+                    RunMode::Capture => {
+                        {
+                            let kernels = self.collect_segment_kernels(seg, resolved)?;
+                            ep.begin_device_graph_capture(&kernels)?;
+                        }
+                        for pi in seg.start..seg.end {
+                            self.exec_plan_node(pi, resolved, outer_scope, external)?;
+                        }
+                        ep.end_device_graph_capture()?;
+                        ep.replay_device_graph_segment(seg.graph_index)?;
+                    }
+                    RunMode::Replay => {
+                        ep.replay_device_graph_segment(seg.graph_index)?;
+                    }
+                    RunMode::Eager => {
+                        unreachable!("eager runs never build a segment schedule")
+                    }
+                }
+            } else {
+                for pi in seg.start..seg.end {
+                    self.exec_plan_node(pi, resolved, outer_scope, external)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
