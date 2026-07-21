@@ -1,10 +1,12 @@
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
+use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::{CudaExecutionProvider, SCATTER_CAPTURE_ERROR_INDEX};
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -30,14 +32,13 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
     }
 }
 
-fn run(
+fn graph(
     op: &str,
     opset: u64,
     inputs: &[Tensor],
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
-) -> Vec<Vec<u8>> {
-    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+) -> (Graph, NodeId) {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), opset);
     let input_values = inputs
@@ -45,7 +46,7 @@ fn run(
         .enumerate()
         .map(|(i, input)| {
             let value = graph.create_named_value(
-                &format!("input_{i}"),
+                format!("input_{i}"),
                 input.dtype,
                 static_shape(input.shape.iter().copied()),
             );
@@ -58,7 +59,7 @@ fn run(
         .enumerate()
         .map(|(i, (dtype, shape))| {
             graph.create_named_value(
-                &format!("output_{i}"),
+                format!("output_{i}"),
                 *dtype,
                 static_shape(shape.iter().copied()),
             )
@@ -77,9 +78,25 @@ fn run(
     for output in output_values {
         graph.add_output(output);
     }
+    (graph, node_id)
+}
+
+fn run(
+    op: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Vec<Vec<u8>> {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    let (graph, node_id) = graph(op, opset, inputs, outputs, attrs);
     let model = Model::new(&graph);
+    let concrete_shapes = inputs
+        .iter()
+        .map(|input| input.shape.clone())
+        .collect::<Vec<_>>();
     let kernel = ep
-        .get_kernel(model.graph.node(node_id), &[], opset)
+        .get_kernel(model.graph.node(node_id), &concrete_shapes, opset)
         .unwrap();
 
     let input_buffers = inputs
@@ -163,6 +180,67 @@ fn run(
         ep.deallocate(buffer).unwrap();
     }
     result
+}
+
+fn run_cpu(
+    op: &str,
+    opset: u64,
+    inputs: &[Tensor],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Vec<Vec<u8>> {
+    let ep = CpuExecutionProvider::new();
+    let (graph, node_id) = graph(op, opset, inputs, outputs, attrs);
+    let model = Model::new(&graph);
+    let concrete_shapes = inputs
+        .iter()
+        .map(|input| input.shape.clone())
+        .collect::<Vec<_>>();
+    let kernel = ep
+        .get_kernel(model.graph.node(node_id), &concrete_shapes, opset)
+        .unwrap();
+    let input_strides = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect::<Vec<_>>();
+    let input_views = inputs
+        .iter()
+        .zip(&input_strides)
+        .map(|(input, strides)| {
+            TensorView::new(
+                DevicePtr(input.bytes.as_ptr().cast()),
+                input.dtype,
+                &input.shape,
+                strides,
+                DeviceId::cpu(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output_strides = outputs
+        .iter()
+        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let mut output_bytes = outputs
+        .iter()
+        .map(|(dtype, shape)| vec![0_u8; dtype.storage_bytes(shape.iter().product())])
+        .collect::<Vec<_>>();
+    let mut output_views = outputs
+        .iter()
+        .zip(&output_strides)
+        .zip(output_bytes.iter_mut())
+        .map(|(((dtype, shape), strides), bytes)| {
+            TensorMut::new(
+                DevicePtrMut(bytes.as_mut_ptr().cast()),
+                *dtype,
+                shape,
+                strides,
+                DeviceId::cpu(),
+            )
+        })
+        .collect::<Vec<_>>();
+    kernel.execute(&input_views, &mut output_views).unwrap();
+    drop(output_views);
+    output_bytes
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -310,6 +388,250 @@ fn scatter_elements_all_reductions_are_ordered_and_deterministic() {
     assert_eq!(scatter("mul"), vec![40., 120., 30.]);
     assert_eq!(scatter("max"), vec![10., 20., 30.]);
     assert_eq!(scatter("min"), vec![4., 2., 30.]);
+}
+
+#[test]
+fn scatter_elements_fp16_data_matches_cpu_oracle() {
+    let data = [
+        f16::from_f32(10.0),
+        f16::from_f32(20.0),
+        f16::from_f32(30.0),
+    ];
+    let updates = [f16::from_f32(2.0), f16::from_f32(3.0), f16::from_f32(4.0)];
+    for reduction in ["none", "add", "mul", "max", "min"] {
+        let attrs = if reduction == "none" {
+            vec![("axis", Attribute::Int(-1))]
+        } else {
+            vec![
+                ("axis", Attribute::Int(-1)),
+                ("reduction", Attribute::String(reduction.into())),
+            ]
+        };
+        let opset = if reduction == "none" { 11 } else { 16 };
+        let gpu = run(
+            "ScatterElements",
+            opset,
+            &[
+                tensor(DataType::Float16, &[3], &data),
+                tensor(DataType::Int64, &[3], &[1_i64, 1, -3]),
+                tensor(DataType::Float16, &[3], &updates),
+            ],
+            &[(DataType::Float16, vec![3])],
+            &attrs,
+        );
+        let cpu = run_cpu(
+            "ScatterElements",
+            opset,
+            &[
+                tensor(DataType::Float16, &[3], &data),
+                tensor(DataType::Int64, &[3], &[1_i64, 1, -3]),
+                tensor(DataType::Float16, &[3], &updates),
+            ],
+            &[(DataType::Float16, vec![3])],
+            &attrs,
+        );
+        assert_eq!(gpu, cpu, "fp16 reduction={reduction}");
+    }
+}
+
+#[test]
+fn scatter_elements_int32_indices_match_cpu_oracle() {
+    for reduction in ["none", "add", "mul", "max", "min"] {
+        let attrs = if reduction == "none" {
+            vec![("axis", Attribute::Int(-1))]
+        } else {
+            vec![
+                ("axis", Attribute::Int(-1)),
+                ("reduction", Attribute::String(reduction.into())),
+            ]
+        };
+        let opset = if reduction == "none" { 11 } else { 16 };
+        let gpu = run(
+            "ScatterElements",
+            opset,
+            &[
+                tensor(DataType::Float32, &[3], &[10_f32, 20.0, 30.0]),
+                tensor(DataType::Int32, &[3], &[1_i32, 1, -3]),
+                tensor(DataType::Float32, &[3], &[2_f32, 3.0, 4.0]),
+            ],
+            &[(DataType::Float32, vec![3])],
+            &attrs,
+        );
+        let cpu = run_cpu(
+            "ScatterElements",
+            opset,
+            &[
+                tensor(DataType::Float32, &[3], &[10_f32, 20.0, 30.0]),
+                tensor(DataType::Int64, &[3], &[1_i64, 1, -3]),
+                tensor(DataType::Float32, &[3], &[2_f32, 3.0, 4.0]),
+            ],
+            &[(DataType::Float32, vec![3])],
+            &attrs,
+        );
+        assert_eq!(gpu, cpu, "int32 indices reduction={reduction}");
+    }
+}
+
+#[test]
+fn scatter_elements_bf16_data_and_int32_indices_match_cpu_oracle() {
+    let data = [
+        bf16::from_f32(10.0),
+        bf16::from_f32(20.0),
+        bf16::from_f32(30.0),
+    ];
+    let updates = [
+        bf16::from_f32(2.0),
+        bf16::from_f32(3.0),
+        bf16::from_f32(4.0),
+    ];
+    let attrs = [
+        ("axis", Attribute::Int(-1)),
+        ("reduction", Attribute::String(b"add".to_vec())),
+    ];
+    let gpu = run(
+        "ScatterElements",
+        16,
+        &[
+            tensor(DataType::BFloat16, &[3], &data),
+            tensor(DataType::Int32, &[3], &[1_i32, 1, -3]),
+            tensor(DataType::BFloat16, &[3], &updates),
+        ],
+        &[(DataType::BFloat16, vec![3])],
+        &attrs,
+    );
+    let cpu = run_cpu(
+        "ScatterElements",
+        16,
+        &[
+            tensor(DataType::BFloat16, &[3], &data),
+            tensor(DataType::Int64, &[3], &[1_i64, 1, -3]),
+            tensor(DataType::BFloat16, &[3], &updates),
+        ],
+        &[(DataType::BFloat16, vec![3])],
+        &attrs,
+    );
+    assert_eq!(gpu, cpu);
+}
+
+#[test]
+fn scatter_elements_warmed_fp16_int32_path_is_capture_safe() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    let data = [
+        f16::from_f32(10.0),
+        f16::from_f32(20.0),
+        f16::from_f32(30.0),
+    ];
+    let indices = [1_i32, 1, -3];
+    let updates = [f16::from_f32(2.0), f16::from_f32(3.0), f16::from_f32(4.0)];
+    let inputs = [
+        tensor(DataType::Float16, &[3], &data),
+        tensor(DataType::Int32, &[3], &indices),
+        tensor(DataType::Float16, &[3], &updates),
+    ];
+    let outputs = [(DataType::Float16, vec![3])];
+    let attrs = [
+        ("axis", Attribute::Int(-1)),
+        ("reduction", Attribute::String(b"add".to_vec())),
+    ];
+    let (graph, node_id) = graph("ScatterElements", 16, &inputs, &outputs, &attrs);
+    let model = Model::new(&graph);
+    let shapes = inputs
+        .iter()
+        .map(|input| input.shape.clone())
+        .collect::<Vec<_>>();
+    let kernel = ep
+        .get_kernel(model.graph.node(node_id), &shapes, 16)
+        .unwrap();
+    let mut input_buffers = inputs
+        .iter()
+        .map(|input| {
+            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            unsafe {
+                ep.runtime()
+                    .htod(&input.bytes, cuptr(buffer.as_ptr()))
+                    .unwrap()
+            };
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let input_strides = inputs
+        .iter()
+        .map(|input| compute_contiguous_strides(&input.shape))
+        .collect::<Vec<_>>();
+    let input_views = inputs
+        .iter()
+        .zip(&input_buffers)
+        .zip(&input_strides)
+        .map(|((input, buffer), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                input.dtype,
+                &input.shape,
+                strides,
+                ep.device_id(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut output = ep.allocate(3 * std::mem::size_of::<f16>(), 256).unwrap();
+    let output_strides = compute_contiguous_strides(&[3]);
+    let execute = |output: &mut DeviceBuffer| {
+        let output_view = TensorMut::new(
+            DevicePtrMut(output.as_mut_ptr()),
+            DataType::Float16,
+            &[3],
+            &output_strides,
+            ep.device_id(),
+        );
+        kernel.execute(&input_views, &mut [output_view]).unwrap();
+    };
+
+    execute(&mut output);
+    let mut eager = vec![0_u8; 3 * std::mem::size_of::<f16>()];
+    unsafe {
+        ep.runtime()
+            .dtoh(&mut eager, cuptr(output.as_ptr()))
+            .unwrap()
+    };
+    assert!(kernel.cuda_graph_compatible());
+    let allocation_counts = ep.runtime().allocation_counts();
+
+    ep.runtime()
+        .begin_graph_capture(&[kernel.as_ref()])
+        .unwrap();
+    execute(&mut output);
+    ep.runtime().end_graph_capture().unwrap();
+    ep.runtime().replay_graph().unwrap();
+    let mut replay = vec![0_u8; eager.len()];
+    unsafe {
+        ep.runtime()
+            .dtoh(&mut replay, cuptr(output.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(replay, eager);
+    assert_eq!(ep.runtime().allocation_counts(), allocation_counts);
+
+    let invalid = [-4_i32, 1, -3];
+    unsafe {
+        ep.runtime()
+            .htod(
+                raw(&invalid).as_slice(),
+                cuptr(input_buffers[1].as_mut_ptr()),
+            )
+            .unwrap()
+    };
+    ep.runtime().replay_graph().unwrap();
+    assert_ne!(
+        ep.runtime().check_capture_error().unwrap() & SCATTER_CAPTURE_ERROR_INDEX,
+        0
+    );
+    assert!(ep.runtime().reset_graph().unwrap());
+
+    drop(input_views);
+    drop(kernel);
+    for buffer in input_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output).unwrap();
 }
 
 #[test]

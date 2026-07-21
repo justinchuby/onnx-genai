@@ -60,6 +60,21 @@ fn assert_rejected(
     );
 }
 
+fn assert_supported(
+    ep: &CudaExecutionProvider,
+    op_type: &str,
+    opset: u64,
+    input_dtypes: &[DataType],
+    outputs: usize,
+) {
+    let (graph, id) = node(op_type, input_dtypes, outputs, None, &[]);
+    assert!(
+        ep.supports_op(graph.node(id), opset, &[], input_dtypes, &[])
+            .is_supported(),
+        "{op_type} must claim its supported input dtype combination"
+    );
+}
+
 #[test]
 fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
@@ -106,13 +121,16 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
         &[DataType::Float32, DataType::Int32],
         1,
     );
-    assert_rejected(
-        &ep,
-        "ScatterElements",
-        24,
-        &[DataType::Float32, DataType::Int32, DataType::Float32],
-        1,
-    );
+    for data in [
+        DataType::Float16,
+        DataType::Float32,
+        DataType::BFloat16,
+        DataType::Int64,
+    ] {
+        for indices in [DataType::Int32, DataType::Int64] {
+            assert_supported(&ep, "ScatterElements", 24, &[data, indices, data], 1);
+        }
+    }
     assert_rejected(
         &ep,
         "Where",
