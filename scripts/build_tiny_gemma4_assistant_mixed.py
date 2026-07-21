@@ -354,8 +354,8 @@ def main() -> None:
     target = build_target()
     assistant = build_assistant()
 
-    ir.save(target, str(OUT_DIR / "model.onnx"))
-    ir.save(assistant, str(assistant_dir / "model.onnx"))
+    ir.save(target, str(OUT_DIR / "model.onnx.textproto"), format="textproto")
+    ir.save(assistant, str(assistant_dir / "model.onnx.textproto"), format="textproto")
     _copy_tokenizer(OUT_DIR / "tokenizer.json")
 
     # The shared-KV proposer builds inputs_embeds from the target input-token

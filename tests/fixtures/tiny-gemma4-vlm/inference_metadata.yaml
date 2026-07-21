@@ -1,0 +1,51 @@
+# Tiny Gemma4-style VLM composite pipeline fixture with inputs_embeds fusion.
+# Built by scripts/build_tiny_gemma4_vlm.py; exercises the composite strategy
+# with two prompt_only single_pass stages (vision + fusion) feeding an
+# autoregressive decoder that consumes inputs_embeds (DESIGN.md §20).
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx.textproto
+      type: vision_encoder
+    embedding:
+      filename: embedding.onnx.textproto
+      type: encoder
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+  dataflow:
+    - from: vision_encoder.image_features
+      to: embedding.image_features
+      dtype: fp32
+      device_transfer: false
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_vision
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: fuse_embeddings
+        strategy:
+          kind: single_pass
+          model: embedding
+        run_on: prompt_only
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 4
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    embedding:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step

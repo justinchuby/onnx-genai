@@ -26,6 +26,7 @@ from tokenizers.processors import TemplateProcessing
 
 from mobius import ArchitectureConfig, build_from_module
 from mobius.models.gpt2 import GPT2CausalLMModel
+import onnx_ir as ir
 
 SEED = 20260712
 
@@ -120,6 +121,12 @@ def main() -> None:
     pkg = build_from_module(GPT2CausalLMModel(config), config, execution_provider="default")
     _apply_deterministic_weights(pkg)
     pkg.save(str(output_dir), check_weights=True, progress_bar=False)
+    # Re-emit as git-friendly textproto with weights inlined, then drop binaries.
+    ir.save(pkg["model"], str(output_dir / "model.onnx.textproto"), format="textproto")
+    for stale in ("model.onnx", "model.onnx.data"):
+        stale_path = output_dir / stale
+        if stale_path.exists():
+            stale_path.unlink()
     _write_tokenizer(output_dir / "tokenizer.json")
 
     manifest = {
@@ -137,7 +144,7 @@ def main() -> None:
         "head_dim": config.head_dim,
         "files": {
             name: (output_dir / name).stat().st_size
-            for name in ["model.onnx", "model.onnx.data", "tokenizer.json"]
+            for name in ["model.onnx.textproto", "tokenizer.json"]
         },
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

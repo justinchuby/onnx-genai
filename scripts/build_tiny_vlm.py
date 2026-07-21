@@ -68,8 +68,8 @@ def constant_node(name: str, output: str, value: np.ndarray) -> ir.Node:
 
 
 def save_model(model: ir.Model, path: Path) -> None:
-    ir.save(model, path)
-    onnx.checker.check_model(path)
+    ir.save(model, path, format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
 
 
 def build_encoder(path: Path) -> None:
@@ -292,15 +292,20 @@ def write_tokenizer(path: Path) -> None:
 
 def write_metadata(path: Path) -> None:
     path.write_text(
-        """pipeline:\n  models:\n    encoder:\n      filename: encoder.onnx\n      type: encoder\n    decoder:\n      filename: decoder.onnx\n      type: decoder\n      tokenizer: tokenizer.json\n  dataflow:\n    - from: encoder.image_features\n      to: decoder.image_features\n      dtype: fp32\n      device_transfer: false\n  strategy:\n    kind: composite\n    stages:\n      - name: encode_image\n        strategy:\n          kind: single_pass\n          model: encoder\n        run_on: prompt_only\n      - name: decode_text\n        strategy:\n          kind: autoregressive\n          decoder: decoder\n          max_tokens: 4\n        run_on: every_step\n  phases:\n    encoder:\n      run_on: prompt_only\n    decoder:\n      run_on: every_step\n"""
+        """pipeline:\n  models:\n    encoder:\n      filename: encoder.onnx.textproto\n      type: encoder\n    decoder:\n      filename: decoder.onnx.textproto\n      type: decoder\n      tokenizer: tokenizer.json\n  dataflow:\n    - from: encoder.image_features\n      to: decoder.image_features\n      dtype: fp32\n      device_transfer: false\n  strategy:\n    kind: composite\n    stages:\n      - name: encode_image\n        strategy:\n          kind: single_pass\n          model: encoder\n        run_on: prompt_only\n      - name: decode_text\n        strategy:\n          kind: autoregressive\n          decoder: decoder\n          max_tokens: 4\n        run_on: every_step\n  phases:\n    encoder:\n      run_on: prompt_only\n    decoder:\n      run_on: every_step\n"""
     )
+
+
+def _textproto_bytes(path) -> bytes:
+    """Load a .onnx.textproto fixture and return serialized binary ModelProto bytes."""
+    return ir.to_proto(ir.load(str(path), format="textproto")).SerializeToString()
 
 
 def validate_with_ort(output_dir: Path) -> None:
     import onnxruntime as ort
 
-    encoder = ort.InferenceSession(str(output_dir / "encoder.onnx"), providers=["CPUExecutionProvider"])
-    decoder = ort.InferenceSession(str(output_dir / "decoder.onnx"), providers=["CPUExecutionProvider"])
+    encoder = ort.InferenceSession(_textproto_bytes(output_dir / "encoder.onnx.textproto"), providers=["CPUExecutionProvider"])
+    decoder = ort.InferenceSession(_textproto_bytes(output_dir / "decoder.onnx.textproto"), providers=["CPUExecutionProvider"])
     pixels = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2) / 12.0
     features = encoder.run(None, {"pixel_values": pixels})[0]
     logits = decoder.run(None, {"input_ids": np.array([[2, 3]], dtype=np.int64), "image_features": features})[0]
@@ -322,8 +327,8 @@ def main() -> None:
 
     output_dir = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
-    build_encoder(output_dir / "encoder.onnx")
-    build_decoder(output_dir / "decoder.onnx")
+    build_encoder(output_dir / "encoder.onnx.textproto")
+    build_decoder(output_dir / "decoder.onnx.textproto")
     write_tokenizer(output_dir / "tokenizer.json")
     write_metadata(output_dir / "inference_metadata.yaml")
     if not args.no_validate:

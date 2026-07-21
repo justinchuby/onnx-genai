@@ -750,7 +750,8 @@ pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) ->
 mod tests {
     use super::*;
     use crate::decode::{
-        ModelDecodePath, detect_model_decode_path, run_decode_session_logits, run_decode_step,
+        ModelDecodePath, detect_model_decode_path, extract_next_token_logits_with_io,
+        run_decode_session_logits, run_decode_step,
     };
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
     use onnx_genai_ort::{Environment, SessionOptions};
@@ -768,7 +769,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures")
             .join(name)
-            .join("model.onnx")
+            .join("model.onnx.textproto")
     }
 
     fn load_session(name: &str) -> anyhow::Result<(Environment, Session)> {
@@ -1245,6 +1246,68 @@ mod tests {
         run_decode_step(&session, &mut state, &[5], 3)?;
         assert_eq!(state.retained_kv_len(4), 3);
         assert!(state.past.values().all(|value| value.shape()[2] == 3));
+        Ok(())
+    }
+
+    /// Regression guard for metadata-driven graph-port binding: the
+    /// `tiny-llm-explicit-io` fixture is the tiny-llm graph with every decode
+    /// port renamed to a non-conventional name (`tokens`, `attn_mask_port`,
+    /// `pos_port`, `out_logits`, `cache_k_in.0`/`cache_v_in.0` ->
+    /// `cache_k_out.0`/`cache_v_out.0`). The runtime can only decode it by
+    /// reading the explicit `model.io` block, proving it never infers a port by
+    /// tensor name.
+    #[test]
+    fn explicit_io_binds_decode_ports_purely_from_metadata_names() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm-explicit-io")?;
+
+        // Sanity: the graph exposes only the renamed, non-conventional names.
+        assert!(session.input_names().iter().any(|name| name == "tokens"));
+        assert!(session.output_names().iter().any(|name| name == "out_logits"));
+        assert!(!session.input_names().iter().any(|name| name == "input_ids"));
+        assert!(!session.output_names().iter().any(|name| name == "logits"));
+
+        // Without an `io` block, the name-convention fallback cannot bind the
+        // renamed token input and decoding fails.
+        let mut convention_state = DecodeState::new(&session)?;
+        let convention_err = match run_decode_step(&session, &mut convention_state, &[2, 4], 0) {
+            Ok(_) => panic!("name-convention binding must not decode a renamed graph"),
+            Err(error) => error,
+        };
+        assert!(
+            convention_err.to_string().contains("unsupported model input"),
+            "expected name-convention binding to fail, got: {convention_err}"
+        );
+
+        // Load the explicit `io` block from the fixture's inference metadata and
+        // decode purely from the declared names.
+        let metadata_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm-explicit-io/inference_metadata.yaml");
+        let metadata = onnx_genai_metadata::load_metadata(&metadata_path)?;
+        let io = metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref())
+            .expect("fixture declares a model.io block");
+
+        let mut state = DecodeState::new_with_io(&session, Some(io))?;
+        assert!(state.use_kv, "declared kv_inputs/kv_outputs enable KV cache");
+
+        // First step (prefill) over two tokens, then a single decode step that
+        // must read the cached KV threaded via the declared kv pairs.
+        let prefill = run_decode_step(&session, &mut state, &[2, 4], 0)?;
+        let prefill_logits =
+            extract_next_token_logits_with_io(&session, prefill, io.logits_output.as_deref())?;
+        assert_eq!(
+            prefill_logits.len(),
+            32,
+            "logits bound from declared out_logits output must be vocab-sized"
+        );
+
+        let step = run_decode_step(&session, &mut state, &[3], 2)?;
+        let step_logits =
+            extract_next_token_logits_with_io(&session, step, io.logits_output.as_deref())?;
+        assert_eq!(step_logits.len(), 32);
         Ok(())
     }
 

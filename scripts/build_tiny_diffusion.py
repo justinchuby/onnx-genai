@@ -4,11 +4,11 @@
 This hand-constructs the minimal ONNX pair needed to exercise the iterative
 pipeline seam (`PipelineEngine::run_pipeline` over a `kind: iterative` strategy):
 
-  * ``denoiser.onnx``  — one denoise step: ``denoised = (sample + cond) * 0.5``.
+  * ``denoiser.onnx.textproto``  — one denoise step: ``denoised = (sample + cond) * 0.5``.
       * ``sample`` is loop-carried (a ``denoiser.denoised -> denoiser.sample``
         self-edge feeds each step's output into the next step's input).
       * ``cond`` is constant conditioning re-supplied every step.
-  * ``vae.onnx``       — a ``final_only`` single-pass decoder: ``image = latent * 2 + 1``,
+  * ``vae.onnx.textproto``       — a ``final_only`` single-pass decoder: ``image = latent * 2 + 1``,
       fed the final denoiser output via ``denoiser.denoised -> vae.latent``.
 
 The transforms are affine and deterministic so the Rust test can assert the
@@ -38,8 +38,8 @@ def node(op_type: str, inputs: list[ir.Value], output: str, *, name: str = "") -
 
 
 def save_model(model: ir.Model, path: Path) -> None:
-    ir.save(model, path)
-    onnx.checker.check_model(path)
+    ir.save(model, path, format="textproto")
+    onnx.checker.check_model(ir.to_proto(model))
 
 
 def build_denoiser(path: Path) -> None:
@@ -166,10 +166,10 @@ METADATA = """\
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
     vae:
-      filename: vae.onnx
+      filename: vae.onnx.textproto
       type: vae
   dataflow:
     - from: denoiser.denoised
@@ -192,13 +192,18 @@ def write_metadata(path: Path) -> None:
     path.write_text(METADATA)
 
 
+def _textproto_bytes(path) -> bytes:
+    """Load a .onnx.textproto fixture and return serialized binary ModelProto bytes."""
+    return ir.to_proto(ir.load(str(path), format="textproto")).SerializeToString()
+
+
 def validate_with_ort(output_dir: Path) -> None:
     import onnxruntime as ort
 
     denoiser = ort.InferenceSession(
-        str(output_dir / "denoiser.onnx"), providers=["CPUExecutionProvider"]
+        _textproto_bytes(output_dir / "denoiser.onnx.textproto"), providers=["CPUExecutionProvider"]
     )
-    vae = ort.InferenceSession(str(output_dir / "vae.onnx"), providers=["CPUExecutionProvider"])
+    vae = ort.InferenceSession(_textproto_bytes(output_dir / "vae.onnx.textproto"), providers=["CPUExecutionProvider"])
 
     sample = np.zeros((1, 4), dtype=np.float32)
     cond = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
@@ -226,11 +231,11 @@ def main() -> None:
 
     output_dir = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
-    build_denoiser(output_dir / "denoiser.onnx")
-    build_denoiser_multi(output_dir / "denoiser_multi.onnx")
-    build_denoiser_dualcond(output_dir / "denoiser_dualcond.onnx")
-    build_denoiser_step(output_dir / "denoiser_step.onnx")
-    build_vae(output_dir / "vae.onnx")
+    build_denoiser(output_dir / "denoiser.onnx.textproto")
+    build_denoiser_multi(output_dir / "denoiser_multi.onnx.textproto")
+    build_denoiser_dualcond(output_dir / "denoiser_dualcond.onnx.textproto")
+    build_denoiser_step(output_dir / "denoiser_step.onnx.textproto")
+    build_vae(output_dir / "vae.onnx.textproto")
     write_metadata(output_dir / "inference_metadata.yaml")
     if not args.no_validate:
         validate_with_ort(output_dir)

@@ -23,6 +23,25 @@ pub fn from_textproto(source: &str) -> Result<Model> {
     Model::from_proto(proto)
 }
 
+/// Convert a protobuf TextFormat (`.textproto`) document into the binary
+/// protobuf wire encoding of its `ModelProto`.
+///
+/// This is the conversion used by runtime loaders to accept git-friendly
+/// textproto fixtures: parse the text and re-encode as the exact binary bytes a
+/// runtime's binary-decode path already expects. It is deliberately
+/// *lightweight* — it does not build the runtime graph or run shape inference
+/// (unlike [`from_textproto`]), so it faithfully reproduces the model bytes for
+/// a downstream runtime (e.g. ONNX Runtime) to load and validate itself.
+///
+/// Because the returned buffer carries no model-directory context, textproto
+/// documents must inline all weights (no external `.onnx.data`).
+pub fn to_binary(source: &str) -> Result<Vec<u8>> {
+    use prost::Message;
+    let dynamic = DynamicMessage::parse_text_format(crate::proto_serde::descriptor(), source)
+        .map_err(|error| textproto_error(error.to_string()))?;
+    Ok(dynamic.encode_to_vec())
+}
+
 fn textproto_error(message: impl Into<String>) -> Error {
     Error::TextProto(message.into())
 }

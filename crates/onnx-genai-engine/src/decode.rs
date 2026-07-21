@@ -236,11 +236,168 @@ impl DecodeBackend for StaticCacheDecodeSession<'static> {
     }
 }
 
+/// Resolved graph I/O port bindings for the decode step.
+///
+/// Built from an explicit metadata `io` block when a model package declares one
+/// (via [`ModelIoSpec`]), or derived from historical tensor-name conventions
+/// otherwise. When [`ResolvedIo::explicit`] is `false`, the scalar port fields
+/// are `None` and the decode step falls back to tensor-name conventions.
+///
+/// TRANSITIONAL: the convention fallback exists only until every model package
+/// emits an `io` block. Phase 2 removes the fallback, at which point `explicit`
+/// is always `true` and the `is_*` helpers collapse to direct name comparisons.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolvedIo {
+    /// True when built from an explicit metadata `io` block.
+    explicit: bool,
+    pub(crate) token_input: Option<String>,
+    pub(crate) inputs_embeds_input: Option<String>,
+    pub(crate) attention_mask_input: Option<String>,
+    pub(crate) position_ids_input: Option<String>,
+    pub(crate) logits_output: Option<String>,
+    pub(crate) hidden_output: Option<String>,
+    /// `(past_input, present_output)` pairs, positionally paired. Empty for a
+    /// non-KV graph.
+    pub(crate) kv_pairs: Vec<(String, String)>,
+}
+
+impl ResolvedIo {
+    /// Resolve port bindings from an explicit `io` block when present, else fall
+    /// back to tensor-name conventions.
+    pub(crate) fn resolve(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
+        match io {
+            Some(io) => Self::from_spec(session, io),
+            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn from_spec(
+        session: &Session,
+        io: &onnx_genai_metadata::ModelIoSpec,
+    ) -> anyhow::Result<Self> {
+        let has_input = |name: &str| session.inputs().iter().any(|info| info.name == name);
+        let has_output = |name: &str| session.outputs().iter().any(|info| info.name == name);
+
+        for (label, port) in [
+            ("io.token_input", &io.token_input),
+            ("io.inputs_embeds_input", &io.inputs_embeds_input),
+            ("io.attention_mask_input", &io.attention_mask_input),
+            ("io.position_ids_input", &io.position_ids_input),
+        ] {
+            if let Some(name) = port.as_deref().filter(|name| !has_input(name)) {
+                anyhow::bail!(
+                    "{label} declares input '{name}' but the graph does not expose it; graph inputs: {:?}",
+                    session.input_names()
+                );
+            }
+        }
+        for (label, port) in [
+            ("io.logits_output", &io.logits_output),
+            ("io.hidden_output", &io.hidden_output),
+        ] {
+            if let Some(name) = port.as_deref().filter(|name| !has_output(name)) {
+                anyhow::bail!(
+                    "{label} declares output '{name}' but the graph does not expose it; graph outputs: {:?}",
+                    session.output_names()
+                );
+            }
+        }
+        if io.token_input.is_some() && io.inputs_embeds_input.is_some() {
+            anyhow::bail!(
+                "io.token_input and io.inputs_embeds_input are mutually exclusive; a decoder consumes tokens OR pre-embedded inputs, not both"
+            );
+        }
+
+        let kv_pairs = match (&io.kv_inputs, &io.kv_outputs) {
+            (Some(inputs), Some(outputs)) => {
+                if inputs.len() != outputs.len() {
+                    anyhow::bail!(
+                        "io.kv_inputs ({}) and io.kv_outputs ({}) must have equal length for positional pairing",
+                        inputs.len(),
+                        outputs.len()
+                    );
+                }
+                for name in inputs {
+                    if !has_input(name) {
+                        anyhow::bail!(
+                            "io.kv_inputs declares input '{name}' but the graph does not expose it; graph inputs: {:?}",
+                            session.input_names()
+                        );
+                    }
+                }
+                for name in outputs {
+                    if !has_output(name) {
+                        anyhow::bail!(
+                            "io.kv_outputs declares output '{name}' but the graph does not expose it; graph outputs: {:?}",
+                            session.output_names()
+                        );
+                    }
+                }
+                inputs
+                    .iter()
+                    .cloned()
+                    .zip(outputs.iter().cloned())
+                    .collect()
+            }
+            (None, None) => Vec::new(),
+            _ => anyhow::bail!(
+                "io.kv_inputs and io.kv_outputs must be declared together (positional KV pairing)"
+            ),
+        };
+
+        Ok(Self {
+            explicit: true,
+            token_input: io.token_input.clone(),
+            inputs_embeds_input: io.inputs_embeds_input.clone(),
+            attention_mask_input: io.attention_mask_input.clone(),
+            position_ids_input: io.position_ids_input.clone(),
+            logits_output: io.logits_output.clone(),
+            hidden_output: io.hidden_output.clone(),
+            kv_pairs,
+        })
+    }
+
+    /// Whether `name` is the token-id input for this graph.
+    fn is_token_input(&self, name: &str, lower: &str) -> bool {
+        if self.explicit {
+            self.token_input.as_deref() == Some(name)
+        } else {
+            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+            is_token_input_name(lower)
+        }
+    }
+
+    /// Whether `name` is the attention-mask input for this graph.
+    fn is_attention_mask_input(&self, name: &str, lower: &str) -> bool {
+        if self.explicit {
+            self.attention_mask_input.as_deref() == Some(name)
+        } else {
+            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+            lower == "attention_mask" || lower.ends_with(".attention_mask")
+        }
+    }
+
+    /// Whether `name` is the position-ids input for this graph.
+    fn is_position_ids_input(&self, name: &str, lower: &str) -> bool {
+        if self.explicit {
+            self.position_ids_input.as_deref() == Some(name)
+        } else {
+            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+            lower == "position_ids" || lower.ends_with(".position_ids")
+        }
+    }
+}
+
 pub(crate) struct DecodeState {
     pub(crate) use_kv: bool,
     pub(crate) past: HashMap<String, Value>,
     pub(crate) present_to_past: HashMap<String, String>,
     pub(crate) kv_inputs: Vec<String>,
+    pub(crate) io: ResolvedIo,
     sliding_window: Option<usize>,
     sink_tokens: usize,
     retained_kv_len: usize,
@@ -249,6 +406,47 @@ pub(crate) struct DecodeState {
 
 impl DecodeState {
     pub(crate) fn new(session: &Session) -> anyhow::Result<Self> {
+        Self::new_with_io(session, None)
+    }
+
+    /// Construct a decode state, binding KV and per-step ports from an explicit
+    /// metadata `io` block when supplied, else from tensor-name conventions.
+    pub(crate) fn new_with_io(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
+        let resolved = ResolvedIo::resolve(session, io)?;
+        Self::from_resolved(session, resolved)
+    }
+
+    fn from_resolved(session: &Session, resolved: ResolvedIo) -> anyhow::Result<Self> {
+        if resolved.explicit {
+            let kv_inputs = resolved
+                .kv_pairs
+                .iter()
+                .map(|(past, _)| past.clone())
+                .collect::<Vec<_>>();
+            let present_to_past = resolved
+                .kv_pairs
+                .iter()
+                .map(|(past, present)| (present.clone(), past.clone()))
+                .collect::<HashMap<_, _>>();
+            let use_kv = !resolved.kv_pairs.is_empty();
+            return Ok(Self {
+                use_kv,
+                past: HashMap::new(),
+                present_to_past,
+                kv_inputs,
+                io: resolved,
+                sliding_window: None,
+                sink_tokens: 0,
+                retained_kv_len: 0,
+                runner: None,
+            });
+        }
+
+        // TRANSITIONAL: remove in Phase 2 once all packages emit `io`. KV wiring
+        // is inferred from `past`/`present` tensor-name conventions.
         let kv_inputs = session
             .inputs()
             .iter()
@@ -268,6 +466,7 @@ impl DecodeState {
                 past: HashMap::new(),
                 present_to_past: HashMap::new(),
                 kv_inputs,
+                io: resolved,
                 sliding_window: None,
                 sink_tokens: 0,
                 retained_kv_len: 0,
@@ -298,6 +497,7 @@ impl DecodeState {
             past: HashMap::new(),
             present_to_past,
             kv_inputs,
+            io: resolved,
             sliding_window: None,
             sink_tokens: 0,
             retained_kv_len: 0,
@@ -306,13 +506,24 @@ impl DecodeState {
     }
 
     pub(crate) fn new_for_path(session: &Session, path: &ModelDecodePath) -> anyhow::Result<Self> {
+        Self::new_for_path_with_io(session, path, None)
+    }
+
+    /// Like [`DecodeState::new_for_path`], binding per-step and KV ports from an
+    /// explicit metadata `io` block when supplied (Legacy / PastPresent paths).
+    pub(crate) fn new_for_path_with_io(
+        session: &Session,
+        path: &ModelDecodePath,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
         match path {
-            ModelDecodePath::Legacy => Self::new(session),
+            ModelDecodePath::Legacy => Self::new_with_io(session, io),
             ModelDecodePath::StaticCache { .. } => Ok(Self {
                 use_kv: true,
                 past: HashMap::new(),
                 present_to_past: HashMap::new(),
                 kv_inputs: Vec::new(),
+                io: ResolvedIo::resolve(session, io)?,
                 sliding_window: None,
                 sink_tokens: 0,
                 retained_kv_len: 0,
@@ -327,7 +538,7 @@ impl DecodeState {
                 sliding_window,
                 sink_tokens,
             } => {
-                let mut state = Self::new(session)?;
+                let mut state = Self::new_with_io(session, io)?;
                 state.sliding_window = *sliding_window;
                 state.sink_tokens = sink_tokens.unwrap_or(0);
                 if state.use_kv && sliding_window.is_none() {
@@ -701,7 +912,7 @@ pub(crate) fn next_session_token_logits(
             state.decode_state.sink_tokens(),
         )?;
     }
-    extract_next_token_logits(session, outputs)
+    extract_next_token_logits_from_outputs(session, &outputs, state.decode_state.io.logits_output.as_deref())
 }
 
 pub(crate) fn next_session_token_logits_and_hidden(
@@ -779,7 +990,7 @@ pub(crate) fn next_session_token_logits_and_hiddens(
             state.decode_state.sink_tokens(),
         )?;
     }
-    let logits = extract_next_token_logits_from_outputs(session, &outputs)?;
+    let logits = extract_next_token_logits_from_outputs(session, &outputs, state.decode_state.io.logits_output.as_deref())?;
     let hidden = hidden_outputs
         .iter()
         .map(|output| extract_last_hidden(session, &outputs, output))
@@ -839,7 +1050,7 @@ pub(crate) fn next_draft_token_logits(
         )?;
     }
 
-    extract_next_token_logits(&draft_model.session, outputs)
+    extract_next_token_logits_from_outputs(&draft_model.session, &outputs, draft_state.decode_state.io.logits_output.as_deref())
 }
 
 pub(crate) fn apply_paged_sliding_window(
@@ -1342,19 +1553,19 @@ pub(crate) fn run_decode_step_with_extra(
     let mut owned_inputs: Vec<(String, Value)> = Vec::new();
     for info in session.inputs() {
         let lower = info.name.to_ascii_lowercase();
-        if is_token_input_name(&lower) {
+        if decode_state.io.is_token_input(&info.name, &lower) {
             ensure_i64(info)?;
             owned_inputs.push((
                 info.name.clone(),
                 Value::from_slice_i64(&input_ids, &[1, seq_len as i64])?,
             ));
-        } else if lower == "attention_mask" || lower.ends_with(".attention_mask") {
+        } else if decode_state.io.is_attention_mask_input(&info.name, &lower) {
             ensure_i64(info)?;
             owned_inputs.push((
                 info.name.clone(),
                 Value::from_slice_i64(&attention_mask, &[1, total_len as i64])?,
             ));
-        } else if lower == "position_ids" || lower.ends_with(".position_ids") {
+        } else if decode_state.io.is_position_ids_input(&info.name, &lower) {
             ensure_i64(info)?;
             owned_inputs.push((
                 info.name.clone(),
@@ -1371,6 +1582,11 @@ pub(crate) fn run_decode_step_with_extra(
             owned_inputs.push((info.name.clone(), value));
         } else if let Some((_, value)) = extra_inputs.iter().find(|(name, _)| name == &info.name) {
             owned_inputs.push((info.name.clone(), clone_value(value)?));
+        } else if decode_state.io.inputs_embeds_input.as_deref() == Some(info.name.as_str()) {
+            anyhow::bail!(
+                "declared inputs_embeds input '{}' was not supplied to the decode step; an embeds-driven decoder must receive its pre-embedded sequence via a pipeline dataflow edge",
+                info.name
+            );
         } else {
             anyhow::bail!(
                 "unsupported model input '{}' with shape {:?}; supported inputs are input_ids, attention_mask, position_ids, past key-values, and pipeline-routed extra inputs",
@@ -1411,18 +1627,31 @@ pub(crate) fn run_decode_step_with_extra(
     Ok(outputs)
 }
 
-pub(crate) fn extract_next_token_logits(
+pub(crate) fn extract_next_token_logits_with_io(
     session: &Session,
     outputs: Vec<Value>,
+    logits_output: Option<&str>,
 ) -> anyhow::Result<Vec<f32>> {
-    extract_next_token_logits_from_outputs(session, &outputs)
+    extract_next_token_logits_from_outputs(session, &outputs, logits_output)
 }
 
-fn extract_next_token_logits_from_outputs(
+/// Locate the logits output index, preferring an explicitly declared name from
+/// the resolved `io` binding and falling back to tensor-name conventions.
+fn logits_output_index(
     session: &Session,
-    outputs: &[Value],
-) -> anyhow::Result<Vec<f32>> {
-    let logits_index = session
+    logits_output: Option<&str>,
+) -> anyhow::Result<usize> {
+    if let Some(declared) = logits_output {
+        return session
+            .output_names()
+            .iter()
+            .position(|name| name == declared)
+            .with_context(|| {
+                format!("declared logits output '{declared}' is not exposed by the graph")
+            });
+    }
+    // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+    session
         .output_names()
         .iter()
         .position(|name| name == "logits")
@@ -1432,7 +1661,15 @@ fn extract_next_token_logits_from_outputs(
                 .iter()
                 .position(|name| name.to_ascii_lowercase().contains("logits"))
         })
-        .context("model did not expose a logits output")?;
+        .context("model did not expose a logits output")
+}
+
+fn extract_next_token_logits_from_outputs(
+    session: &Session,
+    outputs: &[Value],
+    logits_output: Option<&str>,
+) -> anyhow::Result<Vec<f32>> {
+    let logits_index = logits_output_index(session, logits_output)?;
     let logits = outputs
         .get(logits_index)
         .context("logits output index was out of range")?;
@@ -1505,21 +1742,12 @@ fn extract_last_hidden(
     }
 }
 
-pub(crate) fn extract_logits_sequence(
+pub(crate) fn extract_logits_sequence_with_io(
     session: &Session,
     outputs: Vec<Value>,
+    logits_output: Option<&str>,
 ) -> anyhow::Result<Vec<Vec<f32>>> {
-    let logits_index = session
-        .output_names()
-        .iter()
-        .position(|name| name == "logits")
-        .or_else(|| {
-            session
-                .output_names()
-                .iter()
-                .position(|name| name.to_ascii_lowercase().contains("logits"))
-        })
-        .context("model did not expose a logits output")?;
+    let logits_index = logits_output_index(session, logits_output)?;
     let logits = outputs
         .get(logits_index)
         .context("logits output index was out of range")?;
@@ -1610,7 +1838,7 @@ fn ensure_i64(info: &TensorInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_token_input_name(lower_name: &str) -> bool {
+pub(crate) fn is_token_input_name(lower_name: &str) -> bool {
     lower_name == "input_ids"
         || lower_name == "decoder_input_ids"
         || lower_name.ends_with(".input_ids")
@@ -1907,6 +2135,7 @@ mod tests {
     fn empty_metadata() -> InferenceMetadata {
         InferenceMetadata {
             required_capabilities: vec![],
+            schema_version: None,
             model: None,
             kv_cache: None,
             quantization: None,
@@ -1915,6 +2144,8 @@ mod tests {
             speculative: None,
             structured_output: None,
             hardware_requirements: None,
+            generation: None,
+            tokens: None,
         }
     }
 
@@ -1934,6 +2165,8 @@ mod tests {
     fn shared_kv_from_gqa_fp16_native_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
                 speculative: None,
@@ -2019,6 +2252,8 @@ mod tests {
     fn shared_kv_from_gqa_fp16_runtime_configurable_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(2048),
                 speculative: None,
@@ -2041,6 +2276,8 @@ mod tests {
     fn no_shared_kv_when_not_gqa() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(AttentionConfig {
                     attention_type: "multi_head_attention".to_string(),
                     ..gqa_attention()
@@ -2066,6 +2303,8 @@ mod tests {
         // path (O(1)/token) rather than the growing ZeroCopyRebind path.
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
                 speculative: None,
@@ -2086,6 +2325,8 @@ mod tests {
     fn shared_kv_from_gqa_bf16_native_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
                 speculative: None,
@@ -2106,6 +2347,8 @@ mod tests {
     fn no_shared_kv_when_unsupported_kv_dtype() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: Some(4096),
                 speculative: None,
@@ -2126,6 +2369,8 @@ mod tests {
     fn no_shared_kv_when_max_sequence_length_absent() {
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(gqa_attention()),
                 max_sequence_length: None,
                 speculative: None,
@@ -2153,6 +2398,8 @@ mod tests {
         attention.sliding_window = Some(4096);
         let metadata = InferenceMetadata {
             model: Some(ModelCapabilities {
+                vocab_size: None,
+                io: None,
                 attention: Some(attention),
                 max_sequence_length: Some(131_072),
                 speculative: None,

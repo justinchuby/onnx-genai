@@ -40,7 +40,6 @@
     "present.0.value": "[batch, 1, past_sequence_len + sequence_len, 8]"
   },
   "files": {
-    "model.onnx": 27546,
-    "model.onnx.data": 12288
+    "model.onnx.textproto": 102672
   }
 }

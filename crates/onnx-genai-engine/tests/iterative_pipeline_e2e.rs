@@ -119,13 +119,13 @@ fn single_pass_pipeline_runs_one_forward() -> anyhow::Result<()> {
 pipeline:
   models:
     vae:
-      filename: vae.onnx
+      filename: vae.onnx.textproto
       type: vae
   strategy:
     kind: single_pass
     model: vae
 ";
-    let dir = fixture_with_metadata("diffusion-single-pass", &["vae.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-single-pass", &["vae.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
 
     let latent = [1.5f32, -2.0, 3.0, 0.25];
@@ -144,7 +144,7 @@ fn diffusion_metadata_with_guidance(scale: &str) -> String {
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -162,7 +162,7 @@ pipeline:
 fn guidance_scale_one_is_treated_as_no_guidance_and_runs() -> anyhow::Result<()> {
     let dir = fixture_with_metadata(
         "diffusion-guidance-one",
-        &["denoiser.onnx"],
+        &["denoiser.onnx.textproto"],
         &diffusion_metadata_with_guidance("1.0"),
     )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
@@ -185,7 +185,7 @@ fn nonunit_guidance_without_cfg_input_is_rejected_at_load() -> anyhow::Result<()
     // metadata here omits it, so loading must fail with an actionable error.
     let dir = fixture_with_metadata(
         "diffusion-guidance-nocfg",
-        &["denoiser.onnx"],
+        &["denoiser.onnx.textproto"],
         &diffusion_metadata_with_guidance("7.5"),
     )?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
@@ -209,7 +209,7 @@ fn classifier_free_guidance_combines_conditional_and_unconditional() -> anyhow::
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -221,7 +221,7 @@ pipeline:
     guidance_scale: 2.0
     cfg_conditioning_input: cond
 ";
-    let dir = fixture_with_metadata("diffusion-cfg", &["denoiser.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-cfg", &["denoiser.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let cond = [1.0f32, 2.0, 3.0, 4.0];
     let request = empty_request()
@@ -251,7 +251,7 @@ fn multi_input_cfg_overrides_all_conditioning_ports() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_dualcond.onnx
+      filename: denoiser_dualcond.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -263,7 +263,7 @@ pipeline:
     guidance_scale: 2.0
     cfg_conditioning_input: cond_a
 ";
-    let dir = fixture_with_metadata("diffusion-dualcond", &["denoiser_dualcond.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-dualcond", &["denoiser_dualcond.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let a = [1.0f32, 1.0, 1.0, 1.0];
     let b = [10.0f32, 10.0, 10.0, 10.0];
@@ -291,7 +291,7 @@ fn iterative_threads_multiple_independent_loop_carried_tensors() -> anyhow::Resu
 pipeline:
   models:
     denoiser:
-      filename: denoiser_multi.onnx
+      filename: denoiser_multi.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.x_next
@@ -303,7 +303,7 @@ pipeline:
     denoiser: denoiser
     num_steps: 2
 ";
-    let dir = fixture_with_metadata("diffusion-multi", &["denoiser_multi.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-multi", &["denoiser_multi.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
 
     let cond = [4.0f32, 8.0, 12.0, 16.0];
@@ -332,7 +332,7 @@ fn iterative_injects_explicit_timestep_schedule() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -344,7 +344,7 @@ pipeline:
     timestep_input: t
     timesteps: [10.0, 20.0, 30.0]
 ";
-    let dir = fixture_with_metadata("diffusion-timestep", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-timestep", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
@@ -364,7 +364,7 @@ fn iterative_defaults_timestep_to_step_index() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -375,7 +375,7 @@ pipeline:
     num_steps: 3
     timestep_input: t
 ";
-    let dir = fixture_with_metadata("diffusion-timestep-default", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-timestep-default", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
@@ -398,7 +398,7 @@ fn iterative_dpmpp_2m_scheduler_runs_multistep_loop() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -415,7 +415,7 @@ pipeline:
       beta_end: 0.012
       beta_schedule: scaled_linear
 ";
-    let dir = fixture_with_metadata("diffusion-dpmpp", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-dpmpp", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
@@ -438,7 +438,7 @@ fn iterative_start_step_runs_partial_loop() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -455,7 +455,7 @@ pipeline:
       - 30.0
       - 40.0
 ";
-    let dir = fixture_with_metadata("diffusion-img2img", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-img2img", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
@@ -477,7 +477,7 @@ fn iterative_euler_ancestral_consumes_per_step_noise() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -494,7 +494,7 @@ pipeline:
       beta_end: 0.012
       beta_schedule: scaled_linear
 ";
-    let dir = fixture_with_metadata("diffusion-euler-a", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-euler-a", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request = empty_request()
         .with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?)
@@ -516,7 +516,7 @@ fn iterative_dpmpp_2m_karras_runs() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -534,7 +534,7 @@ pipeline:
       beta_schedule: scaled_linear
       use_karras_sigmas: true
 ";
-    let dir = fixture_with_metadata("diffusion-dpmpp-karras", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-dpmpp-karras", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
@@ -552,7 +552,7 @@ fn conflicting_karras_and_exponential_sigmas_rejected() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -567,7 +567,7 @@ pipeline:
       use_karras_sigmas: true
       use_exponential_sigmas: true
 ";
-    let dir = fixture_with_metadata("diffusion-conflict-sigmas", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-conflict-sigmas", &["denoiser_step.onnx.textproto"], metadata)?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
         .err()
         .expect("conflicting karras+exponential must be rejected");
@@ -586,7 +586,7 @@ fn iterative_euler_exponential_sigmas_run() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -604,7 +604,7 @@ pipeline:
       beta_schedule: scaled_linear
       use_exponential_sigmas: true
 ";
-    let dir = fixture_with_metadata("diffusion-euler-exp", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-euler-exp", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
@@ -629,7 +629,7 @@ fn iterative_euler_scheduler_scales_input_and_steps() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -646,7 +646,7 @@ pipeline:
       beta_end: 0.5
       beta_schedule: linear
 ";
-    let dir = fixture_with_metadata("diffusion-euler", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-euler", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
@@ -674,7 +674,7 @@ fn cfg_conditioning_port_that_is_also_a_loop_input_is_rejected() -> anyhow::Resu
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -686,7 +686,7 @@ pipeline:
     guidance_scale: 7.5
     cfg_conditioning_input: sample
 ";
-    let dir = fixture_with_metadata("diffusion-cfg-collision", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-cfg-collision", &["denoiser_step.onnx.textproto"], metadata)?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
         .err()
         .expect("cfg conditioning port colliding with a loop input must be rejected");
@@ -707,7 +707,7 @@ fn iterative_ddim_scheduler_transforms_loop_carried_sample() -> anyhow::Result<(
 pipeline:
   models:
     denoiser:
-      filename: denoiser_step.onnx
+      filename: denoiser_step.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -723,7 +723,7 @@ pipeline:
       beta_start: 0.5
       beta_end: 0.5
 ";
-    let dir = fixture_with_metadata("diffusion-ddim", &["denoiser_step.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-ddim", &["denoiser_step.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request =
         empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
@@ -749,7 +749,7 @@ fn unsupported_scheduler_kind_is_rejected_at_load() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -761,7 +761,7 @@ pipeline:
     scheduler_config:
       kind: no_such_scheduler
 ";
-    let dir = fixture_with_metadata("diffusion-bad-scheduler", &["denoiser.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-bad-scheduler", &["denoiser.onnx.textproto"], metadata)?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
         .err()
         .expect("unsupported scheduler kind must be rejected");
@@ -820,7 +820,7 @@ fn cfg_uses_caller_supplied_unconditional_conditioning() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -832,7 +832,7 @@ pipeline:
     guidance_scale: 2.0
     cfg_conditioning_input: cond
 ";
-    let dir = fixture_with_metadata("diffusion-cfg-uncond", &["denoiser.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-cfg-uncond", &["denoiser.onnx.textproto"], metadata)?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request = empty_request()
         .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
@@ -940,7 +940,7 @@ fn custom_user_scheduler_can_be_registered_and_run() -> anyhow::Result<()> {
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
   dataflow:
     - from: denoiser.denoised
@@ -952,7 +952,7 @@ pipeline:
     scheduler_config:
       kind: my_adder
 ";
-    let dir = fixture_with_metadata("diffusion-custom-sched", &["denoiser.onnx"], metadata)?;
+    let dir = fixture_with_metadata("diffusion-custom-sched", &["denoiser.onnx.textproto"], metadata)?;
     let mut registry = SchedulerRegistry::builtin();
     registry.register(
         "my_adder",

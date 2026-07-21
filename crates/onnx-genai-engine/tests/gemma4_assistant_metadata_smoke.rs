@@ -62,7 +62,7 @@ kv_cache:
 speculative:
   proposal_type: shared_kv
   num_speculative_tokens: 4
-  model: assistant/model.onnx
+  model: assistant/model.onnx.textproto
   backbone_hidden_size: 16
   vocab_size: 32
   projected_state_output: projected_state

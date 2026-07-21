@@ -71,7 +71,7 @@ fn bert_toy_matches_onnxruntime_cpu() {
     const ATOL: f32 = 2e-3;
     const RTOL: f32 = 2e-3;
 
-    let model_path = fixture_dir().join("model.onnx");
+    let model_path = fixture_dir().join("model.onnx.textproto");
     let mut session = InferenceSession::load(&model_path)
         .unwrap_or_else(|e| panic!("load {}: {e}", model_path.display()));
 

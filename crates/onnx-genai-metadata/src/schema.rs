@@ -17,6 +17,15 @@ use serde::{Deserialize, Deserializer};
     transform = schema_helpers::inference_metadata_aliases
 )]
 pub struct InferenceMetadata {
+    /// Schema version of this inference-metadata document, e.g. `"v1"`.
+    ///
+    /// Absent means the initial `"v1"` contract (readers default to `v1`).
+    /// Bump this only for breaking schema changes; additive fields keep the
+    /// same major version and rely on the forward-compatible "ignore unknown
+    /// fields" rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+
     /// Capability identifiers that a runtime MUST support or refuse to load the model.
     #[serde(default)]
     #[schemars(
@@ -60,6 +69,118 @@ pub struct InferenceMetadata {
     /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
+
+    /// Author-declared text-generation / search defaults.
+    ///
+    /// Populated from an onnxruntime-genai `genai_config.json` `search` block.
+    /// Every field is optional; readers treat an absent value as "use the
+    /// runtime default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationDefaults>,
+
+    /// Special / control token ids declared by the model author.
+    ///
+    /// Populated from the model-level token id fields of a `genai_config.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<SpecialTokens>,
+}
+
+/// Author-declared text-generation defaults (sampling and beam search).
+///
+/// Mirrors the `search` section of an onnxruntime-genai `genai_config.json`.
+/// Every field is optional so only values the author declared are carried over.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct GenerationDefaults {
+    /// Whether to randomize sampling through `top_k`/`top_p` (else greedy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub do_sample: Option<bool>,
+
+    /// Softmax temperature applied before sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Number of highest-probability tokens kept for top-k filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+
+    /// Nucleus (top-p) cumulative-probability threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+
+    /// Penalty applied to already-generated tokens (`1.0` = no penalty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
+    /// Number of beams for beam search (`1` = no beam search).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_beams: Option<usize>,
+
+    /// Number of sequences returned after search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_return_sequences: Option<usize>,
+
+    /// Minimum final sequence length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<usize>,
+
+    /// Maximum final sequence length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<usize>,
+
+    /// Exponential length penalty used with beam search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_penalty: Option<f32>,
+
+    /// Disallow repeating n-grams of this size (`0` = disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_repeat_ngram_size: Option<usize>,
+
+    /// Diversity penalty for diverse beam groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diversity_penalty: Option<f32>,
+
+    /// Whether beam search stops once enough beams have finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_stopping: Option<bool>,
+}
+
+/// Special / control token ids declared by a model author.
+///
+/// Every field is optional; `eos_token_id` is normalized to a list because
+/// onnxruntime-genai accepts either a scalar or an array for it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct SpecialTokens {
+    /// Padding token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_token_id: Option<i64>,
+
+    /// Beginning-of-stream token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bos_token_id: Option<i64>,
+
+    /// End-of-stream token ids (one or more).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eos_token_id: Option<Vec<i64>>,
+
+    /// Separator token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sep_token_id: Option<i64>,
+
+    /// Token an encoder-decoder model starts decoding with, when not `bos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder_start_token_id: Option<i64>,
+
+    /// Image placeholder token id (VLMs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_token_id: Option<i64>,
+
+    /// Video placeholder token id (VLMs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_token_id: Option<i64>,
+
+    /// Vision-segment start token id (VLMs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_start_token_id: Option<i64>,
 }
 
 /// Configuration published with a standalone speculative proposer model.
@@ -303,11 +424,98 @@ pub struct ModelCapabilities {
     #[schemars(range(min = 1))]
     pub max_sequence_length: Option<usize>,
 
+    /// Vocabulary size (rows of the token-embedding / logits table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub vocab_size: Option<usize>,
+
     /// Built-in draft-head or self-speculative model properties.
     pub speculative: Option<SpeculativeModelInfo>,
 
     /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
+
+    /// Explicit graph I/O port bindings for the single-decoder LLM path.
+    ///
+    /// When present, the runtime binds decode-step inputs and outputs from the
+    /// declared names instead of inferring them from tensor-name conventions.
+    /// When absent, the runtime falls back to the historical name conventions
+    /// (a temporary, transitional behavior).
+    #[serde(default)]
+    pub io: Option<ModelIoSpec>,
+}
+
+/// Explicit binding of the graph ports the decode step reads and writes.
+///
+/// Every field is optional so a model package can declare only the ports its
+/// graph exposes. Any port left unset falls back to the runtime's historical
+/// tensor-name convention (a temporary, transitional behavior removed once all
+/// emitters populate this block). Declaring an `io` block lets a graph use
+/// arbitrary tensor names — the runtime never infers a port by name or dtype
+/// for a declared port.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct ModelIoSpec {
+    /// Token-id input (e.g. `input_ids`). Mutually exclusive with
+    /// `inputs_embeds_input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub token_input: Option<String>,
+
+    /// Pre-embedded input (e.g. `inputs_embeds`) for embeds-driven decoders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub inputs_embeds_input: Option<String>,
+
+    /// Attention-mask input, if the graph takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub attention_mask_input: Option<String>,
+
+    /// Position-ids input, if the graph takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub position_ids_input: Option<String>,
+
+    /// Logits output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub logits_output: Option<String>,
+
+    /// Per-token hidden-state output for embedding / VLM hidden extraction, if
+    /// the graph exposes a distinct hidden output (e.g. `last_hidden_state`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub hidden_output: Option<String>,
+
+    /// Past-KV cache inputs, in the SAME order as `kv_outputs` (positional
+    /// pairing). Length must match `kv_outputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub kv_inputs: Option<Vec<String>>,
+
+    /// Present-KV cache outputs, paired positionally with `kv_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub kv_outputs: Option<Vec<String>>,
+
+    /// Encoder-hidden-states input for an encoder-decoder (cross-attention)
+    /// decoder graph (e.g. `encoder_hidden_states`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub encoder_hidden_states_input: Option<String>,
+
+    /// Cross-attention past-KV cache inputs for an encoder-decoder decoder, in
+    /// the SAME order as `cross_kv_outputs`. These are the encoder-derived KV
+    /// tensors, distinct from the self-attention `kv_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub cross_kv_inputs: Option<Vec<String>>,
+
+    /// Cross-attention present-KV cache outputs (produced by the encoder for an
+    /// encoder-decoder model), paired positionally with `cross_kv_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub cross_kv_outputs: Option<Vec<String>>,
 }
 
 /// Build-time attention architecture and dimensions.
@@ -555,6 +763,15 @@ pub struct PipelineComponentSpec {
     /// If absent, loaders may use a shared top-level `tokenizer.json`.
     #[schemars(length(min = 1), example = &"tokenizer.json")]
     pub tokenizer: Option<String>,
+
+    /// Explicit graph I/O port bindings for this pipeline component.
+    ///
+    /// When present, the runtime binds decode-step ports from the declared
+    /// names instead of inferring them from tensor-name conventions. When
+    /// absent, the runtime falls back to the historical name conventions (a
+    /// temporary, transitional behavior).
+    #[serde(default)]
+    pub io: Option<ModelIoSpec>,
 }
 
 /// Directed connection between two pipeline component ports.
@@ -699,6 +916,133 @@ pub struct PipelineStrategy {
     /// Ordered child stages for a composite strategy.
     #[serde(default)]
     pub stages: Vec<PipelineStrategyStage>,
+
+    /// Outer autoregressive decoder for a `nested_autoregressive` stage.
+    ///
+    /// The multi-decoder TTS (Qwen3-TTS-style) shape: one outer step is one
+    /// audio frame. The outer decoder (talker) produces a per-frame
+    /// `last_hidden_state` that seeds the inner loop (see `inner`).
+    #[serde(default)]
+    pub outer: Option<String>,
+
+    /// Inner autoregressive decoder for a `nested_autoregressive` stage.
+    ///
+    /// The code_predictor: for each outer frame it runs a short inner AR loop of
+    /// `num_code_groups` steps over the residual codebooks, seeded at inner step
+    /// 0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge
+    /// `outer.last_hidden_state -> inner.inputs_embeds`) and threading its own
+    /// per-step code embedding on later steps.
+    #[serde(default)]
+    pub inner: Option<String>,
+
+    /// Inner-loop depth (RVQ residual codebook count) for a
+    /// `nested_autoregressive` stage: the number of code tokens collected per
+    /// outer frame. Must be at least 1.
+    #[schemars(range(min = 1))]
+    #[serde(default)]
+    pub num_code_groups: Option<usize>,
+
+    /// Optional pre-embedder component driving the outer decoder (talker) of a
+    /// `nested_autoregressive` stage through `inputs_embeds` instead of
+    /// `input_ids`.
+    ///
+    /// A real Qwen3-TTS talker is not driven by token ids: each step's
+    /// `inputs_embeds` is materialized from the PREVIOUS frame's codes as
+    /// `codec_sum(+ text_embed)` (where
+    /// `codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).
+    /// When this field names such a component (inputs
+    /// `frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,
+    /// hidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds
+    /// the outer decoder's per-step `inputs_embeds` through it, keeping the engine
+    /// generic. Requires a dataflow edge
+    /// `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.
+    ///
+    /// When absent the outer loop is `input_ids`-driven (backward compatible).
+    ///
+    /// All graph-specific port bindings (the pre-embedder's `frame_codes` /
+    /// optional `text_embed` inputs and the output feeding the outer decoder)
+    /// are declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses
+    /// them by tensor name or dtype.
+    #[serde(default)]
+    pub pre_embedder: Option<PreEmbedderSpec>,
+
+    /// Optional prefill embedder component that supplies the outer decoder
+    /// (talker) with its real frame-0 PREFILL sequence and the per-frame
+    /// trailing-text conditioning of a `nested_autoregressive` stage.
+    ///
+    /// The real Qwen3-TTS talker is prefilled with a multi-position embedding
+    /// sequence built from the tokenized prompt, and each subsequent frame is
+    /// conditioned on one trailing-text embedding. This component materializes
+    /// both from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs
+    /// `prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the
+    /// talker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,
+    /// trailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`
+    /// as the pre-embedder's `text_embed`). It runs once in the prompt phase
+    /// (`run_on: prompt_only`); its `text_ids` input is auto-seeded from the
+    /// tokenized prompt.
+    ///
+    /// Only meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`
+    /// path feeds the trailing-text vectors through it). When absent, frame 0
+    /// uses a zero seed and every `text_embed` is zero (backward compatible).
+    ///
+    /// All graph-specific port bindings (the prompt input plus the prefill and
+    /// trailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];
+    /// the runtime never guesses them by tensor name or dtype.
+    #[serde(default)]
+    pub prefill_embedder: Option<PrefillEmbedderSpec>,
+}
+
+/// Structured binding for the optional pre-embedder that drives the outer
+/// decoder (talker) of a `nested_autoregressive` stage via `inputs_embeds`.
+///
+/// Every graph-specific port the runtime touches is declared here, so the
+/// engine never infers a port by tensor name or dtype.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct PreEmbedderSpec {
+    /// Declared model name of the pre-embedder component.
+    #[schemars(length(min = 1))]
+    pub component: String,
+
+    /// Pre-embedder input port receiving the previous frame's codes
+    /// (`int64 [batch, num_code_groups]`).
+    #[schemars(length(min = 1))]
+    pub frame_codes_input: String,
+
+    /// Optional pre-embedder input port receiving the per-frame trailing-text
+    /// conditioning vector (`float [batch, 1, hidden]`). When absent, the
+    /// pre-embedder exposes no trailing-text input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_embed_input: Option<String>,
+}
+
+/// Structured binding for the optional prefill embedder that supplies the outer
+/// decoder (talker) of a `nested_autoregressive` stage with its frame-0 PREFILL
+/// sequence and per-frame trailing-text conditioning.
+///
+/// Every graph-specific port the runtime touches is declared here, so the
+/// engine never infers a port by tensor name or dtype.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct PrefillEmbedderSpec {
+    /// Declared model name of the (prompt-phase) prefill embedder component.
+    #[schemars(length(min = 1))]
+    pub component: String,
+
+    /// Prefill-embedder input port receiving the tokenized prompt
+    /// (`int64 [batch, text_len]`, e.g. `text_ids`).
+    #[schemars(length(min = 1))]
+    pub prompt_input: String,
+
+    /// Prefill-embedder output port carrying the talker's frame-0 multi-position
+    /// PREFILL sequence (`float [batch, prefill_len, hidden]`), fed DIRECTLY to
+    /// the outer decoder's `inputs_embeds` on frame 0.
+    #[schemars(length(min = 1))]
+    pub prefill_output: String,
+
+    /// Prefill-embedder output port carrying the per-frame trailing-text vectors
+    /// (`float [batch, trailing_len, hidden]`), one sliced per outer frame
+    /// `k >= 1` into the pre-embedder's `text_embed`.
+    #[schemars(length(min = 1))]
+    pub trailing_output: String,
 }
 
 /// Named child stage of a composite pipeline strategy.
@@ -806,6 +1150,12 @@ pub enum PipelineStrategyKind {
     SinglePass,
     /// Ordered composition of nested strategies.
     Composite,
+    /// Dual, hierarchically-nested autoregressive loops (multi-decoder TTS).
+    ///
+    /// An outer decoder (talker) AR loop where each outer step drives an inner
+    /// decoder (code_predictor) AR loop; see [`PipelineStrategy::outer`],
+    /// [`PipelineStrategy::inner`], and [`PipelineStrategy::num_code_groups`].
+    NestedAutoregressive,
     /// Future strategy family not recognized by this runtime version.
     Other(String),
 }
@@ -821,6 +1171,7 @@ impl<'de> Deserialize<'de> for PipelineStrategyKind {
             "iterative" | "diffusion_steps" | "diffusion-steps" => Self::Iterative,
             "single_pass" | "single-pass" => Self::SinglePass,
             "composite" => Self::Composite,
+            "nested_autoregressive" | "nested-autoregressive" => Self::NestedAutoregressive,
             _ => Self::Other(value),
         })
     }
@@ -1234,6 +1585,8 @@ mod schema_helpers {
                 "single_pass",
                 "single-pass",
                 "composite",
+                "nested_autoregressive",
+                "nested-autoregressive",
             ],
         );
     }

@@ -7,7 +7,7 @@
 use crate::TokenId;
 use crate::config::{MtpCacheScope, MtpHiddenLayout};
 use crate::decode::{
-    apply_paged_sliding_window, extract_logits_sequence, next_session_token_logits,
+    apply_paged_sliding_window, extract_logits_sequence_with_io, next_session_token_logits,
     next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
     propose_draft_tokens, run_decode_session_logits, run_decode_step,
 };
@@ -1428,11 +1428,12 @@ impl Engine {
                         state.decode_state.sink_tokens(),
                     )?;
                 }
-                extract_logits_sequence(
+                extract_logits_sequence_with_io(
                     self.session
                         .as_deref()
                         .expect("ORT backend must own a decoder session"),
                     outputs,
+                    state.decode_state.io.logits_output.as_deref(),
                 )?
             };
 
@@ -1995,7 +1996,7 @@ mod tests {
         let environment = ENVIRONMENT
             .get_or_init(|| Environment::new("engine-eagle3-test").expect("environment"));
         let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-eagle3/model.onnx");
+            .join("../../tests/fixtures/tiny-eagle3/model.onnx.textproto");
         Ok(Session::new(
             environment,
             &head_path,
@@ -2011,7 +2012,7 @@ mod tests {
         let environment =
             ENVIRONMENT.get_or_init(|| Environment::new("engine-mtp-test").expect("environment"));
         let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx");
+            .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx.textproto");
         let head = Session::new(
             environment,
             &head_path,
@@ -2092,7 +2093,7 @@ mod tests {
         let environment = ENVIRONMENT
             .get_or_init(|| Environment::new("engine-mtp-hc-test").expect("environment"));
         let head_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-hc-mtp/model.onnx");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-hc-mtp/model.onnx.textproto");
         let head = Session::new(
             environment,
             &head_path,
@@ -2147,7 +2148,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-mtp-full");
         let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
-            &fixture.join("model.onnx"),
+            &fixture.join("model.onnx.textproto"),
             "transformer.wte.weight",
             "lm_head.weight_t",
             16,

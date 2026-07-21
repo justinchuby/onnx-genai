@@ -1,0 +1,89 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-tts-nested-prefill fixture"
+graph {
+  node {
+    input: "codes"
+    output: "codes_float"
+    name: "node_Cast_0"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "codes_float"
+    input: "gain"
+    output: "scaled"
+    name: "node_Mul_1"
+    op_type: "Mul"
+  }
+  node {
+    output: "flat_shape"
+    name: "node_Constant_2"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 2
+        data_type: 7
+        name: "flat_shape_value"
+        raw_data: "\001\000\000\000\000\000\000\000\377\377\377\377\377\377\377\377"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "scaled"
+    input: "flat_shape"
+    output: "audio"
+    name: "node_Reshape_3"
+    op_type: "Reshape"
+  }
+  name: "tiny_tts_nested_prefill_vocoder"
+  initializer {
+    data_type: 1
+    name: "gain"
+    raw_data: "\000\000\000@"
+  }
+  input {
+    name: "codes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "frames"
+          }
+          dim {
+            dim_param: "groups"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "audio"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "num_samples"
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

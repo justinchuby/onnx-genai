@@ -52,8 +52,8 @@ pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
 };
 pub use pipeline::{
-    IterativeOverrides, PipelineEngine, PipelineGenerateRequest, PipelineTensors, Scheduler,
-    SchedulerFactory, SchedulerRegistry,
+    IterativeOverrides, PipelineEngine, PipelineGenerateRequest, PipelineSynthesis,
+    PipelineTensors, Scheduler, SchedulerFactory, SchedulerRegistry,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

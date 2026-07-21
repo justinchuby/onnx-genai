@@ -5,6 +5,17 @@
   "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
   "type": "object",
   "properties": {
+    "generation": {
+      "description": "Author-declared text-generation / search defaults.\n\nPopulated from an onnxruntime-genai `genai_config.json` `search` block.\nEvery field is optional; readers treat an absent value as \"use the\nruntime default\".",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GenerationDefaults"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "hardware_requirements": {
       "description": "Minimum and beneficial hardware capabilities used for distribution matching.",
       "anyOf": [
@@ -75,6 +86,13 @@
         "minLength": 1
       }
     },
+    "schema_version": {
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "speculative": {
       "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input.",
       "anyOf": [
@@ -119,6 +137,17 @@
       "anyOf": [
         {
           "$ref": "#/$defs/StructuredOutputSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tokens": {
+      "description": "Special / control token ids declared by the model author.\n\nPopulated from the model-level token id fields of a `genai_config.json`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpecialTokens"
         },
         {
           "type": "null"
@@ -506,6 +535,120 @@
         }
       ]
     },
+    "GenerationDefaults": {
+      "description": "Author-declared text-generation defaults (sampling and beam search).\n\nMirrors the `search` section of an onnxruntime-genai `genai_config.json`.\nEvery field is optional so only values the author declared are carried over.",
+      "type": "object",
+      "properties": {
+        "diversity_penalty": {
+          "description": "Diversity penalty for diverse beam groups.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "do_sample": {
+          "description": "Whether to randomize sampling through `top_k`/`top_p` (else greedy).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "early_stopping": {
+          "description": "Whether beam search stops once enough beams have finished.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "length_penalty": {
+          "description": "Exponential length penalty used with beam search.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "max_length": {
+          "description": "Maximum final sequence length.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "min_length": {
+          "description": "Minimum final sequence length.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "no_repeat_ngram_size": {
+          "description": "Disallow repeating n-grams of this size (`0` = disabled).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "num_beams": {
+          "description": "Number of beams for beam search (`1` = no beam search).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "num_return_sequences": {
+          "description": "Number of sequences returned after search.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "repetition_penalty": {
+          "description": "Penalty applied to already-generated tokens (`1.0` = no penalty).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "temperature": {
+          "description": "Softmax temperature applied before sampling.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "top_k": {
+          "description": "Number of highest-probability tokens kept for top-k filtering.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "top_p": {
+          "description": "Nucleus (top-p) cumulative-probability threshold.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        }
+      }
+    },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
       "type": "object",
@@ -751,6 +894,17 @@
             }
           ]
         },
+        "io": {
+          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nWhen present, the runtime binds decode-step inputs and outputs from the\ndeclared names instead of inferring them from tensor-name conventions.\nWhen absent, the runtime falls back to the historical name conventions\n(a temporary, transitional behavior).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
           "type": [
@@ -781,6 +935,121 @@
               "type": "null"
             }
           ]
+        },
+        "vocab_size": {
+          "description": "Vocabulary size (rows of the token-embedding / logits table).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        }
+      }
+    },
+    "ModelIoSpec": {
+      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. Any port left unset falls back to the runtime's historical\ntensor-name convention (a temporary, transitional behavior removed once all\nemitters populate this block). Declaring an `io` block lets a graph use\narbitrary tensor names — the runtime never infers a port by name or dtype\nfor a declared port.",
+      "type": "object",
+      "properties": {
+        "attention_mask_input": {
+          "description": "Attention-mask input, if the graph takes one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "cross_kv_inputs": {
+          "description": "Cross-attention past-KV cache inputs for an encoder-decoder decoder, in\nthe SAME order as `cross_kv_outputs`. These are the encoder-derived KV\ntensors, distinct from the self-attention `kv_inputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "cross_kv_outputs": {
+          "description": "Cross-attention present-KV cache outputs (produced by the encoder for an\nencoder-decoder model), paired positionally with `cross_kv_inputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "encoder_hidden_states_input": {
+          "description": "Encoder-hidden-states input for an encoder-decoder (cross-attention)\ndecoder graph (e.g. `encoder_hidden_states`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "hidden_output": {
+          "description": "Per-token hidden-state output for embedding / VLM hidden extraction, if\nthe graph exposes a distinct hidden output (e.g. `last_hidden_state`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "inputs_embeds_input": {
+          "description": "Pre-embedded input (e.g. `inputs_embeds`) for embeds-driven decoders.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "kv_inputs": {
+          "description": "Past-KV cache inputs, in the SAME order as `kv_outputs` (positional\npairing). Length must match `kv_outputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "kv_outputs": {
+          "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "logits_output": {
+          "description": "Logits output.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "position_ids_input": {
+          "description": "Position-ids input, if the graph takes one.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "token_input": {
+          "description": "Token-id input (e.g. `input_ids`). Mutually exclusive with\n`inputs_embeds_input`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
         }
       }
     },
@@ -932,6 +1201,17 @@
           ],
           "minLength": 1
         },
+        "io": {
+          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nWhen present, the runtime binds decode-step ports from the declared\nnames instead of inferring them from tensor-name conventions. When\nabsent, the runtime falls back to the historical name conventions (a\ntemporary, transitional behavior).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tokenizer": {
           "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",
           "type": [
@@ -1075,6 +1355,14 @@
           "format": "float",
           "minimum": 0.0
         },
+        "inner": {
+          "description": "Inner autoregressive decoder for a `nested_autoregressive` stage.\n\nThe code_predictor: for each outer frame it runs a short inner AR loop of\n`num_code_groups` steps over the residual codebooks, seeded at inner step\n0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge\n`outer.last_hidden_state -> inner.inputs_embeds`) and threading its own\nper-step code embedding on later steps.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "kind": {
           "description": "Strategy family; determines which strategy-specific fields are meaningful.",
           "$ref": "#/$defs/PipelineStrategyKind"
@@ -1098,6 +1386,16 @@
             "null"
           ]
         },
+        "num_code_groups": {
+          "description": "Inner-loop depth (RVQ residual codebook count) for a\n`nested_autoregressive` stage: the number of code tokens collected per\nouter frame. Must be at least 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
+        },
         "num_steps": {
           "description": "Number of iterative or diffusion steps.",
           "type": [
@@ -1106,6 +1404,36 @@
           ],
           "format": "uint",
           "minimum": 1
+        },
+        "outer": {
+          "description": "Outer autoregressive decoder for a `nested_autoregressive` stage.\n\nThe multi-decoder TTS (Qwen3-TTS-style) shape: one outer step is one\naudio frame. The outer decoder (talker) produces a per-frame\n`last_hidden_state` that seeds the inner loop (see `inner`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "pre_embedder": {
+          "description": "Optional pre-embedder component driving the outer decoder (talker) of a\n`nested_autoregressive` stage through `inputs_embeds` instead of\n`input_ids`.\n\nA real Qwen3-TTS talker is not driven by token ids: each step's\n`inputs_embeds` is materialized from the PREVIOUS frame's codes as\n`codec_sum(+ text_embed)` (where\n`codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).\nWhen this field names such a component (inputs\n`frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,\nhidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds\nthe outer decoder's per-step `inputs_embeds` through it, keeping the engine\ngeneric. Requires a dataflow edge\n`{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.\n\nWhen absent the outer loop is `input_ids`-driven (backward compatible).\n\nAll graph-specific port bindings (the pre-embedder's `frame_codes` /\noptional `text_embed` inputs and the output feeding the outer decoder)\nare declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses\nthem by tensor name or dtype.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PreEmbedderSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prefill_embedder": {
+          "description": "Optional prefill embedder component that supplies the outer decoder\n(talker) with its real frame-0 PREFILL sequence and the per-frame\ntrailing-text conditioning of a `nested_autoregressive` stage.\n\nThe real Qwen3-TTS talker is prefilled with a multi-position embedding\nsequence built from the tokenized prompt, and each subsequent frame is\nconditioned on one trailing-text embedding. This component materializes\nboth from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs\n`prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the\ntalker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,\ntrailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`\nas the pre-embedder's `text_embed`). It runs once in the prompt phase\n(`run_on: prompt_only`); its `text_ids` input is auto-seeded from the\ntokenized prompt.\n\nOnly meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`\npath feeds the trailing-text vectors through it). When absent, frame 0\nuses a zero seed and every `text_embed` is zero (backward compatible).\n\nAll graph-specific port bindings (the prompt input plus the prefill and\ntrailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];\nthe runtime never guesses them by tensor name or dtype.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PrefillEmbedderSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "scheduler": {
           "description": "Scheduler identifier for iterative or diffusion execution.",
@@ -1194,7 +1522,9 @@
             "diffusion-steps",
             "single_pass",
             "single-pass",
-            "composite"
+            "composite",
+            "nested_autoregressive",
+            "nested-autoregressive"
           ]
         },
         {
@@ -1208,7 +1538,9 @@
               "diffusion-steps",
               "single_pass",
               "single-pass",
-              "composite"
+              "composite",
+              "nested_autoregressive",
+              "nested-autoregressive"
             ]
           }
         }
@@ -1267,6 +1599,33 @@
         }
       }
     },
+    "PreEmbedderSpec": {
+      "description": "Structured binding for the optional pre-embedder that drives the outer\ndecoder (talker) of a `nested_autoregressive` stage via `inputs_embeds`.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
+      "type": "object",
+      "properties": {
+        "component": {
+          "description": "Declared model name of the pre-embedder component.",
+          "type": "string",
+          "minLength": 1
+        },
+        "frame_codes_input": {
+          "description": "Pre-embedder input port receiving the previous frame's codes\n(`int64 [batch, num_code_groups]`).",
+          "type": "string",
+          "minLength": 1
+        },
+        "text_embed_input": {
+          "description": "Optional pre-embedder input port receiving the per-frame trailing-text\nconditioning vector (`float [batch, 1, hidden]`). When absent, the\npre-embedder exposes no trailing-text input.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "component",
+        "frame_codes_input"
+      ]
+    },
     "Precision": {
       "description": "Weight precision and quantization-recipe vocabulary.",
       "type": "string",
@@ -1306,6 +1665,38 @@
             ]
           }
         }
+      ]
+    },
+    "PrefillEmbedderSpec": {
+      "description": "Structured binding for the optional prefill embedder that supplies the outer\ndecoder (talker) of a `nested_autoregressive` stage with its frame-0 PREFILL\nsequence and per-frame trailing-text conditioning.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
+      "type": "object",
+      "properties": {
+        "component": {
+          "description": "Declared model name of the (prompt-phase) prefill embedder component.",
+          "type": "string",
+          "minLength": 1
+        },
+        "prefill_output": {
+          "description": "Prefill-embedder output port carrying the talker's frame-0 multi-position\nPREFILL sequence (`float [batch, prefill_len, hidden]`), fed DIRECTLY to\nthe outer decoder's `inputs_embeds` on frame 0.",
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt_input": {
+          "description": "Prefill-embedder input port receiving the tokenized prompt\n(`int64 [batch, text_len]`, e.g. `text_ids`).",
+          "type": "string",
+          "minLength": 1
+        },
+        "trailing_output": {
+          "description": "Prefill-embedder output port carrying the per-frame trailing-text vectors\n(`float [batch, trailing_len, hidden]`), one sliced per outer frame\n`k >= 1` into the pre-embedder's `text_embed`.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "component",
+        "prompt_input",
+        "prefill_output",
+        "trailing_output"
       ]
     },
     "ProposalTopology": {
@@ -1637,6 +2028,79 @@
       "required": [
         "name"
       ]
+    },
+    "SpecialTokens": {
+      "description": "Special / control token ids declared by a model author.\n\nEvery field is optional; `eos_token_id` is normalized to a list because\nonnxruntime-genai accepts either a scalar or an array for it.",
+      "type": "object",
+      "properties": {
+        "bos_token_id": {
+          "description": "Beginning-of-stream token id.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "decoder_start_token_id": {
+          "description": "Token an encoder-decoder model starts decoding with, when not `bos`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "eos_token_id": {
+          "description": "End-of-stream token ids (one or more).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "image_token_id": {
+          "description": "Image placeholder token id (VLMs).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "pad_token_id": {
+          "description": "Padding token id.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "sep_token_id": {
+          "description": "Separator token id.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "video_token_id": {
+          "description": "Video placeholder token id (VLMs).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "vision_start_token_id": {
+          "description": "Vision-segment start token id (VLMs).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
     },
     "SpeculativeModelInfo": {
       "description": "Build-time support for self-contained speculative decoding.",

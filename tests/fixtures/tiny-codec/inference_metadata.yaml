@@ -1,0 +1,34 @@
+# Tiny audio-to-audio (neural codec) composite pipeline fixture.
+# Built by scripts/build_tiny_codec.py; exercises the composite strategy with
+# two single_pass stages sharing one tensor pool (DESIGN.md §20).
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx.textproto
+      type: audio_encoder
+    vocoder:
+      filename: vocoder.onnx.textproto
+      type: vocoder
+  dataflow:
+    - from: encoder.codes
+      to: vocoder.codes
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_waveform
+        strategy:
+          kind: single_pass
+          model: encoder
+        run_on: prompt_only
+      - name: synthesize_waveform
+        strategy:
+          kind: single_pass
+          model: vocoder
+        run_on: prompt_only
+  phases:
+    encoder:
+      run_on: prompt_only
+    vocoder:
+      run_on: prompt_only

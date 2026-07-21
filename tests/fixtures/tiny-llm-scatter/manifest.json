@@ -19,8 +19,7 @@
   "head_dim": 8,
   "kv_hidden": 16,
   "files": {
-    "model.onnx": 12750,
-    "model.onnx.data": 14336,
+    "model.onnx.textproto": 69089,
     "tokenizer.json": 2038
   }
 }

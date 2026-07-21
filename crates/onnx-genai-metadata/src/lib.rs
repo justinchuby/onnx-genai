@@ -2,6 +2,11 @@
 //!
 //! Implements the spec from <https://github.com/onnx/onnx/issues/8184>
 
+/// Current inference-metadata schema version. Emitters should stamp this into
+/// [`schema::InferenceMetadata::schema_version`]; readers treat an absent value
+/// as this version.
+pub const SCHEMA_VERSION: &str = "v1";
+
 pub mod parser;
 pub mod schema;
 pub mod validation;

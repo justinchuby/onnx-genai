@@ -241,6 +241,15 @@ fn validate_strategy(
                 );
             }
         }
+        PipelineStrategyKind::NestedAutoregressive => {
+            require_strategy_model(strategy.outer.as_deref(), "outer", path, models, errors);
+            require_strategy_model(strategy.inner.as_deref(), "inner", path, models, errors);
+            match strategy.num_code_groups {
+                Some(n) if n >= 1 => {}
+                Some(_) => errors.push(format!("{path}.num_code_groups must be at least 1")),
+                None => errors.push(format!("{path}.num_code_groups is required")),
+            }
+        }
         PipelineStrategyKind::Other(_) => {}
     }
 }

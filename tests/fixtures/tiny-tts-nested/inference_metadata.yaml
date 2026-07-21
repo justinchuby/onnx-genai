@@ -1,0 +1,52 @@
+# Tiny nested-autoregressive (multi-decoder TTS) pipeline fixture.
+# Built by scripts/build_tiny_tts_nested.py; exercises the nested_autoregressive
+# contract (DESIGN.md §20.3): an OUTER talker AR loop where each frame drives an
+# INNER code_predictor AR loop of num_code_groups steps, seeded by the talker's
+# last_hidden_state. Assembled codes are published as `talker.output_codes`
+# [1, frames, num_code_groups] and vocoded into a waveform.
+pipeline:
+  models:
+    talker:
+      filename: talker.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+    code_predictor:
+      filename: code_predictor.onnx.textproto
+      type: decoder
+    vocoder:
+      filename: vocoder.onnx.textproto
+      type: vocoder
+  dataflow:
+    # Per-frame hidden binding: inner step 0 seed.
+    - from: talker.last_hidden_state
+      to: code_predictor.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+    # Assembled per-frame codes -> vocoder.
+    - from: talker.output_codes
+      to: vocoder.codes
+      dtype: int64
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: generate_codes
+        strategy:
+          kind: nested_autoregressive
+          outer: talker
+          inner: code_predictor
+          num_code_groups: 4
+          max_tokens: 3
+        run_on: every_step
+      - name: vocode
+        strategy:
+          kind: single_pass
+          model: vocoder
+        run_on: final_only
+  phases:
+    talker:
+      run_on: every_step
+    code_predictor:
+      run_on: every_step
+    vocoder:
+      run_on: final_only

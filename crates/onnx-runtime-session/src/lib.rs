@@ -549,12 +549,7 @@ impl SessionBuilder {
                         .parent()
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| PathBuf::from("."));
-                    let bytes = std::fs::read(&path).map_err(|source| {
-                        onnx_runtime_loader::LoaderError::Io {
-                            path: path.clone(),
-                            source,
-                        }
-                    })?;
+                    let bytes = onnx_runtime_loader::read_model_binary(&path)?;
                     let metadata = model_metadata_from_bytes(&bytes)?;
                     let (g, w) =
                         onnx_runtime_loader::load_model_bytes_with_weights(&bytes, &model_dir)?;

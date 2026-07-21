@@ -199,19 +199,17 @@ impl PipelineModels {
 }
 
 fn resolve_model_path(root: &Path) -> Result<PathBuf> {
-    let decoder = root.join("decoder.onnx");
-    if decoder.is_file() {
-        return Ok(decoder);
+    // Prefer a conventionally named decoder, in either binary or textproto form.
+    for candidate in ["decoder.onnx.textproto", "decoder.onnx"] {
+        let path = root.join(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
     }
 
     let mut onnx_files = std::fs::read_dir(root)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("onnx"))
-        })
+        .filter(|path| path.is_file() && is_onnx_model_file(path))
         .collect::<Vec<_>>();
     onnx_files.sort();
 
@@ -226,6 +224,19 @@ fn resolve_model_path(root: &Path) -> Result<PathBuf> {
             root.display(),
             many
         ))),
+    }
+}
+
+/// Whether `path` names an ONNX model file: a binary `*.onnx` or a git-friendly
+/// ONNX protobuf TextFormat `*.onnx.textproto`.
+fn is_onnx_model_file(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("onnx") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("textproto") => path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .is_some_and(|inner| inner.eq_ignore_ascii_case("onnx")),
+        _ => false,
     }
 }
 

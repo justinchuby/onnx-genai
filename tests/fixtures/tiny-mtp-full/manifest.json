@@ -204,16 +204,14 @@
     "embedding_layout": "[vocab, hidden]",
     "lm_head_weights": "lm_head.f32",
     "lm_head_layout": "[hidden, vocab]",
-    "mtp_head_model": "mtp/model.onnx",
+    "mtp_head_model": "mtp/model.onnx.textproto",
     "mtp_kv_mode": "HiddenThreaded"
   },
   "files": {
     "embedding.f32": 2048,
     "lm_head.f32": 2048,
-    "model.onnx": 15972,
-    "model.onnx.data": 13312,
-    "mtp/model.onnx": 27546,
-    "mtp/model.onnx.data": 12288,
+    "model.onnx.textproto": 75344,
+    "mtp/model.onnx.textproto": 102672,
     "tokenizer.json": 2038
   }
 }

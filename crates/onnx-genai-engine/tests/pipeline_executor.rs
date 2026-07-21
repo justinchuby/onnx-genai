@@ -13,7 +13,7 @@ fn pipeline_fixture() -> anyhow::Result<PathBuf> {
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures/pipeline-tiny-llm");
     fs::create_dir_all(&root)?;
-    for file in ["model.onnx", "model.onnx.data", "tokenizer.json"] {
+    for file in ["model.onnx.textproto", "tokenizer.json"] {
         fs::copy(source.join(file), root.join(file))?;
     }
     fs::write(
@@ -22,7 +22,7 @@ fn pipeline_fixture() -> anyhow::Result<PathBuf> {
 pipeline:
   models:
     decoder:
-      filename: model.onnx
+      filename: model.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
   dataflow: []

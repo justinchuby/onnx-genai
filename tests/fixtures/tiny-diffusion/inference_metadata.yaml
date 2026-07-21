@@ -1,10 +1,10 @@
 pipeline:
   models:
     denoiser:
-      filename: denoiser.onnx
+      filename: denoiser.onnx.textproto
       type: denoiser
     vae:
-      filename: vae.onnx
+      filename: vae.onnx.textproto
       type: vae
   dataflow:
     - from: denoiser.denoised

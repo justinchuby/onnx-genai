@@ -553,6 +553,22 @@ impl Session {
             )));
         }
 
+        // Textproto fixtures (`*.textproto`) are git-friendly ONNX protobuf
+        // TextFormat. ORT cannot read them from disk, so convert to binary bytes
+        // (via onnx-rs) and create the session from memory. Binary `.onnx` files
+        // continue to load directly from the path. Textproto has no
+        // model-directory context, so such fixtures must inline all weights.
+        let model_bytes: Option<Vec<u8>> = if is_textproto_path(path) {
+            let text = std::fs::read_to_string(path)?;
+            Some(onnx_rs::textproto::to_binary(&text).map_err(|err| {
+                OrtError::InvalidArgument(format!(
+                    "failed to convert textproto model {}: {err}",
+                    path.display()
+                ))
+            })?)
+        } else {
+            None
+        };
         #[cfg(windows)]
         let path_c: Vec<u16> = {
             use std::os::windows::ffi::OsStrExt;
@@ -565,28 +581,50 @@ impl Session {
         let path_c = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| OrtError::InvalidArgument("model path contains NUL".into()))?;
         let api = crate::error::api()?;
-        let create = api
-            .CreateSession
-            .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
 
         // Build session options (which registers/appends execution providers)
-        // and create the session. Both steps can fail for a requested non-CPU
-        // provider, so keep them together behind one closure that can be retried
-        // with CPU-only options.
+        // and create the session, dispatching to the from-bytes API for
+        // converted textproto models and the from-path API for binary `.onnx`
+        // files. Both steps can fail for a requested non-CPU provider, so keep
+        // them together behind one closure that can be retried with CPU-only
+        // options.
         let create_session = |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
             let session_options = RawSessionOptions::new(env, opts)?;
             let mut ptr = std::ptr::null_mut();
-            // SAFETY: `env` and `session_options` are valid ORT handles, `path_c`
-            // is NUL-terminated for the duration of the call, and `ptr` is an
-            // out-param.
-            crate::error::check_status(unsafe {
-                create(
-                    env.as_ptr(),
-                    path_c.as_ptr(),
-                    session_options.as_ptr(),
-                    &mut ptr,
-                )
-            })?;
+            match &model_bytes {
+                Some(bytes) => {
+                    let create = api
+                        .CreateSessionFromArray
+                        .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+                    // SAFETY: `env` and `session_options` are valid ORT handles,
+                    // `bytes` outlives the call, and `ptr` is an out-param.
+                    crate::error::check_status(unsafe {
+                        create(
+                            env.as_ptr(),
+                            bytes.as_ptr() as *const std::ffi::c_void,
+                            bytes.len(),
+                            session_options.as_ptr(),
+                            &mut ptr,
+                        )
+                    })?;
+                }
+                None => {
+                    let create = api
+                        .CreateSession
+                        .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
+                    // SAFETY: `env` and `session_options` are valid ORT handles,
+                    // `path_c` is NUL-terminated for the call, and `ptr` is an
+                    // out-param.
+                    crate::error::check_status(unsafe {
+                        create(
+                            env.as_ptr(),
+                            path_c.as_ptr(),
+                            session_options.as_ptr(),
+                            &mut ptr,
+                        )
+                    })?;
+                }
+            }
             Ok(ptr)
         };
 
@@ -1182,6 +1220,15 @@ fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
         .execution_providers
         .iter()
         .any(|ep| !ep.caps.is_host())
+}
+
+/// Whether `path` names an ONNX protobuf TextFormat fixture (`*.textproto`).
+///
+/// Textproto models are git-friendly text; ORT cannot read them from disk, so
+/// [`Session::new`] converts them to binary bytes and loads them from memory.
+fn is_textproto_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("textproto"))
 }
 
 fn requested_strict_provider(options: &SessionOptions) -> bool {

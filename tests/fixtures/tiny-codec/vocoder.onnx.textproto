@@ -1,0 +1,128 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-codec fixture"
+graph {
+  node {
+    output: "gain"
+    name: "node_Constant_0"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "gain_value"
+        raw_data: "\000\000\000@"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "codes"
+    input: "gain"
+    output: "scaled"
+    name: "node_Mul_1"
+    op_type: "Mul"
+  }
+  node {
+    output: "expand_axis"
+    name: "node_Constant_2"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "expand_axis_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "scaled"
+    input: "expand_axis"
+    output: "scaled_col"
+    name: "node_Unsqueeze_3"
+    op_type: "Unsqueeze"
+  }
+  node {
+    output: "pair_shape"
+    name: "node_Constant_4"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 3
+        data_type: 7
+        name: "pair_shape_value"
+        raw_data: "\001\000\000\000\000\000\000\000\010\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "scaled_col"
+    input: "pair_shape"
+    output: "duplicated"
+    name: "node_Expand_5"
+    op_type: "Expand"
+  }
+  node {
+    output: "audio_shape"
+    name: "node_Constant_6"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 2
+        data_type: 7
+        name: "audio_shape_value"
+        raw_data: "\001\000\000\000\000\000\000\000\020\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "duplicated"
+    input: "audio_shape"
+    output: "audio"
+    name: "node_Reshape_7"
+    op_type: "Reshape"
+  }
+  name: "tiny_codec_vocoder"
+  input {
+    name: "codes"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "audio"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

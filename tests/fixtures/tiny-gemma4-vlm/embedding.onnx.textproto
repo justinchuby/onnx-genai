@@ -1,0 +1,166 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-gemma4-vlm fixture"
+graph {
+  node {
+    input: "embedding_table"
+    input: "input_ids"
+    output: "text_embed"
+    name: "node_Gather_0"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    output: "placeholder_id"
+    name: "node_Constant_1"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 7
+        name: "placeholder_id_value"
+        raw_data: "\007\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "input_ids"
+    input: "placeholder_id"
+    output: "is_placeholder"
+    name: "node_Equal_2"
+    op_type: "Equal"
+  }
+  node {
+    input: "is_placeholder"
+    output: "placeholder_mask"
+    name: "node_Cast_3"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    output: "mask_axis"
+    name: "node_Constant_4"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "mask_axis_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "placeholder_mask"
+    input: "mask_axis"
+    output: "placeholder_mask_col"
+    name: "node_Unsqueeze_5"
+    op_type: "Unsqueeze"
+  }
+  node {
+    input: "placeholder_mask_col"
+    input: "image_features"
+    output: "image_contrib"
+    name: "node_Mul_6"
+    op_type: "Mul"
+  }
+  node {
+    input: "text_embed"
+    input: "image_contrib"
+    output: "inputs_embeds"
+    name: "node_Add_7"
+    op_type: "Add"
+  }
+  name: "tiny_gemma4_embedding"
+  initializer {
+    dims: 8
+    dims: 4
+    data_type: 1
+    name: "embedding_table"
+    raw_data: "\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\200?\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\200?\000\000\000\000\000\000\000\000\000\000\000\000\000\000\200?\000\000\200?\000\000\200?\000\000\000\000\000\000\000\000\000\000\200?"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "image_features"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "inputs_embeds"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "embedding_table"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 8
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

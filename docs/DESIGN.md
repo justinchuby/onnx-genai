@@ -1229,6 +1229,214 @@ pipeline:
     vocoder: { run_on: final_only }
 ```
 
+**Post-decode stages & the generated-codes tensor contract.** The vocoder above
+is a `final_only` single_pass stage that runs **once, after** the AR decode loop
+completes — the one composite structure that is neither a prompt-phase encoder
+nor a per-step decoder. The engine wires it up as follows:
+
+- After `generate` finishes, the AR decoder's generated code sequence is
+  published into the shared tensor pool as the synthetic tensor
+  **`{decoder}.output_ids`** of shape `[1, num_generated]` (int64). This is the
+  canonical "the AR decoder's generated codes as a tensor" contract.
+- A post-decode stage consumes those codes via a normal `dataflow` edge, e.g.
+  `decoder.output_ids -> vocoder.codes`, and writes its waveform back into the
+  pool (e.g. `vocoder.audio`).
+- `final_only` components are collected (in dataflow order) into
+  `AutoregressivePlan::post_decode_components` and run once over the shared pool
+  after the loop, exactly like a prompt-phase stage but *downstream* of decode.
+
+The caller retrieves the waveform with `PipelineEngine::synthesize`, which
+composes prompt-stages → AR decode → post-decode stages and returns both the
+generated codes and the final tensor pool (see §20.4). `generate` still works on
+a TTS pipeline — it drives the AR loop and returns the code tokens only, without
+running the post-decode stages.
+
+#### Multi-decoder TTS (Qwen3-TTS-style) — `nested_autoregressive`
+
+The TTS example above is the **single-AR-decoder** shape (one code stream → vocoder).
+Production neural TTS such as **Qwen3-TTS** (built by Mobius `TTSTask`) is a
+**dual, nested autoregressive** architecture expressed by the
+`nested_autoregressive` composite stage kind. Its components (Mobius
+`src/mobius/tasks/_tts.py`):
+
+- `embedding`: `text_ids + codec_ids → text_embeds + codec_embeds` (fusion).
+- `talker` (AR **outer** decoder): `inputs_embeds → logits (first code group) +
+  last_hidden_state + KV`. One outer step = one audio frame.
+- `code_predictor` (AR **inner** decoder): `inputs_embeds → logits + KV` — an
+  inner loop that expands the talker's per-frame `last_hidden_state` into the
+  residual code groups (RVQ depth = `num_code_groups`), with its own KV cache.
+- The waveform is produced by a **separate** codec/vocoder model
+  (`codes → waveform`), not part of the TTS package.
+
+The `nested_autoregressive` stage composes **two autoregressive loops
+hierarchically**: for each outer (talker) step — one frame — the inner
+(code_predictor) decoder runs a short AR loop of `num_code_groups` steps,
+threading the talker's `last_hidden_state` in and collecting all code groups for
+that frame.
+
+**Contract.** A composite stage carries:
+
+```yaml
+strategy:
+  kind: composite
+  stages:
+    - {name: fuse, strategy: {kind: single_pass, model: embedding}, run_on: prompt_only}
+    - name: generate_codes
+      strategy:
+        kind: nested_autoregressive
+        outer: talker            # AR outer decoder (one step per audio frame)
+        inner: code_predictor    # AR inner decoder (num_code_groups steps per frame)
+        num_code_groups: 4       # inner-loop depth (RVQ residual codebooks)
+      run_on: every_step
+    - {name: vocode, strategy: {kind: single_pass, model: vocoder}, run_on: final_only}
+dataflow:
+  # inner step-0 seed: talker frame hidden state → inner decoder input embeds
+  - {from: talker.last_hidden_state, to: code_predictor.inputs_embeds}
+  # assembled per-frame codes → external codec vocoder
+  - {from: talker.output_codes, to: vocoder.codes}
+```
+
+1. **Fields.** `nested_autoregressive` adds `outer` (talker decoder name),
+   `inner` (code_predictor decoder name) and `num_code_groups` (inner-loop
+   depth) to `PipelineStrategy`. Validation requires both decoders to be declared
+   models and `num_code_groups >= 1`.
+2. **Per-frame hidden seed.** The dataflow edge
+   `talker.last_hidden_state -> code_predictor.inputs_embeds` supplies the inner
+   loop's **step-0** input. On later inner steps the driver threads the inner
+   decoder's own per-code embedding output (its sole non-logits, non-KV output)
+   back into `inputs_embeds` — an in-driver loop-carry rather than a dataflow
+   self-edge (the validator permits at most one edge per destination port and
+   allows self-edges only for iterative denoisers).
+3. **Assembled codes.** Every code group is written into the synthetic pool
+   tensor `{outer}.output_codes` (e.g. `talker.output_codes`) of shape
+   `[1, frames, num_code_groups]` (int64). A `final_only` single-pass `vocoder`
+   stage consumes it via the `talker.output_codes -> vocoder.codes` dataflow
+   edge, reusing the post-decode-stage machinery of the single-AR TTS path.
+4. **Engine.** `PipelinePlan::NestedAutoregressive` drives an outer AR loop (up to
+   `max_frames`) and, per frame, a fresh inner AR loop of `num_code_groups`
+   steps, reusing `DecodeState` for both decoders. `generate` returns the
+   flattened per-frame code tokens; `synthesize` additionally runs the vocoder
+   post-stage into a waveform.
+
+The synthetic fixture `tests/fixtures/tiny-tts-nested/` (built by
+`scripts/build_tiny_tts_nested.py`) and the test
+`crates/onnx-genai-engine/tests/tts_nested_pipeline_e2e.rs` prove the nested-loop
+mechanism with a closed form. This path does not affect the single-AR-decoder TTS
+path or any other modality.
+
+**Real Qwen3-TTS export — build, validation, engine pre-embedder + prefill, and emitter DONE.**
+A real 1.7B Qwen3-TTS package (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) now **builds
+and runs end to end at the codec-token level** via Mobius (`examples/qwen3_tts.py`):
+the 3-model package (`embedding`, `talker`, `code_predictor`) produces valid multi-group
+codec frames (e.g. 27 frames × 16 codes for "Hello world.", all codes in the codebook
+range [0, 2047], natural EOS termination). Two Mobius build bugs were fixed to get there:
+(1) the stacked `codec_embeddings` table is exposed via `op.Identity(...)`, which onnx-ir
+folds so the initializer takes the unprefixed output name — the weight loader is now keyed
+to that name (verified `maxdiff 0.0` vs the HF `codec_embedding.{i}.weight` stack); and
+(2) the talker's interleaved-MRoPE `rope_scaling` (`{"interleaved": true,
+"mrope_section": [24,20,20], ...}`) was silently dropped by HF config standardization,
+so the talker fell back to 1D RoPE and ORT failed on a 4D `cos_cache` — the config
+resolver now preserves non-standard nested `rope_scaling` and the extractor accepts the
+`interleaved` key alias. The fixture above exercises the nested-loop *mechanism*, but the
+real package still differs materially from it and is **not** yet emittable/runnable end to
+end *inside the onnx-genai engine*:
+
+- **Components:** `embedding` (`text_ids + codec_ids -> text_embeds + codec_embeds`),
+  `talker`, `code_predictor`, and an optional `speaker_encoder`. There is **no
+  vocoder** in the package — the codes are decoded to a waveform by a *separate*
+  codec model (e.g. Mimi / `qwen3_tts_tokenizer_12hz`), so the `final_only` vocoder
+  stage in the fixture would instead be a second, externally-supplied package.
+- **The talker input is loop-constructed — now materialized via a `pre_embedder`
+  (DONE).** The talker's per-step `inputs_embeds` is assembled *inside the generation
+  loop*, mixing codec and text embeddings in "talker-hidden space":
+  `inputs_embeds = codec_sum(+ text_embed)`, where
+  `codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`. This is now
+  **materialized into an ONNX component** (`talker_step_embedder`, inputs
+  `frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch,1,hidden]]` →
+  output `inputs_embeds [batch,1,hidden]`) so the engine stays generic, and the
+  `nested_autoregressive` strategy gained an **optional `pre_embedder` field**
+  (backward compatible — absent ⇒ the legacy `input_ids`-driven outer loop). See the
+  `pre_embedder` contract note below.
+- **Build path:** the 1.7B model builds via the custom `examples/qwen3_tts.py`
+  pipeline (not the standard `mobius build` CLI). Calling `write_onnx_genai_config`
+  on the built package now **emits** the `pre_embedder`-driven contract when the
+  package carries `talker_step_embedder`; a `talker + code_predictor` package
+  *without* the pre-embedder still **fails loudly** (`_looks_like_multi_decoder_tts`
+  + `_has_tts_pre_embedder`) rather than emit speculative metadata.
+
+Completing real Qwen3-TTS is therefore a focused, monitored effort. The build +
+codec-token validation, the Mobius `talker_step_embedder` + `talker_prefill_embedder`
+pre-embedding components, the engine `pre_embedder`-driven outer loop **plus real
+prefill + trailing-text threading (`prefill_embedder`)**, and the Mobius
+`build_tts_pipeline_metadata` emitter **are all done** — the real 1.7B
+`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` package now self-describes the full
+`pre_embedder` + `prefill_embedder` `nested_autoregressive` contract and validates
+against the committed JSON schema. The remaining refinements are the speaker / language
+/ instruct prefill branches and the exact `tts_pad` embedding for exhausted trailing
+text (see the `pre_embedder` note) toward fully bit-accurate real-package playback.
+
+##### The `pre_embedder` / `prefill_embedder` extension to `nested_autoregressive`
+
+`nested_autoregressive` gained two **optional** structured fields, `pre_embedder` and
+`prefill_embedder`, keeping the contract minimal and backward compatible. Every
+graph-specific port is declared **explicitly in metadata** — the engine makes **no
+assumptions about tensor names** (a firm runtime rule):
+
+```yaml
+strategy:
+  kind: nested_autoregressive
+  outer: talker            # driven by inputs_embeds when pre_embedder is set
+  inner: code_predictor
+  num_code_groups: 16
+  max_tokens: 2000
+  pre_embedder:                          # NEW (optional)
+    component: talker_step_embedder
+    frame_codes_input: frame_codes       # int64 [1,G] — previous frame's codes
+    text_embed_input: text_embed         # optional float [1,1,H] — trailing text
+  prefill_embedder:                      # NEW (optional; requires pre_embedder)
+    component: talker_prefill_embedder
+    prompt_input: text_ids               # receives the tokenized prompt
+    prefill_output: prefill_embeds       # [1,P,H] fed to the talker on frame 0
+    trailing_output: trailing_text_embeds # [1,T,H] sliced per frame into text_embed
+# required wiring when pre_embedder is set (declares its output port too):
+dataflow:
+  - {from: talker_step_embedder.inputs_embeds, to: talker.inputs_embeds}
+```
+
+1. **Semantics.** When `pre_embedder` is absent the outer loop is `input_ids`-driven
+   (unchanged legacy behavior). When set, each frame the engine assembles
+   `frame_codes = [outer_code_0, inner_code_1, …, inner_code_{G-1}]` from the *previous*
+   frame, runs the named pre-embedder to materialize the outer decoder's single-position
+   `inputs_embeds`, and feeds it to the talker (which consumes `inputs_embeds`, not
+   `input_ids`).
+2. **Wiring resolution — all from metadata, no name guessing.** The pre-embedder must be
+   a declared model, distinct from `outer`/`inner`, wired by a **required** dataflow edge
+   `{component}.{output} -> {outer}.inputs_embeds` (which declares both the pre-embedder's
+   output port and the talker's input port). Its `frame_codes_input` and optional
+   `text_embed_input` port names come from the `pre_embedder` spec; the hidden size comes
+   from the outer decoder's `inputs_embeds` input. The pre-embedder is a loop-internal
+   component (`run_on: on_demand`), excluded from prompt/final phase classification.
+3. **Prefill + trailing-text (`prefill_embedder`, optional; requires `pre_embedder`).**
+   Names a `prompt_only` component with explicit `prompt_input` / `prefill_output` /
+   `trailing_output` ports. The engine seeds the declared `prompt_input` with the tokenized
+   prompt, reads the two named pooled outputs, and: on **frame 0** feeds the multi-position
+   `prefill_output` directly to the talker (advancing the past length by `P`, *not* running
+   the pre-embedder); on **frames k≥1** threads `trailing_output[:, k-1, :]` as the
+   pre-embedder's `text_embed_input` (zeros once the text is exhausted). This moves the
+   whole Qwen3-TTS prefill/trailing-text construction into ONNX, keeping the engine
+   generic. When absent, the engine feeds a zero frame-0 seed + zero `text_embed`.
+4. **Remaining follow-ups.** Speaker / language / instruct prefill branches (the
+   `talker_prefill_embedder` currently materializes the Auto / no-speaker / no-instruct
+   path) and the exact `tts_pad` embedding for exhausted trailing text — refinements
+   toward fully bit-accurate real-package playback.
+
+Proven by the synthetic fixtures `tests/fixtures/tiny-tts-nested-preembed/` +
+`tiny-tts-nested-prefill/` (built by `scripts/build_tiny_tts_nested_preembed.py` /
+`build_tiny_tts_nested_prefill.py`) and their `*_pipeline_e2e.rs` tests, which drive the
+talker through `talker_step_embedder` (+ the prompt-derived `talker_prefill_embedder`)
+and assert a distinct code stream from the `input_ids` / zero-seed paths — with zero
+regression to the legacy `tiny-tts-nested` fixture.
+
 #### Speech-to-Text (ASR / Whisper-style)
 
 ```yaml
@@ -1362,7 +1570,47 @@ pipeline:
           kv_cache: { enabled: true }
 ```
 
-#### Reranking / Cross-Encoder
+#### Vision-Language (Gemma4-style, `inputs_embeds` fusion)
+
+Unlike OCR/captioning above (which conditions the decoder via cross-attention
+`encoder_hidden_states`), a Gemma-3/Gemma-4 VLM fuses image and text in
+**embedding space**: a prompt-phase `embedding` model merges `image_features`
+into the text-token embeddings at the image placeholder positions, and the
+decoder's prompt input is `inputs_embeds` (it has **no** `input_ids` input).
+
+```yaml
+pipeline:
+  models:
+    vision_encoder: { filename: vision_encoder.onnx, type: vision_encoder }
+    embedding:      { filename: embedding.onnx,      type: encoder }
+    decoder:        { filename: decoder.onnx,        type: decoder, tokenizer: tokenizer.json }
+  dataflow:
+    - { from: vision_encoder.image_features, to: embedding.image_features, dtype: fp32 }
+    - { from: embedding.inputs_embeds,       to: decoder.inputs_embeds,    dtype: fp32 }
+  strategy:
+    kind: composite
+    stages:
+      - { name: encode_vision,   strategy: { kind: single_pass,    model: vision_encoder }, run_on: prompt_only }
+      - { name: fuse_embeddings, strategy: { kind: single_pass,    model: embedding },      run_on: prompt_only }
+      - { name: decode,          strategy: { kind: autoregressive, decoder: decoder },      run_on: every_step }
+```
+
+The engine handles two seams unique to `inputs_embeds` fusion (see
+`pipeline.rs`: `seed_prompt_token_inputs`, `embeds_step_binding`):
+
+1. **Prompt seeding** — the prompt token ids are seeded into the shared pool as
+   `embedding.input_ids` (they come from the prompt, not another model), so the
+   fusion component can run in the prompt phase.
+2. **Per-step re-embedding** — because the decoder's `inputs_embeds` is a *self*
+   sequence input (unlike seq-independent cross-conditioning such as
+   `encoder_hidden_states`), each decode step re-runs the fusion component on the
+   single running token to produce that step's `inputs_embeds`; the prefill step
+   reuses the full-prompt embeddings. Cross-conditioning inputs (image features)
+   are resolved once and re-supplied unchanged. A decoder that carries its own
+   `input_ids` input embeds internally and skips this path.
+
+Fixture + test: `scripts/build_tiny_gemma4_vlm.py`,
+`tests/fixtures/tiny-gemma4-vlm/`, `gemma4_vlm_pipeline_e2e.rs`.
 
 ```yaml
 pipeline:
@@ -1412,6 +1660,26 @@ impl Engine {
 
     // --- Generic (any pipeline) ---
     pub fn run_pipeline(&self, inputs: PipelineInputs) -> PipelineOutputStream;
+}
+```
+
+The implemented TTS entry point on `PipelineEngine` is:
+
+```rust
+/// prompt-stages -> AR decode (emits code tokens) -> post-decode single_pass
+/// stages (vocoder). The generated codes are published into the shared pool as
+/// `{decoder}.output_ids` [1, num_generated] (int64) and routed to a stage input
+/// by a dataflow edge (e.g. `decoder.output_ids -> vocoder.codes`).
+pub fn synthesize(
+    &mut self,
+    request: PipelineGenerateRequest,
+) -> anyhow::Result<PipelineSynthesis>;
+
+/// The generated codes plus the final tensor pool (holding the vocoder waveform,
+/// e.g. `vocoder.audio`, keyed by `component.output`).
+pub struct PipelineSynthesis {
+    pub generation: GenerateResult,   // the AR code tokens
+    pub tensors: PipelineTensors,     // post-decode stage outputs (waveform)
 }
 ```
 

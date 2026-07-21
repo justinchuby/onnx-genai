@@ -22,7 +22,7 @@ use onnx_runtime_optimizer::{PassContext, default_passes, run_passes};
 
 fn model_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../onnx-runtime-session/tests/fixtures/bert_toy/model.onnx")
+        .join("../onnx-runtime-session/tests/fixtures/bert_toy/model.onnx.textproto")
 }
 
 fn count(g: &Graph, op: &str) -> usize {
