@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T04:39Z — CPU fp16/bf16 SimplifiedLayerNormalization, stale live-shape recompute, fp16 MatMulNBits prefill GEMM, and the stale nbits test fix landed._
+_Last updated: 2026-07-22T05:52Z — fused SwiGLU M>1 prefill blocker resolved and merged._
 
-**Current `origin/main` implementation HEAD:** `54b49eb` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `97e0cb4` (code before this docs update).
+
+## 2026-07-22 — Fused SwiGLU M>1 prefill blocker resolved
+
+- **Fused gate/up SwiGLU M>1 prefill ✅ (`97e0cb4`):** Bryant landed the generic CUDA fused path for prompt rows; M=1 decode remains unchanged/capture-safe while M>1 uses portable fp16 MatMulNBits GEMM + SiluMul and is marked non-capture-safe. Native multi-token prefill is now unblocked. (Deckard 🟢)
 
 ## 2026-07-22 — CPU SLN + stale live-shape + fp16 MatMulNBits prefill GEMM merged
 
