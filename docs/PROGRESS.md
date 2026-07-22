@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T05:00Z — VLM enablement (WP2 image processor, WP3/WP4 positions+fixed-state through the pipeline), ScatterElements (fp16/bf16/fp32/int64), DeepSeek DS-3 MLA (qk≠v) conformance, generic fp16 GQA empty-present K/V, and the Leon KV logical-shape fix all merged to main. Gemma4-E2B now places AND executes all 1,299 nodes on CUDA; warm native decode diagnosed at **10.76 tok/s** with a single dominant bottleneck (auxiliary graph output unbound → CUDA-graph capture rejected → 291 alloc/free per token), fix in flight._
+_Last updated: 2026-07-22T07:00Z — the generic auxiliary-graph-output binding fix landed (`791e276`): Gemma4-E2B warm native decode **10.76 → 13.09 tok/s** with CUDA-graph capture now succeeding (captures/replays/fallbacks 3/378/0), Qwen2.5-0.5B unchanged at ~831 tok/s. In flight: capture-safety hardening (structural decline for unsafe aux symbolic dims + e2e capture test), an H200 multi-model decode roofline bench, VLM WP5 (server multimodal bundle — review), and VLM WP6 (genai_config compat loader — revision after 🔴 review)._
 
-**Current `origin/main` implementation HEAD:** `9032253`.
+**Current `origin/main` implementation HEAD:** `791e276`.
+
+## 2026-07-22 — Gemma4 CUDA-graph capture enabled (aux-output binding) + VLM WP5/WP6 in flight
+
+- **Generic auxiliary graph-output binding ✅ (`791e276`):** `DecodeCudaState::new` now binds **every** declared auxiliary graph output (e.g. Gemma4's `projected_state`) to a persistent device buffer by contract — never by model name — so the capture precondition (all graph outputs device-bound) is satisfiable. Gemma4-E2B warm decode **10.76 → 13.09 tok/s** with captures/replays/fallbacks **3/378/0**; Qwen2.5-0.5B unchanged (~831 tok/s, no regression). Symbolic aux dims collapse to 1, which is safe for batch/query-seq-indexed outputs at decode; a mismatch is caught loudly at warmup by the exact-shape `accepts_output` check (no silent corruption). (Batty build → Leon 🟡 opus review; follow-ups: structural friendly-decline for unsafe aux symbolic dims + e2e capture test in flight.)
 
 ## 2026-07-22 — VLM enablement + DeepSeek MLA + Gemma4 native placement + warm-decode diagnosis
 
