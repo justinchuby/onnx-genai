@@ -10,6 +10,7 @@
 pub mod allocator;
 pub mod binding;
 pub mod chat_template;
+pub mod component;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_rt;
 pub mod decode;
@@ -30,6 +31,7 @@ pub mod value;
 pub use allocator::{Allocator, AllocatorType, MemoryInfo, MemoryType};
 pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
+pub use component::OrtComponentSession;
 pub use decode::{
     BatchedDecodeSession, BatchedSharedBufferDecodeSession, BatchedStaticCacheDecodeSession,
     DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams,
@@ -45,6 +47,9 @@ pub use error::{OrtError, Result};
 pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
+};
+pub use onnx_genai_metadata::{
+    ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
 pub use onnx_genai_metadata::{
     ProposalType, SpeculatorConfig, SpeculatorConfigSource, SpeculatorDescriptor,

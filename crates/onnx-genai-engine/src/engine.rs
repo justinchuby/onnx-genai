@@ -53,7 +53,7 @@ use crate::speculative::{
 };
 
 #[cfg(feature = "native-backend")]
-fn resolve_native_decode_device(
+pub(crate) fn resolve_native_decode_device(
     configured: Option<crate::native_decode::NativeDecodeDevice>,
     session_options: &SessionOptions,
 ) -> anyhow::Result<crate::native_decode::NativeDecodeDevice> {
