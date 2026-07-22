@@ -585,9 +585,9 @@ fn pack_image(image: &PreparedImage, patchify: &PatchifySpec) -> anyhow::Result<
                             PatchChannelOrder::ChannelsFirst => {
                                 for channel in 0..3 {
                                     let channel_offset = channel * width * height;
-                                    for y in 0..patch_size {
-                                        let row = (patch_y * patch_size + y) * width;
-                                        for _ in 0..patchify.temporal_patch_size {
+                                    for _ in 0..patchify.temporal_patch_size {
+                                        for y in 0..patch_size {
+                                            let row = (patch_y * patch_size + y) * width;
                                             let start = channel_offset + row + patch_x * patch_size;
                                             patches.extend_from_slice(
                                                 &tile[start..start + patch_size],
@@ -597,10 +597,10 @@ fn pack_image(image: &PreparedImage, patchify: &PatchifySpec) -> anyhow::Result<
                                 }
                             }
                             PatchChannelOrder::ChannelsLast => {
-                                for y in 0..patch_size {
-                                    let row = (patch_y * patch_size + y) * width;
-                                    for x in 0..patch_size {
-                                        for _ in 0..patchify.temporal_patch_size {
+                                for _ in 0..patchify.temporal_patch_size {
+                                    for y in 0..patch_size {
+                                        let row = (patch_y * patch_size + y) * width;
+                                        for x in 0..patch_size {
                                             for channel in 0..3 {
                                                 patches.push(
                                                     tile[channel * width * height
@@ -1247,6 +1247,51 @@ mod tests {
         let error =
             checked_element_product("test image tensor", &[MAX_TENSOR_ELEMENTS + 1]).unwrap_err();
         assert!(error.to_string().contains("exceeding the safety limit"));
+    }
+
+    #[test]
+    fn temporal_patches_repeat_the_complete_spatial_tile() {
+        let image = PreparedImage {
+            original_size: (2, 2),
+            transformed_size: (2, 2),
+            tile_grid: TileGrid {
+                columns: 1,
+                rows: 1,
+            },
+            tile_size: (2, 2),
+            tiles: vec![vec![
+                1.0, 2.0, 3.0, 4.0, // channel 0
+                5.0, 6.0, 7.0, 8.0, // channel 1
+                9.0, 10.0, 11.0, 12.0, // channel 2
+            ]],
+            validity_masks: None,
+        };
+        let patchify = |channel_order| PatchifySpec {
+            patch_size: 2,
+            temporal_patch_size: 2,
+            merge_size: 1,
+            channel_order,
+            coordinate_order: CoordinateOrder::Yx,
+        };
+
+        let channels_first =
+            pack_image(&image, &patchify(PatchChannelOrder::ChannelsFirst)).unwrap();
+        assert_eq!(
+            channels_first.patches,
+            vec![
+                1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0, 9.0, 10.0, 11.0, 12.0,
+            ]
+        );
+
+        let channels_last = pack_image(&image, &patchify(PatchChannelOrder::ChannelsLast)).unwrap();
+        assert_eq!(
+            channels_last.patches,
+            vec![
+                1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0, 4.0, 8.0, 12.0, 1.0, 5.0, 9.0, 2.0,
+                6.0, 10.0, 3.0, 7.0, 11.0, 4.0, 8.0, 12.0,
+            ]
+        );
     }
 
     #[test]
