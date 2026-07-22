@@ -5,6 +5,1218 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-23T01-00-00Z-gap1-mla-qwen3-merges -->
+## 2026-07-23 — Native GAP 1, MLA conformance, Qwen3 bench, and inbox reconciliation
+
+Decision archive gate checked at 2026-07-23T01:00Z: active ledger was 163948 bytes before merge; because it exceeded 51200 bytes, entries older than 2026-07-16T01:00Z were eligible for archival. No active entries older than that cutoff were present, so no archive file was written.
+
+<!-- source: .squad/decisions/inbox/dave-mobius-decoder-metadata-fix.md -->
+### 2026-07-23: mobius decoder metadata GQA+KV emission fix
+**By:** Dave
+**What:** Mobius now emits `grouped_query_attention` for GQA decoders and infers canonical `kv_cache.native_dtype` (`float16`, `bfloat16`, or `float32`) from the model activation/compute dtype, independent of weight quantization. PR: https://github.com/onnxruntime/mobius/pull/422. Validation: ONNX GenAI integration tests passed (90 passed, 3 skipped); Ruff format/check passed. The existing Qwen3-0.6B int4 CUDA artifact was re-verified with a metadata-only probe using its FLOAT16 KV graph inputs, producing `attention.type: grouped_query_attention` and `kv_cache.native_dtype: float16` without rerunning the GPU export or overwriting the artifact.
+**Why:** The runtime enables device/shared-buffer KV only when metadata both identifies GQA with a recognized attention type and declares a supported floating-point KV dtype. Mobius previously emitted the unrecognized `grouped_query` value and omitted `kv_cache` whenever callers left `kv_native_dtype=None`, forcing generic GQA decoder exports—including int4-weight/fp16-activation models—onto the slow growing ZeroCopyRebind path.
+
+<!-- source: .squad/decisions/inbox/deckard-cudaattn-revision.md -->
+### 2026-07-22: Route CUDA attention mode through RuntimeConfig
+**By:** Deckard
+**What:** Moved `ONNX_GENAI_CUDA_ATTENTION` parsing into `onnx-genai-runtime-config` as the typed `RuntimeConfig::cuda_attention_mode` field with `Auto`, `Fused`, `Unfused`, and invalid-value preservation. Added default, valid-value, alias, and invalid-value registry tests; ORT now consumes only `runtime_config()`, while `Unfused` still sets `sdpa_kernel=16`. Preserved Howie's actionable CUDA provider-missing errors. Formatting passed; CUDA-feature clippy passed with warnings denied; the requested two-crate test suite passed 100 tests; and the CUDA provider-option test passed without a GPU.
+**Why:** The binding runtime-config decision requires every new runtime flag to be declared, parsed, documented, and tested in the single typed registry rather than read directly at an ORT call site.
+
+<!-- source: .squad/decisions/inbox/deckard-gap1-schema-fix-merge.md -->
+### 2026-07-23: GAP 1 schema_sync fix + merge
+**By:** Deckard
+**What:** The blocker was a pre-existing schema-generation determinism bug, not a GAP 1 schema change. Schema generation now recursively sorts JSON object keys before pretty-printing, and both the generator and sync test use that canonical codepath. The committed schema was reordered without semantic changes. GAP 1 and the fix merged to `origin/main` at `c47534d`.
+**Why:** On both the GAP 1 branch and pre-fix `origin/main` (`a9370e2`), the isolated schema test passed while the combined metadata+engine graph failed with semantically identical JSON and ordering-only differences. The isolated `cargo tree` had no `serde_json/preserve_order`; the combined graph enabled it through `llguidance`, changing `schemars` map ordering. Isolated, combined, and native-backend schema tests passed after the fix, as did the full combined metadata+engine tests, default workspace build, targeted Clippy with warnings denied, and metadata fmt check.
+
+<!-- source: .squad/decisions/inbox/deckard-sebastian-gap1-review.md -->
+### 2026-07-22: Review of sebastian native gap 1 (ComponentSession interface)
+**By:** Deckard
+**Verdict:** 🟢 APPROVE
+
+**What:** Reviewed `squad/sebastian-native-interface` @ `b6dcb32` (merge-base origin/main `1ae99b4`). Sebastian introduces the backend-neutral `ComponentSession` seam plus neutral tensor vocabulary (`ComponentTensor` = raw LE bytes, `ComponentIo`, `ComponentDataType`, `ComponentError`) in `onnx-genai-metadata`, an ORT adapter (`OrtComponentSession` + `Value::from_raw_bytes`/`to_raw_bytes` + `TensorBacking::Bytes`), a native adapter (`NativeComponentSession`, feature-gated), and rewires `pipeline.rs::from_dir_with_schedulers` to select ONE backend for the whole pipeline. Every claim in the task was verified true.
+
+**Evidence:**
+- **Diff scope:** 1 commit, +1081/-28 across 9 files, all coherent to gap 1 (metadata component.rs, ort component.rs/value.rs/lib.rs, engine native_component.rs/pipeline.rs/lib.rs + 1-line `pub(crate)` visibility bump in engine.rs). No scope creep.
+- **No dependency cycle:** `onnx-genai-metadata/Cargo.toml` deps = `thiserror` only (a true leaf crate). Both `onnx-genai-ort` and `onnx-genai-engine` already depend on it. Trait genuinely lives where both backends can implement it without a cycle. ✓
+- **Behavior preservation (ORT):** The native branch returns early; the ORT path falls through to the identical `PipelineModels::load_with_options(...)` call as before. Cambodia's `every_step` executor (pipeline.rs ~L1952-2027/2145-2259) is NOT in the diff — untouched. The ORT round-trip parity test (`named_tensor_run_round_trip_matches_session`) runs the raw `Session` directly and asserts `tensor.as_bytes() == reference[0].to_raw_bytes()` byte-for-byte through the seam. ✓
+- **Actionable error (RULES §1):** Native path returns a detailed message naming the precise next blocker — generalizing native target decode beyond token-id-only to metadata-declared `inputs_embeds`/routed per-layer inputs, then moving `DecodeState`/pipeline execution off ORT `Value`/`Session` (gaps 2/3) — plus the ORT fallback instruction. No generic panic. When built without the feature, a distinct actionable "compiled without 'native-backend' feature" error. ✓
+- **No hardcoded architecture (§2/§2.1):** `grep -rniE "gemma|qwen|phi[^a-z]|llama|mistral"` over the three touched logic files = empty. ✓
+- **Tensor neutrality:** dtype coverage comprehensive (fp32/fp16/bf16/fp8e4m3/fp8e5m2/int8/16/32/64/uint8/16/32/64/bool) with correct `size_of`. Raw LE bytes with static-shape + byte-length validation in `from_raw`. Uses `dim as usize`/`as i64` only — no `#[cfg]` pointer-width assumptions; arm64/Windows-arm64 safe (usize is 64-bit there). ✓
+- **Build:** `cargo build -p onnx-genai-metadata -p onnx-runtime-session -p onnx-genai-engine` — clean.
+- **Clippy:** `-D warnings --all-targets` on all three crates — clean, zero warnings.
+- **Test (default):** metadata component tests pass; the one failure `committed_inference_metadata_schema_is_current` (schema_sync) is pre-existing/environmental (committed schema out of date) — branch does not touch `schema/`, `schema.rs`, the generator, or `tests/`.
+- **Native feature build:** clean except the pre-existing `native_decode.rs:17` unused `BTreeMap` warning (native_decode.rs untouched by this branch — out of scope, sebastian flagged it correctly).
+- **Native feature test:** branch = 162 passed / 16 failed. Baseline `1ae99b4` = 160 passed / **17 failed**. I captured both failing sets: the branch's 16 failures are EXACTLY the base's 16 embedding+engine fixture failures (all environmental — `failed to decode Protobuf message: invalid wire type value: 6`, i.e. unmaterialized LFS fixtures). The 17th base failure (`auto_backend_rejects_pipeline_component_requiring_native`) is now FIXED by the renamed passing test. **Net: -1 failure, +2 passing, ZERO new failures, ZERO new warnings.** New unit tests in native_component/ort component/metadata all pass.
+
+**Non-blocking observations (no change required before merge):**
+- `Value::to_raw_bytes` assumes a host-resident tensor (documented); correct for the CPU-only pipeline component path.
+- `static_numel` overflow branch synthesizes a `ByteLengthMismatch{dtype: Uint8, expected: usize::MAX}` — slightly misleading label but only reachable on absurd shape overflow. Cosmetic.
+
+Foundational interface is cycle-free, behavior-preserving on the ORT path, and correctly gates native behind an actionable gap-2/3 error. Cleared for a merge agent to land on main.
+
+<!-- source: .squad/decisions/inbox/eldon-zhora-mla-merge.md -->
+### 2026-07-23: Zhora MLA conformance merge
+**By:** Eldon
+**What:** Merged as a9370e2 on origin/main.
+**Why:** Rebased cleanly onto origin/main; CPU crate build, clippy with -D warnings, all tests (656 passed, 2 ignored across suites), and crate-scoped rustfmt check passed; fast-forward ancestry confirmed before push.
+
+<!-- source: .squad/decisions/inbox/gaff-deckard-rereview.md -->
+### Approve Deckard's RuntimeConfig revision for ORT CUDA attention
+**By:** Gaff
+**Verdict:** 🟢 APPROVE revised commits `496a200` and `1f24046`; fast-forward merged to `main` at `1f24046`.
+**Rationale:** `ONNX_GENAI_CUDA_ATTENTION` is parsed only by the typed `RuntimeConfig` registry as `CudaAttentionMode`; registry coverage verifies Auto/Fused/Unfused, aliases, invalid preservation, and the default. ORT consumes `runtime_config()` without a raw environment read, Unfused maps to `sdpa_kernel=16`, explicit missing-CUDA errors remain actionable, and changed runtime logic contains no model-family branching. Changed-crate fmt, CUDA-feature Clippy with `-D warnings`, runtime-config tests (14 passed), raw-read grep, and `git diff --check` all passed after rebasing onto `origin/main`.
+
+<!-- source: .squad/decisions/inbox/garland-wp5.md -->
+### 2026-07-22: Server multimodal bundle and post-expansion admission verified
+**By:** Garland
+**What:** Verified and extended WP5 server coverage for metadata-declared multimodal endpoint bundles, prompt-order per-image expansion, and context admission after expansion. Added an end-to-end rank-4 compatibility test whose declared graph endpoint is `vision_encoder.image_tensor`, proving the server does not depend on the literal `pixel_values` name. Gap #4 is fully closed for metadata-declared typed outputs, including multi-output bundles and the rank-4 compatibility shape. Gap #6 is fully closed: both streaming and non-streaming chat preprocess and expand before context-cap admission. Gap #5 is partially closed: prompt-order image summaries, per-image tile/patch counts, thumbnail placement, distinct image-token IDs, and supported per-tile separators are materialized into the final token prompt before the engine call.
+**Why:** The current engine request API accepts named tensors and token IDs but has no typed per-image expansion-summary field; the server therefore resolves supported expansion contracts before submission and retains summaries through the driver seam for ordering validation. Deferred dependencies: `token_count_source=from_grid`, explicit-index correspondence, and patch-grid row/column separators require a fully specified processor-summary interpretation and the WP4 grid/position path; the frozen schema names summary tensors but does not define enough server-side arithmetic/correspondence semantics to implement these generically without inference. The pre-existing compatibility-package server unit test remains red on `origin/main` because WP1 package admission rejects an external WP6 fixture's rank-2-to-rank-3 dataflow mismatch; fixing that fixture is outside the server-only WP5 scope.
+
+<!-- source: .squad/decisions/inbox/holden-sebastian-gap1-merge.md -->
+### 2026-07-22: Sebastian GAP 1 merge blocked by verification
+**By:** Holden
+**What:** No SHA was merged or pushed; `origin/main` remains `8d9d2fa279a0463b9fc6c02932ebd7b9ec775fb4`. Commit `b6dcb32` rebased cleanly to candidate `65fc88a12cd840023da5a9faf3662b6fb07802de`.
+**Why:** Default build and targeted Clippy passed, but the requested combined metadata/engine test command failed `committed_inference_metadata_schema_is_current` because generated schema property ordering differed from the committed schema. The isolated schema-sync test passed, but this non-LFS failure required stopping before push.
+
+<!-- source: .squad/decisions/inbox/joi-gemma4-e2b-gaps.md -->
+### 2026-07-22: Gemma4 E2B text pipeline reaches H200 ORT CUDA; native pipeline remains blocked
+**By:** Joi
+**What:** The four-model Mobius package produced coherent text through onnx-genai's metadata-driven PipelineEngine on H200: `"The capital of France is **Paris**."`, 140.09 tok/s steady median (7.138 ms/token; five runs, two warmups, skip eight). The run required a generic optional image/audio metadata overlay, the CUDA-enabled ORT `root/lib`, and disabling ORT's optimized attention implementations. Pure-Rust multi-model execution remains unavailable.
+**Why:** The exported package predates optional-modality PR #419 and has no absent image/audio closure. Current Mobius only declares audio optional; text-only also needs an optional image input and vision presence gate. `PipelineEngine` explicitly rejects the native backend at `crates/onnx-genai-engine/src/pipeline.rs:189-208`. ORT CUDA's optimized Attention path returns `cudaErrorInvalidValue` for the valid fp16 GQA Attention node; disabling flash/lean/fused/memory-efficient/cuDNN-flash paths succeeds. The originally supplied ORT library directory has no CUDA provider library, and `onnx-genai-ort/src/session.rs:1747-1752` otherwise warns and silently falls back to CPU.
+
+Dependency-ordered, file-disjoint work packages:
+
+1. **Mobius text-only closure:** update `src/mobius/tasks/_gemma4.py`, `tests/build_graph_test.py`, and `src/mobius/integrations/onnx_genai/inference_metadata_test.py` to mark `image_features` optional and gate `vision_encoder`; re-export from Mobius `54be48a+`.
+2. **Pure-Rust pipeline sessions:** refactor `crates/onnx-genai-engine/src/pipeline.rs` behind a backend-neutral component-session interface and load native sessions for every declared component. No model-name dispatch.
+3. **ORT CUDA Attention fix:** upstream reproduction/fix for standard ONNX fp16 GQA Attention (`q_heads=8`, `kv_heads=1`, head size 256); until then use the five explicit `ORT_DISABLE_*ATTENTION=1` variables.
+4. **VLM image E2E:** independently validate Gemma4 typed preprocessing and placeholder expansion in `crates/onnx-genai-server/src/image_input.rs`.
+5. **Audio E2E:** independently implement typed fp16+bool audio request construction in `crates/onnx-genai-preprocess/src/audio.rs` and `crates/onnx-genai-server/src/driver.rs`.
+
+<!-- source: .squad/decisions/inbox/joi-gemma4-native-gaps.md -->
+### 2026-07-22: Gemma4 E2B pure-Rust native pipeline remains blocked at backend construction
+**By:** Joi
+**What:** Running the unmodified package with `ONNX_GENAI_BACKEND=native profile_native --pipeline --model /home/justinchu/mobius/.scratch/gemma4-e2b-native ...` fails before model loading with: `native backend not supported for pipeline models; set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort)`. No native tok/s can be reported. The actionable gaps, in dependency order, are:
+
+1. Add a backend-neutral pipeline component-session interface. `PipelineEngine::from_dir_with_schedulers` explicitly rejects `EngineDecodeBackend::Native`, then unconditionally loads `onnx_genai_ort::PipelineModels` (`crates/onnx-genai-engine/src/pipeline.rs:189-208`). `PipelineModels` owns only ORT `Session` objects and constructs every component through ORT (`crates/onnx-genai-ort/src/loader.rs:197-223`). The interface must expose graph I/O metadata, named-tensor execution, and output names for either ORT `Session` or native `InferenceSession`; backend selection must instantiate every declared component consistently.
+2. Generalize native target decode beyond token-ID-only single-model sessions. `NativeDecodeSession` is a decoder-specific adapter with a fixed input/KV field set (`crates/onnx-genai-engine/src/native_decode.rs:190-205`) and explicitly rejects `sequence_source: inputs_embeds` (`native_decode.rs:716-729`). Gemma4 declares `inputs_embeds_input: inputs_embeds` and `sequence_source: inputs_embeds`, while also requiring routed `per_layer_inputs` (`/home/justinchu/mobius/.scratch/gemma4-e2b-native/inference_metadata.yaml:663-667,885-895`). Native pipeline decode therefore needs metadata-declared arbitrary named step inputs, including both refreshed embedding outputs, without architecture-specific port names or dimensions.
+3. Convert pipeline decode state/execution from ORT-only values and sessions. `pipeline.rs` imports ORT `Session`/`Value` directly (`crates/onnx-genai-engine/src/pipeline.rs:23-34`); `DecodeState` is constructed around `&Session` and stores ORT `Value` (`crates/onnx-genai-engine/src/decode.rs:693-735`); `PipelineDecodeLoopBackend` stores `&Session` for the decoder and every step component and calls ORT `session.run` (`pipeline.rs:2181-2244`). Introduce backend-neutral tensor/state operations or a parallel native decode-loop backend rather than converting through ORT types.
+4. Re-export text-only optional-modality metadata. The local package still declares `embedding.image_features` and `embedding.audio_features` as required inputs (`inference_metadata.yaml:850-867`) and runs vision/audio prompt stages unconditionally (`inference_metadata.yaml:901-932`); it contains no `optional_inputs` or `when_present` declarations. Once native pipeline construction is implemented, an unmodified text-only request will still hit the generic missing-input path (`crates/onnx-genai-engine/src/pipeline.rs:1693-1718`). Mobius should emit explicit presence gates and zero fallbacks from metadata, not a Gemma-specific runtime workaround.
+
+The merged generic `every_step` executor is not the remaining blocker: it binds token inputs from explicit metadata, resolves all routed inputs, publishes every output, and re-reads decoder routes each step (`crates/onnx-genai-engine/src/pipeline.rs:1952-2027,2145-2259`). Thus both `inputs_embeds` and `per_layer_inputs` are refreshable once sessions are backend-neutral. Literal server `pixel_values` discovery is also not on the text-only benchmark path, and decoder position/KV handling was not reached because native pipeline construction fails first.
+**Why:** WP2/WP3 removed the previously suspected multi-output preprocessing and one-output step-binding limitations, but they did not add native multi-model session ownership. The correct next work is an architecture-neutral backend abstraction plus embedding-driven native target decode, followed by producer-emitted optional-modality metadata; changing runtime behavior based on Gemma/model names would violate RULES.md §2/§2.1.
+
+<!-- source: .squad/decisions/inbox/joi-qwen3-0.6b-bench.md -->
+### 2026-07-22: Qwen3-0.6B CUDA smoke passes but metadata disables shared KV
+**By:** Joi
+**What:** The exported Qwen3-0.6B int4 package loaded on ORT 1.27 CUDA and coherently generated ` Paris, and the capital of Italy is Rome. The capital of France is also the capital of the` for the 20-token smoke. As exported it measured 197.49 tok/s at 128 and 64.01 tok/s at 1024, equal to 1.57% and 0.61% of the explicit 3.35 TB/s weight+KV rooflines (12,585 and 10,549 tok/s). A metadata-only diagnostic using `attention.type: grouped_query_attention` plus `kv_cache.native_dtype: float16` reached 429.95/381.49 tok/s; matched Qwen2.5 ORT eager controls reached 570.61/501.88 tok/s.
+**Why:** Qwen3 QK-norm and the graph are functionally supported, but this export is not a clean performance win. It lacks `genai_config.json`; its native metadata emits the unrecognized shared-KV alias `grouped_query` and omits the fp16 KV dtype, so onnx-genai selects growing `ZeroCopyRebind` despite device KV. Corrected metadata removes the length collapse, after which Qwen3 remains about 24% slower than Qwen2.5 under matched eager ORT conditions; QK-norm is only one contributor alongside 28 layers, 8 KV heads, and larger attention geometry.
+
+<!-- source: .squad/decisions/inbox/keaton-native-specdecode-design.md -->
+# Design: Speculative decoding on the FAST native CUDA decode path
+
+- **Author:** Keaton (systems architect)
+- **Date:** 2026-07-21
+- **Status:** Design-only proposal (P0 blocker). No code changed. Read-only investigation.
+- **Requested by:** Justin Chu
+- **Scope:** Make speculative decoding *multiplicative* on the 762 tok/s native decode path, which today rejects speculation outright.
+
+---
+
+## 0. Problem statement & verified ground truth
+
+Speculation is implemented and **correct** — token-identical to greedy across draft / prompt-lookup / MTP / EAGLE-3 / Gemma4 shared-KV proposers (`docs/PROGRESS.md` L244, L272). But it is trapped on the **ORT** path and **explicitly rejected on native**:
+
+- `engine.rs:2340 reject_native_request_speculation()` bails for *every* non-`None` `SpeculativeMode` and for any `num_speculative_tokens`.
+- Native engine construction hard-wires all proposers off: `draft/mtp/eagle3/shared_kv_proposer = None`, `speculative_mode = SpeculativeMode::None` (`engine.rs:1004-1011`).
+- So native gets **zero** of the decode win; and the only measured *real* speculation (Gemma4 E2B shared-KV on H200) runs at **0.53× — slower than greedy** — because the drafter's lm_head compute cost exceeds the tokens it saves, and the drafter rarely gets 2+ ahead (`PROGRESS.md` L329: acceptance ~25%, `multi_token_accepts=0`; Leon's fix lifted this to 70.6% / 12-of-17 but raw speedup is still <1×, L272).
+
+The native fast path today (verified in `native_decode.rs`):
+
+- Plain decode is a **single-token (M=1) CUDA graph**: fixed-shape `input_ids [1,1]` / `position_ids [1,1]` device bindings, a `max_len`-capacity device KV whose *logical* length grows via `set_logical_len` while the *physical* pointer/topology stays invariant, and an attention mask grown in place via `extend_mask`. Topology is step-invariant; only **buffer contents** change → that is *why* M=1 is capture-safe with **0 fallbacks** (`run_one_token` L774-821; `DecodeCudaGraphPhase` NeedsWarmup→Armed→Ready).
+- Greedy runs a **device argmax** on the single logits row and returns only a token id (`read_greedy_result` L833-845, `device_argmax`), so no host logit copy on the hot path.
+- **A multi-token (M=K) eager path ALREADY EXISTS** and is exercised by prefill: `decode_cuda` L480-537 calls `invalidate_graph`, rebuilds **host** `input_ids/position_ids` of shape `[1,K]`, and runs `run_with_device_bindings(host_inputs, &mut state.bindings[..base_binding_count])` — host CPU inputs + device KV/mask bindings — returning full `[K,vocab]` host logits. This is the raw material for verify.
+- **Rewind already exists and is device-KV correct**: `NativeDecodeSession::rewind` (L1006-1038) → for CUDA it calls `state.invalidate_graph` then `state.rewind(target_len)` (L756-763), which zeroes the mask tail `[target_len, logical_len)` and truncates the KV *logical* length. Physical buffer bytes beyond `target_len` are left stale but hidden by logical shape — correct, because the next pass overwrites those positions before they are ever attended.
+
+Other verified facts used below:
+
+- Multi-row `argmax_rows` / `sample_rows` device kernels exist in the **ORT** crate (`device_sampler.rs` L114-119 "handling rows>1 lets speculative decoding argmax every verified position in a single launch", L647-733) but are **UNUSED** — no caller outside `device_sampler.rs`. The native crate has its own *single-row* device argmax on `logits_binding`; it has **no multi-row primitive yet**.
+- The ORT speculative acceptance loop copies the full `[K,vocab]` logits to host as `Vec<Vec<f32>>` and selects tokens host-side (`speculative.rs` L1440-1492).
+- The native graph lifecycle uses `reset_device_graph()` + `DecodeCudaGraphPhase` (clean re-warm), **not** the ORT `gpu_graph_id` annotation-id protocol (`session.rs:754-810`). The "re-capture under a held annotation id corrupts the ORT heap" hazard is an **ORT-path** hazard; the native path sidesteps it entirely by destroying and rebuilding the graph exec via `reset_device_graph`. This is a structural advantage for native spec.
+- `NgramProposer` (prompt-lookup) is **model-free**: `NgramProposer::new(ngram, max_tokens)` + `propose(ctx)` needs only the context tokens in `SpeculativeProposerContext` — no session, no runner, no lm_head (`speculative.rs:542-604`). Ideal first increment.
+- The plain path runs through the shared `run_decode_loop`/`DecodeLoopBackend` via `NativeLoopAdapter` (`native_decode.rs:1049+`). The ORT speculative loop is a **separate** method (`generate_speculative`) — native must get its **own** driver, not reuse the ORT one.
+
+---
+
+## 1. Architecture: native speculative driver beside the plain native loop
+
+Two peer drivers behind one dispatch, sharing the *same* `NativeDecodeSession`:
+
+```
+generate_native_with_callback (engine.rs)
+    ├─ speculation OFF  → native_session.generate_with_callback   (EXISTING, untouched)
+    │                        → run_decode_loop(NativeLoopAdapter)  → M=1 captured graph, device argmax
+    └─ speculation ON   → native_session.generate_speculative(...) (NEW)
+                             → NativeSpeculativeDriver loop:
+                                  propose K  (NgramProposer, model-free, host)
+                                  verify     NativeDecodeSession::decode_verify(&[t1..tK])  (M=K)
+                                  accept     device multi-row argmax over [K+1, vocab]
+                                  rewind     NativeDecodeSession::rewind(past + accepted)
+```
+
+Key structural decisions:
+
+1. **The plain loop is never touched.** `generate_with_callback` → `run_decode_loop` → `NativeLoopAdapter` stays byte-identical. The M=1 captured-graph greedy fast path is unchanged. All new code lives in a *new* `generate_speculative` entry + a *new* `NativeSpeculativeDriver` struct + a *new* verify primitive. See §6 (non-regression).
+2. **The driver owns the outer token loop itself** (it cannot use `run_decode_loop`, whose contract is one-token-per-step). It reuses the existing `ProcessorChain`, EOS handling, `max_new_tokens`/`max_context` checks, and streaming callback so behavior matches the plain loop for accepted tokens.
+3. **Proposer stays host-side and pluggable** via the existing `SpeculativeProposerContext`. The n-gram proposer needs nothing device-side; later proposers (draft/shared-KV/MTP/EAGLE) plug into the *same* verify/accept/rewind machinery — only `propose()` changes.
+4. **Verify + accept become the fast, device-resident core.** The target forward over K tokens is a single native pass; acceptance is a single device kernel returning K+1 token ids. No `[K,vocab]` host copy.
+
+---
+
+## 2. The M=K verify decision (the crux) + capture-safety analysis
+
+Speculative verify must run K candidate tokens (K=2..8) through the target in **one** pass and read one predicted token per position. Three options:
+
+### (a) Per-K CUDA-graph capture buckets
+Capture a distinct graph for each fixed K in a small set (e.g. {2,4,8}), each with `input_ids/position_ids [1,K]` device bindings.
+- **Capture-safety:** topology is fixed *per bucket*, so each is individually capture-safe *if* the M=K attention kernels pass the pre-capture audit. Risk: the 0-fallback property was proven only for M=1; K-query attention may trip a non-capturable op → a *new* fallback surface per bucket.
+- **0-fallback property:** now must hold for N buckets, not 1. N× the audit risk, N× warmup cost (each bucket needs its own NeedsWarmup→Armed→Ready).
+- **Device-KV correctness:** same data-driven mask/KV mechanism as M=1 → fine.
+- **Perf:** best steady-state (graph replay on every verify) but forces the proposer to emit exactly a bucketed K (pad to nearest bucket).
+- **Verdict:** highest steady-state perf, highest capture risk + warmup/memory cost. Over-engineered for increment 1.
+
+### (b) Uncaptured eager M=K path — **ALREADY EXISTS** (`decode_cuda` L480-537)
+Run K tokens eagerly (`invalidate_graph` + host `[1,K]` inputs + device KV bindings), return `[K,vocab]`.
+- **Capture-safety:** N/A — no capture, so **zero** new capture-audit risk. Cannot regress the M=1 0-fallback property (different code path).
+- **0-fallback property:** trivially preserved for the plain path (untouched); the spec path simply doesn't capture.
+- **Device-KV correctness:** already proven — this is the prefill path; `set_logical_len(total_len)` advances KV correctly; `rewind` truncates.
+- **Perf:** loses graph replay *for the verify pass only*. But: (i) the spec loop is **pure M=K** — it never interleaves M=1 steps, so there is **no capture thrash** (`invalidate_graph` fires once at entry, not per token); (ii) batching K tokens into one pass amortizes the ~227 launches/token across K tokens (≈K× fewer launches/token), which recovers much of what graph capture bought (the graph win was *CPU launch-overhead* elimination); (iii) target decode is weight-bandwidth-bound, so K query rows cost ≈ same wall-time as 1 row (weights streamed once).
+- **Verdict:** simplest, correct today, near-zero risk, and *already implemented*. The perf gap vs. capture is smaller than it looks because of launch amortization + bandwidth-bound verify.
+
+### (c) Single fixed M=maxK captured graph with padding
+Capture **one** graph at `M = maxK`; when the proposer offers fewer than maxK, pad unused query rows with dummy input ids (their logits are ignored, their KV writes are rewound).
+- **Capture-safety:** a **single** topology → a single pre-capture audit, exactly like M=1. The 0-fallback property is proven **once** for maxK and then holds for every step. This is the *only* option that keeps "one audited, capture-safe graph."
+- **0-fallback property:** one graph, one audit — cleanest.
+- **Device-KV correctness:** same data-driven mask/KV mechanism; padded rows write KV at positions `[past+realK, past+maxK)` which are **rewound** every step, so they never leak into attention of committed tokens. Mask marks all maxK positions valid during the pass.
+- **Perf:** graph replay on **every** verify pass (full 762-class launch reduction) *plus* K-token batching. Cost: always computes maxK rows even when fewer are proposed — but decode is bandwidth-bound, so the marginal cost of extra query rows is small (weights loaded once). This is the classic "verification is nearly free" property that makes speculation multiplicative.
+- **Verdict:** best end-state — graph replay + single audit + bandwidth-cheap padding.
+
+### Recommendation
+
+**Target architecture = (c) single fixed M=maxK captured, padded graph.** It is the only option that preserves the hard-won 0-fallback graph-replay win on the verify pass while keeping a *single* capture audit, and its padding cost is nearly free on a bandwidth-bound decode.
+
+**But sequence through (b) first.** Increment 1 lands the verify/rewind/accept machinery on the **existing eager M=K path** (option b) — zero capture risk, correct today, fastest path to an end-to-end measurable number. Only after correctness + a measured speedup are proven does WP-later graduate the verify pass to (c) as a *pure perf lever*, gated behind the same flag. This de-risks the P0: we prove the loop works before we touch capture.
+
+> **One-line rule for the coordinator:** ship (b) to prove it, upgrade to (c) to make it fast. Both behind the speculation flag; the plain M=1 path is never in the blast radius.
+
+---
+
+## 3. Rewind / KV-correctness protocol
+
+The accept loop must, per outer step:
+
+1. `past = session.current_len()` (committed length).
+2. Propose `K` tokens (host).
+3. `verify_logits_or_ids = session.decode_verify(&draft[0..K], past)` — advances device KV to `past+K`, mask valid over `[0, past+K)`.
+4. Determine `accepted = j` (longest prefix where target argmax == draft) and the **bonus token** `t_{j}` = target argmax at position `j` (the free correct token verify always yields).
+5. Commit `draft[0..j] ++ [t_j]` (that is `j+1` tokens) to the output/stream/processor chain.
+6. `session.rewind(past + j + 1)` — roll device KV back to the committed length (dropping the `K-j-1` unaccepted KV columns and, under option (c), the padded columns).
+
+Correctness invariants (all verified against existing code):
+
+- **`rewind` is device-KV correct.** `state.rewind(target)` zeroes mask `[target, logical)` and truncates KV logical length (L756-763). Because unaccepted/padded positions are always `> target`, their stale physical bytes are hidden and are overwritten by the *next* pass before being attended. No corruption.
+- **Graph state.** Under **(b)** verify already runs `invalidate_graph` (L480) so there is no captured state to corrupt; the *next* verify re-warms cleanly via `NeedsWarmup`. Under **(c)** the captured M=maxK graph must **not** be invalidated on the accept/rewind (rewind only rewrites mask/KV *contents* + logical shapes, which is exactly the data-driven mutation the captured graph tolerates — identical in spirit to how M=1 replays across growing KV). `rewind`'s current `invalidate_graph` call is correct for (b) but must be made **conditional** for (c): keep the capture, rewind only buffer contents/shapes. This is the single subtle correctness point for the (c) upgrade and gets its own test.
+- **No annotation-id hazard.** Native uses `reset_device_graph` + phase reset, not `gpu_graph_id` held-id re-capture — the ORT heap-corruption hazard does not apply. This is why native is a *safer* home for spec than ORT.
+- **CPU inputs rebind each step.** The eager M=K path already rebuilds host `input_ids/position_ids` per pass (L481-496); under (c) the padded input-id/position buffers are device bindings whose *contents* are rewritten each step (like the M=1 `write_decode_inputs`), never re-topologized.
+
+---
+
+## 4. Device-side verified-row acceptance (API change)
+
+**Today (ORT):** verify returns `Vec<Vec<f32>>` `[K+1, vocab]`; host runs argmax/sampling (`speculative.rs` L1440-1492). That is `(K+1) × vocab × 4 bytes` host copy per step (e.g. 9 × 151936 × 4 ≈ 5.5 MB/step at K=8) — a real cost that erodes speedup.
+
+**Native target:** select target ids **on-device** and copy back only `K+1` token ids (≈36 bytes).
+
+- **New native primitive:** `DecodeCudaState::verify_argmax_rows(rows) -> Vec<TokenId>` (or write into a caller `[u32; maxK+1]` to avoid per-step alloc, mirroring `argmax_into`). It runs the multi-row argmax kernel over the `[rows, vocab]` device logits binding — the native analogue of the ORT `argmax_rows` that already exists but is unused. Reuse the same one-block-per-row kernel design (`device_sampler.rs` L114-119) in the native/ep-cuda crate, or lift the ORT kernel into a shared location. It must also poll the shared capture-error word (same detection-before-consumption discipline as `read_greedy_result`, L833-845) so a bad replay rejects the whole step.
+- **New verify API on the backend:**
+  - `decode_verify_argmax(&mut self, draft: &[TokenId], past: usize) -> anyhow::Result<Vec<TokenId>>` returns the `K+1` **selected target ids** (positions `0..=K`), not host logits. The driver compares element-wise with `draft` to find `accepted`, and reads the bonus token at index `accepted`.
+  - Greedy-only for increment 1 (`options.greedy || temperature==0`). This is exactly the regime where the M=1 device argmax fast path already applies, so it is behavior-consistent.
+- **Where sampling slots in later:** temperature/top-k/top-p verify uses the existing device `sample_rows` (`device_sampler.rs` L745-756) instead of `argmax_rows`, with the documented shared-rng-per-row simplification. That is a *later* WP; increment 1 is greedy verify only. For non-greedy / processor-chain / logprobs requests, the driver **falls back** to reading host `[K,vocab]` logits and using the existing host `select_next_token_with_rng` path (correctness over speed) — never disabling the plain fast path.
+
+---
+
+## 5. Proposer sequencing on the fast path
+
+**First increment = prompt-lookup / n-gram (`NgramProposer`).** Confirmed correct choice:
+
+- **Model-free:** `NgramProposer::new(ngram, max_tokens)` + `propose(ctx)` uses only context tokens — no draft session, no lm_head, no KV, no device residency (`speculative.rs:542-604`). It isolates the variable under test to *exactly* the native verify/rewind/accept machinery.
+- **Measurable win without draft complexity:** on a repetitive/long-context prompt (code, JSON, retrieval, chat with quoted context) n-gram acceptance is high and its proposal cost is ≈0, so any accepted token is pure speedup. This proves the native loop is multiplicative *before* any draft-model cost is in play.
+- **Same socket for everything else:** once the native verify/accept/rewind loop is proven with n-gram, `DraftModelProposer` / `SharedKvProposer` / MTP / EAGLE-3 plug into the identical loop — only the `propose()` branch changes (they already all produce `draft_tokens: Vec<TokenId>` via `SpeculativeProposerContext`). No further verify/rewind work needed for them.
+
+Sequencing: **n-gram (WP4) → draft-model / shared-KV (follow-on, out of scope here but unblocked).**
+
+---
+
+## 6. Why real Gemma spec is <1×, and whether native flips it
+
+**Root cause (verified, `PROGRESS.md` L272, L329):** the Gemma4 E2B shared-KV drafter runs its own internal **lm_head** to propose each token. On the ORT path that drafter forward + lm_head + host logit copies costs a large fraction of a target step; with acceptance ~25% and `multi_token_accepts=0` (drafter never gets 2+ ahead), the target still runs nearly every position, so total work = target + drafter > target alone → **0.53×**. Leon's embedding fix (`inputs_embeds = concat(input_embedding(last), last_hidden)`) lifted acceptance to 70.6% and `multi_token_accepts` 0→12/17 — proving the *acceptance* side is fixable — but raw speedup is still <1× because the **drafter cost per proposal** dominates.
+
+**Does the fast path plausibly flip it >1×? Honest answer: for a *cheap/free* proposer, yes; for the current Gemma drafter, only maybe, and not from the native loop alone.**
+
+- The native fast path removes several *fixed* costs that erode speedup: **no `[K,vocab]` host logit copy** (device argmax returns K+1 ids), **graph-replayed verify** (option c), **aliased shared-KV** (no re-materialization), and **launch amortization** across K. These raise the ceiling for *every* proposer.
+- **For n-gram (proposal cost ≈ 0):** speedup ≈ `1 + E[accepted]` limited by verify overhead. On a favorable prompt this is comfortably >1× — this is the increment we can *prove* flips the sign.
+- **For the Gemma drafter:** the binding constraint is **drafter lm_head compute vs. tokens saved**, not host-copy overhead. Native helps (device-resident drafter, aliased shared-KV, no host round-trips) and *raising acceptance to 70%* helps, but if the drafter forward is an appreciable fraction of a target step, the acceptance rate must clear `draft_cost_fraction` for net >1×. Native improves the constant factors on both sides; whether that clears the bar is an **empirical** question that only the benchmark answers. **We must not promise native alone flips Gemma >1×.** The honest framing: native is a *necessary* enabler (it removes the overheads that made even n-gram impossible), and it *plus* the acceptance fix *plus* a cheaper drafter head is the plausible route. The acceptance-rate ↔ draft-cost tradeoff is fundamental: `speedup ≈ (1 + α·K) / (1 + c)` where α is per-position acceptance and c is drafter-cost-as-fraction-of-target; native shrinks `c` (device residency, aliasing) and the fix raises `α`, but neither guarantees the product > 1 for an expensive head.
+
+---
+
+## 7. Non-regression guarantee (the 762 tok/s path stays byte-identical)
+
+Zero-cost-when-off, enforced structurally:
+
+1. **Separate entry point.** Speculation dispatches to a *new* `generate_speculative`; when off, control never enters new code — `generate_with_callback` → `run_decode_loop` → `NativeLoopAdapter` is untouched, so the M=1 captured-graph greedy path is *literally the same instructions*.
+2. **Flag/request-gated.** Wire speculation through the existing `SpeculativeMode` + `num_speculative_tokens` request options (config.rs:381). `reject_native_request_speculation` is *narrowed* (WP2): reject only the *unimplemented* modes; allow the implemented native mode(s). Default remains `SpeculativeMode::None` → plain path.
+3. **No shared mutable state added to the hot path.** The new verify primitive and multi-row argmax live in new methods; the M=1 `run_one_token` / `read_greedy_result` are not edited. The `rewind` change for option (c) is guarded so the *plain* path (which never calls verify) sees identical behavior.
+4. **Guard test:** a byte-identical + tok/s non-regression check — same prompt, spec off, asserts token stream and a tok/s floor vs. the current 762-class baseline (extend the existing native decode bench/soak). This is WP4's exit gate.
+
+---
+
+## 8. Transparency (Deckard's trace spans + kernel-variant records)
+
+Preserve and extend observability:
+
+- The verify pass reuses the existing `TraceContext` and per-op spans already threaded through `run_one_token`/`decode_cuda` (`self.trace`, `trace_capture_declines`). The M=K verify pass must emit its own span so per-op timings remain attributable.
+- **New per-step speculative record** (extend `SpeculativeStats`, already tracked: `proposed_tokens`, `accepted_tokens`, `multi_token_accepts`, `verification_steps`): add/emit **K (proposed)**, **accepted count**, and **per-phase timing** (propose / verify-forward / device-argmax-accept / rewind). Surface via the same stats channel the ORT path uses so dashboards are uniform.
+- **Kernel-variant records:** the multi-row argmax and the M=K verify forward must register their kernel-variant identity (dtype path, rows, vocab) the same way the M=1 argmax + GEMV variants do, so Deckard's kernel-variant ledger stays complete for the fast path.
+- Capture-error polling (option c) reuses the existing shared capture-error word + detection-before-consumption, so a bad replay is *observable* (latched flag → structured bail) rather than silent.
+
+---
+
+## 9. Phased, FILE-DISJOINT work packages
+
+Ordered by dependency. Files are chosen to minimize overlap so the coordinator can fan out WP1/WP3 primitives in parallel, then WP2 wires, then WP4 proves.
+
+### WP1 — Native M=K verify + rewind primitive (option b) + (c)-ready rewind guard
+- **Files:** `crates/onnx-genai-engine/src/native_decode.rs`; `crates/onnx-runtime-ep-cuda/src/graph.rs` (+ its executor glue for the padded-capture upgrade only).
+- **Do:** expose `decode_verify(draft, past) -> [K,vocab]`/`decode_verify_argmax(draft, past) -> Vec<TokenId>` built on the existing eager M=K path (L480-537); make `rewind`'s `invalidate_graph` call **conditional** so option (c) can retain the captured graph across rewind (contents-only mutation). Add the padded single-M=maxK capture behind an internal switch (dormant until WP4 flips it).
+- **Depends on:** nothing (uses existing eager path + rewind).
+- **Risk:** Medium. The (c) rewind-without-invalidate correctness is the one subtle point — ship (b) first with `invalidate_graph` retained, land (c) guarded.
+- **Exit criterion:** unit test — decode(K) then rewind(past+j) leaves `current_len == past+j`, mask/KV logical shapes correct, and a subsequent decode produces logits **bit-identical** to a fresh M=1 decode from that committed prefix (proves no KV corruption).
+
+### WP2 — Stop rejecting + native speculative driver
+- **Files:** `crates/onnx-genai-engine/src/engine.rs` (narrow `reject_native_request_speculation` L2340; add `generate_speculative` dispatch + native proposer wiring in the native constructor L991-1011); `crates/onnx-genai-engine/src/config.rs` (validate the allowed native mode).
+- **Do:** allow prompt-lookup on native; construct the `NgramProposer`; add the outer `NativeSpeculativeDriver` loop (propose → verify → accept → rewind → commit/stream) reusing `ProcessorChain`/EOS/`max_new_tokens`/callback.
+- **Depends on:** WP1 (verify+rewind primitive), WP3 (accept API — can stub with host argmax until WP3 lands).
+- **Risk:** Medium. Loop correctness (EOS mid-accepted-run, context-limit mid-verify, streaming order).
+- **Exit criterion:** native prompt-lookup produces a token stream **identical to native greedy** on a fixed prompt (env-gated integration test, mirrors `tests/milestone_b_real.rs` style).
+
+### WP3 — Device verified-row acceptance
+- **Files:** `crates/onnx-genai-ort/src/device_sampler.rs` (expose/relocate the multi-row `argmax_rows` so native can use it — it is currently unused/private); `crates/onnx-runtime-ep-cuda/` native argmax wiring; native branch in `crates/onnx-genai-engine/src/speculative.rs` (or a new `native_speculative.rs`) that calls device accept instead of the host `Vec<Vec<f32>>` compare.
+- **Do:** wire `decode_verify_argmax` to a multi-row device argmax over `[K+1, vocab]`, returning only K+1 ids + capture-error poll. Keep host-logit fallback for non-greedy/processor/logprobs.
+- **Depends on:** WP1 (verify pass produces the device logits binding).
+- **Risk:** Medium — dtype coverage (f16/bf16/f32), capture-error latch integration.
+- **Exit criterion:** greedy verify selects the **same** K+1 ids as the host `[K,vocab]` argmax reference, with **zero** `[K,vocab]`→host copies on the greedy path (assert via transfer-stats counters, like `CudaKvDebugStats`).
+
+### WP4 — Prompt-lookup native e2e + benchmark/test + option-(c) enable
+- **Files:** `crates/onnx-genai-bench/` (new native-spec bench scenario); `crates/onnx-genai-engine/tests/` (native spec e2e + non-regression guard); scripts under `scripts/`.
+- **Do:** end-to-end native prompt-lookup on a repetitive prompt; measure tok/s vs. plain native; flip the option-(c) captured verify on and compare; add the **spec-off byte-identical + tok/s-floor** non-regression guard (§7).
+- **Depends on:** WP1–WP3.
+- **Risk:** Low-Medium — bench variance on shared H200 (use median-of-3, matching the 762 methodology).
+- **Exit criterion:** **>1× decode speedup** on a favorable prompt with token-identical output, AND spec-off path proven byte-identical at the 762-class tok/s floor. This is the go/no-go gate (§11).
+
+---
+
+## 10. Expected speedup (honest range)
+
+- **Prompt-lookup increment (favorable, repetitive prompt):** **1.3×–2.2×** decode. Proposal cost ≈ 0, so speedup ≈ `1 + E[accepted per step]` discounted by verify overhead; with option (c) graph-replayed verify and K≈4–8 and moderate n-gram hit rates this lands comfortably >1×. On **non-repetitive** prompts n-gram acceptance collapses → **~1.0× (neutral)**; the driver must early-exit to the plain path when the proposer returns empty, so worst case is *no regression*, not a slowdown.
+- **Real Gemma-4 E2B draft increment:** honest range **0.7×–1.4×**, *conditional*. Native removes host-copy + launch overhead and aliases shared-KV; with acceptance ~70% (post-fix) it *can* clear 1× **iff** the drafter head cost stays a small fraction of a target step. If the lm_head remains expensive, expect **<1× even on native** — that is a *proposer-cost* problem native cannot fully solve. Do not commit to >1× for Gemma without the WP4 measurement.
+
+---
+
+## 11. Kill-criterion
+
+Abandon native spec (or park it behind an off-by-default flag with a documented negative result) if, after WP4:
+
+- **Prompt-lookup cannot beat 1.15× median** (3-sample) on a *favorable* repetitive prompt on H200 — i.e. even the zero-cost proposer with device-side accept and graph-replayed verify fails to be multiplicative. That would mean the verify/rewind overhead itself eats the win, and no real draft model can succeed either.
+- **OR** the spec-off path cannot be kept byte-identical at the 762-class tok/s floor — i.e. enabling the feature regresses the plain path. Non-negotiable.
+
+If prompt-lookup clears >1.15× but Gemma draft stays <1×, that is **not** a native-spec kill — it is a *drafter-cost* finding: keep native prompt-lookup (shipped win) and route the Gemma head-cost problem to a separate proposer-optimization track (cheaper/quantized drafter lm_head, MTP/EAGLE with smaller heads).
+
+---
+
+## Plain-text summary
+
+- **Recommended M=K verify approach:** target end-state **(c) — one fixed M=maxK CUDA graph with padding** (single capture audit, preserves the 0-fallback graph-replay win, padding is ~free on bandwidth-bound decode), but **sequence through (b) — the eager M=K path that already exists** for increment 1 (zero capture risk, correct today). Ship (b) to prove it; upgrade to (c) to make it fast. The plain M=1 path is never in the blast radius.
+- **First increment / proposer:** **prompt-lookup / n-gram** — model-free (`NgramProposer::new(ngram, max_tokens)`), no draft LM, isolates the native verify/rewind/accept machinery and gives a measurable win on repetitive prompts. Draft-model / shared-KV / MTP / EAGLE plug into the identical loop afterward.
+- **Four work packages in order:** WP1 native M=K verify+rewind primitive (`native_decode.rs` + `ep-cuda/graph.rs`) → WP2 stop-rejecting + native speculative driver (`engine.rs` + `config.rs`) → WP3 device verified-row acceptance (`device_sampler.rs` multi-row argmax + native accept branch) → WP4 prompt-lookup e2e + benchmark + non-regression guard (`onnx-genai-bench` + tests). WP1 and WP3 primitives can start in parallel; WP2 wires; WP4 proves.
+- **Honest expected speedup:** prompt-lookup **1.3×–2.2×** on favorable prompts (**~1.0×, no regression** on unfavorable, via early-exit); real Gemma-4 draft **0.7×–1.4×, conditional** on the drafter lm_head cost — native removes host-copy/launch/KV-realization overhead and the acceptance fix raises hit rate, but an expensive drafter head can still keep Gemma <1× (a proposer-cost problem, not a native-loop problem).
+- **Go/no-go:** GO if native prompt-lookup beats **1.15× median (3-sample)** on H200 with token-identical output **and** the spec-off path stays byte-identical at the 762-class tok/s floor. KILL native spec only if the zero-cost proposer itself can't clear 1.15× or if enabling the feature regresses the plain path. A Gemma-draft <1× result is a drafter-cost finding, not a native-spec kill — keep the shipped prompt-lookup win and split the head-cost problem into its own track.
+
+<!-- source: .squad/decisions/inbox/kowalski-zhora-mla-conformance-review.md -->
+### 2026-07-22: Zhora DeepSeek MLA conformance review
+**By:** Kowalski
+**What:** 🟢 APPROVE `91e747d27d8309da27671cc2263580f624d94487`.
+**Why:** Independent review found the focused CPU Attention conformance addition correct, green, model-agnostic, and scoped.
+
+Evidence:
+- Diff versus `origin/main` is exactly 51 test-only lines in `crates/onnx-runtime-ep-cpu/src/kernels/attention.rs`; there are no `executor.rs`, `.squad/`, documentation, or unrelated changes. `git diff --check` passed.
+- The test genuinely uses asymmetric widths: Q/K head dimension `2`, V head dimension `1`; Q has hidden width `4*2=8`, K `2*2=4`, V `2*1=2`, and Y is allocated/asserted at `4*1=4`. It also exercises GQA (`4` query heads mapped in pairs to `2` KV heads), non-empty cached decode, and present K/V concatenation.
+- Independent SDPA recomputation used `scores = QK^T/sqrt(2)`. Since each Q vector is zero, every head has scores `[0,0,0]` and softmax probabilities `[1/3,1/3,1/3]`. KV head 0 values `[1,3,5]` produce `3`; KV head 1 values `[2,4,8]` produce `14/3`. GQA therefore produces `[3,3,14/3,14/3]`, exactly matching the golden. Independently verified cache layouts are present K `[1,0,0,1,10,20,2,0,0,2,30,40]` and present V `[1,3,5,2,4,8]`.
+- `cargo build -p onnx-runtime-ep-cpu`: passed.
+- `cargo clippy -p onnx-runtime-ep-cpu -- -D warnings`: passed.
+- `cargo test -p onnx-runtime-ep-cpu mla_gqa_decode_with_asymmetric_head_dims_matches_hand_computed_result -- --nocapture`: passed (`1 passed`, `646 filtered out`).
+- Native CPU DeepSeek-V2-tiny E2E was independently rerun with `--features native-backend`; it passed and generated `[42, 237, 198, 2, 186, 81, 210, 149]`. The first attempt without that required feature failed at configuration validation, then the correctly configured command passed.
+- RULES.md model-name grep found only pre-existing `llama.cpp` provenance comments/test names in `block_quantized_matmul.rs`; the changed code adds only an `mla` test name/comment and no model-specific runtime logic.
+
+<!-- source: .squad/decisions/inbox/kowalski-zhora-unsqueeze-review.md -->
+### 2026-07-22: APPROVE zhora DeepSeek Unsqueeze test coverage
+**By:** Kowalski
+**What:** Reviewed the test-only Unsqueeze dynamic-output-shape regression coverage and approved it. The opset-17 input axes `[0, -1]` correctly produce `[1, 2, 3, 1]`, and the opset-11 attribute axes `[1, -1]` correctly produce `[2, 1, 3, 1]`.
+**Why:** `cargo fmt -p onnx-runtime-session --check`, `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings`, `cargo test -p onnx-runtime-session dynamic_output_shapes_unsqueeze -- --nocapture`, and `cargo test -p onnx-runtime-session` all passed. Fast-forward merged SHA: `8d9d2fa279a0463b9fc6c02932ebd7b9ec775fb4`.
+
+<!-- source: .squad/decisions/inbox/leon-vlm-scope.md -->
+### 2026-07-21: Next VLM runtime scope
+**By:** Leon (Engine Dev)
+**Requested by:** Justin Chu
+**Scope:** Read-only investigation of onnx-genai runtime, Mobius export, and local validation assets. This file is the only artifact created.
+
+# Executive conclusion
+
+The repository has a real but narrow multimodal vertical slice: a metadata-declared `vision_encoder -> embedding/fusion -> inputs_embeds decoder` pipeline works end-to-end for the committed deterministic `tiny-gemma4-vlm` fixture. Native image loading, rank-4 RGB resize/normalize/tiling, one-placeholder expansion, and OpenAI `image_url` ingestion also exist.
+
+No real Mobius VLM package found locally is currently runnable end-to-end by the server without additional work. The first recommended real target is **Gemma4 E2B**, because its gated source checkpoint and processor config are already cached locally and Mobius exports its three-model ONNX topology. The shortest correct path is not a Gemma-specific branch: it is a typed, architecture-neutral multimodal tensor contract; a generic multi-output image processor; generic per-step pipeline component execution; and native Mobius metadata emission.
+
+Qwen2.5/3-VL is the next architecture class after Gemma4. The complete local Qwen3.5 Foundry package is valuable as a stress target, but it additionally needs 3-axis MRoPE and generic fixed recurrent-state carry, so it should not be the first runtime milestone.
+
+# A. Current VLM state
+
+## A1. Runtime: what already works
+
+### Composite vision -> fusion -> autoregressive decode
+
+`PipelineEngine::run_autoregressive` tokenizes, optionally expands image placeholders, seeds prompt component inputs, executes prompt components, then drives the decoder (`crates/onnx-genai-engine/src/pipeline.rs:329-428`). The Gemma4-style seams are:
+
+- `seed_prompt_token_inputs` supplies prompt IDs to an embedding/fusion model (`pipeline.rs:1483-1517`).
+- `embeds_step_binding` finds a decoder fed through `inputs_embeds`, resolves its embedding component, reuses prompt embeddings for prefill, and re-runs that component for each generated token (`pipeline.rs:1519-1617`).
+- `PipelineDecodeLoopBackend::step_extras` implements the prefill-versus-single-token embedding behavior (`pipeline.rs:1776-1837`).
+
+The committed proof is `crates/onnx-genai-engine/tests/gemma4_vlm_pipeline_e2e.rs:1-24,42-66`, backed by `tests/fixtures/tiny-gemma4-vlm/inference_metadata.yaml` and `scripts/build_tiny_gemma4_vlm.py:2-45,329-381`. It asserts exact generated IDs `[0,5,6,7]`, including a first token that depends on image features. This is a genuine contract test, but the fixture deliberately has only one rank-4 image tensor, one embedding output, ordinary KV, and no position-ID input.
+
+### Image ingestion and preprocessing
+
+`onnx-genai-preprocess` already provides:
+
+- RGB decoding, resize, interpolation, crop/pad, normalization, fixed/dynamic-anyres tiling, and thumbnail ordering (`crates/onnx-genai-preprocess/src/image.rs:395-537,559-724`).
+- A rich multi-image placeholder expander with separate placeholder/image token IDs, per-image tile grids, row/column separators, and thumbnail ordering (`image.rs:67-97,169-337`).
+
+The server accepts base64 data URIs and HTTP(S) image URLs with size/time limits (`crates/onnx-genai-server/src/image_input.rs:44-107`). Chat routes validate image use against pipeline handles and invoke preprocessing (`crates/onnx-genai-server/src/routes.rs:1218-1248,1305-1320`).
+
+### Structurally compatible class today
+
+With a hand-authored native sidecar, the current path can support a single-image, rank-4 RGB VLM whose:
+
+1. vision encoder has exactly one `pixel_values` float32 input;
+2. embedding graph accepts prompt IDs plus fixed image features and emits only the decoder's `inputs_embeds` sequence input;
+3. decoder has no simultaneous raw token input, uses ordinary rank-2 positions or no positions, and has ordinary declared K/V pairs; and
+4. prompt expansion is a uniform repetition of one placeholder token.
+
+That can describe a simplified LLaVA/PaliGemma/InternVL-style three-model split, but no real such package is committed or locally validated in this repository.
+
+## A2. Runtime: what is not wired
+
+### Server discovers one literal, rank-4 RGB input
+
+Pipeline startup searches sessions for an input literally named `pixel_values`, rejects more than one match, requires `Float32`, and constructs the rank-4 `ImagePreprocessor` (`crates/onnx-genai-server/src/state.rs:409-435`). `ImagePreprocessor::from_input_and_metadata` rejects any rank other than four and identifies RGB layout from a dimension equal to 3 (`crates/onnx-genai-preprocess/src/image.rs:395-418`). `VisionInputSpec` and server `ImageTensor` carry only one endpoint, one `Vec<f32>`, and aggregate tile count (`crates/onnx-genai-server/src/image_input.rs:9-41,44-61`).
+
+This excludes all three priority real interfaces:
+
+- **Gemma4 E2B/12B:** Mobius emits `pixel_values [B,N,3*P^2]` plus `pixel_position_ids [B,N,2]` (`/home/justinchu/mobius/src/mobius/tasks/_gemma4.py:317-362`).
+- **Qwen2.5/3/3.5-VL:** Mobius emits packed `pixel_values [total_patches,pixel_dim]` plus `image_grid_thw [num_images,3]` (`.../_vision_language_3model.py:98-157`).
+- **Phi4 multimodal:** Mobius emits rank-4 pixels plus `image_sizes` and `image_attention_mask` (`.../_phi4mm_multimodal.py:86-129`).
+
+### Rich expansion exists but the live path discards it
+
+The engine's live API carries only `num_image_tiles` (`pipeline.rs:71-103`). `expand_image_placeholders_count_based` supports exactly one placeholder, multiplies `tokens_per_tile * aggregate_tiles`, and repeats the placeholder token itself (`pipeline.rs:1629-1736`). The server reduces preprocessing output to aggregate `num_tiles` (`image_input.rs:56-61`; `routes.rs:1315-1320`). It therefore loses per-image tile counts, grids, thumbnail placement, separate image-token IDs, and separators already represented by `ImageTilingSummary`/`TokenExpansionConfig`.
+
+The server also performs its context-cap check before image preprocessing and placeholder expansion (`routes.rs:1289-1305`), so request accounting is based on the unexpanded prompt rather than the actual prefill length.
+
+### Per-step fusion is a one-output special case
+
+`embeds_step_binding` deliberately returns `None` whenever the decoder has any token-ID input (`pipeline.rs:1537-1544`). It recognizes `inputs_embeds` and the fusion token input by historical names (`pipeline.rs:1545-1579`), and `step_extras` extracts only one configured fusion output (`pipeline.rs:1814-1836`). Other dataflow inputs are captured once by `decoder_extra_inputs` and reused unchanged (`pipeline.rs:1457-1480`).
+
+That is insufficient for:
+
+- **Gemma4 E2B:** Mobius embedding can emit both `inputs_embeds` and `per_layer_inputs`; the decoder consumes both (`/home/justinchu/mobius/src/mobius/tasks/_gemma4.py:238-247,271-309,418-464`). Both are sequence-dependent and must be regenerated for the single running token after prefill. Today `per_layer_inputs` would be frozen at prompt shape/content.
+- **Gemma4 12B/bidirectional variants:** decoder may consume both `input_ids` and routed embedding outputs (`_gemma4.py:283-309`). Runtime explicit I/O rejects simultaneous `token_input` and `inputs_embeds_input` (`crates/onnx-genai-engine/src/decode.rs:278-313`), and the special fusion path opts out when `input_ids` exists.
+- **Phi4 multimodal:** embedding can emit `vision_gate` and `speech_gate` alongside `inputs_embeds`; the decoder consumes those gates (`_phi4mm_multimodal.py:175-232`). The current converter/runtime does not route and refresh all of them.
+
+The general missing primitive is: **execute declared upstream `every_step` components in topological order on prefill and decode, then route all of their outputs into the decoder**. The existing `phases` schema can express this intent, but the autoregressive executor currently collects only `prompt_only` components (`pipeline.rs:3903-3919`), so a component marked `every_step` is skipped unless covered by the one-output embedding special case.
+
+### Decoder positions are fixed to ordinary 1-D positions
+
+`run_decode_step_with_extra` always constructs `position_ids` as `[1, sequence_length]` (`crates/onnx-genai-engine/src/decode.rs:1543-1573`). Mobius explicitly exports Qwen VL decoders with `[3,batch,sequence]` MRoPE positions (`/home/justinchu/mobius/src/mobius/tasks/_base.py:200-220,253-257`). The real local Qwen3.5 decoder confirms `position_ids [3,B,S]`.
+
+### Decoder state is KV-specific
+
+`ResolvedIo` only represents positional K/V input-output pairs (`decode.rs:249-361`), and the decode input builder supports token IDs, mask, positions, KV, or fixed pipeline extras (`decode.rs:1553-1595`). The real Qwen3.5 decoder has only eight ordinary attention K/V layers (3, 7, ..., 31) plus 24 layers each of fixed-shape `conv_state` and `recurrent_state`; those states must be zero-initialized and replaced by their matching outputs every step. They are neither K/V nor fixed conditioning.
+
+### Pipeline package discovery requires native metadata
+
+`PipelineModelDirectory::load` requires `inference_metadata.{yaml,yml,json}` and loads the pipeline spec from it (`crates/onnx-genai-ort/src/loader.rs:82-135`). The server chooses pipeline mode only when native metadata already contains `pipeline` (`crates/onnx-genai-server/src/state.rs:349-367`). Single-model loading has `genai_config.json` compatibility conversion, but pipeline loading does not.
+
+The current `genai_config` multimodal converter is not sufficient by itself: it creates vision, embedding, and decoder models/dataflow, but marks embedding `every_step` (`crates/onnx-genai-genai-config/src/lib.rs:606-694`) while `composite_encode_decode` includes only the first encoder and decoder stages (`lib.rs:904-920`). It also emits only `image_placeholder_token_id`, not a full preprocessing/expansion contract.
+
+## A3. Mobius export state
+
+### Architectures Mobius can build as ONNX components
+
+Current Mobius registrations include Gemma4 and Gemma4 unified, LLaVA variants, BLIP-2, Idefics, InternVL, PaliGemma, Pixtral/Mistral3, SmolVLM, Mllama, Phi4 multimodal, Qwen2/2.5/3-VL, hybrid Qwen3.5-VL, Hunyuan VL, and others (`/home/justinchu/mobius/src/mobius/_registry.py:556-609`). Important concrete builders are:
+
+- generic three-model vision/embedding/decoder and Qwen packed-patch/MRoPE variants (`src/mobius/tasks/_vision_language_3model.py:34-186`);
+- Gemma4 E2B and unified 12B vision, embedding, and decoder interfaces (`src/mobius/tasks/_gemma4.py:227-362,418-527`);
+- Phi4 multimodal four-model interfaces (`src/mobius/tasks/_phi4mm_multimodal.py:80-232`).
+
+Registry presence means the graph builder exists, not that every architecture has a passing real-model ORT golden test.
+
+### Native onnx-genai metadata emission is currently decoder-only
+
+The checked-out Mobius `src/mobius/integrations/onnx_genai/inference_metadata.py` derives only attention dimensions, context length, and KV dtype (`lines 58-89`) and writes that dictionary as `inference_metadata.yaml` (`lines 129-150`). It does not inspect `ModelPackage.models`, emit `pipeline`, emit component I/O/dataflow/phases, copy tokenizer/processor assets, or emit image preprocessing/token expansion.
+
+Mobius's ORT-GenAI exporter is materially ahead: it detects VLM packages, introspects vision/embedding graph ports, selects processor config assets, and emits multimodal mappings (`src/mobius/integrations/ort_genai/auto_export.py:757-804`). That implementation is the best producer-side reference, but its output contract is ORT-GenAI-specific.
+
+`docs/PROGRESS.md:814-818` claims Mobius commit `f313bd1` added native composite emission. That object is absent from every current Mobius ref (`git branch -a --contains f313bd1` reports a malformed/unknown object), and the current source contradicts the note. Treat the progress entry as historical/unverified, not current capability.
+
+# B. Concrete export-to-runtime gap list
+
+1. **No portable typed VLM package contract.** `InferenceMetadata` has no typed top-level preprocessing section (`crates/onnx-genai-metadata/src/schema.rs:8-86`). `PipelineVisionConfig` has only placeholder ID and tokens-per-tile (`schema.rs:698-743`). The preprocessor privately parses an untyped `preprocessing.image` document (`image.rs:348-355,540-556`).
+2. **Mobius does not emit native composite metadata.** It exports the ONNX components but not the sidecar that names ports, phases, preprocessing, expansion, positions, and state.
+3. **Runtime image preprocessing returns one rank-4 float tensor.** Real Gemma4, Qwen VL, and Phi4 require packed/rank-3 or auxiliary tensors and model-declared dtype.
+4. **Server discovers inputs by the literal name `pixel_values`.** It cannot consume metadata-declared endpoint bundles and rejects non-float32 input.
+5. **Per-image prompt structure is dropped.** The live request carries aggregate tile count only; multi-image ordering and separator semantics cannot be correct.
+6. **Actual expanded length is not available at admission/context checking.** Preprocessing and expansion must precede final context/KV sizing.
+7. **Autoregressive `every_step` components are not generally executed.** The special case refreshes only one `inputs_embeds` output and cannot handle Gemma4 `per_layer_inputs` or Phi gates.
+8. **Decoder I/O forbids valid dual sequence inputs.** A graph cannot declare both raw `input_ids` and routed `inputs_embeds` even if both are real graph inputs.
+9. **Position construction is fixed to rank-2 linear IDs.** Qwen VL MRoPE cannot run.
+10. **Loop-carried state is KV-only.** Qwen3.5 DeltaNet convolution/recurrent states cannot run; sparse attention-layer K/V lists must be emitted from actual graph ports rather than expanded from total layer count.
+11. **Pipeline loader has no compatibility fallback.** The complete local Foundry Qwen package has `genai_config.json` but no native sidecar.
+12. **No real VLM E2E baseline exists.** The committed test proves orchestration only; there is no image-quality or real-checkpoint token parity test.
+
+# C. Dependency-ordered, file-disjoint work plan
+
+The packages below intentionally do not share files, so separate agents can own them without merge contention. Dependencies are logical/API dependencies.
+
+## WP0 — Typed multimodal metadata contract (P0; blocks WP1/WP2/WP3/WP4)
+
+**Owner shape:** metadata/schema agent.
+
+**Files:**
+
+- `crates/onnx-genai-metadata/src/schema.rs`
+- `crates/onnx-genai-metadata/tests/metadata_fixtures.rs`
+- new `crates/onnx-genai-metadata/tests/fixtures/vlm_packed_valid.yaml`
+- new `crates/onnx-genai-metadata/tests/fixtures/vlm_multistate_valid.yaml`
+- `schema/inference_metadata.schema.json`
+
+**Concrete contract:**
+
+- Add typed `preprocessing.image` transforms and named tensor outputs. Required generic operations: decode/convert RGB, resize, rescale/normalize, tile, flatten/patchify, pad, emit original size, emit validity mask, emit patch/grid coordinates. Outputs bind to arbitrary pipeline endpoints; names such as `pixel_position_ids` are data, not runtime branches.
+- Replace minimal `PipelineVisionConfig` with the already-proven rich expansion fields: placeholder token, emitted image token, per-tile/per-patch count source, per-image correspondence, optional separators, and thumbnail order.
+- Add declared position-input generation/continuation semantics sufficient for rank-2 linear and rank-N multimodal coordinates. It must be parameterized by axes/sections and processor summaries, never by model family.
+- Add generic loop-carried state pairs `{input, output, init, update}` for fixed recurrent tensors. Keep append/growing KV semantics separate.
+- Permit graph I/O to declare raw token input and routed sequence inputs simultaneously.
+- Add capability strings so unsupported processors/position/state programs fail at load with a precise missing-capability error.
+
+**Acceptance:** both fixtures validate against generated JSON schema; one describes two packed image outputs and rich expansion, the other describes 3-axis positions plus sparse KV and fixed replacement-state pairs. No schema field or enum contains `gemma`, `qwen`, `phi`, a fixed layer count, hidden size, patch size, or magic tensor dimension.
+
+## WP1 — Mobius native VLM package emission (P1; depends WP0; parallel with WP2/WP3/WP4)
+
+**Owner shape:** Mobius exporter agent.
+
+**Files in `/home/justinchu/mobius`:**
+
+- `src/mobius/integrations/onnx_genai/inference_metadata.py`
+- `src/mobius/integrations/onnx_genai/inference_metadata_test.py`
+- `src/mobius/__main__.py`
+- `tests/cli_test.py`
+
+**Implementation:** inspect `ModelPackage.models` graph I/O and component roles; emit all models, topological dataflow, prompt/every-step phases, all embedding-to-decoder outputs, explicit component `io`, sparse actual KV pairs, fixed state pairs, typed processor program, expansion, and position contract. Reuse/refactor the concepts in ORT-GenAI emission, but dispatch processor operations through a registry/config description rather than `model_type` branches. Copy tokenizer, chat template, and processor config needed by the runtime.
+
+**Acceptance:** no-weight or tiny builds for (1) cached Gemma4 E2B, (2) a Qwen VL config, and (3) Phi4MM produce native sidecars that pass onnx-genai schema validation and exactly match every ONNX input/output name. Gemma4 metadata routes both `inputs_embeds` and `per_layer_inputs`; Phi routes both gates; Qwen declares rank-3 positions and actual sparse/fixed state pairs when present. `mobius build ... --runtime onnx-genai` leaves a self-contained directory loadable as a pipeline without hand editing.
+
+## WP2 — Generic multi-output image processor (P1; depends WP0; parallel with WP1/WP3/WP4)
+
+**Owner shape:** preprocessing agent.
+
+**Files:**
+
+- `crates/onnx-genai-preprocess/src/image.rs`
+- new `crates/onnx-genai-preprocess/src/image/packed.rs`
+- `crates/onnx-genai-preprocess/src/lib.rs`
+
+**Implementation:** change image processing from one `ImageTensor<Vec<f32>>` to a typed named tensor bundle plus per-image expansion summary. Execute the WP0 operation descriptors. Preserve the current rank-4 path, and add packed patches, padding/sentinel coordinates, grid THW, original-size tensors, and validity masks. Output dtype conversion must be declared (`fp32`, `fp16`, `bf16`, integer/bool auxiliary tensors), not inferred from model identity.
+
+**Acceptance:** deterministic unit vectors cover:
+
+- rank-4 NCHW existing behavior unchanged;
+- Gemma4-shaped `[B,N,3*P^2]` pixels plus `[B,N,2]` coordinates with `(-1,-1)` padding;
+- Qwen-shaped `[total_patches,pixel_dim]` plus `[num_images,3]` grid;
+- Phi-shaped pixels plus original sizes and patch-validity mask;
+- two images preserve per-image order and expansion summaries.
+
+Reference outputs must match a checked-in small numerical fixture generated once from the corresponding HF processors; runtime tests must not download models.
+
+## WP3 — Generic autoregressive step-component execution (P1; depends WP0; parallel with WP1/WP2/WP4)
+
+**Owner shape:** pipeline engine agent.
+
+**Files:**
+
+- `crates/onnx-genai-engine/src/pipeline.rs`
+- `crates/onnx-genai-engine/tests/gemma4_vlm_pipeline_e2e.rs`
+- new `crates/onnx-genai-engine/tests/vlm_multibinding_pipeline_e2e.rs`
+- `scripts/build_tiny_gemma4_vlm.py`
+- new `scripts/build_tiny_vlm_multibinding.py`
+- `tests/fixtures/tiny-gemma4-vlm/inference_metadata.yaml`
+- new `tests/fixtures/tiny-vlm-multibinding/`
+
+**Implementation:** replace the architecture-flavored `EmbedsStepBinding` with a generic topological executor for declared `every_step` components. On prefill, run them over the full expanded prompt; on decode, seed their declared token inputs with the running token and run them over one position. Route every produced output to decoder inputs for that same step. Fixed conditioning remains prompt-cached. Use explicit component `io`, not suffix checks. Preserve prompt-only and final-only semantics.
+
+**Acceptance:** existing exact-token tiny Gemma4 test remains green after migrating metadata to generic phase semantics. New fixture's embedding emits both `inputs_embeds` and a second sequence-dependent tensor; generation fails if either is stale and passes with exact IDs when both are refreshed. A second assertion covers a decoder that also consumes raw `input_ids`, proving no token/embed exclusivity in pipeline execution.
+
+## WP4 — Generic position programs and loop-carried decoder state (P2; depends WP0; parallel with WP1/WP2/WP3)
+
+**Owner shape:** decode-state agent.
+
+**Files:**
+
+- `crates/onnx-genai-engine/src/decode.rs`
+- new `crates/onnx-genai-engine/tests/decode_position_and_state_e2e.rs`
+- new `scripts/build_tiny_multiaxis_state_decoder.py`
+- new `tests/fixtures/tiny-multiaxis-state-decoder/`
+
+**Implementation:** resolve position tensors from WP0 metadata rather than always generating `[1,S]`; support declared rank/axes and prefill-to-decode continuation. Generalize decoder state to initialize and carry arbitrary declared input/output pairs with `replace` semantics, while retaining KV append/share-buffer behavior separately. Remove the explicit-I/O rejection of simultaneous token and routed sequence inputs. Validate every declared graph port and shape-compatible initialization at load.
+
+**Acceptance:** synthetic decoder asserts exact 3-axis prefill and next-token positions, zero initialization of two fixed state tensors, state replacement over at least two steps, and sparse KV indices. All existing text, sliding-window, and shared-buffer decode tests remain green.
+
+## WP5 — Server/driver multimodal tensor bundle and admission ordering (P2; depends WP2 + WP3; WP4 for Qwen)
+
+**Owner shape:** serving agent.
+
+**Files:**
+
+- `crates/onnx-genai-server/src/image_input.rs`
+- `crates/onnx-genai-server/src/driver.rs`
+- `crates/onnx-genai-server/src/state.rs`
+- `crates/onnx-genai-server/src/routes.rs`
+- new `crates/onnx-genai-server/tests/vlm_image_bundle.rs`
+
+**Implementation:** discover processor bindings from typed metadata, not literal session input names. Carry a vector/map of typed tensors and full per-image expansion summary through `PipelineInputTensor`. Inject all endpoints into `PipelineGenerateRequest`. Tokenize, preprocess, expand, then enforce context/admission limits using final prefill length. Support multiple image content parts in prompt order. Fail with endpoint, expected dtype/shape, and missing metadata operation when a contract is incomplete.
+
+**Acceptance:** an OpenAI chat request with a data-URI image against a packed two-input tiny fixture reaches both vision inputs, expands exactly one matching placeholder, and generates deterministic output. A two-image test proves placeholder/image ordering. Negative tests cover missing placeholder, wrong image count, and expanded-context overflow.
+
+## WP6 — Pipeline compatibility loading for existing ORT-GenAI packages (P3; depends WP0 + WP3 + WP4)
+
+**Owner shape:** compatibility/loader agent.
+
+**Files:**
+
+- `crates/onnx-genai-genai-config/src/lib.rs`
+- `crates/onnx-genai-genai-config/tests/` (new VLM fixtures/tests)
+- `crates/onnx-genai-ort/src/loader.rs`
+- new `crates/onnx-genai-ort/tests/pipeline_genai_fallback.rs`
+
+**Implementation:** when native metadata is absent, convert `genai_config.json`, `config.json`, and processor config into an in-memory typed pipeline only when those files explicitly provide every required semantic. Include embedding as an `every_step` stage, all declared dataflow, rank/dtype preprocessing, positions, actual KV pairs, and fixed state pairs. Do not guess from `model.type`; if an old package lacks explicit state/position facts, fail and tell the user to regenerate native metadata.
+
+**Acceptance:** the local Foundry Qwen3.5 directory is recognized as a pipeline without a hand-written sidecar; loader reports its two vision inputs, rank-3 positions, eight K/V layer pairs, and 48 fixed state pairs. A deliberately incomplete compatibility fixture fails with a what/why/how-to-fix error rather than architecture inference.
+
+## WP7 — Real-model validation ladder (P3; depends WP1-WP5; Qwen3.5 also depends WP6)
+
+**Owner shape:** validation agent.
+
+**Files:**
+
+- new `scripts/validate_vlm_pipeline.py`
+- new `crates/onnx-genai-engine/tests/real_vlm_env.rs`
+- new `docs/benchmarks/<date>-real-vlm.md`
+
+**Milestone order and acceptance:**
+
+1. **Gemma4 E2B, first real milestone.** Export cached source through Mobius with native metadata. Compare vision outputs, embedding outputs (including `per_layer_inputs`), prefill logits, and one decode step against HF/Mobius ORT reference with fixed image/prompt. Then server-smoke `Describe this image.` with the correct image token sequence. Environment-gated due model size.
+2. **Qwen2.5/3-VL, second architecture milestone.** Validate packed patches + `image_grid_thw` + rank-3 MRoPE on a small checkpoint; exact prefill logits and one generated token.
+3. **Foundry Qwen3.5, stress milestone.** Validate the complete local package through compatibility loading, including recurrent-state carry, then one-token image generation. This is not a CI test.
+4. **Phi4MM, follow-on.** Validate multi-output image preprocessing and embedding gates; audio/mixed modality stays a separate scope.
+
+# D. Available real models and fixtures
+
+## Immediately usable
+
+- **Committed deterministic contract fixture:** `/home/justinchu/onnx-genai/tests/fixtures/tiny-gemma4-vlm/`. Small, exact, CI-safe.
+- **Gemma4 E2B source checkpoint and processor:** `/home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it/`. A snapshot contains the ~10.2 GB weights, tokenizer, chat template, and `processor_config.json`. Config declares image token `258880`, `hidden_size_per_layer_input=256`, 35 text layers, patch size 16, and processor `max_soft_tokens/image_seq_length=280`.
+- **Complete real Qwen3.5 VLM ONNX package:** `/home/justinchu/.foundry/cache/models/Microsoft/qwen3.5-9b-generic-cpu-2/v2/`. Contains `vision.onnx`, `embedding.onnx`, `text.onnx`, external data, tokenizer, `processor_config.json`, `config.json`, and `genai_config.json`. Its interfaces are:
+  - vision: `pixel_values [num_patches,1536]`, `image_grid_thw [1,3]` -> `image_features [num_logical_patches,4096]`;
+  - embedding: `input_ids`, `image_features` -> `inputs_embeds`;
+  - decoder: `inputs_embeds`, mask, `position_ids [3,B,S]`, eight sparse K/V pairs, and 48 fixed DeltaNet state pairs.
+- **Image fixture:** `/home/justinchu/Olive-recipes/Qwen-Qwen2.5-VL-3B-Instruct/cat.jpeg` (also present in Qwen3 recipe directories).
+
+## Useful but not a VLM package
+
+- `/home/justinchu/gemma4-e2b-onnx`, `gemma4-e2b-onnx-target`, and `gemma4-e2b-assistant-onnx` are real text/speculative decoder artifacts, not a vision+embedding package. The benchmark `docs/benchmarks/2026-07-15-real-native-gemma4e2b.md:1-39` proves real native text decode only.
+- `/home/justinchu/ana-bench/qwen-oga-cuda-graph-a4` contains one text Qwen `model.onnx`/`genai_config.json`, not a VLM.
+- The cached `Qwen/Qwen3-VL-2B-Instruct` directory currently contains config only, not model weights; it is not an offline-ready export source.
+
+## Not found locally
+
+No complete Phi-vision/Phi4MM ONNX package was found under the inspected home/model fixture paths. No real multimodal Gemma4 ONNX trio (`vision_encoder` + `embedding` + decoder) was found; it must be exported from the cached source checkpoint.
+
+# E. RULES.md section 2 / 2.1 risks and guardrails
+
+`RULES.md:20-29` requires all architectural assumptions to be explicit metadata, with no model/vendor/EP dispatch. `RULES.md:30-37` requires structural, EP-internal graph fusion.
+
+Review-blocking risks:
+
+1. **Do not add `Gemma4`, `Qwen`, `Phi`, or model-name modes** to metadata, preprocessing, server discovery, pipeline execution, or decode.
+2. **Do not bake fixed shapes or counts** such as 280 patches, three MRoPE axes, 35 layers, 1536 patch width, 4096 hidden size, every-fourth attention, or Phi's 448 image size into runtime code. These are fixture/model metadata values.
+3. **Do not discover semantic ports from names** such as `pixel_values`, `image_grid_thw`, `per_layer_inputs`, `vision_gate`, `conv_state`, or suffixes. Emit exact graph ports and their roles in metadata; missing roles fail clearly.
+4. **Do not implement vision projector/fusion math in Rust.** Vision tower, projector, feature scatter, per-layer embeddings, and modality gates remain ONNX components connected by dataflow. Rust only executes declared transforms and component topology.
+5. **Do not make MRoPE a Qwen branch.** Position generation must be a parameterized position program/declared component with rank, axes, sections, and continuation semantics as data.
+6. **Do not treat every non-logits output as KV.** State behavior must be declared (`append/share` KV versus fixed `replace` recurrence), and sparse layers must come from actual emitted port lists.
+7. **Do not add model-specific fusion in generic graph code.** Any optimization of patchification/projector or embedding fusion must be a structural pattern inside an EP. The first implementation should preserve separate ONNX components.
+8. **Do not silently guess compatibility metadata.** For existing `genai_config.json` packages, reject missing processor/position/state semantics with an actionable regeneration instruction.
+
+Top 3 next VLM work packages in priority order:
+1. WP0 — Define the typed, architecture-neutral multimodal preprocessing, expansion, position, and loop-state contract.
+2. WP3 — Replace the one-output embedding special case with generic autoregressive every-step component execution.
+3. WP2 — Produce typed multi-tensor image bundles for packed patches, coordinates/grids, sizes, and masks.
+
+<!-- source: .squad/decisions/inbox/mariette-qwen3-export.md -->
+### 2026-07-22: Export Qwen3-0.6B as an int4 CUDA onnx-genai package
+**By:** Mariette
+**What:** Exported Qwen/Qwen3-0.6B with Mobius for CUDA/onnx-genai, then applied ORT weight-only int4 RTN quantization because this Mobius branch's `build` CLI has no quantization flags.
+**Why:** Provide a Qwen3 package with QK-norm and block-32 MatMulNBits projections for a future H200 roofline benchmark against the existing Qwen2.5 packages.
+
+**Commands:**
+```bash
+cd /home/justinchu/mobius
+.venv/bin/python -m mobius build \
+  --model Qwen/Qwen3-0.6B \
+  .scratch/qwen3-0.6b-int4-cuda \
+  --runtime onnx-genai \
+  --execution-provider cuda \
+  --dtype f16 \
+  --optimize
+
+.venv/bin/python -m onnxruntime.quantization.matmul_nbits_quantizer \
+  --input_model .scratch/qwen3-0.6b-int4-cuda/model.onnx \
+  --output_model .scratch/qwen3-0.6b-int4-cuda/model.int4.onnx \
+  --block_size 32 \
+  --bits 4 \
+  --quant_method default \
+  --symmetric True \
+  --accuracy_level 4 \
+  --quant_format QOperator
+```
+
+**Artifacts:**
+- Package: `/home/justinchu/mobius/.scratch/qwen3-0.6b-int4-cuda`
+- Full log: `/home/justinchu/mobius/.scratch/qwen3-0.6b-int4-cuda-export.log`
+- Final graph/data: `model.onnx` (391,327 bytes) + `model.onnx.data` (569,493,504 bytes)
+- Runtime metadata: `inference_metadata.yaml`
+- Tokenizer: `tokenizer.json`
+
+**Metadata and structure:**
+- Architecture: `qwen3`
+- Layers: 28 (graph-derived from 28 GroupQueryAttention nodes)
+- Attention heads / KV heads / head dim: 16 / 8 / 128
+- Maximum sequence length: 40,960
+- Quantization: 196 symmetric `com.microsoft::MatMulNBits` nodes, all `bits=4`, `block_size=32`, `accuracy_level=4`, and no explicit zero-point input; this is exactly 7 decoder projections × 28 layers.
+- RoPE: fused in GroupQueryAttention with `do_rotary=1`, `rotary_interleaved=0`; HF config has `rope_theta=1,000,000` and `rope_scaling=null`.
+- Qwen3 QK-norm is explicit: 56 `RMSNormalization` nodes, one Q norm and one K norm in each of 28 layers.
+- One float `MatMul` remains for the tied embedding/LM-head projection because the ORT quantizer reported that the transposed tied weight was not a direct constant.
+- `onnx.checker.check_model` passed; no GPU generation smoke was run.
+
+**Coverage/tooling gaps:**
+- Mobius `build` on `dave-wp1-vlm-emission` accepts CUDA/runtime/dtype/optimization flags but exposes no int4/group-size flag. Producing the requested package therefore required a second ORT quantization command after Mobius export.
+- `inference_metadata.yaml` declares architecture, attention/KV dimensions, and max sequence length, but not layer count, quantization format, or RoPE theta. Those values above are graph/config-derived.
+
+**Next step:** Run the H200 structural-load and short generation smoke first, then roofline-benchmark decode. Confirm that native CUDA assigns all 196 block-32 MatMulNBits nodes and the QK-norm/GQA path without fallback.
+
+<!-- source: .squad/decisions/inbox/rachael-qwen-ladder-review.md -->
+### 2026-07-22: Review — Qwen 1.5B/7B H200 bench ladder
+**By:** Rachael
+**What:** APPROVE+merged as `c9190c6c3f9f559913814db9ed3d49eafd890692`.
+**Roofline check:** At 3.35e12 B/s, 886 tok/s implies 3,781,038,375 B/token. That is not the stated weight-plus-KV model: Qwen2.5-0.5B has 282,190,592 streamed weight bytes and 12,288 KV bytes/cached token, yielding 283,081,472 B/token and 11,834 tok/s at the 128-token window (288,586,496 B/token and 11,608 tok/s at 1024). Thus the prior 810.06/778.59 results are 6.85%/6.71% of this explicit HBM bound; their 91.4%/87.9% figures use the separate practical 886 tok/s gap-free ceiling. Applying the same explicit formula gives 1.5B: 879,014,912 B/token → 3,811 tok/s and 487.66/3,811 = 12.8%; 891,859,968 B/token → 3,756 tok/s and 457.88/3,756 = 12.2%. For 7B: 3,990,248,448 B/token → 840 tok/s and 230.47/840 = 27.5%; 4,015,938,560 B/token → 834 tok/s and 223.38/834 = 26.8%. Joi's percentages are internally consistent.
+**Why:** The apparent impossibility comes from treating the practical 886 tok/s ceiling as the physical weight-plus-KV HBM roofline. The document explicitly distinguishes those denominators, its throughput/latency reciprocals and roofline arithmetic check out, and commit scope is only the added benchmark document with no Rust `src/` changes or model-name logic.
+
+<!-- source: .squad/decisions/inbox/rachael-qwen3-bench-review.md -->
+### 2026-07-23: Qwen3-0.6B bench doc review
+**By:** Rachael
+**What:** 🟢 Approved and fast-forward merged as `e04fc2df95ad0740bdc71917a55af7d6b8b52356`.
+**Why:** The branch adds only `docs/benchmarks/qwen3-0.6b-h200-2026-07-22.md`; no Rust or runtime logic changed. The 12,585/10,549 tok/s rooflines, achieved percentages, benchmark values, and comparison percentages are internally consistent. The metadata gap is described generically as the unrecognized `grouped_query` alias, absent fp16 KV dtype, and missing compatibility config. No secrets or credentials were found; the absolute paths are benchmark provenance and include only the permitted scratch export and local setup paths.
+
+<!-- source: .squad/decisions/inbox/sebastian-native-interface.md -->
+### 2026-07-22: GAP 1 done — backend-neutral pipeline component-session interface
+**By:** Sebastian
+**Branch:** `squad/sebastian-native-interface`  **Base:** `origin/main` @ `1ae99b4`  **Commit:** `b6dcb32`
+
+**What:** Implemented GAP 1 of Joi's Gemma4 native-backend analysis: a
+backend-neutral abstraction for pipeline component sessions. `PipelineEngine`
+now constructs every declared component through EITHER ORT `Session` OR the
+native `InferenceSession`, driven by `EngineDecodeBackend`, with no ORT-only
+type on the engine's construction path. The old hard `Native` rejection at
+construction is gone; the native path now fails later at a precise,
+actionable next blocker (gaps 2/3) instead of a blanket refusal.
+
+#### Trait design + crate placement
+- New module `onnx-genai-metadata/src/component.rs` defines:
+  - `ComponentSession` — object-safe trait exposing exactly what neutral
+    construction/wiring needs: `inputs()`/`outputs()` (graph I/O metadata:
+    name, dtype, shape → rank), default `input_names()`/`output_names()`, and
+    `run(&mut self, &[(&str, &ComponentTensor)]) -> Result<Vec<(String, ComponentTensor)>, ComponentError>`
+    (named-tensor execution, outputs in `output_names()` order).
+  - `ComponentDataType` — 14-variant neutral dtype vocabulary
+    (`size_of`/`as_str`/`Display`).
+  - `ComponentIo { name, dtype, shape: Vec<i64> }` with `rank()`; negative
+    axes = dynamic (ORT convention).
+  - `ComponentTensor` — owned host tensor carrying **raw little-endian element
+    bytes** in row-major order; `from_raw` enforces static shape and
+    `len == numel * dtype.size_of()`. Bytes-as-payload means any dtype
+    round-trips without a per-dtype host container and without either
+    backend's tensor type entering the interface.
+  - `ComponentError` — thiserror enum: `ByteLengthMismatch`, `DynamicShape`,
+    `UnsupportedDataType`, `Backend { component, backend, detail }` (all
+    RULES §1 actionable).
+- **Placement rationale:** the trait lives in `onnx-genai-metadata`, the
+  lowest crate **both** backend crates already depend on. `onnx-genai-engine`
+  depends on `onnx-genai-ort` (not vice-versa), so putting the trait in the
+  ort crate would bar the native backend from implementing it; putting it in
+  the engine would force ort to depend "up". Metadata is the only cycle-free
+  home both sides can implement against. `&mut self` on `run` accommodates
+  native `InferenceSession::run(&mut self)`; ORT's `Session::run(&self)` is a
+  no-op under `&mut`.
+
+#### ORT implementation (behavior-preserving)
+- New `onnx-genai-ort/src/component.rs`: `OrtComponentSession` wraps an
+  existing `Session`. `run` builds ORT `Value`s from the neutral byte tensors,
+  forwards to `Session::run` unchanged, and reads outputs back to bytes — a
+  pure adapter, so a pipeline routed through the seam produces **byte-identical**
+  results to one calling `Session::run` directly (proven by a round-trip test).
+- `From<DataType> for ComponentDataType` and reverse (total maps over ORT's
+  14 dtypes).
+- `onnx-genai-ort/src/value.rs`: added a `TensorBacking::Bytes(Vec<u8>)`
+  variant plus `Value::from_raw_bytes(bytes, shape, dtype)` /
+  `Value::to_raw_bytes()` so host tensors of any dtype cross the seam as
+  opaque LE bytes. No decode/session logic changed.
+
+#### Native implementation (feature-gated)
+- New `onnx-genai-engine/src/native_component.rs` (`#[cfg(feature = "native-backend")]`):
+  `NativeComponentSession` wraps `InferenceSession`; maps `onnx_runtime_ir`
+  dtypes ↔ neutral dtypes (unmapped ir types → `UnsupportedDataType`),
+  `Dim::Symbolic → -1`. `load(path, NativeDecodeDevice)` builds a session on
+  the requested device.
+
+#### Construction is now backend-neutral
+- `pipeline.rs::from_dir_with_schedulers` selects **one** backend for the
+  whole pipeline (never a mix):
+  - Explicit `Ort`/`Native` resolve **without** touching the model directory
+    (bad requests still fail fast — preserves the old non-existent-path test).
+  - `Auto` inspects declared operators via `model_requires_native_backend`
+    and routes to Native only when some component requires it (previously it
+    hard-rejected such pipelines).
+- When the backend is Native:
+  - built **without** `native-backend` → actionable "compiled without the
+    'native-backend' feature" error.
+  - built **with** `native-backend` → loads **all** components through
+    `NativeComponentSession` via the trait, confirming construction is
+    genuinely backend-neutral, then returns the gap-2/3 error (below).
+- The **ORT path is unchanged**: same `PipelineModels::load_with_options`
+  construction and the merged `every_step` executor (`pipeline.rs`
+  ~L1952-2027) are untouched.
+
+#### Where the native path now errors (the precise next blocker)
+With `native-backend` on, all components load and expose graph I/O through the
+seam, then construction returns:
+> "native pipeline decode is not yet implemented. All N component(s) loaded on
+> the native backend and expose their graph I/O through the backend-neutral
+> component-session interface … The remaining work is wiring these native
+> sessions into the pipeline decode loop, which still routes per-step decode
+> state through ORT tensors/sessions."
+
+That maps exactly to Joi's gaps 2 → 3, in order:
+- **GAP 2 (next):** generalize native target decode beyond token-ID-only
+  sessions. `NativeDecodeSession` has a fixed field set and rejects
+  `sequence_source: inputs_embeds` (`native_decode.rs:190-205,716-729`);
+  Gemma4-class models declare `inputs_embeds` + routed `per_layer_inputs`.
+  Needs metadata-declared arbitrary named step inputs (no architecture-specific
+  ports).
+- **GAP 3 (after):** convert pipeline decode state/execution off ORT `Value`/
+  `Session` — `DecodeState` around `&Session`/`Value` (`decode.rs:693-735`),
+  `PipelineDecodeLoopBackend` (`pipeline.rs:~2181-2244`). Introduce
+  neutral tensor/state ops or a parallel native decode-loop backend.
+
+The merged `every_step` executor is **not** a blocker (it already binds token
+inputs from metadata, resolves routed inputs, and republishes outputs each
+step) — confirmed preserved this cycle.
+
+#### Test coverage (CPU/ORT only, no GPU)
+- metadata: 5 unit tests — tensor byte-length/dynamic-shape invariants, rank,
+  dtype sizes.
+- ort: 2 unit tests on the tiny-whisper textproto fixture — graph I/O
+  exposure, and a run round-trip asserting the seam's output bytes equal
+  direct `Session::run` (behavior-preservation proof).
+- engine (native): 2 unit tests on a tiny `Add` graph — I/O metadata + named
+  run round-trip; plus the rewired-selection test
+  `auto_backend_routes_native_only_pipeline_to_the_native_backend`.
+- engine (default): rewrote `explicit_native_backend_without_feature_reports_actionable_build_error`
+  to assert the new actionable message and the **absence** of the removed
+  blanket refusal.
+
+#### Validation
+- `cargo build -p onnx-genai-metadata -p onnx-genai-ort -p onnx-genai-engine` → OK.
+- `cargo clippy -p onnx-genai-metadata -p onnx-genai-ort -p onnx-genai-engine --all-targets -- -D warnings` (default features) → **clean**.
+- `cargo test` for all three crates (default features) → **pass**.
+- `cargo test -p onnx-genai-engine --features native-backend`: my new tests
+  pass. 16 pre-existing failures remain (single-model `engine::`/`embedding::`
+  fixtures that decode textproto as binary protobuf and/or need CUDA) — present
+  on `origin/main` too (base showed 17; delta is the extra tests I added). Not
+  introduced by this change.
+- **Known pre-existing warning:** `cargo clippy -p onnx-genai-engine --features native-backend`
+  fails **only** on a pre-existing unused-import (`BTreeMap`,
+  `native_decode.rs:17`, used solely under `#[cfg(test)]`). It exists on
+  `origin/main`; `native_decode.rs` is out of GAP-1 scope (and belongs to
+  gaps 2/3) so I left it untouched. Default-feature clippy is clean.
+
+**Why:** GAP 1 was the top blocker — native pipeline construction failed before
+model loading. Construction + the component-session seam are now backend-neutral
+with the ORT path byte-preserved, turning "native not supported for pipelines"
+into a scoped, ordered pair of next blockers (gaps 2/3). No hardcoded model
+architecture (RULES §2/§2.1): all dtype/shape handling is generic;
+`grep -niE "gemma|qwen|phi|llama|mistral"` over touched logic is empty.
+
+<!-- source: .squad/decisions/inbox/tessa-progress-qwen-ladder.md -->
+# Tessa progress note — Qwen2.5 H200 decode ladder
+
+Commit: `2053a11ae882fed79f75e2dee890dc989bb5e461`
+
+Summary: Added the 2026-07-22 PROGRESS changelog entry for the merged Qwen2.5-1.5B/7B H200 decode roofline ladder report.
+
+<!-- source: .squad/decisions/inbox/zhora-deepseek-mla-conformance.md -->
+### 2026-07-22: Re-verify native DeepSeek V2 and add CPU MLA decode conformance
+**By:** Zhora
+**What:** Native DeepSeek-V2 tiny E2E on CPU generated eight tokens `[42, 237, 198, 2, 186, 81, 210, 149]`, exactly matching the established sequence. No new op or dtype gap appeared after the generic Unsqueeze shape-chain fix. Added a deterministic fp32 CPU standard-Attention test for 3-D BSH decode with `qk_head_dim=2`, `v_head_dim=1`, four query heads, two KV heads, and a non-empty two-token past cache. The test checks hand-computed GQA outputs and verifies Y/present-value use V width while present-key uses Q/K width. fp16 was not added because the CPU Attention kernel currently supports f32 only.
+**Why:** This keeps the native DeepSeek smoke green on current `origin/main` and adds a compact hand-computed guard for the asymmetric MLA cached-decode contract without changing kernel logic. The next native decode-parity step requires deterministic Mobius DeepSeek fixtures after DS-0/DS-2; CUDA MLA conformance requires an available GPU and was intentionally not run in this CPU-only round.
+
+<!-- source: .squad/decisions/inbox/zhora-deepseek-native-unsqueeze.md -->
+### 2026-07-22: Lock DeepSeek Unsqueeze dynamic-shape coverage
+**By:** Zhora
+**What:** The reported original failure was `no inferred shape for value v_model.Unsqueeze_9 produced by op Unsqueeze`. Current `origin/main` already contains the generic runtime implementation in `crates/onnx-runtime-session/src/executor.rs:1156-1292`: `dynamic_output_shapes` re-runs the opset-aware ONNX shape-inference registry with concrete runtime input shapes and bounded integer shape data, covering opset-13+ axes inputs, older `axes` attributes, and negative-axis normalization against output rank. This branch adds the focused unit regression `dynamic_output_shapes_unsqueeze_supports_input_and_attribute_axes` at `executor.rs:7123`, directly checking both axes forms and negative axes.
+**Why:** The exact requested native command now stops earlier with the actionable feature-gate error (`native decoder backend requires building onnx-genai-engine with the 'native-backend' feature`), so the historical Unsqueeze failure was not reproducible from current main. With `--features native-backend`, the pre-change baseline and post-change run both passed end-to-end and generated 8 tokens: `[42, 237, 198, 2, 186, 81, 210, 149]`; no downstream native gap was observed. The default ORT-backend run also passed with the same 8 tokens. Validation passed: `cargo fmt -p onnx-runtime-session`, `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings`, and `cargo test -p onnx-runtime-session` (62 unit tests plus integration/doc tests). Branch: `squad/zhora-deepseek-native-unsqueeze`; commit: `8d9d2fa279a0463b9fc6c02932ebd7b9ec775fb4`.
+
+<!-- source: .squad/decisions/inbox/zhora-deepseek-scope.md -->
+# DeepSeek work scope: unblocked path after V4 upstream block
+
+**By:** Zhora (Server Dev)  
+**Requested by:** Justin Chu  
+**Date:** 2026-07-21T15:12Z  
+**Scope:** Read-only investigation; no source files changed.
+
+## Executive answer
+
+DeepSeek support is real but split across three maturity levels:
+
+1. **DeepSeek-V2/V3 export exists.** Mobius registers `deepseek_v2`, `deepseek_v2_moe`, and `deepseek_v3` to `DeepSeekV3CausalLMModel` (`/home/justinchu/mobius/src/mobius/_registry.py:541-545`). `DeepSeekMLA::forward` lowers MLA to ordinary projections, partial RoPE, and standard ONNX `Attention` (`/home/justinchu/mobius/src/mobius/components/_deepseek_mla.py:107-218`). `DeepSeekMoEGate` implements V2 softmax/group-limited routing and V3 sigmoid/noaux routing (`/home/justinchu/mobius/src/mobius/models/deepseek.py:53-122`), and `_DeepSeekMoEFFN` adds routed plus shared experts (`deepseek.py:308-346`).
+2. **DeepSeek-V2 runs end-to-end today through the default ORT backend.** The checked-in gated test loads a Mobius package with `Engine::from_dir` and generates eight tokens (`crates/onnx-genai-engine/tests/deepseek_e2e.rs:1-47`). I ran it against `/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny`; it passed and generated `[42, 237, 198, 2, 186, 81, 210, 149]`. This is a random-weight structural smoke, not production-weight semantic proof.
+3. **Native Rust execution is not end-to-end yet.** With `ONNX_GENAI_BACKEND=native`, the same model fails before attention/MoE execution: `no inferred shape for value v_model.Unsqueeze_9 produced by op Unsqueeze`. The failing graph chain is `Shape/Sub -> Slice -> Unsqueeze` in the attention-mask construction. `dynamic_output_shapes` currently handles dynamic `Slice` but not the following `Unsqueeze` (`crates/onnx-runtime-session/src/executor.rs:988-1024,2728-2788`). This is the first concrete, unblocked runtime task.
+
+DeepSeek-V4 production onboarding remains blocked by the missing official Transformers-compatible reference/config and unresolved official iterative-MTP contract. A V4-Flash preview exporter and substantial CSA runtime kernels exist, but they do not form a verified model E2E path today.
+
+## 1. State today — export
+
+### 1.1 DeepSeek-V2/V3 MLA + MoE
+
+Mobius supports:
+
+- `deepseek_v2` and alias `deepseek_v2_moe` using `deepseek-ai/DeepSeek-V2-Lite` as the catalog model;
+- `deepseek_v3` using `deepseek-ai/DeepSeek-V3` (`/home/justinchu/mobius/src/mobius/_registry.py:908-912`);
+- variant labels `mla`, `mla+moe`, and `mla+moe` respectively (`_registry.py:1221-1226`).
+
+The model implementation is config-driven:
+
+- `DeepSeekV3TextModel` chooses MLA when `qk_nope_head_dim > 0`, otherwise standard attention, and selects dense vs. MoE layers from `first_k_dense_replace` (`/home/justinchu/mobius/src/mobius/models/deepseek.py:373-425`).
+- `DeepSeekMLA` builds low-rank Q and KV projection paths, applies RoPE only to the rotary subspace, supports `qk_head_dim != v_head_dim`, then emits standard `Attention` (`/home/justinchu/mobius/src/mobius/components/_deepseek_mla.py:29-102,107-218`).
+- V2 routing is softmax plus greedy/group-limited top-k; V3 routing is sigmoid plus correction bias/noaux group selection (`deepseek.py:53-122,164-202`).
+- Shared experts are always added to routed-expert output (`deepseek.py:308-346`).
+
+Existing Mobius verification is stronger for prefill than decode:
+
+- reduced DeepSeek-V2-Lite HF-vs-ONNX prefill logits are compared in `tests/integration_test.py:2132-2153`;
+- synthetic DeepSeek-V3 parity has an explicit `0.04` tolerance (`tests/synthetic_parity_test.py:158-164`);
+- V3 has no small public checkpoint and is skipped as a 671B model in model coverage (`tests/model_coverage_test.py:203-207`).
+
+**Important MLA limitation:** the export decompresses latent KV into per-head `k_nope` and V before `Attention`, and `Attention` returns ordinary full present K/V (`_deepseek_mla.py:136-218`). It executes MLA math, but does **not** preserve a low-rank latent KV cache. Thus correctness is available; MLA's intended decode-memory/bandwidth benefit is not.
+
+### 1.2 Quantized MoE export
+
+The current Mobius worktree `/home/justinchu/mobius` is on `glm5.2-moe-export` at `cd782dd`. Relevant commits are:
+
+- `93cbcf7` — shared GLM/DeepSeek fused `com.microsoft::QMoE` emitter;
+- `cd782dd` — restored DeepSeek grouped top-k selection;
+- `2b629cc` — tiny DeepSeek-V2 ONNX export helper.
+
+`_DeepSeekMoEFFN` chooses `FusedQuantizedMoE` when quantization is enabled and `fused_quantized_moe=true` (`/home/justinchu/mobius/src/mobius/models/deepseek.py:315-346`). The emitter packs expert-major weights and supplies separate selection and aggregation tensors to generic `com.microsoft::QMoE` (`/home/justinchu/mobius/src/mobius/components/_moe.py:239-381`). The config explicitly says this shared path is wired for GLM/DeepSeek (`src/mobius/_configs/_base.py:410-413`).
+
+However, only GLM currently has a focused exporter assertion that one QMoE node is emitted per MoE layer (`src/mobius/models/glm_moe_dsa_test.py:174-200`) and an engine QMoE smoke (`crates/onnx-genai-engine/tests/glm_tiny_qmoe_e2e.rs:1-103`). DeepSeek has no equivalent fused-QMoE artifact/test yet.
+
+### 1.3 DeepSeek-V4-Flash preview export
+
+The `dsv4-flash-export` worktree exists at `/home/justinchu/mobius-wt-dsv4`, commit `7e26e6e`; Mobius PR #405 is open draft. It exports:
+
+- V4 projections, Hyper-Connections, sqrt-softplus/hash MoE, clipped SwiGLU, grouped output LoRA;
+- learned per-head sinks and dense causal attention;
+- retained compressor/indexer tensors;
+- target `hidden_states` and a separate MTP sidecar (`/home/justinchu/mobius-wt-dsv4/DSV4_FLASH_EXPORT.md:26-46`; `src/mobius/models/deepseek_v4.py:1-14,289-480,594-764`).
+
+It does **not** execute CSA/HCA. Compressor/indexer tensors are kept reachable through zero-valued shape anchors (`deepseek_v4.py:54-65,455-459`). The design explicitly says dense attention is not numerically equivalent to learned sparse compression at long context (`DSV4_FLASH_EXPORT.md:35-41`). The sidecar emits `mtp_hidden` but no recurrent `mtp_state` (`src/mobius/models/deepseek_v4_flash_test.py:163-183`).
+
+## 2. State today — runtime
+
+### 2.1 Default ORT engine path
+
+`EngineConfig::default()` selects `EngineDecodeBackend::Auto` (`crates/onnx-genai-engine/src/config.rs:453-475,509-525`). Auto uses ORT unless a narrowly detected native-only op is present (`crates/onnx-genai-engine/src/engine.rs:2228-2267`). The detector recognizes only `pkg.nxrt::BlockQuantizedMatMul` (`engine.rs:2329-2367`), so primitive-op DeepSeek V2/V3 and `com.microsoft::QMoE` packages stay on ORT.
+
+The existing DeepSeek-V2 artifact therefore proves the public engine flow and ORT execution, not the native Rust EP. `docs/PROGRESS.md:114-119` accurately calls it a tiny fp32 structural E2E and notes real-weight/native QMoE follow-up.
+
+### 2.2 Native MLA-relevant kernels
+
+The native CPU standard `Attention` kernel accepts explicit `q_num_heads`/`kv_num_heads`, keeps Q/K head width separate from V head width, and sizes output from `v_head_size` (`crates/onnx-runtime-ep-cpu/src/kernels/attention.rs:53-112,324-445`). CUDA standard Attention has the same separate `head_size` and `v_head_size` contract (`crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs:654-767`). This is the right primitive contract for the current decomposed MLA export.
+
+What is missing is a full native graph pass. The first observed blocker is dynamic shape propagation after `Slice`; the executor fallback is model-agnostic but incomplete (`crates/onnx-runtime-session/src/executor.rs:988-1024,2728-2788`). After that is fixed, the same E2E must expose any later unsupported op or dtype gap.
+
+### 2.3 Native MoE kernels
+
+Native generic kernels already exist:
+
+- CPU `com.microsoft::QMoE`: integer 1/2/4/8-bit expert weights, generic expert-major layout, optional mmap route-first selected-expert loading (`crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs:1-16,43-99,101-247`).
+- CUDA `com.microsoft::QMoE`: device routing, decode GEMV, grouped prefill GEMM; paging and expert-parallel sharding are deferred (`crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs:1-7,690-788`).
+- CPU/CUDA registries both register `com.microsoft::QMoE` (`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:372-373`; `crates/onnx-runtime-ep-cuda/src/kernels/mod.rs:335-336`).
+
+Gap: no DeepSeek engine E2E forces these native kernels. The existing GLM QMoE engine test explicitly exercises ORT contrib QMoE, not native Rust (`crates/onnx-genai-engine/tests/glm_tiny_qmoe_e2e.rs:6-12`; `docs/PROGRESS.md:108-119`).
+
+### 2.4 CSA and MTP
+
+CSA runtime work is advanced but disconnected from a model package:
+
+- CPU `pkg.nxrt::CompressedSparseAttention` implements stateful ratio-4/128 compression, index stream, top-k, cache/carry, and learned sink semantics (`crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs:1-8,151-270`).
+- CUDA ratio-4 FP8 six-output execution is device-resident and capture-clean; other configurations retain partial/host-staged paths (`crates/onnx-runtime-ep-cuda/src/kernels/compressed_sparse_attention.rs:942-1070,1960-1971,2171-2190`). The B7 decision records Phase B complete for that specific ratio-4 configuration and notes MTP composite atomicity remains gated on an external artifact (`.squad/decisions/archive/2026-07-20T13-35-00Z-decisions-pre-multistream.md:1871-1884`).
+- Mobius PR #405 does not emit this custom op, so these kernels are not model-E2E exercised.
+
+Generic MTP Phase-1 plumbing also exists:
+
+- metadata resolves an MTP sidecar with BSHC layout, exact initializer references, `mtp_hidden`, `mtp_state`, and KV mode (`crates/onnx-genai-metadata/src/parser.rs:51-76,100-187`);
+- `MtpDecodeSession::step_with_state` binds rank-4 HC state and requires a recurrent state output when `hc_mult > 1` (`crates/onnx-genai-ort/src/mtp.rs:313-457`);
+- `MtpProposer` is constructed once per generation and reused inside the speculative loop (`crates/onnx-genai-engine/src/speculative.rs:1164-1187`).
+
+Gap: the V4-Flash sidecar lacks `mtp_state`, while the official reference does not publish an iterative recurrence/acceptance loop. `docs/DEEPSEEK_CSA_MTP_RUNTIME.md:1485-1515,1585-1625` explicitly marks recurrence, verification, cache lifetime, tie behavior, and exact backend arithmetic as unfrozen.
+
+## 3. BLOCKED vs ACTIONABLE
+
+### BLOCKED — do not schedule as implementation work
+
+1. **Production DeepSeek-V4 onboarding/parity.** Mobius PR #213 is an open draft investigation documenting that no Transformers `configuration_deepseek_v4.py` / `modeling_deepseek_v4.py` exists and the standard AutoConfig/parity workflow cannot run. This blocks a normal verified V4 model onboarding.
+2. **Official iterative V4 MTP.** The reference exposes one MTP block but no recurrent state/acceptance algorithm; the current sidecar lacks `mtp_state`. Do not invent recurrence from `mtp_hidden`.
+3. **V4 portable tie/quant arithmetic claims.** Top-k tie stability, Hadamard implementation version, and several accumulator details remain unpinned (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md:1597-1619`).
+4. **Real V4 E2E in this checkout.** PR #405's manifest entry exists (`tests/e2e/mobius_heads.json:17-27`), but no `deepseek-v4-flash` artifact is present locally.
+
+### ACTIONABLE NOW
+
+1. Make the existing DeepSeek-V2 primitive graph run through the native Rust backend by completing generic dynamic shape propagation.
+2. Add deterministic DeepSeek-V2 and tiny-config V3 **decode** parity, not only prefill/structural smoke.
+3. Export DeepSeek-V2/V3 int4 fused-QMoE packages and run them through native CPU/CUDA QMoE.
+4. Add explicit MLA Attention conformance for `Q/K head_dim != V head_dim` with past-cache decode on CPU and CUDA.
+5. Once correctness is locked, design a metadata-declared, EP-internal structural MLA fusion/latent-cache path; the current standard Attention export forfeits MLA cache compression.
+6. Green/publish the shared GLM PR because the DeepSeek QMoE implementation is currently carried on that branch.
+
+## 4. Dependency-ordered, file-disjoint work packages
+
+The packages below have disjoint owned files. Acceptance commands may consume another package's artifact but must not edit its files.
+
+### DS-0 — Green and publish the shared GLM/DeepSeek QMoE branch
+
+**Dependency:** none.  
+**Suggested owner:** Sapper/Chew.  
+**Owned files:** Mobius PR #404 branch only; resolve the branch's current CI/rebase failures without touching onnx-genai files.
+
+Current status: coordinator todo `publish-glm-pr` is pending, but PR #404 already exists and points to `glm5.2-moe-export@cd782dd`. As of this audit it is an open draft, `mergeStateStatus=DIRTY`, with lint/test/integration failures. Thus “publish” now means rebase/green/ready-for-review, not create a new PR. This PR contains the shared QMoE emitter and grouped-top-k repair needed by DeepSeek.
+
+**Acceptance:** PR #404 head contains `93cbcf7` and `cd782dd`, all required checks green, draft status removed or an explicit remaining-review note recorded.
+
+### DS-1 — Native dynamic shape-chain unblock
+
+**Dependency:** none; highest-priority runtime task.  
+**Suggested owner:** Deckard.  
+**Owned files:**
+
+- `crates/onnx-runtime-session/src/executor.rs`
+- `crates/onnx-runtime-session/tests/executor.rs`
+- `crates/onnx-runtime-shape-inference/src/handlers/movement.rs`
+- `crates/onnx-runtime-shape-inference/tests/graph_inference.rs`
+
+Extend model-agnostic runtime output-shape fallback so a dynamically resolved `Slice` can feed `Unsqueeze` and subsequent broadcast/movement nodes. Reuse ONNX op semantics; do not key on node names such as `model/Unsqueeze_node_9`.
+
+**Acceptance:**
+
+```text
+ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu \
+DEEPSEEK_V2_TINY_E2E_DIR=/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny \
+cargo test --locked -p onnx-genai-engine --features 'native-backend cuda' \
+  --test deepseek_e2e -- --ignored --nocapture
+```
+
+must complete eight generated tokens. Add a small `Slice -> Unsqueeze -> comparison/broadcast` executor regression and run the shape-inference/session test suites.
+
+### DS-2 — Deterministic V2/V3 export and fused-QMoE fixtures
+
+**Dependencies:** DS-0.  
+**Suggested owner:** Sapper.  
+**Owned files:**
+
+- `/home/justinchu/mobius/export_deepseek_v2_tiny.py`
+- new `/home/justinchu/mobius/export_deepseek_v3_tiny.py`
+- new `/home/justinchu/mobius/src/mobius/models/deepseek_test.py`
+- `/home/justinchu/mobius/tests/integration_test.py` DeepSeek-only test section
+
+Produce deterministic packages for:
+
+1. fp32 V2 MLA+MoE;
+2. int4 per-expert `MatMulNBits` V2;
+3. int4 fused `QMoE` V2;
+4. tiny-config V3 sigmoid/noaux QMoE.
+
+Add decode-with-past HF parity, grouped-routing tests, QMoE node-count/layout assertions, and a regression for the repaired `_group_topk_selection` path.
+
+**Acceptance:** ONNX checker passes; V2/V3 prefill plus at least two decode steps match HF logits within calibrated tolerance and exact greedy token identity; fused artifacts contain one `QMoE` per routed MoE layer and no routed-expert `MatMulNBits` nodes.
+
+### DS-3 — MLA Attention primitive conformance
+
+**Dependency:** none; can run in parallel with DS-1/DS-2.  
+**Suggested owner:** Pris/Chew.  
+**Owned files:**
+
+- `crates/onnx-runtime-ep-cpu/src/kernels/attention.rs` test module only
+- `crates/onnx-runtime-ep-cuda/tests/standard_attention_gpu.rs`
+
+Add the exact structural property used by DeepSeek MLA: `qk_head_dim != v_head_dim`, 3-D BSH inputs with explicit head attributes, non-empty past K/V, and prefill/decode parity. Include GQA/MQA head sharing even though today's Mobius MLA expands to equal Q/KV head counts.
+
+**Acceptance:** scalar oracle == CPU; CUDA == CPU within the established numeric bound; output and present-value shapes use V width while present-key uses Q/K width.
+
+### DS-4 — Native CPU DeepSeek QMoE correctness/offload
+
+**Dependencies:** DS-1, DS-2, DS-3.  
+**Suggested owner:** Deckard.  
+**Owned files:**
+
+- `crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs`
+- `crates/onnx-runtime-ep-cpu/src/weight_offload.rs`
+- new `crates/onnx-runtime-ep-cpu/tests/deepseek_qmoe.rs`
+
+Feed generic QMoE with V2 softmax/group-masked scores and V3 sigmoid+bias/noaux scores generated by the fixture. Validate selected expert IDs, separate aggregation weights, shared-expert addition at graph level, and resident vs mmap route-first equality. Keep routing outside the kernel as tensor inputs; do not add a `deepseek` mode attribute.
+
+**Acceptance:** 1/2/4/8-bit kernel parity remains green; V2 and V3 fixture rows match the decomposed float expert oracle; `ONNX_GENAI_WEIGHT_OFFLOAD=1` loads only selected expert slices and is token-identical.
+
+### DS-5 — Native CUDA DeepSeek QMoE prefill/decode
+
+**Dependencies:** DS-2, DS-3.  
+**Suggested owner:** Leon/Sebastian.  
+**Owned files:**
+
+- `crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs`
+- `crates/onnx-runtime-ep-cuda/src/kernels/qmoe_gemm.rs`
+- `crates/onnx-runtime-ep-cuda/src/kernels/qmoe_grouping.rs`
+- `crates/onnx-runtime-ep-cuda/tests/qmoe_gpu.rs`
+
+Exercise V2/V3 route tensors through decode GEMV and grouped prefill GEMM. Measure route distribution, workspace, and expert grouping; no architecture constants or model-name gates.
+
+**Acceptance:** H200 CPU/CUDA output parity for V2 and V3 route cases; deterministic lower-index tie behavior; prefill uses grouped GEMM for multi-token experts; steady decode has no host expert-routing round trip.
+
+### DS-6 — Engine dual-backend DeepSeek E2E gate
+
+**Dependencies:** DS-1 through DS-5.  
+**Suggested owner:** Pris.  
+**Owned files:**
+
+- `crates/onnx-genai-engine/tests/deepseek_e2e.rs`
+- new `crates/onnx-genai-engine/tests/deepseek_qmoe_e2e.rs`
+
+Turn the current one-backend random smoke into a matrix: ORT fp32, native CPU fp32, ORT QMoE, native CPU QMoE, native CUDA QMoE. Pin artifact commit/config and assert exact token identity between equivalent deterministic packages.
+
+**Acceptance:** prefill plus eight decode tokens for each available backend; QMoE model bytes are checked for the fused op; failures do not silently skip when an explicitly configured artifact exists.
+
+### DS-7 — Metadata-declared latent MLA cache, then EP-internal fusion
+
+**Dependencies:** DS-3 and DS-6; performance work after correctness.  
+**Suggested owner:** Roy for contract, then Deckard/CUDA owner for implementation.  
+**Owned files:**
+
+- `crates/onnx-genai-metadata/src/schema.rs`
+- `crates/onnx-genai-metadata/src/validation.rs`
+- `docs/MODEL_METADATA.md`
+- `crates/onnx-runtime-ep-cpu/src/optimizer.rs` plus a new CPU MLA kernel
+- `crates/onnx-runtime-ep-cuda/src/optimizer.rs` plus a new CUDA MLA kernel
+
+First define generic metadata for latent-KV layout, LoRA ranks, rotary/non-rotary widths, and cache state. Then detect the projection/normalization/split/RoPE/Attention topology structurally inside each EP. Do not inspect `model_type`, initializer names, or DeepSeek dimensions.
+
+**Acceptance:** same logits/tokens as decomposed Attention; cache bytes/token track metadata-derived latent rank instead of full per-head K/V; fusion declines with an actionable reason when metadata or shape/dtype compatibility is missing.
+
+## 5. Available fixtures
+
+### Usable now
+
+`/home/justinchu/ds-e2e-artifacts/deepseek-v2-tiny/`
+
+- `model.onnx` — 129,317 bytes
+- `model.onnx.data` — 459,776 bytes
+- `inference_metadata.yaml`
+- `tokenizer.json`
+
+The graph has 195 nodes, including two standard `Attention` nodes and decomposed MoE (`MatMul`, `TopK`, `GatherElements`, `OneHot`, etc.); it has no QMoE/custom CSA op. Metadata currently labels it generic `multi_head_attention` (`inference_metadata.yaml:1-16`). ORT E2E passes; native currently fails at dynamic `Unsqueeze` shape resolution.
+
+### Not available
+
+- `~/ana-bench`: no DeepSeek path/model found outside its Python environment fixtures.
+- No local DeepSeek-V4-Flash ONNX package was found.
+- The `tests/e2e/mobius_heads.json` V4 entry is only a manifest pointer, not an artifact (`tests/e2e/mobius_heads.json:17-27`).
+- `~/Olive-recipes/deepseek-ai-DeepSeek-R1-Distill-*` contains distill recipes/configs; these are Llama/Qwen-family models, not DeepSeek MLA+MoE ONNX fixtures.
+- Mobius `testdata/cases/causal-lm/deepseek-v2-lite.yaml` is an export case descriptor, not a generated model.
+
+## 6. Shared MoE opportunity with GLM
+
+GLM and DeepSeek already share the relevant exporter implementation:
+
+- GLM imports `DeepSeekMLA`, `DeepSeekMoEGate`, and `_DeepSeekMoEFFN` (`/home/justinchu/mobius/src/mobius/models/glm_moe_dsa.py:24-30,150,339-341`).
+- `FusedQuantizedMoE` is explicitly shared and generic (`/home/justinchu/mobius/src/mobius/components/_moe.py:239-381`).
+- Native CPU/CUDA QMoE kernels consume generic router probability/weight tensors; they do not encode GLM or DeepSeek identity.
+
+Therefore DS-0/DS-2/DS-4/DS-5 unblock both families. The best shared milestone is: **one deterministic GLM artifact and one deterministic DeepSeek artifact, both emitting the same QMoE contract, passing the same native CPU/CUDA kernel suite with family-specific routing computed outside QMoE.**
+
+PR status matters: Mobius PR #404 is already open draft at `cd782dd` but dirty/failing, so the pending `publish-glm-pr` work is on the critical path for stabilizing the shared emitter. DeepSeek should not fork a second MoE implementation while that branch is pending.
+
+## 7. RULES.md §2 / §2.1 risks
+
+1. **Current V4 CSA code contains exact architecture constants.** CPU rejects anything except `D=512`, `RD=64`, and ratio-4 `ID=128` (`crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs:725-737,1148-1155`). CUDA claim geometry likewise contains fixed 512/128 dimensions and a fixed 128-token dense window (`crates/onnx-runtime-ep-cuda/src/kernels/compressed_sparse_attention.rs:76-79,2271-2434`). Under `RULES.md:20-38`, these are review-blocking if treated as a general runtime architecture. Any future CSA work must express such requirements as versioned op attributes/metadata and shape compatibility, or clearly constrain them as a private schema version while planning a generic successor.
+2. **Do not detect MLA by model name or tensor names.** The current artifact metadata says only `multi_head_attention`; a latent-cache optimization must add explicit inspectable metadata rather than infer “DeepSeek” from graph/initializer names (`RULES.md:24-28`).
+3. **Fusion belongs inside the EP.** A future MLA optimization must structurally match the low-rank projection/norm/split/RoPE/Attention topology in CPU/CUDA EP optimizer code, not rewrite the generic loader or add a `deepseek_v2` branch (`RULES.md:30-38`).
+4. **QMoE must remain family-neutral.** V2/V3/GLM routing differences should remain graph-computed `router_probs` and `router_weights`; adding a `deepseek`/`glm` kernel attribute would violate §2.
+5. **Backend selection is currently too narrow.** `model_proto_requires_native_backend` hardcodes one op type (`engine.rs:2351-2367`). If CSA/BQMoE packages are added, replace this with capability/registry-driven selection or explicit metadata; do not grow a model/op-name special-case list.
+6. **Tiny fixture dimensions are acceptable only in tests.** Never copy test values such as four heads, hidden 64, or V4's 512/128 widths into runtime dispatch.
+
+## Recommended priority
+
+1. DS-1 native dynamic shape-chain unblock.
+2. DS-0 + DS-2 stabilize/publish the shared QMoE exporter and produce DeepSeek V2/V3 deterministic fp32/int4 fixtures.
+3. DS-3/DS-4/DS-5/DS-6 prove MLA and QMoE on native CPU/CUDA end-to-end.
+
+Only after these pass should latent MLA-cache optimization (DS-7) become the performance focus. V4-specific export/runtime integration should remain outside the active queue until its official configuration and MTP contract are usable.
+
+**Inbox:** Merged and cleared `dave-mobius-decoder-metadata-fix.md`, `deckard-cudaattn-revision.md`, `deckard-gap1-schema-fix-merge.md`, `deckard-sebastian-gap1-review.md`, `eldon-zhora-mla-merge.md`, `gaff-deckard-rereview.md`, `garland-wp5.md`, `holden-sebastian-gap1-merge.md`, `joi-gemma4-e2b-gaps.md`, `joi-gemma4-native-gaps.md`, `joi-qwen3-0.6b-bench.md`, `keaton-native-specdecode-design.md`, `kowalski-zhora-mla-conformance-review.md`, `kowalski-zhora-unsqueeze-review.md`, `leon-vlm-scope.md`, `mariette-qwen3-export.md`, `rachael-qwen-ladder-review.md`, `rachael-qwen3-bench-review.md`, `sebastian-native-interface.md`, `tessa-progress-qwen-ladder.md`, `zhora-deepseek-mla-conformance.md`, `zhora-deepseek-native-unsqueeze.md`, `zhora-deepseek-scope.md`.
+<!-- scribe-merge-2026-07-23T01-00-00Z-gap1-mla-qwen3-merges-end -->
+
 <!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation -->
 ## 2026-07-22 — VLM WP1/WP2/WP3 reconciliation and ORT CUDA attention review
 

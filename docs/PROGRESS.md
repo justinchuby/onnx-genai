@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T17:55Z — VLM metadata/runtime/admission landings and Gemma4 E2B validation._
+_Last updated: 2026-07-23T01:00Z — native GAP 1 backend-neutral pipeline interface, DeepSeek MLA head-dim-asymmetry conformance, Qwen3-0.6B bench + perf-metadata gap._
 
-**Current `origin/main` implementation HEAD:** `6ddcb68` (code/docs before this update).
+**Current `origin/main` implementation HEAD:** `e04fc2d` (after the 2026-07-23T01:00Z batch).
+
+## 2026-07-23 — Native GAP 1 + DeepSeek MLA conformance + Qwen3-0.6B bench
+
+- **Native GAP 1 backend-neutral pipeline interface ✅ (`851af3a`):** `onnx-genai-metadata` now owns the cycle-free leaf contract for pipeline components via the backend-neutral `ComponentSession` trait plus neutral tensor/IO/error types (`ComponentTensor`, `ComponentIo`, `ComponentDataType`, `ComponentError`). ORT implements the contract as `OrtComponentSession`, the native path has a feature-gated `NativeComponentSession`, and `pipeline.rs` no longer hard-rejects native component execution. The every-step executor is preserved.
+- **Schema determinism fix ✅ (`c47534d`):** generated schema property ordering is canonicalized so `schema_sync` remains deterministic even when `serde_json`'s `preserve_order` feature is unified into the combined build graph (root cause: `llguidance` enabling `preserve_order`).
+- **DeepSeek MLA conformance ✅ (`a9370e2`):** CPU fp32 conformance now covers MLA-decomposed `Attention` with asymmetric Q/K versus V head dimensions on the cached-decode path; output sizing follows `v_head_size`.
+- **Qwen3-0.6B H200 bench + perf-metadata gap ✅ (`e04fc2d`):** Qwen3-0.6B is functionally supported on CUDA (QK-norm works), but the benchmark exposed metadata that suppresses device/shared-buffer KV: the export declares `attention.type: grouped_query` (an alias the runtime GQA detector did not accept) and omits `kv_cache.native_dtype`. The documented run measured **197.49 tok/s** at 128 and **64.01 tok/s** at 1024, while a corrected-metadata probe reached **429.95/381.49 tok/s**; the Qwen2.5-0.5B control was **570.61/501.88 tok/s**. The exporter root cause is in Mobius `decoder_metadata.py`; a generic runtime defensive GQA-alias consistency fix is also in progress.
 
 ## 2026-07-22 — Qwen2.5-1.5B/7B H200 decode roofline ladder
 
