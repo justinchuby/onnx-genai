@@ -79,3 +79,6 @@
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Bryant approved WP-B3 v3 after raw-shape authority, loader-unchanged, mutation, fmt, clippy, and full ORT gates passed.

@@ -106,3 +106,6 @@ Recorded the integration rejection and subsequent approval after dependency meta
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
 - 2026-07-21T23:55Z — WP2 rejection/lockout and ScatterElements review were recorded; final WP2 acceptance came through Pris after Sapper revision.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Chew's rejection of loader-IR shape authority directly informed the final Sapper WP-B3 v3 fix.

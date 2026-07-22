@@ -31,3 +31,6 @@ all doctests ran in 0.16s; merged doctests compilation took 0.16s
 - Merged `475cea1`: ONNX-RS §8 checker expanded to nine rules, including I/O declaration, unconnected-node, type-constraint, initializer-declaration, and lower-bound IR-version validation.
 - Brion corrected unknown/placeholder type handling, dangling output detection, and static initializer-dimension mismatch coverage. 67 unit tests plus 1 doctest pass; Deckard reviewed.
 - `cargo fmt -p onnx-rs -- --check 2>&1 | head -15` exited 0 with no output.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+Clippy cleanup landed at `6f217a4`, clearing `-D warnings` for `onnx-genai`, `onnx-runtime-capi`, and `onnx-runtime-python`.

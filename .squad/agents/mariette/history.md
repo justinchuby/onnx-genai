@@ -41,3 +41,6 @@ Hired as a Metal/MPS kernel engineer for the new Apple Metal EP for ONNX Runtime
 
 ## 2026-07-21T11:15:00Z — Wave-3 SwiGLU fusion
 - Fused `silu(gate) * up` into one capture-safe CUDA kernel, halving activation launches from 48 to 24/token. Pris approved; `12e48b8` merged and measured about 673→689 tok/s at 256 tokens with zero fallbacks.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Mariette's WP-B2 engine runtime remains the accepted presence/fallback/gating implementation feeding the completed epic.

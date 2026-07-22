@@ -85,3 +85,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 2026-07-21T23:55Z — DS-1 generic Slice→Unsqueeze shape propagation landed after Holden bounded materialization and Pris approved; ScatterElements dtype expansion also landed.
 ## 2026-07-22T12:00:00Z — Luv Phase 0 review
 - Independently reviewed Luv's partial-CUDA-graph capture path-kind change at `3c94a57`; approved 🟢 GREEN after confirming additive behavior, correct structural seam mapping, model-agnostic dispatch, exhaustive matches, and clean fmt/clippy/tests.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default classification but was superseded by Sapper's v3 raw signature fix.

@@ -139,3 +139,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 - Sapper fixed native CUDA fp16 int4 GEMV explicit `zero_points` support for asymmetric Phi-4-mini-style MatMulNBits, preserving symmetric zp=8 fast paths and M==1 capture safety.
 - Holden completed the non-author review 🟢 (SM-portability, capture-safety, symmetric no-regress, genericity, correctness); merged to main as `48de993`.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Sapper's WP-B3 v3 admission fix landed at `3d84b9b`, making raw `GraphProto.input` authoritative for optional fallback validation.

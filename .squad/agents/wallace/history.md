@@ -68,3 +68,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T11:15:00Z — CUDA EP Clippy review
 - 🟢 Approved Gaff's 21-warning cleanup and CI gate after verifying behavior-preserving rewrites, ownership safety of removed no-op drops, clean Clippy/build/tests, valid workflow YAML, and zero-fallback perf sanity.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Wallace's WP-B4 approve-with-notes review was resolved by Joshi's BF16 regression coverage.

@@ -106,3 +106,6 @@ Added Rayon N-range partitioning for native CPU MatMulNBits.
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
 - 2026-07-21T23:55Z — VLM WP4 initial artifact remains in correction after Gaff rejection/lockout; DeepSeek scope artifact preserved as living research.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+Zhora approved Rutger's clippy cleanup; required Clippy and targeted tests passed with scoped API-preserving fixes.

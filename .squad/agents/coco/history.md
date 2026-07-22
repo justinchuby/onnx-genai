@@ -13,3 +13,6 @@ Applied CUDA coverage documentation correction for the merged kernel slice.
 ## 2026-07-16T00:00:00Z — onnx-rs upstream text-format port review
 - Cleared merged commit `23e4995` 🟢: 10 added tests make 16 upstream-derived text-format cases and assert real parser/IR/codec behavior.
 - Confirmed 89 passing onnx-rs tests with no ignored or vacuous cases; documented unsupported functions, non-tensor type forms, complex/2-bit dtypes, and literal tensor/sparse payload syntax.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+WP-B landed: Coco's initial WP-B3 admission work was superseded by raw-protobuf authority fixes that completed the epic.

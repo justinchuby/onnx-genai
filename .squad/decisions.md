@@ -5,6 +5,92 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T14-59-36+0000-wp-b-landed -->
+## 2026-07-22 — WP-B optional-modality epic landed and clippy cleanup reconciled
+
+<!-- source: .squad/decisions/inbox/rutger-clippy-cleanup.md -->
+### Clear runtime-entry Clippy gates
+**By:** Rutger
+**Decision:** Landed `6f217a4` clears `-D warnings` for `onnx-genai`, `onnx-runtime-capi`, and `onnx-runtime-python`; tests now resolve the Cargo binary path at runtime, C API maps `RuntimeBroadcastIncompatible` exhaustively to `InvalidArgument`, and Python bindings keep the keyword API with narrow `too_many_arguments` allowances.
+
+<!-- source: .squad/decisions/inbox/zhora-rutger-clippy-review.md -->
+### Review clippy cleanup
+**By:** Zhora
+**Verdict:** 🟢 APPROVE
+**Rationale:** Required Clippy and targeted test gates passed; the C-API mapping is covered without a catch-all, runtime binary lookup preserves Cargo profile/target selection, `GenerateOptions` construction keeps defaults, and the scoped Python allowances avoid public API churn.
+
+<!-- source: .squad/decisions/inbox/sapper-wp-b3-revision.md -->
+### Land WP-B3 v3 optional-modality admission
+**By:** Sapper
+**Decision:** Landed `3d84b9b` makes retained raw `GraphProto.input` authoritative for optional-port membership, dtype, rank, and dimensions; raw initializer names only classify graph-default closure, loader behavior stays unchanged, and admission tests cover missing optional ports, fallback mismatches, gated producers, required inputs, and raw symbolic shapes.
+
+<!-- source: .squad/decisions/inbox/bryant-wp-b3-v3-review.md -->
+### Review WP-B3 v3 optional-modality admission
+**By:** Bryant
+**Verdict:** 🟢 APPROVE
+**Rationale:** Raw protobuf signatures, initializer/default separation, loader unchanged proof, architecture neutrality, mutation proof, fmt, clippy, and full `onnx-genai-ort` tests all passed; unrelated `tiny-qwen35-mtp` fixture naming was ignored as directed.
+
+<!-- source: .squad/decisions/inbox/chew-wp-b3-review.md -->
+### Preserve WP-B3 v2 rejection rationale
+**By:** Chew
+**Verdict:** 🔴 REJECT for Deckard's prior revision
+**Rationale:** Membership/default classification had moved to raw graph inputs, but dtype/rank/static shape still came from loader IR values, so initializer-backed graph inputs could be falsely constrained by initializer shape. Sapper's landed v3 fixed this by deriving signatures directly from raw `ValueInfoProto`.
+
+<!-- source: .squad/decisions/inbox/freysa-wp-b3-review.md -->
+### Preserve WP-B3 initial rejection rationale
+**By:** Freysa
+**Verdict:** 🔴 REJECT for Coco's initial admission work
+**Rationale:** Optional-port existence and fallback-shape checks used loader-projected `model.graph.inputs`; initializer-backed raw graph inputs were therefore falsely rejected and graph-default closure was lost. Later revisions moved validation to retained raw protobuf.
+
+<!-- source: .squad/decisions/inbox/deckard-wp-b3-revision.md -->
+### Record WP-B3 intermediate revision
+**By:** Deckard
+**Decision:** Deckard's revision fixed raw graph-input membership and graph-default classification while leaving `graph_builder.rs` unchanged, but review found rank/static shape still sourced from loader IR; it remains historical context, not the landed artifact.
+
+<!-- source: .squad/decisions/inbox/coco-wp-b3.md -->
+### Record WP-B3 initial implementation context
+**By:** Coco
+**Decision:** Coco added optional-port admission coverage for presence keys, fallback rank/static dimensions, mutually exclusive fallback/routed binding, gated producers, and required-input closure. The initial approach was superseded after raw-protobuf authority reviews.
+
+<!-- source: .squad/decisions/inbox/cotton-wp-b2-review.md -->
+### Review WP-B2 optional-modality engine runtime
+**By:** Cotton
+**Verdict:** 🟢 APPROVE
+**Rationale:** `PipelineGenerateRequest.present`, absent-modality zero fallback, `when_present` plan gating, destination-key fallback caching, initialized zeros, backward compatibility, and 8 CPU E2E tests passed. Engine behavior stays metadata-only with no model or architecture dispatch.
+
+<!-- source: .squad/decisions/inbox/mariette-wp-b2.md -->
+### Land WP-B2 optional-modality engine runtime
+**By:** Mariette
+**Decision:** Engine runtime landed request presence sets, consistency validation, fixed/symbolic zero fallback creation, gated component/route skipping across plan families, and destination-endpoint fallback pooling. `cargo clippy -p onnx-genai-engine --tests -- -D warnings`, `cargo test -p onnx-genai-engine`, and `cargo build -p onnx-genai-ort` passed; crate fmt failure was baseline-only in unrelated files.
+
+<!-- source: .squad/decisions/inbox/wallace-wp-b4-review.md -->
+### Review WP-B4 Mobius optional-audio exporter
+**By:** Wallace
+**Verdict:** 🟡 APPROVE-WITH-NOTES
+**Rationale:** Frozen optional-modality contract, generic emitter, rank adapter, absent shape, and Rust-schema compatibility passed. The only note was missing committed BF16 adapter regression coverage, which Joshi subsequently added.
+
+<!-- source: .squad/decisions/inbox/joshi-wp-b4.md -->
+### Land WP-B4 Gemma4 optional-audio export
+**By:** Joshi
+**Decision:** Mobius PR #419 emits `audio` presence, `embedding.io.optional_inputs.audio_features` with zero fallback `[0, config.hidden_size]`, `audio_encoder.when_present: audio`, and rank-2 masked audio features via a generic metadata emitter. Ruff, metadata, Gemma4 graph/adapter, dtype, and width-probe validations passed.
+
+<!-- source: .squad/decisions/inbox/joshi-wp-b4-bf16.md -->
+### Add WP-B4 BF16 adapter regression
+**By:** Joshi
+**Decision:** Added BF16 coverage for `test_gemma4_audio_encoder_strips_padding_in_graph`, including output dtype verification, closing Wallace's non-blocking note.
+
+<!-- source: .squad/decisions/inbox/tyrell-wp-b-progress.md -->
+### Update WP-B progress documentation
+**By:** Tyrell
+**Decision:** `docs/PROGRESS.md` now records WP-B1, WP-B2, and WP-B4 landings and originally marked WP-B3 as still in review; after `3d84b9b`, WP-B is fully landed and future docs should reflect WP-B3 closure.
+
+<!-- source: .squad/decisions/inbox/taffey-fmt-fix.md -->
+### Restore workspace rustfmt gate on main
+**By:** Taffey
+**Decision:** Reformatted the 89 files reported by workspace `cargo fmt --check` across 25 crates, restoring the formatting gate without logic changes and setting up the later Clippy cleanup.
+
+<!-- scribe-merge-2026-07-22T14-59-36+0000-wp-b-landed-end -->
+
 <!-- scribe-merge-2026-07-22T15-05-00Z-wp-b1-landed-inbox -->
 ## 2026-07-22 — WP-B1 optional-modality schema landing and inbox reconciliation
 
