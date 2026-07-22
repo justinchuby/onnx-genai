@@ -103,3 +103,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-21T13:15:00Z — MatMul-adjacent fusion landed
 - Added guarded QKV-bias folding and paired gate/up+SwiGLU with two-op-exact fp16 rounding. Pris approved; merged as `102fee9`, saving ~72 launches/token and stacking to ~759/~789 tok/s.
 - 2026-07-21T23:55Z — WP0 Default-derived hotfix restored downstream source compatibility after the typed multimodal metadata contract landed.
+
+## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
+
+Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.

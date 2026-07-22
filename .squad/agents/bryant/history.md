@@ -75,3 +75,7 @@
 - Made MatMulNBits M=1 decode capture-safe (`a210703`) and closed GQA's final safety blocker with a sticky detect-before-consume error latch (`ca50bae`).
 
 - 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+
+## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
+
+Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.

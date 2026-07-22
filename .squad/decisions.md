@@ -5,6 +5,1179 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T15-05-00Z-wp-b1-landed-inbox -->
+## 2026-07-22 — WP-B1 optional-modality schema landing and inbox reconciliation
+
+<!-- source: .squad/decisions/inbox/bryant-wp-b1-review.md -->
+### 2026-07-22: WP-B1 optional-modality schema review
+**By:** Bryant
+**Verdict:** 🟢 APPROVE
+**What:** The generic optional-input fallback and phase-presence schema is backward-compatible, architecture-neutral, fully covered, regenerated, and limited to WP-B1 mechanical schema integration.
+**Evidence:**
+1. **Schema correctness/backward compatibility:** `ModelIoSpec.optional_inputs` uses `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]` (`schema.rs:626-630`), and `PhaseConfig.when_present` uses `default` plus `skip_serializing_if = "Option::is_none"` (`schema.rs:1363-1370`). The legacy branch of `optional_modality_schema_round_trips` (`schema.rs:2418-2431`) parses a document lacking both fields, observes empty/`None`, and compares the serialized YAML value to the original without emitted defaults. The full-document branch round-trips the new fields exactly (`schema.rs:2433-2465`).
+2. **Generic/explicit contract:** Presence values are documented as opaque and validated through non-empty-string deserializers (`schema.rs:8-34, 632-641, 1363-1370`); no model/architecture dispatch or port-name inference was added. `TensorDimension` is explicitly either `Fixed(i64)` or `Symbol(String)`; deserialization rejects fixed values below zero and empty symbols (`schema.rs:662-694`). The only absent kind is explicit `Zeros`, serialized in snake case. Searches found no new model/vendor/architecture special case.
+3. **Test non-vacuity:** The test exercises a legacy document, exact full-document round-trip, `Zeros` → `"zeros"`, and a parsed shape containing both `Fixed(0)` and `Symbol("sequence_len")`; it rejects `-1` and empty presence. Mutation proof: I temporarily changed the fixed-dimension guard from `value >= 0` to `value >= -1` and ran the exact test. It failed at `schema.rs:2471` with `negative fixed dimensions must be rejected` (`0 passed; 1 failed`, exit 101). I reverted the mutation and confirmed the review worktree was clean before gates.
+4. **Exhaustive construction sites:** `rg 'ModelIoSpec\s*\{' crates` found only the type plus literals in `metadata/src/parser.rs:247` and `engine/src/native_decode.rs:2629`; both add only an empty `BTreeMap`. `rg 'PhaseConfig\s*\{' crates` found only the type plus two literals in `engine/src/pipeline.rs:4703,4710`; both add only `when_present: None`. No runtime behavior was introduced.
+5. **Generated schema:** The committed root `schema/inference_metadata.schema.json` contains `AbsentInputKind`, `AbsentInputSpec`, `OptionalInputSpec`, `optional_inputs`, `when_present`, and `TensorDimension` with integer minimum 0/string minimum length 1. `committed_inference_metadata_schema_is_current` passed.
+6. **Gate tails:**
+   - `cargo fmt -p onnx-genai-metadata --check`: no output; exit 0.
+   - `cargo clippy -p onnx-genai-metadata --tests -- -D warnings`: `Checking onnx-genai-metadata ...`; `Checking jsonschema v0.48.2`; `Finished dev profile ... in 5.25s`; exit 0.
+   - `cargo test -p onnx-genai-metadata`: `test result: ok. 24 passed; 0 failed`; schema sync `committed_inference_metadata_schema_is_current ... ok`; `test result: ok. 1 passed; 0 failed`; doc tests 0/0; exit 0.
+   - `cargo build -p onnx-genai-engine`: tail compiled `onnx-genai-ort` and `onnx-genai-engine`; `Finished dev profile ... in 13.17s`; exit 0.
+7. **Scope discipline:** Merge-base diff changes only metadata `schema.rs`/`parser.rs`, mechanical engine construction sites, and the generated JSON schema. It does not modify `onnx-genai-ort` or `onnx-runtime-loader`, and searches show no engine consumption of `optional_inputs`/`when_present`; WP-B2/WP-C behavior remains out of scope. `git diff --check` passed.
+**Why:** Every requested contract, compatibility, validation, construction-site, schema-sync, gate, and scope check passed. The mutation test demonstrates the key rejection assertion is effective rather than vacuous.
+
+<!-- source: .squad/decisions/inbox/deckard-wp-c-rereview.md -->
+### 2026-07-22: WP-C admission gate re-review (v2)
+**By:** Deckard
+
+**Verdict:** 🔴 REJECT
+
+**Per-finding status**
+1. **Resolved.** Temporal shape/name inference and stale-input rejection were removed. Unknown refresh semantics now fail open; the schema-blocker deferral is justified.
+2. **Resolved.** External provenance is evaluated per port. The mixed routed plus request-supplied component regression passes.
+3. **Resolved.** Admission no longer classifies generated inputs by tensor-name conventions. The `decoder.past_noise` regression rejects with the component-qualified port.
+4. **Resolved.** `cargo fmt -p onnx-genai-ort --check` passes.
+5. **Partially resolved.** Read, textproto parse, and binary model-load failures preserve the model path and underlying cause. However, unnamed graph input/output failures at `crates/onnx-genai-ort/src/pipeline_admission.rs:87-113` still omit the model path, contrary to the RULES §1 requirement that inspection errors include path and cause.
+
+**Verification run by Deckard**
+- `cargo test -p onnx-genai-ort --tests` — PASS
+- `cargo test -p onnx-genai-ort --test pipeline_admission` — PASS (9/9)
+- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — PASS
+- `cargo fmt -p onnx-genai-ort --check` — PASS
+
+**New defects / gate failures**
+- The mandated architecture-name grep is not clean: the authoritative diff contains `tiny-qwen35-mtp` in `crates/onnx-genai-ort/tests/mtp_session.rs:12`. This is a formatting-only test-fixture reference, not architecture-specific admission logic, but it still fails the explicit clean-diff gate.
+- Add path-preserving diagnostics (and a regression) for unnamed graph inputs and outputs.
+
+The fail-open temporal/schema deferral is otherwise sound for WP-C: no unsupported name/shape inference remains, and unknown bindings are left to loud runtime diagnostics where the current schema cannot prove invalidity.
+
+**Fix owner:** Gaff
+
+<!-- source: .squad/decisions/inbox/deckard-wp-c-review.md -->
+### 2026-07-22: WP-C load-time VLM admission review
+**By:** Deckard
+**Verdict:** 🔴 REJECT
+**Revision owner:** Sapper must own the revision. Leon is locked out as the rejected artifact's author; Deckard is the reviewer and must not revise it.
+
+## Findings
+
+### 1. BLOCKER — stale-input classification is unsound and violates the explicit-metadata rule
+**What:** `refresh_required_decoder_inputs` infers temporal semantics from symbolic-dimension intersections and fallback port names (`pipeline_admission.rs:420-475,784-790`) instead of declared metadata.
+
+**Why:** This can both reject valid packages and miss the defect it claims to catch:
+- If any decoder input omits the batch symbol, `batch` becomes a supposed sequence symbol. A valid prompt-cached conditioning tensor shaped `[batch, image_sequence, hidden]` is then rejected when fed by a `prompt_only` producer, although the engine explicitly supports cached prompt-only conditioning (`onnx-genai-engine/src/pipeline.rs:1561-1568,1869-1878`).
+- If all non-scalar inputs share the primary sequence symbol, that symbol is removed as “common”; a secondary per-token input can remain stale without rejection. The test avoids this by giving `attention_mask` a different `total_sequence` symbol.
+- Shape/name inference is not the explicit, inspectable metadata required by RULES.md §2.
+
+**How:** Add explicit per-decoder-input temporal/binding semantics (for example, refreshed-every-step versus fixed prompt conditioning) and validate producer phase against those declarations. Add regressions for valid fixed conditioning plus an unbatched position input, and for a stale secondary sequence input when all relevant ports share the same sequence symbol.
+
+### 2. BLOCKER — valid mixed external/routed components are rejected
+**What:** Input closure treats an unbound port as externally supplied only when its entire component has no incoming cross-component edge (`pipeline_admission.rs:485-517`).
+
+**Why:** The runtime accepts direct request tensors keyed by any `component.input_name`, and `component_inputs` checks that direct endpoint before routed dataflow (`onnx-genai-engine/src/pipeline.rs:72-99,1475-1495`). A valid component with one routed input and one request-supplied input is therefore rejected at load time. The gate has invented a component-level provenance rule absent from the metadata and runtime contract.
+
+**How:** Declare external/generated/default/state/dataflow provenance per port and validate exactly one declared source. Add a valid test where a component consumes one edge-fed tensor and one external request tensor.
+
+### 3. BLOCKER — name heuristics let required unbound inputs pass
+**What:** When `model.io` is absent, `generated_inputs` classifies decoder inputs by names such as `input_ids`, `attention_mask`, `position_ids`, `past*`, and `cache_*` (`pipeline_admission.rs:577-588,784-808`).
+
+**Why:** An unrelated required input such as `past_noise` is accepted as generated/stateful despite having no KV/state declaration or dataflow source. This misses the required-input defect class and violates RULES.md §2's requirement that assumptions be explicit metadata. The requested model-name grep is clean—there are no Gemma/Qwen/Phi/Llama/model-type hits—but semantic port-name dispatch remains.
+
+**How:** Admission must rely only on `ModelIoSpec`, `positions`, KV/state pairs, strategy-generated ports, graph defaults, declared external inputs, and dataflow. Compatibility conversion must emit those facts or fail. Add negative tests for convention-looking but undeclared ports.
+
+### 4. BLOCKER — required formatting validation fails
+**What:** `cargo fmt -p onnx-genai-ort --check` exits 1. The changed `src/lib.rs` has a rustfmt ordering delta around `shared_kv_proposer`, `loader`, and `pipeline_admission`.
+
+**Why:** The review contract requires rejection on fmt failure. The branch's older baseline also contains unrelated crate formatting deltas, and current main is not crate-fmt-clean, but the touched `lib.rs` is itself not formatted.
+
+**How:** Format the touched integration and reconcile the required crate-level fmt check before re-review.
+
+### 5. Error-quality finding — graph inspection discards the useful cause
+**What:** `inspect_component_signature` maps every read/parse/load failure to the same message and drops the model path and parser/IO cause (`pipeline_admission.rs:66-83`).
+
+**Why:** RULES.md §1 requires preserving resource path and causal context. “Could not be inspected structurally” does not tell whether the file is missing, unreadable, invalid protobuf, invalid textproto, or otherwise malformed.
+
+**How:** Preserve the underlying error and component model path with contextual wrapping while avoiding URL/secret-bearing content. Other admission errors are generally component.port-named and actionable; no secret/URL leak was observed.
+
+## Test assessment
+
+The six new admission tests pass, use `onnx_std` IR builders, and assert meaningful endpoint/reason text for valid, unbound, stale, dtype, rank, and modality cases. They are tailored to the current heuristics and omit the false-positive/false-negative cases above. The compatibility suite no longer proves that any valid compatibility VLM package loads.
+
+## Validation
+
+- `cargo test -p onnx-genai-ort --tests`: PASS
+- `cargo test -p onnx-genai-ort --test pipeline_admission`: PASS (6/6)
+- `cargo clippy -p onnx-genai-ort --tests -- -D warnings`: PASS
+- `cargo fmt -p onnx-genai-ort --check`: FAIL
+- Existing valid VLM engine tests: PASS (3/3)
+- Existing VLM server bundle tests: PASS (9/9)
+
+<!-- source: .squad/decisions/inbox/deckard-wp-c-v3-review.md -->
+### 2026-07-22: WP-C v3 re-review (finding #5)
+**By:** Deckard
+
+**Verdict:** 🔴 REJECT
+
+## Per-item findings
+
+1. **The two diagnostic strings now satisfy RULES.md §1.** The unnamed-input and
+   unnamed-output errors include the component, the allowed filesystem model path,
+   the underlying cause, why binding/dataflow cannot proceed, and explicit graph
+   regeneration guidance (`crates/onnx-genai-ort/src/pipeline_admission.rs:87-94`,
+   `:109-116`). No secret or URL is added.
+
+2. **The fixtures are built through the requested IR API.** They use
+   `Graph`, `Node`, `Model`, and `Model::to_proto`, and explicitly verify that the
+   serialized graph port name is empty
+   (`crates/onnx-genai-ort/tests/pipeline_admission.rs:101-132`).
+
+3. **Blocking defect: the new tests are not regressions for the changed
+   diagnostics.** Both tests deliberately trigger the pre-existing generic
+   `"could not be loaded"` wrapper and assert only that unrelated error plus its
+   path (`crates/onnx-genai-ort/tests/pipeline_admission.rs:160-167`,
+   `:584-592`). Reverting the v3 changes at
+   `src/pipeline_admission.rs:87-94` and `:109-116` would leave both tests green.
+   Thus the tests are vacuous with respect to finding #5.
+
+4. **The documented loader limitation is real, but it exposes dead admission
+   branches rather than making the tests acceptable.** The loader silently skips
+   empty-name graph inputs and outputs before constructing the IR
+   (`crates/onnx-runtime-loader/src/graph_builder.rs:118-120`, `:143-146`).
+   Consequently admission cannot reach either dedicated unnamed-port rejection,
+   and a test-engineered `DataType::Undefined` on the named peer is what causes
+   the observed load failure. Handle empty names at the retained-protobuf/loader
+   boundary (or otherwise make the dedicated validation reachable), then assert
+   the actual unnamed-input/output message, model path, and fix guidance.
+
+5. **No new fmt, clippy, test, or architecture-name regression was found.**
+   Findings 1-4 from the earlier review were not reopened.
+
+## Verification
+
+- `cargo fmt -p onnx-genai-ort --check` — exit 0.
+  Tail: `EXIT_STATUS=0`
+- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — exit 0.
+  Tail: `Finished 'dev' profile ... in 0.17s`; `EXIT_STATUS=0`
+- `cargo test -p onnx-genai-ort --test pipeline_admission` — exit 0.
+  Tail: `test result: ok. 11 passed; 0 failed; ...`; `EXIT_STATUS=0`
+- `cargo test -p onnx-genai-ort --tests` — exit 0.
+  Tail: final `tokenizer` test passed; `test result: ok. 1 passed; 0 failed; ...`;
+  `EXIT_STATUS=0`
+- Admission-logic-only architecture grep — no matches (`grep` exit 1, expected
+  for a clean result).
+
+**Specific remaining defect:** the regressions at
+`crates/onnx-genai-ort/tests/pipeline_admission.rs:160-167` do not execute or
+verify the v3 diagnostics and mask the fact that those production branches are
+unreachable after loader projection.
+
+Gaff is locked out from revising this artifact after rejection. Since Leon,
+Sapper, and Gaff have now each owned a rejected revision, escalate to Justin or
+assign a new owner.
+
+<!-- source: .squad/decisions/inbox/deckard-wp-c-v4-review.md -->
+# 🟢 APPROVE — WP-C v4 load-time VLM pipeline admission gate
+
+**Reviewer:** Deckard  
+**Commit:** `f3fd686f12ac4b147154194a08fa54bc9fd1a05d`  
+**Date:** 2026-07-22
+
+## Findings
+
+1. **WHAT — The raw-protobuf unnamed-port checks are reachable.**  
+   **WHY —** `onnx_std::load_model` decodes the original `ModelProto` and stores it
+   unchanged in `Model::source_proto` (`crates/onnx-std/src/model.rs:180-197`);
+   `Model::to_proto()` returns a clone of that retained proto
+   (`crates/onnx-std/src/model.rs:121-135`). This occurs before the execution
+   projection drops empty graph input/output names in
+   `crates/onnx-runtime-loader/src/graph_builder.rs:118-121,143-147`. The passing
+   exact-message tests and mutation result empirically confirm that both new
+   branches at `pipeline_admission.rs:99-118` execute.  
+   **HOW —** No change required.
+
+2. **WHAT — The two regression tests are non-vacuous and isolate only the intended
+   malformed port.**  
+   **WHY —** The fixtures use `onnx_std::ir::{Graph, Node, NodeId, DataType}` plus
+   `Model`/`Model::to_proto`; all named peers are `Float32`. Each fixture adds
+   exactly one unnamed `Float32` top-level input or output and asserts that the
+   generated proto contains it (`tests/pipeline_admission.rs:101-145`). The tests
+   assert the exact cause, full model path, and matching regeneration guidance
+   (`:148-184,601-608`). Commenting out only the two raw-protobuf checks admitted
+   both malformed fixtures, producing exactly two failures; restoring them
+   returned all 11 tests to green.  
+   **HOW —** No change required.
+
+3. **WHAT — Both diagnostics comply with RULES.md §1.**  
+   **WHY —** Each message states what is wrong, why execution cannot proceed,
+   includes `path.display()`, and gives explicit graph/sidecar regeneration
+   guidance (`pipeline_admission.rs:99-118`).  
+   **HOW —** No change required.
+
+4. **WHAT — The implementation remains model-architecture agnostic under
+   RULES.md §2.**  
+   **WHY —** The required architecture-name grep returned no matches. Validation
+   is based only on ONNX graph structure.  
+   **HOW —** No change required.
+
+5. **WHAT — All requested gates pass on the reviewed commit.**  
+   **WHY —** Formatting, clippy with warnings denied, and the complete admission
+   integration test all succeeded. The worktree was restored to a clean
+   `f3fd686f12ac4b147154194a08fa54bc9fd1a05d` after mutation testing.  
+   **HOW —** No change required.
+
+6. **WHAT — The `to_proto()` clone is acceptable.**  
+   **WHY —** It is one bounded transient clone per component during model
+   admission, not a per-token or steady-state execution cost. I found no
+   correctness defect or demonstrated load-time regression that warrants
+   blocking this fix.  
+   **HOW —** No change required.
+
+## Exact command tails
+
+```text
+$ cargo fmt -p onnx-genai-ort --check
+FMT_EXIT_STATUS=0
+
+$ cargo clippy -p onnx-genai-ort --tests -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+CLIPPY_EXIT_STATUS=0
+
+$ cargo test -p onnx-genai-ort --test pipeline_admission
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+TEST_EXIT_STATUS=0
+
+$ rg -n -i 'qwen|gemma|phi|llama|mistral|deepseek|glm' crates/onnx-genai-ort/src/pipeline_admission.rs
+RG_EXIT_STATUS=1
+
+$ cargo test -p onnx-genai-ort --test pipeline_admission  # raw checks commented out
+failures:
+    admission_rejects_unnamed_graph_input_from_retained_proto
+    admission_rejects_unnamed_graph_output_from_retained_proto
+test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+MUTATION_EXIT_STATUS=101
+
+$ cargo test -p onnx-genai-ort --test pipeline_admission  # checks restored
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESTORED_TEST_EXIT_STATUS=0
+
+$ git status --short && git rev-parse HEAD
+f3fd686f12ac4b147154194a08fa54bc9fd1a05d
+```
+
+**Verdict:** v4 genuinely fixes both fatal v3 issues: admission now observes the
+retained source protobuf before loader filtering, and the regressions fail when
+that validation is removed.
+
+<!-- source: .squad/decisions/inbox/gaff-wp-c-finding5-fix.md -->
+### 2026-07-22: WP-C finding #5 fix (unnamed graph-port diagnostics)
+**By:** Gaff
+**What:** Updated both unnamed ONNX graph-input and graph-output admission diagnostics to include `path.display()` and retain explicit graph-regeneration guidance. Added separate unnamed-input and unnamed-output regression cases in `crates/onnx-genai-ort/tests/pipeline_admission.rs`, constructing the models through the `onnx_std` IR (`Graph`, `Node`, `Model`, and `Model::to_proto`). Commit: `60e75ef1db831910b36b4b1f27aee22a37304cbf`.
+**Why:** RULES.md §1 requires inspection/admission failures to preserve the model path and underlying cause. The protobuf loader currently drops empty-name graph `ValueInfo` entries before the admission scanner can reach its dedicated unnamed-port branches, so the tests document that limitation and assert the model path on the closest reachable component-inspection rejection while verifying that the serialized input/output is genuinely unnamed.
+
+Verification:
+- `cargo fmt -p onnx-genai-ort --check` — PASS (exit 0, no output)
+- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — PASS
+- `cargo test -p onnx-genai-ort --test pipeline_admission` — PASS (11 passed, 0 failed)
+- `cargo test -p onnx-genai-ort --tests` — PASS (81 passed, 0 failed)
+
+Architecture-name grep on the added admission-logic diff (`gemma|qwen|phi|llama|mistral|deepseek`) — clean.
+
+<!-- source: .squad/decisions/inbox/holden-wp-c-v4-fix.md -->
+### 2026-07-22: WP-C v4 root-cause fix
+**By:** Holden
+**What:** Chose direction **B**. Pipeline admission now validates top-level graph input/output names in the retained raw `ModelProto` before scanning the loader's execution IR. Replaced the vacuous unnamed-port fixtures with valid IR-built models whose only defect is an extra unnamed graph input or output, and asserted the precise cause, filesystem model path, and regeneration guidance.
+**Why:** `onnx_std::load_model` and `onnx_std::textproto::from_textproto` return `onnx_std::Model`, which retains the exact source protobuf and exposes it through `Model::to_proto()`. Admission therefore already has legitimate access to the raw graph without changing the loader contract. This is the smallest honest way to validate names before `onnx-runtime-loader/src/graph_builder.rs:118-121` and `:143-147` project empty-name ports out of the IR.
+
+**Code changes:**
+- `crates/onnx-genai-ort/src/pipeline_admission.rs:82-118` — obtain the retained `ModelProto`, require a graph, and reject empty top-level `GraphProto.input`/`output` names with component, model path, cause, execution impact, and fix guidance.
+- `crates/onnx-genai-ort/src/pipeline_admission.rs:120-153` — scan the loaded IR only after raw-name validation; removed the unreachable IR-level unnamed-port rejection closures and documented the loader projection seam.
+- `crates/onnx-genai-ort/tests/pipeline_admission.rs:101-184` — rebuilt unnamed-port fixtures exclusively with `ir::Graph`, `ir::Node`, `ir::Model`, and `Model::to_proto`; all named peers now use valid `Float32` types, eliminating the unrelated `DataType::Undefined` load failure.
+- `crates/onnx-genai-ort/tests/pipeline_admission.rs:601-608` — renamed the two regressions to state that they exercise retained-protobuf admission.
+
+**Non-vacuity proof:**
+- Both tests assert the exact unnamed-input/output cause, the exact filesystem model path, and the corresponding explicit-name regeneration guidance.
+- A mutation run removed only the new raw-protobuf input/output checks. Both fixtures were then admitted, so both tests failed at `expect_err`: `0 passed; 2 failed`, `MUTATION_EXIT_STATUS=101`. Restoring the production checks returned both tests to green. Thus reverting the claimed production behavior cannot leave either test passing.
+
+**Verification tails:**
+```text
+$ cargo fmt -p onnx-genai-ort --check
+EXIT_STATUS=0
+
+$ cargo clippy -p onnx-genai-ort --tests -- -D warnings
+    Checking onnx-genai-ort v0.1.0-dev.3 (...)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.87s
+EXIT_STATUS=0
+
+$ cargo test -p onnx-genai-ort --test pipeline_admission
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+EXIT_STATUS=0
+
+$ cargo test -p onnx-genai-ort --tests
+test tiny_tokenizer_round_trip ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+EXIT_STATUS=0
+
+$ rg -n -i 'qwen|gemma|phi[-_0-9a-z]*|llama|mistral|deepseek|glm[-_0-9a-z]*' crates/onnx-genai-ort/src/pipeline_admission.rs
+RG_EXIT_STATUS=1 (1 means clean)
+```
+
+**Commit:** `f3fd686f12ac4b147154194a08fa54bc9fd1a05d`
+
+**Residual risk:** `Model::to_proto()` clones the retained protobuf once per component during load-time admission, adding bounded transient load-time memory proportional to model protobuf size. No loader, runtime execution, or admission-name inference contract was expanded.
+
+<!-- source: .squad/decisions/inbox/keaton-phase1-seam.md -->
+### 2026-07-22: Split capture-region policy from kernel capture mechanism
+**By:** Keaton
+**What:** Phase 1 uses a per-node EP hook, `ExecutionProvider::plan_capture_region(node, shape_status) -> Option<StructuralCaptureDecline>`. The EP owns the ordered structural predicates: control-flow/sequence classification, then unresolved output shape, then unresolved input shape. The executor converts that structural result to the existing `CaptureDecline`, and only when the hook admits the node does it apply the existing kernel-cache checks in order: `KernelNotWarmed`, then the compiled kernel's `CaptureSupport` decline (`KernelCaptureUnsupported`). The executor continues to form maximal contiguous segments and enforce persistent graph-output bindings.
+**Why:** The executor alone owns the shape-keyed compiled-kernel cache, so kernel warmth and concrete-kernel capture support cannot move behind an EP-only graph hook without changing ownership or behavior. A per-node structural annotation is the clean EP↔executor seam: it passes only the node plus resolved-input/output presence, keeps structural policy model-agnostic and EP-owned, and leaves cache/kernel inspection as executor mechanism. The combined precedence is exactly the pre-refactor order—host/sequence, unresolved output, unresolved input, unwarmed kernel, kernel decline—so every node produces the same `Option<CaptureDecline>`, including identical `SeamReason` and reason text.
+
+<!-- source: .squad/decisions/inbox/leon-keaton-phase1-review.md -->
+### 2026-07-22: Phase 1 partial-CUDA-graph EP-capture-hook refactor — INDEPENDENT REVIEW 🟢 GREEN
+
+**By:** Leon (senior engine reviewer; independent — not the author)
+
+**What:** Reviewed Keaton's Phase 1 refactor on `squad/keaton-ep-capture-hook` @ 3390ba6
+(EP hook `plan_capture_region` + `StructuralCaptureDecline`/`CaptureRegionShapeStatus`;
+executor `node_capture_reason` refactor). Verdict: **🟢 GREEN — safe to merge.**
+
+Checklist results (all verified against merge-base e1eeae4, diff vs origin/main):
+
+1. **Byte-identical precedence ✅** — Combined EP-hook + executor evaluation reproduces the
+   pre-refactor `node_capture_reason` exactly. Short-circuit order preserved:
+   host/sequence → unresolved-output → unresolved-input → kernel-not-warmed →
+   kernel-capture-unsupported. The hook computes control-flow → output → input in that order;
+   executor eagerly computes both shape-status booleans but that has no ordering side effect
+   (hook returns by precedence). SeamReason mapping is 1:1 and reason STRINGS are character-for-
+   character identical to the originals (verified against `origin/main` lines 2650–2712).
+2. **Shape-status fidelity ✅** — `outputs_resolved = outputs.all(contains_key)` == old
+   `!outputs.any(!contains_key)`. `inputs_resolved` match{Some→contains_key, None→true} exactly
+   reproduces old `.map(...).unwrap_or(Some(vec![])).collect::<Option<Vec<_>>>()` (None input =
+   present/empty). KernelKey input_shapes reconstruction (`map_or_else(Vec::new, expect)`) yields
+   the identical shapes vector; the `.expect`/`assert!` are safe under the hook invariant.
+3. **Model-agnostic ✅** — No model-name/architecture branching in the hook, its default impl,
+   or `is_control_flow_or_sequence`. Classification is purely structural (op_type + ai.onnx domain).
+4. **Default impl vs overrides ✅** — Only the trait default impl exists (grep: zero overrides).
+   CPU and CUDA EPs both inherit it → stock EPs behave identically. New provider.rs
+   `is_control_flow_or_sequence` op set == old `is_control_flow_op ∪ is_sequence_op` (If/Loop/Scan
+   + 8 Sequence ops), same domain guard.
+5. **Exhaustiveness/types ✅** — `structural_capture_decline` and `reason()` matches are
+   exhaustive (no catch-all). New enum/struct are doc-commented and re-exported via lib.rs.
+6. **Build/test/clippy ✅** — All pass:
+   - `cargo build -p onnx-runtime-ep-api -p onnx-runtime-session` ✅
+   - `cargo build -p onnx-runtime-session --features cuda` ✅
+   - `cargo test -p onnx-runtime-session` ✅ (61 lib incl. new parity test + all integration)
+   - new `ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines` ✅ — GENUINE:
+     builds a 6-node graph and asserts refactored == an inlined copy of the legacy function AND
+     the exact SeamReason sequence [HostControlFlowOrSequence, UnresolvedOutputShape,
+     UnresolvedInputShape, KernelNotWarmed, KernelCaptureUnsupported, None]. Adversarially covers
+     output-before-input precedence (node1 has BOTH unresolved → asserts Output wins) and
+     control-flow-before-shape (node0 is `If` with unresolved shapes → asserts HostControlFlow wins).
+   - `cargo clippy … -D warnings` ✅ and `--features cuda` ✅ (both clean)
+   - `cargo test -p onnx-genai-engine --features native-backend --lib
+     capture_fallback_emits_each_structured_decline_to_tracer` ✅ (1 passed)
+7. **Segmentation unchanged ✅** — `plan_capture_segments` and the graph-output persistent-binding
+   precondition are untouched by the diff.
+
+**Advisory (non-blocking):** The refactor adds `assert!(inputs_resolved && outputs_resolved, …)`
+after the hook admits a node, plus an `.expect` in the KernelKey shape reconstruction. For all
+current EPs (default impl only) these never fire. They are an intentional seam-contract guard for
+future EP overrides that might admit unresolved shapes; behavior is unchanged for stock EPs. Fine
+to merge as-is; worth a doc note in the Phase 2 EP-override guidance.
+
+**Why:** The seam matches design intent (docs/design-ep-partial-cuda-graph.md §9 Phase 1 / Open
+Question #1 §10): structural policy moved into the EP hook, kernel mechanism (warmth + compiled
+CaptureSupport) stays executor-owned, and segmentation is byte-identical. No precedence reorder,
+no shape-status mismatch, no altered reason string, no model-name branching, all checks green.
+
+<!-- source: .squad/decisions/inbox/leon-wp-c-admission-gate.md -->
+### 2026-07-22: Add graph-structural pipeline admission before ORT session creation
+**By:** Leon
+**What:** PipelineModelDirectory now inspects every component's real ONNX input/output signature and rejects non-closed input bindings, prompt-only producers feeding sequence-dependent every-step decoder ports, dtype/rank-incompatible dataflow edges, and incomplete declared image preprocessing/vision construction before PipelineModels creates any ORT session. ONNX graph-input initializers count as defaults; declared KV/fixed state and runtime-generated sequence/mask/position/timestep inputs count as generated or stateful bindings.
+**Why:** Multi-model sidecars can be structurally valid metadata while still being non-executable. The gate is model-agnostic: it uses only pipeline components, phases, strategies, dataflow, typed preprocessing declarations, explicit model I/O, and graph-derived names/dtypes/ranks/symbolic dimensions, with no model-family names or fixed architecture counts.
+
+<!-- source: .squad/decisions/inbox/pris-wp-b1-schema.md -->
+### 2026-07-22: WP-B1 metadata schema (optional-modality contract)
+**By:** Pris
+**What:** Added the generic optional-input fallback and phase-presence schema, updated all exhaustive construction sites with mechanical defaults, regenerated the committed JSON schema, and added serde round-trip coverage.
+**Why:** Optional modalities require explicit metadata for absent tensors and conditional component execution without model-, architecture-, or port-name inference.
+
+## Exact schema additions
+
+- `ModelIoSpec.optional_inputs: BTreeMap<String, OptionalInputSpec>`
+  - `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
+- `OptionalInputSpec { presence: String, absent: AbsentInputSpec }`
+  - `presence` is enforced as a non-empty opaque string.
+- `AbsentInputSpec { kind: AbsentInputKind, shape: Vec<TensorDimension> }`
+- `AbsentInputKind::Zeros`
+  - `#[serde(rename_all = "snake_case")]`; serializes as `"zeros"`.
+- `TensorDimension::{Fixed(i64), Symbol(String)}`
+  - Untagged bare integer/string serde representation.
+  - Negative fixed dimensions and empty symbols are rejected.
+- `PhaseConfig.when_present: Option<String>`
+  - `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  - Enforced as non-empty when present.
+
+Definitions: `crates/onnx-genai-metadata/src/schema.rs:518-695`,
+`crates/onnx-genai-metadata/src/schema.rs:1359-1420`.
+
+## Mechanical construction-site updates
+
+- `crates/onnx-genai-metadata/src/parser.rs:273`
+  - `optional_inputs: std::collections::BTreeMap::new()`
+- `crates/onnx-genai-engine/src/native_decode.rs:2650`
+  - `optional_inputs: BTreeMap::new()`
+- `crates/onnx-genai-engine/src/pipeline.rs:4705`
+  - `when_present: None`
+- `crates/onnx-genai-engine/src/pipeline.rs:4712`
+  - `when_present: None`
+
+Re-ran the requested exhaustive-literal grep across `crates/`; no other
+`ModelIoSpec` or `PhaseConfig` construction sites require updates.
+
+## Round-trip test
+
+`crates/onnx-genai-metadata/src/schema.rs:2417`
+(`optional_modality_schema_round_trips`) proves:
+
+1. A legacy document without either new field deserializes and serializes without emitting defaults.
+2. A document containing `optional_inputs` and `when_present` round-trips exactly.
+3. `AbsentInputKind::Zeros` serializes as `"zeros"`.
+4. `TensorDimension` accepts both `0` and `"sequence_len"`.
+5. Negative fixed dimensions and empty presence keys are rejected.
+
+The generated `schema/inference_metadata.schema.json` was refreshed and its
+schema-sync test passes.
+
+## Verification tails
+
+`cargo fmt -p onnx-genai-metadata --check`
+```text
+(no output; exit status 0)
+```
+
+`cargo clippy -p onnx-genai-metadata --tests -- -D warnings`
+```text
+    Checking onnx-genai-metadata v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-metadata)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.06s
+```
+
+`cargo test -p onnx-genai-metadata`
+```text
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/schema_sync.rs (target/debug/deps/schema_sync-d71939150098efe1)
+
+running 1 test
+test committed_inference_metadata_schema_is_current ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests onnx_genai_metadata
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`cargo build -p onnx-genai-engine`
+```text
+   Compiling onnx-genai-metadata v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-metadata)
+   Compiling onnx-genai-preprocess v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-preprocess)
+   Compiling onnx-genai-kv v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-kv)
+   Compiling onnx-genai-scheduler v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-scheduler)
+   Compiling onnx-genai-genai-config v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-genai-config)
+   Compiling onnx-genai-ort v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-ort)
+   Compiling onnx-genai-engine v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.73s
+```
+
+## Git
+
+- Branch: `squad/pris-wp-b1-schema`
+- Commit: `c18807440c79172e73ac73a7924193cb71f01c3d`
+- Pushed: `origin/squad/pris-wp-b1-schema`
+
+<!-- source: .squad/decisions/inbox/roy-gemma4-e2b-reexport.md -->
+### 2026-07-22: Gemma4 E2B corrected native-contract re-export
+**By:** Roy
+**What:** Re-exported `google/gemma-4-E2B-it` from Mobius `main` commit `640c1cb` using task `gemma4`, CPU-targeted optimization, fp16 weights, and `--runtime onnx-genai`. The emitted metadata closes over all four ONNX component graphs and passes all five requested contract checks.
+**Why:** PR #418 changed native VLM metadata emission from an incomplete prompt-only contract into a graph-derived executable contract. This re-export verifies the merged producer against the real cached E2B checkpoint.
+
+## Export
+
+- **Status:** PASS
+- **Mobius commit:** `640c1cb Emit executable native VLM contracts (#418)`
+- **Task:** `gemma4` (`gemma4_unified` was not used)
+- **Target:** CPU (`--ep cpu`)
+- **Package:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native`
+- **Package size:** 11G
+- **Metadata:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native/inference_metadata.yaml` (19,625 bytes, 948 lines)
+- **Export log:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native-export.log`
+- **Verification log:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native-verification.txt`
+
+The execution environment disallowed the requested `/tmp` scratch location, so the persistent package was written to Mobius's repo-local `.scratch` directory instead.
+
+```bash
+cd /home/justinchu/mobius
+HF_HUB_OFFLINE=1 python3 -m mobius build \
+  --config /home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/70af34e20bd4b7a91f0de6b22675850c43922a03 \
+  --task gemma4 \
+  .scratch/gemma4-e2b-native \
+  --dtype f16 \
+  --runtime onnx-genai \
+  --ep cpu \
+  --optimize
+```
+
+The build exited 0 and reported:
+
+```text
+Saved decoder to .scratch/gemma4-e2b-native/decoder/model.onnx
+Saved vision_encoder to .scratch/gemma4-e2b-native/vision_encoder/model.onnx
+Saved audio_encoder to .scratch/gemma4-e2b-native/audio_encoder/model.onnx
+Saved embedding to .scratch/gemma4-e2b-native/embedding/model.onnx
+  inference_metadata: .scratch/gemma4-e2b-native/inference_metadata.yaml
+```
+
+No Mobius source files were modified.
+
+## Relevant exact metadata excerpts
+
+### Decoder sequence inputs
+
+```yaml
+- name: inputs_embeds
+  dtype: fp16
+  rank: 3
+  shape:
+  - batch
+  - sequence_len
+  - 1536
+  source:
+    kind: dataflow
+    from: embedding.inputs_embeds
+```
+
+```yaml
+- name: per_layer_inputs
+  dtype: fp16
+  rank: 3
+  shape:
+  - batch
+  - sequence_len
+  - 8960
+  source:
+    kind: dataflow
+    from: embedding.per_layer_inputs
+```
+
+### Dataflow and every-step phases
+
+```yaml
+dataflow:
+- from: embedding.inputs_embeds
+  to: decoder.inputs_embeds
+  dtype: fp16
+  rank: 3
+  device_transfer: false
+- from: embedding.per_layer_inputs
+  to: decoder.per_layer_inputs
+  dtype: fp16
+  rank: 3
+  device_transfer: false
+- from: vision_encoder.image_features
+  to: embedding.image_features
+  dtype: fp16
+  rank: 2
+  device_transfer: false
+strategy:
+  kind: composite
+  stages:
+  - name: run_vision_encoder
+    strategy:
+      kind: single_pass
+      model: vision_encoder
+    run_on: prompt_only
+  - name: run_audio_encoder
+    strategy:
+      kind: single_pass
+      model: audio_encoder
+    run_on: prompt_only
+  - name: run_embedding
+    strategy:
+      kind: single_pass
+      model: embedding
+    run_on: every_step
+  - name: run_decoder
+    strategy:
+      kind: autoregressive
+      decoder: decoder
+    run_on: every_step
+phases:
+  decoder:
+    run_on: every_step
+  vision_encoder:
+    run_on: prompt_only
+  audio_encoder:
+    run_on: prompt_only
+  embedding:
+    run_on: every_step
+```
+
+### Representative typed KV declarations
+
+The metadata contains the corresponding key and value declarations for layers 0 through 14. These exact excerpts show both trailing dimensions:
+
+```yaml
+- name: past_key_values.0.key
+  dtype: fp16
+  rank: 4
+  shape:
+  - batch
+  - 1
+  - past_sequence_len
+  - 256
+  source:
+    kind: stateful
+    from: decoder.present.0.key
+    update: append
+```
+
+```yaml
+- name: past_key_values.4.key
+  dtype: fp16
+  rank: 4
+  shape:
+  - batch
+  - 1
+  - past_sequence_len
+  - 512
+  source:
+    kind: stateful
+    from: decoder.present.4.key
+    update: append
+```
+
+The parsed per-layer K/V trailing dimensions were:
+
+```text
+layer:    0   1   2   3   4   5   6   7   8   9  10  11  12  13  14
+head_dim: 256 256 256 256 512 256 256 256 256 512 256 256 256 256 512
+```
+
+Every key and value input and output is `dtype: fp16`, `rank: 4`.
+
+### Vision endpoints
+
+```yaml
+vision_encoder:
+  filename: vision_encoder/model.onnx
+  type: vision_encoder
+  io:
+    inputs:
+    - name: pixel_values
+      dtype: fp16
+      rank: 3
+      shape:
+      - batch
+      - num_patches
+      - 768
+      source:
+        kind: generated
+        generator: image_preprocessing
+    - name: pixel_position_ids
+      dtype: int64
+      rank: 3
+      shape:
+      - batch
+      - num_patches
+      - 2
+      source:
+        kind: generated
+        generator: image_preprocessing
+```
+
+```yaml
+outputs:
+- name: vision_encoder.pixel_values
+  content: pixels
+  dtype: fp16
+- name: vision_encoder.pixel_position_ids
+  content: patch_coordinates
+  dtype: int64
+  pad_value: -1
+```
+
+## Requested verification
+
+### 1. Decoder consumes both every-step embedding outputs — PASS
+
+Evidence:
+
+- `embedding.inputs_embeds -> decoder.inputs_embeds`, `dtype: fp16`, `rank: 3`.
+- `embedding.per_layer_inputs -> decoder.per_layer_inputs`, `dtype: fp16`, `rank: 3`.
+- Both decoder inputs declare their source as the matching embedding endpoint.
+- Decoder phase is `run_on: every_step`.
+
+### 2. Embedding emits/runs every step — PASS
+
+Evidence:
+
+- Embedding declares both `inputs_embeds` and `per_layer_inputs` outputs.
+- `run_embedding` stage is `run_on: every_step`.
+- `pipeline.phases.embedding.run_on` is `every_step`.
+
+### 3. All 15 typed mixed-dimension K/V pairs — PASS
+
+Programmatic metadata inspection found:
+
+```text
+kv_input_tensors=30
+kv_output_tensors=30
+kv_layers=15
+layers=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+kv_head_dims=[256, 512]
+```
+
+All 30 state inputs and all 30 state outputs explicitly declare `dtype: fp16` and `rank: 4`. Layers 4, 9, and 14 retain head dimension 512; the other layers retain 256.
+
+### 4. Typed vision endpoints — PASS
+
+Evidence:
+
+- `pixel_values`: fp16, rank 3, `[batch, num_patches, 768]`.
+- `pixel_position_ids`: int64, rank 3, `[batch, num_patches, 2]`.
+- The image preprocessor emits the exact qualified endpoints `vision_encoder.pixel_values` and `vision_encoder.pixel_position_ids` with matching dtypes.
+
+### 5. No model-name/model-type hardcoded contract assumptions — PASS
+
+Metadata grep:
+
+```bash
+grep -Ein '(^|[[:space:]])(model_name|model_type)[[:space:]]*:|google/gemma|gemma-4|E2B' \
+  inference_metadata.yaml
+```
+
+Result: no matches.
+
+A broader identity grep has one descriptive architecture value:
+
+```text
+13:  architecture: gemma4_text
+```
+
+This is the standard top-level architecture descriptor, not a pipeline/preprocessing/IO dispatch condition. The native metadata emitter itself contains no `gemma`, checkpoint ID, or E2B branch. Its sole `model_type` identifier is a generic helper parameter used to write component roles such as `vision_encoder`; all emitted ports, edges, phases, dtypes, ranks, shapes, KV geometry, and image bindings are derived structurally.
+
+## Closure and consumer validation
+
+The emitted declarations exactly matched the saved ONNX graph ports:
+
+```text
+closure_decoder=inputs_match:true outputs_match:true graph_inputs:34 declared_inputs:34 graph_outputs:31 declared_outputs:31
+closure_vision_encoder=inputs_match:true outputs_match:true graph_inputs:2 declared_inputs:2 graph_outputs:1 declared_outputs:1
+closure_audio_encoder=inputs_match:true outputs_match:true graph_inputs:2 declared_inputs:2 graph_outputs:2 declared_outputs:2
+closure_embedding=inputs_match:true outputs_match:true graph_inputs:3 declared_inputs:3 graph_outputs:2 declared_outputs:2
+```
+
+The current onnx-genai native consumer also parsed and resolved the package:
+
+```text
+runtime_parse=PASS models=4 model_paths=4 metadata=/home/justinchu/mobius/.scratch/gemma4-e2b-native/inference_metadata.yaml
+```
+
+## Native E2E gap
+
+The corrected emission itself is complete for the requested checks, and the native runtime loader accepts it. A normal image-only generation E2E remains blocked by the known optional-audio contract gap: this four-model checkpoint's embedding graph requires external rank-2 fp16 `embedding.audio_features`, while the audio encoder produces rank-3 features and is therefore correctly not connected by an incompatible guessed edge. A caller must provide compatible external audio features, or WP-B must add typed audio flattening/optional-modality/default semantics. Full ORT token generation was not claimed or run.
+
+<!-- source: .squad/decisions/inbox/roy-gemma4-e2b-topology.md -->
+### 2026-07-22: Gemma4 E2B emitted ONNX runtime topology
+**By:** Roy
+**What:** Exported the cached `google/gemma-4-E2B-it` checkpoint through Mobius task `gemma4` with fp16 CUDA-targeted optimization and captured the exact emitted ONNX and metadata contract. The real package is a **four-model** vision+audio+embedding+decoder topology, not the assumed three-model VLM topology.
+**Why:** Runtime work must be driven by the actual graph ports, dtypes, ranks, phases, and dataflow, not by reading `_gemma4.py` or adding model-name branches. This artifact identifies which generic primitives already exist in onnx-genai and which producer/runtime contracts still block real E2B execution.
+
+## Export result
+
+- **Status:** succeeded; no Mobius source changes.
+- **Mobius task:** `gemma4` (`Gemma4Task`).
+- **Duration:** 86 seconds.
+- **Output:** `/home/justinchu/gemma4-e2b-onnx`, 11,272,112,857 bytes (`du -sh`: 11G).
+- **External data:** default ONNX external-data files (`model.onnx.data`).
+- **Topology correction:** four ONNX models were emitted because the cached source config contains an audio tower: `vision_encoder`, `audio_encoder`, `embedding`, `decoder`.
+- **Assistant note:** `google/gemma-4-E2B-it-assistant` remains cached at `/home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it-assistant` for a later speculative-decoding test; it was not exported here.
+
+Exact working command:
+
+```bash
+cd /home/justinchu/mobius
+HF_HUB_OFFLINE=1 python3 -m mobius build --config /home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/70af34e20bd4b7a91f0de6b22675850c43922a03 --task gemma4 /home/justinchu/gemma4-e2b-onnx --dtype f16 --runtime onnx-genai --ep cuda --optimize
+```
+
+The CLI accepts `f16`/`float16`, not `fp16`. The initially preferred `--model google/gemma-4-E2B-it` offline path could not resolve the cache because `refs/main` points to an incomplete snapshot; using the complete local snapshot through `--config` kept the build fully offline.
+
+## Emitted ONNX I/O contract
+
+| Model file | Direction | Tensor | Dtype | Shape |
+|---|---|---|---|---|
+| `audio_encoder/model.onnx` | input | `input_features` | `FLOAT16` | `[batch, time, 128]` |
+| `audio_encoder/model.onnx` | input | `input_features_mask` | `BOOL` | `[batch, time]` |
+| `audio_encoder/model.onnx` | output | `audio_features` | `FLOAT16` | `[batch, floor(floor(time/2 - 1/2)/2) + 1, 1536]` |
+| `audio_encoder/model.onnx` | output | `audio_features_mask` | `BOOL` | `[batch, _d1]` |
+| `decoder/model.onnx` | input | `inputs_embeds` | `FLOAT16` | `[batch, sequence_len, 1536]` |
+| `decoder/model.onnx` | input | `attention_mask` | `INT64` | `[batch, past_seq_len + seq_len]` |
+| `decoder/model.onnx` | input | `per_layer_inputs` | `FLOAT16` | `[batch, sequence_len, 8960]` |
+| `decoder/model.onnx` | input | `past_key_values.0.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.0.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.1.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.1.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.2.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.2.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.3.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.3.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.4.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
+| `decoder/model.onnx` | input | `past_key_values.4.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
+| `decoder/model.onnx` | input | `past_key_values.5.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.5.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.6.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.6.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.7.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.7.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.8.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.8.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.9.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
+| `decoder/model.onnx` | input | `past_key_values.9.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
+| `decoder/model.onnx` | input | `past_key_values.10.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.10.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.11.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.11.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.12.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.12.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.13.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.13.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
+| `decoder/model.onnx` | input | `past_key_values.14.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
+| `decoder/model.onnx` | input | `past_key_values.14.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
+| `decoder/model.onnx` | output | `logits` | `FLOAT16` | `[batch, sequence_len, 262144]` |
+| `decoder/model.onnx` | output | `present.0.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.0.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.1.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.1.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.2.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.2.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.3.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.3.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.4.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
+| `decoder/model.onnx` | output | `present.4.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
+| `decoder/model.onnx` | output | `present.5.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.5.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.6.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.6.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.7.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.7.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.8.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.8.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.9.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
+| `decoder/model.onnx` | output | `present.9.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
+| `decoder/model.onnx` | output | `present.10.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.10.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.11.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.11.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.12.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.12.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.13.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.13.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
+| `decoder/model.onnx` | output | `present.14.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
+| `decoder/model.onnx` | output | `present.14.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
+| `embedding/model.onnx` | input | `input_ids` | `INT64` | `[batch, sequence_len]` |
+| `embedding/model.onnx` | input | `image_features` | `FLOAT16` | `[num_image_tokens, 1536]` |
+| `embedding/model.onnx` | input | `audio_features` | `FLOAT16` | `[num_audio_tokens, 1536]` |
+| `embedding/model.onnx` | output | `inputs_embeds` | `FLOAT16` | `[batch, sequence_len, 1536]` |
+| `embedding/model.onnx` | output | `per_layer_inputs` | `FLOAT16` | `[batch, sequence_len, 8960]` |
+| `vision_encoder/model.onnx` | input | `pixel_values` | `FLOAT16` | `[batch, num_patches, 768]` |
+| `vision_encoder/model.onnx` | input | `pixel_position_ids` | `INT64` | `[batch, num_patches, 2]` |
+| `vision_encoder/model.onnx` | output | `image_features` | `FLOAT16` | `[_d0*batch, 1536]` |
+
+## Generated `inference_metadata.yaml` (verbatim)
+
+```yaml
+required_capabilities:
+- kv_cache
+- grouped_query_attention
+model:
+  attention:
+    type: grouped_query
+    num_attention_heads: 8
+    num_kv_heads: 1
+    head_dim: 256
+    sliding_window: 512
+  architecture: gemma4_text
+  max_sequence_length: 131072
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder/model.onnx
+      type: vision_encoder
+    audio_encoder:
+      filename: audio_encoder/model.onnx
+      type: audio_encoder
+    embedding:
+      filename: embedding/model.onnx
+      type: encoder
+    decoder:
+      filename: decoder/model.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+  dataflow:
+  - from: vision_encoder.image_features
+    to: embedding.image_features
+    dtype: fp16
+    device_transfer: false
+  - from: audio_encoder.audio_features
+    to: embedding.audio_features
+    dtype: fp16
+    device_transfer: false
+  - from: embedding.inputs_embeds
+    to: decoder.inputs_embeds
+    dtype: fp16
+    device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+    - name: encode_vision
+      strategy:
+        kind: single_pass
+        model: vision_encoder
+      run_on: prompt_only
+    - name: encode_audio
+      strategy:
+        kind: single_pass
+        model: audio_encoder
+      run_on: prompt_only
+    - name: fuse_embeddings
+      strategy:
+        kind: single_pass
+        model: embedding
+      run_on: prompt_only
+    - name: decode
+      strategy:
+        kind: autoregressive
+        decoder: decoder
+      run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    audio_encoder:
+      run_on: prompt_only
+    embedding:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step
+```
+
+## Runtime gap analysis
+
+### Contract facts that replace assumptions
+
+1. **The export is four-model, not three-model.** The embedding graph requires both `image_features` and `audio_features`. The audio encoder emits rank-3 `audio_features` plus `audio_features_mask`, while embedding expects rank-2 `audio_features`; the emitted metadata routes the former directly and ignores the mask. An image-only run therefore needs either a generically selected vision-only export or declared optional-modality/default/reshape semantics.
+2. **Vision has two typed endpoints:** fp16 `pixel_values [B,N,768]` and int64 `pixel_position_ids [B,N,2]`. The generated YAML declares neither `preprocessing.image` outputs nor `pipeline.vision` expansion, so the server cannot construct or bind either endpoint from an image request.
+3. **Embedding produces two sequence-dependent decoder inputs:** fp16 `inputs_embeds [B,S,1536]` and fp16 `per_layer_inputs [B,S,8960]`. The YAML routes only `inputs_embeds` and marks embedding `prompt_only`; `per_layer_inputs` is therefore absent at decoder binding and neither output is refreshed during decode.
+4. **The optimized decoder has no `input_ids` and no `position_ids` input.** Its non-KV inputs are `inputs_embeds`, `attention_mask`, and `per_layer_inputs`, followed by 15 K/V pairs. A Gemma-specific position-ID workaround would be wrong for this artifact.
+5. **Metadata is not an executable closure over graph inputs.** It omits explicit component `io`, the `per_layer_inputs` edge, image preprocessing/expansion, optional modality semantics, and exact graph-derived KV declarations. A producer-side contract validator should reject this sidecar before packaging.
+
+### Known Leon VLM gaps, checked against current source and this export
+
+| Area | Current onnx-genai support | What still blocks this package |
+|---|---|---|
+| Multi-endpoint vision inputs | **Generic primitive now exists.** The typed image program/server bundle resolves arbitrary named outputs, declared dtypes, packed/rank-3 tensors, and auxiliary coordinates (`state.rs` typed binding path; preprocess packed tests include Gemma-shaped pixels + positions). | Mobius emitted no typed image program, no endpoint bindings, and no `pipeline.vision` placeholder/expansion contract. The runtime must not fall back to literal `pixel_values` discovery or rank-4 assumptions. |
+| Generic `every_step` upstream execution | **Generic primitive now exists.** The engine topologically runs declared `every_step` components and routes all outputs; `vlm_multibinding_pipeline_e2e` proves two refreshed outputs plus simultaneous raw IDs. | The sidecar incorrectly marks embedding `prompt_only` and emits only one of two embedding→decoder edges. Fix emission; do not reintroduce a one-output or model-name special case. |
+| Decoder position-id rank/shape | **Generic declared position programs now exist.** | This optimized E2B decoder exposes **no position input**, so position generation is not a blocker for this model. Keep rank/axes metadata-driven for other VLMs; do not add a Gemma branch or invent `[1,S]`. |
+| Optional modality/audio path | Server audio discovery is still literal and Float32-only, while this graph declares fp16 `input_features` plus a bool mask. Prompt component execution requires every graph input. | Either export a generic vision-only package, or add typed optional-modality execution/defaults and audio tensor bundles/transforms. Direct rank-3 audio→rank-2 embedding routing is not executable as emitted. |
+
+All follow-up changes must obey `RULES.md` §2: derive behavior from metadata, graph I/O, shapes, dtypes, registries, and explicit configuration; no `gemma4`/model-name dispatch, fixed 35-layer/280-patch constants, or semantic port-name guessing.
+
+## Ordered minimal generic follow-up work packages
+
+1. **WP-A — Mobius executable-contract emission (small/medium, exporter owner).** Introspect every graph port and emit explicit model `io`, exact KV pairs, all dataflow edges (including `embedding.per_layer_inputs -> decoder.per_layer_inputs`), and phase `embedding: every_step`. Emit typed image transforms/outputs and token expansion from processor config. Add a closure validator: every required ONNX input must be external, generated, stateful, defaulted, or fed by exactly one edge; every declared edge must match dtype/rank.
+2. **WP-B — Generic modality selection or optional-component/default semantics (medium, exporter + metadata/runtime).** For a vision request, either build a graph-derived vision-only package whose embedding has no audio input, or declare optional audio components and a typed zero/empty/default path. If audio remains, declare both fp16 features and bool mask plus the generic flatten/strip-padding transform required to satisfy the embedding rank-2 input. No model-family conditionals.
+3. **WP-C — Package admission/load gate (small, runtime loader/server).** Fail before model loading when preprocessing/vision expansion is absent, a required component input is unbound, phase/dataflow leaves a decoder input stale, or an edge has incompatible dtype/rank. Errors must name the exact component.port and instruct regeneration with a corrected native sidecar.
+4. **WP-D — Real E2B parity ladder (medium, validation owner; depends A-C).** With one fixed image/prompt, compare vision outputs, both embedding outputs, prefill logits, and one decode step against a Mobius/ORT reference; then perform the OpenAI image-chat smoke test. Assert that both sequence outputs refresh at decode and keep the emitted 15-pair mixed-256/512-head-dimension KV contract.
+
+No new decoder position work is required for this emitted E2B graph. The architecture-neutral position-program implementation remains necessary for models whose ONNX graph actually declares higher-rank position inputs.
+
+## WP-A corrected export verification
+
+Re-exported from Mobius branch `vlm-wp-a-executable-contract` to
+`/home/justinchu/gemma4-e2b-onnx-wp-a` with the same offline command and `--dtype f16`.
+The persisted sidecar was revalidated against all four saved ONNX graphs:
+`CLOSURE_VALIDATION=PASS`, 15 K/V layers (30 state inputs and 30 state outputs), mixed
+trailing dimensions `[256, 512]`, and typed fp16 pixels + int64 patch coordinates.
+
+```yaml
+dataflow:
+- from: embedding.inputs_embeds
+  to: decoder.inputs_embeds
+  dtype: fp16
+  rank: 3
+  device_transfer: false
+- from: embedding.per_layer_inputs
+  to: decoder.per_layer_inputs
+  dtype: fp16
+  rank: 3
+  device_transfer: false
+- from: vision_encoder.image_features
+  to: embedding.image_features
+  dtype: fp16
+  rank: 2
+  device_transfer: false
+strategy:
+  kind: composite
+  stages:
+  - name: run_vision_encoder
+    strategy: {kind: single_pass, model: vision_encoder}
+    run_on: prompt_only
+  - name: run_audio_encoder
+    strategy: {kind: single_pass, model: audio_encoder}
+    run_on: prompt_only
+  - name: run_embedding
+    strategy: {kind: single_pass, model: embedding}
+    run_on: every_step
+  - name: run_decoder
+    strategy: {kind: autoregressive, decoder: decoder}
+    run_on: every_step
+phases:
+  decoder: {run_on: every_step}
+  vision_encoder: {run_on: prompt_only}
+  audio_encoder: {run_on: prompt_only}
+  embedding: {run_on: every_step}
+```
+
+The old rank-3 `audio_encoder.audio_features` → rank-2 `embedding.audio_features` edge
+is intentionally absent. The embedding port is explicitly declared as an external request
+input until WP-B supplies optional-modality/default or typed audio flattening semantics.
+
+<!-- source: .squad/decisions/inbox/roy-wp-a-contract-emission.md -->
+### 2026-07-22: Emit graph-closed native VLM package contracts
+**By:** Roy
+**What:** Mobius native VLM metadata now emits typed `io.inputs`/`io.outputs` for every component directly from ONNX graph ports (name, dtype, rank, symbolic shape, and input source), routes every dtype/rank-compatible graph edge, marks sequence-producing upstream components `every_step`, declares their token-stream input, and validates the complete sidecar before writing it. Decoder KV input/output lists and geometry come from the real sparse graph ports; the Gemma4 E2B export produced 30 state tensors = 15 K/V layers with mixed 256/512 trailing dimensions. Typed image outputs are exact qualified endpoints derived from the structural processor registry: fp16 `vision_encoder.pixel_values [B,N,768]` and int64 `vision_encoder.pixel_position_ids [B,N,2]`, with patch-budget transforms and coordinate-derived token expansion.
+
+Before, Gemma4 E2B routed only `embedding.inputs_embeds`, ran embedding only during the prompt, omitted typed component ports/KV geometry/image bindings, and emitted an incompatible rank-3 audio-output → rank-2 embedding-input edge. After:
+
+```yaml
+dataflow:
+- from: embedding.inputs_embeds
+  to: decoder.inputs_embeds
+  dtype: fp16
+  rank: 3
+  device_transfer: false
+- from: embedding.per_layer_inputs
+  to: decoder.per_layer_inputs
+  dtype: fp16
+  rank: 3
+  device_transfer: false
+- from: vision_encoder.image_features
+  to: embedding.image_features
+  dtype: fp16
+  rank: 2
+  device_transfer: false
+strategy:
+  kind: composite
+  stages:
+  - name: run_vision_encoder
+    strategy: {kind: single_pass, model: vision_encoder}
+    run_on: prompt_only
+  - name: run_audio_encoder
+    strategy: {kind: single_pass, model: audio_encoder}
+    run_on: prompt_only
+  - name: run_embedding
+    strategy: {kind: single_pass, model: embedding}
+    run_on: every_step
+  - name: run_decoder
+    strategy: {kind: autoregressive, decoder: decoder}
+    run_on: every_step
+phases:
+  decoder: {run_on: every_step}
+  vision_encoder: {run_on: prompt_only}
+  audio_encoder: {run_on: prompt_only}
+  embedding: {run_on: every_step}
+```
+
+The incompatible audio edge is no longer guessed: `embedding.audio_features` is explicitly an external request input until optional-modality/typed-audio transforms are declared (WP-B).
+
+**Why:** A sidecar is executable only when every required `component.port` has exactly one declared source: external, generated, stateful, defaulted, or one compatible dataflow edge. The producer-side validator checks the sidecar against every real graph input/output, rejects missing/duplicate sources and dtype/rank-mismatched edges with WHAT/WHY/HOW errors naming the exact endpoint, and is invoked before YAML serialization. All behavior is derived from graph I/O, shapes/dtypes, processor configuration, and structural registries; there is no model-family dispatch, fixed layer count, patch count, or KV dimension.
+
+Mobius delivery: branch `vlm-wp-a-executable-contract`, commit `6ae7017`, PR
+https://github.com/onnxruntime/mobius/pull/418.
+
+<!-- source: .squad/decisions/inbox/sapper-wp-c-revision.md -->
+### 2026-07-22: WP-C admission gate revision
+**By:** Sapper
+**What:** Revised `squad/leon-vlm-admission-gate` to remove symbolic-shape and port-name semantic inference, validate bindings per port, preserve ONNX model path and parser/I/O causes, and format the `onnx-genai-ort` crate. Temporal producer-phase rejection now fails open because today's metadata does not declare per-port refresh semantics. Binding closure uses only explicit `ModelIoSpec`, positions, KV/cross-KV/state declarations, strategy-generated ports, graph defaults, preprocessing outputs, and dataflow; components without an explicit decoder I/O contract remain eligible for request-supplied `component.port` tensors. Added regressions admitting cached prompt-only `[batch, image_sequence, hidden]` conditioning and mixed routed/request inputs, rejecting undeclared `decoder.past_noise`, and preserving model-load context. Updated the loader fixture to declare decoder I/O explicitly. Missing temporal/external-port schema facts are recorded separately in `sapper-wp-c-schema-blocker.md`.
+**Why:** Deckard rejected the prior gate because shape/name heuristics falsely rejected valid cached conditioning, missed undeclared convention-looking ports, and imposed component-level provenance. The narrowed gate rejects only violations supported by explicit metadata or graph facts and otherwise prefers runtime diagnostics over speculative load-time rejection.
+
+**Pushed branch HEAD:** `0b60958624a54e82ca48bc0fa0cea8f0b9388197`
+
+**Verification:**
+- `cargo test -p onnx-genai-ort --tests` — PASS
+- `cargo test -p onnx-genai-ort --test pipeline_admission` — PASS (9/9)
+- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — PASS
+- `cargo fmt -p onnx-genai-ort --check` — PASS
+
+<!-- source: .squad/decisions/inbox/sapper-wp-c-schema-blocker.md -->
+### 2026-07-22: WP-C metadata facts intentionally left fail-open
+**By:** Sapper
+**What:** The current metadata contract has no per-port temporal semantic (fixed prompt conditioning versus refreshed every step) and no explicit list of request-supplied external pipeline ports. The revision therefore removes temporal stale-input rejection and treats otherwise-unbound ports as request-external unless an autoregressive decoder has an explicit `ModelIoSpec`; only then can an undeclared required decoder port be rejected.
+**Why:** Shape symbols, port names, and component-level dataflow topology cannot prove temporal or external-binding semantics. Adding the missing fields requires metadata-schema and emitter work outside WP-C; failing open avoids false rejection while retaining sound closure checks where today's explicit decoder I/O contract proves a port has no source.
+
+<!-- source: .squad/decisions/inbox/sebastian-wp-a-review.md -->
+### 2026-07-22: Review of mobius PR #418 "VLM WP-A executable-contract emission"
+
+**Reviewer:** Sebastian (independent; author Roy is locked out)
+**Repo/branch:** onnxruntime/mobius `vlm-wp-a-executable-contract` @ `6ae7017` (base `00c8fac` / PR #416)
+**Scope:** `src/mobius/integrations/onnx_genai/inference_metadata.py` (+374), `..._test.py` (+176)
+
+## Verdict: 🟢 APPROVE (do NOT merge — review only)
+
+Emission is structural/graph-derived, generalizes per model CATEGORY, and satisfies every WP-A requirement. Tests genuinely cover the new behavior across three distinct VLM categories. No model-name/architecture dispatch. Ruff clean, 40/40 tests pass.
+
+## WP-A requirements — all verified
+
+1. **`embedding.per_layer_inputs -> decoder.per_layer_inputs` edge** — ✓ Built by structural output→input name+dtype+rank matching across all components (`build_native_vlm_package_metadata`, lines 1158-1186), not hardcoded. Asserted present in `test_gemma4_routes_all_embedding_outputs` (test lines 416-421).
+2. **Embedding phase `run_on: every_step`** — ✓ Derived: `_sequence_decoder_inputs` finds decoder inputs whose leading dims track `logits` dims (lines 812-832); any component feeding one is marked `every_step` (`downstream_to_decoder`, lines 1216-1244). Not name-forced. Asserted (test line 198, 204).
+3. **Explicit typed `io` for ALL components incl. 15 KV pairs derived FROM THE GRAPH (mixed 256/512)** — ✓ `_port_metadata` emits name/dtype/rank/shape for every port; `_state_and_kv_pairs` pairs `past_key_values.<layer>.<role>` ↔ `present.<layer>.<role>` via regex + `config.layer_types`, raising on unclassifiable ports (lines 591-680). Trailing dims come straight from graph shapes. Test uses mixed `kv_head_dims=[8,16,8]` and asserts `past_key_values.1.key` shape[-1]==16 (test line 470) — proves dims are read, not hardcoded.
+4. **Typed vision endpoints fp16 pixel_values + int64 pixel_position_ids** — ✓ Registry-driven `_resolve_image_program` matches structural rank/dtype signatures (`_match_packed_coordinates`: fp float rank-3 pixels + int64 rank-3 coords with last-dim 2). Dtypes taken from graph ports; endpoints named from `port.name`. Asserted (test lines 472-484), incl. `pad_value: -1` for coordinates.
+5. **Producer-side closure validator** — ✓ `validate_executable_closure` (lines 913-1075) checks: every graph input has exactly one source (external/generated/stateful/defaulted/dataflow); every edge maps real output→input with matching dtype/rank; declared io matches graph ports exactly. Invoked before serialization (line 1334). Emits WHAT/WHY/HOW errors. Negative test removes the per_layer_inputs edge and asserts rejection naming `decoder.per_layer_inputs` (test lines 486-496).
+
+## RULES.md §2/§2.1 compliance
+
+- **No model-name/architecture branching.** `grep` for gemma/qwen/phi/llama/architecture==/model_type== in the source found only one unrelated TTS comment. Dispatch is on structural package roles (`vision_encoder`/`embedding`/`decoder` component keys) = model CATEGORY, which the topology note explicitly sanctions.
+- **No fixed constants.** No hardcoded 35-layer/280-patch/256/512 KV dims; all derived from graph shapes and `config.layer_types`/processor config.
+- **Assumptions explicit in metadata.** Unsupported vision signatures and unclassifiable state ports fail loudly with regenerate-instructions rather than guessing.
+- **Audio edge correctly deferred to WP-B.** The incompatible rank-3 `audio_encoder.audio_features` → rank-2 `embedding.audio_features` edge is intentionally NOT emitted; `embedding.audio_features` is declared `external/request`. Asserted (test lines 191, 197).
+
+## Test quality
+
+Tests are non-trivial and category-diverse, proving generalization not overfit:
+- `test_gemma4_routes_all_embedding_outputs` — full 4-model topology (vision+audio+embedding+decoder), mixed KV dims, per_layer edge, every_step, typed image outputs, closure negative case.
+- `test_qwen_packed_grid_rank3_positions...` — area-grid processor, mrope, `linear_attention` layer types (sparse/replace state).
+- `test_phi_routes_both_modality_gates...` — dynamic-HD crop-mask processor.
+- Negative tests: unsupported signature, missing components, rank-3 positions requiring registry, equal-shape KV still declared KV.
+- Three cached-processor tests match emitted programs against real processor configs.
+
+Verified locally: `ruff check` + `ruff format --check` clean; `pytest inference_metadata_test.py` = 40 passed. (lintrunner 0.12.7 adapter env was broken — `lintrunner_adapters` not importable — so ran `ruff` directly per fallback; this is an environment issue, not a PR defect.)
+
+## Non-blocking observations (do not require changes before merge)
+
+- `vision_encoder` (`prompt_only`) and `decoder` (`every_step`) `run_on` are role-assigned rather than structurally derived, unlike embedding/audio. Correct for these categories today; a future refactor could derive all phases uniformly for robustness. Not blocking.
+- Emission still branches on the literal component key `"audio_encoder"` for the `type` label (line 1238). This is a category label, not model dispatch; acceptable, but a role registry keyed on structure would be cleaner long-term.
+
+## Recommendation
+
+Approve for merge by an authorized non-author (coordinator or Justin). WP-B (optional-modality/typed-audio) and WP-C (runtime admission gate) remain the correct next work; nothing in this PR blocks them.
+
+### Fold processed inbox notes
+**By:** Scribe
+**What:** Merged and cleared `bryant-wp-b1-review.md`, `deckard-wp-c-rereview.md`, `deckard-wp-c-review.md`, `deckard-wp-c-v3-review.md`, `deckard-wp-c-v4-review.md`, `gaff-wp-c-finding5-fix.md`, `holden-wp-c-v4-fix.md`, `keaton-phase1-seam.md`, `leon-keaton-phase1-review.md`, `leon-wp-c-admission-gate.md`, `pris-wp-b1-schema.md`, `roy-gemma4-e2b-reexport.md`, `roy-gemma4-e2b-topology.md`, `roy-wp-a-contract-emission.md`, `sapper-wp-c-revision.md`, `sapper-wp-c-schema-blocker.md`, `sebastian-wp-a-review.md`. Preserved active reference/in-flight files `keaton-native-specdecode-design.md`, `leon-vlm-scope.md`, `rachael-wp-b-optional-modality-design.md`, `zhora-deepseek-scope.md`.
+**Why:** Completed implementation, review, revision, benchmark, and schema notes belong in the current decision ledger; active scope/design files remain in the inbox until their work lands.
+
 <!-- scribe-merge-2026-07-22T12-00-00Z-phase0-7b-cudagraph -->
 ## 2026-07-22 — Partial CUDA-graph Phase 0 and Qwen2.5-7B CUDA-graph benchmark
 
