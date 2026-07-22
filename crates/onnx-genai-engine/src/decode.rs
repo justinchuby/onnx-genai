@@ -1777,7 +1777,11 @@ fn is_group_query_attention(attention_type: &str) -> bool {
     let normalized = attention_type.to_ascii_lowercase().replace(['-', ' '], "_");
     matches!(
         normalized.as_str(),
-        "group_query_attention" | "grouped_query_attention" | "gqa"
+        "group_query"
+            | "grouped_query"
+            | "group_query_attention"
+            | "grouped_query_attention"
+            | "gqa"
     )
 }
 
@@ -2839,14 +2843,31 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_group_query_attention_variants() {
-        assert!(is_group_query_attention("group_query_attention"));
-        assert!(is_group_query_attention("group-query-attention"));
-        assert!(is_group_query_attention("Group Query Attention"));
-        assert!(is_group_query_attention("GQA"));
-        assert!(is_group_query_attention("grouped_query_attention"));
-        assert!(!is_group_query_attention("multi_head_attention"));
-        assert!(!is_group_query_attention("attention"));
+    fn is_group_query_attention_recognizes_variants() {
+        for attention_type in [
+            "grouped_query",
+            "group_query",
+            "grouped_query_attention",
+            "group_query_attention",
+            "gqa",
+            "Grouped-Query",
+            "GROUPED QUERY",
+            "group-query-attention",
+            "Group Query Attention",
+            "GQA",
+        ] {
+            assert!(
+                is_group_query_attention(attention_type),
+                "{attention_type:?} should be recognized as GQA"
+            );
+        }
+
+        for attention_type in ["multi_head_attention", "mha", ""] {
+            assert!(
+                !is_group_query_attention(attention_type),
+                "{attention_type:?} should not be recognized as GQA"
+            );
+        }
     }
 
     #[test]
