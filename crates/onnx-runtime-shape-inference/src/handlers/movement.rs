@@ -320,7 +320,29 @@ pub fn unsqueeze_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 
 /// `Unsqueeze` with axes from input 1 (opset ≥ 13).
 pub fn unsqueeze_v13(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_vector_input(ctx, 1, "Unsqueeze")?;
     let axes = const_ints(ctx, 1);
+    if axes.is_none() {
+        let Some(t) = ctx.input_type(0).cloned() else {
+            return Ok(());
+        };
+        let Some(axis_count) = vector_length(ctx, 1) else {
+            return Ok(());
+        };
+        let out_rank =
+            t.rank()
+                .checked_add(axis_count)
+                .ok_or_else(|| ShapeInferError::Invalid {
+                    op: "Unsqueeze".into(),
+                    detail: format!(
+                        "input rank {} plus {axis_count} axes exceeds the supported rank",
+                        t.rank()
+                    ),
+                })?;
+        let out = (0..out_rank).map(|_| ctx.fresh_dim()).collect();
+        ctx.set_output(0, t.dtype, out);
+        return Ok(());
+    }
     unsqueeze_common(ctx, axes)
 }
 

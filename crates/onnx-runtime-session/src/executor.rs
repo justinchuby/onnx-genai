@@ -1049,7 +1049,7 @@ fn dynamic_output_shapes(
         // per-axis element count mirrors the `Slice` kernel's clamp semantics
         // exactly (ONNX reference), so the buffer we size here matches what the
         // kernel writes.
-        "Slice" => {
+        "Slice" if node.domain.is_empty() || node.domain == "ai.onnx" => {
             let data_shape = input_shapes.first()?;
             let starts = input_values.get(1)?.as_ref()?;
             let ends = input_values.get(2)?.as_ref()?;
@@ -6763,9 +6763,23 @@ mod tests {
         assert_eq!(out.len(), 1, "Slice must resolve exactly one output shape");
         assert_eq!(out[0], vec![2, 2]);
 
+        let mut custom_slice = Node::new(NodeId(1), "Slice", vec![], vec![ValueId(0)]);
+        custom_slice.domain = "example.custom".into();
+        assert!(
+            dynamic_output_shapes(
+                &custom_slice,
+                &input_shapes,
+                &input_dtypes,
+                &input_values,
+                17
+            )
+            .is_none(),
+            "ONNX Slice semantics must not be applied to an unrelated custom-domain op"
+        );
+
         // An op the sizer cannot resolve returns None (surfaces as UnresolvedShape).
         let other = Node::new(
-            NodeId(1),
+            NodeId(2),
             "NxrtNeverRegisteredSentinelOp",
             vec![],
             vec![ValueId(0)],

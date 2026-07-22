@@ -139,11 +139,7 @@ fn nonzero_branch() -> Graph {
     let input = branch.create_named_value("local", DataType::Float32, vec![Dim::Static(2)]);
     branch.set_initializer(
         input,
-        WeightRef::Inline(TensorData::from_raw(
-            DataType::Float32,
-            vec![2],
-            vec![0; 8],
-        )),
+        WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![2], vec![0; 8])),
     );
     let output = branch.create_named_value("branch_output", DataType::Int64, Shape::new());
     branch.insert_node(node(0, "NonZero", vec![Some(input)], vec![output]));
@@ -547,6 +543,159 @@ fn shape_data_chain_drives_reshape() {
     assert_eq!(out_shape.len(), 2);
     assert_eq!(out_shape[0], Dim::Symbolic(n_sym));
     assert_eq!(out_shape[1], Dim::Static(512));
+}
+
+#[test]
+fn dynamic_slice_extent_flows_through_unsqueeze_and_broadcast() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let data = graph.create_named_value(
+        "data",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Static(4)],
+    );
+    graph.add_input(data);
+    let ends = graph.create_named_value("ends", DataType::Int64, vec![Dim::Static(1)]);
+    graph.add_input(ends);
+
+    let starts = graph.create_named_value("starts", DataType::Int64, vec![Dim::Static(1)]);
+    graph.set_initializer(
+        starts,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            i64_bytes(&[0]),
+        )),
+    );
+    let slice_axes = graph.create_named_value("slice_axes", DataType::Int64, vec![Dim::Static(1)]);
+    graph.set_initializer(
+        slice_axes,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            i64_bytes(&[1]),
+        )),
+    );
+    let steps = graph.create_named_value("steps", DataType::Int64, vec![Dim::Static(1)]);
+    graph.set_initializer(
+        steps,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            i64_bytes(&[1]),
+        )),
+    );
+    let unsqueeze_axes =
+        graph.create_named_value("unsqueeze_axes", DataType::Int64, vec![Dim::Static(1)]);
+    graph.set_initializer(
+        unsqueeze_axes,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![1],
+            i64_bytes(&[-1]),
+        )),
+    );
+    let thresholds = graph.create_named_value(
+        "thresholds",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Static(1), Dim::Static(2)],
+    );
+    graph.add_input(thresholds);
+
+    let sliced = graph.create_named_value("sliced", DataType::Float32, Shape::new());
+    let unsqueezed = graph.create_named_value("unsqueezed", DataType::Float32, Shape::new());
+    let compared = graph.create_named_value("compared", DataType::Bool, Shape::new());
+    graph.insert_node(node(
+        1,
+        "Slice",
+        vec![
+            Some(data),
+            Some(starts),
+            Some(ends),
+            Some(slice_axes),
+            Some(steps),
+        ],
+        vec![sliced],
+    ));
+    graph.insert_node(node(
+        2,
+        "Unsqueeze",
+        vec![Some(sliced), Some(unsqueeze_axes)],
+        vec![unsqueezed],
+    ));
+    graph.insert_node(node(
+        3,
+        "Less",
+        vec![Some(unsqueezed), Some(thresholds)],
+        vec![compared],
+    ));
+    graph.add_output(compared);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .unwrap();
+
+    let sliced_shape = graph.value(sliced).shape.clone();
+    assert_eq!(sliced_shape.len(), 2);
+    assert_eq!(sliced_shape[0], Dim::Static(2));
+    let Dim::Symbolic(dynamic_extent) = sliced_shape[1] else {
+        panic!("dynamic Slice end must produce a symbolic extent");
+    };
+    assert_eq!(
+        graph.value(unsqueezed).shape,
+        vec![
+            Dim::Static(2),
+            Dim::Symbolic(dynamic_extent),
+            Dim::Static(1),
+        ]
+    );
+    assert_eq!(
+        graph.value(compared).shape,
+        vec![
+            Dim::Static(2),
+            Dim::Symbolic(dynamic_extent),
+            Dim::Static(2),
+        ]
+    );
+}
+
+#[test]
+fn unsqueeze_with_runtime_axes_preserves_known_output_rank() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let data = graph.create_named_value(
+        "data",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+    graph.add_input(data);
+    let axes = graph.create_named_value("axes", DataType::Int64, vec![Dim::Static(2)]);
+    graph.add_input(axes);
+    let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    graph.insert_node(node(
+        1,
+        "Unsqueeze",
+        vec![Some(data), Some(axes)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .unwrap();
+
+    let output_shape = &graph.value(output).shape;
+    assert_eq!(output_shape.len(), 4);
+    assert!(
+        output_shape
+            .iter()
+            .all(|dim| matches!(dim, Dim::Symbolic(_)))
+    );
 }
 
 #[test]

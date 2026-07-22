@@ -383,7 +383,7 @@ fn gqa_decode_growing_cache_extends_present_to_logical_total() {
 }
 
 #[test]
-fn dynamic_slice_shape_propagates_through_unsqueeze_and_comparison_broadcast() {
+fn dynamic_slice_shape_propagates_through_unsqueeze_comparison_and_transpose() {
     let mut g = Graph::new();
     g.opset_imports.insert(String::new(), 17);
 
@@ -393,7 +393,7 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_and_comparison_broadcast() {
     let slice_axes = i64_init(&mut g, "slice_axes", &[1], &[0]);
     let steps = i64_init(&mut g, "steps", &[1], &[1]);
     let unsqueeze_axes = i64_init(&mut g, "unsqueeze_axes", &[1], &[-1]);
-    let thresholds = f32_init(&mut g, "thresholds", &[1, 2], &[1.5, 2.5]);
+    let thresholds = f32_init(&mut g, "thresholds", &[2, 1], &[1.5, 2.5]);
     let dynamic_extent = g.intern_symbol("dynamic_extent");
 
     let data_shape = g.create_value(DataType::Int64, static_shape([1]));
@@ -438,15 +438,30 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_and_comparison_broadcast() {
         vec![unsqueezed],
     ));
 
+    let transposed = g.create_value(
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(dynamic_extent)],
+    );
+    g.mark_value_shape_unknown(transposed);
+    let mut transpose = Node::new(
+        NodeId(0),
+        "Transpose",
+        vec![Some(unsqueezed)],
+        vec![transposed],
+    );
+    transpose
+        .attributes
+        .insert("perm".into(), Attribute::Ints(vec![1, 0]));
+    g.insert_node(transpose);
     let compared = g.create_value(
         DataType::Bool,
-        vec![Dim::Symbolic(dynamic_extent), Dim::Static(2)],
+        vec![Dim::Static(2), Dim::Symbolic(dynamic_extent)],
     );
     g.mark_value_shape_unknown(compared);
     g.insert_node(Node::new(
         NodeId(0),
         "Less",
-        vec![Some(unsqueezed), Some(thresholds)],
+        vec![Some(transposed), Some(thresholds)],
         vec![compared],
     ));
     g.add_output(compared);
@@ -455,9 +470,9 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_and_comparison_broadcast() {
     let data = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let outputs = session.run(&[("data", &data)]).expect("run dynamic chain");
 
-    assert_eq!(outputs[0].shape, vec![3, 2]);
+    assert_eq!(outputs[0].shape, vec![2, 3]);
     assert_eq!(outputs[0].dtype, DataType::Bool);
-    assert_eq!(outputs[0].as_bytes(), &[1, 1, 0, 1, 0, 0]);
+    assert_eq!(outputs[0].as_bytes(), &[1, 0, 0, 1, 1, 0]);
 }
 
 #[test]
@@ -481,10 +496,26 @@ fn non_integer_shape_input_is_rejected_before_host_materialization() {
 
 #[test]
 fn rank_two_shape_input_is_rejected_before_host_materialization() {
-    assert_shape_input_rejected_without_materialization(
-        DataType::Int64,
-        &[1, 1],
-        &0i64.to_le_bytes(),
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = Arc::new(HostDownloadCountingEp::new(Arc::clone(&downloads)));
+    let model = unresolved_unsqueeze_model(DataType::Int64, &[1, 1]);
+    let error = match InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep)
+        .build()
+    {
+        Ok(_) => panic!("rank-two Unsqueeze axes must be rejected during shape inference"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("Unsqueeze") && message.contains("1-D tensor"),
+        "error must identify the invalid Unsqueeze axes contract: {message}"
+    );
+    assert_eq!(
+        downloads.load(Ordering::Relaxed),
+        0,
+        "shape-inference rejection must not materialize the invalid axes tensor"
     );
 }
 
