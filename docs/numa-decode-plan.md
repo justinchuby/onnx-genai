@@ -77,3 +77,52 @@ barrier then pays a cross-socket cache-coherency round trip. Reaching both
 sockets' bandwidth requires eliminating that cross-socket barrier (per-node
 sub-pools joined by a two-level barrier), which is the remaining lever.
 
+## Implemented increment: persistent SPMD decode pool (barrier fusion)
+
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` replaces the per-op rayon fork-join
+region -- there are ~141 `MatMulNBits` ops per decoded token, each currently a
+separate parallel region whose *join barrier* dominates once the int4 kernel
+itself is L3-resident -- with **one persistent worker set** that stays hot for
+the whole decode loop and is driven by a lightweight reusable barrier instead of
+re-forking rayon tasks. This targets the fork-join/barrier bound directly rather
+than the kernel math (Rule 4: the actual GEMV still runs the existing packed
+int4 / MLAS SQNBit kernels; only the orchestration changes).
+
+Design (mirrors the `numa-split` two-level structure so it inherits its
+node-local placement and exact reduction order):
+
+- On first decode use, spawn `ONNX_GENAI_CPU_DECODE_THREADS` workers, pinned one
+  per CPU across the covering NUMA node(s) via the same runtime topology probe as
+  `ONNX_GENAI_CPU_DECODE_AFFINITY` (no hardcoded socket/core counts, Rule 2).
+- Each op is broadcast by bumping a `sequence` counter the spinning workers watch;
+  completion is tracked with **per-node** counters so the dispatcher reads mostly
+  node-local cache lines and never pays a cross-socket coherency round trip on the
+  hot path (this is exactly the cross-socket-barrier cost that sank the naive
+  dual-node pool). Workers spin briefly, then park; the dispatcher only unparks
+  workers actually parked, so the steady hot loop issues zero syscalls.
+- Weights are first-touched by each pinned worker on its own row-shard, so the
+  packed int4 stream is node-local, same as `compact`/`numa-split`.
+
+Bit-parity: output rows are sharded, and each output row is an independent
+full-K dot product, so any row partition is exactly associative -- greedy token
+ids are byte-identical with the flag ON vs OFF (verified over 64 tokens).
+
+Generality / fallback (Rule 2, Rule 5): default OFF; on a single-node host,
+non-Linux, or when pinning is refused (cgroup) it degrades to the existing
+bounded pool behavior. The barrier primitive itself is portable `std` atomics +
+`thread::park`; only the optional CPU pinning is Linux-specific and is a
+best-effort no-op elsewhere.
+
+Measured (Sapphire Rapids Xeon 8480C, 2x48 cores, 2 NUMA nodes,
+Qwen2.5-Coder-7B int4, 32 decode threads, steady M=1, 96 tokens, interleaved
+A/B, shared/noisy host load avg ~10-37):
+
+| Path | steady decode median | best | wins/rounds |
+| --- | --- | --- | --- |
+| `numa-split` (prior best) | 16.42 tok/s | 16.96 | 0/4 |
+| `PERSISTENT_POOL=1` | 17.71 tok/s | 18.37 | 4/4 |
+
+~+7.9% median (+8.3% best) over the prior best `numa-split` path, winning every
+interleaved round. Still short of ORT (26.9) / onnxruntime-genai (20.8) -- the
+residual gap is memory-latency bound -- but it is the best native result and is
+shipped OFF by default until enabled explicitly.

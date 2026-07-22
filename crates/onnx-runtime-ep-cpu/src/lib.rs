@@ -31,6 +31,7 @@
 pub mod backend;
 pub mod decode_affinity;
 pub mod decode_numa;
+pub mod decode_spmd;
 pub mod dtype;
 pub mod kernels;
 pub mod optimizer;

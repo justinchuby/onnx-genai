@@ -690,6 +690,13 @@ fn configured_decode_threads() -> Option<usize> {
     resolve_decode_threads(value.as_deref(), available)
 }
 
+/// The resolved bounded decode-worker count, exposed so the persistent SPMD
+/// pool ([`crate::decode_spmd`]) sizes itself exactly like the flat pool and
+/// honors `ONNX_GENAI_CPU_DECODE_THREADS`.
+pub fn configured_decode_threads_public() -> Option<usize> {
+    configured_decode_threads()
+}
+
 fn available_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -825,6 +832,13 @@ thread_local! {
     /// its output rows out across the per-node sub-pools (see
     /// [`parallel_output_rows`] and [`crate::decode_numa`]).
     static IN_NUMA_SCOPE: Cell<bool> = const { Cell::new(false) };
+
+    /// Per-thread flag marking that the current thread is running the forward
+    /// pass inside a persistent SPMD-pool ([`crate::decode_spmd`])
+    /// [`with_decode_pool_scope`] installation, so each M=1 projection fans its
+    /// output rows out across the persistent worker set instead of a per-op
+    /// Rayon region.
+    static IN_SPMD_SCOPE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
@@ -847,6 +861,16 @@ fn numa_decode_active() -> Option<&'static crate::decode_numa::NumaDecodePools> 
     }
 }
 
+/// The active persistent SPMD layout when the current thread is running a
+/// persistent-pool decode forward; `None` otherwise.
+fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDecodePools> {
+    if IN_SPMD_SCOPE.with(Cell::get) {
+        crate::decode_spmd::pools()
+    } else {
+        None
+    }
+}
+
 /// Fan a projection's output rows out across the decode workers.
 ///
 /// With `numa-split` active, the rows are sharded across the per-node sub-pools
@@ -863,6 +887,10 @@ where
         numa.dispatch_output_rows(result, k, &compute);
         return;
     }
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_output_rows(result, k, &compute);
+        return;
+    }
     let chunk = output_chunk_len(result.len(), k);
     if chunk < result.len() {
         result
@@ -875,37 +903,54 @@ where
 }
 
 /// First-touch each row-major weight component on the NUMA node that will read
-/// it under `numa-split`, so each sub-pool streams node-local memory. A no-op
-/// (returns the input) when `numa-split` is not the active decode mode.
+/// it under `numa-split` or the persistent SPMD pool, so each node's workers
+/// stream node-local memory. A no-op (returns the input) when neither node-aware
+/// decode mode is active.
 fn numa_place_int4(weight: PackedInt4Weight, n: usize) -> PackedInt4Weight {
-    match numa_decode_active() {
-        Some(numa) => PackedInt4Weight {
+    if let Some(numa) = numa_decode_active() {
+        return PackedInt4Weight {
             values: numa.place_rows(&weight.values, n),
             scales: numa.place_rows(&weight.scales, n),
-        },
-        None => weight,
+        };
     }
+    if let Some(spmd) = spmd_decode_active() {
+        return PackedInt4Weight {
+            values: spmd.place_rows(&weight.values, n),
+            scales: spmd.place_rows(&weight.scales, n),
+        };
+    }
+    weight
 }
 
 /// Node-local first-touch for the prepacked int8 weight (see [`numa_place_int4`]).
 fn numa_place_int8(weight: Int8Weight, n: usize) -> Int8Weight {
-    match numa_decode_active() {
-        Some(numa) => Int8Weight {
+    if let Some(numa) = numa_decode_active() {
+        return Int8Weight {
             values: numa.place_rows(&weight.values, n),
             scales: numa.place_rows(&weight.scales, n),
             block_sums: numa.place_rows(&weight.block_sums, n),
-        },
-        None => weight,
+        };
     }
+    if let Some(spmd) = spmd_decode_active() {
+        return Int8Weight {
+            values: spmd.place_rows(&weight.values, n),
+            scales: spmd.place_rows(&weight.scales, n),
+            block_sums: spmd.place_rows(&weight.block_sums, n),
+        };
+    }
+    weight
 }
 
 /// Node-local first-touch for the dequantized `[N, K]` weight (see
 /// [`numa_place_int4`]).
 fn numa_place_nk(weight: Vec<f32>, n: usize) -> Vec<f32> {
-    match numa_decode_active() {
-        Some(numa) => numa.place_rows(&weight, n),
-        None => weight,
+    if let Some(numa) = numa_decode_active() {
+        return numa.place_rows(&weight, n);
     }
+    if let Some(spmd) = spmd_decode_active() {
+        return spmd.place_rows(&weight, n);
+    }
+    weight
 }
 
 /// RAII guard that marks the current thread as running a `numa-split` decode
@@ -925,6 +970,26 @@ impl Drop for NumaScopeGuard {
     fn drop(&mut self) {
         let previous = self.previous;
         IN_NUMA_SCOPE.with(|flag| flag.set(previous));
+    }
+}
+
+/// RAII guard that marks the current thread as running a persistent SPMD-pool
+/// decode forward and restores the previous state on drop (including on panic).
+struct SpmdScopeGuard {
+    previous: bool,
+}
+
+impl SpmdScopeGuard {
+    fn enter() -> Self {
+        let previous = IN_SPMD_SCOPE.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for SpmdScopeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        IN_SPMD_SCOPE.with(|flag| flag.set(previous));
     }
 }
 
@@ -982,6 +1047,17 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
             let _decode_guard = DecodeResidencyGuard::enter();
             f()
         });
+    }
+    // Persistent SPMD pool: run the forward inline on this (dispatcher) thread
+    // and let each M=1 projection broadcast its output-row shards to the hot
+    // persistent workers under one lightweight barrier. The decode-residency
+    // flag makes inner `with_decode_pool` calls run inline (they must not
+    // re-install the flat pool); the SPMD-scope flag routes `parallel_output_rows`
+    // through the persistent pool.
+    if crate::decode_spmd::pools().is_some() {
+        let _spmd_guard = SpmdScopeGuard::enter();
+        let _decode_guard = DecodeResidencyGuard::enter();
+        return f();
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => pool.install(move || {
