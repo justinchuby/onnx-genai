@@ -196,11 +196,11 @@ extern "C" __global__ void gqa_append_cache(
 extern "C" __global__ void gqa_rope_bnsh(
     float* tensor, const float* cos_cache, const float* sin_cache,
     const long long* position_ids, const int* past_lengths,
-    int batch, int seq, int heads, int dim, int tensor_capacity,
+    int batch, int seq, int heads, int dim, int rotary_dim, int tensor_capacity,
     int current_offset, int cache_rows, int interleaved, int cache_is_half)
 {
     (void)cache_is_half;
-    const int half = dim / 2;
+    const int half = rotary_dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = batch * heads * seq * half;
     if (idx >= count) return;
@@ -345,13 +345,14 @@ extern "C" __global__ void gqa_fuse_decode_prep(
     int* query_starts, int past_capacity, int* error_flag, int derive_metadata,
     const float* cos_cache, const float* sin_cache,
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
-    int present_capacity, int cache_rows, int do_rotary, int interleaved,
-    int cache_is_half)
+    int rotary_dim, int present_capacity, int cache_rows, int do_rotary,
+    int interleaved, int cache_is_half)
 {
     (void)cache_is_half;
-    const int half = dim / 2;
-    const int qN = q_heads * half;
-    const int kvN = kv_heads * half;
+    const int head_half = dim / 2;
+    const int rotary_half = rotary_dim / 2;
+    const int qN = q_heads * head_half;
+    const int kvN = kv_heads * head_half;
     const int per_batch = qN + 2 * kvN;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ int batch1_past;
@@ -375,19 +376,21 @@ extern "C" __global__ void gqa_fuse_decode_prep(
     const int rope_ok = do_rotary && position >= 0 && position < (long long)cache_rows;
     const int pos = rope_ok ? (int)position : 0;
     int region, h, k;
-    if (local < qN) { region = 0; h = local / half; k = local % half; }
-    else if (local < qN + kvN) { local -= qN; region = 1; h = local / half; k = local % half; }
-    else { local -= qN + kvN; region = 2; h = local / half; k = local % half; }
-    const int d0 = interleaved ? 2 * k : k;
-    const int d1 = interleaved ? 2 * k + 1 : k + half;
+    if (local < qN) { region = 0; h = local / head_half; k = local % head_half; }
+    else if (local < qN + kvN) { local -= qN; region = 1; h = local / head_half; k = local % head_half; }
+    else { local -= qN + kvN; region = 2; h = local / head_half; k = local % head_half; }
+    const int is_rotary = k < rotary_half;
+    const int tail = rotary_dim + 2 * (k - rotary_half);
+    const int d0 = is_rotary ? (interleaved ? 2 * k : k) : tail;
+    const int d1 = is_rotary ? (interleaved ? 2 * k + 1 : k + rotary_half) : tail + 1;
     if (region == 0) {
         const long src = (long)b * (packed ? packed_hidden : q_hidden) + (long)h * dim;
         const long dst = (long)(b * q_heads + h) * dim;
         const float x0 = q_src[src + d0];
         const float x1 = q_src[src + d1];
-        if (rope_ok && past >= 0) {
-            const float c = cos_cache[pos * half + k];
-            const float sn = sin_cache[pos * half + k];
+        if (rope_ok && past >= 0 && is_rotary) {
+            const float c = cos_cache[pos * rotary_half + k];
+            const float sn = sin_cache[pos * rotary_half + k];
             q_bnsh[dst + d0] = __fsub_rn(__fmul_rn(c, x0), __fmul_rn(sn, x1));
             q_bnsh[dst + d1] = __fadd_rn(__fmul_rn(sn, x0), __fmul_rn(c, x1));
         } else {
@@ -403,9 +406,9 @@ extern "C" __global__ void gqa_fuse_decode_prep(
                        + (packed ? q_hidden : 0) + (long)h * dim;
         const float x0 = k_src[src + d0];
         const float x1 = k_src[src + d1];
-        if (rope_ok) {
-            const float c = cos_cache[pos * half + k];
-            const float sn = sin_cache[pos * half + k];
+        if (rope_ok && is_rotary) {
+            const float c = cos_cache[pos * rotary_half + k];
+            const float sn = sin_cache[pos * rotary_half + k];
             present_k[dst + d0] = __fsub_rn(__fmul_rn(c, x0), __fmul_rn(sn, x1));
             present_k[dst + d1] = __fadd_rn(__fmul_rn(sn, x0), __fmul_rn(c, x1));
         } else {
@@ -574,10 +577,10 @@ template <typename T>
 __device__ void gqa_rope_bnsh_body(
     T* tensor, const void* cos_cache, const void* sin_cache,
     const long long* position_ids, const int* past_lengths,
-    int batch, int seq, int heads, int dim, int tensor_capacity,
+    int batch, int seq, int heads, int dim, int rotary_dim, int tensor_capacity,
     int current_offset, int cache_rows, int interleaved, int cache_is_half)
 {
-    const int half = dim / 2;
+    const int half = rotary_dim / 2;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = batch * heads * seq * half;
     if (idx >= count) return;
@@ -631,12 +634,13 @@ __device__ void gqa_fuse_decode_prep_body(
     int* query_starts, int past_capacity, int* error_flag, int derive_metadata,
     const void* cos_cache, const void* sin_cache,
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
-    int present_capacity, int cache_rows, int do_rotary, int interleaved,
-    int cache_is_half)
+    int rotary_dim, int present_capacity, int cache_rows, int do_rotary,
+    int interleaved, int cache_is_half)
 {
-    const int half = dim / 2;
-    const int qN = q_heads * half;
-    const int kvN = kv_heads * half;
+    const int head_half = dim / 2;
+    const int rotary_half = rotary_dim / 2;
+    const int qN = q_heads * head_half;
+    const int kvN = kv_heads * head_half;
     const int per_batch = qN + 2 * kvN;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     __shared__ int batch1_past;
@@ -660,19 +664,21 @@ __device__ void gqa_fuse_decode_prep_body(
     const int rope_ok = do_rotary && position >= 0 && position < (long long)cache_rows;
     const int pos = rope_ok ? (int)position : 0;
     int region, h, k;
-    if (local < qN) { region = 0; h = local / half; k = local % half; }
-    else if (local < qN + kvN) { local -= qN; region = 1; h = local / half; k = local % half; }
-    else { local -= qN + kvN; region = 2; h = local / half; k = local % half; }
-    const int d0 = interleaved ? 2 * k : k;
-    const int d1 = interleaved ? 2 * k + 1 : k + half;
+    if (local < qN) { region = 0; h = local / head_half; k = local % head_half; }
+    else if (local < qN + kvN) { local -= qN; region = 1; h = local / head_half; k = local % head_half; }
+    else { local -= qN + kvN; region = 2; h = local / head_half; k = local % head_half; }
+    const int is_rotary = k < rotary_half;
+    const int tail = rotary_dim + 2 * (k - rotary_half);
+    const int d0 = is_rotary ? (interleaved ? 2 * k : k) : tail;
+    const int d1 = is_rotary ? (interleaved ? 2 * k + 1 : k + rotary_half) : tail + 1;
     if (region == 0) {
         const long src = (long)b * (packed ? packed_hidden : q_hidden) + (long)h * dim;
         const long dst = (long)(b * q_heads + h) * dim;
-        if (rope_ok && past >= 0) {
+        if (rope_ok && past >= 0 && is_rotary) {
             const float x0 = gqa_load<T>(q_src[src + d0]);
             const float x1 = gqa_load<T>(q_src[src + d1]);
-            const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
-            const float sn = gqa_load_cache(sin_cache, pos * half + k, cache_is_half);
+            const float c = gqa_load_cache(cos_cache, pos * rotary_half + k, cache_is_half);
+            const float sn = gqa_load_cache(sin_cache, pos * rotary_half + k, cache_is_half);
             q_bnsh[dst + d0] = gqa_store<T>(c * x0 - sn * x1);
             q_bnsh[dst + d1] = gqa_store<T>(sn * x0 + c * x1);
         } else {
@@ -686,11 +692,11 @@ __device__ void gqa_fuse_decode_prep_body(
     if (region == 1) {
         const long src = (long)b * (packed ? packed_hidden : kv_hidden)
                        + (packed ? q_hidden : 0) + (long)h * dim;
-        if (rope_ok) {
+        if (rope_ok && is_rotary) {
             const float x0 = gqa_load<T>(k_src[src + d0]);
             const float x1 = gqa_load<T>(k_src[src + d1]);
-            const float c = gqa_load_cache(cos_cache, pos * half + k, cache_is_half);
-            const float sn = gqa_load_cache(sin_cache, pos * half + k, cache_is_half);
+            const float c = gqa_load_cache(cos_cache, pos * rotary_half + k, cache_is_half);
+            const float sn = gqa_load_cache(sin_cache, pos * rotary_half + k, cache_is_half);
             present_k[dst + d0] = gqa_store<T>(c * x0 - sn * x1);
             present_k[dst + d1] = gqa_store<T>(sn * x0 + c * x1);
         } else {
@@ -732,10 +738,10 @@ extern "C" __global__ void gqa_append_cache_##SUFFIX( \
 extern "C" __global__ void gqa_rope_bnsh_##SUFFIX( \
     TYPE* tensor, const void* cos_cache, const void* sin_cache, \
     const long long* position_ids, const int* past_lengths, \
-    int batch, int seq, int heads, int dim, int tensor_capacity, \
+    int batch, int seq, int heads, int dim, int rotary_dim, int tensor_capacity, \
     int current_offset, int cache_rows, int interleaved, int cache_is_half) { \
     gqa_rope_bnsh_body<TYPE>(tensor, cos_cache, sin_cache, position_ids, past_lengths, \
-                             batch, seq, heads, dim, tensor_capacity, current_offset, \
+                             batch, seq, heads, dim, rotary_dim, tensor_capacity, current_offset, \
                              cache_rows, interleaved, cache_is_half); \
 } \
 extern "C" __global__ void gqa_transpose_bnsh_to_bsh_##SUFFIX( \
@@ -749,13 +755,13 @@ extern "C" __global__ void gqa_fuse_decode_prep_##SUFFIX( \
     int* query_starts, int past_capacity, int* error_flag, int derive_metadata, \
     const void* cos_cache, const void* sin_cache, \
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim, \
-    int present_capacity, int cache_rows, int do_rotary, int interleaved, \
-    int cache_is_half) { \
+    int rotary_dim, int present_capacity, int cache_rows, int do_rotary, \
+    int interleaved, int cache_is_half) { \
     gqa_fuse_decode_prep_body<TYPE>(q_src, k_src, v_src, packed, q_bnsh, present_k, \
         present_v, seqlens_k, total_lengths, past_lengths, query_starts, past_capacity, \
         error_flag, derive_metadata, cos_cache, sin_cache, position_ids, batch, \
-        q_heads, kv_heads, dim, present_capacity, cache_rows, do_rotary, interleaved, \
-        cache_is_half); \
+        q_heads, kv_heads, dim, rotary_dim, present_capacity, cache_rows, do_rotary, \
+        interleaved, cache_is_half); \
 }
 
 DEFINE_GQA_HALF_KERNELS(__half, f16)
@@ -1493,80 +1499,105 @@ impl GroupQueryAttentionKernel {
             .map(|output| output.shape.get(2).copied().unwrap_or(past_capacity));
 
         let explicit_positions = inputs.get(9).filter(|view| !view.is_absent());
-        let (cos_ptr, sin_ptr, positions_ptr, cache_rows, cache_rows_usize, rope_cache_is_half) =
-            if self.do_rotary {
-                if !dim.is_multiple_of(2) {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep GroupQueryAttention: do_rotary requires an even head_size".into(),
-                    ));
-                }
-                if k_seq != 0 && q_seq != k_seq {
-                    return Err(EpError::KernelFailed(
+        let (
+            cos_ptr,
+            sin_ptr,
+            positions_ptr,
+            cache_rows,
+            cache_rows_usize,
+            rotary_dim,
+            rotary_dim_usize,
+            rope_cache_is_half,
+        ) = if self.do_rotary {
+            if k_seq != 0 && q_seq != k_seq {
+                return Err(EpError::KernelFailed(
                         "cuda_ep GroupQueryAttention: do_rotary requires equal query/key sequence lengths unless current key/value are empty".into(),
                     ));
+            }
+            let cos = inputs
+                .get(7)
+                .filter(|view| !view.is_absent())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: do_rotary=1 requires cos_cache".into(),
+                    )
+                })?;
+            let sin = inputs
+                .get(8)
+                .filter(|view| !view.is_absent())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "cuda_ep GroupQueryAttention: do_rotary=1 requires sin_cache".into(),
+                    )
+                })?;
+            require_dense(cos, "cos_cache", DataType::Float32)
+                .or_else(|_| require_dense(cos, "cos_cache", DataType::Float16))?;
+            let cache_dtype = cos.dtype;
+            let cache_is_half = match cache_dtype {
+                DataType::Float32 => 0i32,
+                DataType::Float16 if matches!(q.dtype, DataType::Float16 | DataType::BFloat16) => {
+                    1i32
                 }
-                let cos = inputs
-                    .get(7)
-                    .filter(|view| !view.is_absent())
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep GroupQueryAttention: do_rotary=1 requires cos_cache".into(),
-                        )
-                    })?;
-                let sin = inputs
-                    .get(8)
-                    .filter(|view| !view.is_absent())
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep GroupQueryAttention: do_rotary=1 requires sin_cache".into(),
-                        )
-                    })?;
-                require_dense(cos, "cos_cache", DataType::Float32)
-                    .or_else(|_| require_dense(cos, "cos_cache", DataType::Float16))?;
-                let cache_dtype = cos.dtype;
-                let cache_is_half = match cache_dtype {
-                    DataType::Float32 => 0i32,
-                    DataType::Float16
-                        if matches!(q.dtype, DataType::Float16 | DataType::BFloat16) =>
-                    {
-                        1i32
-                    }
-                    other => {
-                        return Err(EpError::KernelFailed(format!(
-                            "cuda_ep GroupQueryAttention: cos_cache/sin_cache dtype {other:?} unsupported for query dtype {:?}; expected Float32, or Float16 with half-precision queries",
-                            q.dtype
-                        )));
-                    }
-                };
-                require_dense(sin, "sin_cache", cache_dtype)?;
-                if cos.shape.len() != 2 || sin.shape != cos.shape || cos.shape[1] != dim / 2 {
+                other => {
                     return Err(EpError::KernelFailed(format!(
-                        "cuda_ep GroupQueryAttention: cos_cache/sin_cache must have shape [max_sequence_length,{}]",
-                        dim / 2
+                        "cuda_ep GroupQueryAttention: cos_cache/sin_cache dtype {other:?} unsupported for query dtype {:?}; expected Float32, or Float16 with half-precision queries",
+                        q.dtype
                     )));
                 }
-                let position_ptr = if let Some(position_ids) = explicit_positions {
-                    require_dense(position_ids, "position_ids", DataType::Int64)?;
-                    if position_ids.shape != [batch, q_seq] {
-                        return Err(EpError::KernelFailed(
+            };
+            require_dense(sin, "sin_cache", cache_dtype)?;
+            if cos.shape.len() != 2 {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: cos_cache must be rank 2 [max_sequence_length, rotary_dim/2], got shape {:?}",
+                    cos.shape
+                )));
+            }
+            if sin.shape != cos.shape {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: sin_cache shape {:?} must exactly match cos_cache shape {:?} so both caches describe the same rotary_dim",
+                    sin.shape, cos.shape
+                )));
+            }
+            let rotary_dim_usize = cos.shape[1].checked_mul(2).ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep GroupQueryAttention: rotary_dim derived from cos_cache width {} overflows; use a finite cache width with 1 <= width <= head_size/2",
+                        cos.shape[1]
+                    ))
+                })?;
+            if rotary_dim_usize < 2
+                || !rotary_dim_usize.is_multiple_of(2)
+                || rotary_dim_usize > dim
+                || cos.shape[1] != rotary_dim_usize / 2
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: rotary_dim derived from cos_cache width {} is {}; it must be even and satisfy 2 <= rotary_dim <= head_size={} (cache width must equal rotary_dim/2)",
+                    cos.shape[1], rotary_dim_usize, dim
+                )));
+            }
+            let position_ptr = if let Some(position_ids) = explicit_positions {
+                require_dense(position_ids, "position_ids", DataType::Int64)?;
+                if position_ids.shape != [batch, q_seq] {
+                    return Err(EpError::KernelFailed(
                         "cuda_ep GroupQueryAttention: position_ids must be valid non-negative int64 [batch_size, sequence_length]".into(),
                     ));
-                    }
-                    cuptr(position_ids.data_ptr::<u8>() as *const c_void)
-                } else {
-                    0
-                };
-                (
-                    cuptr(cos.data_ptr::<u8>() as *const c_void),
-                    cuptr(sin.data_ptr::<u8>() as *const c_void),
-                    position_ptr,
-                    checked_i32(cos.shape[0], "rotary cache rows")?,
-                    cos.shape[0],
-                    cache_is_half,
-                )
+                }
+                cuptr(position_ids.data_ptr::<u8>() as *const c_void)
             } else {
-                (0, 0, 0, 0, 0, 0)
+                0
             };
+            (
+                cuptr(cos.data_ptr::<u8>() as *const c_void),
+                cuptr(sin.data_ptr::<u8>() as *const c_void),
+                position_ptr,
+                checked_i32(cos.shape[0], "rotary cache rows")?,
+                cos.shape[0],
+                checked_i32(rotary_dim_usize, "rotary dimension")?,
+                rotary_dim_usize,
+                cache_is_half,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        };
 
         let structurally_valid_outputs = requested_present_capacity.is_some_and(|capacity| {
             let expected = [batch, self.kv_num_heads, capacity, dim];
@@ -1960,6 +1991,7 @@ impl GroupQueryAttentionKernel {
                         .arg(&heads_i)
                         .arg(&kv_heads_i)
                         .arg(&dim_i)
+                        .arg(&rotary_dim)
                         .arg(&present_capacity_i)
                         .arg(&cache_rows)
                         .arg(&do_rotary_i)
@@ -2120,7 +2152,8 @@ impl GroupQueryAttentionKernel {
                         1i32,
                     ),
                 ] {
-                    let count = batch * (heads as usize) * (seq_i as usize) * (dim / 2);
+                    let count =
+                        batch * (heads as usize) * (seq_i as usize) * (rotary_dim_usize / 2);
                     launch_1d!(
                         self.runtime,
                         prep_module,
@@ -2139,6 +2172,7 @@ impl GroupQueryAttentionKernel {
                                 .arg(&seq_i)
                                 .arg(&heads)
                                 .arg(&dim_i)
+                                .arg(&rotary_dim)
                                 .arg(&capacity)
                                 .arg(&current_offset)
                                 .arg(&cache_rows)

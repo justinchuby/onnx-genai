@@ -540,11 +540,14 @@ fn run_packed_step(
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 64;
     const PACKED_WIDTH: usize = (NUM_HEADS + 2 * KV_HEADS) * HEAD_DIM;
+    let rotary_half = cos.len().checked_div(capacity).unwrap_or(0);
 
     if packed.len() != seq * PACKED_WIDTH
         || positions.len() != seq
         || total != past_len + seq
-        || cos.len() != capacity * HEAD_DIM / 2
+        || rotary_half == 0
+        || rotary_half > HEAD_DIM / 2
+        || cos.len() != capacity * rotary_half
         || sin.len() != cos.len()
         || cache_k.is_some() != cache_v.is_some()
         || (past_len > 0 && cache_k.is_none())
@@ -557,8 +560,8 @@ fn run_packed_step(
     let packed = f32_tensor(&[1, seq, PACKED_WIDTH], packed);
     let seqlens = i32_tensor(&[1], &[total_i32 - 1]);
     let total = i32_tensor(&[], &[i32::try_from(capacity).unwrap()]);
-    let cos = f32_tensor(&[capacity, HEAD_DIM / 2], cos);
-    let sin = f32_tensor(&[capacity, HEAD_DIM / 2], sin);
+    let cos = f32_tensor(&[capacity, rotary_half], cos);
+    let sin = f32_tensor(&[capacity, rotary_half], sin);
     let position = i64_tensor(&[1, seq], positions);
     let transient = [&packed, &seqlens, &total, &cos, &sin, &position]
         .into_iter()
@@ -575,8 +578,8 @@ fn run_packed_step(
         has_past.then(|| (DataType::Float32, cache_shape.clone())),
         Some((DataType::Int32, vec![1])),
         Some((DataType::Int32, vec![])),
-        Some((DataType::Float32, vec![capacity, HEAD_DIM / 2])),
-        Some((DataType::Float32, vec![capacity, HEAD_DIM / 2])),
+        Some((DataType::Float32, vec![capacity, rotary_half])),
+        Some((DataType::Float32, vec![capacity, rotary_half])),
         Some((DataType::Int64, vec![1, seq])),
     ];
     let mut graph = Graph::new();
@@ -638,8 +641,8 @@ fn run_packed_step(
         &[1, seq, PACKED_WIDTH][..],
         &[1][..],
         &[][..],
-        &[capacity, HEAD_DIM / 2][..],
-        &[capacity, HEAD_DIM / 2][..],
+        &[capacity, rotary_half][..],
+        &[capacity, rotary_half][..],
         &[1, seq][..],
     ];
     let transient_dtypes = [
@@ -896,22 +899,26 @@ fn rotate_target(
     data: &[f32],
     seq: usize,
     heads: usize,
+    dimensions: (usize, usize),
+    interleaved: bool,
     positions: &[usize],
-    cos: &[f32],
-    sin: &[f32],
+    caches: (&[f32], &[f32]),
 ) -> Vec<f32> {
-    const HEAD_DIM: usize = 64;
-    let half = HEAD_DIM / 2;
+    let (head_dim, rotary_dim) = dimensions;
+    let (cos, sin) = caches;
+    let half = rotary_dim / 2;
     let mut output = data.to_vec();
     for (token, &position) in positions.iter().enumerate().take(seq) {
         for head in 0..heads {
-            let base = (token * heads + head) * HEAD_DIM;
+            let base = (token * heads + head) * head_dim;
             for k in 0..half {
-                let x0 = data[base + k];
-                let x1 = data[base + k + half];
+                let d0 = if interleaved { 2 * k } else { k };
+                let d1 = if interleaved { 2 * k + 1 } else { k + half };
+                let x0 = data[base + d0];
+                let x1 = data[base + d1];
                 let cache = position * half + k;
-                output[base + k] = cos[cache] * x0 - sin[cache] * x1;
-                output[base + k + half] = sin[cache] * x0 + cos[cache] * x1;
+                output[base + d0] = cos[cache] * x0 - sin[cache] * x1;
+                output[base + d1] = sin[cache] * x0 + cos[cache] * x1;
             }
         }
     }
@@ -2720,6 +2727,126 @@ fn gqa_gpu_rope_explicit_positions_rotate_query_and_key() {
 }
 
 #[test]
+fn gqa_gpu_partial_rope_supports_all_query_dtypes() {
+    const HEAD_DIM: usize = 6;
+    const ROTARY_DIM: usize = 4;
+    let Some(ep) = gpu() else { return };
+    let positions = [1_i64, 2];
+    let mut cos = Vec::with_capacity(3 * ROTARY_DIM / 2);
+    let mut sin = Vec::with_capacity(cos.capacity());
+    for position in 0..3 {
+        for lane in 0..ROTARY_DIM / 2 {
+            let angle = (position + 1) as f32 * (lane + 1) as f32 * 0.2;
+            cos.push(angle.cos());
+            sin.push(angle.sin());
+        }
+    }
+    let raw_q = fill(2 * 4 * HEAD_DIM, 0x401);
+    let raw_k = fill(2 * 2 * HEAD_DIM, 0x402);
+    let raw_v = fill(2 * 2 * HEAD_DIM, 0x403);
+
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for interleaved in [false, true] {
+            let q = quantize(&raw_q, dtype);
+            let k = quantize(&raw_k, dtype);
+            let v = quantize(&raw_v, dtype);
+            let mut inputs = base_inputs_dtype(
+                dtype,
+                &[1, 2, 4 * HEAD_DIM],
+                &q,
+                &[1, 2, 2 * HEAD_DIM],
+                &k,
+                &v,
+                None,
+                None,
+                &[1],
+                2,
+            );
+            inputs.push(Some(f32_tensor(&[3, ROTARY_DIM / 2], &cos)));
+            inputs.push(Some(f32_tensor(&[3, ROTARY_DIM / 2], &sin)));
+            inputs.push(Some(i64_tensor(&[1, 2], &positions)));
+            let outputs = run_available(run(
+                &ep,
+                &attrs(&[
+                    ("do_rotary", Attribute::Int(1)),
+                    ("rotary_interleaved", Attribute::Int(interleaved.into())),
+                ]),
+                &inputs,
+                &[
+                    vec![1, 2, 4 * HEAD_DIM],
+                    vec![1, 2, 2, HEAD_DIM],
+                    vec![1, 2, 2, HEAD_DIM],
+                ],
+            ))
+            .unwrap();
+
+            let expected_bsh = quantize(
+                &rotate_target(
+                    &k,
+                    2,
+                    2,
+                    (HEAD_DIM, ROTARY_DIM),
+                    interleaved,
+                    &[1, 2],
+                    (&cos, &sin),
+                ),
+                dtype,
+            );
+            let mut expected_bnsh = vec![0.0; expected_bsh.len()];
+            for sequence in 0..2 {
+                for head in 0..2 {
+                    let src = (sequence * 2 + head) * HEAD_DIM;
+                    let dst = (head * 2 + sequence) * HEAD_DIM;
+                    expected_bnsh[dst..dst + HEAD_DIM]
+                        .copy_from_slice(&expected_bsh[src..src + HEAD_DIM]);
+                }
+            }
+            let (atol, rtol) = parity_tolerances(dtype);
+            assert_close(&outputs[1], &expected_bnsh, atol, rtol);
+            for sequence in 0..2 {
+                for head in 0..2 {
+                    let got = (head * 2 + sequence) * HEAD_DIM;
+                    let source = (sequence * 2 + head) * HEAD_DIM;
+                    assert_eq!(
+                        &outputs[1][got + ROTARY_DIM..got + HEAD_DIM],
+                        &k[source + ROTARY_DIM..source + HEAD_DIM],
+                        "{dtype:?} partial RoPE tail must pass through unchanged"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gqa_gpu_partial_rope_rejects_invalid_cache_shapes_actionably() {
+    let Some(ep) = gpu() else { return };
+    let q = [0.0; 16];
+    let kv = [0.0; 8];
+    let base = base_inputs(&[1, 1, 16], &q, &[1, 1, 8], &kv, &kv, None, None, &[0], 1);
+    let attrs = attrs(&[("do_rotary", Attribute::Int(1))]);
+    let output_shapes = [vec![1, 1, 16], vec![1, 2, 1, 4], vec![1, 2, 1, 4]];
+
+    let mut too_wide = base.clone();
+    too_wide.push(Some(f32_tensor(&[2, 3], &[1.0; 6])));
+    too_wide.push(Some(f32_tensor(&[2, 3], &[0.0; 6])));
+    let error = run(&ep, &attrs, &too_wide, &output_shapes)
+        .expect_err("rotary_dim wider than head_size must be rejected");
+    let message = format!("{error}");
+    assert!(message.contains("rotary_dim derived from cos_cache width 3 is 6"));
+    assert!(message.contains("2 <= rotary_dim <= head_size=4"));
+
+    let mut mismatched = base;
+    mismatched.push(Some(f32_tensor(&[2, 1], &[1.0; 2])));
+    mismatched.push(Some(f32_tensor(&[2, 2], &[0.0; 4])));
+    let error = run(&ep, &attrs, &mismatched, &output_shapes)
+        .expect_err("different sin/cos cache shapes must be rejected");
+    let message = format!("{error}");
+    assert!(message.contains("sin_cache shape [2, 2] must exactly match cos_cache shape [2, 1]"));
+    assert!(message.contains("same rotary_dim"));
+}
+
+#[test]
 fn gqa_gpu_zero_scale_softcap_and_sliding_window_match_reference() {
     let Some(ep) = gpu() else { return };
     let q = [2., 0., 2., 0., 2., 0., 2., 0.];
@@ -2882,17 +3009,19 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
         &prefill_query,
         PREFILL,
         NUM_HEADS,
+        (HEAD_DIM, HEAD_DIM),
+        false,
         &prefill_positions,
-        &cos,
-        &sin,
+        (&cos, &sin),
     );
     let rotated_key = rotate_target(
         &prefill_key,
         PREFILL,
         KV_HEADS,
+        (HEAD_DIM, HEAD_DIM),
+        false,
         &prefill_positions,
-        &cos,
-        &sin,
+        (&cos, &sin),
     );
     let cache_len = KV_HEADS * CAPACITY * HEAD_DIM;
     let mut expected_k = vec![0.0; cache_len];
@@ -2943,8 +3072,24 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
         packed.extend_from_slice(&query);
         packed.extend_from_slice(&key);
         packed.extend_from_slice(&value);
-        let rotated_query = rotate_target(&query, 1, NUM_HEADS, &[position], &cos, &sin);
-        let rotated_key = rotate_target(&key, 1, KV_HEADS, &[position], &cos, &sin);
+        let rotated_query = rotate_target(
+            &query,
+            1,
+            NUM_HEADS,
+            (HEAD_DIM, HEAD_DIM),
+            false,
+            &[position],
+            (&cos, &sin),
+        );
+        let rotated_key = rotate_target(
+            &key,
+            1,
+            KV_HEADS,
+            (HEAD_DIM, HEAD_DIM),
+            false,
+            &[position],
+            (&cos, &sin),
+        );
         for head in 0..KV_HEADS {
             for dim in 0..HEAD_DIM {
                 let cache_index = (head * CAPACITY + position) * HEAD_DIM + dim;
@@ -3000,6 +3145,154 @@ fn gqa_gpu_packed_qkv_rope_decode_appends_in_place_across_steps() {
         max_attention_abs <= 1e-6,
         "GQA error accumulated across decode: {max_attention_abs:e}"
     );
+    ep.deallocate(step.cache_k).unwrap();
+    ep.deallocate(step.cache_v).unwrap();
+}
+
+#[test]
+fn gqa_gpu_partial_rope_rotates_prefix_and_preserves_tail() {
+    const NUM_HEADS: usize = 14;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 64;
+    const ROTARY_DIM: usize = 32;
+    const CAPACITY: usize = 4;
+    let Some(ep) = gpu() else { return };
+
+    let mut cos = Vec::with_capacity(CAPACITY * ROTARY_DIM / 2);
+    let mut sin = Vec::with_capacity(cos.capacity());
+    for position in 0..CAPACITY {
+        for dim in 0..ROTARY_DIM / 2 {
+            let angle = (position + 1) as f32 * (dim + 1) as f32 * 0.01;
+            cos.push(angle.cos());
+            sin.push(angle.sin());
+        }
+    }
+    let make_token = |position: usize| {
+        let query = fill(NUM_HEADS * HEAD_DIM, 0x100 + position as u64);
+        let key = fill(KV_HEADS * HEAD_DIM, 0x200 + position as u64);
+        let value = fill(KV_HEADS * HEAD_DIM, 0x300 + position as u64);
+        let mut packed = Vec::with_capacity((NUM_HEADS + 2 * KV_HEADS) * HEAD_DIM);
+        packed.extend_from_slice(&query);
+        packed.extend_from_slice(&key);
+        packed.extend_from_slice(&value);
+        (query, key, value, packed)
+    };
+
+    let cache_len = KV_HEADS * CAPACITY * HEAD_DIM;
+    let mut expected_k = vec![0.0; cache_len];
+    let mut expected_v = vec![0.0; cache_len];
+
+    let (query0, key0, value0, packed0) = make_token(0);
+    let rotated_query0 = rotate_target(
+        &query0,
+        1,
+        NUM_HEADS,
+        (HEAD_DIM, ROTARY_DIM),
+        false,
+        &[1],
+        (&cos, &sin),
+    );
+    let rotated_key0 = rotate_target(
+        &key0,
+        1,
+        KV_HEADS,
+        (HEAD_DIM, ROTARY_DIM),
+        false,
+        &[1],
+        (&cos, &sin),
+    );
+    for head in 0..KV_HEADS {
+        let cache_base = head * CAPACITY * HEAD_DIM;
+        let source_base = head * HEAD_DIM;
+        expected_k[cache_base..cache_base + HEAD_DIM]
+            .copy_from_slice(&rotated_key0[source_base..source_base + HEAD_DIM]);
+        expected_v[cache_base..cache_base + HEAD_DIM]
+            .copy_from_slice(&value0[source_base..source_base + HEAD_DIM]);
+    }
+    let expected_output0 =
+        target_attention_reference(&rotated_query0, &expected_k, &expected_v, 1, 0, CAPACITY);
+    let mut step = run_available(run_packed_step(
+        &ep,
+        &packed0,
+        1,
+        None,
+        None,
+        0,
+        1,
+        CAPACITY,
+        &cos,
+        &sin,
+        &[1],
+    ))
+    .unwrap();
+    assert_eq!(
+        step.key, expected_k,
+        "partial prefill RoPE must be bit-exact"
+    );
+    close(&step.output, &expected_output0);
+
+    let (query1, key1, value1, packed1) = make_token(1);
+    let rotated_query1 = rotate_target(
+        &query1,
+        1,
+        NUM_HEADS,
+        (HEAD_DIM, ROTARY_DIM),
+        false,
+        &[2],
+        (&cos, &sin),
+    );
+    let rotated_key1 = rotate_target(
+        &key1,
+        1,
+        KV_HEADS,
+        (HEAD_DIM, ROTARY_DIM),
+        false,
+        &[2],
+        (&cos, &sin),
+    );
+    for head in 0..KV_HEADS {
+        let cache_base = (head * CAPACITY + 1) * HEAD_DIM;
+        let source_base = head * HEAD_DIM;
+        expected_k[cache_base..cache_base + HEAD_DIM]
+            .copy_from_slice(&rotated_key1[source_base..source_base + HEAD_DIM]);
+        expected_v[cache_base..cache_base + HEAD_DIM]
+            .copy_from_slice(&value1[source_base..source_base + HEAD_DIM]);
+    }
+    let expected_output1 =
+        target_attention_reference(&rotated_query1, &expected_k, &expected_v, 1, 1, CAPACITY);
+    let key_ptr = step.cache_k.as_ptr();
+    let value_ptr = step.cache_v.as_ptr();
+    step = run_available(run_packed_step(
+        &ep,
+        &packed1,
+        1,
+        Some(step.cache_k),
+        Some(step.cache_v),
+        1,
+        2,
+        CAPACITY,
+        &cos,
+        &sin,
+        &[2],
+    ))
+    .unwrap();
+    assert_eq!(step.cache_k.as_ptr(), key_ptr);
+    assert_eq!(step.cache_v.as_ptr(), value_ptr);
+    assert_eq!(
+        step.key, expected_k,
+        "fused partial RoPE must rotate only the prefix"
+    );
+    close(&step.output, &expected_output1);
+    for head in 0..KV_HEADS {
+        let cache_base = (head * CAPACITY + 1) * HEAD_DIM;
+        let source_base = head * HEAD_DIM;
+        assert_eq!(
+            &step.key[cache_base + ROTARY_DIM..cache_base + HEAD_DIM],
+            &key1[source_base + ROTARY_DIM..source_base + HEAD_DIM],
+            "partial RoPE tail must pass through unchanged"
+        );
+    }
+
     ep.deallocate(step.cache_k).unwrap();
     ep.deallocate(step.cache_v).unwrap();
 }
