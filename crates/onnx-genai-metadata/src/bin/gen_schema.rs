@@ -1,13 +1,9 @@
 use std::{error::Error, fs, path::PathBuf};
 
-use onnx_genai_metadata::InferenceMetadata;
-use schemars::generate::SchemaSettings;
+use onnx_genai_metadata::inference_metadata_schema_json;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let schema = SchemaSettings::draft2020_12()
-        .into_generator()
-        .into_root_schema_for::<InferenceMetadata>();
-    let contents = format!("{}\n", serde_json::to_string_pretty(&schema)?);
+    let contents = format!("{}\n", inference_metadata_schema_json()?);
     let path = schema_path();
 
     fs::create_dir_all(path.parent().expect("schema path has a parent"))?;

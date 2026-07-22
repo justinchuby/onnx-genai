@@ -1,244 +1,65 @@
 {
-  "$id": "https://github.com/onnx/onnx/issues/8184",
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ONNX Inference Metadata",
-  "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
-  "type": "object",
-  "properties": {
-    "generation": {
-      "description": "Author-declared text-generation / search defaults.\n\nPopulated from an onnxruntime-genai `genai_config.json` `search` block.\nEvery field is optional; readers treat an absent value as \"use the\nruntime default\".",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/GenerationDefaults"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "hardware_requirements": {
-      "description": "Minimum and beneficial hardware capabilities used for distribution matching.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/HardwareRequirements"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "kv_cache": {
-      "description": "KV-cache storage, quantization tolerance, and operational semantics.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/KvCacheSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "model": {
-      "description": "Build-time model properties and runtime-configurable capabilities.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ModelCapabilities"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "pipeline": {
-      "description": "Declarative multi-model pipeline and its dataflow graph.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/PipelineSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "preprocessing": {
-      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/PreprocessingSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "quantization": {
-      "description": "Model weight quantization intent, independent of the packed representation.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/QuantizationIntent"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "required_capabilities": {
-      "description": "Capability identifiers that a runtime MUST support or refuse to load the model.",
-      "type": "array",
-      "default": [],
-      "examples": [
-        [
-          "kv_cache",
-          "grouped_query_attention"
-        ]
-      ],
-      "items": {
-        "type": "string",
-        "minLength": 1
-      }
-    },
-    "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "speculative": {
-      "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/SpeculatorConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "speculator_config": {
-      "description": "Deprecated alias for `speculative`.",
-      "allOf": [
-        {
-          "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SpeculatorConfig"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      ],
-      "deprecated": true
-    },
-    "strategy": {
-      "description": "Generic inference strategy, including speculative decoding.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/StrategySpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "structured_output": {
-      "description": "Structured-output formats and model training conventions.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/StructuredOutputSpec"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "tokens": {
-      "description": "Special / control token ids declared by the model author.\n\nPopulated from the model-level token id fields of a `genai_config.json`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/SpecialTokens"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    }
-  },
-  "allOf": [
-    {
-      "not": {
-        "required": [
-          "speculative",
-          "speculator_config"
-        ]
-      }
-    }
-  ],
   "$defs": {
     "AbsentInputKind": {
       "description": "Supported absent-input fallback kinds.",
       "oneOf": [
         {
+          "const": "zeros",
           "description": "Materialize a zero-initialized tensor.",
-          "type": "string",
-          "const": "zeros"
+          "type": "string"
         }
       ]
     },
     "AbsentInputSpec": {
       "description": "Explicit tensor fallback for an absent optional graph input.",
-      "type": "object",
       "properties": {
         "kind": {
-          "description": "Fallback materialization kind.",
-          "$ref": "#/$defs/AbsentInputKind"
+          "$ref": "#/$defs/AbsentInputKind",
+          "description": "Fallback materialization kind."
         },
         "shape": {
           "description": "Runtime-resolved shape of the fallback tensor.",
-          "type": "array",
           "items": {
             "$ref": "#/$defs/TensorDimension"
-          }
+          },
+          "type": "array"
         }
       },
       "required": [
         "kind",
         "shape"
-      ]
+      ],
+      "type": "object"
     },
     "AcceptanceMethod": {
       "description": "Speculative acceptance-rule vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "rejection_sampling",
             "greedy",
             "typical"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "rejection_sampling",
               "greedy",
               "typical"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "AttentionConfig": {
       "description": "Build-time attention architecture and dimensions.",
-      "type": "object",
       "properties": {
         "fallback_behavior": {
-          "description": "Compatible attention behavior for runtimes that do not recognize `type`.",
           "anyOf": [
             {
               "$ref": "#/$defs/AttentionType"
@@ -246,19 +67,19 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Compatible attention behavior for runtimes that do not recognize `type`."
         },
         "head_dim": {
           "description": "Per-head hidden dimension.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "key_sequence_lengths": {
-          "description": "Representation compatibility for the attention key-sequence lengths.\n\nAbsent means the canonical contiguous `int32 [batch_size]` representation\nis required.",
           "anyOf": [
             {
               "$ref": "#/$defs/KeySequenceLengthsSpec"
@@ -266,59 +87,59 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Representation compatibility for the attention key-sequence lengths.\n\nAbsent means the canonical contiguous `int32 [batch_size]` representation\nis required."
         },
         "num_attention_heads": {
           "description": "Number of query/attention heads.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "num_kv_heads": {
           "description": "Number of key/value heads; required by runtimes that need explicit GQA dimensions.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "sink_tokens": {
           "description": "Number of leading \"attention sink\" tokens always retained alongside the\nsliding window (StreamingLLM). Only meaningful when `sliding_window` is\nset; `null` or `0` disables sink retention. These first tokens stabilize\nthe attention distribution and are never evicted by the window.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "sliding_window": {
           "description": "Sliding-window length in tokens, or null for full-context attention.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "type": {
-          "description": "Attention architecture.\n\nCanonical values include `multi_head`, `grouped_query`, and\n`multi_latent`; future values are allowed when paired with a usable\n`fallback_behavior`.",
-          "$ref": "#/$defs/AttentionType"
+          "$ref": "#/$defs/AttentionType",
+          "description": "Attention architecture.\n\nCanonical values include `multi_head`, `grouped_query`, and\n`multi_latent`; future values are allowed when paired with a usable\n`fallback_behavior`."
         }
       },
       "required": [
         "type"
-      ]
+      ],
+      "type": "object"
     },
     "AttentionType": {
       "description": "Attention architecture vocabulary with an extension branch.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "multi_head",
             "multi_head_attention",
@@ -329,11 +150,10 @@
             "multi_latent",
             "multi_latent_attention",
             "mla"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "multi_head",
@@ -346,31 +166,32 @@
               "multi_latent_attention",
               "mla"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "ChunkedPrefillConfig": {
       "description": "Runtime chunked-prefill preference.",
-      "type": "object",
       "properties": {
         "chunk_size": {
           "description": "Preferred number of prompt tokens processed in each prefill chunk.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "DType": {
       "description": "Scalar dtype vocabulary with common ONNX and runtime aliases.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "float32",
             "fp32",
@@ -389,11 +210,10 @@
             "uint8",
             "int4",
             "uint4"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "float32",
@@ -414,13 +234,15 @@
               "int4",
               "uint4"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "DataflowEdge": {
       "description": "Directed connection between two pipeline component ports.",
-      "type": "object",
       "properties": {
         "device_transfer": {
           "description": "Whether the runtime must move the value between execution devices.",
@@ -430,7 +252,6 @@
           ]
         },
         "dtype": {
-          "description": "Scalar or logical data type at the component boundary.",
           "anyOf": [
             {
               "$ref": "#/$defs/TensorDType"
@@ -438,36 +259,36 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Scalar or logical data type at the component boundary."
         },
         "from": {
           "description": "Source endpoint in `component.output_name` form.",
-          "type": "string",
           "examples": [
             "encoder.hidden_states"
           ],
-          "pattern": "^[^.]+\\.[^.]+$"
+          "pattern": "^[^.]+\\.[^.]+$",
+          "type": "string"
         },
         "to": {
           "description": "Destination endpoint in `component.input_name` form.",
-          "type": "string",
           "examples": [
             "decoder.encoder_hidden_states"
           ],
-          "pattern": "^[^.]+\\.[^.]+$"
+          "pattern": "^[^.]+\\.[^.]+$",
+          "type": "string"
         }
       },
       "required": [
         "from",
         "to"
-      ]
+      ],
+      "type": "object"
     },
     "DevicePreference": {
       "description": "Execution-device preference vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "auto",
             "cpu",
@@ -477,11 +298,10 @@
             "coreml",
             "webgpu",
             "npu"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "auto",
@@ -493,22 +313,24 @@
               "webgpu",
               "npu"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "DraftConfig": {
       "description": "Draft-token producer configuration.",
-      "type": "object",
       "properties": {
         "depth": {
           "description": "Self-speculative early-exit depth.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "heads": {
           "description": "Named draft-head layout or selection.",
@@ -521,8 +343,8 @@
           "description": "Runtime-specific n-gram or prompt-lookup configuration."
         },
         "producer": {
-          "description": "Producer family: `draft_model`, `self_speculative`, `ngram`, or `extra_heads`.",
-          "$ref": "#/$defs/DraftProducer"
+          "$ref": "#/$defs/DraftProducer",
+          "description": "Producer family: `draft_model`, `self_speculative`, `ngram`, or `extra_heads`."
         },
         "session": {
           "description": "Named runtime session or pipeline component used as the producer.",
@@ -534,24 +356,22 @@
       },
       "required": [
         "producer"
-      ]
+      ],
+      "type": "object"
     },
     "DraftProducer": {
       "description": "Speculative draft-producer vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "draft_model",
             "self_speculative",
             "ngram",
             "extra_heads"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "draft_model",
@@ -559,46 +379,48 @@
               "ngram",
               "extra_heads"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "ForkPrecisionPolicy": {
       "description": "KV fork-precision policy vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "inherit",
             "highest",
             "independent"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "inherit",
               "highest",
               "independent"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "GenerationDefaults": {
       "description": "Author-declared text-generation defaults (sampling and beam search).\n\nMirrors the `search` section of an onnxruntime-genai `genai_config.json`.\nEvery field is optional so only values the author declared are carried over.",
-      "type": "object",
       "properties": {
         "diversity_penalty": {
           "description": "Diversity penalty for diverse beam groups.",
+          "format": "float",
           "type": [
             "number",
             "null"
-          ],
-          "format": "float"
+          ]
         },
         "do_sample": {
           "description": "Whether to randomize sampling through `top_k`/`top_p` (else greedy).",
@@ -616,142 +438,142 @@
         },
         "length_penalty": {
           "description": "Exponential length penalty used with beam search.",
+          "format": "float",
           "type": [
             "number",
             "null"
-          ],
-          "format": "float"
+          ]
         },
         "max_length": {
           "description": "Maximum final sequence length.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "min_length": {
           "description": "Minimum final sequence length.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "no_repeat_ngram_size": {
           "description": "Disallow repeating n-grams of this size (`0` = disabled).",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "num_beams": {
           "description": "Number of beams for beam search (`1` = no beam search).",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "num_return_sequences": {
           "description": "Number of sequences returned after search.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "repetition_penalty": {
           "description": "Penalty applied to already-generated tokens (`1.0` = no penalty).",
+          "format": "float",
           "type": [
             "number",
             "null"
-          ],
-          "format": "float"
+          ]
         },
         "temperature": {
           "description": "Softmax temperature applied before sampling.",
+          "format": "float",
           "type": [
             "number",
             "null"
-          ],
-          "format": "float"
+          ]
         },
         "top_k": {
           "description": "Number of highest-probability tokens kept for top-k filtering.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "top_p": {
           "description": "Nucleus (top-p) cumulative-probability threshold.",
+          "format": "float",
           "type": [
             "number",
             "null"
-          ],
-          "format": "float"
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
-      "type": "object",
       "properties": {
         "beneficial_dtypes": {
           "description": "Dtypes that improve performance or memory use but are not mandatory.",
+          "items": {
+            "$ref": "#/$defs/DType"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/DType"
-          }
+          ]
         },
         "kv_cache_memory_per_1k_tokens_mb": {
           "description": "Estimated KV-cache memory in MiB per 1,000 cached tokens.",
+          "format": "float",
+          "minimum": 0.0,
           "type": [
             "number",
             "null"
-          ],
-          "format": "float",
-          "minimum": 0.0
+          ]
         },
         "min_memory_gb": {
           "description": "Minimum aggregate accelerator or system memory in GiB.",
+          "format": "float",
+          "minimum": 0.0,
           "type": [
             "number",
             "null"
-          ],
-          "format": "float",
-          "minimum": 0.0
+          ]
         },
         "min_tp_degree": {
           "description": "Minimum useful tensor-parallel degree when tensor parallelism is selected.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "required_dtypes": {
           "description": "Dtypes the selected device or execution provider must support.",
+          "items": {
+            "$ref": "#/$defs/DType"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/DType"
-          }
+          ]
         },
         "supports_tensor_parallel": {
           "description": "Whether the model can be partitioned with tensor parallelism.",
@@ -760,50 +582,50 @@
             "null"
           ]
         }
-      }
+      },
+      "type": "object"
     },
     "ImageCorrespondence": {
       "description": "Prompt-placeholder to image correspondence vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "prompt_order",
             "explicit_indices"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "prompt_order",
               "explicit_indices"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "ImageOutputBinding": {
       "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a generic content role to an ARBITRARY endpoint name with a\nDECLARED dtype. Neither the name nor the content role is inferred from a model\nidentity, and the dtype is always explicit rather than derived from the model.",
-      "type": "object",
       "properties": {
         "content": {
-          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label.",
-          "$ref": "#/$defs/ImageOutputContent"
+          "$ref": "#/$defs/ImageOutputContent",
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label."
         },
         "dtype": {
-          "description": "Declared output dtype. Always explicit; never inferred from the model.",
-          "$ref": "#/$defs/TensorDType"
+          "$ref": "#/$defs/TensorDType",
+          "description": "Declared output dtype. Always explicit; never inferred from the model."
         },
         "name": {
           "description": "Arbitrary pipeline endpoint name this tensor is bound to (model DATA).",
-          "type": "string",
           "examples": [
             "vision_encoder.pixel_values"
           ],
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "optional": {
           "description": "Whether the runtime may omit this output when a model does not need it.",
@@ -814,33 +636,32 @@
         },
         "pad_value": {
           "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
+          "format": "double",
           "type": [
             "number",
             "null"
-          ],
-          "format": "double"
+          ]
         },
         "source": {
           "description": "Named value produced by a transform.\n\nAbsent preserves the legacy content-derived binding behavior.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         }
       },
       "required": [
         "name",
         "content",
         "dtype"
-      ]
+      ],
+      "type": "object"
     },
     "ImageOutputContent": {
       "description": "Generic image-output content-role vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "pixels",
             "patch_coordinates",
@@ -848,11 +669,10 @@
             "original_size",
             "transformed_size",
             "validity_mask"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "pixels",
@@ -862,119 +682,121 @@
               "transformed_size",
               "validity_mask"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "ImagePreprocessingProgram": {
       "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad); outputs bind a produced tensor to an ARBITRARY pipeline\nendpoint name with a DECLARED dtype. A model may name an output\n`pixel_position_ids`, `image_grid_thw`, or anything else — that string is\ndata carried in the model's metadata, never a branch in the runtime.",
-      "type": "object",
       "properties": {
         "outputs": {
           "description": "Named tensor outputs the program emits, each bound to a pipeline endpoint.",
-          "type": "array",
           "items": {
             "$ref": "#/$defs/ImageOutputBinding"
           },
-          "minItems": 1
+          "minItems": 1,
+          "type": "array"
         },
         "transforms": {
           "description": "Ordered list of generic transform operations applied to decoded pixels.",
-          "type": "array",
           "items": {
             "$ref": "#/$defs/ImageTransform"
-          }
+          },
+          "type": "array"
         }
       },
       "required": [
         "outputs"
-      ]
+      ],
+      "type": "object"
     },
     "ImageSizeSpec": {
-      "description": "A square size or an explicit width/height for an image transform.",
       "anyOf": [
         {
           "description": "A single edge length applied to both dimensions.",
-          "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 0,
+          "type": "integer"
         },
         {
           "description": "Explicit width and height.",
-          "type": "object",
           "properties": {
             "height": {
               "description": "Target height in pixels.",
-              "type": "integer",
               "format": "uint32",
-              "minimum": 0
+              "minimum": 0,
+              "type": "integer"
             },
             "width": {
               "description": "Target width in pixels.",
-              "type": "integer",
               "format": "uint32",
-              "minimum": 0
+              "minimum": 0,
+              "type": "integer"
             }
           },
           "required": [
             "width",
             "height"
-          ]
+          ],
+          "type": "object"
         }
-      ]
+      ],
+      "description": "A square size or an explicit width/height for an image transform."
     },
     "ImageTokenCountSource": {
       "description": "Image token-count source vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "per_tile",
             "per_patch",
             "from_grid"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "per_tile",
               "per_patch",
               "from_grid"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "ImageTransform": {
       "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
-      "type": "object",
       "properties": {
         "canvas_pad_value": {
           "description": "RGB canvas fill value applied before dynamic tiling.",
+          "format": "double",
           "type": [
             "number",
             "null"
-          ],
-          "format": "double"
+          ]
         },
         "channel_order": {
           "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "coordinate_order": {
           "description": "Patch-coordinate component order (`yx` or `xy`).",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "flatten": {
           "description": "Whether `patchify` flattens each patch into a single feature vector.",
@@ -992,149 +814,148 @@
         },
         "inputs": {
           "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "minItems": 1
+          ]
         },
         "interpolation": {
           "description": "Interpolation filter for a `resize` operation — generic string data.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "mask_patch_size": {
           "description": "Pixel edge represented by one validity-mask cell.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "max_patches": {
           "description": "Maximum number of spatial patches for a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "max_pixels": {
           "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "max_tiles": {
           "description": "Maximum number of local tiles for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "mean": {
           "description": "Per-channel mean for a `normalize` operation (length is model data).",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "number",
-            "format": "float"
-          }
+          ]
         },
         "merge_size": {
           "description": "Spatial patch-group edge controlling packed patch traversal order.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "min_pixels": {
           "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "mode": {
           "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "op": {
-          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`).",
-          "$ref": "#/$defs/ImageTransformOp"
+          "$ref": "#/$defs/ImageTransformOp",
+          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`)."
         },
         "outputs": {
           "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `ImageOutputBinding::source`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          },
-          "minItems": 1
+          ]
         },
         "pad_value": {
           "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
+          "format": "double",
           "type": [
             "number",
             "null"
-          ],
-          "format": "double"
+          ]
         },
         "patch_size": {
           "description": "Edge length of a square patch for a `patchify` operation.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "pooling_kernel_size": {
           "description": "Spatial pooling edge used when resolving a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "scale": {
           "description": "Scalar multiplier for a `rescale` operation.",
+          "format": "double",
           "type": [
             "number",
             "null"
-          ],
-          "format": "double"
+          ]
         },
         "size": {
-          "description": "Target size for a `resize` operation.",
           "anyOf": [
             {
               "$ref": "#/$defs/ImageSizeSpec"
@@ -1142,56 +963,56 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Target size for a `resize` operation."
         },
         "size_multiple": {
           "description": "Required divisibility of both resized dimensions.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "std": {
           "description": "Per-channel standard deviation for a `normalize` operation.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "number",
-            "format": "float"
-          }
+          ]
         },
         "target_length": {
           "description": "Exact first-axis length produced by a `pad` operation.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "temporal_patch_size": {
           "description": "Number of identical temporal frames packed into each spatial patch.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "thumbnail_interpolation": {
           "description": "Interpolation filter used specifically for a global thumbnail.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "thumbnail_order": {
-          "description": "Ordering of a global thumbnail relative to local tiles.",
           "anyOf": [
             {
               "$ref": "#/$defs/ThumbnailOrder"
@@ -1199,28 +1020,28 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Ordering of a global thumbnail relative to local tiles."
         },
         "tile_size": {
           "description": "Edge length of a square tile for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         }
       },
       "required": [
         "op"
-      ]
+      ],
+      "type": "object"
     },
     "ImageTransformOp": {
       "description": "Generic image transform-operation vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "decode",
             "decode_rgb",
@@ -1237,11 +1058,10 @@
             "emit_validity_mask",
             "emit_patch_coordinates",
             "emit_grid_coordinates"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "decode",
@@ -1260,16 +1080,17 @@
               "emit_patch_coordinates",
               "emit_grid_coordinates"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "KeySequenceLengthsSpec": {
       "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
-      "type": "object",
       "properties": {
         "scalar_broadcast": {
-          "description": "Optional scalar compatibility. `unit_batch` authorizes a contiguous\nrank-0 one-element `int32` tensor only when the attention batch is one.",
           "anyOf": [
             {
               "$ref": "#/$defs/SequenceLengthScalarBroadcast"
@@ -1277,13 +1098,14 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Optional scalar compatibility. `unit_batch` authorizes a contiguous\nrank-0 one-element `int32` tensor only when the attention batch is one."
         }
-      }
+      },
+      "type": "object"
     },
     "KvCacheOperations": {
       "description": "Operational guarantees for mutable KV-cache state.",
-      "type": "object",
       "properties": {
         "checkpoint_serializable": {
           "description": "Whether checkpoints can be serialized for suspend/resume or migration.",
@@ -1293,7 +1115,6 @@
           ]
         },
         "fork_precision_policy": {
-          "description": "Precision policy for a copy-on-write fork, such as `inherit` or `highest`.",
           "anyOf": [
             {
               "$ref": "#/$defs/ForkPrecisionPolicy"
@@ -1301,7 +1122,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Precision policy for a copy-on-write fork, such as `inherit` or `highest`."
         },
         "rewind_safe": {
           "description": "Whether truncating cache state to an earlier token position is correctness-preserving.",
@@ -1310,14 +1132,13 @@
             "null"
           ]
         }
-      }
+      },
+      "type": "object"
     },
     "KvCacheSpec": {
       "description": "KV-cache storage, precision tolerance, and operational guarantees.",
-      "type": "object",
       "properties": {
         "native_dtype": {
-          "description": "Native KV scalar dtype produced by the model before optional compression.",
           "anyOf": [
             {
               "$ref": "#/$defs/DType"
@@ -1325,10 +1146,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Native KV scalar dtype produced by the model before optional compression."
         },
         "operations": {
-          "description": "Cache mutation and persistence operations known to be safe for this model.",
           "anyOf": [
             {
               "$ref": "#/$defs/KvCacheOperations"
@@ -1336,10 +1157,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Cache mutation and persistence operations known to be safe for this model."
         },
         "quantization_tolerance": {
-          "description": "Independent precision tolerance for key and value tensors.",
           "anyOf": [
             {
               "$ref": "#/$defs/KvQuantTolerance"
@@ -1347,27 +1168,27 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Independent precision tolerance for key and value tensors."
         },
         "sensitive_layers": {
           "description": "Layer indices that should retain high precision; negative indices count from the end.",
+          "items": {
+            "format": "int32",
+            "type": "integer"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "integer",
-            "format": "int32"
-          }
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "KvComponentTolerance": {
       "description": "Quantization tolerance for one KV-cache component.",
-      "type": "object",
       "properties": {
         "default": {
-          "description": "Default minimum acceptable scalar dtype for this component.",
           "anyOf": [
             {
               "$ref": "#/$defs/DType"
@@ -1375,20 +1196,20 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Default minimum acceptable scalar dtype for this component."
         },
         "per_layer": {
           "description": "Layer-specific minimum-precision overrides.",
+          "items": {
+            "$ref": "#/$defs/LayerPrecisionOverride"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/LayerPrecisionOverride"
-          }
+          ]
         },
         "quantization_axis": {
-          "description": "Quantization scaling axis, such as `per_tensor`, `per_channel`, or `per_token`.",
           "anyOf": [
             {
               "$ref": "#/$defs/QuantizationAxis"
@@ -1396,31 +1217,31 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Quantization scaling axis, such as `per_tensor`, `per_channel`, or `per_token`."
         }
-      }
+      },
+      "type": "object"
     },
     "KvOwnership": {
       "description": "Ownership model for a graph's KV cache inputs.",
       "oneOf": [
         {
+          "const": "owned",
           "description": "The graph consumes past KV and emits replacement/extended present KV.",
-          "type": "string",
-          "const": "owned"
+          "type": "string"
         },
         {
+          "const": "shared",
           "description": "The graph reads references to KV owned and advanced by another decoder.",
-          "type": "string",
-          "const": "shared"
+          "type": "string"
         }
       ]
     },
     "KvQuantTolerance": {
       "description": "Precision tolerance for key and value cache components.",
-      "type": "object",
       "properties": {
         "key": {
-          "description": "Key-cache precision tolerance.",
           "anyOf": [
             {
               "$ref": "#/$defs/KvComponentTolerance"
@@ -1428,10 +1249,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Key-cache precision tolerance."
         },
         "value": {
-          "description": "Value-cache precision tolerance.",
           "anyOf": [
             {
               "$ref": "#/$defs/KvComponentTolerance"
@@ -1439,77 +1260,78 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Value-cache precision tolerance."
         }
-      }
+      },
+      "type": "object"
     },
     "KvUpdateKind": {
       "description": "Paired KV-cache update-semantics vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "append",
             "shared_buffer"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "append",
               "shared_buffer"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "LayerPrecisionOverride": {
       "description": "Minimum precision required by a set of model layers.",
-      "type": "object",
       "properties": {
         "layers": {
           "description": "Non-empty layer-index list; negative indices count from the final layer.",
-          "type": "array",
           "items": {
-            "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "type": "integer"
           },
-          "minItems": 1
+          "minItems": 1,
+          "type": "array"
         },
         "min_precision": {
-          "description": "Minimum acceptable scalar dtype for the listed layers.",
-          "$ref": "#/$defs/DType"
+          "$ref": "#/$defs/DType",
+          "description": "Minimum acceptable scalar dtype for the listed layers."
         }
       },
       "required": [
         "layers",
         "min_precision"
-      ]
+      ],
+      "type": "object"
     },
     "LoopStatePair": {
       "description": "One fixed-shape loop-carried recurrent-state port pair.\n\nGeneric and architecture-neutral: the runtime zero/other-initializes `input`\non the first step, runs the graph, and copies `output` back into `input` for\nthe next step (`replace` update). This models any fixed recurrent tensor\n(convolution state, linear-attention recurrent state, and so on) without\nreferencing a model family. It is intentionally distinct from growing or\nshared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`\nand `kv_update`.",
-      "type": "object",
       "properties": {
         "init": {
-          "description": "How `input` is initialized before the first step (e.g. `zeros`).",
-          "$ref": "#/$defs/StateInitKind"
+          "$ref": "#/$defs/StateInitKind",
+          "description": "How `input` is initialized before the first step (e.g. `zeros`)."
         },
         "input": {
           "description": "Graph input port that receives the carried state for this step.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "output": {
           "description": "Graph output port that produces the next-step state.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "update": {
-          "description": "How `output` becomes the next step's `input` (fixed state uses `replace`).",
-          "$ref": "#/$defs/StateUpdateKind"
+          "$ref": "#/$defs/StateUpdateKind",
+          "description": "How `output` becomes the next step's `input` (fixed state uses `replace`)."
         }
       },
       "required": [
@@ -1517,14 +1339,13 @@
         "output",
         "init",
         "update"
-      ]
+      ],
+      "type": "object"
     },
     "ModelCapabilities": {
       "description": "Model properties that are baked into the graph or advertised as configurable.",
-      "type": "object",
       "properties": {
         "attention": {
-          "description": "Attention architecture and dimensions.",
           "anyOf": [
             {
               "$ref": "#/$defs/AttentionConfig"
@@ -1532,10 +1353,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Attention architecture and dimensions."
         },
         "io": {
-          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nWhen present, the runtime binds decode-step inputs and outputs from the\ndeclared names instead of inferring them from tensor-name conventions.\nWhen absent, the runtime falls back to the historical name conventions\n(a temporary, transitional behavior).",
           "anyOf": [
             {
               "$ref": "#/$defs/ModelIoSpec"
@@ -1544,19 +1365,19 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nWhen present, the runtime binds decode-step inputs and outputs from the\ndeclared names instead of inferring them from tensor-name conventions.\nWhen absent, the runtime falls back to the historical name conventions\n(a temporary, transitional behavior)."
         },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "runtime_configurable": {
-          "description": "Features that a serving runtime may configure at load time.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeConfigurable"
@@ -1564,10 +1385,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Features that a serving runtime may configure at load time."
         },
         "speculative": {
-          "description": "Built-in draft-head or self-speculative model properties.",
           "anyOf": [
             {
               "$ref": "#/$defs/SpeculativeModelInfo"
@@ -1575,101 +1396,101 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Built-in draft-head or self-speculative model properties."
         },
         "vocab_size": {
           "description": "Vocabulary size (rows of the token-embedding / logits table).",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "ModelIoSpec": {
       "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. Any port left unset falls back to the runtime's historical\ntensor-name convention (a temporary, transitional behavior removed once all\nemitters populate this block). Declaring an `io` block lets a graph use\narbitrary tensor names — the runtime never infers a port by name or dtype\nfor a declared port.",
-      "type": "object",
       "properties": {
         "attention_mask_input": {
           "description": "Attention-mask input, if the graph takes one.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "cross_kv_inputs": {
           "description": "Cross-attention past-KV cache inputs for an encoder-decoder decoder, in\nthe SAME order as `cross_kv_outputs`. These are the encoder-derived KV\ntensors, distinct from the self-attention `kv_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          ]
         },
         "cross_kv_outputs": {
           "description": "Cross-attention present-KV cache outputs (produced by the encoder for an\nencoder-decoder model), paired positionally with `cross_kv_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          ]
         },
         "encoder_hidden_states_input": {
           "description": "Encoder-hidden-states input for an encoder-decoder (cross-attention)\ndecoder graph (e.g. `encoder_hidden_states`).",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "hidden_output": {
           "description": "Per-token hidden-state output for embedding / VLM hidden extraction, if\nthe graph exposes a distinct hidden output (e.g. `last_hidden_state`).",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "inputs_embeds_input": {
           "description": "Pre-embedded / routed sequence input (e.g. `inputs_embeds`).\n\nMay be declared alongside `token_input` (see its documentation): a graph\nthat consumes both a raw token input and one or more routed sequence\ninputs is explicitly permitted.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "kv_inputs": {
           "description": "Past-KV cache inputs, in the SAME order as `kv_outputs` (positional\npairing). Length must match `kv_outputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          ]
         },
         "kv_outputs": {
           "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          ]
         },
         "kv_ownership": {
-          "description": "Whether this graph owns past/present KV state or reads target-owned KV.\n\nAbsent preserves the historical `owned` behavior.",
           "anyOf": [
             {
               "$ref": "#/$defs/KvOwnership"
@@ -1677,10 +1498,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Whether this graph owns past/present KV state or reads target-owned KV.\n\nAbsent preserves the historical `owned` behavior."
         },
         "kv_update": {
-          "description": "How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.\n\nThis declares GROWING/append versus fixed shared-buffer cache semantics\nexplicitly, and is deliberately kept separate from `state_pairs` (which\ndescribes fixed recurrent tensors that are wholly REPLACED). The KV pair\nlists are the authoritative sparse layer ports: the runtime binds exactly\nthe ports named in `kv_inputs`/`kv_outputs` and never expands them from a\ntotal layer count. Absent means the historical growing-cache default.",
           "anyOf": [
             {
               "$ref": "#/$defs/KvUpdateKind"
@@ -1688,33 +1509,33 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.\n\nThis declares GROWING/append versus fixed shared-buffer cache semantics\nexplicitly, and is deliberately kept separate from `state_pairs` (which\ndescribes fixed recurrent tensors that are wholly REPLACED). The KV pair\nlists are the authoritative sparse layer ports: the runtime binds exactly\nthe ports named in `kv_inputs`/`kv_outputs` and never expands them from a\ntotal layer count. Absent means the historical growing-cache default."
         },
         "logits_output": {
           "description": "Logits output.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "optional_inputs": {
-          "description": "Optional graph inputs and their explicit absent-value contracts, keyed by\nthe real ONNX input port name.",
-          "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/OptionalInputSpec"
-          }
+          },
+          "description": "Optional graph inputs and their explicit absent-value contracts, keyed by\nthe real ONNX input port name.",
+          "type": "object"
         },
         "position_ids_input": {
           "description": "Position-ids input, if the graph takes one.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "sequence_source": {
-          "description": "Which declared sequence port drives autoregressive execution.\n\nAbsent preserves the historical `token_ids` behavior. Declaring\n`inputs_embeds` requires `inputs_embeds_input`; declaring `token_ids`\nrequires `token_input`.",
           "anyOf": [
             {
               "$ref": "#/$defs/SequenceInputKind"
@@ -1722,41 +1543,43 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Which declared sequence port drives autoregressive execution.\n\nAbsent preserves the historical `token_ids` behavior. Declaring\n`inputs_embeds` requires `inputs_embeds_input`; declaring `token_ids`\nrequires `token_input`."
         },
         "state_pairs": {
           "description": "Fixed-shape loop-carried recurrent state ports, distinct from KV cache.\n\nEach pair binds an input port to its matching output port and declares\nhow the input is initialized and how the output feeds the next step\n(`replace` semantics for fixed recurrent tensors). These are neither KV\ncache nor fixed conditioning; the sparse set of state ports comes from\nthis declared list, never expanded from a layer count.",
-          "type": [
-            "array",
-            "null"
-          ],
           "items": {
             "$ref": "#/$defs/LoopStatePair"
           },
-          "minItems": 1
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "token_input": {
           "description": "Token-id input (e.g. `input_ids`).\n\nA graph MAY declare this together with `inputs_embeds_input`: some fused\ndecoders consume a raw token stream AND a routed pre-embedded sequence in\nthe same forward pass. The two are not mutually exclusive; declaring both\nis a valid, explicit contract.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "MtpHiddenLayout": {
       "description": "Layout of the target state consumed by an MTP sidecar.",
       "oneOf": [
         {
+          "const": "BSH",
           "description": "`[batch, sequence, hidden]` legacy layout.",
-          "type": "string",
-          "const": "BSH"
+          "type": "string"
         },
         {
+          "const": "BSHC",
           "description": "`[batch, sequence, hc_mult, hidden]` Mobius Hyper-Connection layout.",
-          "type": "string",
-          "const": "BSHC"
+          "type": "string"
         }
       ]
     },
@@ -1764,127 +1587,124 @@
       "description": "Lifetime declared for an MTP sidecar's private KV state.",
       "oneOf": [
         {
+          "const": "proposal_local",
           "description": "Reset sidecar KV at every target verification iteration.",
-          "type": "string",
-          "const": "proposal_local"
+          "type": "string"
         },
         {
+          "const": "accepted_prefix",
           "description": "Retain only KV corresponding to the accepted draft prefix.",
-          "type": "string",
-          "const": "accepted_prefix"
+          "type": "string"
         }
       ]
     },
     "MtpTargetInitializer": {
       "description": "Exact target-model initializer reference used by an MTP sidecar.",
-      "type": "object",
       "properties": {
         "name": {
           "description": "Exact initializer name in the target ONNX graph.",
           "type": "string"
         },
         "source": {
-          "description": "Initializer ownership source. The Phase-1 contract requires\n`target_initializer`.",
-          "$ref": "#/$defs/MtpWeightSource"
+          "$ref": "#/$defs/MtpWeightSource",
+          "description": "Initializer ownership source. The Phase-1 contract requires\n`target_initializer`."
         }
       },
       "required": [
         "source",
         "name"
-      ]
+      ],
+      "type": "object"
     },
     "MtpWeightSource": {
       "description": "Ownership source for an MTP shared weight.",
       "oneOf": [
         {
+          "const": "target_initializer",
           "description": "Borrow the named initializer from the target model package.",
-          "type": "string",
-          "const": "target_initializer"
+          "type": "string"
         }
       ]
     },
     "OptionalInputSpec": {
       "description": "Presence and absent-value contract for one optional graph input.",
-      "type": "object",
       "properties": {
         "absent": {
-          "description": "Tensor value supplied when the presence key is absent.",
-          "$ref": "#/$defs/AbsentInputSpec"
+          "$ref": "#/$defs/AbsentInputSpec",
+          "description": "Tensor value supplied when the presence key is absent."
         },
         "presence": {
           "description": "Opaque, non-empty request presence key; not a port or model name.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
         "presence",
         "absent"
-      ]
+      ],
+      "type": "object"
     },
     "PerformanceHints": {
       "description": "Publisher-provided speculative decoding performance guidance.",
-      "type": "object",
       "properties": {
         "expected_acceptance_rate": {
           "description": "Expected fraction of proposed tokens accepted, from 0.0 through 1.0.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
           "type": [
             "number",
             "null"
-          ],
-          "format": "float",
-          "maximum": 1.0,
-          "minimum": 0.0
+          ]
         },
         "optimal_k": {
           "description": "Recommended number of draft tokens per verification step.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "PhaseConfig": {
       "description": "Phase gate for one pipeline component.",
-      "type": "object",
       "properties": {
         "run_on": {
-          "description": "Pipeline phase in which the component runs.",
-          "$ref": "#/$defs/PhaseRunOn"
+          "$ref": "#/$defs/PhaseRunOn",
+          "description": "Pipeline phase in which the component runs."
         },
         "when_present": {
           "description": "Opaque presence key required for this component to run.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         }
       },
       "required": [
         "run_on"
-      ]
+      ],
+      "type": "object"
     },
     "PhaseRunOn": {
       "description": "Pipeline phase gate.\n\nKnown values are enumerated while future strings remain valid.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "prompt_only",
             "every_step",
             "always",
             "final_only",
             "on_demand"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "prompt_only",
@@ -1893,16 +1713,17 @@
               "final_only",
               "on_demand"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "PipelineComponentSpec": {
       "description": "One executable ONNX model in a pipeline.",
-      "type": "object",
       "properties": {
         "device_preference": {
-          "description": "Optional execution or device preference declared by the model package.",
           "anyOf": [
             {
               "$ref": "#/$defs/DevicePreference"
@@ -1910,18 +1731,18 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Optional execution or device preference declared by the model package."
         },
         "filename": {
           "description": "Non-empty ONNX filename relative to the model package root.",
-          "type": "string",
           "examples": [
             "decoder.onnx"
           ],
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "io": {
-          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nWhen present, the runtime binds decode-step ports from the declared\nnames instead of inferring them from tensor-name conventions. When\nabsent, the runtime falls back to the historical name conventions (a\ntemporary, transitional behavior).",
           "anyOf": [
             {
               "$ref": "#/$defs/ModelIoSpec"
@@ -1930,35 +1751,35 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nWhen present, the runtime binds decode-step ports from the declared\nnames instead of inferring them from tensor-name conventions. When\nabsent, the runtime falls back to the historical name conventions (a\ntemporary, transitional behavior)."
         },
         "tokenizer": {
           "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",
-          "type": [
-            "string",
-            "null"
-          ],
           "examples": [
             "tokenizer.json"
           ],
-          "minLength": 1
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "type": {
-          "description": "Component role, for example `encoder`, `decoder`, `draft`, `denoiser`, or `vocoder`.",
-          "$ref": "#/$defs/PipelineRole"
+          "$ref": "#/$defs/PipelineRole",
+          "description": "Component role, for example `encoder`, `decoder`, `draft`, `denoiser`, or `vocoder`."
         }
       },
       "required": [
         "filename",
         "type"
-      ]
+      ],
+      "type": "object"
     },
     "PipelineRole": {
       "description": "Pipeline component-role vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "encoder",
             "vision_encoder",
@@ -1969,11 +1790,10 @@
             "scheduler",
             "vocoder",
             "speech_synthesis"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "encoder",
@@ -1986,39 +1806,40 @@
               "vocoder",
               "speech_synthesis"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "PipelineSpec": {
       "description": "Multi-model pipeline represented as a directed acyclic dataflow graph.",
-      "type": "object",
       "properties": {
         "dataflow": {
           "description": "Directed tensor or data edges between component ports.",
-          "type": "array",
           "items": {
             "$ref": "#/$defs/DataflowEdge"
-          }
+          },
+          "type": "array"
         },
         "models": {
-          "description": "Named model components in the pipeline DAG; at least one component is required.",
-          "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/PipelineComponentSpec"
           },
-          "minProperties": 1
+          "description": "Named model components in the pipeline DAG; at least one component is required.",
+          "minProperties": 1,
+          "type": "object"
         },
         "phases": {
-          "description": "Optional per-component phase gating, keyed by component name.",
-          "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/PhaseConfig"
           },
-          "default": {}
+          "default": {},
+          "description": "Optional per-component phase gating, keyed by component name.",
+          "type": "object"
         },
         "positions": {
-          "description": "Declared position-id generation and prefill→decode continuation program.\n\nGeneric and architecture-neutral: parameterized by rank, axis labels, and\nsection sizes so it expresses both ordinary rank-2 linear positions and\nrank-N multimodal coordinates as data — never a model-family branch.",
           "anyOf": [
             {
               "$ref": "#/$defs/PositionProgram"
@@ -2026,14 +1847,14 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Declared position-id generation and prefill→decode continuation program.\n\nGeneric and architecture-neutral: parameterized by rank, axis labels, and\nsection sizes so it expresses both ordinary rank-2 linear positions and\nrank-N multimodal coordinates as data — never a model-family branch."
         },
         "strategy": {
-          "description": "Loop and execution strategy for the pipeline.",
-          "$ref": "#/$defs/PipelineStrategy"
+          "$ref": "#/$defs/PipelineStrategy",
+          "description": "Loop and execution strategy for the pipeline."
         },
         "vision": {
-          "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with the declared expanded image-token\nsequence before KV-cache allocation.",
           "anyOf": [
             {
               "$ref": "#/$defs/PipelineVisionConfig"
@@ -2041,28 +1862,29 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with the declared expanded image-token\nsequence before KV-cache allocation."
         }
       },
       "required": [
         "models",
         "strategy"
-      ]
+      ],
+      "type": "object"
     },
     "PipelineStrategy": {
       "description": "Parameterized execution strategy for a pipeline or composite stage.",
-      "type": "object",
       "properties": {
         "batching": {
           "description": "Runtime-specific batching parameters."
         },
         "cfg_conditioning_input": {
+          "default": null,
           "description": "Denoiser conditioning input port zeroed for the unconditional pass of\nclassifier-free guidance. Required when `guidance_scale` != 1.0.",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
+          ]
         },
         "decoder": {
           "description": "Autoregressive decoder component name.",
@@ -2080,36 +1902,36 @@
         },
         "guidance_scale": {
           "description": "Classifier-free guidance scale or equivalent strategy-specific multiplier.",
+          "format": "float",
+          "minimum": 0.0,
           "type": [
             "number",
             "null"
-          ],
-          "format": "float",
-          "minimum": 0.0
+          ]
         },
         "inner": {
+          "default": null,
           "description": "Inner autoregressive decoder for a `nested_autoregressive` stage.\n\nThe code_predictor: for each outer frame it runs a short inner AR loop of\n`num_code_groups` steps over the residual codebooks, seeded at inner step\n0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge\n`outer.last_hidden_state -> inner.inputs_embeds`) and threading its own\nper-step code embedding on later steps.",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
+          ]
         },
         "kind": {
-          "description": "Strategy family; determines which strategy-specific fields are meaningful.",
-          "$ref": "#/$defs/PipelineStrategyKind"
+          "$ref": "#/$defs/PipelineStrategyKind",
+          "description": "Strategy family; determines which strategy-specific fields are meaningful."
         },
         "kv_cache": {
           "description": "Runtime-specific KV-cache strategy parameters."
         },
         "max_tokens": {
           "description": "Maximum number of tokens generated by an autoregressive stage.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "model": {
           "description": "Single-pass component name.",
@@ -2119,34 +1941,33 @@
           ]
         },
         "num_code_groups": {
+          "default": null,
           "description": "Inner-loop depth (RVQ residual codebook count) for a\n`nested_autoregressive` stage: the number of code tokens collected per\nouter frame. Must be at least 1.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 1
+          ]
         },
         "num_steps": {
           "description": "Number of iterative or diffusion steps.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "outer": {
+          "default": null,
           "description": "Outer autoregressive decoder for a `nested_autoregressive` stage.\n\nThe multi-decoder TTS shape: one outer step is one\naudio frame. The outer decoder (talker) produces a per-frame\n`last_hidden_state` that seeds the inner loop (see `inner`).",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
+          ]
         },
         "pre_embedder": {
-          "description": "Optional pre-embedder component driving the outer decoder (talker) of a\n`nested_autoregressive` stage through `inputs_embeds` instead of\n`input_ids`.\n\nA codec-driven TTS talker is not driven by token ids: each step's\n`inputs_embeds` is materialized from the PREVIOUS frame's codes as\n`codec_sum(+ text_embed)` (where\n`codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).\nWhen this field names such a component (inputs\n`frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,\nhidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds\nthe outer decoder's per-step `inputs_embeds` through it, keeping the engine\ngeneric. Requires a dataflow edge\n`{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.\n\nWhen absent the outer loop is `input_ids`-driven (backward compatible).\n\nAll graph-specific port bindings (the pre-embedder's `frame_codes` /\noptional `text_embed` inputs and the output feeding the outer decoder)\nare declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses\nthem by tensor name or dtype.",
           "anyOf": [
             {
               "$ref": "#/$defs/PreEmbedderSpec"
@@ -2154,10 +1975,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Optional pre-embedder component driving the outer decoder (talker) of a\n`nested_autoregressive` stage through `inputs_embeds` instead of\n`input_ids`.\n\nA codec-driven TTS talker is not driven by token ids: each step's\n`inputs_embeds` is materialized from the PREVIOUS frame's codes as\n`codec_sum(+ text_embed)` (where\n`codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).\nWhen this field names such a component (inputs\n`frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,\nhidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds\nthe outer decoder's per-step `inputs_embeds` through it, keeping the engine\ngeneric. Requires a dataflow edge\n`{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.\n\nWhen absent the outer loop is `input_ids`-driven (backward compatible).\n\nAll graph-specific port bindings (the pre-embedder's `frame_codes` /\noptional `text_embed` inputs and the output feeding the outer decoder)\nare declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses\nthem by tensor name or dtype."
         },
         "prefill_embedder": {
-          "description": "Optional prefill embedder component that supplies the outer decoder\n(talker) with its real frame-0 PREFILL sequence and the per-frame\ntrailing-text conditioning of a `nested_autoregressive` stage.\n\nThe talker is prefilled with a multi-position embedding\nsequence built from the tokenized prompt, and each subsequent frame is\nconditioned on one trailing-text embedding. This component materializes\nboth from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs\n`prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the\ntalker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,\ntrailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`\nas the pre-embedder's `text_embed`). It runs once in the prompt phase\n(`run_on: prompt_only`); its `text_ids` input is auto-seeded from the\ntokenized prompt.\n\nOnly meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`\npath feeds the trailing-text vectors through it). When absent, frame 0\nuses a zero seed and every `text_embed` is zero (backward compatible).\n\nAll graph-specific port bindings (the prompt input plus the prefill and\ntrailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];\nthe runtime never guesses them by tensor name or dtype.",
           "anyOf": [
             {
               "$ref": "#/$defs/PrefillEmbedderSpec"
@@ -2165,7 +1986,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Optional prefill embedder component that supplies the outer decoder\n(talker) with its real frame-0 PREFILL sequence and the per-frame\ntrailing-text conditioning of a `nested_autoregressive` stage.\n\nThe talker is prefilled with a multi-position embedding\nsequence built from the tokenized prompt, and each subsequent frame is\nconditioned on one trailing-text embedding. This component materializes\nboth from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs\n`prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the\ntalker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,\ntrailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`\nas the pre-embedder's `text_embed`). It runs once in the prompt phase\n(`run_on: prompt_only`); its `text_ids` input is auto-seeded from the\ntokenized prompt.\n\nOnly meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`\npath feeds the trailing-text vectors through it). When absent, frame 0\nuses a zero seed and every `text_embed` is zero (backward compatible).\n\nAll graph-specific port bindings (the prompt input plus the prefill and\ntrailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];\nthe runtime never guesses them by tensor name or dtype."
         },
         "scheduler": {
           "description": "Scheduler identifier for iterative or diffusion execution.",
@@ -2175,7 +1997,6 @@
           ]
         },
         "scheduler_config": {
-          "description": "Optional diffusion scheduler applied to the denoiser's loop-carried\noutput (treating it as a noise prediction) each step.",
           "anyOf": [
             {
               "$ref": "#/$defs/SchedulerSpec"
@@ -2183,70 +2004,70 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Optional diffusion scheduler applied to the denoiser's loop-carried\noutput (treating it as a noise prediction) each step."
         },
         "speculative": {
           "description": "Runtime-specific speculative execution parameters."
         },
         "stages": {
           "description": "Ordered child stages for a composite strategy.",
-          "type": "array",
           "items": {
             "$ref": "#/$defs/PipelineStrategyStage"
-          }
+          },
+          "type": "array"
         },
         "start_step": {
+          "default": null,
           "description": "First step index for a partial (img2img) denoise loop.\n\nWhen set, the iterative loop runs `start_step..num_steps` instead of the\nfull `0..num_steps`, and the seed (`denoiser` sample input) is expected to\nalready be the encoded image noised to `timesteps[start_step]`. Matches\ndiffusers' img2img `get_timesteps(num_steps, strength)` skip. Default 0.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 0
+          ]
         },
         "state": {
           "description": "Runtime-specific iterative state declaration."
         },
         "stop_conditions": {
           "description": "Runtime-specific stop-condition declarations.",
+          "items": true,
           "type": [
             "array",
             "null"
-          ],
-          "items": true
+          ]
         },
         "timestep_input": {
+          "default": null,
           "description": "Denoiser input port that receives the per-step timestep/sigma scalar.\n\nWhen set, the iterative loop feeds this input a rank-1 `float32` value\neach step (from `timesteps` when provided, otherwise the 0-based step\nindex), so a step-aware denoiser can condition on the current step.",
           "type": [
             "string",
             "null"
-          ],
-          "default": null
+          ]
         },
         "timesteps": {
+          "default": null,
           "description": "Explicit per-step timestep/sigma schedule for an iterative strategy.\n\nWhen present its length must equal `num_steps`; when absent the loop\nuses the 0-based step index. Requires `timestep_input` to have any effect.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "default": null,
-          "items": {
-            "type": "number",
-            "format": "float"
-          }
+          ]
         }
       },
       "required": [
         "kind"
-      ]
+      ],
+      "type": "object"
     },
     "PipelineStrategyKind": {
       "description": "Pipeline execution strategy family.\n\nKnown values are enumerated while future strings remain valid.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "autoregressive",
             "iterative",
@@ -2257,11 +2078,10 @@
             "composite",
             "nested_autoregressive",
             "nested-autoregressive"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "autoregressive",
@@ -2274,21 +2094,22 @@
               "nested_autoregressive",
               "nested-autoregressive"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "PipelineStrategyStage": {
       "description": "Named child stage of a composite pipeline strategy.",
-      "type": "object",
       "properties": {
         "name": {
           "description": "Non-empty stage name unique within its containing composite.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "run_on": {
-          "description": "Optional phase gate for the stage.",
           "anyOf": [
             {
               "$ref": "#/$defs/PhaseRunOn"
@@ -2296,40 +2117,40 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Optional phase gate for the stage."
         },
         "strategy": {
-          "description": "Execution strategy for this stage.",
-          "$ref": "#/$defs/PipelineStrategy"
+          "$ref": "#/$defs/PipelineStrategy",
+          "description": "Execution strategy for this stage."
         }
       },
       "required": [
         "name",
         "strategy"
-      ]
+      ],
+      "type": "object"
     },
     "PipelineVisionConfig": {
       "description": "Image placeholder token-expansion contract for encoder-free VLM pipelines.\n\nEvery field is optional and additive: legacy documents that declare only\n`image_placeholder_token_id` and `tokens_per_tile` keep working. The richer\nfields mirror the generic expansion the preprocessor already models\n(separate emitted image token, per-tile/per-patch count source, per-image\ncorrespondence, optional row/column separators, and thumbnail order). All of\nit is generic data — no field names or values reference a model family.",
-      "type": "object",
       "properties": {
         "column_separator_token_id": {
           "description": "Optional token ID emitted between columns within a grid row.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "correspondence_summary": {
           "description": "Named preprocessing value containing explicit image correspondence data.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "image_correspondence": {
-          "description": "How prompt placeholders correspond to input images.\n\n`prompt_order` pairs each placeholder with the next input image.\n`explicit_indices` reads correspondence from `correspondence_summary`.",
           "anyOf": [
             {
               "$ref": "#/$defs/ImageCorrespondence"
@@ -2337,23 +2158,24 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "How prompt placeholders correspond to input images.\n\n`prompt_order` pairs each placeholder with the next input image.\n`explicit_indices` reads correspondence from `correspondence_summary`."
         },
         "image_placeholder_token_id": {
           "description": "Token ID of the image placeholder in the tokenized prompt.\n\nThe engine replaces every occurrence of this token with the expanded\nimage token sequence before sequence-length and KV-cache sizing.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "image_token_id": {
           "description": "Token ID emitted for each expanded image position.\n\nDistinct from `image_placeholder_token_id`: the placeholder marks WHERE\nto expand, while this is the token actually written into the expanded\nsequence. When absent, the placeholder token itself is repeated.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "placeholder_per_image": {
           "description": "Whether each placeholder occurrence corresponds to one input image in\nprompt order. Absent means the historical one-placeholder-per-image rule.",
@@ -2364,14 +2186,13 @@
         },
         "row_separator_token_id": {
           "description": "Optional token ID emitted between rows of a tiled image grid.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "thumbnail_order": {
-          "description": "Order of the optional global thumbnail tile relative to the local grid.",
           "anyOf": [
             {
               "$ref": "#/$defs/ThumbnailOrder"
@@ -2379,10 +2200,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Order of the optional global thumbnail tile relative to the local grid."
         },
         "token_count_source": {
-          "description": "Where the per-placeholder token count comes from (per tile, per patch, or\na declared grid). Generic selector, never a model-family branch.",
           "anyOf": [
             {
               "$ref": "#/$defs/ImageTokenCountSource"
@@ -2390,101 +2211,101 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Where the per-placeholder token count comes from (per tile, per patch, or\na declared grid). Generic selector, never a model-family branch."
         },
         "token_count_summary": {
           "description": "Named preprocessing value that supplies per-image counts or grid\ndimensions when `token_count_source` is data-derived.\n\nThis is an arbitrary processor output name. A runtime resolves the name\nfrom the declared preprocessing program; it never dispatches on familiar\ntensor names.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "tokens_per_patch": {
           "description": "Number of image tokens each patch expands to, used when the count source\nis per patch. Declared data.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "tokens_per_tile": {
           "description": "Number of image tokens each tile expands to.\n\nThe total per-tile expansion is `tokens_per_tile * num_tiles`.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "PositionContinuation": {
       "description": "Prefill→decode position-continuation vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "linear_increment",
             "carry_max",
             "from_grid"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "linear_increment",
               "carry_max",
               "from_grid"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "PositionGeneration": {
       "description": "Position-value generation vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "linear",
             "processor_coordinates"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "linear",
               "processor_coordinates"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "PositionProgram": {
       "description": "Declared position-id program for a decoder graph.\n\nThe runtime constructs the position tensor from these declared parameters\ninstead of assuming a fixed rank-2 layout. `rank` 1 (with a single axis)\nexpresses ordinary linear positions; `rank` N expresses multi-axis\nmultimodal coordinates. Axis labels and section sizes are opaque DATA — the\nruntime never infers them from a model name.",
-      "type": "object",
       "properties": {
         "axes": {
           "description": "Optional coordinate-stream labels, one per stream (DATA).",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          ]
         },
         "continuation": {
-          "description": "How positions continue from the prompt (prefill) into per-token decode.",
           "anyOf": [
             {
               "$ref": "#/$defs/PositionContinuation"
@@ -2492,10 +2313,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "How positions continue from the prompt (prefill) into per-token decode."
         },
         "dtype": {
-          "description": "Declared dtype of the position tensor.",
           "anyOf": [
             {
               "$ref": "#/$defs/TensorDType"
@@ -2503,10 +2324,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Declared dtype of the position tensor."
         },
         "generation": {
-          "description": "How the position values are generated for prefill.\n\n`linear` generates ordinary sequence positions. `processor_coordinates`\nconsumes the declared processor summaries to construct multi-axis\ncoordinates. Future generation programs remain extensible capability\nstrings rather than model-family branches.",
           "anyOf": [
             {
               "$ref": "#/$defs/PositionGeneration"
@@ -2514,70 +2335,71 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "How the position values are generated for prefill.\n\n`linear` generates ordinary sequence positions. `processor_coordinates`\nconsumes the declared processor summaries to construct multi-axis\ncoordinates. Future generation programs remain extensible capability\nstrings rather than model-family branches."
         },
         "input": {
           "description": "Graph input port that receives the position ids (arbitrary name, DATA).",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "processor_summaries": {
           "description": "Optional processor-summary endpoints this program reads to compute\nmulti-axis coordinates (e.g. a declared grid-dimensions output). Each\nentry is an arbitrary endpoint name (DATA), never a model-family hint.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
+          ]
         },
         "rank": {
           "description": "Number of coordinate streams carried by the position tensor.\n\n`1` is an ordinary linear position stream; values `> 1` describe\nmulti-axis multimodal coordinates. The physical ONNX tensor rank is\ndeclared separately by `tensor_rank`.",
-          "type": "integer",
           "format": "uint",
-          "minimum": 1
+          "minimum": 1,
+          "type": "integer"
         },
         "sections": {
           "description": "Optional section sizes for sectioned rotary position embeddings.\n\nOpaque list of per-section widths; their meaning is model DATA, not a\nruntime branch.",
+          "items": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "integer",
-            "format": "uint",
-            "minimum": 0
-          }
+          ]
         },
         "tensor_rank": {
           "description": "Physical ONNX tensor rank.\n\nRank 2 declares a conventional `[batch, sequence]` linear input. Higher\nranks declare an explicit coordinate axis in addition to batch/sequence\naxes. Absent preserves the legacy mapping (`rank == 1` means tensor rank\n2; otherwise tensor rank 3).",
+          "format": "uint",
+          "minimum": 2,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 2
+          ]
         }
       },
       "required": [
         "input",
         "rank"
-      ]
+      ],
+      "type": "object"
     },
     "PreEmbedderSpec": {
       "description": "Structured binding for the optional pre-embedder that drives the outer\ndecoder (talker) of a `nested_autoregressive` stage via `inputs_embeds`.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
-      "type": "object",
       "properties": {
         "component": {
           "description": "Declared model name of the pre-embedder component.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "frame_codes_input": {
           "description": "Pre-embedder input port receiving the previous frame's codes\n(`int64 [batch, num_code_groups]`).",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "text_embed_input": {
           "description": "Optional pre-embedder input port receiving the per-frame trailing-text\nconditioning vector (`float [batch, 1, hidden]`). When absent, the\npre-embedder exposes no trailing-text input.",
@@ -2590,14 +2412,13 @@
       "required": [
         "component",
         "frame_codes_input"
-      ]
+      ],
+      "type": "object"
     },
     "Precision": {
       "description": "Weight precision and quantization-recipe vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "float32",
             "fp32",
@@ -2610,11 +2431,10 @@
             "int8",
             "int4",
             "int4_group128"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "float32",
@@ -2629,33 +2449,35 @@
               "int4",
               "int4_group128"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "PrefillEmbedderSpec": {
       "description": "Structured binding for the optional prefill embedder that supplies the outer\ndecoder (talker) of a `nested_autoregressive` stage with its frame-0 PREFILL\nsequence and per-frame trailing-text conditioning.\n\nEvery graph-specific port the runtime touches is declared here, so the\nengine never infers a port by tensor name or dtype.",
-      "type": "object",
       "properties": {
         "component": {
           "description": "Declared model name of the (prompt-phase) prefill embedder component.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "prefill_output": {
           "description": "Prefill-embedder output port carrying the talker's frame-0 multi-position\nPREFILL sequence (`float [batch, prefill_len, hidden]`), fed DIRECTLY to\nthe outer decoder's `inputs_embeds` on frame 0.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "prompt_input": {
           "description": "Prefill-embedder input port receiving the tokenized prompt\n(`int64 [batch, text_len]`, e.g. `text_ids`).",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         },
         "trailing_output": {
           "description": "Prefill-embedder output port carrying the per-frame trailing-text vectors\n(`float [batch, trailing_len, hidden]`), one sliced per outer frame\n`k >= 1` into the pre-embedder's `text_embed`.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
@@ -2663,14 +2485,13 @@
         "prompt_input",
         "prefill_output",
         "trailing_output"
-      ]
+      ],
+      "type": "object"
     },
     "PreprocessingSpec": {
       "description": "Declared, architecture-neutral input preprocessing programs.",
-      "type": "object",
       "properties": {
         "image": {
-          "description": "Typed image preprocessing transform program and its named tensor outputs.",
           "anyOf": [
             {
               "$ref": "#/$defs/ImagePreprocessingProgram"
@@ -2678,39 +2499,39 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Typed image preprocessing transform program and its named tensor outputs."
         }
-      }
+      },
+      "type": "object"
     },
     "ProposalTopology": {
       "description": "Speculative proposal-topology vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "linear",
             "tree"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "linear",
               "tree"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "ProposalType": {
       "description": "Speculator proposal architecture.\n\nKnown spellings are enumerated in the generated schema while unknown\nstrings remain valid to preserve forward compatibility.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "eagle",
             "eagle3",
@@ -2722,11 +2543,10 @@
             "d-flash",
             "shared_kv",
             "shared-kv"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "eagle",
@@ -2740,26 +2560,26 @@
               "shared_kv",
               "shared-kv"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "QuantizationAxis": {
       "description": "Quantization scaling-axis vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "per_tensor",
             "per_channel",
             "per_token",
             "per_head"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "per_tensor",
@@ -2767,16 +2587,17 @@
               "per_token",
               "per_head"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "QuantizationIntent": {
       "description": "Runtime-independent model-weight quantization intent.",
-      "type": "object",
       "properties": {
         "default": {
-          "description": "Default precision or quantization recipe for model weights.",
           "anyOf": [
             {
               "$ref": "#/$defs/Precision"
@@ -2784,58 +2605,58 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Default precision or quantization recipe for model weights."
         },
         "overrides": {
           "description": "Layer- or component-specific precision overrides.",
+          "items": {
+            "$ref": "#/$defs/QuantizationOverride"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/QuantizationOverride"
-          }
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "QuantizationOverride": {
       "description": "Precision override for selected layers or a named graph component.",
-      "type": "object",
       "properties": {
         "component": {
           "description": "Logical component path, for example `attention.qk` or `lm_head`.",
+          "minLength": 1,
           "type": [
             "string",
             "null"
-          ],
-          "minLength": 1
+          ]
         },
         "layers": {
           "description": "Layer indices to which the override applies; negative indices count from the end.",
+          "items": {
+            "format": "int32",
+            "type": "integer"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "integer",
-            "format": "int32"
-          }
+          ]
         },
         "precision": {
-          "description": "Required precision or quantization recipe.",
-          "$ref": "#/$defs/Precision"
+          "$ref": "#/$defs/Precision",
+          "description": "Required precision or quantization recipe."
         }
       },
       "required": [
         "precision"
-      ]
+      ],
+      "type": "object"
     },
     "RuntimeConfigurable": {
       "description": "Features whose concrete settings may be selected by the runtime.",
-      "type": "object",
       "properties": {
         "chunked_prefill": {
-          "description": "Chunked-prefill support and preferred chunk size.",
           "anyOf": [
             {
               "$ref": "#/$defs/ChunkedPrefillConfig"
@@ -2843,7 +2664,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Chunked-prefill support and preferred chunk size."
         },
         "continuous_batching": {
           "description": "Whether continuous batching may be enabled.",
@@ -2853,7 +2675,6 @@
           ]
         },
         "kv_cache": {
-          "description": "Supported runtime-selectable KV-cache dtypes.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeKvConfig"
@@ -2861,7 +2682,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Supported runtime-selectable KV-cache dtypes."
         },
         "prefix_cache": {
           "description": "Whether prefix caching may be enabled.",
@@ -2870,37 +2692,37 @@
             "null"
           ]
         }
-      }
+      },
+      "type": "object"
     },
     "RuntimeKvConfig": {
       "description": "Runtime-selectable KV-cache representations.",
-      "type": "object",
       "properties": {
         "dtype": {
           "description": "Non-empty list of supported KV-cache scalar dtypes, in preference order.",
-          "type": "array",
           "items": {
             "$ref": "#/$defs/DType"
           },
-          "minItems": 1
+          "minItems": 1,
+          "type": "array"
         }
       },
       "required": [
         "dtype"
-      ]
+      ],
+      "type": "object"
     },
     "SchedulerSpec": {
       "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\n(or, for `masked_diffusion`, as token logits) and applies one scheduler step\nper iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image\ndiffusion, with optional Karras/exponential sigmas) and `masked_diffusion`\n(discrete language diffusion).",
-      "type": "object",
       "properties": {
         "beta_end": {
           "description": "Linear beta-schedule end (default 0.012).",
+          "format": "float",
+          "minimum": 0.0,
           "type": [
             "number",
             "null"
-          ],
-          "format": "float",
-          "minimum": 0.0
+          ]
         },
         "beta_schedule": {
           "description": "Beta schedule shape: `\"linear\"` (default) or `\"scaled_linear\"` (Stable\nDiffusion).",
@@ -2911,21 +2733,21 @@
         },
         "beta_start": {
           "description": "Linear beta-schedule start (default 0.00085).",
+          "format": "float",
+          "minimum": 0.0,
           "type": [
             "number",
             "null"
-          ],
-          "format": "float",
-          "minimum": 0.0
+          ]
         },
         "block_length": {
           "description": "Semi-autoregressive block length for a `masked_diffusion` scheduler, in\ntokens. When set (and smaller than the masked generation region), each\nstep only commits tokens inside the current left-to-right block, matching\nLLaDA's semi-autoregressive remasking. Defaults to a single block\nspanning the whole masked region.",
+          "format": "uint",
+          "minimum": 0,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 0
+          ]
         },
         "kind": {
           "description": "Scheduler algorithm: `\"ddim\"`, `\"euler\"`, `\"dpmpp_2m\"`, or\n`\"masked_diffusion\"`.",
@@ -2933,20 +2755,20 @@
         },
         "mask_token_id": {
           "description": "Mask token id for a `masked_diffusion` (language-diffusion) scheduler:\neach step commits the highest-confidence still-masked positions.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "num_train_timesteps": {
           "description": "Training timesteps the noise schedule was defined over (default 1000).",
+          "format": "uint",
+          "minimum": 2,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 2
+          ]
         },
         "prediction_type": {
           "description": "Model output parameterization; `\"epsilon\"` is supported (default).",
@@ -2964,11 +2786,11 @@
         },
         "temperature": {
           "description": "Sampling temperature for a `masked_diffusion` scheduler. `0` (default)\nselects each masked position's argmax token deterministically; a positive\nvalue applies Gumbel noise (`logits.exp() / (-log u)^temperature`) before\nthe argmax, matching LLaDA's `add_gumbel_noise`. Confidence used for\nremasking is always the clean-softmax probability of the chosen token.",
+          "format": "float",
           "type": [
             "number",
             "null"
-          ],
-          "format": "float"
+          ]
         },
         "use_exponential_sigmas": {
           "description": "Use the exponential sigma spacing (`exp(linspace(log σ_max, log σ_min))`)\ninstead of linspace. Applies to `euler`/`dpmpp_2m`. Mutually exclusive\nwith `use_karras_sigmas` (Karras takes precedence).",
@@ -2987,20 +2809,21 @@
       },
       "required": [
         "kind"
-      ]
+      ],
+      "type": "object"
     },
     "SequenceInputKind": {
       "description": "Primary autoregressive sequence source for a decoder or proposer graph.",
       "oneOf": [
         {
+          "const": "token_ids",
           "description": "Integer token ids supplied through `token_input`.",
-          "type": "string",
-          "const": "token_ids"
+          "type": "string"
         },
         {
+          "const": "inputs_embeds",
           "description": "Precomputed floating-point embeddings supplied through\n`inputs_embeds_input`.",
-          "type": "string",
-          "const": "inputs_embeds"
+          "type": "string"
         }
       ]
     },
@@ -3008,15 +2831,14 @@
       "description": "Permitted scalar compatibility for attention key-sequence lengths.",
       "oneOf": [
         {
+          "const": "unit_batch",
           "description": "Interpret one rank-0 value as the canonical one-element vector only for\nan attention batch of exactly one.",
-          "type": "string",
-          "const": "unit_batch"
+          "type": "string"
         }
       ]
     },
     "SharedKvGroup": {
       "description": "One shared-KV binding group for a shared-KV proposer.\n\nA `shared_kv` proposer graph exposes `shared_kv.<name>.key` and\n`shared_kv.<name>.value` inputs bound to slices of the target model's paged\nKV cache. `target_layers` lists the target KV layer indices feeding this\nslice.",
-      "type": "object",
       "properties": {
         "key_input": {
           "description": "Proposer input receiving this group's shared key cache.",
@@ -3037,14 +2859,14 @@
           ]
         },
         "target_layers": {
-          "description": "Target KV layer indices whose cache feeds this shared-KV slice.",
-          "type": "array",
           "default": [],
+          "description": "Target KV layer indices whose cache feeds this shared-KV slice.",
           "items": {
-            "type": "integer",
             "format": "uint",
-            "minimum": 0
-          }
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
         },
         "target_value_input": {
           "description": "Target decoder past-KV input whose current value cache is referenced.",
@@ -3063,84 +2885,84 @@
       },
       "required": [
         "name"
-      ]
+      ],
+      "type": "object"
     },
     "SpecialTokens": {
       "description": "Special / control token ids declared by a model author.\n\nEvery field is optional; `eos_token_id` is normalized to a list because\nonnxruntime-genai accepts either a scalar or an array for it.",
-      "type": "object",
       "properties": {
         "bos_token_id": {
           "description": "Beginning-of-stream token id.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "decoder_start_token_id": {
           "description": "Token an encoder-decoder model starts decoding with, when not `bos`.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "eos_token_id": {
           "description": "End-of-stream token ids (one or more).",
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "integer",
-            "format": "int64"
-          }
+          ]
         },
         "image_token_id": {
           "description": "Image placeholder token id (VLMs).",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "pad_token_id": {
           "description": "Padding token id.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "sep_token_id": {
           "description": "Separator token id.",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "video_token_id": {
           "description": "Video placeholder token id (VLMs).",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         },
         "vision_start_token_id": {
           "description": "Vision-segment start token id (VLMs).",
+          "format": "int64",
           "type": [
             "integer",
             "null"
-          ],
-          "format": "int64"
+          ]
         }
-      }
+      },
+      "type": "object"
     },
     "SpeculativeModelInfo": {
       "description": "Build-time support for self-contained speculative decoding.",
-      "type": "object",
       "properties": {
         "has_draft_heads": {
           "description": "Whether the exported graph contains Medusa/EAGLE/MTP-style draft heads.",
@@ -3151,224 +2973,17 @@
         },
         "self_speculative_depth": {
           "description": "Early-exit layer depth usable for self-speculation.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
-        }
-      }
-    },
-    "SpeculatorConfig": {
-      "description": "Configuration published with a standalone speculative proposer model.",
-      "type": "object",
-      "properties": {
-        "backbone_hidden_size": {
-          "description": "Target backbone hidden size `H` shared with the proposer.\n\nFor `shared_kv`, `inputs_embeds` is `[B, q, 2*H]` and\n`projected_state` is `[B, q, H]`.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 1
-        },
-        "embedding": {
-          "description": "Target embedding initializer shared with the MTP sidecar.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MtpTargetInitializer"
-            },
-            {
-              "type": "null"
-            }
           ]
-        },
-        "hc_mult": {
-          "description": "Number of Hyper-Connection lanes `C`.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 1
-        },
-        "input_embedding": {
-          "description": "Relative path (from the model directory) to the target model's raw\ninput-token embedding table, as a little-endian f32 matrix in\n`[vocab_size, backbone_hidden_size]` order.\n\nThe `shared_kv` proposer builds each step's `inputs_embeds` as\n`concat(target_input_embedding(last_token), hidden)`, so it must be able\nto look up the target's input embedding of the last drafted/accepted\ntoken. Required for the `shared_kv` proposer.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "io": {
-          "description": "Explicit proposer graph execution contract.\n\nThis uses the same architecture-neutral I/O vocabulary as a target\ndecoder. `sequence_source` selects token ids versus embeddings,\n`kv_ownership` selects private past/present state versus references to\ntarget-owned cache, and the output fields assign semantic roles.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ModelIoSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "kv_mode": {
-          "description": "Lifetime of the sidecar's KV state.\n\nDefaults to `proposal_local`.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MtpKvMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "lm_head": {
-          "description": "Target LM-head initializer shared with the MTP sidecar.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MtpTargetInitializer"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "logits_output": {
-          "description": "Name of the proposer's draft-distribution output.\n\nDefaults to `logits` for `shared_kv`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "method": {
-          "description": "Deprecated alias for `proposal_type`.",
-          "allOf": [
-            {
-              "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input.",
-              "$ref": "#/$defs/ProposalType"
-            }
-          ],
-          "deprecated": true
-        },
-        "model": {
-          "description": "Relative path (from the model directory) to the proposer ONNX model.\n\nUsed by the `shared_kv` proposer to locate the\nproposer graph. Optional for forward compatibility with proposer\nfamilies that do not ship a standalone model file.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "mtp_hidden_output": {
-          "description": "Sidecar output projected through the shared target LM head.\n\nDefaults to `mtp_hidden`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "mtp_state_output": {
-          "description": "Sidecar recurrent Hyper-Connection state output.\n\nDefaults to `mtp_state`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "num_speculative_tokens": {
-          "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
-          "type": "integer",
-          "format": "uint",
-          "default": 4,
-          "minimum": 1
-        },
-        "projected_state_output": {
-          "description": "Name of the proposer output threaded forward between steps.\n\nDefaults to `projected_state` for `shared_kv`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "proposal_type": {
-          "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input.",
-          "$ref": "#/$defs/ProposalType"
-        },
-        "shared_kv": {
-          "description": "Shared-KV binding groups consumed by the proposer.\n\nEach group names an assistant input prefix\n(`shared_kv.<name>.{key,value}`) and the target KV layer indices whose\ncache feeds that slice. Empty for proposers that own their KV cache.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/SharedKvGroup"
-          }
-        },
-        "target_hidden_layout": {
-          "description": "Layout of `target_hidden_output`.\n\nMobius MTP sidecars use `BSHC`: batch, sequence, Hyper-Connection lane,\nhidden.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MtpHiddenLayout"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "target_hidden_output": {
-          "description": "Target decoder output carrying the recurrent MTP seed.\n\nDefaults to `hidden_states` for `mtp`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "target_hidden_size": {
-          "description": "Target hidden width `H`.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 1
-        },
-        "tokens_per_step": {
-          "description": "Deprecated alias for `num_speculative_tokens`.",
-          "allOf": [
-            {
-              "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
-              "type": "integer",
-              "format": "uint",
-              "default": 4,
-              "minimum": 1
-            }
-          ],
-          "deprecated": true
-        },
-        "verifier": {
-          "description": "Identity of the verifier model against which this proposer was trained.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SpeculatorVerifier"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vocab_size": {
-          "description": "Vocabulary size of the proposer's own `logits` output.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "default": null,
-          "minimum": 1
         }
       },
+      "type": "object"
+    },
+    "SpeculatorConfig": {
       "allOf": [
         {
           "not": {
@@ -3379,6 +2994,7 @@
           }
         }
       ],
+      "description": "Configuration published with a standalone speculative proposer model.",
       "oneOf": [
         {
           "not": {
@@ -3401,19 +3017,225 @@
           ]
         }
       ],
-      "required": []
+      "properties": {
+        "backbone_hidden_size": {
+          "default": null,
+          "description": "Target backbone hidden size `H` shared with the proposer.\n\nFor `shared_kv`, `inputs_embeds` is `[B, q, 2*H]` and\n`projected_state` is `[B, q, H]`.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "embedding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpTargetInitializer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Target embedding initializer shared with the MTP sidecar."
+        },
+        "hc_mult": {
+          "default": null,
+          "description": "Number of Hyper-Connection lanes `C`.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_embedding": {
+          "default": null,
+          "description": "Relative path (from the model directory) to the target model's raw\ninput-token embedding table, as a little-endian f32 matrix in\n`[vocab_size, backbone_hidden_size]` order.\n\nThe `shared_kv` proposer builds each step's `inputs_embeds` as\n`concat(target_input_embedding(last_token), hidden)`, so it must be able\nto look up the target's input embedding of the last drafted/accepted\ntoken. Required for the `shared_kv` proposer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "io": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit proposer graph execution contract.\n\nThis uses the same architecture-neutral I/O vocabulary as a target\ndecoder. `sequence_source` selects token ids versus embeddings,\n`kv_ownership` selects private past/present state versus references to\ntarget-owned cache, and the output fields assign semantic roles."
+        },
+        "kv_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpKvMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Lifetime of the sidecar's KV state.\n\nDefaults to `proposal_local`."
+        },
+        "lm_head": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpTargetInitializer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Target LM-head initializer shared with the MTP sidecar."
+        },
+        "logits_output": {
+          "default": null,
+          "description": "Name of the proposer's draft-distribution output.\n\nDefaults to `logits` for `shared_kv`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ProposalType",
+              "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input."
+            }
+          ],
+          "deprecated": true,
+          "description": "Deprecated alias for `proposal_type`."
+        },
+        "model": {
+          "default": null,
+          "description": "Relative path (from the model directory) to the proposer ONNX model.\n\nUsed by the `shared_kv` proposer to locate the\nproposer graph. Optional for forward compatibility with proposer\nfamilies that do not ship a standalone model file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mtp_hidden_output": {
+          "default": null,
+          "description": "Sidecar output projected through the shared target LM head.\n\nDefaults to `mtp_hidden`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mtp_state_output": {
+          "default": null,
+          "description": "Sidecar recurrent Hyper-Connection state output.\n\nDefaults to `mtp_state`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "num_speculative_tokens": {
+          "default": 4,
+          "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "projected_state_output": {
+          "default": null,
+          "description": "Name of the proposer output threaded forward between steps.\n\nDefaults to `projected_state` for `shared_kv`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proposal_type": {
+          "$ref": "#/$defs/ProposalType",
+          "description": "Proposal architecture used by the speculator.\n\nThe deprecated `method` alias is accepted on input."
+        },
+        "shared_kv": {
+          "description": "Shared-KV binding groups consumed by the proposer.\n\nEach group names an assistant input prefix\n(`shared_kv.<name>.{key,value}`) and the target KV layer indices whose\ncache feeds that slice. Empty for proposers that own their KV cache.",
+          "items": {
+            "$ref": "#/$defs/SharedKvGroup"
+          },
+          "type": "array"
+        },
+        "target_hidden_layout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MtpHiddenLayout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Layout of `target_hidden_output`.\n\nMobius MTP sidecars use `BSHC`: batch, sequence, Hyper-Connection lane,\nhidden."
+        },
+        "target_hidden_output": {
+          "default": null,
+          "description": "Target decoder output carrying the recurrent MTP seed.\n\nDefaults to `hidden_states` for `mtp`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_hidden_size": {
+          "default": null,
+          "description": "Target hidden width `H`.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens_per_step": {
+          "allOf": [
+            {
+              "default": 4,
+              "description": "Maximum number of tokens proposed per verifier step; defaults to 4.\n\nThe deprecated `tokens_per_step` alias is accepted on input.",
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            }
+          ],
+          "deprecated": true,
+          "description": "Deprecated alias for `num_speculative_tokens`."
+        },
+        "verifier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeculatorVerifier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Identity of the verifier model against which this proposer was trained."
+        },
+        "vocab_size": {
+          "default": null,
+          "description": "Vocabulary size of the proposer's own `logits` output.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object"
     },
     "SpeculatorVerifier": {
       "description": "Verifier identity embedded in a speculator package.",
-      "type": "object",
       "properties": {
         "architectures": {
-          "description": "Verifier architecture class names, in preference order.",
-          "type": "array",
           "default": [],
+          "description": "Verifier architecture class names, in preference order.",
           "items": {
             "type": "string"
-          }
+          },
+          "type": "array"
         },
         "name_or_path": {
           "description": "HuggingFace-style verifier repository name or local model path.",
@@ -3422,77 +3244,76 @@
             "null"
           ]
         }
-      }
+      },
+      "type": "object"
     },
     "StateInitKind": {
       "description": "Loop-carried state initialization vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "zeros"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "zeros"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "StateUpdateKind": {
       "description": "Loop-carried state update-semantics vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "replace"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "replace"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "StrategyKind": {
       "description": "Generic inference-strategy vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "speculative"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "speculative"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "StrategySpec": {
       "description": "Generic inference strategy declaration.",
-      "type": "object",
       "properties": {
         "acceptance": {
-          "description": "Draft-token acceptance rule.",
           "anyOf": [
             {
               "$ref": "#/$defs/AcceptanceMethod"
@@ -3500,10 +3321,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Draft-token acceptance rule."
         },
         "draft": {
-          "description": "Draft-token producer configuration for speculative decoding.",
           "anyOf": [
             {
               "$ref": "#/$defs/DraftConfig"
@@ -3511,14 +3332,14 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Draft-token producer configuration for speculative decoding."
         },
         "kind": {
-          "description": "Strategy vocabulary entry, such as `speculative`.",
-          "$ref": "#/$defs/StrategyKind"
+          "$ref": "#/$defs/StrategyKind",
+          "description": "Strategy vocabulary entry, such as `speculative`."
         },
         "performance_hints": {
-          "description": "Model-publisher performance guidance.",
           "anyOf": [
             {
               "$ref": "#/$defs/PerformanceHints"
@@ -3526,19 +3347,19 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Model-publisher performance guidance."
         },
         "tokens_per_step": {
           "description": "Number of draft tokens attempted per verification step.",
+          "format": "uint",
+          "minimum": 1,
           "type": [
             "integer",
             "null"
-          ],
-          "format": "uint",
-          "minimum": 1
+          ]
         },
         "topology": {
-          "description": "Proposal topology, such as `linear` or `tree`.",
           "anyOf": [
             {
               "$ref": "#/$defs/ProposalTopology"
@@ -3546,10 +3367,10 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Proposal topology, such as `linear` or `tree`."
         },
         "verify": {
-          "description": "Verification configuration for speculative decoding.",
           "anyOf": [
             {
               "$ref": "#/$defs/VerifyConfig"
@@ -3557,29 +3378,28 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Verification configuration for speculative decoding."
         }
       },
       "required": [
         "kind"
-      ]
+      ],
+      "type": "object"
     },
     "StructuredOutputFormat": {
       "description": "Structured-output constraint-format vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "json_schema",
             "regex",
             "context_free_grammar",
             "choice"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "json_schema",
@@ -3587,33 +3407,35 @@
               "context_free_grammar",
               "choice"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "StructuredOutputSpec": {
       "description": "Structured-output capabilities and model formatting conventions.",
-      "type": "object",
       "properties": {
         "stop_sequences": {
           "description": "Literal token sequences that terminate a structured response.",
+          "items": {
+            "type": "string"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "type": "string"
-          }
+          ]
         },
         "supported_formats": {
           "description": "Supported constraint formats, such as JSON Schema, regular expressions, or CFGs.",
+          "items": {
+            "$ref": "#/$defs/StructuredOutputFormat"
+          },
           "type": [
             "array",
             "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/StructuredOutputFormat"
-          }
+          ]
         },
         "training_format": {
           "description": "Format in which the model was trained to emit tool calls or structured values.",
@@ -3622,14 +3444,13 @@
             "null"
           ]
         }
-      }
+      },
+      "type": "object"
     },
     "TensorDType": {
       "description": "Tensor-boundary dtype vocabulary, including non-numeric pipeline values.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "float32",
             "fp32",
@@ -3645,11 +3466,10 @@
             "uint8",
             "bool",
             "string"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "float32",
@@ -3667,78 +3487,79 @@
               "bool",
               "string"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "TensorDimension": {
-      "description": "One fixed or runtime-resolved tensor-shape dimension.",
       "anyOf": [
         {
           "description": "A fixed, non-negative dimension.",
-          "type": "integer",
           "format": "int64",
-          "minimum": 0
+          "minimum": 0,
+          "type": "integer"
         },
         {
           "description": "A runtime shape symbol.",
-          "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "type": "string"
         }
-      ]
+      ],
+      "description": "One fixed or runtime-resolved tensor-shape dimension."
     },
     "ThumbnailOrder": {
       "description": "Optional-thumbnail ordering vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "none",
             "prepend",
             "append"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "none",
               "prepend",
               "append"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "VerificationMethod": {
       "description": "Speculative verification-method vocabulary.",
-      "type": "string",
       "oneOf": [
         {
-          "title": "Known standard value",
           "enum": [
             "single_forward"
-          ]
+          ],
+          "title": "Known standard value"
         },
         {
-          "title": "Forward-compatible extension value",
-          "type": "string",
           "not": {
             "enum": [
               "single_forward"
             ]
-          }
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
         }
-      ]
+      ],
+      "type": "string"
     },
     "VerifyConfig": {
       "description": "Draft-token verification configuration.",
-      "type": "object",
       "properties": {
         "method": {
-          "description": "Verification method, such as `single_forward`.",
           "anyOf": [
             {
               "$ref": "#/$defs/VerificationMethod"
@@ -3746,7 +3567,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Verification method, such as `single_forward`."
         },
         "session": {
           "description": "Named verifier session or pipeline component.",
@@ -3755,7 +3577,185 @@
             "null"
           ]
         }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/onnx/onnx/issues/8184",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "not": {
+        "required": [
+          "speculative",
+          "speculator_config"
+        ]
       }
     }
-  }
+  ],
+  "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
+  "properties": {
+    "generation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GenerationDefaults"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Author-declared text-generation / search defaults.\n\nPopulated from an onnxruntime-genai `genai_config.json` `search` block.\nEvery field is optional; readers treat an absent value as \"use the\nruntime default\"."
+    },
+    "hardware_requirements": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HardwareRequirements"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Minimum and beneficial hardware capabilities used for distribution matching."
+    },
+    "kv_cache": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KvCacheSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "KV-cache storage, quantization tolerance, and operational semantics."
+    },
+    "model": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ModelCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Build-time model properties and runtime-configurable capabilities."
+    },
+    "pipeline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PipelineSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Declarative multi-model pipeline and its dataflow graph."
+    },
+    "preprocessing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PreprocessingSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail."
+    },
+    "quantization": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QuantizationIntent"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Model weight quantization intent, independent of the packed representation."
+    },
+    "required_capabilities": {
+      "default": [],
+      "description": "Capability identifiers that a runtime MUST support or refuse to load the model.",
+      "examples": [
+        [
+          "kv_cache",
+          "grouped_query_attention"
+        ]
+      ],
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "speculative": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpeculatorConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input."
+    },
+    "speculator_config": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpeculatorConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Standalone speculative proposer declaration.\n\nThis is the preferred native source for speculator discovery;\nHuggingFace `config.json` is a compatibility fallback. The deprecated\n`speculator_config` alias is accepted on input."
+        }
+      ],
+      "deprecated": true,
+      "description": "Deprecated alias for `speculative`."
+    },
+    "strategy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StrategySpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Generic inference strategy, including speculative decoding."
+    },
+    "structured_output": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StructuredOutputSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Structured-output formats and model training conventions."
+    },
+    "tokens": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SpecialTokens"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Special / control token ids declared by the model author.\n\nPopulated from the model-level token id fields of a `genai_config.json`."
+    }
+  },
+  "title": "ONNX Inference Metadata",
+  "type": "object"
 }
