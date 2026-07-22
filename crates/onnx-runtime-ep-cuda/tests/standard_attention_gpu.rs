@@ -1080,6 +1080,7 @@ fn concat_bsh(
 fn asymmetric_3d_prefill_decode_cpu_cuda_case(kv_heads: usize) {
     let (batch, q_heads, prefill_seq, decode_seq) = (1usize, 4usize, 3usize, 1usize);
     let (qk_head_dim, v_head_dim) = (192usize, 128usize);
+    assert_ne!(qk_head_dim, v_head_dim);
     let attrs = [
         ("is_causal", Attribute::Int(1)),
         ("q_num_heads", Attribute::Int(q_heads as i64)),

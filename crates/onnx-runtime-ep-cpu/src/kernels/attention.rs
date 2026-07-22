@@ -954,6 +954,7 @@ mod tests {
     fn asymmetric_3d_prefill_decode_case(kv_heads: usize) {
         let (batch, q_heads, prefill_seq, decode_seq) = (1usize, 4usize, 3usize, 1usize);
         let (qk_head_dim, v_head_dim) = (192usize, 128usize);
+        assert_ne!(qk_head_dim, v_head_dim);
 
         let q_prefill =
             conformance_values(batch * prefill_seq * q_heads * qk_head_dim, 1 + kv_heads);
