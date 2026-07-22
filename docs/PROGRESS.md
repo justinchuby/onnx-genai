@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T14:59Z — WP-B optional-modality contract completion + clippy cleanup._
+_Last updated: 2026-07-22T15:33Z — H200 native CUDA decode benchmark report._
 
 **Current `origin/main` implementation HEAD:** `3d84b9b` (code before this docs update).
+
+## 2026-07-22 — H200 native CUDA decode benchmark report
+
+- **Qwen2.5-0.5B H200 graph decode ✅:** Native CUDA device-KV with whole-step graph replay reached **820.65 tok/s** at 128 tokens and **781.20 tok/s** at 1024 tokens, or **92.6%/88.2%** of the supplied 886 tok/s roofline and **2.16x/2.06x** vs the 380 tok/s RTX 4060 baseline. Graph-off token-identical runs were 434.14/427.65 tok/s; Phi-4-mini graph-on held **94.50/93.19 tok/s**. Full report: `docs/benchmarks/h200-native-decode-2026-07-22.md`.
 
 ## 2026-07-22 — WP-B optional-modality contract landings
 
