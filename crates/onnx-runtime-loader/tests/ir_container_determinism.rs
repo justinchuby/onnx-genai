@@ -129,12 +129,7 @@ fn randomized_single_removal_matches_reference_serialization() {
                 DataType::Float32,
                 static_shape([1]),
             );
-            nodes.push(original.insert_node(Node::new(
-                NodeId(0),
-                "Add",
-                inputs,
-                vec![output],
-            )));
+            nodes.push(original.insert_node(Node::new(NodeId(0), "Add", inputs, vec![output])));
             values.push(output);
         }
         for _ in 0..rng.usize(4) {

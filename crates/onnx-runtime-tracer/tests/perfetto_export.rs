@@ -51,11 +51,7 @@ fn perfetto_export_is_non_empty_and_valid() {
     // The process name we set must survive into the descriptor.
     assert!(
         descriptors.iter().any(|d| d.name.as_deref() == Some("nxrt")
-            || d
-                .process
-                .as_ref()
-                .and_then(|p| p.process_name.as_deref())
-                == Some("nxrt")),
+            || d.process.as_ref().and_then(|p| p.process_name.as_deref()) == Some("nxrt")),
         "process_name metadata must name the process track"
     );
 

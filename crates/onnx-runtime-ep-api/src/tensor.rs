@@ -325,7 +325,13 @@ mod tests {
         let buf = vec![0u8; 6 * 4];
         let shape = [2usize, 3];
         let strides = compute_contiguous_strides(&shape);
-        let v = TensorView::new(ptr(&buf), DataType::Float32, &shape, &strides, DeviceId::cpu());
+        let v = TensorView::new(
+            ptr(&buf),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
         v.validate().unwrap();
         assert!(v.is_contiguous());
         assert_eq!(v.numel(), 6);
@@ -339,8 +345,14 @@ mod tests {
         let buf = vec![0u8; 6 * 4];
         let shape = [3usize, 2];
         let strides = [1i64, 3];
-        let v = TensorView::new(ptr(&buf), DataType::Float32, &shape, &strides, DeviceId::cpu())
-            .with_byte_offset(4);
+        let v = TensorView::new(
+            ptr(&buf),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(4);
         v.validate().unwrap();
         assert!(!v.is_contiguous());
         assert_eq!(v.shape, &[3, 2]);
@@ -357,7 +369,13 @@ mod tests {
         let buf = vec![0u8; 4 * 4];
         let shape = [4usize];
         let strides = [-1i64];
-        let v = TensorView::new(ptr(&buf), DataType::Float32, &shape, &strides, DeviceId::cpu());
+        let v = TensorView::new(
+            ptr(&buf),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
         v.validate().unwrap();
         assert!(!v.is_contiguous());
     }
@@ -367,7 +385,13 @@ mod tests {
         let buf = vec![0u8; 8];
         let shape = [2usize, 2];
         let strides = [1i64]; // wrong rank
-        let v = TensorView::new(ptr(&buf), DataType::Float32, &shape, &strides, DeviceId::cpu());
+        let v = TensorView::new(
+            ptr(&buf),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
         assert!(v.validate().is_err());
     }
 
@@ -377,13 +401,23 @@ mod tests {
         let shape = [2usize];
         let strides = [1i64];
         // byte_offset not a multiple of f32 element size.
-        let bad_off =
-            TensorView::new(ptr(&buf), DataType::Float32, &shape, &strides, DeviceId::cpu())
-                .with_byte_offset(1);
+        let bad_off = TensorView::new(
+            ptr(&buf),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(1);
         assert!(bad_off.validate().is_err());
         // String has no fixed-width raw layout.
-        let bad_dt =
-            TensorView::new(ptr(&buf), DataType::String, &shape, &strides, DeviceId::cpu());
+        let bad_dt = TensorView::new(
+            ptr(&buf),
+            DataType::String,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
         assert!(bad_dt.validate().is_err());
         // Null data pointer.
         let bad_null = TensorView::new(

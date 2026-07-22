@@ -151,10 +151,7 @@ where
     // free fits (a strict `>=` policy — a reused slot is never grown, keeping
     // each slot's capacity fixed at its first occupant's size unless a larger
     // owner is later assigned to a fresh slot).
-    let allocate = |need: usize,
-                    slots: &mut Vec<SlotInfo>,
-                    free: &mut Vec<SlotId>|
-     -> SlotId {
+    let allocate = |need: usize, slots: &mut Vec<SlotInfo>, free: &mut Vec<SlotId>| -> SlotId {
         // Track (free-list index, capacity, slot id) of the best fit so far.
         let mut best: Option<(usize, usize, u32)> = None;
         for (i, &sid) in free.iter().enumerate() {
@@ -164,7 +161,9 @@ where
             }
             let better = match best {
                 None => true,
-                Some((_, best_cap, best_id)) => cap < best_cap || (cap == best_cap && sid.0 < best_id),
+                Some((_, best_cap, best_id)) => {
+                    cap < best_cap || (cap == best_cap && sid.0 < best_id)
+                }
             };
             if better {
                 best = Some((i, cap, sid.0));

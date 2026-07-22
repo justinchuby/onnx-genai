@@ -416,10 +416,7 @@ fn concatenate_initializer_bytes(
 }
 
 fn remove_orphan_initializer(graph: &mut Graph, value: ValueId) {
-    if !graph.has_uses(value)
-        && !graph.inputs.contains(&value)
-        && !graph.outputs.contains(&value)
-    {
+    if !graph.has_uses(value) && !graph.inputs.contains(&value) && !graph.outputs.contains(&value) {
         graph.initializers.remove(&value);
     }
 }

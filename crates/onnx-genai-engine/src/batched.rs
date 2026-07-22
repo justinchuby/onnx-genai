@@ -14,11 +14,11 @@ use crate::processors::{
 };
 use crate::sampling::SamplingRng;
 use anyhow::Context;
+use onnx_genai_ort::Tokenizer;
 use onnx_genai_ort::decode::{
     BatchedDecodeSession, BatchedSharedBufferDecodeSession, SharedBufferBatchOptions,
 };
 use onnx_genai_ort::{BatchedStaticCacheDecodeSession, StaticCacheDecodeOptions};
-use onnx_genai_ort::Tokenizer;
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -593,25 +593,22 @@ impl Engine {
             .context("ORT decoder session is unavailable")?;
         let batch_size = i64::try_from(max_batch).context("batch size exceeds i64")?;
         let decode: Box<dyn BatchedDecodeSession<'_> + '_> = match self.decode_path {
-            ModelDecodePath::StaticCache { .. } => {
-                Box::new(
-                    BatchedStaticCacheDecodeSession::new(
-                        session,
-                        StaticCacheDecodeOptions { batch_size },
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to create continuous static-cache session: {}", e)
-                    })?,
+            ModelDecodePath::StaticCache { .. } => Box::new(
+                BatchedStaticCacheDecodeSession::new(
+                    session,
+                    StaticCacheDecodeOptions { batch_size },
                 )
-            }
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create continuous static-cache session: {}", e)
+                })?,
+            ),
             ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len,
                 ..
             } => {
-                let max_len = max_len.context(
-                    "shared-buffer continuous batching requires a known max_len",
-                )?;
+                let max_len = max_len
+                    .context("shared-buffer continuous batching requires a known max_len")?;
                 Box::new(
                     BatchedSharedBufferDecodeSession::new(
                         session,
@@ -621,10 +618,7 @@ impl Engine {
                         },
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "Failed to create continuous shared-buffer session: {}",
-                            e
-                        )
+                        anyhow::anyhow!("Failed to create continuous shared-buffer session: {}", e)
                     })?,
                 )
             }

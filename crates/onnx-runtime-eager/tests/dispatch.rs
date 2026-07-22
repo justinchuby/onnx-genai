@@ -11,7 +11,11 @@ use onnx_runtime_eager::{EagerContext, EagerError, Tensor};
 
 /// f32 comparison helper with a tight tolerance for exact-arithmetic ops.
 fn assert_close(got: &[f32], want: &[f32], tol: f32) {
-    assert_eq!(got.len(), want.len(), "length mismatch: {got:?} vs {want:?}");
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "length mismatch: {got:?} vs {want:?}"
+    );
     for (g, w) in got.iter().zip(want.iter()) {
         assert!((g - w).abs() <= tol, "‖{g} - {w}‖ > {tol}");
     }
@@ -82,7 +86,9 @@ fn dispatch_unknown_op_is_no_kernel() {
         .dispatch("Conv", "", &[&x], &HashMap::new(), None)
         .unwrap_err();
     match err {
-        EagerError::NoKernel { op_type, domain, .. } => {
+        EagerError::NoKernel {
+            op_type, domain, ..
+        } => {
             assert_eq!(op_type, "Conv");
             assert_eq!(domain, "");
         }
@@ -111,7 +117,10 @@ fn kernel_cache_reuses_same_op_and_shape() {
         .dispatch("Add", "", &[&a, &b], &HashMap::new(), None)
         .unwrap();
     let after_second = ctx.cache_stats();
-    assert_eq!(after_second.misses, 1, "second dispatch reuses the cached kernel");
+    assert_eq!(
+        after_second.misses, 1,
+        "second dispatch reuses the cached kernel"
+    );
     assert_eq!(after_second.hits, 1);
     assert_eq!(after_second.entries, 1);
 

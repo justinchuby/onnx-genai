@@ -198,11 +198,19 @@ mod tests {
         let a = key("Add", vec![1]);
         let b = key("Mul", vec![1]);
         let c = key("Sub", vec![1]);
-        let _ = cache.get_or_create::<()>(a.clone(), || Ok(Box::new(NopKernel))).unwrap();
-        let _ = cache.get_or_create::<()>(b.clone(), || Ok(Box::new(NopKernel))).unwrap();
+        let _ = cache
+            .get_or_create::<()>(a.clone(), || Ok(Box::new(NopKernel)))
+            .unwrap();
+        let _ = cache
+            .get_or_create::<()>(b.clone(), || Ok(Box::new(NopKernel)))
+            .unwrap();
         // Touch `a` so `b` becomes the LRU victim.
-        let _ = cache.get_or_create::<()>(a.clone(), || Ok(Box::new(NopKernel))).unwrap();
-        let _ = cache.get_or_create::<()>(c.clone(), || Ok(Box::new(NopKernel))).unwrap();
+        let _ = cache
+            .get_or_create::<()>(a.clone(), || Ok(Box::new(NopKernel)))
+            .unwrap();
+        let _ = cache
+            .get_or_create::<()>(c.clone(), || Ok(Box::new(NopKernel)))
+            .unwrap();
         assert_eq!(cache.stats().entries, 2);
         // `b` evicted → recompiled on next access (a fresh miss).
         let mut recreated = 0;

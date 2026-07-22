@@ -30,8 +30,8 @@
 //!   `null` on success, an owned status the caller must
 //!   [`nxrt_release_status`] on error.
 
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use onnx_runtime_session::{InferenceSession, SessionBuilder, SessionError, Tensor};
@@ -156,10 +156,9 @@ fn map_loader_error(err: &onnx_runtime_loader::LoaderError) -> OrtErrorCode {
         }
         L::ExternalDataNotFound { .. } => OrtErrorCode::NoSuchFile,
         L::ProtobufParse(_) => OrtErrorCode::InvalidProtobuf,
-        L::ExternalDataPath { .. }
-        | L::EpContextPath { .. }
-        | L::Ir(_)
-        | L::GraphBuild(_) => OrtErrorCode::InvalidGraph,
+        L::ExternalDataPath { .. } | L::EpContextPath { .. } | L::Ir(_) | L::GraphBuild(_) => {
+            OrtErrorCode::InvalidGraph
+        }
         _ => OrtErrorCode::Fail,
     }
 }
@@ -257,7 +256,12 @@ pub unsafe extern "C" fn nxrt_create_session(
         // SAFETY: non-null NUL-terminated C string per the precondition.
         let path = unsafe { CStr::from_ptr(model_path) }
             .to_str()
-            .map_err(|_| (OrtErrorCode::InvalidArgument, "model_path is not valid UTF-8".into()))?;
+            .map_err(|_| {
+                (
+                    OrtErrorCode::InvalidArgument,
+                    "model_path is not valid UTF-8".into(),
+                )
+            })?;
 
         let inner = InferenceSession::load(path).map_err(session_err)?;
         let handle = Box::into_raw(Box::new(OrtSession { inner }));
@@ -357,20 +361,32 @@ pub unsafe extern "C" fn nxrt_add_session_config_entry(
 ) -> *mut OrtStatus {
     guard(|| {
         if options.is_null() {
-            return Err((OrtErrorCode::InvalidArgument, "options handle is null".into()));
+            return Err((
+                OrtErrorCode::InvalidArgument,
+                "options handle is null".into(),
+            ));
         }
         if key.is_null() || value.is_null() {
-            return Err((OrtErrorCode::InvalidArgument, "key or value pointer is null".into()));
+            return Err((
+                OrtErrorCode::InvalidArgument,
+                "key or value pointer is null".into(),
+            ));
         }
         // SAFETY: non-null handle per the precondition.
         let options = unsafe { &mut *options };
         // SAFETY: non-null NUL-terminated C strings per the precondition.
-        let key = unsafe { CStr::from_ptr(key) }
-            .to_str()
-            .map_err(|_| (OrtErrorCode::InvalidArgument, "key is not valid UTF-8".into()))?;
-        let value = unsafe { CStr::from_ptr(value) }
-            .to_str()
-            .map_err(|_| (OrtErrorCode::InvalidArgument, "value is not valid UTF-8".into()))?;
+        let key = unsafe { CStr::from_ptr(key) }.to_str().map_err(|_| {
+            (
+                OrtErrorCode::InvalidArgument,
+                "key is not valid UTF-8".into(),
+            )
+        })?;
+        let value = unsafe { CStr::from_ptr(value) }.to_str().map_err(|_| {
+            (
+                OrtErrorCode::InvalidArgument,
+                "value is not valid UTF-8".into(),
+            )
+        })?;
         options.entries.push((key.to_string(), value.to_string()));
         Ok(())
     })
@@ -409,7 +425,12 @@ pub unsafe extern "C" fn nxrt_create_session_with_options(
         // SAFETY: non-null NUL-terminated C string per the precondition.
         let path = unsafe { CStr::from_ptr(model_path) }
             .to_str()
-            .map_err(|_| (OrtErrorCode::InvalidArgument, "model_path is not valid UTF-8".into()))?;
+            .map_err(|_| {
+                (
+                    OrtErrorCode::InvalidArgument,
+                    "model_path is not valid UTF-8".into(),
+                )
+            })?;
 
         let mut builder = SessionBuilder::new().model(path);
         if !options.is_null() {
@@ -426,7 +447,6 @@ pub unsafe extern "C" fn nxrt_create_session_with_options(
         Ok(())
     })
 }
-
 
 /// Opaque tensor value handle wrapping an owned [`Tensor`].
 pub struct OrtValue {
@@ -707,8 +727,10 @@ pub unsafe extern "C" fn nxrt_run(
 ) -> *mut OrtStatus {
     guard(|| {
         // SAFETY: precondition — non-null unreleased handle, or null (handled).
-        let session = unsafe { session.as_mut() }
-            .ok_or((OrtErrorCode::InvalidArgument, "session handle is null".into()))?;
+        let session = unsafe { session.as_mut() }.ok_or((
+            OrtErrorCode::InvalidArgument,
+            "session handle is null".into(),
+        ))?;
 
         // Pre-null the output slots so an early error leaves no dangling caller
         // pointers, and validate the output arrays.
@@ -768,8 +790,12 @@ pub unsafe extern "C" fn nxrt_run(
 
         // Resolve requested output names before running so a bad name fails
         // fast. Outputs come back in the model's declared order.
-        let declared: Vec<&str> =
-            session.inner.outputs().iter().map(|m| m.name.as_str()).collect();
+        let declared: Vec<&str> = session
+            .inner
+            .outputs()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
         let mut want: Vec<usize> = Vec::with_capacity(n_outputs);
         for i in 0..n_outputs {
             // SAFETY: `output_names` holds `n_outputs` elems (validated above).

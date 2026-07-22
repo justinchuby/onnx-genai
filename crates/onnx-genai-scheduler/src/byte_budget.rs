@@ -172,7 +172,9 @@ impl ByteBudget {
         // The critical sections are tiny and panic-free, so the mutex can only be
         // poisoned by a panic in unrelated code; recover the guard rather than
         // propagating a poison error onto the hot admission path.
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

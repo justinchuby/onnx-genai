@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, ValueId};
 
-use crate::{pathsafe::guarded_join, LoaderError};
+use crate::{LoaderError, pathsafe::guarded_join};
 
 /// The op type of an EPContext node. Shared with the §55.4 writer so the dump
 /// path never re-invents the literal.
@@ -239,9 +239,8 @@ pub fn resolve_ep_context(
                 ))
             })?;
             let path = resolve_external_path(model_dir, rel)?;
-            let file = File::open(&path).map_err(|_| LoaderError::ExternalDataNotFound {
-                path: path.clone(),
-            })?;
+            let file = File::open(&path)
+                .map_err(|_| LoaderError::ExternalDataNotFound { path: path.clone() })?;
             // SAFETY: identical idiom to `weights.rs`'s external-data mmap — the
             // `File` is held open for the duration of the map and the bytes are
             // only ever read immutably (opaque vendor blob). This is the same,

@@ -66,7 +66,10 @@ fn parse_args() -> Args {
             "--runs" => runs = it.next().and_then(|v| v.parse().ok()).expect("--runs N"),
             "--raw" => raw = true,
             "--temperature" => {
-                temperature = it.next().and_then(|v| v.parse().ok()).expect("--temperature F");
+                temperature = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--temperature F");
             }
             "--top-p" => top_p = it.next().and_then(|v| v.parse().ok()).expect("--top-p F"),
             "--top-k" => top_k = it.next().and_then(|v| v.parse().ok()).expect("--top-k N"),
@@ -108,12 +111,14 @@ fn load_real_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
                 .and_then(|value| value.as_str().map(ToString::to_string))
                 .is_some());
     if has_template {
-        Some(ChatTemplate::from_model_dir(model_dir).unwrap_or_else(|err| {
-            panic!(
-                "failed to load chat template from {}: {err}",
-                model_dir.display()
-            )
-        }))
+        Some(
+            ChatTemplate::from_model_dir(model_dir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to load chat template from {}: {err}",
+                    model_dir.display()
+                )
+            }),
+        )
     } else {
         None
     }

@@ -38,8 +38,8 @@ mod error;
 mod opset;
 mod tensor;
 
-use std::sync::{Mutex, OnceLock, RwLock};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use onnx_runtime_ep_api::{EpConfig, ExecutionProvider};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
@@ -49,7 +49,7 @@ use onnx_runtime_shape_inference::InferenceRegistry;
 pub use cache::{CacheStats, KernelCache, KernelCacheKey};
 pub use domain::{DomainInfo, DomainRegistry};
 pub use error::{EagerError, Result};
-pub use opset::{resolve_opset, LATEST_ONNX_OPSET};
+pub use opset::{LATEST_ONNX_OPSET, resolve_opset};
 pub use tensor::Tensor;
 
 /// Default compiled-kernel cache capacity (`docs/EAGER.md` §13: per-process LRU,
@@ -130,7 +130,10 @@ impl EagerContext {
 
     /// Current kernel-cache statistics (entries / hits / misses).
     pub fn cache_stats(&self) -> CacheStats {
-        self.cache.lock().expect("kernel cache lock poisoned").stats()
+        self.cache
+            .lock()
+            .expect("kernel cache lock poisoned")
+            .stats()
     }
 
     /// Resolve the single target device from `inputs`; mixed devices are an

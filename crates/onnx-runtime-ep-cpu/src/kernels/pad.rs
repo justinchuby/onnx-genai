@@ -198,7 +198,8 @@ impl Kernel for PadKernel {
                 return Err(EpError::KernelFailed(
                     "Pad: WHAT: constant_value holds fewer bytes than one element. \
                      WHY: it must be a scalar of the data dtype. \
-                     HOW: provide a one-element constant_value.".into(),
+                     HOW: provide a one-element constant_value."
+                        .into(),
                 ));
             }
             cv[..esize].to_vec()
@@ -282,10 +283,7 @@ mod tests {
         constant_kernel(None)
             .execute(&[x.view(), pads.view()], &mut [out.view_mut()])
             .unwrap();
-        assert_eq!(
-            out.to_f32(),
-            vec![0., 0., 1., 2., 3., 4., 0., 0.]
-        );
+        assert_eq!(out.to_f32(), vec![0., 0., 1., 2., 3., 4., 0., 0.]);
     }
 
     #[test]
@@ -296,10 +294,7 @@ mod tests {
         let cv = Owned::f32(&[], &[9.]);
         let mut out = Owned::zeros_f32(&[3, 4]);
         constant_kernel(None)
-            .execute(
-                &[x.view(), pads.view(), cv.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[x.view(), pads.view(), cv.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(
             out.to_f32(),
@@ -396,10 +391,7 @@ mod tests {
                 &mut [out.view_mut()],
             )
             .unwrap();
-        assert_eq!(
-            out.to_f32(),
-            vec![0., 1., 2., 0., 0., 3., 4., 0.]
-        );
+        assert_eq!(out.to_f32(), vec![0., 1., 2., 0., 0., 3., 4., 0.]);
     }
 
     #[test]
@@ -409,10 +401,7 @@ mod tests {
         let cv = Owned::i64(&[], &[99]);
         let mut out = Owned::zeros(DataType::Int64, &[3]);
         constant_kernel(None)
-            .execute(
-                &[x.view(), pads.view(), cv.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[x.view(), pads.view(), cv.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_i64(), vec![99, 10, 20]);
     }

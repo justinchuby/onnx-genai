@@ -28,13 +28,13 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, EpError, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, Attribute, DataType, Node, NodeId, ValueId};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, compute_contiguous_strides};
 use onnx_runtime_shape_inference::{DimExpr, MergePolicy, NodeIo, SymbolInterner, TypeInfo};
 
+use crate::EagerContext;
 use crate::cache::KernelCacheKey;
 use crate::error::{EagerError, Result};
 use crate::tensor::Tensor;
-use crate::EagerContext;
 
 /// Build the ephemeral [`Node`] that feeds both `get_kernel` and shape
 /// inference. Input/output value ids are positional placeholders — no real
@@ -111,16 +111,20 @@ impl EagerContext {
             .cache
             .lock()
             .expect("kernel cache lock poisoned")
-            .get_or_create(cache_key, || -> Result<Box<dyn onnx_runtime_ep_api::Kernel>> {
-                ep.get_kernel(&node, &input_shapes, opset).map_err(|e| match e {
-                    EpError::NoEpForOp { .. } => EagerError::NoKernel {
-                        op_type: op_type.to_string(),
-                        domain: domain.to_string(),
-                        device,
-                    },
-                    other => EagerError::Kernel(other),
-                })
-            })?;
+            .get_or_create(
+                cache_key,
+                || -> Result<Box<dyn onnx_runtime_ep_api::Kernel>> {
+                    ep.get_kernel(&node, &input_shapes, opset)
+                        .map_err(|e| match e {
+                            EpError::NoEpForOp { .. } => EagerError::NoKernel {
+                                op_type: op_type.to_string(),
+                                domain: domain.to_string(),
+                                device,
+                            },
+                            other => EagerError::Kernel(other),
+                        })
+                },
+            )?;
 
         // 5. Infer output shapes/dtypes for the single op.
         let output_meta = self.infer_output_meta(&node, op_type, domain, opset, inputs)?;
@@ -144,8 +148,7 @@ impl EagerContext {
             .collect();
 
         let in_ptrs: Vec<*const c_void> = inputs.iter().map(|t| t.device_ptr()).collect();
-        let out_ptrs: Vec<*mut c_void> =
-            outputs.iter_mut().map(|t| t.device_ptr_mut()).collect();
+        let out_ptrs: Vec<*mut c_void> = outputs.iter_mut().map(|t| t.device_ptr_mut()).collect();
 
         let input_views: Vec<TensorView> = (0..inputs.len())
             .map(|i| {
@@ -196,8 +199,11 @@ impl EagerContext {
         let input_ios: Vec<NodeIo> = inputs
             .iter()
             .map(|t| {
-                let shape: Vec<DimExpr> =
-                    t.shape().iter().map(|&d| DimExpr::constant(d as i64)).collect();
+                let shape: Vec<DimExpr> = t
+                    .shape()
+                    .iter()
+                    .map(|&d| DimExpr::constant(d as i64))
+                    .collect();
                 NodeIo::typed(TypeInfo::new(t.dtype(), shape))
             })
             .collect();
@@ -218,14 +224,17 @@ impl EagerContext {
 
         let mut meta = Vec::with_capacity(out_ios.len());
         for (i, io) in out_ios.iter().enumerate() {
-            let type_info = io.type_info.as_ref().ok_or_else(|| EagerError::ShapeInference {
-                op_type: op_type.to_string(),
-                domain: domain.to_string(),
-                reason: format!(
-                    "no shape-inference rule resolved output {i} \
+            let type_info = io
+                .type_info
+                .as_ref()
+                .ok_or_else(|| EagerError::ShapeInference {
+                    op_type: op_type.to_string(),
+                    domain: domain.to_string(),
+                    reason: format!(
+                        "no shape-inference rule resolved output {i} \
                      (kernel-provided fallback is DEFERRED, EAGER.md §9.2)"
-                ),
-            })?;
+                    ),
+                })?;
             let mut dims = Vec::with_capacity(type_info.shape.len());
             for (axis, d) in type_info.shape.iter().enumerate() {
                 let c = d.as_const().ok_or_else(|| EagerError::ShapeInference {

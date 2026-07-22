@@ -61,11 +61,11 @@ pub use dtype::DataType;
 pub use error::{GraphError, IrError, Result};
 pub use graph::Graph;
 pub use layout::{
-    broadcast_shapes, compute_contiguous_strides, is_contiguous, MemoryFormat, TensorLayout,
+    MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides, is_contiguous,
 };
 pub use node::{Attribute, Node, NodeId};
 pub use shape::{
-    as_static_shape, is_fully_static, static_shape, Dim, Shape, SymbolConstraints, SymbolId,
+    Dim, Shape, SymbolConstraints, SymbolId, as_static_shape, is_fully_static, static_shape,
 };
 pub use tensor::{SparseTensorData, TensorData, TypeProto, WeightRef};
 pub use value::{Consumers, Usage, Value, ValueId};

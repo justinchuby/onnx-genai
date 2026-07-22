@@ -391,13 +391,20 @@ pub unsafe fn export_versioned(
         shape.len()
     );
     let ndim = i32::try_from(shape.len()).expect("shape length was validated above");
-    let flags = if read_only { DLPACK_FLAG_BITMASK_READ_ONLY } else { 0 };
+    let flags = if read_only {
+        DLPACK_FLAG_BITMASK_READ_ONLY
+    } else {
+        0
+    };
     let mut owner = Box::new(ManagedOwnerVersioned {
         _keep_alive: keep_alive,
         shape,
         strides,
         managed: DLManagedTensorVersioned {
-            version: DLPackVersion { major: DLPACK_MAJOR_VERSION, minor: DLPACK_MINOR_VERSION },
+            version: DLPackVersion {
+                major: DLPACK_MAJOR_VERSION,
+                minor: DLPACK_MINOR_VERSION,
+            },
             manager_ctx: std::ptr::null_mut(),
             deleter: Some(owner_deleter_versioned),
             flags,
@@ -595,7 +602,10 @@ impl ManagedTensorOwner {
     /// a capsule still named `"dltensor"` that Python may also finalize, would
     /// double-free.
     pub unsafe fn new(managed: *mut DLManagedTensor) -> Self {
-        Self { managed, deleted: false }
+        Self {
+            managed,
+            deleted: false,
+        }
     }
 
     /// The managed pointer this owner will delete (for reading fields before
@@ -658,7 +668,10 @@ impl ManagedTensorVersionedOwner {
     ///
     /// As [`ManagedTensorOwner::new`], for a `*mut DLManagedTensorVersioned`.
     pub unsafe fn new(managed: *mut DLManagedTensorVersioned) -> Self {
-        Self { managed, deleted: false }
+        Self {
+            managed,
+            deleted: false,
+        }
     }
 
     /// The versioned managed pointer this owner will delete.
@@ -721,10 +734,16 @@ mod tests {
         assert_eq!(std::mem::size_of::<DLPackVersion>(), 8);
         assert_eq!(std::mem::size_of::<DLManagedTensorVersioned>(), 80);
         assert_eq!(std::mem::offset_of!(DLManagedTensorVersioned, version), 0);
-        assert_eq!(std::mem::offset_of!(DLManagedTensorVersioned, manager_ctx), 8);
+        assert_eq!(
+            std::mem::offset_of!(DLManagedTensorVersioned, manager_ctx),
+            8
+        );
         assert_eq!(std::mem::offset_of!(DLManagedTensorVersioned, deleter), 16);
         assert_eq!(std::mem::offset_of!(DLManagedTensorVersioned, flags), 24);
-        assert_eq!(std::mem::offset_of!(DLManagedTensorVersioned, dl_tensor), 32);
+        assert_eq!(
+            std::mem::offset_of!(DLManagedTensorVersioned, dl_tensor),
+            32
+        );
     }
 
     #[test]
@@ -736,8 +755,15 @@ mod tests {
             export(
                 Box::new(()),
                 ptr,
-                DLDevice { device_type: DL_CPU, device_id: 0 },
-                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                DLDataType {
+                    code: DL_UINT,
+                    bits: 8,
+                    lanes: 1,
+                },
                 vec![2, 2],
                 vec![],
                 0,
@@ -775,8 +801,15 @@ mod tests {
             export(
                 Box::new(owner.clone()),
                 byte.as_mut_ptr() as *mut c_void,
-                DLDevice { device_type: DL_CPU, device_id: 0 },
-                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                DLDataType {
+                    code: DL_UINT,
+                    bits: 8,
+                    lanes: 1,
+                },
                 vec![1],
                 vec![],
                 0,
@@ -802,8 +835,15 @@ mod tests {
             export(
                 Box::new(()),
                 data.as_mut_ptr() as *mut c_void,
-                DLDevice { device_type: DL_CPU, device_id: 0 },
-                DLDataType { code: DL_INT, bits: 32, lanes: 1 },
+                DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                DLDataType {
+                    code: DL_INT,
+                    bits: 32,
+                    lanes: 1,
+                },
                 vec![2, 1],
                 vec![1, 2],
                 0,
@@ -827,8 +867,15 @@ mod tests {
             export(
                 Box::new(()),
                 data.as_mut_ptr() as *mut c_void,
-                DLDevice { device_type: DL_CPU, device_id: 0 },
-                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                DLDataType {
+                    code: DL_UINT,
+                    bits: 8,
+                    lanes: 1,
+                },
                 vec![1, 1],
                 vec![1],
                 0,
@@ -851,8 +898,15 @@ mod tests {
             export_versioned(
                 Box::new(Tracker),
                 byte.as_mut_ptr() as *mut c_void,
-                DLDevice { device_type: DL_CPU, device_id: 0 },
-                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                DLDataType {
+                    code: DL_UINT,
+                    bits: 8,
+                    lanes: 1,
+                },
                 vec![1],
                 vec![],
                 0,
@@ -878,8 +932,15 @@ mod tests {
             export_versioned(
                 Box::new(()),
                 byte.as_mut_ptr() as *mut c_void,
-                DLDevice { device_type: DL_CPU, device_id: 0 },
-                DLDataType { code: DL_UINT, bits: 8, lanes: 1 },
+                DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
+                DLDataType {
+                    code: DL_UINT,
+                    bits: 8,
+                    lanes: 1,
+                },
                 vec![1],
                 vec![],
                 0,
@@ -888,7 +949,10 @@ mod tests {
         };
         // SAFETY: live versioned export pointer.
         unsafe {
-            assert_eq!((*managed).flags & DLPACK_FLAG_BITMASK_READ_ONLY, DLPACK_FLAG_BITMASK_READ_ONLY);
+            assert_eq!(
+                (*managed).flags & DLPACK_FLAG_BITMASK_READ_ONLY,
+                DLPACK_FLAG_BITMASK_READ_ONLY
+            );
             release_versioned(managed);
         }
     }
@@ -928,7 +992,10 @@ mod tests {
     /// Build a heap `*mut DLManagedTensor` that mimics what torch/numpy hand us.
     fn make_fake_managed(shape: Vec<i64>) -> *mut DLManagedTensor {
         let numel: usize = shape.iter().map(|&d| d as usize).product();
-        let mut producer = Box::new(FakeProducer { _backing: vec![0u8; numel * 4], shape });
+        let mut producer = Box::new(FakeProducer {
+            _backing: vec![0u8; numel * 4],
+            shape,
+        });
         let data = producer._backing.as_mut_ptr() as *mut c_void;
         let shape_ptr = producer.shape.as_mut_ptr();
         let ndim = producer.shape.len() as i32;
@@ -936,9 +1003,16 @@ mod tests {
         let managed = Box::new(DLManagedTensor {
             dl_tensor: DLTensor {
                 data,
-                device: DLDevice { device_type: DL_CPU, device_id: 0 },
+                device: DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
                 ndim,
-                dtype: DLDataType { code: DL_FLOAT, bits: 32, lanes: 1 },
+                dtype: DLDataType {
+                    code: DL_FLOAT,
+                    bits: 32,
+                    lanes: 1,
+                },
                 shape: shape_ptr,
                 strides: std::ptr::null_mut(),
                 byte_offset: 0,
@@ -992,11 +1066,19 @@ mod tests {
         // SAFETY: no CPython C-API involved in the fake deleter, so no GIL is
         // required here; models the guard's explicit call.
         unsafe { owner.call_deleter() };
-        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "explicit call ran deleter");
+        assert_eq!(
+            IMPORT_DROPS.load(Ordering::SeqCst),
+            1,
+            "explicit call ran deleter"
+        );
         // SAFETY: redundant call must be a no-op.
         unsafe { owner.call_deleter() };
         drop(owner);
-        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "no double free after Drop");
+        assert_eq!(
+            IMPORT_DROPS.load(Ordering::SeqCst),
+            1,
+            "no double free after Drop"
+        );
     }
 
     #[test]
@@ -1009,8 +1091,14 @@ mod tests {
         let managed = make_fake_managed(vec![5]);
         // SAFETY: single owner of a live fake managed tensor.
         let owner = unsafe { ManagedTensorOwner::new(managed) };
-        std::thread::spawn(move || drop(owner)).join().expect("drop thread panicked");
-        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "deleter ran once off-thread");
+        std::thread::spawn(move || drop(owner))
+            .join()
+            .expect("drop thread panicked");
+        assert_eq!(
+            IMPORT_DROPS.load(Ordering::SeqCst),
+            1,
+            "deleter ran once off-thread"
+        );
     }
 
     static IMPORT_DROPS_V: AtomicUsize = AtomicUsize::new(0);
@@ -1032,21 +1120,34 @@ mod tests {
 
     fn make_fake_managed_versioned(shape: Vec<i64>) -> *mut DLManagedTensorVersioned {
         let numel: usize = shape.iter().map(|&d| d as usize).product();
-        let mut producer = Box::new(FakeProducer { _backing: vec![0u8; numel * 4], shape });
+        let mut producer = Box::new(FakeProducer {
+            _backing: vec![0u8; numel * 4],
+            shape,
+        });
         let data = producer._backing.as_mut_ptr() as *mut c_void;
         let shape_ptr = producer.shape.as_mut_ptr();
         let ndim = producer.shape.len() as i32;
         let ctx = Box::into_raw(producer);
         let managed = Box::new(DLManagedTensorVersioned {
-            version: DLPackVersion { major: DLPACK_MAJOR_VERSION, minor: DLPACK_MINOR_VERSION },
+            version: DLPackVersion {
+                major: DLPACK_MAJOR_VERSION,
+                minor: DLPACK_MINOR_VERSION,
+            },
             manager_ctx: ctx as *mut c_void,
             deleter: Some(fake_deleter_versioned),
             flags: 0,
             dl_tensor: DLTensor {
                 data,
-                device: DLDevice { device_type: DL_CPU, device_id: 0 },
+                device: DLDevice {
+                    device_type: DL_CPU,
+                    device_id: 0,
+                },
                 ndim,
-                dtype: DLDataType { code: DL_FLOAT, bits: 32, lanes: 1 },
+                dtype: DLDataType {
+                    code: DL_FLOAT,
+                    bits: 32,
+                    lanes: 1,
+                },
                 shape: shape_ptr,
                 strides: std::ptr::null_mut(),
                 byte_offset: 0,
@@ -1069,12 +1170,24 @@ mod tests {
         // SAFETY: no CPython C-API in the fake deleter, so no GIL required;
         // models the Python guard's explicit call under the GIL.
         unsafe { owner.call_deleter() };
-        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "explicit call ran deleter once");
+        assert_eq!(
+            IMPORT_DROPS_V.load(Ordering::SeqCst),
+            1,
+            "explicit call ran deleter once"
+        );
         // SAFETY: redundant call must be a no-op.
         unsafe { owner.call_deleter() };
-        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "second call is idempotent");
+        assert_eq!(
+            IMPORT_DROPS_V.load(Ordering::SeqCst),
+            1,
+            "second call is idempotent"
+        );
         drop(owner);
-        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 1, "no double free after Drop");
+        assert_eq!(
+            IMPORT_DROPS_V.load(Ordering::SeqCst),
+            1,
+            "no double free after Drop"
+        );
     }
 
     #[test]
@@ -1085,7 +1198,10 @@ mod tests {
         // dereferenced here, so a dummy host pointer stands in for a device
         // address. This proves the kDLCUDA device_type/id survives a round trip.
         let mut data = [0u8; 8];
-        let dev = DLDevice { device_type: DL_CUDA, device_id: 3 };
+        let dev = DLDevice {
+            device_type: DL_CUDA,
+            device_id: 3,
+        };
         // SAFETY: `data` remains live until `release` below; we never deref the
         // pointer through the "CUDA" device, only read back the header fields.
         let managed = unsafe {
@@ -1093,7 +1209,11 @@ mod tests {
                 Box::new(()),
                 data.as_mut_ptr() as *mut c_void,
                 dev,
-                DLDataType { code: DL_FLOAT, bits: 32, lanes: 1 },
+                DLDataType {
+                    code: DL_FLOAT,
+                    bits: 32,
+                    lanes: 1,
+                },
                 vec![2],
                 vec![],
                 0,

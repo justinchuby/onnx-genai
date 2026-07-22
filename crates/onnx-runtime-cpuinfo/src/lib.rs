@@ -338,13 +338,24 @@ impl CpuTopology {
 
     /// Number of Performance cores (or all cores if homogeneous).
     pub fn performance_cores(&self) -> usize {
-        let p_count = self.cores.iter().filter(|c| c.core_type == CoreType::Performance).count();
-        if p_count == 0 { self.physical_cores } else { p_count }
+        let p_count = self
+            .cores
+            .iter()
+            .filter(|c| c.core_type == CoreType::Performance)
+            .count();
+        if p_count == 0 {
+            self.physical_cores
+        } else {
+            p_count
+        }
     }
 
     /// Number of Efficiency cores (0 if homogeneous).
     pub fn efficiency_cores(&self) -> usize {
-        self.cores.iter().filter(|c| c.core_type == CoreType::Efficiency).count()
+        self.cores
+            .iter()
+            .filter(|c| c.core_type == CoreType::Efficiency)
+            .count()
     }
 }
 
@@ -401,7 +412,11 @@ impl TileConfig {
         let tile_m = max_mn.clamp(32, 512).next_power_of_two();
         let tile_n = tile_m;
 
-        Self { tile_m, tile_n, tile_k }
+        Self {
+            tile_m,
+            tile_n,
+            tile_k,
+        }
     }
 }
 

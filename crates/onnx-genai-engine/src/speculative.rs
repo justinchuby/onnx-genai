@@ -973,8 +973,7 @@ impl SpeculativeProposer for SharedKvProposer<'_> {
                     anyhow::anyhow!("shared-KV proposer proposal step failed: {error}")
                 })?;
             let drafted = TokenId::try_from(
-                argmax(&output.logits)
-                    .context("shared-KV proposer produced empty draft logits")?,
+                argmax(&output.logits).context("shared-KV proposer produced empty draft logits")?,
             )
             .context("shared-KV proposer token id exceeds u32 range")?;
             last_hidden = output.projected_state;
@@ -1705,11 +1704,10 @@ pub(crate) fn shared_kv_slices_from_materialized(
     let num_layers = materialized.layers.len();
     let mut slices = Vec::with_capacity(groups.len());
     for group in groups {
-        let layer_idx = group
-            .target_layers
-            .last()
-            .copied()
-            .with_context(|| format!("shared_kv group '{}' has no target layers", group.name))?;
+        let layer_idx =
+            group.target_layers.last().copied().with_context(|| {
+                format!("shared_kv group '{}' has no target layers", group.name)
+            })?;
         let layer = materialized.layers.get(layer_idx).with_context(|| {
             format!(
                 "shared_kv group '{}' references target layer {} but only {} layers exist",
@@ -1790,7 +1788,10 @@ mod tests {
         let sliding = &slices[0];
         assert_eq!(sliding.name, "sliding_attention");
         assert_eq!(sliding.kv_heads, 2, "sliding group must use layer 0 heads");
-        assert_eq!(sliding.head_dim, 8, "sliding group must use layer 0 head_dim");
+        assert_eq!(
+            sliding.head_dim, 8,
+            "sliding group must use layer 0 head_dim"
+        );
         assert_eq!(sliding.kv_len, seq_len);
         assert_eq!(sliding.key, sliding_key);
         assert_eq!(sliding.value, sliding_value);
@@ -2092,8 +2093,8 @@ mod tests {
         static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
         let environment = ENVIRONMENT
             .get_or_init(|| Environment::new("engine-mtp-hc-test").expect("environment"));
-        let head_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-hc-mtp/model.onnx.textproto");
+        let head_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny-hc-mtp/model.onnx.textproto");
         let head = Session::new(
             environment,
             &head_path,
@@ -2145,8 +2146,8 @@ mod tests {
 
     #[test]
     fn mtp_package_references_borrow_target_initializers() -> anyhow::Result<()> {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-mtp-full");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
         let (embedder, lm_head, vocab_size) = load_target_initializer_adapters(
             &fixture.join("model.onnx.textproto"),
             "transformer.wte.weight",

@@ -2320,16 +2320,38 @@ mod tests {
         };
         let mut cache = HostExpertCache::default();
 
-        drop(cache.lease(cache_key(0), 4, 4, || Ok(weights(1.0))).unwrap());
-        let held = cache.lease(cache_key(0), 4, 4, || Ok(weights(1.0))).unwrap();
-        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
-        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
-        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        drop(
+            cache
+                .lease(cache_key(0), 4, 4, || Ok(weights(1.0)))
+                .unwrap(),
+        );
+        let held = cache
+            .lease(cache_key(0), 4, 4, || Ok(weights(1.0)))
+            .unwrap();
+        drop(
+            cache
+                .lease(cache_key(1), 4, 4, || Ok(weights(2.0)))
+                .unwrap(),
+        );
+        drop(
+            cache
+                .lease(cache_key(1), 4, 4, || Ok(weights(2.0)))
+                .unwrap(),
+        );
+        drop(
+            cache
+                .lease(cache_key(1), 4, 4, || Ok(weights(2.0)))
+                .unwrap(),
+        );
         assert!(cache.entries.contains_key(&cache_key(0)));
         assert!(!cache.entries.contains_key(&cache_key(1)));
 
         drop(held);
-        drop(cache.lease(cache_key(1), 4, 4, || Ok(weights(2.0))).unwrap());
+        drop(
+            cache
+                .lease(cache_key(1), 4, 4, || Ok(weights(2.0)))
+                .unwrap(),
+        );
         assert!(!cache.entries.contains_key(&cache_key(0)));
         assert!(cache.entries.contains_key(&cache_key(1)));
         assert_eq!(crate::weight_offload_stats().host_cache_evictions, 1);

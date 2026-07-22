@@ -59,10 +59,10 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use crate::LoaderError;
 use crate::proto::onnx::{
     AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
 };
-use crate::LoaderError;
 
 /// Unique identity of a model-local function: `(domain, name, overload)`.
 type FnKey = (String, String, String);
@@ -235,7 +235,15 @@ fn inline_graph(
     let mut out = gp.clone();
     out.node = Vec::with_capacity(gp.node.len());
     for node in &gp.node {
-        expand_node(node, funcs, counter, stack, used, synthesized_default, &mut out.node)?;
+        expand_node(
+            node,
+            funcs,
+            counter,
+            stack,
+            used,
+            synthesized_default,
+            &mut out.node,
+        )?;
     }
     Ok(out)
 }
@@ -253,7 +261,16 @@ fn expand_node(
     sink: &mut Vec<NodeProto>,
 ) -> Result<(), LoaderError> {
     if let Some(func) = funcs.get(&fn_key_of_call(node)) {
-        instantiate(node, func, funcs, counter, stack, used, synthesized_default, sink)?;
+        instantiate(
+            node,
+            func,
+            funcs,
+            counter,
+            stack,
+            used,
+            synthesized_default,
+            sink,
+        )?;
     } else {
         sink.push(inline_subgraph_attrs(
             node,
@@ -437,7 +454,15 @@ fn instantiate(
         // 3. Recursively inline any function calls the body itself makes.
         let mut expanded: Vec<NodeProto> = Vec::new();
         for n in &instantiated {
-            expand_node(n, funcs, counter, stack, used, synthesized_default, &mut expanded)?;
+            expand_node(
+                n,
+                funcs,
+                counter,
+                stack,
+                used,
+                synthesized_default,
+                &mut expanded,
+            )?;
         }
         Ok::<Vec<NodeProto>, LoaderError>(expanded)
     })();
@@ -574,7 +599,8 @@ fn rename_subgraph_refs(gp: &mut GraphProto, rename: &HashMap<String, String>) {
         {
             locals.insert(values.name.as_str());
         }
-    }    for n in &gp.node {
+    }
+    for n in &gp.node {
         for o in &n.output {
             if !o.is_empty() {
                 locals.insert(o.as_str());

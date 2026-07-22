@@ -63,7 +63,11 @@ impl Engine {
             .session
             .as_deref()
             .context("embeddings are not supported by the native decoder backend")?;
-        let io = self.metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
         let mut decode_state = DecodeState::new_with_io(session, io)
             .context("failed to initialize embedding model inputs")?;
         // Prefer the caller's explicit request, then a declared `io.hidden_output`;

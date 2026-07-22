@@ -185,9 +185,8 @@ impl LocalTieredConnector {
     /// content (same model / layers / index / hash) maps to the same path, which
     /// is what makes chunk-granular prefix sharing work.
     fn key_path(key: &KvCacheKey) -> Vec<TokenId> {
-        let model_hash = crate::connector::hash_tokens(
-            &key.model_id.bytes().map(u32::from).collect::<Vec<_>>(),
-        );
+        let model_hash =
+            crate::connector::hash_tokens(&key.model_id.bytes().map(u32::from).collect::<Vec<_>>());
         vec![
             (model_hash >> 32) as u32,
             model_hash as u32,
@@ -304,10 +303,12 @@ impl Interior {
     /// [`LocalTieredConfig::cpu_load_ms_per_page`]; it is not stored on
     /// `Interior` to keep the interior state free of config duplication.
     fn locate(&self, entry: &ChunkEntry, cpu_load_ms_per_page: f64) -> KvCacheLocation {
-        let all_hot = entry
-            .page_ids
-            .iter()
-            .all(|pid| matches!(self.page_table.pages.get(pid).map(|p| p.device), Some(Device::Gpu(_))));
+        let all_hot = entry.page_ids.iter().all(|pid| {
+            matches!(
+                self.page_table.pages.get(pid).map(|p| p.device),
+                Some(Device::Gpu(_))
+            )
+        });
         if all_hot {
             KvCacheLocation::LocalGpu {
                 page_ids: entry.page_ids.clone(),
@@ -591,7 +592,9 @@ mod tests {
         let seed = key.chunk_hash as f32;
         let layers = (0..num_layers)
             .map(|l| KvLayerPayload {
-                key: (0..per_layer).map(|i| seed + (l * 100 + i) as f32).collect(),
+                key: (0..per_layer)
+                    .map(|i| seed + (l * 100 + i) as f32)
+                    .collect(),
                 value: (0..per_layer)
                     .map(|i| -(seed + (l * 100 + i) as f32))
                     .collect(),
@@ -997,7 +1000,9 @@ mod tests {
         }
         // k0 was the first stored; hot_capacity=2 means it got offloaded.
         match conn.lookup(&k0).await.unwrap() {
-            KvCacheLocation::LocalCpu { estimated_load_ms, .. } => {
+            KvCacheLocation::LocalCpu {
+                estimated_load_ms, ..
+            } => {
                 // 1 CPU-resident page × 2.5 ms/page = 2.5 ms
                 assert!(
                     (estimated_load_ms - 2.5).abs() < f64::EPSILON,
@@ -1098,4 +1103,3 @@ mod tests {
         }
     }
 }
-

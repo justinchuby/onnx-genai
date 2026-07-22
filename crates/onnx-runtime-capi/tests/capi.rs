@@ -7,17 +7,16 @@
 //! Nothing here names a real model or bakes in a fixed op path; the model is a
 //! generic MatMul (+ Add) chain built purely to exercise the ABI.
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::path::PathBuf;
 use std::ptr;
 
 use onnx_runtime_capi::{
-    nxrt_add_session_config_entry, nxrt_create_session, nxrt_create_session_options,
-    nxrt_create_session_with_options, nxrt_create_tensor, nxrt_get_error_code,
-    nxrt_get_error_message, nxrt_get_tensor_data, nxrt_get_tensor_dtype, nxrt_get_tensor_rank,
-    nxrt_get_tensor_shape, nxrt_release_session, nxrt_release_session_options,
-    nxrt_release_status, nxrt_release_value, nxrt_run, OrtErrorCode, OrtSession,
-    OrtSessionOptions, OrtValue,
+    OrtErrorCode, OrtSession, OrtSessionOptions, OrtValue, nxrt_add_session_config_entry,
+    nxrt_create_session, nxrt_create_session_options, nxrt_create_session_with_options,
+    nxrt_create_tensor, nxrt_get_error_code, nxrt_get_error_message, nxrt_get_tensor_data,
+    nxrt_get_tensor_dtype, nxrt_get_tensor_rank, nxrt_get_tensor_shape, nxrt_release_session,
+    nxrt_release_session_options, nxrt_release_status, nxrt_release_value, nxrt_run,
 };
 use onnx_runtime_loader::proto::onnx;
 use prost::Message;
@@ -37,7 +36,7 @@ fn f32_initializer(name: &str, dims: &[i64], data: &[f32]) -> onnx::TensorProto 
 }
 
 fn value_info(name: &str, dims: &[i64]) -> onnx::ValueInfoProto {
-    use onnx::tensor_shape_proto::{dimension::Value as DV, Dimension};
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
     let dim = dims
         .iter()
         .map(|&n| Dimension {
@@ -48,10 +47,12 @@ fn value_info(name: &str, dims: &[i64]) -> onnx::ValueInfoProto {
     onnx::ValueInfoProto {
         name: name.to_string(),
         r#type: Some(onnx::TypeProto {
-            value: Some(onnx::type_proto::Value::TensorType(onnx::type_proto::Tensor {
-                elem_type: FLOAT,
-                shape: Some(onnx::TensorShapeProto { dim }),
-            })),
+            value: Some(onnx::type_proto::Value::TensorType(
+                onnx::type_proto::Tensor {
+                    elem_type: FLOAT,
+                    shape: Some(onnx::TensorShapeProto { dim }),
+                },
+            )),
             ..Default::default()
         }),
         ..Default::default()
@@ -489,15 +490,20 @@ fn create_session_with_ep_context_options_succeeds() {
     ] {
         let ck = cstring(k);
         let cv = cstring(v);
-        let status =
-            unsafe { nxrt_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
-        assert!(status.is_null(), "add_session_config_entry({k}) should succeed");
+        let status = unsafe { nxrt_add_session_config_entry(options, ck.as_ptr(), cv.as_ptr()) };
+        assert!(
+            status.is_null(),
+            "add_session_config_entry({k}) should succeed"
+        );
     }
 
     let mut session: *mut OrtSession = ptr::null_mut();
     let status =
         unsafe { nxrt_create_session_with_options(c_path.as_ptr(), options, &mut session) };
-    assert!(status.is_null(), "create_session_with_options should succeed");
+    assert!(
+        status.is_null(),
+        "create_session_with_options should succeed"
+    );
     assert!(!session.is_null());
 
     unsafe { nxrt_release_session(session) };
@@ -570,9 +576,8 @@ fn create_session_with_null_options_is_like_plain_create() {
     let c_path = cstring(path.to_str().unwrap());
 
     let mut session: *mut OrtSession = ptr::null_mut();
-    let status = unsafe {
-        nxrt_create_session_with_options(c_path.as_ptr(), ptr::null(), &mut session)
-    };
+    let status =
+        unsafe { nxrt_create_session_with_options(c_path.as_ptr(), ptr::null(), &mut session) };
     assert!(status.is_null(), "null options should still build");
     assert!(!session.is_null());
     unsafe { nxrt_release_session(session) };

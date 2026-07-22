@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use onnx_genai::metadata::load_metadata;
 use onnx_genai::ort::ModelDirectory;
-use onnx_genai::{Engine, EngineConfig, GenerateOptions, GenerateRequest, GenerateToken, StopSequence};
+use onnx_genai::{
+    Engine, EngineConfig, GenerateOptions, GenerateRequest, GenerateToken, StopSequence,
+};
 use onnx_genai_server::{ServeArgs, from_models_dir, run_serve};
 
 #[derive(Debug, Parser)]
@@ -96,12 +98,7 @@ impl SamplingArgs {
         if let Some(top_k) = self.top_k {
             options.top_k = top_k;
         }
-        options.stop_sequences = self
-            .stop
-            .iter()
-            .cloned()
-            .map(StopSequence::Text)
-            .collect();
+        options.stop_sequences = self.stop.iter().cloned().map(StopSequence::Text).collect();
         options
     }
 }

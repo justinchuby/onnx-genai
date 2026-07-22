@@ -4,7 +4,7 @@ use std::path::Path;
 
 use onnx_runtime_ir::WeightRef;
 use onnx_runtime_loader::proto::onnx;
-use onnx_runtime_loader::{load_model_bytes_with_weights, LoaderError};
+use onnx_runtime_loader::{LoaderError, load_model_bytes_with_weights};
 use prost::Message;
 
 fn external_model(location: &str, length: usize) -> Vec<u8> {

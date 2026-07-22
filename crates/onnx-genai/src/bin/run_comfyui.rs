@@ -72,7 +72,11 @@ struct Arguments {
 fn read_f32(path: &Path) -> Result<Vec<f32>> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() % 4 != 0 {
-        bail!("{}: length {} is not a multiple of 4", path.display(), bytes.len());
+        bail!(
+            "{}: length {} is not a multiple of 4",
+            path.display(),
+            bytes.len()
+        );
     }
     Ok(bytes
         .chunks_exact(4)
@@ -83,7 +87,11 @@ fn read_f32(path: &Path) -> Result<Vec<f32>> {
 fn read_i64(path: &Path) -> Result<Vec<i64>> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() % 8 != 0 {
-        bail!("{}: length {} is not a multiple of 8", path.display(), bytes.len());
+        bail!(
+            "{}: length {} is not a multiple of 8",
+            path.display(),
+            bytes.len()
+        );
     }
     Ok(bytes
         .chunks_exact(8)
@@ -146,10 +154,8 @@ fn text_encode(
         .first()
         .context("text_encoder has no inputs")?
         .clone();
-    let ids_value = Value::from_slice_i64(
-        input_ids,
-        &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64],
-    )?;
+    let ids_value =
+        Value::from_slice_i64(input_ids, &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64])?;
     let outputs = session.run(&[(input_name.as_str(), &ids_value)])?;
     let hidden = outputs
         .into_iter()
@@ -226,69 +232,76 @@ fn main() -> Result<()> {
     let environment = Environment::new("run_comfyui")?;
     let text_encoder_path = arguments.pipeline_dir.join("text_encoder.onnx");
 
-    let mut engine =
-        Engine::from_pipeline_dir(&arguments.pipeline_dir, EngineConfig::default())?;
+    let mut engine = Engine::from_pipeline_dir(&arguments.pipeline_dir, EngineConfig::default())?;
     let init_noise_sigma = engine.diffusion_init_noise_sigma().unwrap_or(1.0);
     eprintln!("init_noise_sigma = {init_noise_sigma}");
 
     // Build the fed tensors: either replayed from files (verification mode) or
     // generated natively (normal render).
-    let (positive_ids_tiled, sample, uncond, per_step_noise) =
-        if let Some(replay_dir) = &arguments.replay_inputs {
-            let replay_ids = read_i64(&replay_dir.join("ids.i64"))?;
-            // Prove the native tokenizer matches the Python driver's ids.
-            let native_ids = tile_ids(&positive_ids, batch_size);
-            if native_ids != replay_ids {
-                bail!(
-                    "native tokenized ids differ from replay ids.i64 \
+    let (positive_ids_tiled, sample, uncond, per_step_noise) = if let Some(replay_dir) =
+        &arguments.replay_inputs
+    {
+        let replay_ids = read_i64(&replay_dir.join("ids.i64"))?;
+        // Prove the native tokenizer matches the Python driver's ids.
+        let native_ids = tile_ids(&positive_ids, batch_size);
+        if native_ids != replay_ids {
+            bail!(
+                "native tokenized ids differ from replay ids.i64 \
                      ({} vs {} elements; first mismatch matters)",
-                    native_ids.len(),
-                    replay_ids.len()
-                );
-            }
-            eprintln!("[verify A] native tokenized ids == ids.i64 ({} ids)", replay_ids.len());
-            let sample = read_f32(&replay_dir.join("sample.f32"))?;
-            let uncond = read_f32(&replay_dir.join("uncond.f32"))?;
-            let noise_path = replay_dir.join("noise.f32");
-            let per_step_noise = if noise_path.exists() {
-                Some(read_f32(&noise_path)?)
-            } else {
-                None
-            };
-            (replay_ids, sample, Some(uncond), per_step_noise)
+                native_ids.len(),
+                replay_ids.len()
+            );
+        }
+        eprintln!(
+            "[verify A] native tokenized ids == ids.i64 ({} ids)",
+            replay_ids.len()
+        );
+        let sample = read_f32(&replay_dir.join("sample.f32"))?;
+        let uncond = read_f32(&replay_dir.join("uncond.f32"))?;
+        let noise_path = replay_dir.join("noise.f32");
+        let per_step_noise = if noise_path.exists() {
+            Some(read_f32(&noise_path)?)
         } else {
-            let mut rng = StdRng::seed_from_u64(workflow.seed as u64);
-            let sample_len = batch_size * latent_channels * latent_height * latent_width;
-            let sample: Vec<f32> = (0..sample_len)
-                .map(|_| {
-                    let normal: f32 = StandardNormal.sample(&mut rng);
-                    normal * init_noise_sigma
-                })
-                .collect();
-            let uncond = if uses_cfg {
-                let (encoded, _shape) = text_encode(
-                    &environment,
-                    &text_encoder_path,
-                    &tile_ids(&negative_ids, batch_size),
-                    batch_size,
-                )?;
-                Some(encoded)
-            } else {
-                None
-            };
-            let per_step_noise = if is_ancestral {
-                let noise_len =
-                    num_steps * batch_size * latent_channels * latent_height * latent_width;
-                Some(
-                    (0..noise_len)
-                        .map(|_| StandardNormal.sample(&mut rng))
-                        .collect::<Vec<f32>>(),
-                )
-            } else {
-                None
-            };
-            (tile_ids(&positive_ids, batch_size), sample, uncond, per_step_noise)
+            None
         };
+        (replay_ids, sample, Some(uncond), per_step_noise)
+    } else {
+        let mut rng = StdRng::seed_from_u64(workflow.seed as u64);
+        let sample_len = batch_size * latent_channels * latent_height * latent_width;
+        let sample: Vec<f32> = (0..sample_len)
+            .map(|_| {
+                let normal: f32 = StandardNormal.sample(&mut rng);
+                normal * init_noise_sigma
+            })
+            .collect();
+        let uncond = if uses_cfg {
+            let (encoded, _shape) = text_encode(
+                &environment,
+                &text_encoder_path,
+                &tile_ids(&negative_ids, batch_size),
+                batch_size,
+            )?;
+            Some(encoded)
+        } else {
+            None
+        };
+        let per_step_noise = if is_ancestral {
+            let noise_len = num_steps * batch_size * latent_channels * latent_height * latent_width;
+            Some(
+                (0..noise_len)
+                    .map(|_| StandardNormal.sample(&mut rng))
+                    .collect::<Vec<f32>>(),
+            )
+        } else {
+            None
+        };
+        (
+            tile_ids(&positive_ids, batch_size),
+            sample,
+            uncond,
+            per_step_noise,
+        )
+    };
 
     let mut request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
@@ -335,13 +348,11 @@ fn main() -> Result<()> {
         );
     }
 
-    let outputs = engine.run_pipeline(
-        request.with_iterative_overrides(IterativeOverrides {
-            num_steps: Some(num_steps),
-            guidance_scale: Some(workflow.cfg as f32),
-            start_step: None,
-        }),
-    )?;
+    let outputs = engine.run_pipeline(request.with_iterative_overrides(IterativeOverrides {
+        num_steps: Some(num_steps),
+        guidance_scale: Some(workflow.cfg as f32),
+        start_step: None,
+    }))?;
     let image_value = outputs
         .get("vae.image")
         .context("pipeline did not produce 'vae.image'")?;

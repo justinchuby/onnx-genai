@@ -45,7 +45,12 @@ fn main() {
         vendor.join("core/mlas/inc"),
         root.join("vendor/compat"),
     ];
-    let p = Paths { root, lib, asm, includes };
+    let p = Paths {
+        root,
+        lib,
+        asm,
+        includes,
+    };
 
     // --- C++ groups (drivers + intrinsic kernels) ---
 
@@ -83,7 +88,11 @@ fn main() {
     generic.push(p.root.join("vendor/probe.cpp"));
     p.compile_cpp("mlas_generic", &[], &generic);
 
-    p.compile_cpp("mlas_sse2_cpp", &["-msse2"], &[p.lib.join("qgemm_kernel_sse.cpp")]);
+    p.compile_cpp(
+        "mlas_sse2_cpp",
+        &["-msse2"],
+        &[p.lib.join("qgemm_kernel_sse.cpp")],
+    );
 
     p.compile_cpp(
         "mlas_avx_cpp",
@@ -112,14 +121,21 @@ fn main() {
             p.lib.join("intrinsics/avx512/gelu_avx512f.cpp"),
             p.lib.join("intrinsics/avx512/silu_avx512f.cpp"),
             p.lib.join("intrinsics/avx512/quantize_avx512f.cpp"),
-            p.lib
-                .join("intrinsics/avx512/sconv_nchw_depthwise_multiplier_greater_than_1_avx512f.cpp"),
+            p.lib.join(
+                "intrinsics/avx512/sconv_nchw_depthwise_multiplier_greater_than_1_avx512f.cpp",
+            ),
         ],
     );
 
     p.compile_cpp(
         "mlas_avx512core_cpp",
-        &["-mfma", "-mavx512vnni", "-mavx512bw", "-mavx512dq", "-mavx512vl"],
+        &[
+            "-mfma",
+            "-mavx512vnni",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+        ],
         &[
             p.lib.join("sqnbitgemm_kernel_avx512.cpp"),
             p.lib.join("sqnbitgemm_kernel_avx512_2bit.cpp"),
@@ -128,7 +144,14 @@ fn main() {
 
     p.compile_cpp(
         "mlas_avx512vnni_cpp",
-        &["-mfma", "-mavx512vnni", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mavx512f"],
+        &[
+            "-mfma",
+            "-mavx512vnni",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+            "-mavx512f",
+        ],
         &[
             p.lib.join("sqnbitgemm_kernel_avx512vnni.cpp"),
             p.lib.join("qkv_quant_kernel_avx512vnni.cpp"),
@@ -140,7 +163,13 @@ fn main() {
 
     p.compile_cpp(
         "mlas_amx_cpp",
-        &["-mavx2", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mavx512f"],
+        &[
+            "-mavx2",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+            "-mavx512f",
+        ],
         &[p.lib.join("qgemm_kernel_amx.cpp")],
     );
 
@@ -210,7 +239,13 @@ fn main() {
 
     p.compile_asm(
         "mlas_avx512core_asm",
-        &["-mfma", "-mavx512vnni", "-mavx512bw", "-mavx512dq", "-mavx512vl"],
+        &[
+            "-mfma",
+            "-mavx512vnni",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+        ],
         &[
             "QgemvU8S8KernelAvx512Core.S",
             "QgemvU8S8KernelAvx512Vnni.S",
@@ -221,7 +256,13 @@ fn main() {
 
     p.compile_asm(
         "mlas_amx_asm",
-        &["-mavx2", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mavx512f"],
+        &[
+            "-mavx2",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+            "-mavx512f",
+        ],
         &["QgemmU8S8KernelAmxCommon.S", "QgemmU8S8KernelAmx.S"],
     );
 

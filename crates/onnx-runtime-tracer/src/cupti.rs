@@ -162,9 +162,11 @@ type FnActivityDisable = unsafe extern "C" fn(kind: u32) -> u32;
 type FnActivityRegisterCallbacks =
     unsafe extern "C" fn(requested: BufferRequestedFn, completed: BufferCompletedFn) -> u32;
 type FnActivityFlushAll = unsafe extern "C" fn(flag: u32) -> u32;
-type FnActivityGetNextRecord =
-    unsafe extern "C" fn(buffer: *mut u8, valid_size: usize, record: *mut *mut CuptiActivity)
-        -> u32;
+type FnActivityGetNextRecord = unsafe extern "C" fn(
+    buffer: *mut u8,
+    valid_size: usize,
+    record: *mut *mut CuptiActivity,
+) -> u32;
 type FnGetTimestamp = unsafe extern "C" fn(timestamp: *mut u64) -> u32;
 
 /// The resolved CUPTI entry points.
@@ -297,7 +299,10 @@ fn required_symbol<T: Copy>(loaded: &LoadedCuptiLibrary, name: &'static [u8]) ->
 /// [`set_search_paths`]), explicit environment hints, `PYTHONPATH`, and likely
 /// interpreter prefixes; no build-machine path is embedded in the binary.
 fn libcupti_candidates() -> Vec<PathBuf> {
-    let injected = INJECTED_SEARCH_PATHS.get().map(Vec::as_slice).unwrap_or(&[]);
+    let injected = INJECTED_SEARCH_PATHS
+        .get()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     collect_libcupti_candidates(injected)
 }
 
@@ -363,7 +368,11 @@ fn collect_libcupti_candidates_for(
 }
 
 fn discover_site_packages(prefix: &Path, roots: &mut Vec<PathBuf>) {
-    for lib_dir in [prefix.join("lib"), prefix.join("lib64"), prefix.join("local/lib")] {
+    for lib_dir in [
+        prefix.join("lib"),
+        prefix.join("lib64"),
+        prefix.join("local/lib"),
+    ] {
         let Ok(entries) = std::fs::read_dir(lib_dir) else {
             continue;
         };
@@ -376,7 +385,11 @@ fn discover_site_packages(prefix: &Path, roots: &mut Vec<PathBuf>) {
 }
 
 fn push_pip_cupti_candidates(site_packages: &Path, os: TargetOs, candidates: &mut Vec<PathBuf>) {
-    let library_subdir = if os == TargetOs::Windows { "bin" } else { "lib" };
+    let library_subdir = if os == TargetOs::Windows {
+        "bin"
+    } else {
+        "lib"
+    };
     let library_dir = site_packages.join("nvidia/cuda_cupti").join(library_subdir);
     for soname in libcupti_names_for(os) {
         let candidate = library_dir.join(soname);
@@ -411,15 +424,15 @@ impl CuptiApi {
         // an actionable error that names it (usually a libcupti too old for the
         // requested CUPTI Activity API).
         macro_rules! symbol {
-            ($ty:ty, $name:literal) => {{
-                required_symbol::<$ty>(lib, $name)?
-            }};
+            ($ty:ty, $name:literal) => {{ required_symbol::<$ty>(lib, $name)? }};
         }
 
         let activity_enable = symbol!(FnActivityEnable, b"cuptiActivityEnable\0");
         let activity_disable = symbol!(FnActivityDisable, b"cuptiActivityDisable\0");
-        let activity_register_callbacks =
-            symbol!(FnActivityRegisterCallbacks, b"cuptiActivityRegisterCallbacks\0");
+        let activity_register_callbacks = symbol!(
+            FnActivityRegisterCallbacks,
+            b"cuptiActivityRegisterCallbacks\0"
+        );
         let activity_flush_all = symbol!(FnActivityFlushAll, b"cuptiActivityFlushAll\0");
         let activity_get_next_record =
             symbol!(FnActivityGetNextRecord, b"cuptiActivityGetNextRecord\0");
@@ -633,7 +646,11 @@ unsafe extern "C" fn buffer_requested(
             .expect("activity buffer layout is valid");
         let ptr = alloc(layout);
         *buffer = ptr;
-        *size = if ptr.is_null() { 0 } else { ACTIVITY_BUFFER_SIZE };
+        *size = if ptr.is_null() {
+            0
+        } else {
+            ACTIVITY_BUFFER_SIZE
+        };
         *max_num_records = 0; // 0 = fill with as many records as fit.
     }
 }
@@ -675,12 +692,7 @@ unsafe extern "C" fn buffer_completed(
 }
 
 /// Iterate every record in a completed buffer and push kernel records.
-unsafe fn drain_buffer(
-    api: &CuptiApi,
-    shared: &SharedState,
-    buffer: *mut u8,
-    valid_size: usize,
-) {
+unsafe fn drain_buffer(api: &CuptiApi, shared: &SharedState, buffer: *mut u8, valid_size: usize) {
     let mut record: *mut CuptiActivity = ptr::null_mut();
     loop {
         // SAFETY: standard CUPTI drain loop; `get_next_record` advances `record`
@@ -753,8 +765,16 @@ unsafe fn parse_kernel_record(
             start_ns: start,
             end_ns: end,
             duration_ns: end.saturating_sub(start),
-            grid: (grid_x.max(0) as u32, grid_y.max(0) as u32, grid_z.max(0) as u32),
-            block: (block_x.max(0) as u32, block_y.max(0) as u32, block_z.max(0) as u32),
+            grid: (
+                grid_x.max(0) as u32,
+                grid_y.max(0) as u32,
+                grid_z.max(0) as u32,
+            ),
+            block: (
+                block_x.max(0) as u32,
+                block_y.max(0) as u32,
+                block_z.max(0) as u32,
+            ),
             shared_memory_bytes: (static_shared.max(0) as u32)
                 .saturating_add(dynamic_shared.max(0) as u32),
             registers_per_thread: u32::from(registers_per_thread),
@@ -874,18 +894,19 @@ impl CuptiProfiler {
 
         // SAFETY: FFI into resolved CUPTI symbols with valid arguments.
         unsafe {
-            check("cuptiActivityRegisterCallbacks", (api
-                .activity_register_callbacks)(
-                buffer_requested,
-                buffer_completed,
-            ))?;
-            check("cuptiActivityEnable(KERNEL)", (api.activity_enable)(
-                CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
-            ))
+            check(
+                "cuptiActivityRegisterCallbacks",
+                (api.activity_register_callbacks)(buffer_requested, buffer_completed),
+            )?;
+            check(
+                "cuptiActivityEnable(KERNEL)",
+                (api.activity_enable)(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL),
+            )
             .or_else(|_| {
-                check("cuptiActivityEnable(KERNEL)", (api.activity_enable)(
-                    CUPTI_ACTIVITY_KIND_KERNEL,
-                ))
+                check(
+                    "cuptiActivityEnable(KERNEL)",
+                    (api.activity_enable)(CUPTI_ACTIVITY_KIND_KERNEL),
+                )
             })?;
             // MEMCPY/MEMSET are best-effort: a failure to enable them must not
             // fail the whole session (kernels are the primary signal).
@@ -1237,18 +1258,29 @@ mod tests {
             .collect_metrics(&["k"], &[CuptiMetric::AchievedOccupancy], 1)
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Phase-2"), "message should name the phase: {msg}");
-        assert!(msg.contains("Activity mode"), "message should suggest an alternative: {msg}");
+        assert!(
+            msg.contains("Phase-2"),
+            "message should name the phase: {msg}"
+        );
+        assert!(
+            msg.contains("Activity mode"),
+            "message should suggest an alternative: {msg}"
+        );
     }
 
     #[test]
     fn collector_construction_is_graceful_or_actionable() {
         // The factory is the graceful auto-selection path: absent CUPTI must be
         // Ok(None), present CUPTI Ok(Some).
-        let factory = CuptiFactory.try_create().expect("factory never errors on absence");
+        let factory = CuptiFactory
+            .try_create()
+            .expect("factory never errors on absence");
         let profiler = CuptiProfiler::new().unwrap();
         if profiler.available() {
-            assert!(factory.is_some(), "collector expected when CUPTI is present");
+            assert!(
+                factory.is_some(),
+                "collector expected when CUPTI is present"
+            );
             // Explicit construction succeeds and emit/flush do not panic.
             let collector = CuptiCollector::new().expect("collector construction with CUPTI");
             let event = TraceEvent {
@@ -1265,10 +1297,18 @@ mod tests {
             collector.emit(&event);
             collector.flush().expect("flush is graceful");
         } else {
-            assert!(factory.is_none(), "graceful skip expected when CUPTI is absent");
+            assert!(
+                factory.is_none(),
+                "graceful skip expected when CUPTI is absent"
+            );
             // But the explicit collector path surfaces the actionable error.
-            let err = CuptiCollector::new().err().expect("explicit request must error when absent");
-            assert!(err.to_string().contains("nvidia-cuda-cupti-cu13"), "actionable: {err}");
+            let err = CuptiCollector::new()
+                .err()
+                .expect("explicit request must error when absent");
+            assert!(
+                err.to_string().contains("nvidia-cuda-cupti-cu13"),
+                "actionable: {err}"
+            );
         }
     }
 
@@ -1284,8 +1324,13 @@ mod tests {
         }
 
         for err in [
-            profiler.start_activity_tracing().err().expect("start must error when absent"),
-            CuptiProfiler::require().err().expect("require must error when absent"),
+            profiler
+                .start_activity_tracing()
+                .err()
+                .expect("start must error when absent"),
+            CuptiProfiler::require()
+                .err()
+                .expect("require must error when absent"),
             cupti_unavailable_error(),
         ] {
             let msg = err.to_string();
@@ -1295,9 +1340,15 @@ mod tests {
                 "WHAT missing: {msg}"
             );
             // WHY: GPU tracing needs the CUDA-13 CUPTI runtime.
-            assert!(msg.contains("CUDA-13") || msg.contains("CUDA 13"), "WHY missing: {msg}");
+            assert!(
+                msg.contains("CUDA-13") || msg.contains("CUDA 13"),
+                "WHY missing: {msg}"
+            );
             // HOW: the concrete pip fix, version-matched.
-            assert!(msg.contains("pip install nvidia-cuda-cupti-cu13"), "HOW missing: {msg}");
+            assert!(
+                msg.contains("pip install nvidia-cuda-cupti-cu13"),
+                "HOW missing: {msg}"
+            );
             // The variant carries structured, debuggable context.
             assert!(matches!(err, TracerError::CuptiUnavailable { .. }));
         }
@@ -1321,15 +1372,27 @@ mod tests {
         };
         let msg = err.to_string();
 
-        assert!(msg.contains("CUPTI") && msg.to_lowercase().contains("gpu"), "WHAT missing: {msg}");
-        assert!(msg.contains("CUDA-13") || msg.contains("CUDA 13"), "WHY missing: {msg}");
-        assert!(msg.contains("pip install nvidia-cuda-cupti-cu13"), "HOW missing: {msg}");
+        assert!(
+            msg.contains("CUPTI") && msg.to_lowercase().contains("gpu"),
+            "WHAT missing: {msg}"
+        );
+        assert!(
+            msg.contains("CUDA-13") || msg.contains("CUDA 13"),
+            "WHY missing: {msg}"
+        );
+        assert!(
+            msg.contains("pip install nvidia-cuda-cupti-cu13"),
+            "HOW missing: {msg}"
+        );
         assert!(msg.contains("libc.so.6"), "loaded path missing: {msg}");
         assert!(
             msg.contains("nxrt_cupti_symbol_that_does_not_exist"),
             "symbol name missing: {msg}"
         );
-        assert!(msg.contains("undefined symbol"), "underlying symbol error missing: {msg}");
+        assert!(
+            msg.contains("undefined symbol"),
+            "underlying symbol error missing: {msg}"
+        );
         assert!(matches!(
             err,
             TracerError::CuptiUnavailable { attempted, .. }
@@ -1343,7 +1406,9 @@ mod tests {
         // CPU/normal run that only asks "is CUPTI here?" is unaffected.
         let profiler = CuptiProfiler::new().expect("new is a graceful probe");
         assert_eq!(profiler.available(), profiler.api.is_some());
-        let _ = CuptiFactory.try_create().expect("factory auto-selection never errors");
+        let _ = CuptiFactory
+            .try_create()
+            .expect("factory auto-selection never errors");
     }
 
     #[test]
@@ -1360,7 +1425,11 @@ mod tests {
         let Some(library_name) = libcupti_names_for(os).first() else {
             return;
         };
-        let library_subdir = if os == TargetOs::Windows { "bin" } else { "lib" };
+        let library_subdir = if os == TargetOs::Windows {
+            "bin"
+        } else {
+            "lib"
+        };
         let lib_dir = base.join("nvidia/cuda_cupti").join(library_subdir);
         std::fs::create_dir_all(&lib_dir).expect("create dummy site-packages layout");
         let dummy = lib_dir.join(library_name);
@@ -1372,7 +1441,10 @@ mod tests {
             candidates.contains(&dummy),
             "injected site-packages libcupti not discovered: {candidates:?}"
         );
-        assert!(dummy.exists(), "dummy libcupti should exist on disk for the probe");
+        assert!(
+            dummy.exists(),
+            "dummy libcupti should exist on disk for the probe"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }

@@ -33,9 +33,9 @@ use std::path::{Path, PathBuf};
 
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, ValueId};
 
-use crate::encoder::{encode_model, Model};
-use crate::epcontext::{attr, EP_CONTEXT_OP, MS_DOMAIN};
 use crate::LoaderError;
+use crate::encoder::{Model, encode_model};
+use crate::epcontext::{EP_CONTEXT_OP, MS_DOMAIN, attr};
 
 /// Configuration for the EPContext dump path (§55.4).
 ///

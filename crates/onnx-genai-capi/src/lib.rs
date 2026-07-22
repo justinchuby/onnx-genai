@@ -38,8 +38,8 @@
 //!   recorded error, never an unwind into C (which is undefined behavior).
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_void, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr;
 
@@ -89,7 +89,9 @@ fn guard<T>(context: &str, on_panic: T, body: impl FnOnce() -> T) -> T {
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(value) => value,
         Err(_) => {
-            set_last_error(format!("{context}: panicked (recovered at the C ABI boundary)"));
+            set_last_error(format!(
+                "{context}: panicked (recovered at the C ABI boundary)"
+            ));
             on_panic
         }
     }
@@ -262,7 +264,9 @@ pub unsafe extern "C" fn oge_engine_load(model_dir: *const c_char) -> *mut OgeEn
         let dir = match unsafe { CStr::from_ptr(model_dir) }.to_str() {
             Ok(dir) => dir,
             Err(err) => {
-                set_last_error(format!("oge_engine_load: model_dir is not valid UTF-8: {err}"));
+                set_last_error(format!(
+                    "oge_engine_load: model_dir is not valid UTF-8: {err}"
+                ));
                 return ptr::null_mut();
             }
         };
@@ -307,7 +311,9 @@ fn result_to_cstring(context: &str, result: anyhow::Result<String>) -> *mut c_ch
         Ok(text) => match CString::new(text) {
             Ok(cstring) => cstring.into_raw(),
             Err(_) => {
-                set_last_error(format!("{context}: generated text contained an interior NUL"));
+                set_last_error(format!(
+                    "{context}: generated text contained an interior NUL"
+                ));
                 ptr::null_mut()
             }
         },

@@ -711,8 +711,7 @@ pub(crate) fn past_kv_from_payloads(
             for head in 0..num_kv_heads {
                 for t in 0..num_tokens {
                     for dim in 0..head_dim {
-                        let dst =
-                            (head * total_len + placed.relative_start + t) * head_dim + dim;
+                        let dst = (head * total_len + placed.relative_start + t) * head_dim + dim;
                         let src = (head * num_tokens + t) * head_dim + dim;
                         key[dst] = layer_payload.key[src];
                         value[dst] = layer_payload.value[src];
@@ -720,7 +719,10 @@ pub(crate) fn past_kv_from_payloads(
                 }
             }
         }
-        out.push((layer.key_past.clone(), Value::from_vec_f32(key, &key_shape)?));
+        out.push((
+            layer.key_past.clone(),
+            Value::from_vec_f32(key, &key_shape)?,
+        ));
         out.push((
             layer.value_past.clone(),
             Value::from_vec_f32(value, &value_shape)?,
@@ -1263,7 +1265,12 @@ mod tests {
 
         // Sanity: the graph exposes only the renamed, non-conventional names.
         assert!(session.input_names().iter().any(|name| name == "tokens"));
-        assert!(session.output_names().iter().any(|name| name == "out_logits"));
+        assert!(
+            session
+                .output_names()
+                .iter()
+                .any(|name| name == "out_logits")
+        );
         assert!(!session.input_names().iter().any(|name| name == "input_ids"));
         assert!(!session.output_names().iter().any(|name| name == "logits"));
 
@@ -1275,7 +1282,9 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            convention_err.to_string().contains("unsupported model input"),
+            convention_err
+                .to_string()
+                .contains("unsupported model input"),
             "expected name-convention binding to fail, got: {convention_err}"
         );
 
@@ -1291,7 +1300,10 @@ mod tests {
             .expect("fixture declares a model.io block");
 
         let mut state = DecodeState::new_with_io(&session, Some(io))?;
-        assert!(state.use_kv, "declared kv_inputs/kv_outputs enable KV cache");
+        assert!(
+            state.use_kv,
+            "declared kv_inputs/kv_outputs enable KV cache"
+        );
 
         // First step (prefill) over two tokens, then a single decode step that
         // must read the cached KV threaded via the declared kv pairs.
@@ -1363,8 +1375,7 @@ mod tests {
         let info = infer_kv_model_info(&session, 4, dtype)?
             .expect("tiny-llm exposes past/present KV outputs");
         assert_eq!(
-            info.tensor_config.dtype,
-            dtype,
+            info.tensor_config.dtype, dtype,
             "PageTensorConfig.dtype must equal the requested storage dtype"
         );
         Ok(())
@@ -1424,7 +1435,12 @@ mod tests {
         };
 
         // Shape [1, NUM_KV_HEADS, TOTAL_SEQ, HEAD_DIM] — standard past-KV form.
-        let shape = vec![1_i64, NUM_KV_HEADS as i64, TOTAL_SEQ as i64, HEAD_DIM as i64];
+        let shape = vec![
+            1_i64,
+            NUM_KV_HEADS as i64,
+            TOTAL_SEQ as i64,
+            HEAD_DIM as i64,
+        ];
         let exported: Vec<ExportedLayerKv> = (0..NUM_LAYERS)
             .map(|l| {
                 // flat index: h*TOTAL_SEQ*HEAD_DIM + t*HEAD_DIM + d  (batch=0 → 0 offset)
@@ -1467,15 +1483,13 @@ mod tests {
                         let idx = (h * NUM_TOKENS + t) * HEAD_DIM + d;
                         let expected = (1000 * l + 100 * h + 10 * abs_t + d) as f32;
                         assert_eq!(
-                            payload.layers[l].key[idx],
-                            expected,
+                            payload.layers[l].key[idx], expected,
                             "layer={l} head={h} token={t}(abs={abs_t}) dim={d}: key mismatch \
                              (got {}, expected {expected})",
                             payload.layers[l].key[idx]
                         );
                         assert_eq!(
-                            payload.layers[l].value[idx],
-                            -expected,
+                            payload.layers[l].value[idx], -expected,
                             "layer={l} head={h} token={t}(abs={abs_t}) dim={d}: value mismatch \
                              (got {}, expected {expected})",
                             payload.layers[l].value[idx]

@@ -230,7 +230,13 @@ impl RooflineAnalyzer {
     /// efficiency); callers should pass real device numbers.
     #[must_use]
     pub fn new(peak_flops_fp16: f64, peak_flops_fp32: f64, peak_bandwidth: f64) -> Self {
-        let sane = |v: f64| if v.is_finite() && v > 0.0 { v } else { f64::MIN_POSITIVE };
+        let sane = |v: f64| {
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                f64::MIN_POSITIVE
+            }
+        };
         Self {
             peak_flops_fp16: sane(peak_flops_fp16),
             peak_flops_fp32: sane(peak_flops_fp32),
@@ -305,21 +311,21 @@ impl RooflineAnalyzer {
         // kernel is still confidently launch-bound from timing alone.
         if let Some(dur_ns) = dur_ns.filter(|&d| d < self.launch_threshold_ns) {
             return RooflineResult {
-                    kernel_name: s.kernel_name.clone(),
-                    node_id: s.node_id,
-                    arithmetic_intensity: None,
-                    achieved_tflops: None,
-                    bound: BoundType::LaunchBound,
-                    efficiency: None,
-                    suggestion: Some(format!(
-                        "Kernel ran in {:.2}µs (< {:.2}µs launch-overhead threshold) so \
+                kernel_name: s.kernel_name.clone(),
+                node_id: s.node_id,
+                arithmetic_intensity: None,
+                achieved_tflops: None,
+                bound: BoundType::LaunchBound,
+                efficiency: None,
+                suggestion: Some(format!(
+                    "Kernel ran in {:.2}µs (< {:.2}µs launch-overhead threshold) so \
                          launch cost dominates, even without FLOP/byte metrics. Fix: fuse it \
                          with neighbouring ops or capture the region in a CUDA graph to amortise \
                          launch latency.",
-                        dur_ns as f64 / 1_000.0,
-                        self.launch_threshold_ns as f64 / 1_000.0,
-                    )),
-                };
+                    dur_ns as f64 / 1_000.0,
+                    self.launch_threshold_ns as f64 / 1_000.0,
+                )),
+            };
         }
 
         // Degraded path 2: not enough to classify. Say so explicitly.
@@ -341,7 +347,13 @@ impl RooflineAnalyzer {
         }
     }
 
-    fn analyze_full(&self, s: &KernelSample, flops: u64, bytes: u64, dur_ns: u64) -> RooflineResult {
+    fn analyze_full(
+        &self,
+        s: &KernelSample,
+        flops: u64,
+        bytes: u64,
+        dur_ns: u64,
+    ) -> RooflineResult {
         let ai = flops as f64 / bytes as f64;
         let ridge = self.ridge_point(s.precision);
         let peak_flops = self.peak_flops(s.precision);
@@ -443,15 +455,21 @@ pub fn render_roofline_report(results: &[RooflineResult]) -> String {
     if results.is_empty() {
         return "No kernels to analyze.\n".to_string();
     }
-    let name_w = results.iter().map(|r| r.kernel_name.len()).max().unwrap_or(0).max(4);
+    let name_w = results
+        .iter()
+        .map(|r| r.kernel_name.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
     let mut out = String::new();
     for r in results {
         let ai = r
             .arithmetic_intensity
             .map_or_else(|| "AI=  n/a".to_string(), |v| format!("AI={v:>6.1}"));
-        let eff = r
-            .efficiency
-            .map_or_else(|| "efficiency= n/a".to_string(), |v| format!("efficiency={:>3.0}%", v * 100.0));
+        let eff = r.efficiency.map_or_else(
+            || "efficiency= n/a".to_string(),
+            |v| format!("efficiency={:>3.0}%", v * 100.0),
+        );
         out.push_str(&format!(
             "{:<name_w$} : {ai}  {:<14} {eff}\n",
             r.kernel_name,
@@ -705,7 +723,10 @@ fn median_sorted(sorted: &[u64]) -> f64 {
 fn detect_slow_ops(events: &[TraceEvent], cfg: &DiagnosisConfig, out: &mut Vec<DiagnosedIssue>) {
     let mut cohorts: BTreeMap<&str, Vec<(&TraceEvent, u64)>> = BTreeMap::new();
     for (ev, dur) in completed(events) {
-        cohorts.entry(cohort_key(&ev.name)).or_default().push((ev, dur));
+        cohorts
+            .entry(cohort_key(&ev.name))
+            .or_default()
+            .push((ev, dur));
     }
 
     for (key, members) in cohorts {
@@ -719,7 +740,10 @@ fn detect_slow_ops(events: &[TraceEvent], cfg: &DiagnosisConfig, out: &mut Vec<D
             continue;
         }
         // Median absolute deviation (robust spread).
-        let mut abs_dev: Vec<u64> = durs.iter().map(|d| (*d as f64 - median).abs() as u64).collect();
+        let mut abs_dev: Vec<u64> = durs
+            .iter()
+            .map(|d| (*d as f64 - median).abs() as u64)
+            .collect();
         abs_dev.sort_unstable();
         let mad = median_sorted(&abs_dev);
 
@@ -756,7 +780,11 @@ fn detect_slow_ops(events: &[TraceEvent], cfg: &DiagnosisConfig, out: &mut Vec<D
                     *dur as f64,
                     median,
                     members.len(),
-                    if z.is_finite() { format!("{z:.1}") } else { "∞".to_string() },
+                    if z.is_finite() {
+                        format!("{z:.1}")
+                    } else {
+                        "∞".to_string()
+                    },
                 ),
                 root_cause: format!(
                     "This '{key}' invocation is a statistical outlier — most cohort members run \
@@ -776,7 +804,9 @@ fn detect_slow_ops(events: &[TraceEvent], cfg: &DiagnosisConfig, out: &mut Vec<D
 }
 
 /// Collect, per op cohort, the distinct `shapes` signatures seen.
-fn shape_signatures(events: &[TraceEvent]) -> BTreeMap<&str, (usize, Vec<String>, Vec<TraceEvent>)> {
+fn shape_signatures(
+    events: &[TraceEvent],
+) -> BTreeMap<&str, (usize, Vec<String>, Vec<TraceEvent>)> {
     let mut map: BTreeMap<&str, (usize, Vec<String>, Vec<TraceEvent>)> = BTreeMap::new();
     for ev in events.iter().filter(|e| e.ph == TracePhase::Complete) {
         let Some(sig) = arg_json(ev, "shapes").map(|v| v.to_string()) else {
@@ -871,10 +901,7 @@ fn detect_memory_thrashing(
     cfg: &DiagnosisConfig,
     out: &mut Vec<DiagnosedIssue>,
 ) {
-    let mut pressure: Vec<&TraceEvent> = events
-        .iter()
-        .filter(|e| is_pressure_event(e))
-        .collect();
+    let mut pressure: Vec<&TraceEvent> = events.iter().filter(|e| is_pressure_event(e)).collect();
     if pressure.len() < cfg.thrash_min_events {
         return;
     }
@@ -994,7 +1021,11 @@ fn detect_missed_fastpath(events: &[TraceEvent], out: &mut Vec<DiagnosedIssue>) 
         };
         let candidate = arg_str(ev, ARG_OPTIMIZED_CANDIDATE).unwrap_or("an optimized kernel");
         let chosen = arg_str(ev, ARG_CHOSEN_KERNEL);
-        let node = if ev.name.is_empty() { "op" } else { ev.name.as_str() };
+        let node = if ev.name.is_empty() {
+            "op"
+        } else {
+            ev.name.as_str()
+        };
 
         let (severity, fix) = fastpath_fix(reason, candidate);
 
@@ -1287,7 +1318,12 @@ mod tests {
         let r = analyzer.analyze(&sample);
         assert_eq!(r.bound, BoundType::Indeterminate);
         assert!(r.efficiency.is_none());
-        assert!(r.suggestion.unwrap().to_lowercase().contains("insufficient metrics"));
+        assert!(
+            r.suggestion
+                .unwrap()
+                .to_lowercase()
+                .contains("insufficient metrics")
+        );
     }
 
     #[test]
@@ -1325,7 +1361,12 @@ mod tests {
         let event = ev(
             "MatMul_0",
             30, // 30µs
-            Some(Args::new().flops(16_000_000_000).bytes(4_000_000).with("node_id", 0_u64)),
+            Some(
+                Args::new()
+                    .flops(16_000_000_000)
+                    .bytes(4_000_000)
+                    .with("node_id", 0_u64),
+            ),
         );
         let r = analyzer.analyze_event(&event);
         assert_eq!(r.bound, BoundType::ComputeBound);
@@ -1396,7 +1437,9 @@ mod tests {
         let issue = slow[0];
         assert_eq!(issue.severity, Severity::Critical); // 900/40 = 22.5× ≥ 10
         assert!(!issue.suggestion.is_empty());
-        assert!(issue.evidence_summary.contains("outlier") || issue.evidence_summary.contains("slower"));
+        assert!(
+            issue.evidence_summary.contains("outlier") || issue.evidence_summary.contains("slower")
+        );
         assert_eq!(issue.evidence.len(), 1);
         assert_eq!(issue.evidence[0].name, "MatMul_99");
         // Renders the WHAT/WHY/HOW contract.
@@ -1424,12 +1467,28 @@ mod tests {
     #[test]
     fn diagnosis_detects_shape_instability_and_no_cuda_graph() {
         let events = vec![
-            ev("MatMul_0", 40, Some(Args::new().shapes(vec![vec![1_i64, 128, 4096]]))),
-            ev("MatMul_0", 41, Some(Args::new().shapes(vec![vec![1_i64, 130, 4096]]))),
-            ev("MatMul_0", 42, Some(Args::new().shapes(vec![vec![1_i64, 200, 4096]]))),
+            ev(
+                "MatMul_0",
+                40,
+                Some(Args::new().shapes(vec![vec![1_i64, 128, 4096]])),
+            ),
+            ev(
+                "MatMul_0",
+                41,
+                Some(Args::new().shapes(vec![vec![1_i64, 130, 4096]])),
+            ),
+            ev(
+                "MatMul_0",
+                42,
+                Some(Args::new().shapes(vec![vec![1_i64, 200, 4096]])),
+            ),
         ];
         let d = AutoDiagnosis::analyze(&events);
-        assert!(d.issues.iter().any(|i| i.category == IssueCategory::ShapeInstability));
+        assert!(
+            d.issues
+                .iter()
+                .any(|i| i.category == IssueCategory::ShapeInstability)
+        );
 
         let ncg = d
             .issues
@@ -1443,7 +1502,13 @@ mod tests {
     #[test]
     fn diagnosis_stable_shapes_no_instability() {
         let events: Vec<TraceEvent> = (0..3)
-            .map(|_| ev("MatMul_0", 40, Some(Args::new().shapes(vec![vec![1_i64, 128, 4096]]))))
+            .map(|_| {
+                ev(
+                    "MatMul_0",
+                    40,
+                    Some(Args::new().shapes(vec![vec![1_i64, 128, 4096]])),
+                )
+            })
             .collect();
         let d = AutoDiagnosis::analyze(&events);
         assert!(
@@ -1479,7 +1544,9 @@ mod tests {
             .find(|i| i.category == IssueCategory::MemoryThrashing)
             .expect("should detect thrashing");
         assert_eq!(thr.severity, Severity::Warning);
-        assert!(thr.suggestion.to_lowercase().contains("vram") || thr.suggestion.contains("budget"));
+        assert!(
+            thr.suggestion.to_lowercase().contains("vram") || thr.suggestion.contains("budget")
+        );
         assert!(thr.evidence.len() >= 8);
     }
 
@@ -1505,7 +1572,11 @@ mod tests {
             ev("MatMul_1", 500, None),
         ];
         let d = AutoDiagnosis::analyze(&events);
-        assert!(d.issues.iter().any(|i| i.category == IssueCategory::PrefetchStall));
+        assert!(
+            d.issues
+                .iter()
+                .any(|i| i.category == IssueCategory::PrefetchStall)
+        );
     }
 
     // ---- Report / health ----------------------------------------------------
@@ -1524,8 +1595,16 @@ mod tests {
             .map(|i| ev(&format!("MatMul_{i}"), 40, None))
             .collect();
         events.push(ev("MatMul_99", 900, None)); // critical slow op
-        events.push(ev("LayerNorm_0", 40, Some(Args::new().shapes(vec![vec![1_i64, 1]]))));
-        events.push(ev("LayerNorm_0", 40, Some(Args::new().shapes(vec![vec![1_i64, 2]]))));
+        events.push(ev(
+            "LayerNorm_0",
+            40,
+            Some(Args::new().shapes(vec![vec![1_i64, 1]])),
+        ));
+        events.push(ev(
+            "LayerNorm_0",
+            40,
+            Some(Args::new().shapes(vec![vec![1_i64, 2]])),
+        ));
 
         let d = AutoDiagnosis::analyze(&events);
         assert!(d.issues.len() >= 2);
@@ -1563,7 +1642,11 @@ mod tests {
             pid: 1,
             tid: 1,
             scope: Some('t'),
-            args: Some(Args::new().missed_fastpath(candidate, reason, chosen).into_value()),
+            args: Some(
+                Args::new()
+                    .missed_fastpath(candidate, reason, chosen)
+                    .into_value(),
+            ),
         }
     }
 
@@ -1665,6 +1748,10 @@ mod tests {
         // A plain op (no fastpath_rejected_reason) must not raise the issue.
         let events = vec![ev("MatMul_0", 50, Some(Args::new().device("cpu")))];
         let d = AutoDiagnosis::analyze(&events);
-        assert!(!d.issues.iter().any(|i| i.category == IssueCategory::MissedFastPath));
+        assert!(
+            !d.issues
+                .iter()
+                .any(|i| i.category == IssueCategory::MissedFastPath)
+        );
     }
 }

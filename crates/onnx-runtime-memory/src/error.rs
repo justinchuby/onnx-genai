@@ -40,7 +40,9 @@ pub enum ValidateError {
     UnknownSlot { value: ValueId, slot: SlotId },
     /// A zero-copy view outlives the source buffer it aliases (fold error): the
     /// source could be recycled while the view still points into it.
-    #[error("view {view:?} is used at node {view_use} but its source {source_owner:?} is retired at node {source_end}")]
+    #[error(
+        "view {view:?} is used at node {view_use} but its source {source_owner:?} is retired at node {source_end}"
+    )]
     ViewOutlivesSource {
         view: ValueId,
         source_owner: ValueId,

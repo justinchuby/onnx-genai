@@ -88,14 +88,18 @@ async fn proxies_chat_request_and_forwards_body() {
                 .method("POST")
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#))
+                .body(Body::from(
+                    r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.starts_with("echo:"));
     assert!(text.contains("\"role\":\"user\""));
@@ -122,7 +126,9 @@ async fn streams_sse_response_through_proxy() {
         resp.headers().get("content-type").unwrap(),
         "text/event-stream"
     );
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert_eq!(text, "data: a\n\ndata: b\n\n");
 }

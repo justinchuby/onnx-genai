@@ -471,15 +471,13 @@ impl SpanGuard {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            state
-                .ctx
-                .complete(
-                    state.name,
-                    state.cat,
-                    state.start,
-                    dur,
-                    (!args.is_empty()).then_some(args),
-                );
+            state.ctx.complete(
+                state.name,
+                state.cat,
+                state.start,
+                dur,
+                (!args.is_empty()).then_some(args),
+            );
         }
     }
 }

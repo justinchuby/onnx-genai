@@ -173,7 +173,7 @@ impl Kernel for TriluKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::{static_shape, DataType, Graph, Node, NodeId, TensorData, WeightRef};
+    use onnx_runtime_ir::{DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
 
     fn i64_bytes(data: &[i64]) -> Vec<u8> {
         data.iter().flat_map(|v| v.to_le_bytes()).collect()

@@ -1160,7 +1160,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("index 5 follows trailing -1 padding"), "{error}");
+        assert!(
+            error.contains("index 5 follows trailing -1 padding"),
+            "{error}"
+        );
     }
 
     #[test]

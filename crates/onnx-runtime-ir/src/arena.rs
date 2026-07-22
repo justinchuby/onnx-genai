@@ -85,7 +85,9 @@ impl<K: ArenaKey, T> Arena<K, T> {
 
     /// Borrow the entry for `key`, if live.
     pub fn get(&self, key: K) -> Option<&T> {
-        self.slots.get(key.to_raw() as usize).and_then(Option::as_ref)
+        self.slots
+            .get(key.to_raw() as usize)
+            .and_then(Option::as_ref)
     }
 
     /// Mutably borrow the entry for `key`, if live.

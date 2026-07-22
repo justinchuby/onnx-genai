@@ -128,12 +128,14 @@ fn gemma4_assistant_mixed_speculative_matches_plain_greedy() -> anyhow::Result<(
     // The KV slicer must supply each group with its correct per-layer head_dim,
     // not a uniform global one, for the SharedKvInput binding to be valid.
     assert_eq!(
-        actual.token_ids,
-        expected.token_ids,
+        actual.token_ids, expected.token_ids,
         "mixed head_dim: speculative output must be token-identical to plain greedy"
     );
     assert_eq!(actual.finish_reason, expected.finish_reason);
-    assert!(stats.proposed_tokens > 0, "proposer was not active: {stats:?}");
+    assert!(
+        stats.proposed_tokens > 0,
+        "proposer was not active: {stats:?}"
+    );
     assert!(stats.verification_steps > 0, "{stats:?}");
     Ok(())
 }

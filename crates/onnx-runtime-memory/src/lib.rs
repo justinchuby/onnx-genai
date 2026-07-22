@@ -105,11 +105,11 @@ mod validate;
 mod view_map;
 
 pub use error::{PlanError, ValidateError};
-pub use liveness::{compute_liveness, Interval, Liveness};
+pub use liveness::{Interval, Liveness, compute_liveness};
 pub use options::PlanOptions;
 pub use oracle::{static_size, static_size_oracle};
 pub use plan::{
-    plan_activations, plan_activations_static, ActivationPlan, PlanStatus, SlotId, SlotInfo,
+    ActivationPlan, PlanStatus, SlotId, SlotInfo, plan_activations, plan_activations_static,
 };
 pub use validate::{validate, validate_static};
 pub use view_map::ViewMap;

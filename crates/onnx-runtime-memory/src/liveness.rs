@@ -53,7 +53,12 @@ pub struct Liveness {
 }
 
 /// Whether `value` needs its own activation slot.
-fn is_buffer_owner(graph: &Graph, view_map: &ViewMap, options: &PlanOptions, value: ValueId) -> bool {
+fn is_buffer_owner(
+    graph: &Graph,
+    view_map: &ViewMap,
+    options: &PlanOptions,
+    value: ValueId,
+) -> bool {
     if graph.initializers.contains_key(&value) {
         return false; // streamed / caller-owned weight
     }

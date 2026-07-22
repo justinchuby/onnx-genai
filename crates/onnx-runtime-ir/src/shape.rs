@@ -103,7 +103,9 @@ impl SymbolConstraints {
     pub fn accepts(&self, value: usize) -> bool {
         self.min.is_none_or(|lo| value >= lo)
             && self.max.is_none_or(|hi| value <= hi)
-            && self.divisible_by.is_none_or(|m| m != 0 && value.is_multiple_of(m))
+            && self
+                .divisible_by
+                .is_none_or(|m| m != 0 && value.is_multiple_of(m))
     }
 }
 

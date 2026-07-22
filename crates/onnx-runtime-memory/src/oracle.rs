@@ -10,7 +10,7 @@
 //! * **run-time** planning, where the executor supplies a closure backed by the
 //!   resolved concrete shapes for the current run.
 
-use onnx_runtime_ir::{as_static_shape, Graph, ValueId};
+use onnx_runtime_ir::{Graph, ValueId, as_static_shape};
 
 /// Byte size of a value from its *static* shape, or `None` if any dimension is
 /// symbolic (unknown until run time) or the element count overflows `usize`.

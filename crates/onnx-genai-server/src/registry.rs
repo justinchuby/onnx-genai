@@ -204,7 +204,9 @@ impl ModelRegistry {
             let default = inner.default_id.as_deref()?;
             inner.models.get(default)?
         };
-        handle.last_request_at.store(now_millis(), Ordering::Relaxed);
+        handle
+            .last_request_at
+            .store(now_millis(), Ordering::Relaxed);
         Some(Arc::clone(handle))
     }
 
@@ -484,7 +486,11 @@ mod tests {
         stub_handle_at(id, tokenizer, now_millis())
     }
 
-    fn stub_handle_at(id: &str, tokenizer: Arc<Tokenizer>, last_request_at: u64) -> Arc<ModelHandle> {
+    fn stub_handle_at(
+        id: &str,
+        tokenizer: Arc<Tokenizer>,
+        last_request_at: u64,
+    ) -> Arc<ModelHandle> {
         let (tx, _rx) = mpsc::channel(1);
         Arc::new(ModelHandle {
             id: id.to_string(),

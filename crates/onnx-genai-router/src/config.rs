@@ -63,7 +63,6 @@ impl Default for RoutingConfig {
     }
 }
 
-
 /// Routing strategy (see `docs/DESIGN.md` §34.5).
 ///
 /// Deserializes from YAML in a user-friendly shape: unit variants are plain
@@ -221,7 +220,9 @@ impl RouterConfig {
                 )));
             }
             if node.name.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!("node[{i}] has an empty `name`")));
+                return Err(ConfigError::Invalid(format!(
+                    "node[{i}] has an empty `name`"
+                )));
             }
         }
         // Reject duplicate node names — ids must be unique to key affinity.
@@ -235,7 +236,10 @@ impl RouterConfig {
                 }
             }
         }
-        check_unit_interval("routing.overload_threshold", self.routing.overload_threshold)?;
+        check_unit_interval(
+            "routing.overload_threshold",
+            self.routing.overload_threshold,
+        )?;
         if let RoutingPolicy::Weighted(w) = &self.routing.policy {
             check_unit_interval("routing.weighted.affinity_weight", w.affinity_weight)?;
             check_unit_interval("routing.weighted.kv_weight", w.kv_weight)?;

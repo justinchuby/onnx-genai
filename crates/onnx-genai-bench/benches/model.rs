@@ -136,7 +136,9 @@ fn continuous_batch_throughput(c: &mut Criterion) {
 fn prefix_cache_prefill(c: &mut Criterion) {
     // A shared 12-token prefix followed by a short unique suffix; prefill of the
     // shared prefix is what the KV prefix cache can skip on a warm engine.
-    let shared_prefix = (0..12).map(|index| 4 + (index as u32 % 20)).collect::<Vec<_>>();
+    let shared_prefix = (0..12)
+        .map(|index| 4 + (index as u32 % 20))
+        .collect::<Vec<_>>();
     let full_prompt = {
         let mut prompt = shared_prefix.clone();
         prompt.extend_from_slice(&[24, 25, 26]);

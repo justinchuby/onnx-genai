@@ -13,7 +13,9 @@
 //! `num_steps = 3`, seed `sample = 0`, so the closed form is
 //! `s_3 = cond * (7/8)` and `image = s_3 * 2 + 1`.
 
-use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest};
+use onnx_genai_engine::{
+    Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+};
 use onnx_genai_ort::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,7 +52,10 @@ fn iterative_diffusion_pipeline_runs_denoise_loop_and_final_vae() -> anyhow::Res
 
     let cond = [1.0f32, 2.0, 3.0, 4.0];
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
 
     let outputs = engine.run_pipeline(request)?;
@@ -100,7 +105,10 @@ fn number_of_steps_controls_denoise_iterations() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
     let cond = [4.0f32, 8.0, 12.0, 16.0];
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
     let outputs = engine.run_pipeline(request)?;
     let denoised = outputs.get("denoiser.denoised").unwrap().to_vec_f32()?;
@@ -129,11 +137,16 @@ pipeline:
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
 
     let latent = [1.5f32, -2.0, 3.0, 0.25];
-    let request = empty_request().with_input("vae.latent", Value::from_slice_f32(&latent, &[1, 4])?);
+    let request =
+        empty_request().with_input("vae.latent", Value::from_slice_f32(&latent, &[1, 4])?);
     let out = engine.run_pipeline(request)?;
     let image = out.get("vae.image").expect("vae output").to_vec_f32()?;
     for (got, l) in image.iter().zip(&latent) {
-        assert!((got - (l * 2.0 + 1.0)).abs() < 1e-5, "{got} != {}", l * 2.0 + 1.0);
+        assert!(
+            (got - (l * 2.0 + 1.0)).abs() < 1e-5,
+            "{got} != {}",
+            l * 2.0 + 1.0
+        );
     }
     Ok(())
 }
@@ -168,7 +181,10 @@ fn guidance_scale_one_is_treated_as_no_guidance_and_runs() -> anyhow::Result<()>
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let cond = [2.0f32, 4.0, 6.0, 8.0];
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
     // guidance_scale == 1.0 must run (no CFG); 2 steps -> s_2 = cond * 3/4.
     let out = engine.run_pipeline(request)?;
@@ -225,10 +241,16 @@ pipeline:
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let cond = [1.0f32, 2.0, 3.0, 4.0];
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
     let out = engine.run_pipeline(request)?;
-    let denoised = out.get("denoiser.denoised").expect("guided output").to_vec_f32()?;
+    let denoised = out
+        .get("denoiser.denoised")
+        .expect("guided output")
+        .to_vec_f32()?;
     for (got, c) in denoised.iter().zip(&cond) {
         assert!((got - c).abs() < 1e-5, "guided {got} != {c}");
     }
@@ -263,18 +285,34 @@ pipeline:
     guidance_scale: 2.0
     cfg_conditioning_input: cond_a
 ";
-    let dir = fixture_with_metadata("diffusion-dualcond", &["denoiser_dualcond.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-dualcond",
+        &["denoiser_dualcond.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let a = [1.0f32, 1.0, 1.0, 1.0];
     let b = [10.0f32, 10.0, 10.0, 10.0];
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond_a", Value::from_slice_f32(&a, &[1, 4])?)
         .with_input("denoiser.cond_b", Value::from_slice_f32(&b, &[1, 4])?)
-        .with_input("denoiser.cond_a.uncond", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
-        .with_input("denoiser.cond_b.uncond", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+        .with_input(
+            "denoiser.cond_a.uncond",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
+        .with_input(
+            "denoiser.cond_b.uncond",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        );
     let out = engine.run_pipeline(request)?;
-    let denoised = out.get("denoiser.denoised").expect("guided output").to_vec_f32()?;
+    let denoised = out
+        .get("denoiser.denoised")
+        .expect("guided output")
+        .to_vec_f32()?;
     for got in &denoised {
         assert!((got - 22.0).abs() < 1e-5, "guided {got} != 22 (= 2*(1+10))");
     }
@@ -303,7 +341,11 @@ pipeline:
     denoiser: denoiser
     num_steps: 2
 ";
-    let dir = fixture_with_metadata("diffusion-multi", &["denoiser_multi.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-multi",
+        &["denoiser_multi.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
 
     let cond = [4.0f32, 8.0, 12.0, 16.0];
@@ -344,10 +386,16 @@ pipeline:
     timestep_input: t
     timesteps: [10.0, 20.0, 30.0]
 ";
-    let dir = fixture_with_metadata("diffusion-timestep", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-timestep",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
     let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
     // 10 + 20 + 30 = 60.
@@ -375,10 +423,16 @@ pipeline:
     num_steps: 3
     timestep_input: t
 ";
-    let dir = fixture_with_metadata("diffusion-timestep-default", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-timestep-default",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
     let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
     for got in &denoised {
@@ -415,12 +469,21 @@ pipeline:
       beta_end: 0.012
       beta_schedule: scaled_linear
 ";
-    let dir = fixture_with_metadata("diffusion-dpmpp", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-dpmpp",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[0.1; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
-    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let sample = out
+        .get("denoiser.sample")
+        .expect("scheduled sample")
+        .to_vec_f32()?;
     assert_eq!(sample.len(), 4);
     for got in &sample {
         assert!(got.is_finite(), "dpm++ produced non-finite value {got}");
@@ -455,14 +518,23 @@ pipeline:
       - 30.0
       - 40.0
 ";
-    let dir = fixture_with_metadata("diffusion-img2img", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-img2img",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
     let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
     for got in &denoised {
-        assert!((got - 70.0).abs() < 1e-4, "{got} != 70 (partial loop from start_step=2)");
+        assert!(
+            (got - 70.0).abs() < 1e-4,
+            "{got} != 70 (partial loop from start_step=2)"
+        );
     }
     Ok(())
 }
@@ -494,15 +566,31 @@ pipeline:
       beta_end: 0.012
       beta_schedule: scaled_linear
 ";
-    let dir = fixture_with_metadata("diffusion-euler-a", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-euler-a",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?)
-        .with_input("denoiser.sample.noise", Value::from_slice_f32(&[0.0; 12], &[3, 1, 4])?);
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.1; 4], &[1, 4])?,
+        )
+        .with_input(
+            "denoiser.sample.noise",
+            Value::from_slice_f32(&[0.0; 12], &[3, 1, 4])?,
+        );
     let out = engine.run_pipeline(request)?;
-    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let sample = out
+        .get("denoiser.sample")
+        .expect("scheduled sample")
+        .to_vec_f32()?;
     for got in &sample {
-        assert!(got.is_finite(), "euler_ancestral produced non-finite value {got}");
+        assert!(
+            got.is_finite(),
+            "euler_ancestral produced non-finite value {got}"
+        );
     }
     Ok(())
 }
@@ -534,14 +622,26 @@ pipeline:
       beta_schedule: scaled_linear
       use_karras_sigmas: true
 ";
-    let dir = fixture_with_metadata("diffusion-dpmpp-karras", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-dpmpp-karras",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[0.1; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
-    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let sample = out
+        .get("denoiser.sample")
+        .expect("scheduled sample")
+        .to_vec_f32()?;
     for got in &sample {
-        assert!(got.is_finite(), "dpm++ karras produced non-finite value {got}");
+        assert!(
+            got.is_finite(),
+            "dpm++ karras produced non-finite value {got}"
+        );
     }
     Ok(())
 }
@@ -567,12 +667,17 @@ pipeline:
       use_karras_sigmas: true
       use_exponential_sigmas: true
 ";
-    let dir = fixture_with_metadata("diffusion-conflict-sigmas", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-conflict-sigmas",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
         .err()
         .expect("conflicting karras+exponential must be rejected");
     assert!(
-        err.to_string().contains("use_karras_sigmas and use_exponential_sigmas"),
+        err.to_string()
+            .contains("use_karras_sigmas and use_exponential_sigmas"),
         "unexpected: {err}"
     );
     Ok(())
@@ -604,14 +709,26 @@ pipeline:
       beta_schedule: scaled_linear
       use_exponential_sigmas: true
 ";
-    let dir = fixture_with_metadata("diffusion-euler-exp", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-euler-exp",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[0.1; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[0.1; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
-    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let sample = out
+        .get("denoiser.sample")
+        .expect("scheduled sample")
+        .to_vec_f32()?;
     for got in &sample {
-        assert!(got.is_finite(), "euler exponential produced non-finite value {got}");
+        assert!(
+            got.is_finite(),
+            "euler exponential produced non-finite value {got}"
+        );
     }
     Ok(())
 }
@@ -646,19 +763,34 @@ pipeline:
       beta_end: 0.5
       beta_schedule: linear
 ";
-    let dir = fixture_with_metadata("diffusion-euler", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-euler",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[1.0; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
 
     let inv_sqrt2 = 1.0 / std::f32::consts::SQRT_2;
-    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let sample = out
+        .get("denoiser.sample")
+        .expect("scheduled sample")
+        .to_vec_f32()?;
     let expected_sample = 1.0 - inv_sqrt2;
     for got in &sample {
-        assert!((got - expected_sample).abs() < 1e-5, "sample {got} != {expected_sample}");
+        assert!(
+            (got - expected_sample).abs() < 1e-5,
+            "sample {got} != {expected_sample}"
+        );
     }
-    let eps = out.get("denoiser.denoised").expect("model output").to_vec_f32()?;
+    let eps = out
+        .get("denoiser.denoised")
+        .expect("model output")
+        .to_vec_f32()?;
     for got in &eps {
         assert!((got - inv_sqrt2).abs() < 1e-5, "eps {got} != {inv_sqrt2}");
     }
@@ -686,7 +818,11 @@ pipeline:
     guidance_scale: 7.5
     cfg_conditioning_input: sample
 ";
-    let dir = fixture_with_metadata("diffusion-cfg-collision", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-cfg-collision",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
         .err()
         .expect("cfg conditioning port colliding with a loop input must be rejected");
@@ -723,20 +859,32 @@ pipeline:
       beta_start: 0.5
       beta_end: 0.5
 ";
-    let dir = fixture_with_metadata("diffusion-ddim", &["denoiser_step.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-ddim",
+        &["denoiser_step.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request =
-        empty_request().with_input("denoiser.sample", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.sample",
+        Value::from_slice_f32(&[1.0; 4], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
 
     // Post-scheduler sample is published under the input-port key.
-    let sample = out.get("denoiser.sample").expect("scheduled sample").to_vec_f32()?;
+    let sample = out
+        .get("denoiser.sample")
+        .expect("scheduled sample")
+        .to_vec_f32()?;
     let expected = std::f32::consts::SQRT_2 - 1.0;
     for got in &sample {
         assert!((got - expected).abs() < 1e-5, "sample {got} != {expected}");
     }
     // The raw model output (eps) is still published under the output-port key.
-    let eps = out.get("denoiser.denoised").expect("model output").to_vec_f32()?;
+    let eps = out
+        .get("denoiser.denoised")
+        .expect("model output")
+        .to_vec_f32()?;
     for got in &eps {
         assert!((got - 1.0).abs() < 1e-5, "eps {got} != 1.0");
     }
@@ -761,11 +909,18 @@ pipeline:
     scheduler_config:
       kind: no_such_scheduler
 ";
-    let dir = fixture_with_metadata("diffusion-bad-scheduler", &["denoiser.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-bad-scheduler",
+        &["denoiser.onnx.textproto"],
+        metadata,
+    )?;
     let err = Engine::from_pipeline_dir(&dir, EngineConfig::default())
         .err()
         .expect("unsupported scheduler kind must be rejected");
-    assert!(err.to_string().contains("scheduler kind"), "unexpected: {err}");
+    assert!(
+        err.to_string().contains("scheduler kind"),
+        "unexpected: {err}"
+    );
     Ok(())
 }
 
@@ -783,10 +938,15 @@ fn real_dit_denoiser_runs_through_ddim_iterative_pipeline() -> anyhow::Result<()
         .canonicalize()?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
 
-    let sample: Vec<f32> = (0..4 * 8 * 8).map(|i| (i as f32 % 7.0 - 3.0) * 0.1).collect();
+    let sample: Vec<f32> = (0..4 * 8 * 8)
+        .map(|i| (i as f32 % 7.0 - 3.0) * 0.1)
+        .collect();
     let ehs: Vec<f32> = (0..4 * 16).map(|i| (i as f32 % 5.0 - 2.0) * 0.1).collect();
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&sample, &[1, 4, 8, 8])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&sample, &[1, 4, 8, 8])?,
+        )
         .with_input(
             "denoiser.encoder_hidden_states",
             Value::from_slice_f32(&ehs, &[1, 4, 16])?,
@@ -804,7 +964,10 @@ fn real_dit_denoiser_runs_through_ddim_iterative_pipeline() -> anyhow::Result<()
         "DiT diffusion produced non-finite latent"
     );
     // The raw noise prediction is also published under the output-port key.
-    let noise = out.get("denoiser.noise_pred").expect("noise_pred").to_vec_f32()?;
+    let noise = out
+        .get("denoiser.noise_pred")
+        .expect("noise_pred")
+        .to_vec_f32()?;
     assert_eq!(noise.len(), 4 * 8 * 8);
     Ok(())
 }
@@ -832,16 +995,29 @@ pipeline:
     guidance_scale: 2.0
     cfg_conditioning_input: cond
 ";
-    let dir = fixture_with_metadata("diffusion-cfg-uncond", &["denoiser.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-cfg-uncond",
+        &["denoiser.onnx.textproto"],
+        metadata,
+    )?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond", Value::from_slice_f32(&[2.0; 4], &[1, 4])?)
-        .with_input("denoiser.cond.uncond", Value::from_slice_f32(&[1.0; 4], &[1, 4])?);
+        .with_input(
+            "denoiser.cond.uncond",
+            Value::from_slice_f32(&[1.0; 4], &[1, 4])?,
+        );
     let out = engine.run_pipeline(request)?;
     let denoised = out.get("denoiser.denoised").unwrap().to_vec_f32()?;
     for got in &denoised {
-        assert!((got - 1.5).abs() < 1e-5, "{got} != 1.5 (uncond input not honored?)");
+        assert!(
+            (got - 1.5).abs() < 1e-5,
+            "{got} != 1.5 (uncond input not honored?)"
+        );
     }
     Ok(())
 }
@@ -857,8 +1033,10 @@ fn masked_language_diffusion_refines_masked_sequence() -> anyhow::Result<()> {
         .join("../../tests/fixtures/tiny-masked-diffusion")
         .canonicalize()?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    let request = empty_request()
-        .with_input("denoiser.input_ids", Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?);
+    let request = empty_request().with_input(
+        "denoiser.input_ids",
+        Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?,
+    );
     let out = engine.run_pipeline(request)?;
     let tokens = out
         .get("denoiser.input_ids")
@@ -881,14 +1059,21 @@ fn iterative_num_steps_override_redrives_same_model() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     for steps in [2usize, 8] {
         let request = empty_request()
-            .with_input("denoiser.input_ids", Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?)
+            .with_input(
+                "denoiser.input_ids",
+                Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?,
+            )
             .with_iterative_overrides(IterativeOverrides {
                 num_steps: Some(steps),
                 ..Default::default()
             });
         let out = engine.run_pipeline(request)?;
         let tokens = out.get("denoiser.input_ids").unwrap().to_vec_i64()?;
-        assert_eq!(tokens, vec![2, 3, 4, 5], "num_steps override {steps} must still refine");
+        assert_eq!(
+            tokens,
+            vec![2, 3, 4, 5],
+            "num_steps override {steps} must still refine"
+        );
     }
     Ok(())
 }
@@ -902,7 +1087,10 @@ fn iterative_override_rejects_invalid_start_step() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
     // start_step must be < the (overridden) num_steps.
     let request = empty_request()
-        .with_input("denoiser.input_ids", Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?)
+        .with_input(
+            "denoiser.input_ids",
+            Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?,
+        )
         .with_iterative_overrides(IterativeOverrides {
             start_step: Some(4),
             ..Default::default()
@@ -952,7 +1140,11 @@ pipeline:
     scheduler_config:
       kind: my_adder
 ";
-    let dir = fixture_with_metadata("diffusion-custom-sched", &["denoiser.onnx.textproto"], metadata)?;
+    let dir = fixture_with_metadata(
+        "diffusion-custom-sched",
+        &["denoiser.onnx.textproto"],
+        metadata,
+    )?;
     let mut registry = SchedulerRegistry::builtin();
     registry.register(
         "my_adder",
@@ -967,7 +1159,10 @@ pipeline:
     //   step1: denoised=(c/2+c)/2=3c/4; next=c/2+3c/4=5c/4
     let cond = [4.0f32, 8.0, 12.0, 16.0];
     let request = empty_request()
-        .with_input("denoiser.sample", Value::from_slice_f32(&[0.0; 4], &[1, 4])?)
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
         .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
     let out = engine.run_pipeline(request)?;
     let sample = out.get("denoiser.sample").unwrap().to_vec_f32()?;

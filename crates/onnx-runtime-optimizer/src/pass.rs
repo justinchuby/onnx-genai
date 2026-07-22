@@ -55,10 +55,7 @@ impl PassContext {
 
     /// Attach the resolver that exposes inline or externally mapped initializer
     /// bytes to passes that rewrite immutable weights.
-    pub fn with_initializer_resolver(
-        mut self,
-        resolver: Arc<dyn InitializerResolver>,
-    ) -> Self {
+    pub fn with_initializer_resolver(mut self, resolver: Arc<dyn InitializerResolver>) -> Self {
         self.initializer_resolver = Some(resolver);
         self
     }

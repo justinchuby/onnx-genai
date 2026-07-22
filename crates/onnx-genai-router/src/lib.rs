@@ -54,6 +54,6 @@ pub use metrics::Metrics;
 pub use node::{NodeId, NodeState, NodeStatus, NodeStatusFetcher, SessionSummary};
 pub use node_poller::{HttpStatusFetcher, build_client};
 pub use prefix_map::{PrefixMap, hash_system_prompt};
-pub use router::{RouteRequest, RoutingDecision, Router};
+pub use router::{RouteRequest, Router, RoutingDecision};
 pub use session_map::{MigrationEvent, MigrationReason, SessionMap};
 pub use state::{AppState, SharedState};

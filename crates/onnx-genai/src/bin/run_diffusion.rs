@@ -127,7 +127,8 @@ fn main() -> Result<()> {
     }
 
     let load_start = std::time::Instant::now();
-    let mut engine = Engine::from_pipeline_dir(std::path::Path::new(pipeline_dir), EngineConfig::default())?;
+    let mut engine =
+        Engine::from_pipeline_dir(std::path::Path::new(pipeline_dir), EngineConfig::default())?;
     let load_ms = load_start.elapsed().as_secs_f64() * 1e3;
     let run_start = std::time::Instant::now();
     let outputs = engine.run_pipeline(request)?;

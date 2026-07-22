@@ -74,11 +74,7 @@ pub struct AttentionFactory {
 impl KernelFactory for AttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let scale = node.attr("scale").and_then(|a| a.as_float());
-        let is_causal = node
-            .attr("is_causal")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            != 0;
+        let is_causal = node.attr("is_causal").and_then(|a| a.as_int()).unwrap_or(0) != 0;
         let q_num_heads = node
             .attr("q_num_heads")
             .and_then(|a| a.as_int())
@@ -251,9 +247,15 @@ enum Mask {
     None,
     /// Float mask (added to scores). Stored dense over its own shape with the
     /// leading dims to broadcast.
-    Float { data: Vec<f32>, shape: Vec<usize> },
+    Float {
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    },
     /// Boolean mask (`true` = keep). `false` positions contribute `-inf`.
-    Bool { data: Vec<bool>, shape: Vec<usize> },
+    Bool {
+        data: Vec<bool>,
+        shape: Vec<usize>,
+    },
 }
 
 impl Mask {
@@ -711,7 +713,13 @@ mod tests {
     }
 
     fn approx(a: &[f32], b: &[f32], atol: f32) {
-        assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         for (i, (x, y)) in a.iter().zip(b).enumerate() {
             assert!(
                 (x - y).abs() < atol,
@@ -815,7 +823,15 @@ mod tests {
         qk_mode: i64,
         softcap: f32,
     ) -> AttentionKernel {
-        kernel_v(24, scale, is_causal, q_num_heads, kv_num_heads, qk_mode, softcap)
+        kernel_v(
+            24,
+            scale,
+            is_causal,
+            q_num_heads,
+            kv_num_heads,
+            qk_mode,
+            softcap,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -847,13 +863,32 @@ mod tests {
     #[test]
     fn mha_4d_no_mask_matches_reference() {
         let (b, h, sq, sk, d, dv) = (2, 2, 3, 4, 5, 6);
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.1).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.07).cos()).collect();
-        let v: Vec<f32> = (0..b * h * sk * dv).map(|i| (i as f32 * 0.03) - 0.5).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.07).cos())
+            .collect();
+        let v: Vec<f32> = (0..b * h * sk * dv)
+            .map(|i| (i as f32 * 0.03) - 0.5)
+            .collect();
         let scale = 0.3f32;
 
         let want = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
 
         let qv = Owned::f32(&[b, h, sq, d], &q);
@@ -874,7 +909,20 @@ mod tests {
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.05).collect();
         let scale = 1.0 / (d as f32).sqrt();
         let want = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel(None, false, None, None, 0, 0.0)
@@ -897,8 +945,12 @@ mod tests {
         let (b, h, sq, sk, d, dv) = (2, 2, 2, 3, 2, 2);
         let scale = 0.5f32;
         // Build 3D buffers: Q (b, sq, h*d), K (b, sk, h*d), V (b, sk, h*dv).
-        let q3: Vec<f32> = (0..b * sq * h * d).map(|i| (i as f32 * 0.13).sin()).collect();
-        let k3: Vec<f32> = (0..b * sk * h * d).map(|i| (i as f32 * 0.09).cos()).collect();
+        let q3: Vec<f32> = (0..b * sq * h * d)
+            .map(|i| (i as f32 * 0.13).sin())
+            .collect();
+        let k3: Vec<f32> = (0..b * sk * h * d)
+            .map(|i| (i as f32 * 0.09).cos())
+            .collect();
         let v3: Vec<f32> = (0..b * sk * h * dv).map(|i| i as f32 * 0.02).collect();
 
         // 4D equivalents obtained by transposing (b, s, h, d) → (b, h, s, d).
@@ -921,7 +973,20 @@ mod tests {
         let k4 = to4d(&k3, sk, d);
         let v4 = to4d(&v3, sk, dv);
         let want4 = reference(
-            &q4, &k4, &v4, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q4,
+            &k4,
+            &v4,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
         // Convert reference (b, h, sq, dv) back to 3D (b, sq, h*dv) for compare.
         let mut want3 = vec![0.0f32; b * sq * h * dv];
@@ -1132,10 +1197,8 @@ mod tests {
             kv_heads * v_head_dim,
         );
         let mut full_y = Owned::zeros_f32(&[batch, total_seq, q_heads * v_head_dim]);
-        let mut full_present_key =
-            Owned::zeros_f32(&[batch, kv_heads, total_seq, qk_head_dim]);
-        let mut full_present_value =
-            Owned::zeros_f32(&[batch, kv_heads, total_seq, v_head_dim]);
+        let mut full_present_key = Owned::zeros_f32(&[batch, kv_heads, total_seq, qk_head_dim]);
+        let mut full_present_value = Owned::zeros_f32(&[batch, kv_heads, total_seq, v_head_dim]);
         kernel(None, true, Some(q_heads), Some(kv_heads), 0, 0.0)
             .execute(
                 &[
@@ -1179,11 +1242,30 @@ mod tests {
         // q_heads=4, kv_heads=2 → group of 2 query heads share each KV head.
         let (b, qh, kvh, sq, sk, d, dv) = (1, 4, 2, 2, 3, 3, 2);
         let scale = 0.4f32;
-        let q: Vec<f32> = (0..b * qh * sq * d).map(|i| (i as f32 * 0.11).sin()).collect();
-        let k: Vec<f32> = (0..b * kvh * sk * d).map(|i| (i as f32 * 0.08).cos()).collect();
-        let v: Vec<f32> = (0..b * kvh * sk * dv).map(|i| i as f32 * 0.04 - 1.0).collect();
+        let q: Vec<f32> = (0..b * qh * sq * d)
+            .map(|i| (i as f32 * 0.11).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * kvh * sk * d)
+            .map(|i| (i as f32 * 0.08).cos())
+            .collect();
+        let v: Vec<f32> = (0..b * kvh * sk * dv)
+            .map(|i| i as f32 * 0.04 - 1.0)
+            .collect();
         let want = reference(
-            &q, &k, &v, b, qh, kvh, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            qh,
+            kvh,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, qh, sq, dv]);
         kernel(Some(scale), false, None, None, 0, 0.0)
@@ -1203,11 +1285,28 @@ mod tests {
     fn causal_masking_blocks_future() {
         let (b, h, s, d, dv) = (1, 1, 4, 3, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * s * d).map(|i| (i as f32 * 0.17).sin()).collect();
-        let k: Vec<f32> = (0..b * h * s * d).map(|i| (i as f32 * 0.05).cos()).collect();
+        let q: Vec<f32> = (0..b * h * s * d)
+            .map(|i| (i as f32 * 0.17).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * s * d)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * s * dv).map(|i| i as f32 * 0.1).collect();
         let want = reference(
-            &q, &k, &v, b, h, h, s, s, d, dv, scale, true, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            s,
+            s,
+            d,
+            dv,
+            scale,
+            true,
+            0,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, h, s, dv]);
         kernel(Some(scale), true, None, None, 0, 0.0)
@@ -1236,9 +1335,22 @@ mod tests {
         let k = [1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0];
         let v = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mask = [0.0f32, -1e4, 0.0, 0.0, 0.0, -1e4]; // (sq=2, sk=3)
-        let want = reference(&q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, i, j| {
-            mask[i * sk + j]
-        });
+        let want = reference(
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, i, j| mask[i * sk + j],
+        );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel(Some(scale), false, None, None, 0, 0.0)
             .execute(
@@ -1263,13 +1375,28 @@ mod tests {
         let v = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         // true = keep. Row 0 drops key 1; row 1 drops key 2.
         let keep = [true, false, true, true, true, false];
-        let want = reference(&q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, i, j| {
-            if keep[i * sk + j] {
-                0.0
-            } else {
-                f32::NEG_INFINITY
-            }
-        });
+        let want = reference(
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, i, j| {
+                if keep[i * sk + j] {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            },
+        );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel(Some(scale), false, None, None, 0, 0.0)
             .execute(
@@ -1332,7 +1459,19 @@ mod tests {
         full_v.extend_from_slice(&cur_v);
 
         let want = reference(
-            &q, &full_k, &full_v, b, h, h, sq, total, d, dv, scale, false, past_seq as i64,
+            &q,
+            &full_k,
+            &full_v,
+            b,
+            h,
+            h,
+            sq,
+            total,
+            d,
+            dv,
+            scale,
+            false,
+            past_seq as i64,
             |_, _, _, _| 0.0,
         );
 
@@ -1366,7 +1505,9 @@ mod tests {
         let kv_seq = 2usize;
         let total = past_seq + kv_seq;
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
         let cur_k: Vec<f32> = (0..kv_seq * d).map(|i| (i as f32 * 0.2).cos()).collect();
         let cur_v: Vec<f32> = (0..kv_seq * dv).map(|i| i as f32 * 0.5).collect();
         let past_k: Vec<f32> = (0..past_seq * d).map(|i| i as f32 * 0.1).collect();
@@ -1376,7 +1517,19 @@ mod tests {
         let mut full_v = past_v.clone();
         full_v.extend_from_slice(&cur_v);
         let want = reference(
-            &q, &full_k, &full_v, b, h, h, sq, total, d, dv, scale, true, past_seq as i64,
+            &q,
+            &full_k,
+            &full_v,
+            b,
+            h,
+            h,
+            sq,
+            total,
+            d,
+            dv,
+            scale,
+            true,
+            past_seq as i64,
             |_, _, _, _| 0.0,
         );
         let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
@@ -1404,9 +1557,24 @@ mod tests {
         let k = [2.0f32, 1.0, -1.0, 3.0];
         let v = [1.0f32, 0.0, 0.0, 1.0];
         let softcap = 2.0f32;
-        let want = reference(&q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let want = reference(
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
         // With softcap, scores are squashed → different distribution.
         let want_capped = {
             // Reference with softcap applied on the raw scaled scores.
@@ -1566,7 +1734,11 @@ mod tests {
             .insert("scale".to_string(), Attribute::Float(0.25));
         node.attributes
             .insert("qk_matmul_output_mode".to_string(), Attribute::Int(3));
-        assert!(AttentionFactory { since_version: 24 }.create(&node, &[]).is_ok());
+        assert!(
+            AttentionFactory { since_version: 24 }
+                .create(&node, &[])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1697,7 +1869,10 @@ mod tests {
             )
             .unwrap();
         let got = out.to_f32();
-        assert!(got.iter().all(|x| *x == 0.0), "scalar false → zero: {got:?}");
+        assert!(
+            got.iter().all(|x| *x == 0.0),
+            "scalar false → zero: {got:?}"
+        );
     }
 
     #[test]
@@ -1706,11 +1881,28 @@ mod tests {
         // mask), and is *not* mistaken for an omitted input.
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 3, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.2).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.1).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.2).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.1).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.3).collect();
         let want = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
         let mask = [true];
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
@@ -1806,7 +1998,20 @@ mod tests {
             out
         };
         let want_nocap = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel(Some(scale), false, None, None, 0, softcap)
@@ -1852,7 +2057,10 @@ mod tests {
                 acc * scale
             })
             .collect();
-        let capped: Vec<f32> = scaled.iter().map(|s| softcap * (s / softcap).tanh()).collect();
+        let capped: Vec<f32> = scaled
+            .iter()
+            .map(|s| softcap * (s / softcap).tanh())
+            .collect();
         let masked: Vec<f32> = capped.iter().zip(&maskv).map(|(s, m)| s + m).collect();
         let softmaxed = {
             let max = masked.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -1897,13 +2105,30 @@ mod tests {
         // offset = nonpad - q_seq > 0 shifts the causal diagonal to the right.
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 4, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
         let nonpad = [4i64];
         let offset = nonpad[0] - sq as i64; // 2
         let want = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, offset, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            true,
+            offset,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel_v(24, Some(scale), true, None, None, 0, 0.0)
@@ -1928,12 +2153,29 @@ mod tests {
         // offset = 0 recovers standard lower-triangular causal masking.
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 2, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
         let nonpad = [2i64];
         let want = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            true,
+            0,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel_v(24, Some(scale), true, None, None, 0, 0.0)
@@ -1958,13 +2200,30 @@ mod tests {
         // offset < 0 fully masks leading query rows → zero output rows (no NaN).
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 2, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3 + 0.1).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3 + 0.1).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1 + 0.2).collect();
         let nonpad = [1i64];
         let offset = nonpad[0] - sq as i64; // -1
         let want = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, true, offset, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            true,
+            offset,
+            |_, _, _, _| 0.0,
         );
         let mut out = Owned::zeros_f32(&[b, h, sq, dv]);
         kernel_v(24, Some(scale), true, None, None, 0, 0.0)
@@ -1995,8 +2254,12 @@ mod tests {
         // those keys to -inf, and assert it differs from the no-nonpad result.
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 4, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
         let nonpad = [2i64];
         // Reference: non-causal, but padding keys (j >= nonpad) masked to -inf.
@@ -2012,7 +2275,20 @@ mod tests {
         );
         // Sanity: the padding mask must actually change the result vs. no mask.
         let no_mask = reference(
-            &q, &k, &v, b, h, h, sq, sk, d, dv, scale, false, 0, |_, _, _, _| 0.0,
+            &q,
+            &k,
+            &v,
+            b,
+            h,
+            h,
+            sq,
+            sk,
+            d,
+            dv,
+            scale,
+            false,
+            0,
+            |_, _, _, _| 0.0,
         );
         assert!(
             want.iter().zip(&no_mask).any(|(a, c)| (a - c).abs() > 1e-4),
@@ -2044,8 +2320,12 @@ mod tests {
         // the causal frontier holds. The kernel offset is nonpad - q_seq.
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 4, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
         let nonpad = [3i64];
         let offset = nonpad[0] - sq as i64; // 1
@@ -2086,8 +2366,12 @@ mod tests {
         // and mode-3 (post-softmax) must be 0 there, for non-causal attention.
         let (b, h, sq, sk, d, dv) = (1, 1, 2, 3, 2, 2);
         let scale = 0.5f32;
-        let q: Vec<f32> = (0..b * h * sq * d).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..b * h * sk * d).map(|i| (i as f32 * 0.2).cos()).collect();
+        let q: Vec<f32> = (0..b * h * sq * d)
+            .map(|i| (i as f32 * 0.3).sin())
+            .collect();
+        let k: Vec<f32> = (0..b * h * sk * d)
+            .map(|i| (i as f32 * 0.2).cos())
+            .collect();
         let v: Vec<f32> = (0..b * h * sk * dv).map(|i| i as f32 * 0.1).collect();
         let nonpad = [2i64];
 
@@ -2137,7 +2421,12 @@ mod tests {
                     absent(),
                     Owned::i64(&[b], &nonpad).view(),
                 ],
-                &mut [y3.view_mut(), pk3.view_mut(), pv3.view_mut(), qk3.view_mut()],
+                &mut [
+                    y3.view_mut(),
+                    pk3.view_mut(),
+                    pv3.view_mut(),
+                    qk3.view_mut(),
+                ],
             )
             .unwrap();
         let probs = qk3.to_f32();

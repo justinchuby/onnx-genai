@@ -88,7 +88,10 @@ mod tests {
 
     #[test]
     fn different_prompts_hash_differently() {
-        assert_ne!(hash_system_prompt("prompt A"), hash_system_prompt("prompt B"));
+        assert_ne!(
+            hash_system_prompt("prompt A"),
+            hash_system_prompt("prompt B")
+        );
     }
 
     #[test]

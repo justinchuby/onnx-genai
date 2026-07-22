@@ -72,13 +72,13 @@ fn write_host(buffer: &mut DeviceBuffer, src: &[u8]) -> Result<()> {
         buffer.device()
     );
     if src.len() > buffer.len() {
-        return Err(EagerError::Kernel(onnx_runtime_ep_api::EpError::KernelFailed(
-            format!(
+        return Err(EagerError::Kernel(
+            onnx_runtime_ep_api::EpError::KernelFailed(format!(
                 "write_host: source {} bytes exceeds buffer {} bytes",
                 src.len(),
                 buffer.len()
-            ),
-        )));
+            )),
+        ));
     }
     if src.is_empty() {
         return Ok(());
@@ -123,12 +123,12 @@ impl Tensor {
         let numel: usize = shape.iter().product();
         let expected = dtype.storage_bytes(numel);
         if bytes.len() != expected {
-            return Err(EagerError::Kernel(onnx_runtime_ep_api::EpError::KernelFailed(
-                format!(
+            return Err(EagerError::Kernel(
+                onnx_runtime_ep_api::EpError::KernelFailed(format!(
                     "Tensor::from_raw_in: {} bytes for shape {shape:?} dtype {dtype:?}, expected {expected}",
                     bytes.len()
-                ),
-            )));
+                )),
+            ));
         }
         let layout = TensorLayout::contiguous();
         let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
@@ -238,7 +238,11 @@ impl Tensor {
 
     /// Copy out the elements as `f32`. Panics if the dtype is not `Float32`.
     pub fn to_vec_f32(&self) -> Vec<f32> {
-        assert_eq!(self.dtype, DataType::Float32, "to_vec_f32 on non-f32 tensor");
+        assert_eq!(
+            self.dtype,
+            DataType::Float32,
+            "to_vec_f32 on non-f32 tensor"
+        );
         self.as_bytes()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

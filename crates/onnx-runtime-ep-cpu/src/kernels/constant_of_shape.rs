@@ -195,7 +195,9 @@ mod tests {
         )));
         let shape = Owned::i64(&[1], &[2]);
         let mut out = Owned::zeros_f32(&[2]);
-        let err = k.execute(&[shape.view()], &mut [out.view_mut()]).unwrap_err();
+        let err = k
+            .execute(&[shape.view()], &mut [out.view_mut()])
+            .unwrap_err();
         assert!(err.to_string().contains("WHY:"));
     }
 }

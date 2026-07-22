@@ -35,11 +35,7 @@ impl AppState {
     }
 
     /// Build shared state with an explicit hyper client (used by tests).
-    pub fn with_client(
-        router: Router,
-        poll_interval_ms: u64,
-        client: ProxyClient,
-    ) -> SharedState {
+    pub fn with_client(router: Router, poll_interval_ms: u64, client: ProxyClient) -> SharedState {
         Arc::new(AppState {
             router: Mutex::new(router),
             metrics: Metrics::new(),

@@ -41,8 +41,14 @@ fn pipeline_folds_constants_and_fuses_matmul_bias_on_bert_toy() {
     let nodes_before = g.num_nodes();
     let const_before = count(&g, "Constant");
     let matmul_before = count(&g, "MatMul");
-    assert!(const_before > 0, "fixture should have Constant nodes to fold");
-    assert!(matmul_before > 0, "fixture should have MatMul nodes to fuse");
+    assert!(
+        const_before > 0,
+        "fixture should have Constant nodes to fold"
+    );
+    assert!(
+        matmul_before > 0,
+        "fixture should have MatMul nodes to fuse"
+    );
     assert!(g.validate().is_ok(), "loaded graph must be valid");
 
     run_passes(&mut g, &default_passes(), &PassContext::new()).expect("pipeline runs");
@@ -52,7 +58,10 @@ fn pipeline_folds_constants_and_fuses_matmul_bias_on_bert_toy() {
     // Op fusion collapsed MatMul+Add spines into FusedMatMulBias.
     let fused = count(&g, "FusedMatMulBias");
     assert!(fused > 0, "MatMul+Add fusion should fire on a real model");
-    assert!(count(&g, "MatMul") < matmul_before, "MatMul count should drop");
+    assert!(
+        count(&g, "MatMul") < matmul_before,
+        "MatMul count should drop"
+    );
     // The pipeline is a net simplification.
     assert!(g.num_nodes() < nodes_before, "node count should decrease");
     // And the result is still a structurally valid graph.

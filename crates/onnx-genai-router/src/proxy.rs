@@ -106,7 +106,16 @@ pub async fn proxy_handler(State(state): State<SharedState>, req: Request) -> Re
     // buffer its response so we can read that id and record affinity.
     let capture_session = method == Method::POST && uri.path() == "/v1/sessions";
 
-    match forward(&state, &address, &parts.method, &uri, &parts.headers, body_bytes).await {
+    match forward(
+        &state,
+        &address,
+        &parts.method,
+        &uri,
+        &parts.headers,
+        body_bytes,
+    )
+    .await
+    {
         Ok(resp) => {
             if capture_session {
                 capture_session_affinity(&state, &node_id, resp).await
@@ -133,7 +142,9 @@ async fn forward(
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let upstream_uri = format!("http://{address}{path_and_query}");
 
-    let mut builder = HyperRequest::builder().method(method.clone()).uri(upstream_uri);
+    let mut builder = HyperRequest::builder()
+        .method(method.clone())
+        .uri(upstream_uri);
     for (name, value) in headers.iter() {
         if !is_hop_by_hop(name) {
             builder = builder.header(name, value);
@@ -350,7 +361,10 @@ mod tests {
     fn hashes_first_message_when_no_system_role() {
         let body = br#"{"messages":[{"role":"user","content":"hello world"}]}"#;
         let req = extract_route_fields(body);
-        assert_eq!(req.system_prompt_hash, Some(hash_system_prompt("hello world")));
+        assert_eq!(
+            req.system_prompt_hash,
+            Some(hash_system_prompt("hello world"))
+        );
     }
 
     #[test]
@@ -365,14 +379,20 @@ mod tests {
             ]
         }"#;
         let req = extract_route_fields(body);
-        assert_eq!(req.system_prompt_hash, Some(hash_system_prompt("part-a part-b")));
+        assert_eq!(
+            req.system_prompt_hash,
+            Some(hash_system_prompt("part-a part-b"))
+        );
     }
 
     #[test]
     fn hashes_prompt_field_for_completions() {
         let body = br#"{"prompt":"complete this"}"#;
         let req = extract_route_fields(body);
-        assert_eq!(req.system_prompt_hash, Some(hash_system_prompt("complete this")));
+        assert_eq!(
+            req.system_prompt_hash,
+            Some(hash_system_prompt("complete this"))
+        );
         assert!(req.session_id.is_none());
     }
 
@@ -399,8 +419,14 @@ mod tests {
     #[test]
     fn oversize_content_length_exceeds_cap() {
         // A declared length above the cap is oversize; at/below is not.
-        assert!(exceeds_cap(Some(MAX_REQUEST_BODY as u64 + 1), MAX_REQUEST_BODY));
-        assert!(!exceeds_cap(Some(MAX_REQUEST_BODY as u64), MAX_REQUEST_BODY));
+        assert!(exceeds_cap(
+            Some(MAX_REQUEST_BODY as u64 + 1),
+            MAX_REQUEST_BODY
+        ));
+        assert!(!exceeds_cap(
+            Some(MAX_REQUEST_BODY as u64),
+            MAX_REQUEST_BODY
+        ));
         assert!(!exceeds_cap(Some(0), MAX_REQUEST_BODY));
         // Unknown length is not treated as oversize (buffer-with-cap path).
         assert!(!exceeds_cap(None, MAX_REQUEST_BODY));

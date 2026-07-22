@@ -221,7 +221,12 @@ mod tests {
     #[test]
     fn migrate_new_session_does_not_record() {
         let mut m = SessionMap::new();
-        let ev = m.migrate("s-new", NodeId::new("gpu-2"), MigrationReason::Overloaded, 100);
+        let ev = m.migrate(
+            "s-new",
+            NodeId::new("gpu-2"),
+            MigrationReason::Overloaded,
+            100,
+        );
         assert!(ev.is_none());
         assert_eq!(m.get("s-new"), Some(&NodeId::new("gpu-2")));
         assert!(m.migrations().is_empty());

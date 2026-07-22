@@ -438,10 +438,7 @@ impl PagedKvCache {
             //  2. The candidate window start must not regress into the sink
             //     region (already guaranteed by the `keep_from <= sink_len_target`
             //     guard above, but made explicit here for auditing).
-            let page_count = self
-                .page_table
-                .get_sequence(seq)
-                .map_or(0, |p| p.len());
+            let page_count = self.page_table.get_sequence(seq).map_or(0, |p| p.len());
             debug_assert!(
                 page_count >= sink_pages,
                 "SWA sink first-activation: sequence has only {page_count} page(s) \
@@ -910,10 +907,7 @@ mod tests {
     /// Two layers with different geometry: sliding-style (head_dim 8) and
     /// full-style (head_dim 16), also with different `num_kv_heads`.
     fn heterogeneous_layer_configs() -> Vec<LayerTensorConfig> {
-        vec![
-            LayerTensorConfig::new(2, 8),
-            LayerTensorConfig::new(3, 16),
-        ]
+        vec![LayerTensorConfig::new(2, 8), LayerTensorConfig::new(3, 16)]
     }
 
     /// Build one token of per-layer K/V for `heterogeneous_layer_configs`,
@@ -960,12 +954,8 @@ mod tests {
     #[test]
     fn heterogeneous_per_layer_geometry_round_trips_within_a_page() {
         let configs = heterogeneous_layer_configs();
-        let mut cache = PagedKvCache::new_with_layer_tensor_configs(
-            4,
-            KvDType::F32,
-            configs.clone(),
-            8,
-        );
+        let mut cache =
+            PagedKvCache::new_with_layer_tensor_configs(4, KvDType::F32, configs.clone(), 8);
         let seq = cache.create_sequence();
         let token = hetero_token(&configs, 0);
         cache
@@ -996,20 +986,14 @@ mod tests {
     fn heterogeneous_per_layer_geometry_round_trips_across_page_boundaries() {
         let configs = heterogeneous_layer_configs();
         // page_size 2 with 3 tokens forces a second page.
-        let mut cache = PagedKvCache::new_with_layer_tensor_configs(
-            2,
-            KvDType::F32,
-            configs.clone(),
-            8,
-        );
+        let mut cache =
+            PagedKvCache::new_with_layer_tensor_configs(2, KvDType::F32, configs.clone(), 8);
         let seq = cache.create_sequence();
         let tokens = (0..3)
             .map(|t| hetero_token(&configs, t))
             .collect::<Vec<_>>();
         for token in &tokens {
-            cache
-                .append_token_kv(seq, &borrowed_layers(token))
-                .unwrap();
+            cache.append_token_kv(seq, &borrowed_layers(token)).unwrap();
         }
         assert_eq!(cache.page_table.get_sequence(seq).unwrap().len(), 2);
 
@@ -1050,9 +1034,7 @@ mod tests {
             .map(|t| hetero_token(&configs, t))
             .collect::<Vec<_>>();
         for token in &tokens {
-            cache
-                .append_token_kv(seq, &borrowed_layers(token))
-                .unwrap();
+            cache.append_token_kv(seq, &borrowed_layers(token)).unwrap();
         }
 
         let materialized = cache.materialize_sequence(seq).unwrap();
@@ -1069,12 +1051,8 @@ mod tests {
     #[test]
     fn heterogeneous_write_rejects_wrong_per_layer_length() {
         let configs = heterogeneous_layer_configs();
-        let mut cache = PagedKvCache::new_with_layer_tensor_configs(
-            2,
-            KvDType::F32,
-            configs.clone(),
-            8,
-        );
+        let mut cache =
+            PagedKvCache::new_with_layer_tensor_configs(2, KvDType::F32, configs.clone(), 8);
         let seq = cache.create_sequence();
         // Layer 1 expects 48 scalars (3 heads * 16); give it a layer-0-sized
         // buffer (16) to prove per-layer validation, not a uniform check.
@@ -1286,7 +1264,10 @@ mod tests {
         cache.apply_sliding_window_with_sinks(seq, 3, 2).unwrap();
         assert_eq!(cache.page_table.sequence_sink_len(seq), Some(2));
         let retained_start = cache.retained_start(seq).unwrap();
-        assert!(retained_start > 2, "gap must be open for the test to be meaningful");
+        assert!(
+            retained_start > 2,
+            "gap must be open for the test to be meaningful"
+        );
 
         // Positions in the evicted gap are still rejected.
         assert!(matches!(

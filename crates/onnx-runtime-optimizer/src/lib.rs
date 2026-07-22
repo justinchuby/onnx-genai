@@ -90,9 +90,8 @@ mod tests {
         // MatMul+Add feeding an output, plus a dead Neg branch off `a`.
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
-        let mk = |g: &mut Graph, n: &str| {
-            g.create_named_value(n, DataType::Float32, static_shape([4]))
-        };
+        let mk =
+            |g: &mut Graph, n: &str| g.create_named_value(n, DataType::Float32, static_shape([4]));
         let a = mk(&mut g, "a");
         let w = mk(&mut g, "w");
         let bias = mk(&mut g, "bias");
@@ -100,9 +99,19 @@ mod tests {
         g.add_input(w);
         g.add_input(bias);
         let m = mk(&mut g, "m");
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let out = mk(&mut g, "out");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![out],
+        ));
         g.add_output(out);
         // Dead branch.
         let dead = mk(&mut g, "dead");

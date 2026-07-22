@@ -14,14 +14,12 @@ use prost::Message;
 
 use onnx_runtime_ir::{DataType, Dim};
 use onnx_runtime_loader::proto::onnx;
-use onnx_runtime_loader::{
-    ep_context_nodes, resolve_ep_context, EmbedMode, EpContextBlob,
-};
+use onnx_runtime_loader::{EmbedMode, EpContextBlob, ep_context_nodes, resolve_ep_context};
 
 // ── proto construction helpers ────────────────────────────────────────────────
 
 fn tensor_type(elem_type: i32, dims: &[i64]) -> onnx::TypeProto {
-    use onnx::tensor_shape_proto::{dimension::Value as DV, Dimension};
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
     let dim = dims
         .iter()
         .map(|d| Dimension {
@@ -30,10 +28,12 @@ fn tensor_type(elem_type: i32, dims: &[i64]) -> onnx::TypeProto {
         })
         .collect();
     onnx::TypeProto {
-        value: Some(onnx::type_proto::Value::TensorType(onnx::type_proto::Tensor {
-            elem_type,
-            shape: Some(onnx::TensorShapeProto { dim }),
-        })),
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type,
+                shape: Some(onnx::TensorShapeProto { dim }),
+            },
+        )),
         ..Default::default()
     }
 }
@@ -201,17 +201,18 @@ fn external_blob_mmaps_and_matches() {
 #[test]
 fn attribute_parsing_uses_defaults_when_absent() {
     // Only `ep_cache_context` present — everything else must default (§55.2).
-    let g = single_epctx_graph(
-        vec![bytes_attr("ep_cache_context", b"blob")],
-        &[2, 8],
-    );
+    let g = single_epctx_graph(vec![bytes_attr("ep_cache_context", b"blob")], &[2, 8]);
     let bytes = model_ms(g);
     let (graph, _store) =
         onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".").expect("load");
 
     let n = ep_context_nodes(&graph).next().expect("one EPContext node");
     assert!(n.main_context, "main_context defaults to true");
-    assert_eq!(n.embed_mode, EmbedMode::Embedded, "embed_mode defaults to Embedded");
+    assert_eq!(
+        n.embed_mode,
+        EmbedMode::Embedded,
+        "embed_mode defaults to Embedded"
+    );
     assert_eq!(n.source, None);
     assert_eq!(n.sdk_version, None);
     assert_eq!(n.partition_name, None);

@@ -292,7 +292,9 @@ mod tests {
             if ctx.data == Self::BLOB {
                 Ok(())
             } else {
-                Err(EpError::KernelFailed("mock: unexpected context blob".to_string()))
+                Err(EpError::KernelFailed(
+                    "mock: unexpected context blob".to_string(),
+                ))
             }
         }
     }
@@ -425,8 +427,7 @@ mod tests {
     fn build_registry_from_eps_skips_non_participants() {
         let mock = MockCompiledEp::new();
         let plain = PlainEp;
-        let eps: Vec<(EpId, &dyn ExecutionProvider)> =
-            vec![(EpId(0), &plain), (EpId(1), &mock)];
+        let eps: Vec<(EpId, &dyn ExecutionProvider)> = vec![(EpId(0), &plain), (EpId(1), &mock)];
 
         let reg = build_ep_context_registry(eps).unwrap();
 

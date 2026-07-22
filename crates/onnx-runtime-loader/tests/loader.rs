@@ -7,7 +7,7 @@
 use prost::Message;
 
 use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, WeightRef};
-use onnx_runtime_loader::{proto::onnx, LoaderError};
+use onnx_runtime_loader::{LoaderError, proto::onnx};
 
 // --- proto construction helpers ---
 
@@ -17,7 +17,7 @@ enum Dimlike {
 }
 
 fn tensor_type(elem_type: i32, dims: &[Dimlike]) -> onnx::TypeProto {
-    use onnx::tensor_shape_proto::{dimension::Value as DV, Dimension};
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
     let dim = dims
         .iter()
         .map(|d| Dimension {
@@ -29,10 +29,12 @@ fn tensor_type(elem_type: i32, dims: &[Dimlike]) -> onnx::TypeProto {
         })
         .collect();
     onnx::TypeProto {
-        value: Some(onnx::type_proto::Value::TensorType(onnx::type_proto::Tensor {
-            elem_type,
-            shape: Some(onnx::TensorShapeProto { dim }),
-        })),
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type,
+                shape: Some(onnx::TensorShapeProto { dim }),
+            },
+        )),
         ..Default::default()
     }
 }
@@ -345,7 +347,11 @@ fn reshape_uses_constant_shape_initializer() {
             1,
             &[Dimlike::Static(2), Dimlike::Static(3), Dimlike::Static(4)],
         )],
-        output: vec![value_info("Y", 1, &[Dimlike::Static(6), Dimlike::Static(4)])],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(6), Dimlike::Static(4)],
+        )],
         initializer: vec![i64_initializer("shape", &[-1, 4])],
         node: vec![node("Reshape", &["X", "shape"], &["Y"])],
         ..Default::default()
@@ -371,8 +377,16 @@ fn unknown_initializer_dtype_is_load_error() {
         let mut init = f32_initializer("W", &[2, 2]);
         init.data_type = bad;
         let g = onnx::GraphProto {
-            input: vec![value_info("X", 1, &[Dimlike::Static(2), Dimlike::Static(2)])],
-            output: vec![value_info("Y", 1, &[Dimlike::Static(2), Dimlike::Static(2)])],
+            input: vec![value_info(
+                "X",
+                1,
+                &[Dimlike::Static(2), Dimlike::Static(2)],
+            )],
+            output: vec![value_info(
+                "Y",
+                1,
+                &[Dimlike::Static(2), Dimlike::Static(2)],
+            )],
             initializer: vec![init],
             node: vec![node("Add", &["X", "W"], &["Y"])],
             ..Default::default()
@@ -495,8 +509,8 @@ fn smoke_load_real_fixture_if_present() {
         .and_then(|p| p.parent())
         .expect("workspace root");
     let candidates = [
-        "tests/fixtures/tiny-eagle3/model.onnx.textproto",     // external data
-        "tests/fixtures/tiny-whisper/encoder.onnx.textproto",  // inline
+        "tests/fixtures/tiny-eagle3/model.onnx.textproto", // external data
+        "tests/fixtures/tiny-whisper/encoder.onnx.textproto", // inline
     ];
     let mut loaded_any = false;
     for rel in candidates {
@@ -583,17 +597,24 @@ fn load_textproto_fixture_matches_binary_io() {
 fn load_bytes_with_weights_inline_survives() {
     let g = onnx::GraphProto {
         name: "inline_weights".into(),
-        input: vec![value_info("X", 1, &[Dimlike::Static(2), Dimlike::Static(4)])],
-        output: vec![value_info("Y", 1, &[Dimlike::Static(2), Dimlike::Static(8)])],
+        input: vec![value_info(
+            "X",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(4)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(8)],
+        )],
         initializer: vec![f32_initializer("W", &[4, 8])],
         node: vec![node("MatMul", &["X", "W"], &["Y"])],
         ..Default::default()
     };
     let bytes = model(g, 17);
 
-    let (graph, store) =
-        onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")
-            .expect("load_model_bytes_with_weights");
+    let (graph, store) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")
+        .expect("load_model_bytes_with_weights");
 
     // The store must be usable to get bytes for every initializer in the graph.
     let mut found_inline = false;
@@ -676,7 +697,9 @@ fn load_with_weights_inlined_fixtures_survive_graph_drop() {
     }
 
     if !tested_any {
-        eprintln!("load_with_weights_inlined_fixtures_survive_graph_drop: no fixture found, skipping");
+        eprintln!(
+            "load_with_weights_inlined_fixtures_survive_graph_drop: no fixture found, skipping"
+        );
     }
 }
 
@@ -693,7 +716,11 @@ fn constant_infers_shape_dtype_and_value() {
             1,
             &[Dimlike::Static(2), Dimlike::Static(3), Dimlike::Static(4)],
         )],
-        output: vec![value_info("Y", 1, &[Dimlike::Static(6), Dimlike::Static(4)])],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(6), Dimlike::Static(4)],
+        )],
         node: vec![
             const_i64("shape", &[2], &[-1, 4]),
             node("Reshape", &["X", "shape"], &["Y"]),
@@ -741,7 +768,12 @@ fn shape_slice_concat_reshape_int64_chain_folds_to_concrete_dims() {
             const_i64("axes", &[1], &[0]),
             node("Slice", &["s", "starts", "ends", "axes"], &["s01"]),
             const_i64("tail", &[1], &[24]),
-            node_attrs("Concat", &["s01", "tail"], &["target"], vec![int_attr("axis", 0)]),
+            node_attrs(
+                "Concat",
+                &["s01", "tail"],
+                &["target"],
+                vec![int_attr("axis", 0)],
+            ),
             node("Reshape", &["D", "target"], &["Y"]),
         ],
         ..Default::default()
@@ -766,8 +798,16 @@ fn shape_slice_concat_reshape_int64_chain_folds_to_concrete_dims() {
 fn expand_broadcasts_to_const_target() {
     // Expand(D[1,3], shape = Constant[2,3]) -> [2,3].
     let g = onnx::GraphProto {
-        input: vec![value_info("D", 1, &[Dimlike::Static(1), Dimlike::Static(3)])],
-        output: vec![value_info("Y", 1, &[Dimlike::Static(2), Dimlike::Static(3)])],
+        input: vec![value_info(
+            "D",
+            1,
+            &[Dimlike::Static(1), Dimlike::Static(3)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(3)],
+        )],
         node: vec![
             const_i64("shape", &[2], &[2, 3]),
             node("Expand", &["D", "shape"], &["Y"]),
@@ -828,8 +868,24 @@ fn bert_toy_optimized_every_value_resolves() {
     // Ops that always produce a rank ≥ 1 tensor in this model: none of their
     // outputs may be left shape-less.
     let structural = [
-        "Reshape", "Transpose", "MatMul", "Gemm", "Slice", "Expand", "Gather", "Concat",
-        "Softmax", "Add", "Sub", "Mul", "Div", "Pow", "Erf", "Sqrt", "Tanh", "ReduceMean",
+        "Reshape",
+        "Transpose",
+        "MatMul",
+        "Gemm",
+        "Slice",
+        "Expand",
+        "Gather",
+        "Concat",
+        "Softmax",
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "Pow",
+        "Erf",
+        "Sqrt",
+        "Tanh",
+        "ReduceMean",
         "LayerNormalization",
     ];
 
@@ -855,7 +911,9 @@ fn bert_toy_optimized_every_value_resolves() {
             // Non-empty shapes are made of concrete and/or interned symbolic
             // dims; both are resolvable by the session.
             assert!(
-                v.shape.iter().all(|d| matches!(d, Dim::Static(_) | Dim::Symbolic(_))),
+                v.shape
+                    .iter()
+                    .all(|d| matches!(d, Dim::Static(_) | Dim::Symbolic(_))),
                 "value {:?} has an ill-formed shape {:?}",
                 v.name,
                 v.shape

@@ -3,10 +3,10 @@
 //! All graphs are built through the public IR API. Every test validates the
 //! produced plan with [`validate_static`].
 
-use onnx_runtime_ir::{static_shape, DataType, Graph, Node, NodeId, Shape, ValueId};
+use onnx_runtime_ir::{DataType, Graph, Node, NodeId, Shape, ValueId, static_shape};
 use onnx_runtime_memory::{
-    plan_activations, plan_activations_static, validate_static, PlanOptions, PlanStatus, SlotId,
-    ValidateError, ViewMap,
+    PlanOptions, PlanStatus, SlotId, ValidateError, ViewMap, plan_activations,
+    plan_activations_static, validate_static,
 };
 
 const F32: DataType = DataType::Float32;
@@ -53,7 +53,10 @@ fn linear_chain_double_buffers() {
     // Concurrent peak is a double buffer.
     assert_eq!(plan.num_slots, 2, "linear chain should reuse into 2 slots");
     assert_eq!(plan.peak_bytes, 2 * 400);
-    assert!((plan.savings_ratio - 0.5).abs() < 1e-9, "expected 50% savings");
+    assert!(
+        (plan.savings_ratio - 0.5).abs() < 1e-9,
+        "expected 50% savings"
+    );
     // The input is not part of the arena.
     assert!(!plan.assignments.contains_key(&inp));
 }
@@ -221,7 +224,10 @@ fn symbolic_shape_defers_plan() {
     let status = plan_activations_static(&g, &vm, &PlanOptions::default()).unwrap();
     match status {
         PlanStatus::Deferred { unknown_sizes } => {
-            assert!(unknown_sizes.contains(&a), "symbolic value must be deferred");
+            assert!(
+                unknown_sizes.contains(&a),
+                "symbolic value must be deferred"
+            );
         }
         PlanStatus::Complete(_) => panic!("expected a deferred plan for a symbolic shape"),
     }

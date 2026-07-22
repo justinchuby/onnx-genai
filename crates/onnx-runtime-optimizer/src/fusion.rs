@@ -170,7 +170,15 @@ impl FusionPattern {
         Self {
             name: "LayerNorm".to_string(),
             ops: [
-                "ReduceMean", "Sub", "Pow", "ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add",
+                "ReduceMean",
+                "Sub",
+                "Pow",
+                "ReduceMean",
+                "Add",
+                "Sqrt",
+                "Div",
+                "Mul",
+                "Add",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -538,13 +546,10 @@ impl FusionPattern {
         // Forward: out = probs · V. `sm_out` must be the LEFT operand of a
         // following MatMul (matmul is not commutative; a right-operand softmax
         // would be `V · probs`, a different op → decline).
-        let out_mm = graph
-            .consumers(sm_out)
-            .into_iter()
-            .find(|&c| {
-                let n = graph.node(c);
-                Self::op_matches(n, "MatMul") && n.inputs.first() == Some(&Some(sm_out))
-            })?;
+        let out_mm = graph.consumers(sm_out).into_iter().find(|&c| {
+            let n = graph.node(c);
+            Self::op_matches(n, "MatMul") && n.inputs.first() == Some(&Some(sm_out))
+        })?;
         let out_mm_node = graph.node(out_mm);
         if out_mm_node.inputs.len() != 2 || out_mm_node.outputs.len() != 1 {
             return None;
@@ -556,30 +561,30 @@ impl FusionPattern {
         // scaling, or by a mask `Add` sitting between the scaling and Softmax.
         let sm_in_prod = graph.value(sm_in).producer?;
         let prod = graph.node(sm_in_prod);
-        let (scale_out, mask, mask_add) =
-            if Self::op_matches(prod, "Add") && prod.inputs.len() == 2 {
-                let a = prod.inputs[0]?;
-                let b = prod.inputs[1]?;
-                // The scaled-scores operand is the one whose producer parses as
-                // the score scaling (`Mul`/`Div` scalar of a MatMul output);
-                // the other operand is the additive mask. Exactly one must
-                // qualify — otherwise the dataflow is ambiguous → decline.
-                let a_scale = graph
-                    .value(a)
-                    .producer
-                    .is_some_and(|p| Self::parse_scale(graph, p).is_some());
-                let b_scale = graph
-                    .value(b)
-                    .producer
-                    .is_some_and(|p| Self::parse_scale(graph, p).is_some());
-                match (a_scale, b_scale) {
-                    (true, false) => (a, Some(b), Some(sm_in_prod)),
-                    (false, true) => (b, Some(a), Some(sm_in_prod)),
-                    _ => return None,
-                }
-            } else {
-                (sm_in, None, None)
-            };
+        let (scale_out, mask, mask_add) = if Self::op_matches(prod, "Add") && prod.inputs.len() == 2
+        {
+            let a = prod.inputs[0]?;
+            let b = prod.inputs[1]?;
+            // The scaled-scores operand is the one whose producer parses as
+            // the score scaling (`Mul`/`Div` scalar of a MatMul output);
+            // the other operand is the additive mask. Exactly one must
+            // qualify — otherwise the dataflow is ambiguous → decline.
+            let a_scale = graph
+                .value(a)
+                .producer
+                .is_some_and(|p| Self::parse_scale(graph, p).is_some());
+            let b_scale = graph
+                .value(b)
+                .producer
+                .is_some_and(|p| Self::parse_scale(graph, p).is_some());
+            match (a_scale, b_scale) {
+                (true, false) => (a, Some(b), Some(sm_in_prod)),
+                (false, true) => (b, Some(a), Some(sm_in_prod)),
+                _ => return None,
+            }
+        } else {
+            (sm_in, None, None)
+        };
 
         // Score scaling: `scores * c` (Mul) or `scores / c` (Div), c a concrete
         // scalar f32 constant, `scores` a MatMul output.
@@ -938,9 +943,9 @@ impl FusionPattern {
             // required op type and is not already in the chain.
             let mut succ_ids = graph.successors(prev);
             succ_ids.sort_by_key(|n| n.0);
-            let next = succ_ids.into_iter().find(|&s| {
-                !chain_set.contains(&s) && Self::op_matches(graph.node(s), op)
-            })?;
+            let next = succ_ids
+                .into_iter()
+                .find(|&s| !chain_set.contains(&s) && Self::op_matches(graph.node(s), op))?;
             chain.push(next);
             chain_set.insert(next);
         }
@@ -1376,14 +1381,7 @@ impl OpFusion {
     fn run_resumable(
         &self,
         graph: &mut Graph,
-        mut observe_fusion: impl FnMut(
-            &str,
-            ScanCandidateSource,
-            NodeId,
-            &[NodeId],
-            &[NodeId],
-            NodeId,
-        ),
+        mut observe_fusion: impl FnMut(&str, ScanCandidateSource, NodeId, &[NodeId], &[NodeId], NodeId),
     ) -> Result<()> {
         for pattern in &self.patterns {
             let candidates: Vec<u32> = graph.nodes.keys().map(|id| id.0).collect();
@@ -1398,10 +1396,9 @@ impl OpFusion {
                         cursor += 1;
                         (id, ScanCandidateSource::Initial)
                     }
-                    (None, Some(_)) => (
-                        revisits.pop_first().unwrap(),
-                        ScanCandidateSource::Revisit,
-                    ),
+                    (None, Some(_)) => {
+                        (revisits.pop_first().unwrap(), ScanCandidateSource::Revisit)
+                    }
                     (Some(id), Some(revisit)) if id <= revisit => {
                         cursor += 1;
                         if id == revisit {
@@ -1409,10 +1406,9 @@ impl OpFusion {
                         }
                         (id, ScanCandidateSource::Initial)
                     }
-                    (Some(_), Some(_)) => (
-                        revisits.pop_first().unwrap(),
-                        ScanCandidateSource::Revisit,
-                    ),
+                    (Some(_), Some(_)) => {
+                        (revisits.pop_first().unwrap(), ScanCandidateSource::Revisit)
+                    }
                 };
                 let start = NodeId(raw_id);
                 let Some(matched) = pattern.try_match_at(graph, start) else {
@@ -1448,14 +1444,7 @@ impl OpFusion {
     fn run_with_fusion_observer(
         &self,
         graph: &mut Graph,
-        observe_fusion: impl FnMut(
-            &str,
-            ScanCandidateSource,
-            NodeId,
-            &[NodeId],
-            &[NodeId],
-            NodeId,
-        ),
+        observe_fusion: impl FnMut(&str, ScanCandidateSource, NodeId, &[NodeId], &[NodeId], NodeId),
     ) -> Result<()> {
         self.run_resumable(graph, observe_fusion)
     }
@@ -1493,9 +1482,19 @@ mod tests {
         g.add_input(bias);
 
         let m = val(&mut g, "m");
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let out = val(&mut g, "out");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![out],
+        ));
         g.add_output(out);
         g
     }
@@ -1528,9 +1527,19 @@ mod tests {
         g.add_input(w);
         g.add_input(bias);
         let m = val(&mut g, "m");
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let s = val(&mut g, "s");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![s]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![s],
+        ));
         let out = val(&mut g, "out");
         g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(s)], vec![out]));
         g.add_output(out);
@@ -1611,7 +1620,8 @@ mod tests {
 
         let reduce_mean = |g: &mut Graph, input: ValueId, out: ValueId| {
             let mut n = Node::new(NodeId(0), "ReduceMean", vec![Some(input)], vec![out]);
-            n.attributes.insert("axes".into(), Attribute::Ints(vec![-1]));
+            n.attributes
+                .insert("axes".into(), Attribute::Ints(vec![-1]));
             n.attributes.insert("keepdims".into(), Attribute::Int(1));
             g.insert_node(n);
         };
@@ -1619,17 +1629,37 @@ mod tests {
         let mean = val(&mut g, "mean");
         reduce_mean(&mut g, x, mean);
         let diff = val(&mut g, "diff");
-        g.insert_node(Node::new(NodeId(0), "Sub", vec![Some(x), Some(mean)], vec![diff]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Sub",
+            vec![Some(x), Some(mean)],
+            vec![diff],
+        ));
         let sq = val(&mut g, "sq");
-        g.insert_node(Node::new(NodeId(0), "Pow", vec![Some(diff), Some(two)], vec![sq]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Pow",
+            vec![Some(diff), Some(two)],
+            vec![sq],
+        ));
         let var = val(&mut g, "var");
         reduce_mean(&mut g, sq, var);
         let vare = val(&mut g, "vare");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(var), Some(eps)], vec![vare]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(var), Some(eps)],
+            vec![vare],
+        ));
         let std = val(&mut g, "std");
         g.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(vare)], vec![std]));
         let norm = val(&mut g, "norm");
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(diff), Some(std)], vec![norm]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(diff), Some(std)],
+            vec![norm],
+        ));
         let scaled = val(&mut g, "scaled");
         g.insert_node(Node::new(
             NodeId(0),
@@ -1696,11 +1726,27 @@ mod tests {
     #[test]
     fn layernorm_count_bookkeeping() {
         let mut g = layernorm_graph();
-        let ln_before = g.nodes.values().filter(|n| n.op_type == "LayerNormalization").count();
-        let rm_before = g.nodes.values().filter(|n| n.op_type == "ReduceMean").count();
+        let ln_before = g
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "LayerNormalization")
+            .count();
+        let rm_before = g
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "ReduceMean")
+            .count();
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
-        let ln_after = g.nodes.values().filter(|n| n.op_type == "LayerNormalization").count();
-        let rm_after = g.nodes.values().filter(|n| n.op_type == "ReduceMean").count();
+        let ln_after = g
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "LayerNormalization")
+            .count();
+        let rm_after = g
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "ReduceMean")
+            .count();
         assert_eq!(ln_before, 0);
         assert_eq!(ln_after, 1);
         assert_eq!(rm_before, 2);
@@ -1738,7 +1784,8 @@ mod tests {
 
         let reduce_mean = |g: &mut Graph, input: ValueId, out: ValueId| {
             let mut n = Node::new(NodeId(0), "ReduceMean", vec![Some(input)], vec![out]);
-            n.attributes.insert("axes".into(), Attribute::Ints(vec![-1]));
+            n.attributes
+                .insert("axes".into(), Attribute::Ints(vec![-1]));
             n.attributes.insert("keepdims".into(), Attribute::Int(1));
             g.insert_node(n);
         };
@@ -1773,7 +1820,12 @@ mod tests {
         let var = val(&mut g, "var");
         reduce_mean(&mut g, sq, var);
         let vare = val(&mut g, "vare");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(var), Some(eps)], vec![vare]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(var), Some(eps)],
+            vec![vare],
+        ));
         let std = val(&mut g, "std");
         g.insert_node(Node::new(NodeId(0), "Sqrt", vec![Some(vare)], vec![std]));
         let norm = val(&mut g, "norm");
@@ -1906,9 +1958,19 @@ mod tests {
             g.add_input(w);
             g.add_input(bias);
             let m = val(&mut g, &format!("m{i}"));
-            g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+            g.insert_node(Node::new(
+                NodeId(0),
+                "MatMul",
+                vec![Some(a), Some(w)],
+                vec![m],
+            ));
             let out = val(&mut g, &format!("out{i}"));
-            g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Add",
+                vec![Some(m), Some(bias)],
+                vec![out],
+            ));
             g.add_output(out);
         }
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
@@ -1969,7 +2031,10 @@ mod tests {
             "no fused LayerNormalization must be emitted"
         );
         assert_eq!(
-            g.nodes.values().filter(|n| n.op_type == "ReduceMean").count(),
+            g.nodes
+                .values()
+                .filter(|n| n.op_type == "ReduceMean")
+                .count(),
             2,
             "both ReduceMean ops remain"
         );
@@ -2019,9 +2084,19 @@ mod tests {
         g.add_input(w);
         g.add_input(bias);
         let m = g.create_named_value("m", DataType::Float32, static_shape([4]));
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let out = g.create_named_value("out", DataType::Float32, static_shape([2, 4]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![out],
+        ));
         g.add_output(out);
 
         assert_eq!(g.num_nodes(), 2);
@@ -2046,17 +2121,24 @@ mod tests {
         g.add_input(w);
         g.add_input(bias);
         let m = g.create_named_value("m", DataType::Float32, static_shape([3, 4]));
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let out = g.create_named_value("out", DataType::Float32, static_shape([3, 4]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![out],
+        ));
         g.add_output(out);
 
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
         assert_eq!(g.num_nodes(), 1, "trailing-broadcast bias must fuse");
-        assert_eq!(
-            g.nodes.values().next().unwrap().op_type,
-            "FusedMatMulBias"
-        );
+        assert_eq!(g.nodes.values().next().unwrap().op_type, "FusedMatMulBias");
         assert!(g.validate().is_ok());
     }
 
@@ -2074,9 +2156,19 @@ mod tests {
         g.add_input(bias);
         // `m` has an unknown (empty) shape.
         let m = g.create_named_value("m", DataType::Float32, Vec::new());
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let out = g.create_named_value("out", DataType::Float32, static_shape([4]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![out],
+        ));
         g.add_output(out);
 
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
@@ -2101,16 +2193,30 @@ mod tests {
         g.add_input(w);
         g.add_input(bias);
         let m = g.create_named_value("m", DataType::Float32, static_shape([4]));
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(a), Some(w)], vec![m]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(a), Some(w)],
+            vec![m],
+        ));
         let biased = g.create_named_value("biased", DataType::Float32, static_shape([2, 4]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(m), Some(bias)], vec![biased]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(m), Some(bias)],
+            vec![biased],
+        ));
         let out = g.create_named_value("out", DataType::Float32, static_shape([2, 4]));
         g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(biased)], vec![out]));
         g.add_output(out);
 
         assert_eq!(g.num_nodes(), 3);
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
-        assert_eq!(g.num_nodes(), 3, "expanding bias must NOT fuse to FusedGemm");
+        assert_eq!(
+            g.num_nodes(),
+            3,
+            "expanding bias must NOT fuse to FusedGemm"
+        );
         assert!(g.nodes.values().any(|n| n.op_type == "MatMul"));
         assert!(g.nodes.values().any(|n| n.op_type == "Add"));
         assert!(g.nodes.values().any(|n| n.op_type == "Relu"));
@@ -2163,9 +2269,19 @@ mod tests {
         let c = scalar_init(&mut g, "scale_c", 2.0);
 
         let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(q), Some(kt)],
+            vec![scores],
+        ));
         let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(scores), Some(c)],
+            vec![scaled],
+        ));
 
         let sm_in = if masked {
             let mask = fval(&mut g, "mask", &[1, 1, 3, 3]);
@@ -2187,7 +2303,12 @@ mod tests {
         sm.attributes.insert("axis".into(), Attribute::Int(axis));
         g.insert_node(sm);
         let out = fval(&mut g, "out", &[1, 2, 3, 4]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(probs), Some(v)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(probs), Some(v)],
+            vec![out],
+        ));
         g.add_output(out);
         g
     }
@@ -2206,7 +2327,10 @@ mod tests {
 
         // Exactly one FusedAttention; no surviving Softmax/MatMul/Div.
         assert_eq!(
-            g.nodes.values().filter(|n| n.op_type == "FusedAttention").count(),
+            g.nodes
+                .values()
+                .filter(|n| n.op_type == "FusedAttention")
+                .count(),
             1
         );
         assert!(g.nodes.values().all(|n| n.op_type != "Softmax"));
@@ -2234,7 +2358,10 @@ mod tests {
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
 
         assert_eq!(
-            g.nodes.values().filter(|n| n.op_type == "FusedAttention").count(),
+            g.nodes
+                .values()
+                .filter(|n| n.op_type == "FusedAttention")
+                .count(),
             1
         );
         assert!(g.nodes.values().all(|n| n.op_type != "Softmax"));
@@ -2264,24 +2391,47 @@ mod tests {
 
         let kt = fval(&mut g, "Kt", &[1, 2, 4, 3]);
         let mut tr = Node::new(NodeId(0), "Transpose", vec![Some(k)], vec![kt]);
-        tr.attributes.insert("perm".into(), Attribute::Ints(vec![0, 1, 3, 2]));
+        tr.attributes
+            .insert("perm".into(), Attribute::Ints(vec![0, 1, 3, 2]));
         g.insert_node(tr);
         let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(q), Some(kt)],
+            vec![scores],
+        ));
         let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(scores), Some(c)],
+            vec![scaled],
+        ));
         let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
         let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(scaled)], vec![probs]);
         sm.attributes.insert("axis".into(), Attribute::Int(-1));
         g.insert_node(sm);
         let out = fval(&mut g, "out", &[1, 2, 3, 4]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(probs), Some(v)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(probs), Some(v)],
+            vec![out],
+        ));
         g.add_output(out);
 
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
-        assert!(g.nodes.values().all(|n| n.op_type != "Transpose"), "clean Kᵀ Transpose absorbed");
+        assert!(
+            g.nodes.values().all(|n| n.op_type != "Transpose"),
+            "clean Kᵀ Transpose absorbed"
+        );
         let fa = fused_attention_node(&g).unwrap();
-        assert_eq!(fa.inputs, vec![Some(q), Some(k), Some(v)], "K input is the natural (un-transposed) K");
+        assert_eq!(
+            fa.inputs,
+            vec![Some(q), Some(k), Some(v)],
+            "K input is the natural (un-transposed) K"
+        );
         assert_eq!(fa.attr("k_transposed").and_then(Attribute::as_int), Some(0));
         // scale = 1/4 = 0.25.
         assert_eq!(fa.attr("scale").and_then(Attribute::as_float), Some(0.25));
@@ -2314,15 +2464,30 @@ mod tests {
         g.add_input(v);
         g.add_input(c);
         let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(q), Some(kt)],
+            vec![scores],
+        ));
         let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(scores), Some(c)],
+            vec![scaled],
+        ));
         let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
         let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(scaled)], vec![probs]);
         sm.attributes.insert("axis".into(), Attribute::Int(3));
         g.insert_node(sm);
         let out = fval(&mut g, "out", &[1, 2, 3, 4]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(probs), Some(v)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(probs), Some(v)],
+            vec![out],
+        ));
         g.add_output(out);
 
         let before = g.num_nodes();
@@ -2345,16 +2510,31 @@ mod tests {
         g.add_input(v);
         let c = scalar_init(&mut g, "scale_c", 2.0);
         let scores = fval(&mut g, "scores", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(q), Some(kt)], vec![scores]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(q), Some(kt)],
+            vec![scores],
+        ));
         let scaled = fval(&mut g, "scaled", &[1, 2, 3, 3]);
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(scores), Some(c)], vec![scaled]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(scores), Some(c)],
+            vec![scaled],
+        ));
         let probs = fval(&mut g, "probs", &[1, 2, 3, 3]);
         let mut sm = Node::new(NodeId(0), "Softmax", vec![Some(scaled)], vec![probs]);
         sm.attributes.insert("axis".into(), Attribute::Int(3));
         g.insert_node(sm);
         let out = fval(&mut g, "out", &[1, 2, 3, 3]);
         // Reversed operand order: V · probs.
-        g.insert_node(Node::new(NodeId(0), "MatMul", vec![Some(v), Some(probs)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(v), Some(probs)],
+            vec![out],
+        ));
         g.add_output(out);
 
         let before = g.num_nodes();
@@ -2378,29 +2558,59 @@ mod tests {
         let half = val(&mut g, "half");
         if half_mul {
             let c = scalar_init(&mut g, "c_half", 0.5);
-            g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(c)], vec![half]));
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Mul",
+                vec![Some(x), Some(c)],
+                vec![half],
+            ));
         } else {
             let c = scalar_init(&mut g, "c_two", 2.0);
-            g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(c)], vec![half]));
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Div",
+                vec![Some(x), Some(c)],
+                vec![half],
+            ));
         }
 
         // scaled = x / √2  (via Div(x, √2) or Mul(x, 1/√2)).
         let scaled = val(&mut g, "scaled");
         if inner_div_sqrt2 {
             let c = scalar_init(&mut g, "c_sqrt2", std::f32::consts::SQRT_2);
-            g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(c)], vec![scaled]));
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Div",
+                vec![Some(x), Some(c)],
+                vec![scaled],
+            ));
         } else {
             let c = scalar_init(&mut g, "c_isqrt2", std::f32::consts::FRAC_1_SQRT_2);
-            g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(c)], vec![scaled]));
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Mul",
+                vec![Some(x), Some(c)],
+                vec![scaled],
+            ));
         }
 
         let e = val(&mut g, "e");
         g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(scaled)], vec![e]));
         let one = scalar_init(&mut g, "c_one", 1.0);
         let a = val(&mut g, "a");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(e), Some(one)], vec![a]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(e), Some(one)],
+            vec![a],
+        ));
         let out = val(&mut g, "out");
-        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(half), Some(a)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(half), Some(a)],
+            vec![out],
+        ));
         g.add_output(out);
         g
     }
@@ -2417,7 +2627,12 @@ mod tests {
         assert_eq!(fused.inputs.len(), 1, "Gelu takes the single input x");
         assert!(fused.attributes.is_empty(), "exact Gelu has no attributes");
         // Single input is the graph input `x`.
-        let x = g.values.iter().find(|(_, v)| v.name.as_deref() == Some("x")).map(|(id, _)| id).unwrap();
+        let x = g
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("x"))
+            .map(|(id, _)| id)
+            .unwrap();
         assert_eq!(fused.inputs[0], Some(x));
         assert_eq!(fused.outputs, g.outputs);
         assert!(g.nodes.values().all(|n| n.op_type != "Erf"));
@@ -2446,17 +2661,37 @@ mod tests {
         g.add_input(x);
         let half = val(&mut g, "half");
         let ch = scalar_init(&mut g, "c_half", 0.5);
-        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(x), Some(ch)], vec![half]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(ch)],
+            vec![half],
+        ));
         let scaled = val(&mut g, "scaled");
         let cbad = scalar_init(&mut g, "c_bad", 2.0);
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(cbad)], vec![scaled]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(x), Some(cbad)],
+            vec![scaled],
+        ));
         let e = val(&mut g, "e");
         g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(scaled)], vec![e]));
         let one = scalar_init(&mut g, "c_one", 1.0);
         let a = val(&mut g, "a");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(e), Some(one)], vec![a]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(e), Some(one)],
+            vec![a],
+        ));
         let out = val(&mut g, "out");
-        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(half), Some(a)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(half), Some(a)],
+            vec![out],
+        ));
         g.add_output(out);
 
         let before = g.num_nodes();
@@ -2471,10 +2706,19 @@ mod tests {
         // Mul(x, 0.4) instead of 0.5 → decline.
         let mut g = gelu_graph(true, true);
         // Rewrite the half Mul's constant initializer to 0.4.
-        let ch = g.values.iter().find(|(_, v)| v.name.as_deref() == Some("c_half")).map(|(id, _)| id).unwrap();
+        let ch = g
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("c_half"))
+            .map(|(id, _)| id)
+            .unwrap();
         g.set_initializer(
             ch,
-            WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![], 0.4f32.to_le_bytes().to_vec())),
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![],
+                0.4f32.to_le_bytes().to_vec(),
+            )),
         );
         let before = g.num_nodes();
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
@@ -2495,17 +2739,37 @@ mod tests {
         let half = val(&mut g, "half");
         let ch = scalar_init(&mut g, "c_half", 0.5);
         // half = 0.5 * y   (NOT x)
-        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(y), Some(ch)], vec![half]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(y), Some(ch)],
+            vec![half],
+        ));
         let scaled = val(&mut g, "scaled");
         let cs = scalar_init(&mut g, "c_sqrt2", std::f32::consts::SQRT_2);
-        g.insert_node(Node::new(NodeId(0), "Div", vec![Some(x), Some(cs)], vec![scaled]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Div",
+            vec![Some(x), Some(cs)],
+            vec![scaled],
+        ));
         let e = val(&mut g, "e");
         g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(scaled)], vec![e]));
         let one = scalar_init(&mut g, "c_one", 1.0);
         let a = val(&mut g, "a");
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(e), Some(one)], vec![a]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(e), Some(one)],
+            vec![a],
+        ));
         let out = val(&mut g, "out");
-        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(half), Some(a)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(half), Some(a)],
+            vec![out],
+        ));
         g.add_output(out);
 
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
@@ -2518,7 +2782,12 @@ mod tests {
         // The Erf output feeds an extra external consumer, so fusing would
         // delete an observed value → decline.
         let mut g = gelu_graph(true, true);
-        let e = g.values.iter().find(|(_, v)| v.name.as_deref() == Some("e")).map(|(id, _)| id).unwrap();
+        let e = g
+            .values
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("e"))
+            .map(|(id, _)| id)
+            .unwrap();
         let side = val(&mut g, "side");
         g.insert_node(Node::new(NodeId(0), "Erf", vec![Some(e)], vec![side]));
         g.add_output(side);
@@ -3156,7 +3425,11 @@ mod tests {
             assert!(case.lower_start.0 < case.later_start.0);
             assert!(case.first_middle.0 < case.later_start.0);
             assert!(case.first_tail.0 < case.later_start.0);
-            assert!(pattern.try_match_at(&case.graph, case.lower_start).is_none());
+            assert!(
+                pattern
+                    .try_match_at(&case.graph, case.lower_start)
+                    .is_none()
+            );
             let first_match = pattern
                 .try_match_at(&case.graph, case.later_start)
                 .expect("later start must be the first eligible match");
@@ -3262,7 +3535,10 @@ mod tests {
             saw_gemm_overlap |= has_relu;
             saw_bias_overlap |= !has_relu;
         }
-        assert!(saw_gemm_overlap, "missing shared MatMul+Add+Relu candidates");
+        assert!(
+            saw_gemm_overlap,
+            "missing shared MatMul+Add+Relu candidates"
+        );
         assert!(saw_bias_overlap, "missing shared MatMul+Add candidates");
     }
 

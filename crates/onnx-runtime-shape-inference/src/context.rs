@@ -349,9 +349,7 @@ impl<'a> InferenceContext<'a> {
             // (not a bare symbol) has no id to compare, so it stays a fresh
             // opaque symbol — the honest "unknown".
             (None, None) => match (a.as_symbol(), b.as_symbol()) {
-                (Some(sa), Some(sb)) => {
-                    Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() })
-                }
+                (Some(sa), Some(sb)) => Ok(if sa.0 <= sb.0 { a.clone() } else { b.clone() }),
                 _ => Ok(self.fresh_dim()),
             },
         }

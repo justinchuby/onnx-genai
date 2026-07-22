@@ -62,11 +62,20 @@ pub struct SparseTensorData {
 /// container of tensors (see `docs/ORT2.md` §3.2).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeProto {
-    Tensor { dtype: DataType, shape: Shape },
+    Tensor {
+        dtype: DataType,
+        shape: Shape,
+    },
     Sequence(Box<TypeProto>),
     Optional(Box<TypeProto>),
-    Map { key: DataType, value: Box<TypeProto> },
-    SparseTensor { dtype: DataType, shape: Shape },
+    Map {
+        key: DataType,
+        value: Box<TypeProto>,
+    },
+    SparseTensor {
+        dtype: DataType,
+        shape: Shape,
+    },
 }
 
 /// A reference to initializer (weight) data.

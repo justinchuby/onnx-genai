@@ -313,7 +313,8 @@ impl InferenceSession {
         // path (covering str and os.PathLike via Python's str()).
         let session = if let Ok(pybytes) = path_or_bytes.cast::<PyBytes>() {
             let bytes = pybytes.as_bytes();
-            RtSession::load_bytes(bytes).map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
+            RtSession::load_bytes(bytes)
+                .map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
         } else {
             let path: String = path_or_bytes
                 .str()
@@ -607,8 +608,7 @@ impl InferenceSession {
                 if let Some(kw) = kwargs {
                     for (key, val) in kw.iter() {
                         if feed.contains(&key)? {
-                            let name: String =
-                                key.extract().unwrap_or_else(|_| format!("{key:?}"));
+                            let name: String = key.extract().unwrap_or_else(|_| format!("{key:?}"));
                             return Err(PyValueError::new_err(format!(
                                 "input {name:?} was supplied both in the feed \
                                  mapping and as a keyword argument; provide it \
@@ -725,8 +725,7 @@ impl InferenceSession {
             }
         }
 
-        let feed: Vec<(&str, &Tensor)> =
-            owned.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        let feed: Vec<(&str, &Tensor)> = owned.iter().map(|(n, t)| (n.as_str(), t)).collect();
 
         let results = {
             let mut guard = self
@@ -810,7 +809,11 @@ impl Outputs {
     }
 
     /// Index by position (`out[0]`, negatives allowed) or by name (`out["y"]`).
-    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<dlpack::NxrtValue>> {
+    fn __getitem__(
+        &self,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<dlpack::NxrtValue>> {
         if let Ok(idx) = key.extract::<isize>() {
             let n = self.values.len() as isize;
             let i = if idx < 0 { idx + n } else { idx };
@@ -1081,7 +1084,8 @@ pub(crate) fn numpy_dtype_object(py: Python<'_>, dtype: DataType) -> PyResult<Py
     Ok(np.getattr("dtype")?.call1((arg,))?.unbind())
 }
 
-fn node_args(py: Python<'_>, metas: &[IoMeta]) -> PyResult<Py<PyList>> {    let list = PyList::empty(py);
+fn node_args(py: Python<'_>, metas: &[IoMeta]) -> PyResult<Py<PyList>> {
+    let list = PyList::empty(py);
     for meta in metas {
         list.append(Py::new(py, NodeArg::from_meta(meta))?)?;
     }
@@ -1098,12 +1102,14 @@ fn numpy_array_parts(
 ) -> PyResult<(DataType, Vec<usize>, Vec<u8>)> {
     // Force a C-contiguous array so `tobytes()` yields row-major little-endian
     // storage regardless of the caller's array flags (copies only if needed).
-    let arr = np.call_method1("ascontiguousarray", (value,)).map_err(|_| {
-        PyTypeError::new_err(format!(
-            "input {input_name:?}: expected a numpy.ndarray, got a value numpy \
+    let arr = np
+        .call_method1("ascontiguousarray", (value,))
+        .map_err(|_| {
+            PyTypeError::new_err(format!(
+                "input {input_name:?}: expected a numpy.ndarray, got a value numpy \
              could not interpret as an array"
-        ))
-    })?;
+            ))
+        })?;
 
     let dtype_name: String = arr
         .getattr("dtype")?
@@ -1219,9 +1225,7 @@ pub(crate) fn raw_tensor_to_numpy(
 /// Map a session load error to the most specific Python exception, preserving
 /// the runtime's rich causal message (`RULES.md` §1).
 fn load_error(source: &str, err: onnx_runtime_session::SessionError) -> PyErr {
-    PyValueError::new_err(format!(
-        "failed to load ONNX model from {source}: {err}"
-    ))
+    PyValueError::new_err(format!("failed to load ONNX model from {source}: {err}"))
 }
 
 /// Map a `run` error to the most specific Python exception type, keeping the
@@ -1247,7 +1251,10 @@ fn run_error(err: onnx_runtime_session::SessionError) -> PyErr {
 /// `onnxruntime.get_available_providers()`.
 #[pyfunction]
 fn get_available_providers() -> Vec<String> {
-    available_providers().iter().map(|s| s.to_string()).collect()
+    available_providers()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Test-only: import `obj` via the zero-copy DLPack consumer path and return the
@@ -1287,7 +1294,9 @@ fn _dlpack_import_drop_on_thread(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyRe
     // a fresh OS thread. The import guard's `Drop` must reacquire the GIL via
     // `Python::attach` to run the foreign deleter — that is what we prove.
     py.detach(move || {
-        std::thread::spawn(move || drop(tensor)).join().expect("drop thread panicked");
+        std::thread::spawn(move || drop(tensor))
+            .join()
+            .expect("drop thread panicked");
     });
     Ok(true)
 }
@@ -1461,6 +1470,9 @@ mod honest_boundary_tests {
         let msg = non_host_read_error("probs", DeviceId::cuda(1))
             .expect("host-reading a CUDA output must be refused");
         assert!(msg.contains("probs"), "names the offending output");
-        assert!(msg.contains("__dlpack__"), "points at the zero-copy export path");
+        assert!(
+            msg.contains("__dlpack__"),
+            "points at the zero-copy export path"
+        );
     }
 }

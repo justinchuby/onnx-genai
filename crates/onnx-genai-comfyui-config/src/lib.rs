@@ -56,8 +56,7 @@ const LATENT_NODES: &[&str] = &["EmptyLatentImage", "EmptySD3LatentImage"];
 
 /// ComfyUI sigma spacings onnx-genai reproduces. `normal`/`simple`/`ddim_uniform`
 /// map to linspace; `karras`/`exponential` enable their schedules.
-const SUPPORTED_SPACINGS: &[&str] =
-    &["normal", "simple", "ddim_uniform", "karras", "exponential"];
+const SUPPORTED_SPACINGS: &[&str] = &["normal", "simple", "ddim_uniform", "karras", "exponential"];
 
 /// Errors produced while parsing a ComfyUI workflow.
 #[derive(Debug, thiserror::Error)]
@@ -347,7 +346,9 @@ fn find_controlnet(nodes: &Map<String, Value>) -> Option<(String, f64)> {
         if node_class(node)
             .is_some_and(|c| matches!(c, "ControlNetApply" | "ControlNetApplyAdvanced"))
         {
-            let strength = input(node, "strength").and_then(Value::as_f64).unwrap_or(1.0);
+            let strength = input(node, "strength")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
             let loader = resolve(nodes, input(node, "control_net"));
             if let Some(loader) = loader
                 && node_class(loader)
@@ -423,10 +424,7 @@ fn build_pipeline_metadata(
     strategy.insert("denoiser".into(), json!("denoiser"));
     strategy.insert("num_steps".into(), json!(num_steps));
     strategy.insert("timestep_input".into(), json!(DENOISER_TIMESTEP_INPUT));
-    strategy.insert(
-        "scheduler_config".into(),
-        scheduler.to_metadata_value(),
-    );
+    strategy.insert("scheduler_config".into(), scheduler.to_metadata_value());
     if let Some(scale) = guidance_scale {
         strategy.insert("guidance_scale".into(), json!(scale));
         if scale != 1.0 {
@@ -531,7 +529,11 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
         steps,
         &scheduler,
         guidance,
-        if start_step > 0 { Some(start_step) } else { None },
+        if start_step > 0 {
+            Some(start_step)
+        } else {
+            None
+        },
         has_text_encoder,
         has_vae,
     )?;
@@ -640,7 +642,10 @@ mod tests {
         let workflow = parse_workflow(&txt2img_graph()).unwrap();
         assert_eq!(workflow.prompt.as_deref(), Some("a fox"));
         assert_eq!(workflow.negative_prompt.as_deref(), Some("blurry"));
-        assert_eq!((workflow.width, workflow.height, workflow.batch_size), (768, 512, 2));
+        assert_eq!(
+            (workflow.width, workflow.height, workflow.batch_size),
+            (768, 512, 2)
+        );
         assert_eq!(workflow.seed, 42);
         assert_eq!(workflow.steps, 20);
         assert_eq!(workflow.cfg, 7.5);
@@ -741,7 +746,10 @@ mod tests {
             "inputs": {"control_net_name": "canny.safetensors"}
         });
         let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!(workflow.controlnet, Some(("canny.safetensors".to_owned(), 0.9)));
+        assert_eq!(
+            workflow.controlnet,
+            Some(("canny.safetensors".to_owned(), 0.9))
+        );
     }
 
     #[test]
@@ -773,7 +781,10 @@ mod tests {
         // Point latent_image at a non-latent node.
         graph["3"]["inputs"]["latent_image"] = json!(["4", 0]);
         let workflow = parse_workflow(&graph).unwrap();
-        assert_eq!((workflow.width, workflow.height, workflow.batch_size), (512, 512, 1));
+        assert_eq!(
+            (workflow.width, workflow.height, workflow.batch_size),
+            (512, 512, 1)
+        );
     }
 
     #[test]

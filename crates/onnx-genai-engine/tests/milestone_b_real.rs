@@ -93,7 +93,10 @@ fn shared_kv_speculative_matches_greedy_and_reports_speedup() -> anyhow::Result<
     println!("  multi_token_accepts:{}", stats.multi_token_accepts);
     println!("  acceptance_rate:    {:.1}%", acceptance * 100.0);
     println!("  speedup:            {:.2}x", spec_tps / greedy_tps);
-    println!("  token_identical:    {}", greedy.token_ids == spec.token_ids);
+    println!(
+        "  token_identical:    {}",
+        greedy.token_ids == spec.token_ids
+    );
     println!("====================================================\n");
 
     assert!(

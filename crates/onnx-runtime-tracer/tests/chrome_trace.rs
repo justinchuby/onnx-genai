@@ -9,8 +9,8 @@
 //! durations.
 
 use onnx_runtime_tracer::{
-    Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase, annotate_current_span,
-    annotate_current_span_with, tracing_active,
+    Args, MemoryCollector, TraceContext, TraceEvent, TraceFormat, TracePhase,
+    annotate_current_span, annotate_current_span_with, tracing_active,
 };
 use serde_json::Value;
 use std::cell::Cell;
@@ -35,7 +35,10 @@ fn parse_and_validate(json: &str) -> Vec<Value> {
             );
         }
         let ph = obj["ph"].as_str().expect("ph is a string");
-        assert!(TracePhase::from_code(ph).is_some(), "unknown phase code {ph:?}");
+        assert!(
+            TracePhase::from_code(ph).is_some(),
+            "unknown phase code {ph:?}"
+        );
     }
     array
 }
@@ -213,7 +216,13 @@ fn disabled_context_emits_nothing() {
 fn noop_context_records_nothing() {
     let ctx = TraceContext::noop();
     assert!(!ctx.is_enabled());
-    ctx.complete("x", "compute", Instant::now(), Duration::from_micros(1), None);
+    ctx.complete(
+        "x",
+        "compute",
+        Instant::now(),
+        Duration::from_micros(1),
+        None,
+    );
     {
         let _s = ctx.span("y", "compute");
     }
@@ -307,11 +316,23 @@ fn empty_collector_exports_valid_empty_array() {
 #[test]
 fn clear_drops_events_but_keeps_context_usable() {
     let (ctx, mem) = TraceContext::in_memory();
-    ctx.complete("a", "compute", Instant::now(), Duration::from_micros(1), None);
+    ctx.complete(
+        "a",
+        "compute",
+        Instant::now(),
+        Duration::from_micros(1),
+        None,
+    );
     assert_eq!(mem.len(), 1);
     mem.clear();
     assert!(mem.is_empty());
-    ctx.complete("b", "compute", Instant::now(), Duration::from_micros(1), None);
+    ctx.complete(
+        "b",
+        "compute",
+        Instant::now(),
+        Duration::from_micros(1),
+        None,
+    );
     assert_eq!(mem.len(), 1);
     assert_eq!(mem.events()[0].name, "b");
 }

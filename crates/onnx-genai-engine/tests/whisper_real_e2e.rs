@@ -18,7 +18,7 @@
 use onnx_genai_engine::pipeline::PipelineGenerateRequest;
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::Value;
-use onnx_genai_preprocess::audio::{decode_wav_pcm16, LogMelExtractor, WHISPER_SAMPLE_RATE};
+use onnx_genai_preprocess::audio::{LogMelExtractor, WHISPER_SAMPLE_RATE, decode_wav_pcm16};
 
 // Whisper multilingual forced decoder prompt: <|startoftranscript|> <|en|>
 // <|transcribe|> <|notimestamps|>.

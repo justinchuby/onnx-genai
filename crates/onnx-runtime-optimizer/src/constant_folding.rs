@@ -95,9 +95,7 @@ impl OptimizationPass for ConstantFolding {
                 // are graph outputs); dead outputs are DCE's job and folding
                 // them would leave a stale initializer referencing a GC'd id.
                 let needed = graph.outputs.contains(&out)
-                    || graph
-                        .try_value(out)
-                        .is_some_and(|_| graph.has_uses(out));
+                    || graph.try_value(out).is_some_and(|_| graph.has_uses(out));
                 if !needed {
                     continue;
                 }
@@ -195,7 +193,11 @@ fn eval_constant(node: &onnx_runtime_ir::Node) -> Option<TensorData> {
         for &i in ints {
             data.extend_from_slice(&i.to_le_bytes());
         }
-        return Some(TensorData::from_raw(DataType::Int64, vec![ints.len()], data));
+        return Some(TensorData::from_raw(
+            DataType::Int64,
+            vec![ints.len()],
+            data,
+        ));
     }
     if let Some(i) = node.attr("value_int").and_then(Attribute::as_int) {
         return Some(TensorData::from_raw(
@@ -225,7 +227,11 @@ fn fold_shape(graph: &Graph, node: &onnx_runtime_ir::Node) -> Option<TensorData>
     for &d in &dims {
         data.extend_from_slice(&(d as i64).to_le_bytes());
     }
-    Some(TensorData::from_raw(DataType::Int64, vec![dims.len()], data))
+    Some(TensorData::from_raw(
+        DataType::Int64,
+        vec![dims.len()],
+        data,
+    ))
 }
 
 /// Fold elementwise integer `Add`/`Sub`/`Mul` on two same-shape constant
@@ -345,9 +351,7 @@ mod tests {
                 };
                 let Some(tensor) = folded else { continue };
                 let needed = graph.outputs.contains(&out)
-                    || graph
-                        .try_value(out)
-                        .is_some_and(|_| graph.has_uses(out));
+                    || graph.try_value(out).is_some_and(|_| graph.has_uses(out));
                 if !needed {
                     continue;
                 }
@@ -538,7 +542,12 @@ mod tests {
         let a = const_init(&mut g, "a", vec![3], &[1, 2, 3]);
         let b = const_init(&mut g, "b", vec![3], &[10, 20, 30]);
         let out = g.create_named_value("out", DataType::Int64, static_shape([3]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![out],
+        ));
         g.add_output(out);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
@@ -575,7 +584,12 @@ mod tests {
         let b = g.create_named_value("b", DataType::Int64, static_shape([3]));
         g.add_input(b);
         let out = g.create_named_value("out", DataType::Int64, static_shape([3]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![out],
+        ));
         g.add_output(out);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
@@ -591,7 +605,12 @@ mod tests {
         let a = const_init(&mut g, "a", vec![3], &[1, 2, 3]);
         let b = const_init(&mut g, "b", vec![2], &[10, 20]);
         let out = g.create_named_value("out", DataType::Int64, static_shape([3]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![out],
+        ));
         g.add_output(out);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
@@ -605,7 +624,12 @@ mod tests {
         let a = const_init(&mut g, "a", vec![1], &[i64::MAX]);
         let b = const_init(&mut g, "b", vec![1], &[1]);
         let out = g.create_named_value("out", DataType::Int64, static_shape([1]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![out],
+        ));
         g.add_output(out);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
@@ -618,12 +642,19 @@ mod tests {
         g.opset_imports.insert(String::new(), 17);
         let out = g.create_named_value("c", DataType::Int64, static_shape([2]));
         let mut node = Node::new(NodeId(0), "Constant", vec![], vec![out]);
-        node.attributes
-            .insert("value".into(), Attribute::Tensor(int64_tensor(vec![2], &[7, 8])));
+        node.attributes.insert(
+            "value".into(),
+            Attribute::Tensor(int64_tensor(vec![2], &[7, 8])),
+        );
         g.insert_node(node);
         // Keep `out` alive with a consumer.
         let sink = g.create_named_value("sink", DataType::Int64, static_shape([2]));
-        g.insert_node(Node::new(NodeId(0), "Identity", vec![Some(out)], vec![sink]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(out)],
+            vec![sink],
+        ));
         g.add_output(sink);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
@@ -657,18 +688,27 @@ mod tests {
 
         let c1 = g.create_named_value("c1", DataType::Int64, static_shape([2]));
         let mut n1 = Node::new(NodeId(0), "Constant", vec![], vec![c1]);
-        n1.attributes
-            .insert("value".into(), Attribute::Tensor(int64_tensor(vec![2], &[1, 2])));
+        n1.attributes.insert(
+            "value".into(),
+            Attribute::Tensor(int64_tensor(vec![2], &[1, 2])),
+        );
         g.insert_node(n1);
 
         let c2 = g.create_named_value("c2", DataType::Int64, static_shape([2]));
         let mut n2 = Node::new(NodeId(0), "Constant", vec![], vec![c2]);
-        n2.attributes
-            .insert("value".into(), Attribute::Tensor(int64_tensor(vec![2], &[3, 4])));
+        n2.attributes.insert(
+            "value".into(),
+            Attribute::Tensor(int64_tensor(vec![2], &[3, 4])),
+        );
         g.insert_node(n2);
 
         let out = g.create_named_value("out", DataType::Int64, static_shape([2]));
-        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(c1), Some(c2)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(c1), Some(c2)],
+            vec![out],
+        ));
         g.add_output(out);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();
@@ -765,7 +805,12 @@ mod tests {
         let a = mk(&mut g, "a");
         let b = mk(&mut g, "b");
         let out = g.create_named_value("out", DataType::Float32, static_shape([2]));
-        g.insert_node(Node::new(NodeId(0), "Mul", vec![Some(a), Some(b)], vec![out]));
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(a), Some(b)],
+            vec![out],
+        ));
         g.add_output(out);
 
         ConstantFolding.run(&mut g, &PassContext::new()).unwrap();

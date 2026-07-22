@@ -63,8 +63,9 @@ impl ModelsConfig {
     /// Load and validate a config file.  The format is detected by file extension:
     /// `.toml` → TOML, `.json` → JSON.  Any other extension is an error.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", path.display(), e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!("failed to read config file '{}': {}", path.display(), e)
+        })?;
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -115,11 +116,12 @@ impl ModelsConfig {
 /// Returns an error if `dir` is not readable or no model directories are found.
 pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
     let mut specs = Vec::new();
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| anyhow::anyhow!("failed to read models directory '{}': {}", dir.display(), e))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        anyhow::anyhow!("failed to read models directory '{}': {}", dir.display(), e)
+    })?;
     for entry in entries {
-        let entry =
-            entry.map_err(|e| anyhow::anyhow!("directory entry error in '{}': {}", dir.display(), e))?;
+        let entry = entry
+            .map_err(|e| anyhow::anyhow!("directory entry error in '{}': {}", dir.display(), e))?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -135,7 +137,11 @@ pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
         if id.is_empty() {
             continue;
         }
-        specs.push(ModelSpec { id, path, eager: true });
+        specs.push(ModelSpec {
+            id,
+            path,
+            eager: true,
+        });
     }
     specs.sort_by(|a, b| a.id.cmp(&b.id));
     if specs.is_empty() {

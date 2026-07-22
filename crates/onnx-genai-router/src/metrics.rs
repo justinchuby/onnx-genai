@@ -83,7 +83,9 @@ impl Metrics {
         let mut migrations: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut reprefill_tokens: u64 = 0;
         for ev in router.session_map().migrations() {
-            *migrations.entry(migration_reason_label(ev.reason)).or_insert(0) += 1;
+            *migrations
+                .entry(migration_reason_label(ev.reason))
+                .or_insert(0) += 1;
             reprefill_tokens = reprefill_tokens.saturating_add(ev.reprefill_tokens);
         }
         out.push_str(
@@ -101,8 +103,11 @@ impl Metrics {
             "# HELP onnx_genai_router_reprefill_tokens_total Tokens re-prefilled after migration.\n",
         );
         out.push_str("# TYPE onnx_genai_router_reprefill_tokens_total counter\n");
-        writeln!(out, "onnx_genai_router_reprefill_tokens_total {reprefill_tokens}")
-            .expect("write to String");
+        writeln!(
+            out,
+            "onnx_genai_router_reprefill_tokens_total {reprefill_tokens}"
+        )
+        .expect("write to String");
 
         // --- node gauges (derived from live node state) ---
         out.push_str("# HELP onnx_genai_router_node_healthy Node health (1 = healthy).\n");
@@ -140,7 +145,9 @@ impl Metrics {
         }
 
         // --- router internals ---
-        out.push_str("# HELP onnx_genai_router_session_map_size Entries in the session->node map.\n");
+        out.push_str(
+            "# HELP onnx_genai_router_session_map_size Entries in the session->node map.\n",
+        );
         out.push_str("# TYPE onnx_genai_router_session_map_size gauge\n");
         writeln!(
             out,
@@ -194,9 +201,11 @@ mod tests {
         assert!(text.contains(
             "onnx_genai_router_requests_total{node=\"gpu-0\",decision=\"least_loaded\"} 1"
         ));
-        assert!(text.contains(
-            "onnx_genai_router_requests_total{node=\"gpu-0\",decision=\"affinity\"} 1"
-        ));
+        assert!(
+            text.contains(
+                "onnx_genai_router_requests_total{node=\"gpu-0\",decision=\"affinity\"} 1"
+            )
+        );
         assert!(text.contains("onnx_genai_router_node_healthy{node=\"gpu-0\"} 1"));
         assert!(text.contains("onnx_genai_router_node_kv_usage{node=\"gpu-0\"} 0.5"));
         assert!(text.contains("onnx_genai_router_node_queue_depth{node=\"gpu-0\"} 2"));
@@ -215,9 +224,9 @@ mod tests {
         router.node_mut(&pinned).unwrap().healthy = false;
         router.route_decision(&req).unwrap();
         let text = Metrics::new().encode(&router);
-        assert!(text.contains(
-            "onnx_genai_router_session_migrations_total{reason=\"node_down\"} 1"
-        ));
+        assert!(
+            text.contains("onnx_genai_router_session_migrations_total{reason=\"node_down\"} 1")
+        );
     }
 
     #[test]

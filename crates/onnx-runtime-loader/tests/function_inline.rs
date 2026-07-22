@@ -5,9 +5,9 @@
 //! are remapped/freshened correctly, that attributes bind (call-site, default,
 //! required-missing), and that recursion is rejected rather than looped.
 
+use onnx_runtime_loader::LoaderError;
 use onnx_runtime_loader::function_inline::inline_functions;
 use onnx_runtime_loader::proto::onnx;
-use onnx_runtime_loader::LoaderError;
 
 // --- proto construction helpers --------------------------------------------
 
@@ -397,7 +397,10 @@ fn two_calls_do_not_collide_internal_names() {
     // The internal MatMul->Add wire of the two instantiations must differ.
     let wire0 = &g.node[0].output[0];
     let wire1 = &g.node[2].output[0];
-    assert_ne!(wire0, wire1, "internal names collided across instantiations");
+    assert_ne!(
+        wire0, wire1,
+        "internal names collided across instantiations"
+    );
     // Node names are unique.
     let mut names: Vec<_> = g.node.iter().map(|n| n.name.clone()).collect();
     names.sort();
@@ -422,13 +425,7 @@ fn empty_optional_input_is_passed_through() {
 
 #[test]
 fn arity_mismatch_too_many_inputs_is_rejected() {
-    let f = function(
-        "F",
-        "d",
-        &["X"],
-        &["Y"],
-        vec![node("Relu", &["X"], &["Y"])],
-    );
+    let f = function("F", "d", &["X"], &["Y"], vec![node("Relu", &["X"], &["Y"])]);
     let graph = onnx::GraphProto {
         node: vec![call("F", "d", &["a", "b"], &["y"])], // 2 > 1
         ..Default::default()
@@ -443,13 +440,7 @@ fn arity_mismatch_too_many_inputs_is_rejected() {
 #[test]
 fn function_called_inside_control_flow_subgraph_is_inlined() {
     // An If node whose then/else branches each call a function.
-    let f = function(
-        "F",
-        "d",
-        &["X"],
-        &["Y"],
-        vec![node("Relu", &["X"], &["Y"])],
-    );
+    let f = function("F", "d", &["X"], &["Y"], vec![node("Relu", &["X"], &["Y"])]);
 
     let then_branch = onnx::GraphProto {
         node: vec![call("F", "d", &["v"], &["tb_out"])],
@@ -515,13 +506,7 @@ fn overload_disambiguates_matching_names() {
         vec![node("Identity", &["X"], &["Y"])],
     );
     f_add.overload = "add".to_string();
-    let mut f_neg = function(
-        "F",
-        "d",
-        &["X"],
-        &["Y"],
-        vec![node("Neg", &["X"], &["Y"])],
-    );
+    let mut f_neg = function("F", "d", &["X"], &["Y"], vec![node("Neg", &["X"], &["Y"])]);
     f_neg.overload = "neg".to_string();
 
     let mut c = call("F", "d", &["x"], &["y"]);
@@ -538,13 +523,7 @@ fn overload_disambiguates_matching_names() {
 
 #[test]
 fn function_opset_import_is_merged_into_model() {
-    let mut f = function(
-        "F",
-        "d",
-        &["X"],
-        &["Y"],
-        vec![node("Relu", &["X"], &["Y"])],
-    );
+    let mut f = function("F", "d", &["X"], &["Y"], vec![node("Relu", &["X"], &["Y"])]);
     // Function relies on a domain the model does not declare.
     f.opset_import = vec![onnx::OperatorSetIdProto {
         domain: "com.microsoft".to_string(),
@@ -555,10 +534,11 @@ fn function_opset_import_is_merged_into_model() {
         ..Default::default()
     };
     let out = inline(model(graph, vec![f]));
-    assert!(out
-        .opset_import
-        .iter()
-        .any(|o| o.domain == "com.microsoft" && o.version == 1));
+    assert!(
+        out.opset_import
+            .iter()
+            .any(|o| o.domain == "com.microsoft" && o.version == 1)
+    );
 }
 
 // --- regression tests for the four scope/correctness bugs ------------------
@@ -619,7 +599,10 @@ fn nested_subgraph_ref_attr_is_bound() {
             lr.attribute[0].ref_attr_name.is_empty(),
             "nested ref_attr_name was not resolved"
         );
-        assert_eq!(lr.attribute[0].f, 0.2, "nested attr not bound to call value");
+        assert_eq!(
+            lr.attribute[0].f, 0.2,
+            "nested attr not bound to call value"
+        );
     }
 }
 
@@ -756,10 +739,7 @@ fn passthrough_output_aliasing_input_is_wired_via_identity() {
     // actually produce `b` (via Identity from `a`), and downstream reads `b`.
     let f = function("F", "d", &["X"], &["X"], vec![]);
     let graph = onnx::GraphProto {
-        node: vec![
-            call("F", "d", &["a"], &["b"]),
-            node("Relu", &["b"], &["c"]),
-        ],
+        node: vec![call("F", "d", &["a"], &["b"]), node("Relu", &["b"], &["c"])],
         ..Default::default()
     };
     let out = inline(model(graph, vec![f]));
@@ -852,10 +832,11 @@ fn synthesized_identity_gets_default_opset_import() {
         "synthesized default-domain Identity must gain a default-domain opset import"
     );
     // The existing custom-domain import is preserved.
-    assert!(out
-        .opset_import
-        .iter()
-        .any(|o| o.domain == "custom.domain" && o.version == 1));
+    assert!(
+        out.opset_import
+            .iter()
+            .any(|o| o.domain == "custom.domain" && o.version == 1)
+    );
 }
 
 #[test]
@@ -932,10 +913,11 @@ fn ai_onnx_spelled_default_import_plus_synthesized_identity_stays_single() {
         "model's original default spelling is preserved"
     );
     assert_eq!(defaults[0].version, 17, "default import not downgraded");
-    assert!(out
-        .opset_import
-        .iter()
-        .any(|o| o.domain == "custom.domain" && o.version == 1));
+    assert!(
+        out.opset_import
+            .iter()
+            .any(|o| o.domain == "custom.domain" && o.version == 1)
+    );
 }
 
 #[test]
@@ -944,13 +926,7 @@ fn default_domain_merge_prefers_highest_version_across_spellings() {
     // contributes the default domain spelled "" @ 20. These collapse to ONE
     // default-domain import at the highest version (20), keeping the model's
     // spelling ("ai.onnx").
-    let mut f = function(
-        "F",
-        "d",
-        &["X"],
-        &["Y"],
-        vec![node("Relu", &["X"], &["Y"])],
-    );
+    let mut f = function("F", "d", &["X"], &["Y"], vec![node("Relu", &["X"], &["Y"])]);
     f.opset_import = vec![
         onnx::OperatorSetIdProto {
             domain: String::new(),
@@ -990,7 +966,10 @@ fn default_domain_merge_prefers_highest_version_across_spellings() {
         defaults[0].domain, "ai.onnx",
         "model's original default spelling is preserved"
     );
-    assert_eq!(defaults[0].version, 20, "highest version across contributors");
+    assert_eq!(
+        defaults[0].version, 20,
+        "highest version across contributors"
+    );
 }
 
 #[test]

@@ -7,9 +7,7 @@
 //! from metadata via `shared_kv_mode_from_metadata`). Asserts token-identity and
 //! reports tokens/sec for both.
 
-use onnx_genai_engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, SpeculativeMode,
-};
+use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest, SpeculativeMode};
 use onnx_genai_ort::SessionOptions;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -81,8 +79,7 @@ fn gemma4_assistant_metadata_driven_matches_plain_greedy() -> anyhow::Result<()>
     let opts = SessionOptions::default().with_intra_op_threads(1);
 
     // Speculative package: fixture + mobius-style metadata (auto-config).
-    let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/gemma4-meta-smoke");
+    let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/gemma4-meta-smoke");
     let _ = std::fs::remove_dir_all(&spec_dir);
     copy_dir(&fixture, &spec_dir);
     std::fs::write(spec_dir.join("inference_metadata.yaml"), METADATA)?;
@@ -98,11 +95,8 @@ fn gemma4_assistant_metadata_driven_matches_plain_greedy() -> anyhow::Result<()>
     )?;
 
     // Speculative: default config -> metadata auto-enables the shared-KV proposer.
-    let mut speculative = Engine::from_dir_with_session_options(
-        &spec_dir,
-        EngineConfig::default(),
-        opts,
-    )?;
+    let mut speculative =
+        Engine::from_dir_with_session_options(&spec_dir, EngineConfig::default(), opts)?;
 
     let t0 = Instant::now();
     let expected = baseline.generate(request())?;
@@ -113,19 +107,28 @@ fn gemma4_assistant_metadata_driven_matches_plain_greedy() -> anyhow::Result<()>
     let spec_secs = t1.elapsed().as_secs_f64();
     let stats = speculative.last_speculative_stats();
 
-    println!("greedy tokens={} time={:.4}s tok/s={:.2}",
-        expected.token_ids.len(), greedy_secs,
-        expected.token_ids.len() as f64 / greedy_secs);
-    println!("spec   tokens={} time={:.4}s tok/s={:.2}",
-        actual.token_ids.len(), spec_secs,
-        actual.token_ids.len() as f64 / spec_secs);
+    println!(
+        "greedy tokens={} time={:.4}s tok/s={:.2}",
+        expected.token_ids.len(),
+        greedy_secs,
+        expected.token_ids.len() as f64 / greedy_secs
+    );
+    println!(
+        "spec   tokens={} time={:.4}s tok/s={:.2}",
+        actual.token_ids.len(),
+        spec_secs,
+        actual.token_ids.len() as f64 / spec_secs
+    );
     println!("spec stats: {stats:?}");
     println!("greedy ids: {:?}", expected.token_ids);
     println!("spec   ids: {:?}", actual.token_ids);
 
     assert_eq!(actual.token_ids, expected.token_ids, "token-identity");
     assert_eq!(actual.finish_reason, expected.finish_reason);
-    assert!(stats.proposed_tokens > 0, "metadata did not enable proposer: {stats:?}");
+    assert!(
+        stats.proposed_tokens > 0,
+        "metadata did not enable proposer: {stats:?}"
+    );
     assert!(stats.verification_steps > 0, "{stats:?}");
 
     let _ = std::fs::remove_dir_all(&spec_dir);

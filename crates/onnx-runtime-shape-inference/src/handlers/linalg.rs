@@ -65,13 +65,7 @@ pub fn fused_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) else {
         return Ok(());
     };
-    let flag = |name: &str| {
-        ctx.node
-            .attr(name)
-            .and_then(Attribute::as_int)
-            .unwrap_or(0)
-            != 0
-    };
+    let flag = |name: &str| ctx.node.attr(name).and_then(Attribute::as_int).unwrap_or(0) != 0;
     let a_eff = apply_fused_trans(&a, flag("transA"), flag("transBatchA"));
     let b_eff = apply_fused_trans(&b, flag("transB"), flag("transBatchB"));
     let shape = matmul_shape(ctx, &a_eff, &b_eff, "FusedMatMul")?;
@@ -340,11 +334,7 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
             v_head_size.clone(),
         ]
     } else {
-        vec![
-            batch.clone(),
-            q_seq.clone(),
-            q_heads.mul(&v_head_size),
-        ]
+        vec![batch.clone(), q_seq.clone(), q_heads.mul(&v_head_size)]
     };
     ctx.set_output(0, dtype, y_shape);
 
@@ -376,11 +366,7 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     }
     // qk_matmul_output: (batch, q_heads, q_seq, total_seq).
     if ctx.num_outputs() > 3 {
-        ctx.set_output(
-            3,
-            dtype,
-            vec![batch, q_heads, q_seq, total_seq],
-        );
+        ctx.set_output(3, dtype, vec![batch, q_heads, q_seq, total_seq]);
     }
     Ok(())
 }
@@ -423,12 +409,7 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MatMul", 1, matmul);
     reg.register("", "Gemm", 1, gemm);
-    reg.register(
-        "pkg.nxrt",
-        "BlockQuantizedMatMul",
-        1,
-        quantized_matmul,
-    );
+    reg.register("pkg.nxrt", "BlockQuantizedMatMul", 1, quantized_matmul);
     reg.register("com.microsoft", "MatMulNBits", 1, quantized_matmul);
     // com.microsoft fused matmul honors transA/transB/transBatch attributes.
     reg.register("com.microsoft", "FusedMatMul", 1, fused_matmul);

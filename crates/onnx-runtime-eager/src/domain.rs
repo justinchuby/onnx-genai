@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::opset::{resolve_opset, LATEST_ONNX_OPSET};
+use crate::opset::{LATEST_ONNX_OPSET, resolve_opset};
 
 /// Metadata for one registered operator domain.
 #[derive(Clone, Debug)]

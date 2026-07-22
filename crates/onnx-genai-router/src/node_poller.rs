@@ -241,7 +241,13 @@ mod tests {
         async fn fetch(&self, address: &str) -> Result<NodeStatus, FetchError> {
             let mut script = self.script.lock().unwrap();
             let queue = script.get_mut(address);
-            match queue.and_then(|q| if q.is_empty() { None } else { Some(q.remove(0)) }) {
+            match queue.and_then(|q| {
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            }) {
                 Some(Ok(status)) => Ok(status),
                 _ => Err(FetchError::Timeout(address.to_string())),
             }
@@ -407,13 +413,7 @@ mod tests {
             .expect("concurrent sweep must complete; serial polling would deadlock the barrier");
 
         let router = state.router.lock().unwrap();
-        let by_id = |id: &str| {
-            router
-                .nodes()
-                .iter()
-                .find(|n| n.id.as_str() == id)
-                .unwrap()
-        };
+        let by_id = |id: &str| router.nodes().iter().find(|n| n.id.as_str() == id).unwrap();
         // The two healthy nodes were updated in the same sweep.
         assert!((by_id("10.0.0.1-8000").kv_usage - 0.25).abs() < 1e-6);
         assert_eq!(by_id("10.0.0.1-8000").consecutive_misses, 0);

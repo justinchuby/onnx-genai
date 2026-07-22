@@ -118,10 +118,7 @@ struct DrainResponse {
     draining: bool,
 }
 
-async fn drain_node(
-    State(state): State<SharedState>,
-    Path(node_id): Path<String>,
-) -> Response {
+async fn drain_node(State(state): State<SharedState>, Path(node_id): Path<String>) -> Response {
     let id = NodeId::new(node_id.clone());
     let mut router = state.router.lock().expect("router mutex poisoned");
     if router.set_draining(&id, true) {
@@ -192,8 +189,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(json["healthy"], true);
         assert_eq!(json["total_nodes"], 2);
         assert_eq!(json["nodes"][0]["id"], "gpu-0");
@@ -235,8 +231,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(json["count"], 1);
         assert_eq!(json["sessions"]["s1"], "gpu-0");
     }
@@ -329,8 +324,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(json["migrated"], 1);
     }
 }

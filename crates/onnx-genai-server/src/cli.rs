@@ -135,7 +135,11 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
                 .unwrap_or("onnx-genai-model")
                 .to_string()
         });
-        vec![ModelSpec { id: model_id, path: model_path, eager: true }]
+        vec![ModelSpec {
+            id: model_id,
+            path: model_path,
+            eager: true,
+        }]
     } else if let Some(models_dir) = args.models_dir {
         from_models_dir(&models_dir)?
     } else if let Some(config_path) = args.models_config {

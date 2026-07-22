@@ -37,8 +37,11 @@ where
 {
     let live = compute_liveness(graph, view_map, options).map_err(|_| ValidateError::Cycle)?;
 
-    let slot_cap: HashMap<SlotId, usize> =
-        plan.slots.iter().map(|s| (s.id, s.capacity_bytes)).collect();
+    let slot_cap: HashMap<SlotId, usize> = plan
+        .slots
+        .iter()
+        .map(|s| (s.id, s.capacity_bytes))
+        .collect();
 
     // (1) + (2): coverage, capacity, and overlap-free slot sharing.
     let mut by_slot: HashMap<SlotId, Vec<ValueId>> = HashMap::new();

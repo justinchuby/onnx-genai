@@ -107,10 +107,7 @@ impl Router {
     /// metrics. Records/updates session affinity and prefix co-location as a
     /// side effect (and a [`crate::session_map::MigrationEvent`] when affinity
     /// broke and the session moved).
-    pub fn route_decision(
-        &mut self,
-        request: &RouteRequest,
-    ) -> Option<(NodeId, RoutingDecision)> {
+    pub fn route_decision(&mut self, request: &RouteRequest) -> Option<(NodeId, RoutingDecision)> {
         let (node, decision) = self.pick(request)?;
         self.record_routing(request, &node);
         Some((node, decision))
@@ -201,9 +198,7 @@ impl Router {
         self.nodes
             .iter()
             .filter(|n| {
-                n.healthy
-                    && !self.draining.contains(&n.id)
-                    && n.kv_usage < self.overload_threshold
+                n.healthy && !self.draining.contains(&n.id) && n.kv_usage < self.overload_threshold
             })
             .min_by(|a, b| {
                 self.load_score(a)
@@ -234,7 +229,12 @@ impl Router {
             .filter(|n| n.healthy && !self.draining.contains(&n.id))
             .min_by(|a, b| {
                 weighted_node_score(a, affinity_target, w, self.overload_threshold)
-                    .partial_cmp(&weighted_node_score(b, affinity_target, w, self.overload_threshold))
+                    .partial_cmp(&weighted_node_score(
+                        b,
+                        affinity_target,
+                        w,
+                        self.overload_threshold,
+                    ))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|n| n.id.clone())
@@ -270,7 +270,9 @@ impl Router {
                 _ => self.session_map.assign(session_id.clone(), node.clone()),
             }
         }
-        if self.prefix_colocate && let Some(hash) = request.system_prompt_hash {
+        if self.prefix_colocate
+            && let Some(hash) = request.system_prompt_hash
+        {
             self.prefix_map.assign(hash, node.clone());
         }
     }
@@ -589,10 +591,7 @@ mod tests {
     #[test]
     fn least_kv_usage_policy_ignores_queue() {
         let r = router(
-            vec![
-                node("gpu-0", true, 0.3, 100),
-                node("gpu-1", true, 0.5, 0),
-            ],
+            vec![node("gpu-0", true, 0.3, 100), node("gpu-1", true, 0.5, 0)],
             RoutingPolicy::LeastKvUsage,
         );
         // Despite huge queue, gpu-0 has lower KV usage.
@@ -610,10 +609,7 @@ mod tests {
             queue_weight: 0.2,
         };
         let r = router(
-            vec![
-                node("gpu-0", true, 0.9, 0),
-                node("gpu-1", true, 0.1, 5),
-            ],
+            vec![node("gpu-0", true, 0.9, 0), node("gpu-1", true, 0.1, 5)],
             RoutingPolicy::Weighted(w),
         );
         assert_eq!(r.least_loaded_node(), Some(NodeId::new("gpu-1")));
@@ -783,7 +779,10 @@ health:
         assert_eq!(moved, 1);
         assert_eq!(r.session_map().get("s1"), Some(&NodeId::new("gpu-0")));
         let migrations = r.session_map().migrations();
-        assert_eq!(migrations.last().unwrap().reason, MigrationReason::Rebalance);
+        assert_eq!(
+            migrations.last().unwrap().reason,
+            MigrationReason::Rebalance
+        );
     }
 
     #[test]
@@ -876,9 +875,16 @@ health:
         // No bonus: gpu-1 (score 0.09) beats gpu-0 (score 0.18).
         let mut r = make_router(0.0);
         r.record_session_affinity("s1", NodeId::new("gpu-0"));
-        let req = RouteRequest { session_id: Some("s1".into()), system_prompt_hash: None };
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
         let d = r.route_decision(&req).unwrap();
-        assert_eq!(d.0, NodeId::new("gpu-1"), "without bonus, lower-load gpu-1 wins");
+        assert_eq!(
+            d.0,
+            NodeId::new("gpu-1"),
+            "without bonus, lower-load gpu-1 wins"
+        );
         assert_eq!(d.1, RoutingDecision::LeastLoaded);
 
         // With affinity_weight=0.5: gpu-0 score = 0.18 − 0.5 = −0.32 < 0.09 → gpu-0 wins.
@@ -892,7 +898,11 @@ health:
     /// A maximum affinity_weight must not route to an *unhealthy* affinity node.
     #[test]
     fn weighted_affinity_bonus_skipped_for_unhealthy_node() {
-        let w = WeightConfig { affinity_weight: 1.0, kv_weight: 0.3, queue_weight: 0.2 };
+        let w = WeightConfig {
+            affinity_weight: 1.0,
+            kv_weight: 0.3,
+            queue_weight: 0.2,
+        };
         let mut r = router(
             vec![
                 node("gpu-0", false, 0.1, 0), // affinity target, but unhealthy
@@ -901,16 +911,27 @@ health:
             RoutingPolicy::Weighted(w),
         );
         r.record_session_affinity("s1", NodeId::new("gpu-0"));
-        let req = RouteRequest { session_id: Some("s1".into()), system_prompt_hash: None };
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
         let d = r.route_decision(&req).unwrap();
-        assert_eq!(d.0, NodeId::new("gpu-1"), "unhealthy affinity node excluded despite max bonus");
+        assert_eq!(
+            d.0,
+            NodeId::new("gpu-1"),
+            "unhealthy affinity node excluded despite max bonus"
+        );
     }
 
     /// A maximum affinity_weight must not route to an *overloaded* affinity node
     /// (KV usage at or above the overload threshold).
     #[test]
     fn weighted_affinity_bonus_skipped_for_overloaded_node() {
-        let w = WeightConfig { affinity_weight: 1.0, kv_weight: 0.3, queue_weight: 0.2 };
+        let w = WeightConfig {
+            affinity_weight: 1.0,
+            kv_weight: 0.3,
+            queue_weight: 0.2,
+        };
         let mut r = router(
             vec![
                 node("gpu-0", true, 0.99, 0), // affinity target, but overloaded (> 0.95)
@@ -919,9 +940,16 @@ health:
             RoutingPolicy::Weighted(w),
         );
         r.record_session_affinity("s1", NodeId::new("gpu-0"));
-        let req = RouteRequest { session_id: Some("s1".into()), system_prompt_hash: None };
+        let req = RouteRequest {
+            session_id: Some("s1".into()),
+            system_prompt_hash: None,
+        };
         let d = r.route_decision(&req).unwrap();
         // Without the bonus gpu-0 scores 0.99×0.3=0.297 vs gpu-1's 0.5×0.3=0.15 → gpu-1 wins.
-        assert_eq!(d.0, NodeId::new("gpu-1"), "overloaded affinity node loses without bonus");
+        assert_eq!(
+            d.0,
+            NodeId::new("gpu-1"),
+            "overloaded affinity node loses without bonus"
+        );
     }
 }

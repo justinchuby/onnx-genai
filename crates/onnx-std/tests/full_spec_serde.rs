@@ -1,10 +1,5 @@
 use std::collections::BTreeSet;
 
-use onnx_std::{
-    DeviceConfigurationProto, IntIntListEntryProto, Json, Model, NodeDeviceConfigurationProto,
-    ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, Text, TextCodec, TextProto,
-    load_model, save_model, simple_sharded_dim_proto,
-};
 use onnx_runtime_loader::proto::{
     FILE_DESCRIPTOR_SET,
     onnx::{
@@ -13,6 +8,11 @@ use onnx_runtime_loader::proto::{
         TrainingInfoProto, TypeProto, ValueInfoProto, attribute_proto, tensor_proto,
         tensor_shape_proto, type_proto,
     },
+};
+use onnx_std::{
+    DeviceConfigurationProto, IntIntListEntryProto, Json, Model, NodeDeviceConfigurationProto,
+    ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, Text, TextCodec, TextProto,
+    load_model, save_model, simple_sharded_dim_proto,
 };
 use prost::Message;
 use prost_reflect::DescriptorPool;

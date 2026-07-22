@@ -75,7 +75,11 @@ fn embed_dump_replaces_subgraph_and_round_trips() {
     assert!(n.main_context);
     assert_eq!(n.embed_mode, EmbedMode::Embedded);
     // Boundary wiring: X in, Y out.
-    let ins: Vec<String> = n.inputs().iter().map(|s| name_of(&g2, s.unwrap())).collect();
+    let ins: Vec<String> = n
+        .inputs()
+        .iter()
+        .map(|s| name_of(&g2, s.unwrap()))
+        .collect();
     let outs: Vec<String> = n.outputs().iter().map(|v| name_of(&g2, *v)).collect();
     assert_eq!(ins, vec!["X".to_string()]);
     assert_eq!(outs, vec!["Y".to_string()]);
@@ -111,7 +115,10 @@ fn external_dump_writes_sidecar_and_round_trips() {
 
     let out = onnx_runtime_loader::dump_ep_context(&model, &orig, &[part], &config).expect("dump");
     let sidecar = dir.join("m_ctx_p0_Vendor_EP_p1.bin");
-    assert!(sidecar.exists(), "sanitised sidecar written next to ctx model");
+    assert!(
+        sidecar.exists(),
+        "sanitised sidecar written next to ctx model"
+    );
     assert_eq!(std::fs::read(&sidecar).unwrap(), payload);
 
     let g2 = load_model(&out).expect("reload");
@@ -397,7 +404,10 @@ fn external_dump_colliding_sanitised_sources_do_not_alias() {
     let s1 = dir.join("m_ctx_p1_Vendor_EP_p1.bin");
     assert!(s0.exists(), "partition-0 sidecar exists");
     assert!(s1.exists(), "partition-1 sidecar exists");
-    assert_ne!(s0, s1, "filenames are distinct despite identical sanitised parts");
+    assert_ne!(
+        s0, s1,
+        "filenames are distinct despite identical sanitised parts"
+    );
     assert_eq!(std::fs::read(&s0).unwrap(), b0, "sidecar 0 holds blob 0");
     assert_eq!(std::fs::read(&s1).unwrap(), b1, "sidecar 1 holds blob 1");
 
@@ -416,7 +426,11 @@ fn external_dump_colliding_sanitised_sources_do_not_alias() {
     let r1 = resolve_ep_context(&dir, &nodes[1]).expect("resolve blob 1");
     assert_eq!(r0.bytes(), &b0[..], "node 0 reloads its own blob");
     assert_eq!(r1.bytes(), &b1[..], "node 1 reloads its own blob");
-    assert_ne!(r0.bytes(), r1.bytes(), "no aliasing — distinct blobs preserved");
+    assert_ne!(
+        r0.bytes(),
+        r1.bytes(),
+        "no aliasing — distinct blobs preserved"
+    );
 }
 
 /// **A1 regression** — a disabled config (`enable = false`) must be a no-op: no
@@ -511,7 +525,10 @@ fn duplicate_primary_identity_round_trips_external() {
     let s1 = dir.join("m_ctx_p1_EpA.bin");
     assert!(s0.exists(), "partition-0 sidecar exists");
     assert!(s1.exists(), "partition-1 sidecar exists");
-    assert_ne!(s0, s1, "distinct p{{index}} filenames despite identical identity");
+    assert_ne!(
+        s0, s1,
+        "distinct p{{index}} filenames despite identical identity"
+    );
     assert_eq!(std::fs::read(&s0).unwrap(), b0, "sidecar 0 holds blob 0");
     assert_eq!(std::fs::read(&s1).unwrap(), b1, "sidecar 1 holds blob 1");
 
@@ -530,9 +547,21 @@ fn duplicate_primary_identity_round_trips_external() {
 
     let r0 = resolve_ep_context(&dir, &nodes[0]).expect("resolve blob 0");
     let r1 = resolve_ep_context(&dir, &nodes[1]).expect("resolve blob 1");
-    assert_eq!(r0.bytes(), &b0[..], "node 0 reloads its own blob (r0 == b0)");
-    assert_eq!(r1.bytes(), &b1[..], "node 1 reloads its own blob (r1 == b1)");
-    assert_ne!(r0.bytes(), r1.bytes(), "distinct blobs preserved (r0 != r1)");
+    assert_eq!(
+        r0.bytes(),
+        &b0[..],
+        "node 0 reloads its own blob (r0 == b0)"
+    );
+    assert_eq!(
+        r1.bytes(),
+        &b1[..],
+        "node 1 reloads its own blob (r1 == b1)"
+    );
+    assert_ne!(
+        r0.bytes(),
+        r1.bytes(),
+        "distinct blobs preserved (r0 != r1)"
+    );
 }
 
 /// **Gaff advisory B** — hostile `source`/`partition_name` strings (`/`, `\`,
@@ -578,7 +607,9 @@ fn hostile_source_strings_sanitise_to_safe_bare_filename() {
     assert!(!name.contains('\\'), "no windows separator: {name}");
     assert!(!name.contains('\0'), "no NUL: {name}");
     assert!(
-        !Path::new(name).components().any(|c| matches!(c, std::path::Component::ParentDir)),
+        !Path::new(name)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
         "no `..` traversal component: {name}"
     );
     assert_eq!(
