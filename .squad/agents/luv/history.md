@@ -53,3 +53,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-21T13:15:00Z — GQA metadata fold landed
 - Folded batch-1 GQA metadata into fused prep, removing 24 launches/token while preserving bounds/latch semantics and exact tokens. Holden approved; merged as `bd30e6c`, moving the stack from ~691 to ~710 tok/s at 256.
 - 2026-07-21T23:55Z — Reviewed/approved VLM WP0 metadata and WP3 generic every_step executor; segment decisions now record both landings.
+## 2026-07-22T12:00:00Z — Partial CUDA-graph Phase 0 landed
+- Landed Phase 0 capture path-kind diagnostics on `main` as `3c94a57`, adding structural `CapturePathKind`/`SeamReason` metadata and seam labels without changing partitioning behavior. Deckard reviewed 🟢 GREEN.

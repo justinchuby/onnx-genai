@@ -128,3 +128,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-21T11:15:00Z — CUDA EP Clippy gate
 - Cleared all 21 CUDA EP Clippy warnings without allows, removed no-op drops of non-owning tensor views, and added blocking `-D warnings` Clippy to `cuda-compile`. Wallace approved; merged as `22ec87e`.
 - 2026-07-21T23:55Z — WP4 and DS-1 rejection lockouts recorded; DS-1 was revised by Holden and approved by Pris, while WP4 is with Batty.
+## 2026-07-22T12:00:00Z — Qwen2.5-7B CUDA-graph benchmark
+- Measured Qwen2.5-7B int4 on H200: CUDA graph auto-enable reached **231.73 tok/s** vs forced eager **180.50 tok/s** (**+28.4%**), token-exact with zero fallbacks and one captured segment.

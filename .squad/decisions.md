@@ -5,6 +5,83 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T12-00-00Z-phase0-7b-cudagraph -->
+## 2026-07-22 — Partial CUDA-graph Phase 0 and Qwen2.5-7B CUDA-graph benchmark
+
+<!-- source: .squad/decisions/inbox/deckard-luv-phase0-review.md -->
+### 2026-07-22: Review verdict — Luv Phase 0 partial-CUDA-graph capture-path-kind (🟢 GREEN)
+
+**By:** Deckard
+
+**What:** Independent read-only review of `squad/luv-capture-pathkind` (commit 3c94a57) diffed against merge-base with `origin/main`. Changed: `executor.rs` (+`CapturePathKind`/`SeamReason` enums, `CaptureDecline.seam_reason: Option<SeamReason>`, seam-kind label in `log_capture_segmentation`, `CaptureDecline::node` now takes a `SeamReason`), `lib.rs` (re-exports + doc), `native_decode.rs` (+1 field in a test fixture), docs. **Verdict: 🟢 GREEN — safe to merge.**
+
+**Why:**
+1. **Byte-identical behavior — PASS.** Only removed string literal is the log-format line (now inserts `[{seam_label}]`); zero decline `reason` strings were removed or altered. Segmentation logic in `plan_capture_segments` is unchanged — `declines[pi].is_none()` still drives partitioning; boundaries pushed identically. Classification is derived *from* existing decline causes, not a replacement.
+2. **Correct mapping — PASS.** All 5 per-node causes map correctly: control-flow/sequence→`HostControlFlowOrSequence`→`HostSeam`; unresolved output→`UnresolvedOutputShape`; unresolved input→`UnresolvedInputShape`; kernel-not-warmed→`KernelNotWarmed`; kernel-capture-unsupported→`KernelCaptureUnsupported` — the last four→`EagerDeviceSeam`. Graph-level persistent-device-binding hard-abort (`CaptureDecline::graph`) intentionally carries `seam_reason: None` ("graph-level hard preconditions"), which is correct — it is a whole-graph abort, not a per-node seam.
+3. **Model-agnostic — PASS.** No model-name/architecture string branching; classification is purely structural (RULES.md §2/§2.1 respected).
+4. **Exhaustiveness — PASS.** `SeamReason::path_kind` and `CapturePathKind::label` use exhaustive matches with no catch-all `_ =>`; `CapturePathKind`/`SeamReason` re-exported from `lib.rs` and doc-commented.
+5. **fmt/clippy — PASS.** `cargo fmt -p onnx-runtime-session -- --check` clean; `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings` clean; `--features cuda` clippy clean.
+6. **Tests — PASS.** `cargo test -p onnx-runtime-session` = 60 passed, incl. new `seam_reasons_map_to_structural_capture_paths` (genuinely asserts all 5 reason→kind→label mappings + `CaptureRegion` label). `cargo test -p onnx-genai-engine --features native-backend capture_fallback_emits_each_structured_decline_to_tracer` = 1 passed.
+7. **Log output — PASS.** Seam-kind label uses `boundary.seam_reason.map(SeamReason::label).unwrap_or("unclassified-seam")`; behind the verbose diagnostic flag; no existing test asserts on the literal log string, so no format-assertion breakage.
+
+Conclusion: purely additive structural diagnostics, correct, model-agnostic, all gates green. Approved for merge.
+
+<!-- source: .squad/decisions/inbox/gaff-qwen7b-cudagraph.md -->
+### 2026-07-22: Qwen2.5-7B int4 CUDA-graph auto-enable benchmark
+**By:** Gaff
+**What:** Benchmarked Qwen2.5-7B int4 on one NVIDIA H200 at `bd3d95a` using `profile_native --ep cuda --prompt Hello --tokens 128 --warmups 2 --runs 3 --steady`, `ONNX_GENAI_DEVICE_KV=1`, and identical greedy decoding. Run A left `ONNX_GENAI_CUDA_GRAPH` unset; Run B set it to `0`. A companion 16-token diagnostic confirmed graph state and fallback counters.
+**Why:** Validate that metadata/structure-driven CUDA-graph auto-enable generalizes beyond Qwen2.5-0.5B and Phi-4-mini without architecture or model-name keying.
+
+| Metric | Run A — auto | Run B — forced eager |
+|---|---:|---:|
+| Median throughput | **231.73 tok/s** | **180.50 tok/s** |
+| Median decode latency | **4.315 ms/token** | **5.540 ms/token** |
+| Throughput speedup vs eager | **+28.38%** | baseline |
+| Token-exact A/B | **Yes** | **Yes** |
+| Capture engaged | **Yes** | No (explicitly disabled) |
+| Zero fallbacks | **Yes** | Yes |
+| Capture diagnostic | `enabled=true`, 1 capture, 14 replays, 0 fallbacks; 1 captured segment, 0 eager seams | `enabled=false`, 0 captures, 0 replays, 0 fallbacks |
+| Kernels/token | N/A — `profile_native` does not surface GPU kernel-launch counts | N/A |
+| GPU-busy | N/A — `profile_native` does not surface GPU utilization | N/A |
+| Fraction of 4.8 TB/s ÷ 3.5 GB/token ceiling | **16.90%** | **13.16%** |
+
+The 128-token outputs were identical token-for-token across A and B. Auto-enable generalized cleanly to Qwen2.5-7B: CUDA plus owned device KV selected whole-step capture automatically, with one captured segment, no eager seams, and zero fallbacks. The **28.38%** gain is smaller than Qwen2.5-0.5B's 87.7% and Phi-4-mini's 41.0%, as expected for a larger decode that spends more time streaming/dequantizing int4 weights and less proportionally on launch overhead, but it remains substantial. The simple peak-bandwidth roofline is about 1,371 tok/s; measured auto throughput is 16.90% of that ceiling, and this ratio should not be interpreted as pure bandwidth efficiency because int4 dequantization and compute also constrain decode.
+
+<!-- source: .squad/decisions/inbox/luv-capture-pathkind.md -->
+### 2026-07-22: Formalize partial CUDA-graph capture path kinds
+**By:** Luv
+**What:** Added `CapturePathKind` and `SeamReason`, attached optional seam classification metadata to `CaptureDecline`, propagated it through `CaptureSchedule` boundaries, and added seam-kind labels to `ONNX_GENAI_LOG_CAPTURE_SEGMENTS` output without changing capture partitioning or existing reason strings.
+**Why:** Phase 0 of the partial-CUDA-graph EP-claim design requires structural, model-agnostic diagnostics that distinguish captured regions, eager device seams, and host seams before EP-owned planning is introduced.
+
+| SeamReason | CapturePathKind |
+|---|---|
+| `HostControlFlowOrSequence` | `HostSeam` |
+| `UnresolvedOutputShape` | `EagerDeviceSeam` |
+| `UnresolvedInputShape` | `EagerDeviceSeam` |
+| `KernelNotWarmed` | `EagerDeviceSeam` |
+| `KernelCaptureUnsupported` | `EagerDeviceSeam` |
+
+**Files touched:**
+- `crates/onnx-runtime-session/src/executor.rs`
+- `crates/onnx-runtime-session/src/lib.rs`
+- `crates/onnx-genai-engine/src/native_decode.rs`
+- `docs/design-ep-partial-cuda-graph.md`
+- `docs/CUDA_GRAPH_CAPTURE.md`
+
+**Verification:**
+- `cargo fmt -p onnx-runtime-session` — PASS.
+- `cargo test -p onnx-runtime-session seam_reasons_map_to_structural_capture_paths` — PASS (1 focused unit test).
+- `cargo build -p onnx-runtime-session` — PASS.
+- `cargo build -p onnx-runtime-session --features cuda` — PASS.
+- `cargo test -p onnx-runtime-session` — PASS (all session unit, integration, and doc tests; one manual performance audit and one doc test remained ignored).
+- `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings` — PASS.
+- `cargo test -p onnx-genai-engine --features native-backend capture_fallback_emits_each_structured_decline_to_tracer` — PASS (1 focused compatibility test).
+
+### Fold processed Phase 0 and 7B CUDA-graph inbox notes
+**By:** Scribe
+**What:** Merged and cleared `deckard-luv-phase0-review.md`, `gaff-qwen7b-cudagraph.md`, `luv-capture-pathkind.md`. Preserved active scope/design files `zhora-deepseek-scope.md`, `leon-vlm-scope.md`, and `keaton-native-specdecode-design.md`.
+**Why:** Landed implementation, independent green review, benchmark results, and progress-log updates belong in the current decision ledger; active scope notes remain in the inbox.
+
 <!-- scribe-merge-2026-07-22T00-00-00Z-cudagraph-autoenable -->
 ## 2026-07-22 — CUDA graph auto-enable, GQA/VLM closure, and inbox reconciliation
 
