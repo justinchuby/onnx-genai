@@ -36,3 +36,37 @@ fn native_cpu_synthetic_profile_reports_throughput() {
         "missing throughput number:\n{stdout}"
     );
 }
+
+#[test]
+fn native_cpu_synthetic_profile_reports_decode_stages_when_enabled() {
+    let output = Command::new(env!("CARGO_BIN_EXE_profile_native"))
+        .env("ONNX_GENAI_PROFILE", "1")
+        .args([
+            "--synthetic",
+            "--tokens",
+            "2",
+            "--warmups",
+            "1",
+            "--runs",
+            "1",
+            "--ep",
+            "cpu",
+        ])
+        .output()
+        .expect("run profile_native with stage profiling");
+
+    assert!(
+        output.status.success(),
+        "profile_native failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("stage")
+            && stdout.contains("us/token")
+            && stdout.contains("loop.next_logits")
+            && stdout.contains("loop.sampling"),
+        "missing per-stage decode profile:\n{stdout}"
+    );
+}

@@ -11,7 +11,7 @@ use onnx_genai_engine::{
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
     ProcessorChain,
 };
-use onnx_genai_ort::{Tokenizer, available_execution_providers};
+use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -469,6 +469,7 @@ fn main() -> Result<()> {
             args.tokens,
         )?);
     }
+    profile::reset();
 
     let stats_before = session.cuda_kv_debug_stats();
     let mut generated = 0usize;
@@ -529,6 +530,9 @@ fn main() -> Result<()> {
                 .decode(&tokens)
                 .context("decode generated tokens")?
         );
+    }
+    if profile::enabled() {
+        println!("{}", profile::report(generated as u64));
     }
     Ok(())
 }
