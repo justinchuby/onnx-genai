@@ -8,6 +8,14 @@ _Last updated: 2026-07-23T06:05Z — Qwen3 fast-path fix, Native GAP 2, DeepSeek
 
 **Current `origin/main` implementation HEAD:** `751f068` (after the 2026-07-23T06:05Z batch).
 
+## 2026-07-23 — Generic lm_head fusion (CUDA EP): Llama-3.2-1B 97→449 tok/s (4.6×)
+
+- New EP-internal, pattern-based (NOT model-name) CUDA passes:
+  1. `CudaFoldConstantTranspose` — any Transpose of a producer-less constant initializer (whole-byte dtype) is materialized once at claim time into a pre-transposed inline initializer (byte-wise permutation, any rank/perm; sub-byte + non-constant skipped; tied weights preserved).
+  2. Dense fp16 M==1 GEMV fast path in `MatMulKernel` — portable NVRTC GEMV (one thread/column, coalesced, fp32 accumulate), no workspace/sync → capture-safe, folds into the decode CUDA graph.
+- H200, greedy byte-identical: Llama-3.2-1B **97→449 tok/s @128 (4.6×), 438 @1024**. Qwen2.5-0.5B no regression (quantized head → passes inert). Reviewed 🟢 by independent reviewer; genericity (RULES §2/§2.1), capture-safety, byte-permutation correctness all verified.
+- Bench doc: `docs/benchmarks/llama-3.2-1b-lmhead-fusion-2026-07-23.md`.
+
 ## 2026-07-23 — Qwen3 fast-path fix, Native GAP 2, DeepSeek MoE Phase 1, and model generality
 
 - **Qwen3-0.6B perf gap fixed ✅ (`joi-14`):** fast KV-share is now the default for corrected exports. H200 ORT CUDA eager decode reached **441.96 tok/s** at 128 and **374.50 tok/s** at 1024; the Qwen2.5-0.5B control rerun was **577.24/498.67 tok/s**. Root cause was the `decode.rs` dual gate (`grouped_query` alias + missing `kv_cache.native_dtype`), fixed by Isidore (`0c7be31`) plus Mobius metadata emitters.
