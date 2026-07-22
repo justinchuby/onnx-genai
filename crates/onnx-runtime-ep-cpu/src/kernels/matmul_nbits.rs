@@ -1,5 +1,5 @@
-//! Correctness-first `com.microsoft::MatMulNBits` for f32 activations and
-//! block-quantized 2-bit, 4-bit, or 8-bit weights.
+//! Correctness-first `com.microsoft::MatMulNBits` for f32/f16/bf16 activations
+//! and block-quantized 2-bit, 4-bit, or 8-bit weights.
 //!
 //! ORT stores `B` as
 //! `[N, ceil(K / block_size), block_size * bits / 8]`, least-significant bits
@@ -21,14 +21,17 @@ use rayon::prelude::*;
 
 use super::matmul::gemm;
 use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_f32};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
-/// Default M=1 decode pool size. Profiling found 4--8 workers optimal for the
-/// tiny projections in decode, while 16 or more workers regressed throughput.
-const DEFAULT_DECODE_THREADS: usize = 8;
+/// Decode is bandwidth-bound and pays one fork/join per projection. Profiling
+/// across the existing 4--96 worker sweep found no gain above eight workers and
+/// clear regressions at 16+, so topology scaling is capped here; the environment
+/// override remains available for processors whose measurements differ.
+const MAX_TOPOLOGY_DECODE_THREADS: usize = 8;
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
 
@@ -42,8 +45,8 @@ static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, Stri
 #[cfg(feature = "mlas")]
 const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 
-/// Default int4 MatMulNBits hand-decode ↔ MLAS crossover. Measured on Sapphire
-/// Rapids (Xeon 8480C):
+/// Basis for the topology-derived int4 MatMulNBits hand-decode ↔ MLAS crossover.
+/// Measurements on Sapphire Rapids (Xeon 8480C) found:
 ///
 /// * Isolated GEMV microbench (`matmulnbits_mlas_perf`, weights L3-resident)
 ///   reports MLAS int4 M=1 ~1.7--1.9x faster, but that is a cache artifact.
@@ -56,30 +59,33 @@ const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 ///   route; the 2.3x gap vs ORT/foundry is per-op Rayon fork-join and NUMA
 ///   locality, not the MatMulNBits kernel (see docs/BENCH_MLAS_INT4_E2E.md).
 ///
-/// MLAS overtakes the hand path in the mid-teens of `m`, so decode/tiny batches
-/// keep the hand path and prefill routes to MLAS. Override with
-/// `NXRT_SQNBIT_DECODE_MIN`.
-#[cfg(feature = "mlas")]
-const DEFAULT_SQNBIT_DECODE_MIN: usize = 16;
-
+/// The default crossover is twice the topology-derived decode worker count.
+/// That preserves `m=16` on the profiled 96-way host while scaling down on
+/// smaller machines where MLAS needs fewer rows to occupy the available cores.
+/// Override with `NXRT_SQNBIT_DECODE_MIN`.
 #[cfg(feature = "mlas")]
 static SQNBIT_DECODE_MIN: OnceLock<usize> = OnceLock::new();
 
 /// Smallest `m` (batch·seq row count) that routes int4 MatMulNBits to MLAS
 /// SQNBit; smaller `m` uses the hand int4/int8 decode path. Parsed once from
-/// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`DEFAULT_SQNBIT_DECODE_MIN`].
+/// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`default_sqnbit_decode_min`].
 #[cfg(feature = "mlas")]
 fn sqnbit_decode_min() -> usize {
-    *SQNBIT_DECODE_MIN
-        .get_or_init(|| resolve_decode_min(std::env::var(SQNBIT_DECODE_MIN_ENV).ok().as_deref()))
+    *SQNBIT_DECODE_MIN.get_or_init(|| {
+        let available = available_parallelism();
+        resolve_decode_min(
+            std::env::var(SQNBIT_DECODE_MIN_ENV).ok().as_deref(),
+            available,
+        )
+    })
 }
 
 /// Parse the SQNBit decode crossover, falling back to
-/// [`DEFAULT_SQNBIT_DECODE_MIN`] for absent, empty, or malformed values.
+/// [`default_sqnbit_decode_min`] for absent, empty, or malformed values.
 #[cfg(feature = "mlas")]
-fn resolve_decode_min(raw: Option<&str>) -> usize {
+fn resolve_decode_min(raw: Option<&str>, available: usize) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SQNBIT_DECODE_MIN)
+        .unwrap_or_else(|| default_sqnbit_decode_min(available))
 }
 
 pub struct MatMulNBitsKernel {
@@ -164,10 +170,10 @@ impl Kernel for MatMulNBitsKernel {
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("MatMulNBits", inputs, outputs, 3, 6, 1)?;
-        require_dtype("A", inputs[0].dtype, DataType::Float32)?;
+        require_float_compute_dtype("A", inputs[0].dtype)?;
         require_dtype("B", inputs[1].dtype, DataType::Uint8)?;
-        require_dtype("scales", inputs[2].dtype, DataType::Float32)?;
-        require_dtype("Y", outputs[0].dtype, DataType::Float32)?;
+        require_float_compute_dtype("scales", inputs[2].dtype)?;
+        require_float_compute_dtype("Y", outputs[0].dtype)?;
 
         let a_shape = inputs[0].shape;
         if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
@@ -209,9 +215,9 @@ impl Kernel for MatMulNBitsKernel {
         }
 
         let bias = if let Some(bias) = optional_input(inputs, 5) {
-            require_dtype("bias", bias.dtype, DataType::Float32)?;
+            require_float_compute_dtype("bias", bias.dtype)?;
             require_shape("bias", bias.shape, &[self.n])?;
-            Some(to_dense_f32(bias)?)
+            Some(to_dense_compute_f32(bias)?)
         } else {
             None
         };
@@ -220,7 +226,7 @@ impl Kernel for MatMulNBitsKernel {
             && self.constant_inputs[2]
             && zero_points.is_none_or(|_| self.constant_inputs[3])
             && group_indices.is_none_or(|_| self.constant_inputs[4]);
-        let activations = to_dense_f32(&inputs[0])?;
+        let activations = to_dense_compute_f32(&inputs[0])?;
         let m = numel(&a_shape[..a_shape.len() - 1]);
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
@@ -247,7 +253,7 @@ impl Kernel for MatMulNBitsKernel {
                 bias.as_deref(),
                 &mut result,
             )? {
-                return write_dense_f32(&mut outputs[0], &result);
+                return write_compute_f32(&mut outputs[0], &result);
             }
         }
         if self.bits == 4
@@ -265,7 +271,7 @@ impl Kernel for MatMulNBitsKernel {
                 } else {
                     let weight = PackedInt4Weight {
                         values: to_dense_bytes(&inputs[1])?,
-                        scales: to_dense_f32(&inputs[2])?,
+                        scales: to_dense_compute_f32(&inputs[2])?,
                     };
                     let weight = numa_place_int4(weight, self.n);
                     let _ = self.packed_int4_weight.set(weight);
@@ -276,7 +282,7 @@ impl Kernel for MatMulNBitsKernel {
             } else {
                 let built = PackedInt4Weight {
                     values: to_dense_bytes(&inputs[1])?,
-                    scales: to_dense_f32(&inputs[2])?,
+                    scales: to_dense_compute_f32(&inputs[2])?,
                 };
                 owned_weight = numa_place_int4(built, self.n);
                 &owned_weight
@@ -376,7 +382,7 @@ impl Kernel for MatMulNBitsKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &result)
+        write_compute_f32(&mut outputs[0], &result)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -480,7 +486,7 @@ impl MatMulNBitsKernel {
         comp: mlas_sys::SQNBitComputeType,
     ) -> Result<Option<mlas_sys::SQNBitPackedB>> {
         let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_f32(scales)?;
+        let scales = to_dense_compute_f32(scales)?;
         let zero_points = zero_points.map(to_dense_bytes).transpose()?;
         Ok(mlas_sys::SQNBitPackedB::new(
             self.n,
@@ -501,7 +507,7 @@ impl MatMulNBitsKernel {
         zero_points: Option<&TensorView>,
     ) -> Result<Int8Weight> {
         let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_f32(scales)?;
+        let scales = to_dense_compute_f32(scales)?;
         let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
         let k_blocks = self.k.div_ceil(self.block_size);
         debug_assert_eq!(self.bits, 4);
@@ -557,7 +563,7 @@ impl MatMulNBitsKernel {
         layout: WeightLayout,
     ) -> Result<Vec<f32>> {
         let packed = to_dense_bytes(packed)?;
-        let scales = to_dense_f32(scales)?;
+        let scales = to_dense_compute_f32(scales)?;
         let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
         let group_indices = group_indices.map(to_dense_i64).transpose()?;
         let k_blocks = self.k.div_ceil(self.block_size);
@@ -680,18 +686,45 @@ fn dequantize_nbits_value(
 
 fn configured_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
-    let available = std::thread::available_parallelism().ok()?.get();
+    let available = available_parallelism();
     resolve_decode_threads(value.as_deref(), available)
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+/// Choose a bounded decode pool from the host's logical CPU count.
+///
+/// Decode projections are small and bandwidth-bound, so worker demand grows
+/// much more slowly than core count: `1 + ceil(log2(logical_cpus))` gives 3
+/// workers on 4-way hosts, 4 on 8-way hosts, and the profiled 8 workers on the
+/// 96-way Xeon. The measured eight-worker ceiling limits fork/join overhead, and
+/// the result never exceeds the CPUs available to a cgroup.
+fn default_decode_threads(available: usize) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    let ceil_log2 = usize::BITS as usize - (available - 1).leading_zeros() as usize;
+    Some((ceil_log2 + 1).min(MAX_TOPOLOGY_DECODE_THREADS).min(available))
 }
 
 fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
+    let default = default_decode_threads(available)?;
     let threads = match raw {
         Some("0") => return None,
-        Some(raw) => raw.parse::<usize>().unwrap_or(DEFAULT_DECODE_THREADS),
-        None => DEFAULT_DECODE_THREADS,
+        Some(raw) => raw.parse::<usize>().unwrap_or(default),
+        None => default,
     };
     (threads > 0).then(|| threads.min(available))
+}
+
+#[cfg(feature = "mlas")]
+fn default_sqnbit_decode_min(available: usize) -> usize {
+    default_decode_threads(available)
+        .unwrap_or(1)
+        .saturating_mul(2)
 }
 
 fn build_decode_pool(
@@ -1435,6 +1468,44 @@ fn require_dtype(name: &str, got: DataType, expected: DataType) -> Result<()> {
     Ok(())
 }
 
+fn require_float_compute_dtype(name: &str, got: DataType) -> Result<()> {
+    if !matches!(
+        got,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        return Err(error(format!(
+            "{name} must have dtype Float32, Float16, or BFloat16, got {got:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Preserve the original f32 materialization path exactly; lower-precision
+/// tensors reuse the shared scalar, cross-architecture widening machinery.
+fn to_dense_compute_f32(view: &TensorView) -> Result<Vec<f32>> {
+    match view.dtype {
+        DataType::Float32 => to_dense_f32(view),
+        DataType::Float16 | DataType::BFloat16 => {
+            Ok(to_dense_f32_widen("MatMulNBits", view)?.into_owned())
+        }
+        other => Err(error(format!(
+            "compute input must have dtype Float32, Float16, or BFloat16, got {other:?}"
+        ))),
+    }
+}
+
+/// Preserve the original f32 writer exactly; f16/bf16 outputs reuse the shared
+/// narrowing path, which has portable scalar conversion on every processor.
+fn write_compute_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
+    match out.dtype {
+        DataType::Float32 => write_dense_f32(out, data),
+        DataType::Float16 | DataType::BFloat16 => write_dense_f32_narrow("MatMulNBits", out, data),
+        other => Err(error(format!(
+            "Y must have dtype Float32, Float16, or BFloat16, got {other:?}"
+        ))),
+    }
+}
+
 fn require_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
     if got != expected {
         return Err(error(format!(
@@ -2064,13 +2135,15 @@ mod tests {
     #[test]
     fn decode_thread_count_defaults_invalid_values_and_clamps() {
         assert_eq!(resolve_decode_threads(None, 96), Some(8));
-        assert_eq!(resolve_decode_threads(None, 4), Some(4));
+        assert_eq!(resolve_decode_threads(None, 4), Some(3));
+        assert_eq!(resolve_decode_threads(None, 8), Some(4));
+        assert_eq!(resolve_decode_threads(None, 1), Some(1));
         assert_eq!(resolve_decode_threads(Some(""), 96), Some(8));
         assert_eq!(resolve_decode_threads(Some("0"), 8), None);
         assert_eq!(resolve_decode_threads(Some("4"), 96), Some(4));
         assert_eq!(resolve_decode_threads(Some("1000"), 96), Some(96));
         assert_eq!(resolve_decode_threads(Some("abc"), 96), Some(8));
-        assert_eq!(resolve_decode_threads(Some("-4"), 4), Some(4));
+        assert_eq!(resolve_decode_threads(Some("-4"), 4), Some(3));
         assert_eq!(resolve_decode_threads(Some("4"), 0), None);
     }
 
@@ -2185,6 +2258,107 @@ mod tests {
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
+    }
+
+    #[test]
+    fn matmulnbits_f16_bf16_inputs_match_widened_f32_for_decode_and_prefill() {
+        let (k, n, block_size) = (64usize, 9usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 9.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let bias_values: Vec<f32> = (0..n).map(|i| (i as f32 - 4.0) / 17.0).collect();
+
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            for m in [1usize, 3usize] {
+                let a_values: Vec<f32> = (0..m * k)
+                    .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+                    .collect();
+                let low_a = match dtype {
+                    DataType::Float16 => Owned::f16(&[m, k], &a_values),
+                    DataType::BFloat16 => Owned::bf16(&[m, k], &a_values),
+                    _ => unreachable!(),
+                };
+                let low_scales = match dtype {
+                    DataType::Float16 => Owned::f16(&[n, 2], &scales),
+                    DataType::BFloat16 => Owned::bf16(&[n, 2], &scales),
+                    _ => unreachable!(),
+                };
+                let low_bias = match dtype {
+                    DataType::Float16 => Owned::f16(&[n], &bias_values),
+                    DataType::BFloat16 => Owned::bf16(&[n], &bias_values),
+                    _ => unreachable!(),
+                };
+                let widened = |owned: &Owned| match dtype {
+                    DataType::Float16 => owned.to_f16_as_f32(),
+                    DataType::BFloat16 => owned.to_bf16_as_f32(),
+                    _ => unreachable!(),
+                };
+                let f32_a = Owned::f32(&[m, k], &widened(&low_a));
+                let f32_scales = Owned::f32(&[n, 2], &widened(&low_scales));
+                let f32_bias = Owned::f32(&[n], &widened(&low_bias));
+                let b = Owned::u8(&[n, 2, 16], &packed);
+                let absent_zp = TensorView::absent(DataType::Uint8);
+                let absent_gidx = TensorView::absent(DataType::Int32);
+
+                let mut low_y = Owned::zeros(dtype, &[m, n]);
+                accuracy4_kernel(k, n, block_size)
+                    .execute(
+                        &[
+                            low_a.view(),
+                            b.view(),
+                            low_scales.view(),
+                            absent_zp,
+                            absent_gidx,
+                            low_bias.view(),
+                        ],
+                        &mut [low_y.view_mut()],
+                    )
+                    .unwrap();
+
+                let mut f32_y = Owned::zeros_f32(&[m, n]);
+                accuracy4_kernel(k, n, block_size)
+                    .execute(
+                        &[
+                            f32_a.view(),
+                            b.view(),
+                            f32_scales.view(),
+                            absent_zp,
+                            absent_gidx,
+                            f32_bias.view(),
+                        ],
+                        &mut [f32_y.view_mut()],
+                    )
+                    .unwrap();
+
+                let actual = widened(&low_y);
+                let reference = f32_y.to_f32();
+                let narrowed_reference: Vec<f32> = reference
+                    .iter()
+                    .map(|&value| match dtype {
+                        DataType::Float16 => half::f16::from_f32(value).to_f32(),
+                        DataType::BFloat16 => half::bf16::from_f32(value).to_f32(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                assert_eq!(
+                    actual, narrowed_reference,
+                    "{dtype:?} M={m} must compute in f32 and narrow only at output"
+                );
+
+                let tolerance: f32 = match dtype {
+                    DataType::Float16 => 2e-2,
+                    DataType::BFloat16 => 1.5e-1,
+                    _ => unreachable!(),
+                };
+                for (index, (&actual, &reference)) in actual.iter().zip(&reference).enumerate() {
+                    assert!(
+                        (actual - reference).abs() <= tolerance.max(tolerance * reference.abs()),
+                        "{dtype:?} M={m} index {index}: actual={actual}, widened f32={reference}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2721,16 +2895,19 @@ mod tests {
     }
 
     /// The SQNBit decode crossover parses `NXRT_SQNBIT_DECODE_MIN`, falling
-    /// back to the measured default for absent, empty, or malformed values.
+    /// back to the topology-derived default for absent, empty, or malformed values.
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_resolve_decode_min_parses_or_defaults() {
-        assert_eq!(resolve_decode_min(None), DEFAULT_SQNBIT_DECODE_MIN);
-        assert_eq!(resolve_decode_min(Some("")), DEFAULT_SQNBIT_DECODE_MIN);
-        assert_eq!(resolve_decode_min(Some("abc")), DEFAULT_SQNBIT_DECODE_MIN);
-        assert_eq!(resolve_decode_min(Some("32")), 32);
-        assert_eq!(resolve_decode_min(Some("  8 ")), 8);
-        assert_eq!(resolve_decode_min(Some("1")), 1);
+        assert_eq!(default_sqnbit_decode_min(96), 16);
+        assert_eq!(default_sqnbit_decode_min(4), 6);
+        assert_eq!(default_sqnbit_decode_min(8), 8);
+        assert_eq!(resolve_decode_min(None, 96), 16);
+        assert_eq!(resolve_decode_min(Some(""), 96), 16);
+        assert_eq!(resolve_decode_min(Some("abc"), 96), 16);
+        assert_eq!(resolve_decode_min(Some("32"), 96), 32);
+        assert_eq!(resolve_decode_min(Some("  8 "), 96), 8);
+        assert_eq!(resolve_decode_min(Some("1"), 96), 1);
     }
 
     /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global
@@ -2746,9 +2923,8 @@ mod tests {
     /// backend selected, `try_mlas_sqnbit` must still fall back (`Ok(None)`) for
     /// `m` below the decode crossover (decode keeps the hand path) and serve
     /// MLAS (`Ok(Some(()))`) for `m` at/above it (prefill). This regression-locks
-    /// the decode/prefill split. Uses the default threshold
-    /// ([`DEFAULT_SQNBIT_DECODE_MIN`]); the host must have an MLAS SQNBit int4
-    /// kernel or the assertions are skipped.
+    /// the decode/prefill split. Uses the topology-derived default threshold; the
+    /// host must have an MLAS SQNBit int4 kernel or the assertions are skipped.
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_gates_decode_by_m_threshold() {
@@ -2779,8 +2955,8 @@ mod tests {
         let b = Owned::u8(&[n, k_blocks, blob], &packed_bytes);
         let scales_t = Owned::f32(&[n, k_blocks], &scales);
 
-        let below = DEFAULT_SQNBIT_DECODE_MIN - 1;
-        let at = DEFAULT_SQNBIT_DECODE_MIN;
+        let at = default_sqnbit_decode_min(available_parallelism());
+        let below = at - 1;
 
         let _guard = backend_env_lock().lock().unwrap();
         let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
@@ -2818,12 +2994,12 @@ mod tests {
 
         assert_eq!(
             decode, None,
-            "m={below} (< {DEFAULT_SQNBIT_DECODE_MIN}) must fall back to the hand int4 path",
+            "m={below} (< {at}) must fall back to the hand int4 path",
         );
         assert_eq!(
             prefill,
             Some(()),
-            "m={at} (>= {DEFAULT_SQNBIT_DECODE_MIN}) must route to MLAS SQNBit",
+            "m={at} must route to MLAS SQNBit",
         );
     }
 
@@ -3073,7 +3249,9 @@ mod tests {
             }
         }
 
-        let threads = configured_decode_threads().unwrap_or(DEFAULT_DECODE_THREADS);
+        let threads = configured_decode_threads()
+            .or_else(|| default_decode_threads(available_parallelism()))
+            .unwrap_or(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
