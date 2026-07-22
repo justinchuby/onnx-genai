@@ -877,6 +877,21 @@ pub fn to_dense_f32(view: &TensorView) -> Result<Vec<f32>> {
     if n == 0 {
         return Ok(out);
     }
+    if view.is_contiguous() {
+        // Contiguous row-major: the element origin addresses `n` consecutive
+        // f32, so a single bulk copy replaces the per-element strided walk. This
+        // is the common decode/prefill case (dense activations) and the strided
+        // loop below is a serial, non-vectorized per-element hot path otherwise.
+        //
+        // SAFETY: identical read assumptions to the strided loop below -- the
+        // validated host-accessible view describes `n` readable, contiguous f32
+        // starting at `origin`, bounds-checked against the backing allocation by
+        // the owning EP (ep-api safety invariant #1). `f32` has no invalid bit
+        // patterns.
+        let slice = unsafe { std::slice::from_raw_parts(origin, n) };
+        out.extend_from_slice(slice);
+        return Ok(out);
+    }
     let mut idx = vec![0usize; view.shape.len()];
     loop {
         let off = elem_offset(view.strides, &idx);
@@ -1006,6 +1021,20 @@ pub fn write_dense_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
         return Ok(());
     }
     let origin = out.data_ptr_mut::<f32>();
+    if out.is_contiguous() {
+        // Contiguous row-major output: write `n` consecutive f32 in one bulk
+        // copy instead of the per-element strided walk. This is the common
+        // decode/prefill case and keeps the write off the serial hot path.
+        //
+        // SAFETY: identical write assumptions to the strided loop below -- the
+        // validated host-accessible output describes `n` writable, contiguous
+        // f32 starting at `origin`, bounds-checked against the backing
+        // allocation by the owning EP (ep-api safety invariant #1). `data.len()`
+        // was checked to equal `n` above, so every element is written once.
+        let slice = unsafe { std::slice::from_raw_parts_mut(origin, n) };
+        slice.copy_from_slice(data);
+        return Ok(());
+    }
     let strides = out.strides;
     let shape = out.shape;
     let mut idx = vec![0usize; shape.len()];
@@ -1438,6 +1467,28 @@ mod tests {
         let v = a.view();
         // Transpose of [[1,2,3],[4,5,6]] is [[1,4],[2,5],[3,6]].
         assert_eq!(to_dense_f32(&v).unwrap(), vec![1., 4., 2., 5., 3., 6.]);
+    }
+
+    #[test]
+    fn write_dense_contiguous_bulk_copies() {
+        // Contiguous output takes the bulk-copy fast path.
+        let mut backing = Owned::f32(&[2, 3], &[0.0; 6]);
+        let mut out = backing.view_mut();
+        write_dense_f32(&mut out, &[1., 2., 3., 4., 5., 6.]).unwrap();
+        assert_eq!(backing.to_f32(), vec![1., 2., 3., 4., 5., 6.]);
+    }
+
+    #[test]
+    fn write_dense_strided_matches_logical_order() {
+        // Backing [2,3] row-major exposed as transposed [3,2] with strides
+        // [1,3] so the write must scatter through the non-contiguous stride
+        // walk. `to_f32` reads raw storage order to confirm the scatter.
+        let mut backing = Owned::f32(&[2, 3], &[0.0; 6]).with_view(&[3, 2], &[1, 3]);
+        let mut out = backing.view_mut();
+        // Logical [[1,2],[3,4],[5,6]] over strides [1,3] lands in storage as
+        // [1,3,5, 2,4,6].
+        write_dense_f32(&mut out, &[1., 2., 3., 4., 5., 6.]).unwrap();
+        assert_eq!(backing.to_f32(), vec![1., 3., 5., 2., 4., 6.]);
     }
 
     #[test]

@@ -2869,7 +2869,8 @@ mod tests {
             k: usize,
             n: usize,
             int4: PackedInt4Weight,
-            mlas: mlas_sys::SQNBitPackedB,
+            mlas_int8: mlas_sys::SQNBitPackedB,
+            mlas_fp32: mlas_sys::SQNBitPackedB,
         }
 
         // Build one *distinct* weight per op instance so the step streams the
@@ -2884,15 +2885,12 @@ mod tests {
                 let weights_nk = pseudo(n * k, seed);
                 let (packed_bytes, scales, _zps, _dq) =
                     quantize(&weights_nk, n, k, block_size, false);
-                let Some(mlas) = mlas_sys::SQNBitPackedB::new(
-                    n,
-                    k,
-                    4,
-                    block_size,
-                    mlas_sys::SQNBitComputeType::Int8,
-                    &packed_bytes,
-                    &scales,
-                    None,
+                let make = |comp| {
+                    mlas_sys::SQNBitPackedB::new(n, k, 4, block_size, comp, &packed_bytes, &scales, None)
+                };
+                let (Some(mlas_int8), Some(mlas_fp32)) = (
+                    make(mlas_sys::SQNBitComputeType::Int8),
+                    make(mlas_sys::SQNBitComputeType::Fp32),
                 ) else {
                     eprintln!("MLAS SQNBit int4 kernel unavailable; skipping decode-step probe");
                     return;
@@ -2905,7 +2903,8 @@ mod tests {
                         values: packed_bytes,
                         scales,
                     },
-                    mlas,
+                    mlas_int8,
+                    mlas_fp32,
                 });
             }
         }
@@ -2923,11 +2922,18 @@ mod tests {
                 int4_matmul_m1(&a, &w.int4, &mut out, w.k, w.n, dot_kernel);
             }
         };
-        let run_mlas = || {
+        let run_mlas_int8 = || {
             for w in &built {
                 let a = vec![0.03f32; w.k];
                 let mut out = vec![0.0f32; w.n];
-                mlas_sys::sqnbit_gemm(&w.mlas, 1, &a, None, &mut out, true);
+                mlas_sys::sqnbit_gemm(&w.mlas_int8, 1, &a, None, &mut out, true);
+            }
+        };
+        let run_mlas_fp32 = || {
+            for w in &built {
+                let a = vec![0.03f32; w.k];
+                let mut out = vec![0.0f32; w.n];
+                mlas_sys::sqnbit_gemm(&w.mlas_fp32, 1, &a, None, &mut out, true);
             }
         };
 
@@ -2957,6 +2963,7 @@ mod tests {
             weight_bytes
         );
         step("hand", &run_hand);
-        step("mlas", &run_mlas);
+        step("mlas-int8", &run_mlas_int8);
+        step("mlas-fp32", &run_mlas_fp32);
     }
 }

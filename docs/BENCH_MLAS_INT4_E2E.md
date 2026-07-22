@@ -250,3 +250,15 @@ NUMA-aware weight placement + thread pinning.
   cases (e.g. `bits==4, accuracy_level!=4`) now route to MLAS CompFp32, a
   genuine generic win, while `g_idx` / 2-bit cases MLAS can't serve still fall
   back to the hand path. No model identity is used (rule 2).
+
+### Contiguous bulk-copy fast path for f32 kernel I/O
+
+`to_dense_f32` / `write_dense_f32` walked tensor elements one at a time with
+multi-dim index bookkeeping even for contiguous tensors. In M=1 decode that is
+~2.5M serial (non-parallel) iterations/token across every op's activation read
+and output write. Adding a contiguous row-major bulk-copy fast path
+(`copy_from_slice`) cut the Qwen2.5-Coder-7B decode step from ~104 ms to ~88 ms
+best-case (9.61 -> 11.39 tok/s best; ~+11% median) on the 32-thread run, with
+bit-identical output. Non-contiguous views keep the strided walk. The remaining
+gap to ORT (20.12 tok/s) is per-op Rayon fork-join, executor dispatch, and NUMA
+locality — see the decision note for the ranked cross-crate follow-up.
