@@ -4,9 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T06:20Z — partial rotary blocker resolved and native prefill re-benchmarked._
+_Last updated: 2026-07-22T06:23Z — native proposer contract merged; Qwen0.5B H200 decode benchmarked._
 
 **Current `origin/main` implementation HEAD:** `d28c0fd` (code before this docs update).
+
+## 2026-07-22 — Native proposer contract merged + Qwen0.5B H200 bench
+
+- **Native proposer execution contract ✅ (`96c79d0`):** Batty landed metadata-driven proposer dispatch: `sequence_source` (`input_ids`/`inputs_embeds`), `kv_ownership` (`owned`/`shared`), explicit shared-KV ports, and semantic output roles. Defaults preserve legacy token-id/owned-KV decode; CPU shared-KV proposer plumbing is complete, with CUDA device-buffer aliasing scoped out. (Deckard 🟢)
+- **Qwen2.5-0.5B native CUDA H200 decode:** Gaff measured **437.76 tok/s median** (**2.284 ms/token**) on H200, **15.2% faster** than the user's 380 tok/s RTX 4060 reference and **2.83%** of the H200 weight-bound roofline; output was coherent.
 
 ## 2026-07-22 — Partial rotary (Phi-4-mini) blocker resolved + native prefill re-benchmarked
 
