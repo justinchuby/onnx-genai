@@ -364,9 +364,8 @@ impl Kernel for QMoEKernel {
                     fc3.as_ref(),
                 );
                 let weights = self.host_cache.lease(key, expanded_bytes, || {
-                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref())
+                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), true)
                 })?;
-                metrics().record_dequantized_window(1);
                 if weights.read_from_mmap {
                     let mut bytes_read = fc1
                         .expert_source_bytes(expert)?
@@ -396,7 +395,7 @@ impl Kernel for QMoEKernel {
             }
         } else {
             for (expert, expert_tasks) in tasks {
-                let weights = DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref())?;
+                let weights = DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), false)?;
                 write_grouped_contributions(
                     &mut contributions,
                     &x,
@@ -443,6 +442,7 @@ struct DequantizedExpert {
     fc1: Vec<f32>,
     fc2: Vec<f32>,
     fc3: Option<Vec<f32>>,
+    _residency: Option<DequantizedExpertResidency>,
 }
 
 impl DequantizedExpert {
@@ -451,6 +451,7 @@ impl DequantizedExpert {
         fc1: &QuantizedExperts<'_>,
         fc2: &QuantizedExperts<'_>,
         fc3: Option<&QuantizedExperts<'_>>,
+        track_residency: bool,
     ) -> Result<Self> {
         Ok(Self {
             fc1: fc1.dequantize_expert(expert)?,
@@ -458,6 +459,7 @@ impl DequantizedExpert {
             fc3: fc3
                 .map(|weights| weights.dequantize_expert(expert))
                 .transpose()?,
+            _residency: track_residency.then(DequantizedExpertResidency::new),
         })
     }
 
@@ -481,6 +483,21 @@ impl DequantizedExpert {
             ));
         }
         Ok(bytes)
+    }
+}
+
+struct DequantizedExpertResidency;
+
+impl DequantizedExpertResidency {
+    fn new() -> Self {
+        metrics().record_dequantized_expert_materialized();
+        Self
+    }
+}
+
+impl Drop for DequantizedExpertResidency {
+    fn drop(&mut self) {
+        metrics().record_dequantized_expert_released();
     }
 }
 
@@ -2237,6 +2254,7 @@ mod tests {
             fc1: vec![value],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
 
         for cache in [&engine_a, &engine_b] {
@@ -2266,6 +2284,7 @@ mod tests {
             fc1: vec![value],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
 
         for expert in 0..2 {
@@ -2307,6 +2326,7 @@ mod tests {
             fc1: vec![1.0],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
 
         drop(cache.lease(cache_key(0), 4, 0, || Ok(weights())).unwrap());
@@ -2345,6 +2365,7 @@ mod tests {
             fc1: vec![value],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
         let mut cache = HostExpertCache::default();
 

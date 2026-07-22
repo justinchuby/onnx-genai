@@ -1,9 +1,9 @@
 # First-Class Mixture-of-Experts Support
 
-**Status:** Phase 1 in progress. Mobius implements a standard-operator dense reference
-fallback plus generic typed inference metadata and a synthetic DeepSeek-style
-correctness test. Fused `MoE`/`QMoE`, QMoE packing validation, grouped kernels, and
-expert streaming are **NOT YET IMPLEMENTED**.
+**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP registers
+grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`; quantized kernels
+dequantize active experts route-first. CUDA grouped MoE and the broader Phase 3
+streaming/scheduling work are not claimed complete.
 
 ## 1. Executive recommendation
 
@@ -158,9 +158,10 @@ Relevant existing seams are:
   CUDA attention demonstrates two batched cuBLAS GEMMs around a custom dispatch
   stage on one stream
   ([`attention.rs` lines 21-49](../crates/onnx-runtime-ep-cuda/src/kernels/attention.rs#L21-L49)).
-- The in-tree CPU/CUDA EPs do **not currently register `MatMulNBits`, `MoE`, or
-  `QMoE` kernels**. Today `MatMulNBits` model execution is an ONNX Runtime/other-EP
-  capability documented by the project, not an in-tree grouped-expert kernel.
+- The in-tree CPU EP registers `MatMulNBits`, grouped float `MoE`, integer `QMoE`,
+  and `BlockQuantizedMoE`. Its quantized MoE paths dequantize only routed experts.
+  The in-tree CUDA EP does not yet register grouped `MoE`/`QMoE` kernels; this
+  document makes no CUDA completion claim.
 - The engine owns generation, KV integration, and the Resource Governor
   ([`engine.rs` lines 24-34](../crates/onnx-genai-engine/src/engine.rs#L24-L34),
   [`engine.rs` lines 56-117](../crates/onnx-genai-engine/src/engine.rs#L56-L117)).
