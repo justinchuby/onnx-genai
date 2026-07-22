@@ -124,3 +124,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-21T13:15:00Z — GQA metadata-fold review
 - 🟢 Approved Luv’s batch-1 metadata fold after verifying exact metadata parity, poison/latch safety, capture behavior, portability, zero fallbacks, and the independent throughput win.
 - 2026-07-21T23:55Z — Revised DS-1 with dtype/rank/element-cap materialization gates after Gaff rejection; Pris approved the landed path.
+## 2026-07-22T00:00:00Z — Reviewed BLOCKER #3 int4 zero-point fix
+
+- Holden reviewed Sapper's native CUDA fp16 int4 GEMV explicit-zero-point fix and returned 🟢 GREEN across all five criteria: SM-portability, capture-safety, symmetric no-regress, genericity, and correctness.
+- Validation evidence: 6/6 unit tests and 18/18 `matmul_nbits_gpu` integration tests passed; Sapper's fix merged to main as `48de993`.

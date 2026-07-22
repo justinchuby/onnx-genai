@@ -135,3 +135,7 @@ Recorded MLAS ep-cpu integration (`d696b7a`) and the provenance README correctio
 ## 2026-07-21 — Wave-2 and CI milestone
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
 - 2026-07-21T23:55Z — VLM WP0 metadata, WP3 generic every_step executor, and WP2 correction path were captured; WP2 landed after Pris approval.
+## 2026-07-22T00:00:00Z — BLOCKER #3 explicit int4 zero-points merged
+
+- Sapper fixed native CUDA fp16 int4 GEMV explicit `zero_points` support for asymmetric Phi-4-mini-style MatMulNBits, preserving symmetric zp=8 fast paths and M==1 capture safety.
+- Holden completed the non-author review 🟢 (SM-portability, capture-safety, symmetric no-regress, genericity, correctness); merged to main as `48de993`.

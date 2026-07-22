@@ -5,6 +5,20 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T00-00-00Z-int4-zp -->
+## 2026-07-22 — Phi-4-mini int4 zero-point blocker closure
+
+### Close BLOCKER #3: explicit int4 zero-points in native CUDA fp16 GEMV
+**By:** Sapper; reviewed by Holden 🟢
+**What:** Merged commit `48de993`, threading packed per-block int4 `zero_points` plus `zp_row_bytes` through the native CUDA fp16 GEMV path so asymmetric int4 MatMulNBits models such as Phi-4-mini decode with explicit zero points. Null zero-point inputs preserve the existing symmetric zp=8 fast paths.
+**Why:** Removes BLOCKER #3 with a structural, model-agnostic asymmetric int4 path while keeping M==1 capture safety, SM-portable arithmetic, and symmetric no-regress behavior.
+**Validation:** Holden's non-author review passed all five criteria (SM-portability, capture-safety, symmetric no-regress, genericity, correctness). H200 validation passed 6/6 unit tests and 18/18 `matmul_nbits_gpu` integration tests, including explicit-zp CPU-reference and capture-replay coverage.
+
+### Fold processed int4 zero-point inbox notes
+**By:** Scribe
+**What:** Merged and cleared `sapper-int4-zp.md` and `holden-int4-zp-review.md`.
+**Why:** The implementation and independent green review are now represented in the ledger; unrelated active inbox artifacts remain untouched.
+
 <!-- scribe-merge-2026-07-22T06-17-16Z -->
 ## 2026-07-22 — Native proposer contract and Qwen0.5B H200 benchmark
 
