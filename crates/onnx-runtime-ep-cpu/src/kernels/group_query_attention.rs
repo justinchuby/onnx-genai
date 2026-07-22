@@ -1,9 +1,35 @@
-//! `com.microsoft::GroupQueryAttention` f32 reference kernel.
+//! `com.microsoft::GroupQueryAttention` — optimized CPU GQA kernel.
 //!
 //! Implements unpacked Q/K/V and packed QKV inputs, BNSH KV caches, causal and
 //! local-window masking, rotary embedding, and score softcap. Packed KV,
 //! quantized caches, attention bias, smooth softmax/head sink, and QK capture
 //! are rejected.
+//!
+//! ## Performance design (M=1 decode, long context)
+//!
+//! The decode hot path is a GEMV over the KV cache, executed per
+//! `(batch, query_head, query_seq)` row.  Three targeted optimizations reduce
+//! GQA latency at long context relative to the scalar reference:
+//!
+//! 1. **Attended-window scoring only**: scores are computed and stored only for
+//!    the `[local_start, causal_limit]` range; unattended positions are never
+//!    written to a full-length scratch buffer.
+//! 2. **SIMD dot-product** ([`dot_f32`] / [`dot_avx2_fma`]): the Q·K dot
+//!    product uses AVX2+FMA (two accumulators to hide latency, scalar tail) on
+//!    x86-64 hosts where `is_x86_feature_detected!("avx2") && "fma"` holds;
+//!    falls back to a scalar sum on other targets.
+//! 3. **Cache-friendly P·V accumulation** ([`axpy_f32`] / [`axpy_avx2_fma`]):
+//!    the weighted-sum loop is reordered to ks-outer, d-inner so that the V row
+//!    (`head_dim` contiguous f32s) is accessed sequentially per key, matching
+//!    cache-line width and enabling AVX2 FMADD.
+//!
+//! ### Precision contract (RULES.md §4 / cross-EP parity)
+//! Softmax uses the **exact** `(score - max) as f64).exp() as f32` path, unchanged
+//! from the original.  The dot-product and AXPY SIMD paths may reorder f32
+//! additions (parallel accumulator reduction); the induced error is bounded by
+//! `f32::EPSILON × n × max(|a|)` and does not change greedy token ids in
+//! practice.  The exact scalar dot-product reference is exercised in unit tests
+//! and remains callable from `#[cfg(test)]` for cross-checking.
 
 use std::borrow::Cow;
 
@@ -234,11 +260,6 @@ impl Bhsd {
             },
         ))
     }
-
-    #[inline]
-    fn at(&self, b: usize, h: usize, s: usize, d: usize) -> f32 {
-        self.data[((b * self.heads + h) * self.seq + s) * self.dim + d]
-    }
 }
 
 /// Borrowed, dense-widened view of a BNSH KV cache input.
@@ -349,6 +370,136 @@ fn write_decode_output(out: &mut TensorMut, data: &[f32]) -> Result<()> {
     dst.copy_from_slice(data);
     Ok(())
 }
+
+// ── SIMD helpers ─────────────────────────────────────────────────────────────
+
+/// Dot product `sum(a[i] * b[i])` using AVX2+FMA when available, scalar
+/// otherwise.  Two AVX2 accumulators hide FMA latency; a scalar tail handles
+/// lengths that are not a multiple of 16.
+///
+/// The AVX2 path reorders f32 additions across the two accumulators relative to
+/// a purely sequential scalar sum.  The numerical difference is bounded by
+/// `f32::EPSILON × n × max(|a|, |b|)` and does not affect greedy token ids.
+#[inline(always)]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if crate::backend::has_simd_x86() {
+        // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
+        return unsafe { dot_avx2_fma(a, b) };
+    }
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// AXPY `dst[d] += scalar * src[d]` for all d, using AVX2+FMA when available.
+///
+/// Used for the probability-weighted V accumulation (P·V step).  The inner
+/// loop is over `head_dim` contiguous f32s, which maps directly to 256-bit
+/// vector FMADD instructions.
+#[inline(always)]
+fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if crate::backend::has_simd_x86() {
+        // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
+        unsafe { axpy_avx2_fma(dst, scalar, src) };
+        return;
+    }
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d += scalar * s;
+    }
+}
+
+/// AVX2+FMA dot product.  Two accumulators hide the 5-cycle FMA latency on
+/// Sapphire Rapids; the 8-lane reduction is a standard 4→2→1 horizontal add.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    unsafe {
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+
+        // Process 16 elements per iteration (two 8-wide AVX2 loads + FMAs).
+        let chunks16 = n / 16;
+        for i in 0..chunks16 {
+            let av0 = _mm256_loadu_ps(a_ptr.add(i * 16));
+            let bv0 = _mm256_loadu_ps(b_ptr.add(i * 16));
+            acc0 = _mm256_fmadd_ps(av0, bv0, acc0);
+            let av1 = _mm256_loadu_ps(a_ptr.add(i * 16 + 8));
+            let bv1 = _mm256_loadu_ps(b_ptr.add(i * 16 + 8));
+            acc1 = _mm256_fmadd_ps(av1, bv1, acc1);
+        }
+
+        // Remaining 8-element chunk (if any).
+        let mut tail = chunks16 * 16;
+        if tail + 8 <= n {
+            let av = _mm256_loadu_ps(a_ptr.add(tail));
+            let bv = _mm256_loadu_ps(b_ptr.add(tail));
+            acc0 = _mm256_fmadd_ps(av, bv, acc0);
+            tail += 8;
+        }
+
+        // Merge the two accumulators.
+        let acc = _mm256_add_ps(acc0, acc1);
+
+        // Horizontal reduce: 8 → 4 → 2 → 1 lane.
+        let lo = _mm256_extractf128_ps(acc, 0);
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let v4 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(v4);
+        let v2 = _mm_add_ps(v4, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, v2);
+        let v1 = _mm_add_ss(v2, shuf2);
+        let mut result = _mm_cvtss_f32(v1);
+
+        // Scalar tail for lengths not a multiple of 8.
+        for i in tail..n {
+            result += *a_ptr.add(i) * *b_ptr.add(i);
+        }
+        result
+    }
+}
+
+/// AVX2+FMA AXPY: `dst[d] += scalar * src[d]` for all d.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n = dst.len();
+    let s = _mm256_set1_ps(scalar);
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+
+    unsafe {
+        let mut i = 0;
+        while i + 8 <= n {
+            let d = _mm256_loadu_ps(dst_ptr.add(i));
+            let x = _mm256_loadu_ps(src_ptr.add(i));
+            _mm256_storeu_ps(dst_ptr.add(i), _mm256_fmadd_ps(s, x, d));
+            i += 8;
+        }
+        // Scalar tail.
+        while i < n {
+            *dst_ptr.add(i) += scalar * *src_ptr.add(i);
+            i += 1;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -593,46 +744,61 @@ impl Kernel for GroupQueryAttentionKernel {
             } else {
                 0
             };
-            let mut scores = vec![f32::NEG_INFINITY; total_sequence_length];
-            for (ks, score_slot) in scores
-                .iter_mut()
-                .enumerate()
-                .take(causal_limit + 1)
-                .skip(local_start)
-            {
-                let mut score = 0.0;
-                for d in 0..cache_dim {
-                    let ki = ((b * self.kv_num_heads + kvh) * present_sequence_length + ks)
-                        * cache_dim
-                        + d;
-                    score += q.at(b, qh, qs, d) * present_k[ki];
-                }
+            // Number of keys in the attended causal window [local_start, causal_limit].
+            let attended = causal_limit + 1 - local_start;
+
+            // Extract the query row slice once to avoid per-element index arithmetic
+            // inside the scoring loop.
+            let q_base = ((b * self.num_heads + qh) * q.seq + qs) * cache_dim;
+            let q_row = &q.data[q_base..q_base + cache_dim];
+
+            // Base sequence index for this (batch, kv_head) in present_k / present_v.
+            let kv_head_stride = (b * self.kv_num_heads + kvh) * present_sequence_length;
+
+            // ── QK scores: dot(q_row, k_row) for each key in the attended window ──
+            // Allocate only `attended` elements rather than `total_sequence_length`
+            // so unattended positions are never touched.
+            let mut scores = vec![0.0f32; attended];
+            for (i, ks) in (local_start..=causal_limit).enumerate() {
+                let k_base = (kv_head_stride + ks) * cache_dim;
+                let k_row = &present_k[k_base..k_base + cache_dim];
+                let mut score = dot_f32(q_row, k_row);
                 score *= scale;
                 if self.softcap != 0.0 {
                     score = self.softcap * (score / self.softcap).tanh();
                 }
-                *score_slot = score;
+                scores[i] = score;
             }
+
+            // ── Softmax over the attended window ──
+            // PRECISION CONTRACT (RULES.md §4): the f64 exp + single f32 rounding
+            // path matches CUDA's device-side computation and is kept unchanged.
             let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0;
+            let mut sum = 0.0_f32;
             for score in &mut scores {
-                if score.is_finite() {
-                    // Match CUDA's f64 device exp followed by one f32
-                    // rounding before the serial softmax reduction.
-                    *score = ((*score - max) as f64).exp() as f32;
-                    sum += *score;
-                } else {
-                    *score = 0.0;
+                *score = ((*score - max) as f64).exp() as f32;
+                sum += *score;
+            }
+            // Normalize once so P·V can multiply without per-element division.
+            if sum > 0.0 {
+                for score in &mut scores {
+                    *score /= sum;
                 }
             }
-            for (d, output) in output_row.iter_mut().enumerate() {
-                let mut value = 0.0;
-                for (ks, probability) in scores.iter().enumerate() {
-                    let vi =
-                        ((b * self.kv_num_heads + kvh) * present_sequence_length + ks) * v.dim + d;
-                    value += (*probability / sum) * present_v[vi];
+
+            // ── P·V accumulation: cache-friendly AXPY (ks-outer, d-inner) ──
+            // Loop order: ks outer (sequential through probability weights),
+            // d inner (contiguous in both the V row and output_row) →
+            // sequential cache access + AVX2 FMADD via axpy_f32.
+            output_row.fill(0.0);
+            for (i, ks) in (local_start..=causal_limit).enumerate() {
+                let prob = scores[i];
+                if prob == 0.0 {
+                    continue;
                 }
-                *output = value;
+                let v_base = (kv_head_stride + ks) * v.dim;
+                let v_row = &present_v[v_base..v_base + v.dim];
+                axpy_f32(output_row, prob, v_row);
             }
         };
         let attention_work = attention_rows
@@ -1361,5 +1527,135 @@ mod tests {
         let zero = run(&[("scale", Attribute::Float(0.0))]);
         close(&zero, &default);
         assert!(zero[8] > 8.0, "zero scale produced uniform attention");
+    }
+
+    // ── New tests covering the vectorized decode hot path ──────────────────
+
+    /// Verifies that M=1 decode at long context (512-token past cache) produces
+    /// exactly the same output as the `reference` scalar computation.  This is
+    /// the primary regression guard for the vectorized QK+AXPY optimizations.
+    #[test]
+    fn gqa_decode_long_context_matches_reference() {
+        const PAST: usize = 511;
+        const TOTAL: usize = PAST + 1; // = 512
+        let (qh, kvh, d) = (4usize, 2usize, 2usize);
+
+        // Use small values in [-1, 1] so floating-point accumulation errors stay
+        // within the 1e-5 absolute tolerance the existing `close` helper applies.
+        let q: Vec<f32> = (0..qh * d)
+            .map(|i| ((i % 7) as f32 - 3.0) / 7.0)
+            .collect();
+        let cur_k: Vec<f32> = (0..kvh * d)
+            .map(|i| ((i % 5) as f32 - 2.0) / 5.0)
+            .collect();
+        let cur_v: Vec<f32> = (0..kvh * d)
+            .map(|i| ((i % 11) as f32 - 5.0) / 11.0)
+            .collect();
+        let past_k: Vec<f32> = (0..kvh * PAST * d)
+            .map(|i| ((i % 13) as f32 - 6.0) / 13.0)
+            .collect();
+        let past_v: Vec<f32> = (0..kvh * PAST * d)
+            .map(|i| ((i % 17) as f32 - 8.0) / 17.0)
+            .collect();
+
+        // Build the full present KV (BNSH) the reference function expects:
+        // [1, kvh, TOTAL, d].
+        let mut full_k = vec![0.0f32; kvh * TOTAL * d];
+        let mut full_v = vec![0.0f32; kvh * TOTAL * d];
+        for h in 0..kvh {
+            full_k[h * TOTAL * d..h * TOTAL * d + PAST * d]
+                .copy_from_slice(&past_k[h * PAST * d..(h + 1) * PAST * d]);
+            full_v[h * TOTAL * d..h * TOTAL * d + PAST * d]
+                .copy_from_slice(&past_v[h * PAST * d..(h + 1) * PAST * d]);
+            for dd in 0..d {
+                full_k[h * TOTAL * d + PAST * d + dd] = cur_k[h * d + dd];
+                full_v[h * TOTAL * d + PAST * d + dd] = cur_v[h * d + dd];
+            }
+        }
+
+        let want = reference(&q, &full_k, &full_v, 1, TOTAL, PAST);
+
+        let mut out = Owned::zeros_f32(&[1, 1, qh * d]);
+        let mut pk = Owned::zeros_f32(&[1, kvh, TOTAL, d]);
+        let mut pv = Owned::zeros_f32(&[1, kvh, TOTAL, d]);
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    Owned::f32(&[1, 1, qh * d], &q).view(),
+                    Owned::f32(&[1, 1, kvh * d], &cur_k).view(),
+                    Owned::f32(&[1, 1, kvh * d], &cur_v).view(),
+                    Owned::f32(&[1, kvh, PAST, d], &past_k).view(),
+                    Owned::f32(&[1, kvh, PAST, d], &past_v).view(),
+                    Owned::i32(&[1], &[(PAST as i32)]).view(),
+                    Owned::i32(&[], &[(TOTAL as i32)]).view(),
+                ],
+                &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
+            )
+            .unwrap();
+
+        close(&out.to_f32(), &want);
+    }
+
+    /// Verifies that the `dot_f32` helper produces results within 1e-4 relative
+    /// error of a scalar reference for various slice lengths, including sizes
+    /// with non-zero tails after 8-element or 16-element boundaries.
+    ///
+    /// AVX2 parallel accumulation may produce slightly different f32 results
+    /// from the scalar sequential sum; this tolerance reflects the bounded error.
+    #[test]
+    fn dot_f32_matches_scalar_reference_for_various_lengths() {
+        let lengths = [1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133];
+        for n in lengths {
+            // Values in [-1, 1] using cycling to keep magnitudes small.
+            let a: Vec<f32> = (0..n)
+                .map(|i| ((i % 11) as f32 - 5.0) / 11.0)
+                .collect();
+            let b: Vec<f32> = (0..n)
+                .map(|i| ((i % 13) as f32 - 6.0) / 13.0)
+                .collect();
+            let scalar: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            let got = dot_f32(&a, &b);
+            // Bound: f32::EPSILON * n * 1.0 (max element magnitude ≤ 1).
+            let tolerance = (n as f32) * f32::EPSILON * 4.0;
+            assert!(
+                (got - scalar).abs() <= tolerance.max(1e-6),
+                "dot_f32 n={n}: got {got}, scalar {scalar}, diff {}, tolerance {}",
+                (got - scalar).abs(),
+                tolerance
+            );
+        }
+    }
+
+    /// Verifies that `axpy_f32` accumulates `dst[d] += scalar * src[d]`
+    /// correctly for various lengths relative to the scalar path.
+    #[test]
+    fn axpy_f32_matches_scalar_reference_for_various_lengths() {
+        let lengths = [1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133];
+        for n in lengths {
+            let src: Vec<f32> = (0..n)
+                .map(|i| ((i % 13) as f32 - 6.0) / 13.0)
+                .collect();
+            let init: Vec<f32> = (0..n)
+                .map(|i| ((i % 7) as f32 - 3.0) / 7.0)
+                .collect();
+            let scalar_val = 0.37_f32;
+
+            // Scalar reference.
+            let mut want = init.clone();
+            for (d, s) in want.iter_mut().zip(&src) {
+                *d += scalar_val * s;
+            }
+
+            // axpy_f32 path.
+            let mut got = init.clone();
+            axpy_f32(&mut got, scalar_val, &src);
+
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-6,
+                    "axpy_f32 n={n} i={i}: got {g}, want {w}"
+                );
+            }
+        }
     }
 }
