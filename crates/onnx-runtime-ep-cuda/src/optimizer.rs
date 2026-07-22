@@ -1,4 +1,6 @@
-use onnx_runtime_ir::{Attribute, DataType, Graph, NodeId, ValueId};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape,
+};
 use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
@@ -61,10 +63,219 @@ pub(crate) struct CudaSwiGluFusion;
 
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
+        Box::new(CudaFoldConstantTranspose),
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
     ]
+}
+
+/// Fold a `Transpose` whose sole input is a constant initializer (weight) into
+/// a pre-transposed constant initializer, deleting the per-step `Transpose`.
+///
+/// This is a classic generic rewrite driven purely by **topology + tensor
+/// roles**, never by model identity: any `Transpose(const)` — a `Transpose`
+/// node in the default/`ai.onnx` domain whose single input is a producer-less
+/// graph initializer — is materialized once at EP claim/compile time into a new
+/// inline initializer holding the permuted bytes, and its consumers are rewired
+/// to that constant. The permutation is applied element-wise over the raw
+/// little-endian bytes, so it is correct for every whole-byte element type and
+/// any rank/`perm`.
+///
+/// The motivating case is a tied embedding / output head: an fp16 embedding
+/// weight `[vocab, hidden]` is both `Gather`-ed for input embeddings and, for
+/// the language-model head, `Transpose`-d to `[hidden, vocab]` and fed to a
+/// dense `MatMul` every decode step. Re-transposing a multi-hundred-MB weight on
+/// every token dominates native decode. Folding hoists that transpose out of the
+/// step entirely. The original initializer is left intact for its other
+/// consumers (e.g. the `Gather`), so tied weights stay correct.
+///
+/// Correctness guards (all shape/dtype-driven, no magic dimensions):
+/// * single input, single output, default (`""`/`ai.onnx`) domain;
+/// * input is a producer-less graph initializer with a fully static shape;
+/// * element type is whole-byte (`byte_size > 0`, not sub-byte packed) so a
+///   byte-wise permutation is exact — sub-byte packed weights are left untouched;
+/// * `perm` (when present) is a valid permutation of the input axes; otherwise
+///   the ONNX default (reversed axes) is used.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaFoldConstantTranspose;
+
+struct TransposeFoldPlan {
+    node: NodeId,
+    output: ValueId,
+    dtype: DataType,
+    out_dims: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl OptimizationPass for CudaFoldConstantTranspose {
+    fn name(&self) -> &str {
+        "CudaFoldConstantTranspose"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Transpose"
+                    && matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<TransposeFoldPlan> = Vec::new();
+        for node_id in candidates {
+            if let Some(plan) = self.plan_fold(graph, ctx, node_id) {
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // Delete the Transpose; its output value survives because a consumer
+            // (or graph-output slot) still references it, mirroring the generic
+            // ConstantFolding rewrite. Then retype the surviving value to the
+            // transposed shape and back it with the materialized constant.
+            graph.remove_node(plan.node);
+            if graph.try_value(plan.output).is_none() {
+                continue;
+            }
+            let value = graph.value_mut(plan.output);
+            value.dtype = plan.dtype;
+            value.shape = static_shape(plan.out_dims.clone());
+            let tensor = TensorData::from_raw(plan.dtype, plan.out_dims, plan.bytes);
+            graph.set_initializer(plan.output, WeightRef::Inline(tensor));
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaFoldConstantTranspose {
+    fn plan_fold(
+        &self,
+        graph: &Graph,
+        ctx: &PassContext,
+        node_id: NodeId,
+    ) -> Option<TransposeFoldPlan> {
+        let node = graph.try_node(node_id)?;
+        let input = node.inputs[0]?;
+        let output = node.outputs[0];
+
+        // The input must be an immutable, producer-less constant initializer.
+        if graph.try_value(input)?.producer.is_some() {
+            return None;
+        }
+        let weight = graph.initializers.get(&input)?;
+        let dtype = weight.dtype();
+
+        // Byte-wise permutation is only exact for whole-byte element types.
+        // Sub-byte packed weights (int4/uint4/…) and string/undefined tensors
+        // are left for a dtype-aware path rather than risk a wrong constant.
+        let elem = dtype.byte_size();
+        if elem == 0 || dtype.is_sub_byte() {
+            return None;
+        }
+
+        let dims = weight.dims().to_vec();
+        let rank = dims.len();
+        let perm = transpose_perm(node, rank)?;
+
+        let src = ctx.initializer_bytes(weight)?;
+        let expected = dims.iter().product::<usize>().checked_mul(elem)?;
+        if src.len() != expected {
+            return None;
+        }
+
+        let out_dims: Vec<usize> = perm.iter().map(|&p| dims[p]).collect();
+        let bytes = permute_bytes(src, &dims, &perm, elem);
+
+        Some(TransposeFoldPlan {
+            node: node_id,
+            output,
+            dtype,
+            out_dims,
+            bytes,
+        })
+    }
+}
+
+/// Resolve a `Transpose` node's permutation, defaulting to the ONNX reversed
+/// axes when `perm` is absent. Returns `None` if `perm` is present but not a
+/// valid permutation of `0..rank`.
+fn transpose_perm(node: &onnx_runtime_ir::Node, rank: usize) -> Option<Vec<usize>> {
+    match node.attr("perm").and_then(Attribute::as_ints) {
+        None => Some((0..rank).rev().collect()),
+        Some(perm) => {
+            if perm.len() != rank {
+                return None;
+            }
+            let mut axes: Vec<usize> = Vec::with_capacity(rank);
+            let mut seen = vec![false; rank];
+            for &p in perm {
+                let p = usize::try_from(p).ok()?;
+                if p >= rank || seen[p] {
+                    return None;
+                }
+                seen[p] = true;
+                axes.push(p);
+            }
+            Some(axes)
+        }
+    }
+}
+
+/// Materialize the transposed bytes for a row-major dense tensor.
+///
+/// Output axis `i` maps to input axis `perm[i]`; the element bytes are copied
+/// verbatim, so this is correct for any whole-byte element type. An odometer
+/// over the output coordinates advances the input offset incrementally, keeping
+/// the cost a single linear pass with no per-element division.
+fn permute_bytes(src: &[u8], dims: &[usize], perm: &[usize], elem: usize) -> Vec<u8> {
+    let rank = dims.len();
+    let out_dims: Vec<usize> = perm.iter().map(|&p| dims[p]).collect();
+    let total: usize = out_dims.iter().product();
+    let mut dst = vec![0u8; total * elem];
+    if total == 0 {
+        return dst;
+    }
+
+    // Row-major input strides (in elements), then the stride each *output* axis
+    // walks through the input.
+    let mut in_strides = vec![0usize; rank];
+    let mut stride = 1usize;
+    for axis in (0..rank).rev() {
+        in_strides[axis] = stride;
+        stride *= dims[axis];
+    }
+    let out_in_stride: Vec<usize> = perm.iter().map(|&p| in_strides[p]).collect();
+
+    let mut coord = vec![0usize; rank];
+    let mut in_off = 0usize;
+    for out_index in 0..total {
+        let dst_off = out_index * elem;
+        let src_off = in_off * elem;
+        dst[dst_off..dst_off + elem].copy_from_slice(&src[src_off..src_off + elem]);
+
+        // Advance the odometer (last output axis fastest).
+        for axis in (0..rank).rev() {
+            coord[axis] += 1;
+            in_off += out_in_stride[axis];
+            if coord[axis] == out_dims[axis] {
+                coord[axis] = 0;
+                in_off -= out_in_stride[axis] * out_dims[axis];
+            } else {
+                break;
+            }
+        }
+    }
+    dst
 }
 
 /// Fold a standalone `Add(MatMulNBits(x), bias)` into the `MatMulNBits` bias
@@ -591,6 +802,250 @@ mod tests {
     // === QKV bias fold ===
 
     use onnx_runtime_ir::{TensorData, WeightRef};
+
+    // === Constant Transpose fold ===
+
+    /// Build a graph: `Transpose(const [rows, cols], perm) -> Identity consumer`,
+    /// with the constant provided as an inline fp16 initializer whose element
+    /// `(r, c)` holds `r * cols + c`. Model-agnostic: nothing is named after any
+    /// architecture.
+    fn const_transpose_graph(rows: usize, cols: usize, perm: Option<Vec<i64>>) -> (Graph, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let weight = graph.create_named_value(
+            "weight",
+            DataType::Float16,
+            vec![Dim::Static(rows), Dim::Static(cols)],
+        );
+        let mut bytes = Vec::with_capacity(rows * cols * 2);
+        for r in 0..rows {
+            for c in 0..cols {
+                let v = half::f16::from_f32((r * cols + c) as f32);
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![rows, cols],
+                bytes,
+            )),
+        );
+
+        let transposed = graph.create_named_value(
+            "transposed",
+            DataType::Float16,
+            vec![Dim::Static(cols), Dim::Static(rows)],
+        );
+        let mut node = Node::new(NodeId(0), "Transpose", vec![Some(weight)], vec![transposed]);
+        if let Some(perm) = perm {
+            node.attributes.insert("perm".into(), Attribute::Ints(perm));
+        }
+        graph.insert_node(node);
+
+        // A consumer keeps the transposed value live (so it survives folding).
+        let out = graph.create_named_value(
+            "out",
+            DataType::Float16,
+            vec![Dim::Static(cols), Dim::Static(rows)],
+        );
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(transposed)],
+            vec![out],
+        ));
+        graph.add_output(out);
+        (graph, transposed)
+    }
+
+    fn f16_at(bytes: &[u8], index: usize) -> f32 {
+        half::f16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]).to_f32()
+    }
+
+    fn static_shape_of(graph: &Graph, value: ValueId) -> Vec<usize> {
+        onnx_runtime_ir::as_static_shape(&graph.value(value).shape).unwrap()
+    }
+
+    #[test]
+    fn folds_constant_transpose_into_initializer() {
+        let (mut graph, transposed) = const_transpose_graph(3, 4, Some(vec![1, 0]));
+        assert!(graph.value(transposed).producer.is_some());
+
+        CudaFoldConstantTranspose
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(graph.nodes.values().all(|node| node.op_type != "Transpose"));
+        let value = graph.value(transposed);
+        assert!(value.producer.is_none());
+        assert_eq!(static_shape_of(&graph, transposed), vec![4, 3]);
+        let WeightRef::Inline(tensor) = graph.initializers.get(&transposed).unwrap() else {
+            panic!("expected inline initializer");
+        };
+        assert_eq!(tensor.dims, vec![4, 3]);
+        // Original element (r, c) held r*4 + c; after transpose the [4, 3] tensor
+        // at flat index c*3 + r must equal r*4 + c.
+        for r in 0..3usize {
+            for c in 0..4usize {
+                assert_eq!(f16_at(&tensor.data, c * 3 + r), (r * 4 + c) as f32);
+            }
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_constant_transpose_default_perm() {
+        // No perm attribute → ONNX default (reverse axes), i.e. [1, 0] for 2-D.
+        let (mut graph, transposed) = const_transpose_graph(2, 5, None);
+        CudaFoldConstantTranspose
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(graph.nodes.values().all(|node| node.op_type != "Transpose"));
+        assert_eq!(static_shape_of(&graph, transposed), vec![5, 2]);
+    }
+
+    #[test]
+    fn leaves_transpose_of_non_constant() {
+        // A Transpose whose input is a graph input (not an initializer) must not
+        // be folded — its bytes are only known at run time.
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input =
+            graph.create_named_value("x", DataType::Float16, vec![Dim::Static(3), Dim::Static(4)]);
+        graph.add_input(input);
+        let out =
+            graph.create_named_value("y", DataType::Float16, vec![Dim::Static(4), Dim::Static(3)]);
+        let mut node = Node::new(NodeId(0), "Transpose", vec![Some(input)], vec![out]);
+        node.attributes
+            .insert("perm".into(), Attribute::Ints(vec![1, 0]));
+        graph.insert_node(node);
+        graph.add_output(out);
+
+        CudaFoldConstantTranspose
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "Transpose")
+                .count(),
+            1
+        );
+        assert!(!graph.initializers.contains_key(&out));
+    }
+
+    #[test]
+    fn leaves_sub_byte_constant_transpose() {
+        // Sub-byte packed weights cannot be byte-permuted; the pass must skip
+        // them rather than emit a wrong constant.
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let weight =
+            graph.create_named_value("w", DataType::Int4, vec![Dim::Static(4), Dim::Static(4)]);
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int4,
+                vec![4, 4],
+                vec![0u8; 8],
+            )),
+        );
+        let out =
+            graph.create_named_value("wt", DataType::Int4, vec![Dim::Static(4), Dim::Static(4)]);
+        let mut node = Node::new(NodeId(0), "Transpose", vec![Some(weight)], vec![out]);
+        node.attributes
+            .insert("perm".into(), Attribute::Ints(vec![1, 0]));
+        graph.insert_node(node);
+        let consumer_out =
+            graph.create_named_value("o", DataType::Int4, vec![Dim::Static(4), Dim::Static(4)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(out)],
+            vec![consumer_out],
+        ));
+        graph.add_output(consumer_out);
+
+        CudaFoldConstantTranspose
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "Transpose")
+                .count(),
+            1,
+            "sub-byte Transpose must be left intact"
+        );
+    }
+
+    #[test]
+    fn folds_rank3_constant_transpose() {
+        // Generic over rank: permute a [2, 3, 4] fp16 constant with perm [2, 0, 1].
+        let (rows, mid, cols) = (2usize, 3usize, 4usize);
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let weight = graph.create_named_value(
+            "w",
+            DataType::Float16,
+            vec![Dim::Static(rows), Dim::Static(mid), Dim::Static(cols)],
+        );
+        let mut bytes = Vec::new();
+        for i in 0..rows * mid * cols {
+            bytes.extend_from_slice(&half::f16::from_f32(i as f32).to_le_bytes());
+        }
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![rows, mid, cols],
+                bytes,
+            )),
+        );
+        let out = graph.create_named_value(
+            "wt",
+            DataType::Float16,
+            vec![Dim::Static(cols), Dim::Static(rows), Dim::Static(mid)],
+        );
+        let mut node = Node::new(NodeId(0), "Transpose", vec![Some(weight)], vec![out]);
+        node.attributes
+            .insert("perm".into(), Attribute::Ints(vec![2, 0, 1]));
+        graph.insert_node(node);
+        let consumer_out = graph.create_named_value(
+            "o",
+            DataType::Float16,
+            vec![Dim::Static(cols), Dim::Static(rows), Dim::Static(mid)],
+        );
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(out)],
+            vec![consumer_out],
+        ));
+
+        CudaFoldConstantTranspose
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        let WeightRef::Inline(tensor) = graph.initializers.get(&out).unwrap() else {
+            panic!("expected inline initializer");
+        };
+        assert_eq!(tensor.dims, vec![cols, rows, mid]);
+        // out[c, r, m] == in[r, m, c] == r*(mid*cols) + m*cols + c
+        for c in 0..cols {
+            for r in 0..rows {
+                for m in 0..mid {
+                    let out_flat = (c * rows + r) * mid + m;
+                    let expected = (r * mid + m) * cols + c;
+                    assert_eq!(f16_at(&tensor.data, out_flat), expected as f32);
+                }
+            }
+        }
+    }
 
     fn vec1d(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(width)])

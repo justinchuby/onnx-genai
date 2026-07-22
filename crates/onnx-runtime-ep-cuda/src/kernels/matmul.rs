@@ -15,13 +15,68 @@
 //!   a missing feature)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
-use crate::error::not_implemented;
+use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+/// NVRTC module/entry for the dense fp16 decode GEMV (see [`GEMV_F16_SRC`]).
+const GEMV_F16_MODULE: &str = "matmul_dense_gemv_f16";
+const GEMV_F16_ENTRY: &str = "matmul_dense_gemv_f16";
+/// Threads per block for the dense fp16 GEMV. One thread owns one output
+/// column, so a warp reads 32 consecutive `B[k, col]` fp16 values — a fully
+/// coalesced 64-byte transaction per step. 256 gives good occupancy without
+/// oversubscribing shared memory.
+const GEMV_F16_THREADS: u32 = 256;
+
+/// Bandwidth-bound dense fp16 GEMV `y[1, N] = a[1, K] * B[K, N]` for the M==1
+/// decode step (e.g. an fp16 language-model head).
+///
+/// Kernel shape: one thread per output column `col`; a block of
+/// [`GEMV_F16_THREADS`] threads cooperatively stages `blockDim.x` activation
+/// elements into shared memory per K-tile, then every thread reads its column's
+/// `B[k, col]` fp16 weight straight from global memory. Consecutive threads read
+/// consecutive `col`, so each warp issues one coalesced load, giving a single
+/// streaming pass over `B` at ≈ HBM roofline. Accumulation is fp32 (matching the
+/// cuBLASLt path's true-fp32 accumulate) and the result is rounded to fp16 once.
+/// The tiled activation staging bounds shared memory to `blockDim.x` floats for
+/// any `K`, and the `col < n` guard makes any `N` safe — no magic dimensions, so
+/// this fires for every dense fp16 M==1 MatMul regardless of model.
+const GEMV_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+extern "C" __global__ void matmul_dense_gemv_f16(
+    const __half* __restrict__ a,   // [K]
+    const __half* __restrict__ b,   // [K, N] row-major
+    __half* __restrict__ y,         // [N]
+    const int k,
+    const int n)
+{
+    extern __shared__ float a_tile[];   // blockDim.x floats
+    const int col = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += (int)blockDim.x) {
+        const int kk = k0 + (int)threadIdx.x;
+        a_tile[threadIdx.x] = (kk < k) ? __half2float(a[kk]) : 0.0f;
+        __syncthreads();
+        const int tile = min((int)blockDim.x, k - k0);
+        if (col < n) {
+            for (int j = 0; j < tile; ++j) {
+                acc += a_tile[j] * __half2float(b[(long)(k0 + j) * n + col]);
+            }
+        }
+        __syncthreads();
+    }
+    if (col < n) {
+        y[col] = __float2half(acc);
+    }
+}
+"#;
 
 /// Factory for [`MatMulKernel`]; carries the shared CUDA runtime.
 pub struct MatMulFactory {
@@ -32,13 +87,20 @@ impl KernelFactory for MatMulFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(MatMulKernel {
             runtime: self.runtime.clone(),
+            last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
 
-/// cuBLASLt-backed f32/f16/bf16 MatMul kernel.
+/// cuBLASLt-backed f32/f16/bf16 MatMul kernel with a capturable dense fp16 GEMV
+/// fast path for the M==1 decode step.
 pub struct MatMulKernel {
     runtime: Arc<CudaRuntime>,
+    /// Set after every [`execute`](Kernel::execute) to record whether the call
+    /// took the allocation- and sync-free GEMV fast path (capture-safe) or the
+    /// cuBLASLt path (per-call workspace + heuristic, not capturable). Mirrors
+    /// the `MatMulNBits` decode GEMV capture contract.
+    last_call_capture_safe: AtomicBool,
 }
 
 /// Map an ONNX element type to a cuBLASLt GEMM dtype.
@@ -223,6 +285,21 @@ impl MatMulKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const std::ffi::c_void);
         let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const std::ffi::c_void);
 
+        // Bandwidth-bound decode fast path: a single fp16 `y[1, N] = a[1, K] *
+        // B[K, N]` (no batching). cuBLASLt's M==1 GEMV leaves HBM idle *and* is
+        // non-capturable (per-call workspace + heuristic query). The dedicated
+        // GEMV kernel streams `B` once, coalesced, with no allocation or sync,
+        // so it approaches roofline and folds into the decode CUDA graph. The
+        // gate is purely structural (dtype + M==1 + single matrix), never a
+        // model dimension.
+        if dtype == GemmDtype::F16 && plan.m == 1 && plan.batch_shape.iter().product::<usize>() == 1
+        {
+            self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?;
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+
         let workspace = self.runtime.alloc_raw(WORKSPACE_BYTES)?;
         let elem_bytes = a.dtype.byte_size();
         let a_matrix_bytes = plan.m * plan.k * elem_bytes;
@@ -265,6 +342,51 @@ impl MatMulKernel {
         let free = unsafe { self.runtime.free_raw(workspace) };
         result.and(free)
     }
+
+    /// Launch the dense fp16 GEMV (`GEMV_F16_SRC`) on the runtime stream.
+    ///
+    /// Allocation- and synchronization-free: one thread per output column,
+    /// `blockDim.x` floats of launch-time shared memory, fixed grid geometry
+    /// from `(k, n)`. This is legal to record into and replay from a CUDA graph.
+    fn launch_dense_gemv_f16(
+        &self,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMul fp16 GEMV")?;
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, GEMV_F16_ENTRY)?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep MatMul: K={k} exceeds i32")))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| EpError::KernelFailed(format!("cuda_ep MatMul: N={n} exceeds i32")))?;
+        let shared_mem_bytes = GEMV_F16_THREADS * std::mem::size_of::<f32>() as u32;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&a_ptr)
+            .arg(&b_ptr)
+            .arg(&c_ptr)
+            .arg(&k_i32)
+            .arg(&n_i32);
+        // SAFETY: pointers address contiguous fp16 `a[K]`, `B[K, N]`, and `y[N]`
+        // buffers validated by the caller; the scalar ABI matches the entry
+        // point. The launch uses only registers and launch-time shared memory,
+        // with no per-call allocation or synchronization, so it is capture-safe.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(GEMV_F16_THREADS), 1, 1),
+                block_dim: (GEMV_F16_THREADS, 1, 1),
+                shared_mem_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMul fp16 GEMV", err))
+    }
 }
 
 impl Kernel for MatMulKernel {
@@ -278,9 +400,18 @@ impl Kernel for MatMulKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "per-call workspace allocation/free and heuristic query are not capturable",
-        )
+        // The dense fp16 M==1 GEMV fast path uses only launch-time shared memory
+        // and fixed geometry — no per-call allocation, D2H, or synchronization —
+        // so it is capture-safe. The cuBLASLt path (per-call workspace + heuristic
+        // query) is not; advertise capture only when the last call took the GEMV.
+        if self.last_call_capture_safe.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires the dense fp16 M==1 GEMV fast path; the cuBLASLt path's \
+                 per-call workspace allocation/free and heuristic query are not capturable",
+            )
+        }
     }
 }
 
