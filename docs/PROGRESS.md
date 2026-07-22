@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T03:37Z — GQA scalar `seqlens_k` support and int8 fp16 default-zero-point parity coverage landed. The GQA fix unblocks Phi-4-mini and Qwen2.5-1.5B native decode._
+_Last updated: 2026-07-22T04:39Z — CPU fp16/bf16 SimplifiedLayerNormalization, stale live-shape recompute, fp16 MatMulNBits prefill GEMM, and the stale nbits test fix landed._
 
-**Current `origin/main` implementation HEAD:** `d653879` (code); `ba86625` (docs).
+**Current `origin/main` implementation HEAD:** `54b49eb` (code before this docs update).
+
+## 2026-07-22 — CPU SLN + stale live-shape + fp16 MatMulNBits prefill GEMM merged
+
+- **fp16 MatMulNBits M>1 prefill GEMM ✅ (`54b49eb`):** Sapper added a portable tiled CUDA-core fp16-activation MatMulNBits GEMM for int4/int8 block-32 prompt rows, with f64-oracle parity and unchanged capture-safe M=1 decode. This enables native multi-token prefill. (Batty 🟢)
+- **Live elementwise output-shape recompute ✅ (`79b2bfc`):** Pris now recomputes standard elementwise broadcast output shapes from concrete runtime inputs before allocation, with actionable equal-or-one failures. This unblocks GLM-5.2-tiny data-dependent indexer `Add` nodes. (Leon 🟢)
+- **CPU SimplifiedLayerNormalization floating dtypes ✅ (`74a80ce`):** Deckard widened fp16/bf16/f32/f64 inputs and scales to f32 for RMS accumulation, then narrows outputs to declared dtypes. This unblocks Qwen2.5/Phi-4-mini CPU decode at `input_layernorm`. (Gaff 🟢)
+- **MatMulNBits bit-width test refresh ✅ (`764a208`):** Hudson updated stale CPU factory coverage to reject `bits=3`, assert the current `{2,4,8}` contract, and positively cover `bits=8`, restoring the CPU suite after int8 support landed.
 
 ## 2026-07-22 — GQA scalar seqlens_k + int8 fp16 default-zp test merged
 
