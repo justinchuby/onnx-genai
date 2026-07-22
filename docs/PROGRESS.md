@@ -15,12 +15,16 @@ _Last updated: 2026-07-22T17:55Z — VLM metadata/runtime/admission landings and
 - **VLM WP3 every-step executor ✅ (`3aec9f3`, `7c82127`):** `crates/onnx-genai-engine/src/pipeline.rs` now runs generic metadata-driven/topological every-step components, replacing the embedding special case; `decode.rs` was untouched.
 - **Optional-modality runtime ✅ (`a71c6f3`, `bdf59b4`, `fc3a011`):** schema, engine runtime, and docs landed for absent-modality fallbacks and `when_present` component gating.
 - **VLM admission gate (WP-C) ✅ (`a72674d`, `96deea2`, `f3fd686`, `d02e400`):** package load now rejects non-executable pipelines using metadata-driven admission and raw graph port-name validation, with docs recorded.
-- **Gemma4 E2B text decode validation 🟡 (`squad/joi-gemma4-e2b`, not merged):** `PipelineEngine` + ORT CUDA on H200 generated the correct output, `"The capital of France is Paris."`, at **140.09 tok/s median**. The pure-Rust native pipeline path is not complete yet for the larger two-stage model with per-layer inputs.
+- **Gemma4 E2B text decode validation ✅:** `PipelineEngine` + ORT CUDA on H200 generated the correct output, `"The capital of France is Paris."`, at **140.09 tok/s median**. Pipeline profiling and the full benchmark report are now landed; the pure-Rust native pipeline path remains incomplete for the larger two-stage model with per-layer inputs.
 - **VLM WP2 image processor 🔄:** the generic multi-output image processor in `crates/onnx-genai-preprocess/src/image.rs` is in revision after the first attempt was rejected; do not count it as landed yet.
 
 ## 2026-07-22 — H200 native CUDA decode benchmark report
 
 - **Qwen2.5-0.5B H200 graph decode ✅:** Native CUDA device-KV with whole-step graph replay reached **820.65 tok/s** at 128 tokens and **781.20 tok/s** at 1024 tokens, or **92.6%/88.2%** of the supplied 886 tok/s roofline and **2.16x/2.06x** vs the 380 tok/s RTX 4060 baseline. Graph-off token-identical runs were 434.14/427.65 tok/s; Phi-4-mini graph-on held **94.50/93.19 tok/s**. Full report: `docs/benchmarks/h200-native-decode-2026-07-22.md`.
+
+## 2026-07-22 — Gemma4 E2B native-package text E2E on H200
+
+- **Coherent four-model text decode ✅ (ORT CUDA pipeline):** the Mobius E2B package executed the metadata-declared every-step `embedding -> decoder` chain, refreshing both `inputs_embeds` and `per_layer_inputs`, and generated `"The capital of France is **Paris**."` at **140.09 tok/s median** (**7.138 ms/token**, 5 runs, 2 warmups, skip 8). A generic metadata overlay supplied absent image/audio zero tensors and presence gates because the package predates Mobius optional-modality PR #419. `profile_native` now supports pipeline profiling/steady windows and refuses false CUDA measurements when linked ORT lacks `CUDAExecutionProvider`. Pure-Rust multi-model execution remains blocked by the explicit native-pipeline rejection in `pipeline.rs`; ORT 1.27 also needs its optimized attention paths disabled for this valid fp16 GQA graph. Full report: `docs/benchmarks/gemma4-e2b-native-2026-07-22.md`.
 
 ## 2026-07-22 — WP-B optional-modality contract landings
 

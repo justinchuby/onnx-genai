@@ -8,9 +8,10 @@ use clap::{Parser, ValueEnum};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
-    NativeDecodeDevice, NativeDecodeSession, ProcessorChain,
+    NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
+    ProcessorChain,
 };
-use onnx_genai_ort::Tokenizer;
+use onnx_genai_ort::{Tokenizer, available_execution_providers};
 use onnx_runtime_session::InferenceSession;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -28,6 +29,9 @@ struct Args {
     /// Build and profile the architecture-representative two-layer cached decoder.
     #[arg(long)]
     synthetic: bool,
+    /// Load a metadata-declared multi-model pipeline instead of a single decoder.
+    #[arg(long)]
+    pipeline: bool,
     /// Inspection ONNX path written by --synthetic; timing uses the equivalent IR graph.
     #[arg(long, default_value = "target/native-synthetic-decoder.onnx")]
     synthetic_model_out: PathBuf,
@@ -98,6 +102,10 @@ fn request(prompt: &str, tokens: usize) -> GenerateRequest {
     request.options.greedy = true;
     request.options.stop_on_eos = false;
     request
+}
+
+fn pipeline_request(prompt: &str, tokens: usize) -> PipelineGenerateRequest {
+    PipelineGenerateRequest::new(request(prompt, tokens))
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -189,6 +197,172 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     Ok(())
 }
 
+fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
+    if args.synthetic {
+        bail!("--pipeline cannot be combined with --synthetic");
+    }
+    if !model_dir.is_dir() {
+        bail!("--pipeline requires --model to name a pipeline directory");
+    }
+    if args.steady && args.tokens <= args.decode_skip {
+        bail!("--tokens must be greater than --decode-skip");
+    }
+    let requested_provider = match args.ep {
+        ExecutionProvider::Cpu => "cpu",
+        ExecutionProvider::Cuda => "cuda",
+    };
+    // This single-threaded CLI sets provider selection before the process-wide
+    // runtime configuration is first read while constructing pipeline sessions.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", requested_provider);
+    }
+    let available_providers =
+        available_execution_providers().context("query linked ONNX Runtime providers")?;
+    println!("ort_available_execution_providers: {available_providers:?}");
+    if matches!(args.ep, ExecutionProvider::Cuda)
+        && !available_providers
+            .iter()
+            .any(|provider| provider.eq_ignore_ascii_case("CUDAExecutionProvider"))
+    {
+        bail!(
+            "--ep cuda requested for a pipeline, but the linked ONNX Runtime does not expose \
+             CUDAExecutionProvider (available: {available_providers:?}); put the CUDA-enabled \
+             ONNX Runtime library directory first in LD_LIBRARY_PATH"
+        );
+    }
+
+    let mut engine = PipelineEngine::from_dir(model_dir)
+        .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
+    for _ in 0..args.warmups {
+        std::hint::black_box(
+            engine
+                .generate_with_pipeline_request(pipeline_request(&args.prompt, args.tokens))
+                .context("pipeline warmup generation")?,
+        );
+    }
+
+    if args.steady {
+        let mut prefills_ms = Vec::with_capacity(args.runs);
+        let mut decode_ms_per_token = Vec::with_capacity(args.runs);
+        let mut throughputs = Vec::with_capacity(args.runs);
+        let mut reference_tokens = None;
+        let mut reference_text = None;
+        for run in 1..=args.runs {
+            let start = Instant::now();
+            let mut token_times = Vec::with_capacity(args.tokens);
+            let mut callback = |_| {
+                token_times.push(start.elapsed());
+                Ok(())
+            };
+            let result = engine
+                .generate_with_callback(
+                    pipeline_request(&args.prompt, args.tokens),
+                    Some(&mut callback),
+                )
+                .context("steady pipeline measured generation")?;
+            if token_times.len() <= args.decode_skip {
+                bail!(
+                    "pipeline generation emitted {} tokens, not enough for --decode-skip {}",
+                    token_times.len(),
+                    args.decode_skip
+                );
+            }
+            if let Some(reference) = &reference_tokens {
+                if reference != &result.token_ids {
+                    bail!("pipeline greedy decode was not deterministic across measured runs");
+                }
+            } else {
+                reference_tokens = Some(result.token_ids);
+                reference_text = Some(result.text);
+            }
+
+            let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
+            let decode_tokens = token_times.len() - args.decode_skip;
+            let decode_wall =
+                token_times[token_times.len() - 1] - token_times[args.decode_skip - 1];
+            let ms_per_token = decode_wall.as_secs_f64() * 1_000.0 / decode_tokens as f64;
+            let tok_per_s = decode_tokens as f64 / decode_wall.as_secs_f64();
+            println!(
+                "steady_run {run}: prefill={prefill_ms:.3} ms decode_tokens={decode_tokens} \
+                 decode_wall={:.3} ms decode={ms_per_token:.3} ms/token \
+                 throughput={tok_per_s:.2} tok/s",
+                decode_wall.as_secs_f64() * 1_000.0
+            );
+            prefills_ms.push(prefill_ms);
+            decode_ms_per_token.push(ms_per_token);
+            throughputs.push(tok_per_s);
+        }
+        println!(
+            "steady_median: prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
+             (runs={} warmups={} decode_skip={})",
+            median(&mut prefills_ms),
+            median(&mut decode_ms_per_token),
+            median(&mut throughputs),
+            args.runs,
+            args.warmups,
+            args.decode_skip
+        );
+        if let Some(tokens) = reference_tokens {
+            println!("generated_token_ids: {tokens:?}");
+        }
+        if let Some(text) = reference_text {
+            println!("generated_text: {text:?}");
+        }
+        return Ok(());
+    }
+
+    let mut generated = 0usize;
+    let mut elapsed = Duration::ZERO;
+    let mut reference_tokens = None;
+    let mut reference_text = None;
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        let result = engine
+            .generate_with_pipeline_request(pipeline_request(&args.prompt, args.tokens))
+            .context("pipeline measured generation")?;
+        elapsed += start.elapsed();
+        generated += result.token_ids.len();
+        if let Some(reference) = &reference_tokens {
+            if reference != &result.token_ids {
+                bail!(
+                    "pipeline greedy decode was not deterministic: first={reference:?}, \
+                     rerun={:?}",
+                    result.token_ids
+                );
+            }
+        } else {
+            reference_tokens = Some(result.token_ids);
+            reference_text = Some(result.text);
+        }
+    }
+    if generated == 0 {
+        bail!("pipeline generation produced no tokens");
+    }
+
+    let tok_per_s = generated as f64 / elapsed.as_secs_f64();
+    let ms_per_step = elapsed.as_secs_f64() * 1_000.0 / generated as f64;
+    println!(
+        "profile_native: pipeline={} ep={:?} tokens={} warmups={} runs={}",
+        model_dir.display(),
+        args.ep,
+        args.tokens,
+        args.warmups,
+        args.runs
+    );
+    println!(
+        "throughput: {tok_per_s:.2} tok/s, {ms_per_step:.3} ms/step \
+         ({generated} generated tokens in {:.3} ms)",
+        elapsed.as_secs_f64() * 1_000.0
+    );
+    if let Some(tokens) = reference_tokens {
+        println!("generated_token_ids: {tokens:?}");
+    }
+    if let Some(text) = reference_text {
+        println!("generated_text: {text:?}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.tokens == 0 || args.runs == 0 {
@@ -196,6 +370,12 @@ fn main() -> Result<()> {
     }
     if !args.synthetic && args.model.is_none() {
         bail!("--model is required unless --synthetic is used");
+    }
+    if args.pipeline {
+        return run_pipeline(
+            &args,
+            args.model.as_deref().expect("validated model argument"),
+        );
     }
     let device = match args.ep {
         ExecutionProvider::Cpu => NativeDecodeDevice::Cpu,
