@@ -4702,12 +4702,14 @@ pipeline:
                     "vision_encoder".to_string(),
                     PhaseConfig {
                         run_on: PhaseRunOn::PromptOnly,
+                        when_present: None,
                     },
                 ),
                 (
                     "decoder".to_string(),
                     PhaseConfig {
                         run_on: PhaseRunOn::EveryStep,
+                        when_present: None,
                     },
                 ),
             ]),

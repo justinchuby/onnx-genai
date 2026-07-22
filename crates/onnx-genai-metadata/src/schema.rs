@@ -3,7 +3,33 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+fn deserialize_non_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(serde::de::Error::custom("presence keys must not be empty"));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_non_empty_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+        if value.is_empty() {
+            Err(serde::de::Error::custom("presence keys must not be empty"))
+        } else {
+            Ok(Some(value))
+        }
+    })
+}
 
 /// ONNX inference metadata consumed by runtimes and emitted by model builders.
 ///
@@ -488,7 +514,7 @@ pub struct ModelCapabilities {
 /// emitters populate this block). Declaring an `io` block lets a graph use
 /// arbitrary tensor names — the runtime never infers a port by name or dtype
 /// for a declared port.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct ModelIoSpec {
     /// Which declared sequence port drives autoregressive execution.
     ///
@@ -596,10 +622,80 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub state_pairs: Option<Vec<LoopStatePair>>,
+
+    /// Optional graph inputs and their explicit absent-value contracts, keyed by
+    /// the real ONNX input port name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub optional_inputs: BTreeMap<String, OptionalInputSpec>,
+}
+
+/// Presence and absent-value contract for one optional graph input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct OptionalInputSpec {
+    /// Opaque, non-empty request presence key; not a port or model name.
+    #[serde(deserialize_with = "deserialize_non_empty_string")]
+    #[schemars(length(min = 1))]
+    pub presence: String,
+
+    /// Tensor value supplied when the presence key is absent.
+    pub absent: AbsentInputSpec,
+}
+
+/// Explicit tensor fallback for an absent optional graph input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct AbsentInputSpec {
+    /// Fallback materialization kind.
+    pub kind: AbsentInputKind,
+
+    /// Runtime-resolved shape of the fallback tensor.
+    pub shape: Vec<TensorDimension>,
+}
+
+/// Supported absent-input fallback kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AbsentInputKind {
+    /// Materialize a zero-initialized tensor.
+    Zeros,
+}
+
+/// One fixed or runtime-resolved tensor-shape dimension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum TensorDimension {
+    /// A fixed, non-negative dimension.
+    Fixed(#[schemars(range(min = 0))] i64),
+    /// A runtime shape symbol.
+    Symbol(#[schemars(length(min = 1))] String),
+}
+
+impl<'de> Deserialize<'de> for TensorDimension {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Fixed(i64),
+            Symbol(String),
+        }
+
+        match Representation::deserialize(deserializer)? {
+            Representation::Fixed(value) if value >= 0 => Ok(Self::Fixed(value)),
+            Representation::Fixed(_) => Err(serde::de::Error::custom(
+                "tensor dimensions must be non-negative",
+            )),
+            Representation::Symbol(value) if !value.is_empty() => Ok(Self::Symbol(value)),
+            Representation::Symbol(_) => {
+                Err(serde::de::Error::custom("tensor symbols must not be empty"))
+            }
+        }
+    }
 }
 
 /// Primary autoregressive sequence source for a decoder or proposer graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceInputKind {
     /// Integer token ids supplied through `token_input`.
@@ -610,7 +706,7 @@ pub enum SequenceInputKind {
 }
 
 /// Ownership model for a graph's KV cache inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum KvOwnership {
     /// The graph consumes past KV and emits replacement/extended present KV.
@@ -628,7 +724,7 @@ pub enum KvOwnership {
 /// referencing a model family. It is intentionally distinct from growing or
 /// shared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`
 /// and `kv_update`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct LoopStatePair {
     /// Graph input port that receives the carried state for this step.
     #[schemars(length(min = 1))]
@@ -1259,10 +1355,19 @@ pub struct DataflowEdge {
 }
 
 /// Phase gate for one pipeline component.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct PhaseConfig {
     /// Pipeline phase in which the component runs.
     pub run_on: PhaseRunOn,
+
+    /// Opaque presence key required for this component to run.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(min = 1))]
+    pub when_present: Option<String>,
 }
 
 /// Pipeline phase gate.
@@ -1295,6 +1400,21 @@ impl<'de> Deserialize<'de> for PhaseRunOn {
             "final_only" => Self::FinalOnly,
             "on_demand" => Self::OnDemand,
             _ => Self::Other(value),
+        })
+    }
+}
+
+impl Serialize for PhaseRunOn {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::PromptOnly => "prompt_only",
+            Self::EveryStep => "every_step",
+            Self::FinalOnly => "final_only",
+            Self::OnDemand => "on_demand",
+            Self::Other(value) => value,
         })
     }
 }
@@ -2286,6 +2406,80 @@ mod schema_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct OptionalModalityDocument {
+        io: ModelIoSpec,
+        phase: PhaseConfig,
+    }
+
+    #[test]
+    fn optional_modality_schema_round_trips() {
+        let old_yaml = r#"
+io:
+  sequence_source: token_ids
+phase:
+  run_on: prompt_only
+"#;
+        let old: OptionalModalityDocument =
+            serde_yaml::from_str(old_yaml).expect("old metadata deserializes");
+        assert!(old.io.optional_inputs.is_empty());
+        assert!(old.phase.when_present.is_none());
+        assert_eq!(
+            serde_yaml::to_value(&old).expect("old metadata serializes"),
+            serde_yaml::from_str::<serde_yaml::Value>(old_yaml).expect("old YAML parses")
+        );
+
+        let new_yaml = r#"
+io:
+  optional_inputs:
+    audio_features:
+      presence: audio
+      absent:
+        kind: zeros
+        shape: [0, sequence_len]
+phase:
+  run_on: prompt_only
+  when_present: audio
+"#;
+        let new: OptionalModalityDocument =
+            serde_yaml::from_str(new_yaml).expect("optional-modality metadata deserializes");
+        let optional = new
+            .io
+            .optional_inputs
+            .get("audio_features")
+            .expect("optional input is preserved");
+        assert_eq!(optional.presence, "audio");
+        assert_eq!(optional.absent.kind, AbsentInputKind::Zeros);
+        assert_eq!(
+            optional.absent.shape,
+            [
+                TensorDimension::Fixed(0),
+                TensorDimension::Symbol("sequence_len".into())
+            ]
+        );
+        assert_eq!(new.phase.when_present.as_deref(), Some("audio"));
+        assert_eq!(
+            serde_yaml::to_value(&new).expect("optional-modality metadata serializes"),
+            serde_yaml::from_str::<serde_yaml::Value>(new_yaml).expect("new YAML parses")
+        );
+        assert_eq!(
+            serde_yaml::to_value(AbsentInputKind::Zeros).expect("kind serializes"),
+            serde_yaml::Value::String("zeros".into())
+        );
+
+        assert!(
+            serde_yaml::from_str::<TensorDimension>("-1").is_err(),
+            "negative fixed dimensions must be rejected"
+        );
+        assert!(
+            serde_yaml::from_str::<OptionalInputSpec>(
+                "presence: ''\nabsent:\n  kind: zeros\n  shape: [0]\n"
+            )
+            .is_err(),
+            "empty presence keys must be rejected"
+        );
+    }
 
     #[test]
     fn attention_config_parses_sliding_window_and_sink_tokens() {
