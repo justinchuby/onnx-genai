@@ -21,6 +21,10 @@ struct FixtureDir(PathBuf);
 
 impl FixtureDir {
     fn new(max_context: usize) -> Self {
+        Self::with_tokens_per_patch(max_context, 3)
+    }
+
+    fn with_tokens_per_patch(max_context: usize, tokens_per_patch: usize) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/vlm-image-bundle-tests")
             .join(format!(
@@ -43,8 +47,11 @@ impl FixtureDir {
             VISION_MODEL_TEXTPROTO,
         )
         .expect("write generated vision model");
-        fs::write(root.join("inference_metadata.yaml"), metadata(max_context))
-            .expect("write fixture metadata");
+        fs::write(
+            root.join("inference_metadata.yaml"),
+            metadata(max_context, tokens_per_patch),
+        )
+        .expect("write fixture metadata");
         fs::write(
             root.join("chat_template.jinja"),
             "{% for message in messages %}{{ message.content }}{% endfor %}",
@@ -235,6 +242,59 @@ async fn expanded_context_overflow_is_rejected_before_driver_admission() {
     assert_structured_error(&body, "final prefill length");
 }
 
+#[tokio::test]
+async fn extreme_expansion_metadata_is_rejected_before_driver_admission() {
+    let fixture = FixtureDir::with_tokens_per_patch(64, usize::MAX / 2);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(data_uri([255, 0, 0]))
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "pre-allocation limit");
+}
+
+#[tokio::test]
+async fn malformed_base64_has_actionable_public_route_error() {
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part("data:image/png;base64,not%%%base64".to_string())
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "not valid standard base64");
+}
+
+#[tokio::test]
+async fn unsupported_image_scheme_has_actionable_public_route_error() {
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part("file:///private/model/image.png".to_string())
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "scheme 'file'");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("/private/model/image.png"), "{message}");
+}
+
 fn assert_structured_error(body: &Value, expected: &str) {
     let message = body["error"]["message"]
         .as_str()
@@ -245,7 +305,7 @@ fn assert_structured_error(body: &Value, expected: &str) {
     assert!(message.contains(expected), "{message}");
 }
 
-fn metadata(max_context: usize) -> String {
+fn metadata(max_context: usize, tokens_per_patch: usize) -> String {
     format!(
         r#"schema_version: v1
 model:
@@ -323,7 +383,7 @@ pipeline:
     image_placeholder_token_id: 7
     image_token_id: 7
     token_count_source: per_patch
-    tokens_per_patch: 3
+    tokens_per_patch: {tokens_per_patch}
     placeholder_per_image: true
     thumbnail_order: none
 "#

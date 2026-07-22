@@ -1301,6 +1301,8 @@ async fn run_chat_completion(
                     .as_ref()
                     .expect("vision input checked before generation"),
                 &mut prepared,
+                handle.model_max_context,
+                request.max_tokens,
             )
             .await?,
         )
@@ -1449,6 +1451,8 @@ async fn stream_chat_completion(
                     .as_ref()
                     .expect("vision input checked before generation"),
                 &mut prepared,
+                handle.model_max_context,
+                request.max_tokens,
             )
             .await?,
         )
@@ -1692,7 +1696,23 @@ async fn preprocess_chat_images(
     image_urls: &[String],
     spec: &crate::image_input::VisionInputSpec,
     prepared: &mut PreparedGenerateRequest,
+    model_max_context: Option<usize>,
+    max_tokens: usize,
 ) -> Result<PipelineInputBundle, ApiError> {
+    let context_prompt_limit = model_max_context
+        .map(|max_context| {
+            max_context.checked_sub(max_tokens).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "What: image request cannot fit within the model context. \
+                     Why: max_tokens ({max_tokens}) already exceeds the model context limit ({max_context}) before prompt and image tokens are counted. \
+                     How: reduce max_tokens below the model context limit."
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(crate::image_input::MAX_EXPANDED_PROMPT_TOKENS);
+    let max_prompt_tokens =
+        context_prompt_limit.min(crate::image_input::MAX_EXPANDED_PROMPT_TOKENS);
     let bundle = crate::image_input::load_and_preprocess(image_urls, spec)
         .await
         .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
@@ -1705,7 +1725,7 @@ async fn preprocess_chat_images(
         }
     };
     let expanded = spec
-        .expand_prompt(token_ids, &bundle)
+        .expand_prompt(token_ids, &bundle, max_prompt_tokens)
         .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
     prepared.prompt_tokens = expanded.len();
     prepared.request.prompt = GeneratePrompt::TokenIds(expanded);

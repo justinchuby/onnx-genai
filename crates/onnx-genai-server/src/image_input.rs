@@ -10,6 +10,8 @@ use onnx_genai_preprocess::image::{
 };
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_BASE64_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+pub(crate) const MAX_EXPANDED_PROMPT_TOKENS: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct ImageTensor {
@@ -113,13 +115,14 @@ impl VisionInputSpec {
         &self,
         prompt_token_ids: &[u32],
         bundle: &ImageBundle,
+        max_prompt_tokens: usize,
     ) -> anyhow::Result<Vec<u32>> {
         let expansion = self.expansion.as_ref().context(
             "What: image placeholder expansion could not run. \
              Why: the server has image tensors but no typed pipeline.vision expansion contract. \
              How: declare image_placeholder_token_id, image_token_id, token_count_source, and its required count field.",
         )?;
-        expansion.expand(prompt_token_ids, &bundle.images)
+        expansion.expand(prompt_token_ids, &bundle.images, max_prompt_tokens)
     }
 }
 
@@ -209,6 +212,7 @@ impl VisionExpansionSpec {
         &self,
         prompt_token_ids: &[u32],
         images: &[ImageExpansionSummary],
+        max_prompt_tokens: usize,
     ) -> anyhow::Result<Vec<u32>> {
         let placeholder = u32::try_from(self.placeholder_token_id).with_context(|| {
             format!(
@@ -235,7 +239,28 @@ impl VisionExpansionSpec {
             );
         }
 
-        let mut replacements = Vec::with_capacity(images.len());
+        let row_separator = self
+            .row_separator_token_id
+            .map(u32::try_from)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "What: image row separator expansion failed. Why: token ID {:?} is outside u32. How: declare a valid tokenizer token ID.",
+                    self.row_separator_token_id
+                )
+            })?;
+        let column_separator = self
+            .column_separator_token_id
+            .map(u32::try_from)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "What: image column separator expansion failed. Why: token ID {:?} is outside u32. How: declare a valid tokenizer token ID.",
+                    self.column_separator_token_id
+                )
+            })?;
+
+        let mut replacement_len = 0usize;
         for (prompt_image_index, image) in images.iter().enumerate() {
             if image.image_index != prompt_image_index {
                 anyhow::bail!(
@@ -245,14 +270,14 @@ impl VisionExpansionSpec {
                     image.image_index
                 );
             }
-            replacements.push(self.replacement(image, image_token)?);
+            let image_len = self.replacement_len(image)?;
+            replacement_len = replacement_len.checked_add(image_len).with_context(|| {
+                format!(
+                    "What: image placeholder expansion length overflowed. Why: adding image {prompt_image_index}'s {image_len} tokens made the aggregate replacement length exceed usize. How: reduce image count, tiles, patches, or tokens-per-unit metadata."
+                )
+            })?;
         }
 
-        let replacement_len = replacements.iter().try_fold(0usize, |total, tokens| {
-            total
-                .checked_add(tokens.len())
-                .context("expanded image token count overflowed")
-        })?;
         let output_len = prompt_token_ids
             .len()
             .checked_sub(placeholder_count)
@@ -260,14 +285,27 @@ impl VisionExpansionSpec {
             .context(
                 "What: image placeholder expansion overflowed. Why: the final prefill length does not fit usize. How: reduce image count, tiles, patches, or expansion tokens.",
             )?;
+        if output_len > max_prompt_tokens {
+            anyhow::bail!(
+                "What: image placeholder expansion exceeds the allowed prompt length. \
+                Why: the final prefill length would be {output_len} tokens, above the pre-allocation limit of {max_prompt_tokens} tokens derived from the model context and the server safety bound ({MAX_EXPANDED_PROMPT_TOKENS}). \
+                How: reduce the prompt, image count, tiles, patches, or tokens-per-unit metadata."
+            );
+        }
         let mut expanded = Vec::new();
         expanded.try_reserve_exact(output_len).context(
-            "What: image placeholder expansion allocation failed. Why: the final prefill token bundle is too large. How: reduce image count or image expansion size.",
+            "What: image placeholder expansion allocation failed. Why: memory could not be reserved for the validated final prefill token bundle. How: reduce the prompt, image count, or image expansion size.",
         )?;
         let mut image_index = 0usize;
         for &token in prompt_token_ids {
             if token == placeholder {
-                expanded.extend_from_slice(&replacements[image_index]);
+                self.append_replacement(
+                    &images[image_index],
+                    image_token,
+                    row_separator,
+                    column_separator,
+                    &mut expanded,
+                );
                 image_index += 1;
             } else {
                 expanded.push(token);
@@ -276,35 +314,29 @@ impl VisionExpansionSpec {
         Ok(expanded)
     }
 
-    fn replacement(
-        &self,
-        image: &ImageExpansionSummary,
-        image_token: u32,
-    ) -> anyhow::Result<Vec<u32>> {
+    fn replacement_len(&self, image: &ImageExpansionSummary) -> anyhow::Result<usize> {
         match self.count_source {
-            ImageTokenCountSource::PerPatch => {
-                let count = image
-                    .expansion_count
-                    .checked_mul(self.tokens_per_unit)
-                    .context(
-                        "What: per-image expansion count overflowed. Why: expansion_count * tokens_per_unit is too large. How: reduce patch count or expansion metadata.",
-                    )?;
-                Ok(std::iter::repeat_n(image_token, count).collect())
-            }
+            ImageTokenCountSource::PerPatch => image
+                .expansion_count
+                .checked_mul(self.tokens_per_unit)
+                .context(
+                    "What: per-image patch expansion length overflowed. Why: expansion_count multiplied by tokens_per_patch exceeds usize. How: reduce the patch count or tokens_per_patch metadata.",
+                ),
             ImageTokenCountSource::PerTile => {
+                let columns = usize::try_from(image.tile_grid.columns)
+                    .context("What: image tile expansion length could not be computed. Why: the tile-grid column count does not fit usize. How: reduce the declared preprocessing tile grid.")?;
+                let rows = usize::try_from(image.tile_grid.rows)
+                    .context("What: image tile expansion length could not be computed. Why: the tile-grid row count does not fit usize. How: reduce the declared preprocessing tile grid.")?;
+                let local_tiles = rows.checked_mul(columns).context(
+                    "What: image tile expansion length overflowed. Why: tile-grid rows multiplied by columns exceeds usize. How: reduce the preprocessing tile grid.",
+                )?;
                 let thumbnail_tiles =
                     usize::from(self.thumbnail_position != ThumbnailPosition::None);
-                let local_tiles = usize::try_from(
-                    image
-                        .tile_grid
-                        .columns
-                        .checked_mul(image.tile_grid.rows)
-                        .context("image tile grid multiplication overflowed")?,
-                )
-                .context("image tile grid does not fit usize")?;
                 let expected_tiles = local_tiles
                     .checked_add(thumbnail_tiles)
-                    .context("image tile count overflowed")?;
+                    .context(
+                        "What: image tile expansion length overflowed. Why: adding the thumbnail to the local tile count exceeds usize. How: reduce the preprocessing tile grid or remove the thumbnail.",
+                    )?;
                 if image.tile_count != expected_tiles {
                     anyhow::bail!(
                         "What: image tile expansion summary is inconsistent. \
@@ -317,40 +349,72 @@ impl VisionExpansionSpec {
                         self.thumbnail_position
                     );
                 }
-                let mut tokens = Vec::new();
-                let emit_tile = |tokens: &mut Vec<u32>| {
-                    tokens.extend(std::iter::repeat_n(image_token, self.tokens_per_unit));
+                let image_tokens = expected_tiles
+                    .checked_mul(self.tokens_per_unit)
+                    .context(
+                        "What: per-image tile expansion length overflowed. Why: tile count multiplied by tokens_per_tile exceeds usize. How: reduce the tile count or tokens_per_tile metadata.",
+                    )?;
+                let column_separators = if self.column_separator_token_id.is_some() {
+                    rows.checked_mul(columns.saturating_sub(1)).context(
+                        "What: image column-separator length overflowed. Why: rows multiplied by separators-per-row exceeds usize. How: reduce the preprocessing tile grid.",
+                    )?
+                } else {
+                    0
                 };
+                let row_separators = if self.row_separator_token_id.is_some() {
+                    rows.saturating_sub(1)
+                } else {
+                    0
+                };
+                image_tokens
+                    .checked_add(column_separators)
+                    .and_then(|len| len.checked_add(row_separators))
+                    .context(
+                        "What: per-image tile expansion length overflowed. Why: image tokens plus row/column separators exceeds usize. How: reduce the tile grid, tokens_per_tile, or separator usage.",
+                    )
+            }
+        }
+    }
+
+    fn append_replacement(
+        &self,
+        image: &ImageExpansionSummary,
+        image_token: u32,
+        row_separator: Option<u32>,
+        column_separator: Option<u32>,
+        tokens: &mut Vec<u32>,
+    ) {
+        let emit_unit = |tokens: &mut Vec<u32>| {
+            tokens.extend(std::iter::repeat_n(image_token, self.tokens_per_unit));
+        };
+        match self.count_source {
+            ImageTokenCountSource::PerPatch => {
+                for _ in 0..image.expansion_count {
+                    emit_unit(tokens);
+                }
+            }
+            ImageTokenCountSource::PerTile => {
                 if self.thumbnail_position == ThumbnailPosition::Prepend {
-                    emit_tile(&mut tokens);
+                    emit_unit(tokens);
                 }
                 for row in 0..image.tile_grid.rows {
                     for column in 0..image.tile_grid.columns {
-                        emit_tile(&mut tokens);
+                        emit_unit(tokens);
                         if column + 1 < image.tile_grid.columns
-                            && let Some(separator) = self.column_separator_token_id
+                            && let Some(separator) = column_separator
                         {
-                            tokens.push(u32::try_from(separator).with_context(|| {
-                                format!(
-                                    "What: image column separator expansion failed. Why: token ID {separator} is outside u32. How: declare a valid tokenizer token ID."
-                                )
-                            })?);
+                            tokens.push(separator);
                         }
                     }
                     if row + 1 < image.tile_grid.rows
-                        && let Some(separator) = self.row_separator_token_id
+                        && let Some(separator) = row_separator
                     {
-                        tokens.push(u32::try_from(separator).with_context(|| {
-                            format!(
-                                "What: image row separator expansion failed. Why: token ID {separator} is outside u32. How: declare a valid tokenizer token ID."
-                            )
-                        })?);
+                        tokens.push(separator);
                     }
                 }
                 if self.thumbnail_position == ThumbnailPosition::Append {
-                    emit_tile(&mut tokens);
+                    emit_unit(tokens);
                 }
-                Ok(tokens)
             }
         }
     }
@@ -469,44 +533,139 @@ async fn load_image_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
     if let Some(data) = url.strip_prefix("data:image/") {
         let (_, encoded) = data
             .split_once(";base64,")
-            .context("image data URI must use base64 encoding")?;
-        let bytes = STANDARD
-            .decode(encoded)
-            .context("image data URI contains invalid base64")?;
+            .context(
+                "What: image data URI parsing failed. Why: the URI is missing the required ';base64,' marker after its image media type. How: send data:image/<type>;base64,<standard-base64-payload>.",
+            )?;
+        if encoded.len() > MAX_IMAGE_BASE64_BYTES {
+            anyhow::bail!(
+                "What: image data URI exceeds the input limit. \
+                 Why: its base64 payload is {} bytes, above the maximum encoded length of {MAX_IMAGE_BASE64_BYTES} bytes for a {MAX_IMAGE_BYTES}-byte image. \
+                 How: resize or recompress the image so its decoded bytes are at most {MAX_IMAGE_BYTES}.",
+                encoded.len()
+            );
+        }
+        let bytes = STANDARD.decode(encoded).with_context(|| {
+            "What: image data URI decoding failed. Why: the payload after ';base64,' is not valid standard base64. How: encode the image bytes with standard base64 and send data:image/<type>;base64,<payload>."
+        })?;
         if bytes.len() > MAX_IMAGE_BYTES {
-            anyhow::bail!("image exceeds the {MAX_IMAGE_BYTES} byte limit");
+            anyhow::bail!(
+                "What: decoded image data exceeds the input limit. \
+                 Why: the data URI decoded to {} bytes, above the {MAX_IMAGE_BYTES}-byte limit. \
+                 How: resize or recompress the image before encoding it.",
+                bytes.len()
+            );
         }
         return Ok(bytes);
     }
 
     if url.starts_with("http://") || url.starts_with("https://") {
+        let parsed_url = reqwest::Url::parse(url).context(
+            "What: image URL parsing failed. Why: the supplied HTTP(S) value is not a valid absolute URL. How: provide a complete URL such as https://images.example/image.png without credentials in the URL.",
+        )?;
+        if parsed_url.host_str().is_none() {
+            anyhow::bail!(
+                "What: image URL parsing failed. \
+                 Why: the supplied HTTP(S) URL has no host. \
+                 How: provide a complete URL such as https://images.example/image.png."
+            );
+        }
+        let safe_url = safe_http_url_context(&parsed_url);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::limited(3))
             .build()
-            .context("failed to initialize image HTTP client")?;
-        let response = client
-            .get(url)
+            .context(
+                "What: image URL fetching could not start. Why: the server could not initialize its bounded HTTP client. How: retry the request or contact the server operator if the failure persists.",
+            )?;
+        let mut response = client
+            .get(parsed_url)
             .send()
             .await
-            .with_context(|| format!("failed to fetch image URL {url}"))?
-            .error_for_status()
-            .with_context(|| format!("image URL returned an error: {url}"))?;
+            .with_context(|| {
+                format!(
+                    "What: image URL fetch failed for {safe_url}. Why: the remote host could not be reached within the timeout or redirect limit. How: verify the URL is reachable over HTTP(S), uses at most 3 redirects, and responds within 10 seconds."
+                )
+            })?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "What: image URL fetch failed for {safe_url}. \
+                 Why: the remote host returned HTTP status {} instead of a successful response. \
+                 How: provide a URL that returns the image directly with a 2xx status.",
+                response.status()
+            );
+        }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_IMAGE_BYTES as u64)
         {
-            anyhow::bail!("image exceeds the {MAX_IMAGE_BYTES} byte limit");
+            anyhow::bail!(
+                "What: image URL response exceeds the input limit for {safe_url}. \
+                 Why: Content-Length is {} bytes, above the {MAX_IMAGE_BYTES}-byte limit. \
+                 How: resize or recompress the remote image, or provide a smaller image URL.",
+                response.content_length().unwrap_or_default()
+            );
         }
-        let bytes = response
-            .bytes()
-            .await
-            .context("failed to read image body")?;
-        if bytes.len() > MAX_IMAGE_BYTES {
-            anyhow::bail!("image exceeds the {MAX_IMAGE_BYTES} byte limit");
+        let initial_capacity = response.content_length().unwrap_or_default() as usize;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(initial_capacity).with_context(|| {
+            format!(
+                "What: image URL response allocation failed for {safe_url}. Why: memory could not be reserved for the declared {initial_capacity}-byte body. How: provide a smaller image."
+            )
+        })?;
+        while let Some(chunk) = response.chunk().await.with_context(|| {
+            format!(
+                "What: image URL response could not be read from {safe_url}. Why: the HTTP body ended with a transport or decoding error. How: verify the remote server returns a complete image response."
+            )
+        })? {
+            let next_len = bytes.len().checked_add(chunk.len()).context(
+                "What: image URL response length overflowed. Why: accumulated body length does not fit usize. How: provide an image no larger than the documented byte limit.",
+            )?;
+            if next_len > MAX_IMAGE_BYTES {
+                anyhow::bail!(
+                    "What: image URL response exceeds the input limit for {safe_url}. \
+                     Why: the streamed body reached at least {next_len} bytes, above the {MAX_IMAGE_BYTES}-byte limit. \
+                     How: resize or recompress the remote image, or provide a smaller image URL."
+                );
+            }
+            bytes.try_reserve_exact(chunk.len()).with_context(|| {
+                format!(
+                    "What: image URL response allocation failed for {safe_url}. Why: memory could not be extended for a validated body of {next_len} bytes. How: provide a smaller image."
+                )
+            })?;
+            bytes.extend_from_slice(&chunk);
         }
-        return Ok(bytes.to_vec());
+        return Ok(bytes);
     }
 
-    anyhow::bail!("image_url must be a data:image/...;base64 URI or an http(s) URL")
+    let scheme = safe_url_scheme(url);
+    anyhow::bail!(
+        "What: image URL scheme is unsupported. \
+         Why: the request used scheme '{scheme}', but image_url accepts only data:image/...;base64, http, or https inputs. \
+         How: embed the image as a base64 data URI or host it at an HTTP(S) URL."
+    )
+}
+
+fn safe_http_url_context(url: &reqwest::Url) -> String {
+    url.host_str()
+        .map(|host| {
+            let port = url
+                .port()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default();
+            format!("{}://{host}{port}", url.scheme())
+        })
+        .unwrap_or_else(|| "the supplied HTTP(S) origin".to_string())
+}
+
+fn safe_url_scheme(url: &str) -> &str {
+    url.split_once(':')
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| {
+            !scheme.is_empty()
+                && scheme.len() <= 32
+                && scheme
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        })
+        .unwrap_or("<missing or invalid>")
 }
