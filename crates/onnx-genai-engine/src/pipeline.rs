@@ -17,8 +17,8 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_metadata::{
-    DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
-    PipelineVisionConfig, SchedulerSpec,
+    AbsentInputKind, DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy,
+    PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, TensorDimension,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
@@ -74,6 +74,11 @@ pub struct PipelineGenerateRequest {
     pub request: GenerateRequest,
     /// External tensors keyed by `component.input_name`.
     pub inputs: PipelineTensors,
+    /// Opaque metadata-declared presence keys active for this request.
+    ///
+    /// Empty preserves the historical behavior for pipelines without optional
+    /// inputs or presence-gated components.
+    pub present: BTreeSet<String>,
     /// Number of image tiles represented by the external vision tensor.
     ///
     /// This is known only after preprocessing and must be supplied before
@@ -88,6 +93,7 @@ impl PipelineGenerateRequest {
         Self {
             request,
             inputs: HashMap::new(),
+            present: BTreeSet::new(),
             num_image_tiles: None,
             iterative_overrides: IterativeOverrides::default(),
         }
@@ -95,6 +101,16 @@ impl PipelineGenerateRequest {
 
     pub fn with_input(mut self, endpoint: impl Into<String>, value: Value) -> Self {
         self.inputs.insert(endpoint.into(), value);
+        self
+    }
+
+    pub fn with_presence(mut self, key: impl Into<String>) -> Self {
+        self.present.insert(key.into());
+        self
+    }
+
+    pub fn with_present_keys(mut self, keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.present.extend(keys.into_iter().map(Into::into));
         self
     }
 
@@ -300,6 +316,7 @@ impl PipelineEngine {
         &mut self,
         pipeline_request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineSynthesis> {
+        let present = pipeline_request.present.clone();
         // A nested-AR (multi-decoder TTS) pipeline publishes its assembled codes
         // as `{outer}.output_codes` inside its own driver; run the post-decode
         // vocoder over the shared pool separately.
@@ -327,6 +344,7 @@ impl PipelineEngine {
             &ar.post_decode_components,
             &mut tensors,
             "postlogue",
+            &present,
             None,
         )?;
         Ok(PipelineSynthesis {
@@ -355,6 +373,8 @@ impl PipelineEngine {
                  single-pass or iterative (diffusion) pipelines",
             )?
             .clone();
+        let present = pipeline_request.present.clone();
+        self.ensure_component_present(&ar.decoder, &present, "autoregressive decoder")?;
 
         let mut options = pipeline_request.request.options.clone();
         options.validate()?;
@@ -379,21 +399,27 @@ impl PipelineEngine {
             self.models.directory.spec.vision.as_ref(),
         )?;
 
-        let mut tensors = pipeline_request.inputs;
+        let mut tensors = self.prepare_request_tensors(pipeline_request.inputs, &present)?;
         // Seed the prompt token ids into the shared pool so a prompt-phase
         // component that consumes `input_ids` (e.g. a text encoder) can run.
         self.seed_prompt_token_inputs(&ar.prompt_components, &prompt_tokens, &mut tensors)?;
-        self.run_prompt_phase_components(&ar.prompt_components, &mut tensors, "prologue", None)?;
+        self.run_prompt_phase_components(
+            &ar.prompt_components,
+            &mut tensors,
+            "prologue",
+            &present,
+            None,
+        )?;
 
         // Static routing from prompt-phase and per-step producers into the
         // decoder. Every non-self edge into the decoder is recomputed from the
         // shared pool on each step, so `every_step` outputs are always fresh and
         // `prompt_only` conditioning stays cached (it is simply re-read).
-        let decoder_in_edges = self.decoder_in_edges(&ar.decoder)?;
+        let decoder_in_edges = self.decoder_in_edges(&ar.decoder, &present, &tensors)?;
         // Owned per-step component bindings (paired with their sessions below).
         // Built before `decoder_state` is taken mutably so the immutable borrow
         // used to enumerate graph ports is released first.
-        let step_bindings = self.build_step_bindings(&ar.step_components)?;
+        let step_bindings = self.build_step_bindings(&ar.step_components, &present)?;
 
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
         self.decoder_state = Some({
@@ -475,12 +501,19 @@ impl PipelineEngine {
         &mut self,
         pipeline_request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineSynthesis> {
+        let present = pipeline_request.present.clone();
         let post_decode_components = match &self.plan {
             PipelinePlan::NestedAutoregressive(plan) => plan.post_decode_components.clone(),
             _ => anyhow::bail!("internal error: synthesize_nested on a non-nested plan"),
         };
         let (generation, mut tensors) = self.run_nested_autoregressive(pipeline_request)?;
-        self.run_prompt_phase_components(&post_decode_components, &mut tensors, "postlogue", None)?;
+        self.run_prompt_phase_components(
+            &post_decode_components,
+            &mut tensors,
+            "postlogue",
+            &present,
+            None,
+        )?;
         Ok(PipelineSynthesis {
             generation,
             tensors,
@@ -508,6 +541,9 @@ impl PipelineEngine {
                 "synthesize()/generate() on a nested pipeline requires a nested_autoregressive plan"
             ),
         };
+        let present = pipeline_request.present.clone();
+        self.ensure_component_present(&plan.outer, &present, "nested outer decoder")?;
+        self.ensure_component_present(&plan.inner, &present, "nested inner decoder")?;
 
         let options = pipeline_request.request.options.clone();
         options.validate()?;
@@ -516,13 +552,17 @@ impl PipelineEngine {
             anyhow::bail!("prompt must contain at least one token");
         }
 
-        let mut tensors = pipeline_request.inputs;
+        let mut tensors = self.prepare_request_tensors(pipeline_request.inputs, &present)?;
         self.seed_prompt_token_inputs(&plan.prompt_components, &prompt_tokens, &mut tensors)?;
         // Explicitly seed the prefill embedder's metadata-declared prompt input
         // with the tokenized prompt (int64 `[1, L]`) unless a dataflow edge
         // already routes it. This does NOT rely on `is_token_input_name` — the
         // prompt port is declared in the PrefillEmbedderSpec, never guessed.
-        if let Some(prefill) = plan.prefill_embedder.as_ref() {
+        if let Some(prefill) = plan
+            .prefill_embedder
+            .as_ref()
+            .filter(|binding| self.plan.component_is_present(&binding.component, &present))
+        {
             let endpoint = format!("{}.{}", prefill.component, prefill.prompt_input);
             let routed = plan.dataflow.iter().any(|edge| edge.to == endpoint);
             if !routed && !tensors.contains_key(&endpoint) {
@@ -531,16 +571,27 @@ impl PipelineEngine {
                 tensors.insert(endpoint, value);
             }
         }
-        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors, "prologue", None)?;
+        self.run_prompt_phase_components(
+            &plan.prompt_components,
+            &mut tensors,
+            "prologue",
+            &present,
+            None,
+        )?;
 
         // Fixed routed extras for each decoder (encoder conditioning etc.). The
         // inner decoder's seed input is threaded per inner step, so exclude it.
         // In pre-embedder mode the outer decoder's per-step `inputs_embeds` is
         // built each frame (not a fixed routed extra), so exclude it too.
         let outer_extra_exclude = plan.pre_embedder.as_ref().map(|p| p.outer_input.as_str());
-        let outer_extras = self.decoder_extra_inputs(&plan.outer, &tensors, outer_extra_exclude)?;
-        let inner_extras =
-            self.decoder_extra_inputs(&plan.inner, &tensors, Some(&plan.inner_embeds_input))?;
+        let outer_extras =
+            self.decoder_extra_inputs(&plan.outer, &tensors, outer_extra_exclude, &present)?;
+        let inner_extras = self.decoder_extra_inputs(
+            &plan.inner,
+            &tensors,
+            Some(&plan.inner_embeds_input),
+            &present,
+        )?;
 
         let outer_session = self
             .models
@@ -555,7 +606,11 @@ impl PipelineEngine {
         // ports exist (sessions are not available at plan-build time). All port
         // names come from the `PreEmbedderSpec` / the required dataflow edge —
         // there is NO name/dtype guessing here.
-        let pre_embed = match plan.pre_embedder.as_ref() {
+        let pre_embed = match plan
+            .pre_embedder
+            .as_ref()
+            .filter(|binding| self.plan.component_is_present(&binding.component, &present))
+        {
             Some(binding) => {
                 let session = self.models.session(&binding.component).with_context(|| {
                     format!("nested pre_embedder '{}' was not loaded", binding.component)
@@ -638,7 +693,11 @@ impl PipelineEngine {
         // PREFILL); `trailing_text_embeds` [1, trailing_len, hidden] supplies one
         // `text_embed` vector per outer frame `k >= 1` (fed through the
         // pre-embedder). Only valid alongside `pre_embedder`.
-        let prefill = match plan.prefill_embedder.as_ref() {
+        let prefill = match plan
+            .prefill_embedder
+            .as_ref()
+            .filter(|binding| self.plan.component_is_present(&binding.component, &present))
+        {
             Some(binding) => {
                 let component = binding.component.as_str();
                 let pre = pre_embed.as_ref().with_context(|| {
@@ -944,6 +1003,7 @@ impl PipelineEngine {
         // Live overrides (ComfyUI-style): re-drive the already-loaded models with
         // different loop parameters, no reload. Seed / prompt / negative are
         // already live via per-request inputs, so only loop params are overridden.
+        let present = request.present.clone();
         let overrides = &request.iterative_overrides;
         let num_steps = overrides.num_steps.unwrap_or(plan.num_steps);
         let start_step = overrides.start_step.unwrap_or(plan.start_step);
@@ -982,14 +1042,26 @@ impl PipelineEngine {
         // mutated by the loop, so a denoiser whose output port shares a name
         // with a conditioning input cannot clobber that conditioning. Denoiser
         // outputs live in a separate `loop_state`, keyed by output port.
-        let mut constants = request.inputs;
+        let mut constants = self.prepare_request_tensors(request.inputs, &present)?;
         let mut stage_timings: Vec<serde_json::Value> = Vec::new();
         self.run_prompt_phase_components(
             &plan.prompt_components,
             &mut constants,
             "encode",
+            &present,
             Some(&mut stage_timings),
         )?;
+        if !self.plan.component_is_present(&plan.denoiser, &present) {
+            self.run_prompt_phase_components(
+                &plan.final_components,
+                &mut constants,
+                "decode",
+                &present,
+                Some(&mut stage_timings),
+            )?;
+            dump_stage_timings(&stage_timings);
+            return Ok(constants);
+        }
 
         let denoiser = self
             .models
@@ -1257,6 +1329,7 @@ impl PipelineEngine {
             &plan.final_components,
             &mut tensors,
             "decode",
+            &present,
             Some(&mut stage_timings),
         )?;
         dump_stage_timings(&stage_timings);
@@ -1390,7 +1463,8 @@ impl PipelineEngine {
         let PipelinePlan::Composite(plan) = &self.plan else {
             anyhow::bail!("internal error: run_composite on a non-composite plan");
         };
-        let mut tensors = request.inputs;
+        let present = request.present;
+        let mut tensors = self.prepare_request_tensors(request.inputs, &present)?;
         for stage in &plan.stages {
             match &stage.kind {
                 CompositeStageKind::SinglePass { model } => {
@@ -1398,6 +1472,7 @@ impl PipelineEngine {
                         std::slice::from_ref(model),
                         &mut tensors,
                         &stage.name,
+                        &present,
                         None,
                     )?;
                 }
@@ -1410,14 +1485,25 @@ impl PipelineEngine {
         let PipelinePlan::SinglePass(plan) = &self.plan else {
             anyhow::bail!("internal error: run_single_pass on a non-single-pass plan");
         };
-        let mut tensors = request.inputs;
-        self.run_prompt_phase_components(&plan.prompt_components, &mut tensors, "prologue", None)?;
+        let present = request.present;
+        let mut tensors = self.prepare_request_tensors(request.inputs, &present)?;
+        self.run_prompt_phase_components(
+            &plan.prompt_components,
+            &mut tensors,
+            "prologue",
+            &present,
+            None,
+        )?;
+
+        if !self.plan.component_is_present(&plan.model, &present) {
+            return Ok(tensors);
+        }
 
         let model = self
             .models
             .session(&plan.model)
             .with_context(|| format!("pipeline model '{}' was not loaded", plan.model))?;
-        let inputs = self.component_inputs(&plan.model, model, &tensors)?;
+        let inputs = self.component_inputs(&plan.model, model, &tensors, &present)?;
         let refs = inputs
             .iter()
             .map(|(name, value)| (name.as_str(), value))
@@ -1437,19 +1523,219 @@ impl PipelineEngine {
             .with_context(|| format!("no tokenizer available for '{}'", self.tokenizer_component))
     }
 
+    fn prepare_request_tensors(
+        &self,
+        inputs: PipelineTensors,
+        present: &BTreeSet<String>,
+    ) -> anyhow::Result<PipelineTensors> {
+        if present.iter().any(String::is_empty) {
+            anyhow::bail!("pipeline request presence keys must be non-empty");
+        }
+        let mut dimensions = HashMap::<String, i64>::new();
+
+        for (component, model) in &self.models.directory.spec.models {
+            let Some(io) = model.io.as_ref() else {
+                continue;
+            };
+            let session = self
+                .models
+                .session(component)
+                .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
+            for (port, optional) in &io.optional_inputs {
+                let endpoint = format!("{component}.{port}");
+                let route = self.plan.dataflow().iter().find(|edge| edge.to == endpoint);
+                let supplied_endpoint = inputs
+                    .get(&endpoint)
+                    .map(|value| (endpoint.as_str(), value));
+                let supplied_route = route.and_then(|edge| {
+                    inputs
+                        .get(&edge.from)
+                        .map(|value| (edge.from.as_str(), value))
+                });
+                let supplied = supplied_endpoint.or(supplied_route);
+                let is_present = present.contains(&optional.presence);
+
+                if !is_present {
+                    if let Some((supplied_name, _)) = supplied {
+                        anyhow::bail!(
+                            "pipeline input '{supplied_name}' is associated with presence key '{}' \
+                             but that key was declared absent",
+                            optional.presence
+                        );
+                    }
+                } else if supplied.is_none() {
+                    let active_route = route.is_some_and(|edge| {
+                        endpoint_component(&edge.from).is_some_and(|producer| {
+                            self.plan.component_is_present(producer, present)
+                        })
+                    });
+                    if !active_route {
+                        anyhow::bail!(
+                            "missing optional-but-present pipeline input '{endpoint}' for presence \
+                             key '{}': supply the destination endpoint or an active routed source",
+                            optional.presence
+                        );
+                    }
+                }
+
+                let info = session
+                    .inputs()
+                    .iter()
+                    .find(|info| info.name == *port)
+                    .with_context(|| {
+                        format!(
+                            "optional pipeline input '{endpoint}' is not exposed by its ONNX graph"
+                        )
+                    })?;
+                if info.shape.len() != optional.absent.shape.len() {
+                    anyhow::bail!(
+                        "invalid fallback for optional pipeline input '{endpoint}': declared rank {} \
+                         does not match graph rank {}",
+                        optional.absent.shape.len(),
+                        info.shape.len()
+                    );
+                }
+                for (index, dimension) in optional.absent.shape.iter().enumerate() {
+                    let TensorDimension::Symbol(symbol) = dimension else {
+                        continue;
+                    };
+                    if info.shape[index] >= 0 {
+                        bind_dimension(&mut dimensions, symbol, info.shape[index], &endpoint)?;
+                    }
+                    if let Some((_, value)) = supplied {
+                        if value.shape().len() != optional.absent.shape.len() {
+                            anyhow::bail!(
+                                "pipeline input '{endpoint}' has rank {}, expected {} from its \
+                                 optional-input contract",
+                                value.shape().len(),
+                                optional.absent.shape.len()
+                            );
+                        }
+                        bind_dimension(&mut dimensions, symbol, value.shape()[index], &endpoint)?;
+                    }
+                }
+            }
+        }
+
+        let mut tensors = inputs;
+        for (component, model) in &self.models.directory.spec.models {
+            let Some(io) = model.io.as_ref() else {
+                continue;
+            };
+            let session = self
+                .models
+                .session(component)
+                .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
+            for (port, optional) in &io.optional_inputs {
+                if present.contains(&optional.presence) {
+                    continue;
+                }
+                let endpoint = format!("{component}.{port}");
+                if tensors.contains_key(&endpoint) {
+                    continue;
+                }
+                let info = session
+                    .inputs()
+                    .iter()
+                    .find(|info| info.name == *port)
+                    .with_context(|| {
+                        format!(
+                            "optional pipeline input '{endpoint}' is not exposed by its ONNX graph"
+                        )
+                    })?;
+                let shape = optional
+                    .absent
+                    .shape
+                    .iter()
+                    .map(|dimension| match dimension {
+                        TensorDimension::Fixed(value) => Ok(*value),
+                        TensorDimension::Symbol(symbol) => {
+                            dimensions.get(symbol).copied().with_context(|| {
+                                format!(
+                                    "unresolved fallback shape symbol '{symbol}' for optional \
+                                     pipeline input '{endpoint}'"
+                                )
+                            })
+                        }
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let value = match optional.absent.kind {
+                    AbsentInputKind::Zeros => zero_value(&shape, info.dtype).with_context(|| {
+                        format!(
+                            "invalid fallback for optional pipeline input '{endpoint}' with dtype \
+                             {:?} and shape {shape:?}",
+                            info.dtype
+                        )
+                    })?,
+                };
+                tensors.insert(endpoint, value);
+            }
+        }
+        Ok(tensors)
+    }
+
+    fn ensure_component_present(
+        &self,
+        component: &str,
+        present: &BTreeSet<String>,
+        role: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(key) = self.plan.presence_condition(component)
+            && !present.contains(key)
+        {
+            anyhow::bail!(
+                "{role} '{component}' is gated by absent presence key '{key}' and cannot execute"
+            );
+        }
+        Ok(())
+    }
+
+    fn missing_input_error(
+        &self,
+        component: &str,
+        port: &str,
+        present: &BTreeSet<String>,
+    ) -> anyhow::Error {
+        let endpoint = format!("{component}.{port}");
+        let optional = self
+            .models
+            .directory
+            .spec
+            .models
+            .get(component)
+            .and_then(|model| model.io.as_ref())
+            .and_then(|io| io.optional_inputs.get(port));
+        match optional {
+            Some(optional) if present.contains(&optional.presence) => anyhow::anyhow!(
+                "missing optional-but-present pipeline input '{endpoint}' for presence key '{}'",
+                optional.presence
+            ),
+            Some(optional) => anyhow::anyhow!(
+                "missing or invalid fallback for absent optional pipeline input '{endpoint}' \
+                 (presence key '{}')",
+                optional.presence
+            ),
+            None => anyhow::anyhow!("missing required pipeline input '{endpoint}'"),
+        }
+    }
+
     fn run_prompt_phase_components(
         &self,
         components: &[String],
         tensors: &mut PipelineTensors,
         phase: &str,
+        present: &BTreeSet<String>,
         mut timings: Option<&mut Vec<serde_json::Value>>,
     ) -> anyhow::Result<()> {
         for component in components {
+            if !self.plan.component_is_present(component, present) {
+                continue;
+            }
             let session = self
                 .models
                 .session(component)
                 .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
-            let inputs = self.component_inputs(component, session, tensors)?;
+            let inputs = self.component_inputs(component, session, tensors, present)?;
             let refs = inputs
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
@@ -1477,6 +1763,7 @@ impl PipelineEngine {
         component: &str,
         session: &Session,
         tensors: &PipelineTensors,
+        present: &BTreeSet<String>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let mut inputs = Vec::new();
         for info in session.inputs() {
@@ -1485,12 +1772,16 @@ impl PipelineEngine {
                 .plan
                 .dataflow()
                 .iter()
-                .find(|edge| edge.to == endpoint)
+                .find(|edge| {
+                    edge.to == endpoint
+                        && endpoint_component(&edge.from)
+                            .is_none_or(|source| self.plan.component_is_present(source, present))
+                })
                 .and_then(|edge| tensors.get(&edge.from));
             let value = tensors
                 .get(&endpoint)
                 .or(routed)
-                .with_context(|| format!("missing pipeline input '{endpoint}'"))?;
+                .ok_or_else(|| self.missing_input_error(component, &info.name, present))?;
             inputs.push((info.name.clone(), coerce_value_to_dtype(value, info.dtype)?));
         }
         Ok(inputs)
@@ -1501,12 +1792,18 @@ impl PipelineEngine {
         decoder: &str,
         tensors: &PipelineTensors,
         exclude_input: Option<&str>,
+        present: &BTreeSet<String>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let mut extras = Vec::new();
+        let mut bound = BTreeSet::new();
         for edge in self
             .plan
             .edges_to_component(decoder)
             .filter(|edge| endpoint_component(&edge.from).is_some_and(|from| from != decoder))
+            .filter(|edge| {
+                endpoint_component(&edge.from)
+                    .is_none_or(|source| self.plan.component_is_present(source, present))
+            })
         {
             let (_, input) = parse_endpoint(&edge.to)?;
             // The per-step `inputs_embeds` edge is threaded dynamically by the
@@ -1515,9 +1812,48 @@ impl PipelineEngine {
                 continue;
             }
             let value = tensors
-                .get(&edge.from)
-                .with_context(|| format!("missing routed pipeline tensor '{}'", edge.from))?;
+                .get(&edge.to)
+                .or_else(|| tensors.get(&edge.from))
+                .with_context(|| {
+                    format!(
+                        "missing pipeline tensor '{}' and routed source '{}'",
+                        edge.to, edge.from
+                    )
+                })?;
             extras.push((input.to_string(), clone_value(value)?));
+            bound.insert(input.to_string());
+        }
+        if let Some(optional_inputs) = self
+            .models
+            .directory
+            .spec
+            .models
+            .get(decoder)
+            .and_then(|model| model.io.as_ref())
+            .map(|io| &io.optional_inputs)
+        {
+            let session = self
+                .models
+                .session(decoder)
+                .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
+            for port in optional_inputs.keys() {
+                if exclude_input == Some(port.as_str()) || bound.contains(port) {
+                    continue;
+                }
+                let endpoint = format!("{decoder}.{port}");
+                let value = tensors
+                    .get(&endpoint)
+                    .ok_or_else(|| self.missing_input_error(decoder, port, present))?;
+                let dtype = session
+                    .inputs()
+                    .iter()
+                    .find(|info| info.name == *port)
+                    .with_context(|| {
+                        format!("optional pipeline input '{endpoint}' is not exposed by its graph")
+                    })?
+                    .dtype;
+                extras.push((port.clone(), coerce_value_to_dtype(value, dtype)?));
+            }
         }
         Ok(extras)
     }
@@ -1566,15 +1902,49 @@ impl PipelineEngine {
     /// `every_step` producers and cached `prompt_only` conditioning route through
     /// this list; the values are re-read from the shared pool on every step, so
     /// per-step outputs stay fresh while fixed conditioning is simply reused.
-    fn decoder_in_edges(&self, decoder: &str) -> anyhow::Result<Vec<(String, String)>> {
+    fn decoder_in_edges(
+        &self,
+        decoder: &str,
+        present: &BTreeSet<String>,
+        tensors: &PipelineTensors,
+    ) -> anyhow::Result<Vec<(String, String)>> {
         let mut edges = Vec::new();
+        let mut bound = BTreeSet::new();
         for edge in self
             .plan
             .edges_to_component(decoder)
             .filter(|edge| endpoint_component(&edge.from).is_some_and(|from| from != decoder))
+            .filter(|edge| {
+                endpoint_component(&edge.from)
+                    .is_none_or(|source| self.plan.component_is_present(source, present))
+            })
         {
             let (_, input) = parse_endpoint(&edge.to)?;
-            edges.push((edge.from.clone(), input.to_string()));
+            let source = if tensors.contains_key(&edge.to) {
+                edge.to.clone()
+            } else {
+                edge.from.clone()
+            };
+            edges.push((source, input.to_string()));
+            bound.insert(input.to_string());
+        }
+        if let Some(io) = self
+            .models
+            .directory
+            .spec
+            .models
+            .get(decoder)
+            .and_then(|model| model.io.as_ref())
+        {
+            for port in io.optional_inputs.keys() {
+                if bound.contains(port) {
+                    continue;
+                }
+                let endpoint = format!("{decoder}.{port}");
+                if tensors.contains_key(&endpoint) {
+                    edges.push((endpoint, port.clone()));
+                }
+            }
         }
         Ok(edges)
     }
@@ -1594,9 +1964,13 @@ impl PipelineEngine {
     fn build_step_bindings(
         &self,
         step_components: &[String],
+        present: &BTreeSet<String>,
     ) -> anyhow::Result<Vec<StepComponentBinding>> {
         let mut bindings = Vec::with_capacity(step_components.len());
         for component in step_components {
+            if !self.plan.component_is_present(component, present) {
+                continue;
+            }
             let session = self.models.session(component).with_context(|| {
                 format!("pipeline every_step component '{component}' was not loaded")
             })?;
@@ -1627,13 +2001,21 @@ impl PipelineEngine {
                     .plan
                     .dataflow()
                     .iter()
-                    .find(|edge| edge.to == endpoint)
+                    .find(|edge| {
+                        edge.to == endpoint
+                            && endpoint_component(&edge.from).is_none_or(|source| {
+                                self.plan.component_is_present(source, present)
+                            })
+                    })
                     .map(|edge| edge.from.clone());
                 routed_inputs.push(StepComponentInput {
                     port: info.name.clone(),
                     endpoint,
                     routed_from,
                     dtype: info.dtype,
+                    missing_message: self
+                        .missing_input_error(component, &info.name, present)
+                        .to_string(),
                 });
             }
             bindings.push(StepComponentBinding {
@@ -1792,6 +2174,8 @@ struct StepComponentInput {
     routed_from: Option<String>,
     /// Declared graph-input dtype to coerce the routed value to.
     dtype: DataType,
+    /// Presence-aware diagnostic if neither direct nor routed binding exists.
+    missing_message: String,
 }
 
 struct PipelineDecodeLoopBackend<'a> {
@@ -1834,12 +2218,7 @@ impl PipelineDecodeLoopBackend<'_> {
                             .as_deref()
                             .and_then(|from| self.pool.get(from))
                     })
-                    .with_context(|| {
-                        format!(
-                            "missing input '{}' for every_step component '{}'",
-                            routed.endpoint, binding.component
-                        )
-                    })?;
+                    .with_context(|| routed.missing_message.clone())?;
                 inputs.push((
                     routed.port.clone(),
                     coerce_value_to_dtype(value, routed.dtype)?,
@@ -1958,6 +2337,7 @@ enum PipelinePlan {
 struct CompositePlan {
     stages: Vec<CompositeStage>,
     dataflow: Vec<DataflowEdge>,
+    presence_conditions: HashMap<String, String>,
 }
 
 /// One stage of a [`CompositePlan`].
@@ -2005,6 +2385,7 @@ struct AutoregressivePlan {
     /// conventional text decoder or a Whisper-style ASR pipeline.
     post_decode_components: Vec<String>,
     dataflow: Vec<DataflowEdge>,
+    presence_conditions: HashMap<String, String>,
 }
 
 /// Dual, hierarchically-nested autoregressive pipeline — the multi-decoder TTS
@@ -2073,6 +2454,7 @@ struct NestedAutoregressivePlan {
     /// (backward compatible).
     prefill_embedder: Option<PrefillEmbedderBinding>,
     dataflow: Vec<DataflowEdge>,
+    presence_conditions: HashMap<String, String>,
 }
 
 /// Wiring for a pre-embedder that drives the outer talker's per-step
@@ -2130,6 +2512,49 @@ struct SinglePassPlan {
     /// Components that run once before the model (e.g. an encoder).
     prompt_components: Vec<String>,
     dataflow: Vec<DataflowEdge>,
+    presence_conditions: HashMap<String, String>,
+}
+
+fn bind_dimension(
+    dimensions: &mut HashMap<String, i64>,
+    symbol: &str,
+    value: i64,
+    endpoint: &str,
+) -> anyhow::Result<()> {
+    if value < 0 {
+        anyhow::bail!(
+            "cannot resolve fallback shape symbol '{symbol}' for '{endpoint}' from dynamic \
+             dimension {value}"
+        );
+    }
+    if let Some(previous) = dimensions.insert(symbol.to_string(), value)
+        && previous != value
+    {
+        anyhow::bail!(
+            "conflicting values for fallback shape symbol '{symbol}': {previous} and {value} \
+             while resolving '{endpoint}'"
+        );
+    }
+    Ok(())
+}
+
+fn zero_value(shape: &[i64], dtype: DataType) -> anyhow::Result<Value> {
+    let numel = shape.iter().try_fold(1usize, |count, &dimension| {
+        let dimension = usize::try_from(dimension)
+            .map_err(|_| anyhow::anyhow!("negative tensor dimension {dimension}"))?;
+        count
+            .checked_mul(dimension)
+            .context("fallback tensor element count overflow")
+    })?;
+    match dtype {
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16 => {
+            Value::from_f32_slice_as(&vec![0.0; numel], shape, dtype).map_err(Into::into)
+        }
+        DataType::Int64 => Value::from_slice_i64(&vec![0; numel], shape).map_err(Into::into),
+        other => anyhow::bail!(
+            "zero fallback materialization does not support graph input dtype {other:?}"
+        ),
+    }
 }
 
 /// Coerce a float tensor to a model input's declared float dtype so the f32-space
@@ -2231,6 +2656,7 @@ struct IterativePlan {
     scheduler_spec: Option<SchedulerSpec>,
     /// The scheduler registry, kept for the same per-request rebuild.
     scheduler_registry: SchedulerRegistry,
+    presence_conditions: HashMap<String, String>,
 }
 
 /// A loop-carried transform applied to a denoiser's output at each iterative
@@ -3570,6 +3996,7 @@ impl PipelinePlan {
             step_components,
             post_decode_components,
             dataflow: spec.dataflow.clone(),
+            presence_conditions: presence_conditions(spec),
         }))
     }
 
@@ -3779,6 +4206,7 @@ impl PipelinePlan {
             pre_embedder,
             prefill_embedder,
             dataflow: spec.dataflow.clone(),
+            presence_conditions: presence_conditions(spec),
         }))
     }
 
@@ -3814,6 +4242,7 @@ impl PipelinePlan {
             model,
             prompt_components,
             dataflow: spec.dataflow.clone(),
+            presence_conditions: presence_conditions(spec),
         }))
     }
 
@@ -3873,6 +4302,7 @@ impl PipelinePlan {
         Ok(Self::Composite(CompositePlan {
             stages,
             dataflow: spec.dataflow.clone(),
+            presence_conditions: presence_conditions(spec),
         }))
     }
 
@@ -3986,6 +4416,7 @@ impl PipelinePlan {
             dataflow: spec.dataflow.clone(),
             scheduler_spec: spec.strategy.scheduler_config.clone(),
             scheduler_registry: schedulers.clone(),
+            presence_conditions: presence_conditions(spec),
         })))
     }
 
@@ -4006,6 +4437,22 @@ impl PipelinePlan {
         }
     }
 
+    fn presence_condition(&self, component: &str) -> Option<&str> {
+        let conditions = match self {
+            Self::Autoregressive(plan) => &plan.presence_conditions,
+            Self::NestedAutoregressive(plan) => &plan.presence_conditions,
+            Self::SinglePass(plan) => &plan.presence_conditions,
+            Self::Iterative(plan) => &plan.presence_conditions,
+            Self::Composite(plan) => &plan.presence_conditions,
+        };
+        conditions.get(component).map(String::as_str)
+    }
+
+    fn component_is_present(&self, component: &str, present: &BTreeSet<String>) -> bool {
+        self.presence_condition(component)
+            .is_none_or(|key| present.contains(key))
+    }
+
     fn edges_to_component<'a>(
         &'a self,
         component: &'a str,
@@ -4014,6 +4461,18 @@ impl PipelinePlan {
             .iter()
             .filter(move |edge| endpoint_component(&edge.to) == Some(component))
     }
+}
+
+fn presence_conditions(spec: &PipelineSpec) -> HashMap<String, String> {
+    spec.phases
+        .iter()
+        .filter_map(|(component, phase)| {
+            phase
+                .when_present
+                .as_ref()
+                .map(|key| (component.clone(), key.clone()))
+        })
+        .collect()
 }
 
 /// Collect the `prompt_only`-phase components (everything except `primary`
