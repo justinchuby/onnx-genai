@@ -8,7 +8,8 @@ use onnx_genai_ort::{
 const HIDDEN: usize = 16;
 
 fn tiny_mtp() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx.textproto")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx.textproto")
 }
 
 fn deterministic_session_options() -> SessionOptions {

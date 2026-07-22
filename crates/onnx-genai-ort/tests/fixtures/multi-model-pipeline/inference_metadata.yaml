@@ -7,6 +7,11 @@ pipeline:
       filename: decoder.onnx.fixture
       type: decoder
       tokenizer: decoder-tokenizer.json
+      io:
+        token_input: input_ids
+        attention_mask_input: attention_mask
+        encoder_hidden_states_input: encoder_hidden_states
+        logits_output: logits
   dataflow:
     - from: encoder.hidden_states
       to: decoder.encoder_hidden_states

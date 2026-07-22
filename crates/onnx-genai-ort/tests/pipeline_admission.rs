@@ -258,15 +258,251 @@ fn admission_rejects_unbound_decoder_input() -> TestResult {
 }
 
 #[test]
-fn admission_rejects_prompt_only_stale_decoder_input() -> TestResult {
-    let fixture = FixtureDir::new("stale")?;
-    write_pipeline_models(&fixture.0, default_per_layer_port())?;
-    write_metadata(&fixture.0, &base_metadata(true, "prompt_only"))?;
+fn admission_accepts_cached_prompt_only_conditioning() -> TestResult {
+    let fixture = FixtureDir::new("cached-conditioning")?;
+    write_identity_model(
+        &fixture.0.join("conditioning.onnx"),
+        vec![Port {
+            name: "image_features",
+            dtype: DataType::Float16,
+            shape: symbolic_shape(&["batch", "image_sequence"], 8),
+        }],
+        vec![("conditioning", "image_features")],
+    )?;
+    write_identity_model(
+        &fixture.0.join("embedding.onnx"),
+        vec![Port {
+            name: "seed_embeddings",
+            dtype: DataType::Float16,
+            shape: symbolic_shape(&["batch", "sequence"], 8),
+        }],
+        vec![("inputs_embeds", "seed_embeddings")],
+    )?;
+    write_identity_model(
+        &fixture.0.join("decoder.onnx"),
+        vec![
+            Port {
+                name: "inputs_embeds",
+                dtype: DataType::Float16,
+                shape: symbolic_shape(&["batch", "sequence"], 8),
+            },
+            Port {
+                name: "conditioning",
+                dtype: DataType::Float16,
+                shape: symbolic_shape(&["batch", "image_sequence"], 8),
+            },
+            Port {
+                name: "position",
+                dtype: DataType::Int64,
+                shape: vec![ShapeDim::Dynamic("sequence")],
+            },
+        ],
+        vec![("logits", "inputs_embeds")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    conditioning:
+      filename: conditioning.onnx
+      type: encoder
+    embedding:
+      filename: embedding.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      io:
+        inputs_embeds_input: inputs_embeds
+        position_ids_input: position
+        logits_output: logits
+  dataflow:
+    - from: conditioning.conditioning
+      to: decoder.conditioning
+      dtype: fp16
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp16
+  strategy:
+    kind: composite
+    stages:
+      - name: conditioning
+        strategy:
+          kind: single_pass
+          model: conditioning
+        run_on: prompt_only
+      - name: embedding
+        strategy:
+          kind: single_pass
+          model: embedding
+        run_on: every_step
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+        run_on: every_step
+  phases:
+    conditioning:
+      run_on: prompt_only
+    embedding:
+      run_on: every_step
+    decoder:
+      run_on: every_step
+  positions:
+    input: position
+    rank: 1
+    axes: [sequence]
+    dtype: int64
+"#,
+    )?;
+
+    PipelineModelDirectory::load(&fixture.0)?;
+    Ok(())
+}
+
+#[test]
+fn admission_accepts_mixed_dataflow_and_external_inputs() -> TestResult {
+    let fixture = FixtureDir::new("mixed-provenance")?;
+    write_identity_model(
+        &fixture.0.join("producer.onnx"),
+        vec![Port {
+            name: "seed",
+            dtype: DataType::Float32,
+            shape: vec![ShapeDim::Dynamic("batch"), ShapeDim::Static(4)],
+        }],
+        vec![("routed", "seed")],
+    )?;
+    write_identity_model(
+        &fixture.0.join("consumer.onnx"),
+        vec![
+            Port {
+                name: "routed",
+                dtype: DataType::Float32,
+                shape: vec![ShapeDim::Dynamic("batch"), ShapeDim::Static(4)],
+            },
+            Port {
+                name: "request_context",
+                dtype: DataType::Float32,
+                shape: vec![ShapeDim::Dynamic("batch"), ShapeDim::Static(4)],
+            },
+        ],
+        vec![("output", "routed")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    producer:
+      filename: producer.onnx
+      type: encoder
+    consumer:
+      filename: consumer.onnx
+      type: encoder
+  dataflow:
+    - from: producer.routed
+      to: consumer.routed
+      dtype: fp32
+  strategy:
+    kind: composite
+    stages:
+      - name: producer
+        strategy:
+          kind: single_pass
+          model: producer
+        run_on: prompt_only
+      - name: consumer
+        strategy:
+          kind: single_pass
+          model: consumer
+        run_on: prompt_only
+  phases:
+    producer:
+      run_on: prompt_only
+    consumer:
+      run_on: prompt_only
+"#,
+    )?;
+
+    PipelineModelDirectory::load(&fixture.0)?;
+    Ok(())
+}
+
+#[test]
+fn admission_rejects_convention_looking_undeclared_input() -> TestResult {
+    let fixture = FixtureDir::new("undeclared-past-noise")?;
+    write_identity_model(
+        &fixture.0.join("decoder.onnx"),
+        vec![
+            Port {
+                name: "input_ids",
+                dtype: DataType::Int64,
+                shape: vec![ShapeDim::Dynamic("batch"), ShapeDim::Dynamic("sequence")],
+            },
+            Port {
+                name: "past_noise",
+                dtype: DataType::Float16,
+                shape: symbolic_shape(&["batch", "sequence"], 8),
+            },
+        ],
+        vec![("logits", "past_noise")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      io:
+        token_input: input_ids
+        logits_output: logits
+  dataflow: []
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
+"#,
+    )?;
 
     let error = rejection(&fixture.0);
-    assert!(error.contains("decoder.inputs_embeds"), "{error}");
-    assert!(error.contains("stale every_step decoder input"), "{error}");
-    assert!(error.contains("embedding.inputs_embeds"), "{error}");
+    assert!(error.contains("decoder.past_noise"), "{error}");
+    assert!(error.contains("unbound"), "{error}");
+    assert!(error.contains("exactly one declared source"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn admission_preserves_component_model_load_context() -> TestResult {
+    let fixture = FixtureDir::new("invalid-model")?;
+    std::fs::write(fixture.0.join("decoder.onnx"), b"not an ONNX model")?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      io:
+        token_input: input_ids
+        logits_output: logits
+  dataflow: []
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+"#,
+    )?;
+
+    let error = rejection(&fixture.0);
+    assert!(error.contains("component 'decoder'"), "{error}");
+    assert!(error.contains("decoder.onnx"), "{error}");
+    assert!(error.contains("could not be loaded"), "{error}");
+    assert!(error.contains("How to fix"), "{error}");
     Ok(())
 }
 

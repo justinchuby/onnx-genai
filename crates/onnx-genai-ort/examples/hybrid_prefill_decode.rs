@@ -28,8 +28,8 @@ use std::{
 };
 
 use onnx_genai_ort::{
-    ChatMessage, ChatTemplate, DecodeSession, DecodeSessionOptions, Environment,
-    ModelDirectory, OrtError, Result, Session, SessionOptions, Tokenizer, Value, ep_selection,
+    ChatMessage, ChatTemplate, DecodeSession, DecodeSessionOptions, Environment, ModelDirectory,
+    OrtError, Result, Session, SessionOptions, Tokenizer, Value, ep_selection,
 };
 
 #[derive(Debug)]
@@ -83,7 +83,10 @@ impl RunReport {
         println!("  prompt_len      : {}", self.prompt_len);
         println!("  prefill/TTFT    : {ttft_ms:.1} ms");
         if let Some(handoff) = self.handoff {
-            println!("  kv_handoff      : {:.2} ms", handoff.as_secs_f64() * 1000.0);
+            println!(
+                "  kv_handoff      : {:.2} ms",
+                handoff.as_secs_f64() * 1000.0
+            );
         }
         println!(
             "  decode          : {} tokens, {:.1} tok/s ({:.2} ms/tok)",
@@ -138,10 +141,8 @@ fn main() -> Result<()> {
     };
 
     let want_cpu = matches!(args.mode, Mode::Cpu | Mode::All);
-    let want_metal =
-        matches!(args.mode, Mode::Metal | Mode::All) && metal_session.is_some();
-    let want_hybrid =
-        matches!(args.mode, Mode::Hybrid | Mode::All) && metal_session.is_some();
+    let want_metal = matches!(args.mode, Mode::Metal | Mode::All) && metal_session.is_some();
+    let want_hybrid = matches!(args.mode, Mode::Hybrid | Mode::All) && metal_session.is_some();
 
     if args.warmup {
         // Warm both sessions (shader compile, weight upload, thread pools) so the
@@ -156,14 +157,25 @@ fn main() -> Result<()> {
     let mut cpu_reference: Option<RunReport> = None;
 
     if want_cpu {
-        let report = run_pure(&cpu_session, &tokenizer, &prompt_tokens, args.max_tokens, "pure-cpu")?;
+        let report = run_pure(
+            &cpu_session,
+            &tokenizer,
+            &prompt_tokens,
+            args.max_tokens,
+            "pure-cpu",
+        )?;
         cpu_reference = Some(clone_stream(&report));
         reports.push(report);
     }
     if want_metal {
         let metal = metal_session.as_ref().unwrap();
-        let report =
-            run_pure(metal, &tokenizer, &prompt_tokens, args.max_tokens, "pure-metal")?;
+        let report = run_pure(
+            metal,
+            &tokenizer,
+            &prompt_tokens,
+            args.max_tokens,
+            "pure-metal",
+        )?;
         reports.push(report);
     }
     if want_hybrid {

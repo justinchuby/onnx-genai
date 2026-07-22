@@ -13,7 +13,8 @@ fn tiny_llm() -> PathBuf {
 }
 
 fn tiny_scatter_llm() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
 }
 
 fn tiny_sharedbuffer_llm() -> PathBuf {

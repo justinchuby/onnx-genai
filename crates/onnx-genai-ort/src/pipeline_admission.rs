@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{
-    ModelIoSpec, PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
-    PreprocessingSpec,
+    PipelineSpec, PipelineStrategy, PipelineStrategyKind, PreprocessingSpec,
 };
 use onnx_std::ir::{DataType, Dim, SymbolId};
 
@@ -18,16 +17,6 @@ struct PortSignature {
 impl PortSignature {
     fn rank(&self) -> usize {
         self.shape.len()
-    }
-
-    fn symbols(&self) -> HashSet<SymbolId> {
-        self.shape
-            .iter()
-            .filter_map(|dim| match dim {
-                Dim::Static(_) => None,
-                Dim::Symbolic(symbol) => Some(*symbol),
-            })
-            .collect()
     }
 }
 
@@ -47,7 +36,6 @@ pub(crate) fn validate_pipeline_admission(
     validate_edges(spec, &signatures)?;
 
     let preprocessed_inputs = validate_image_program(spec, preprocessing, &signatures)?;
-    validate_stale_decoder_inputs(spec, &signatures)?;
     validate_input_closure(spec, &signatures, &preprocessed_inputs)
 }
 
@@ -68,19 +56,29 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("textproto"))
     {
-        std::fs::read_to_string(path)
-            .map_err(|_| ())
-            .and_then(|text| onnx_std::textproto::from_textproto(&text).map_err(|_| ()))
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            component_inspection_error(
+                component,
+                path,
+                format!("the ONNX textproto could not be read: {error}"),
+            )
+        })?;
+        onnx_std::textproto::from_textproto(&text).map_err(|error| {
+            component_inspection_error(
+                component,
+                path,
+                format!("the ONNX textproto could not be parsed: {error}"),
+            )
+        })
     } else {
-        onnx_std::load_model(path).map_err(|_| ())
-    }
-    .map_err(|_| {
-        OrtError::InvalidArgument(format!(
-            "package admission rejected component '{component}': its ONNX graph could not be \
-             inspected structurally. Regenerate the package with a valid ONNX graph and native \
-             sidecar for component '{component}'"
-        ))
-    })?;
+        onnx_std::load_model(path).map_err(|error| {
+            component_inspection_error(
+                component,
+                path,
+                format!("the ONNX model could not be loaded: {error}"),
+            )
+        })
+    }?;
     let graph = &model.graph;
     let mut signature = ComponentSignature::default();
 
@@ -376,124 +374,20 @@ fn validate_image_program(
     Ok(bound)
 }
 
-fn validate_stale_decoder_inputs(
-    spec: &PipelineSpec,
-    signatures: &BTreeMap<String, ComponentSignature>,
-) -> Result<()> {
-    let decoders = decoder_components(&spec.strategy);
-    for decoder in &decoders {
-        let Some(signature) = signatures.get(decoder.as_str()) else {
-            continue;
-        };
-        let refresh_required = refresh_required_decoder_inputs(
-            signature,
-            spec.models
-                .get(decoder.as_str())
-                .and_then(|component| component.io.as_ref()),
-        );
-        for edge in spec.dataflow.iter().filter(|edge| {
-            parse_endpoint_unchecked(&edge.to).is_some_and(|(component, port)| {
-                component == decoder && refresh_required.contains(port)
-            })
-        }) {
-            let (producer, _) = parse_endpoint(&edge.from)?;
-            if component_phase(spec, producer, &decoders) == PhaseRunOn::PromptOnly
-                && component_phase(spec, decoder, &decoders) == PhaseRunOn::EveryStep
-            {
-                return Err(admission_error(
-                    &edge.to,
-                    format!(
-                        "stale every_step decoder input: '{}' is sequence-dependent, but its producer '{}' runs prompt_only and cannot refresh it during decode",
-                        edge.to, edge.from
-                    ),
-                    format!(
-                        "regenerate the native sidecar so producer component '{producer}' runs every_step and feeds {} on every decode step",
-                        edge.to
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn refresh_required_decoder_inputs(
-    signature: &ComponentSignature,
-    io: Option<&ModelIoSpec>,
-) -> BTreeSet<String> {
-    let primary = io
-        .and_then(|io| io.inputs_embeds_input.as_deref())
-        .filter(|port| signature.inputs.contains_key(*port))
-        .or_else(|| {
-            io.and_then(|io| io.token_input.as_deref())
-                .filter(|port| signature.inputs.contains_key(*port))
-        })
-        .or_else(|| {
-            signature
-                .inputs
-                .contains_key("inputs_embeds")
-                .then_some("inputs_embeds")
-        })
-        .or_else(|| {
-            signature
-                .inputs
-                .keys()
-                .find(|port| is_token_input_name(port))
-                .map(String::as_str)
-        });
-    let Some(primary) = primary else {
-        return BTreeSet::new();
-    };
-
-    let primary_symbols = signature.inputs[primary].symbols();
-    let mut common_symbols = primary_symbols.clone();
-    for input in signature
-        .inputs
-        .values()
-        .filter(|input| !input.shape.is_empty())
-    {
-        common_symbols = common_symbols
-            .intersection(&input.symbols())
-            .copied()
-            .collect();
-    }
-    let sequence_symbols = primary_symbols
-        .difference(&common_symbols)
-        .copied()
-        .collect::<HashSet<_>>();
-
-    signature
-        .inputs
-        .iter()
-        .filter_map(|(port, input)| {
-            let explicitly_sequence = io
-                .and_then(|io| io.inputs_embeds_input.as_deref())
-                .is_some_and(|declared| declared == port);
-            let shares_sequence_symbol = !sequence_symbols.is_disjoint(&input.symbols());
-            (explicitly_sequence || shares_sequence_symbol).then_some(port.clone())
-        })
-        .collect()
-}
-
 fn validate_input_closure(
     spec: &PipelineSpec,
     signatures: &BTreeMap<String, ComponentSignature>,
     preprocessed_inputs: &BTreeSet<String>,
 ) -> Result<()> {
     let decoders = decoder_components(&spec.strategy);
-    let generated = generated_inputs(spec, signatures, &decoders);
-    let incoming_components = spec
-        .dataflow
-        .iter()
-        .filter_map(|edge| {
-            let (from, _) = parse_endpoint_unchecked(&edge.from)?;
-            let (to, _) = parse_endpoint_unchecked(&edge.to)?;
-            (from != to).then_some(to.to_string())
-        })
-        .collect::<BTreeSet<_>>();
+    let generated = generated_inputs(spec, &decoders);
 
     for (component, signature) in signatures {
-        let is_external_source = !incoming_components.contains(component);
+        let explicit_decoder_contract = decoders.contains(component)
+            && spec
+                .models
+                .get(component)
+                .is_some_and(|model| model.io.is_some());
         for port in signature.inputs.keys() {
             let endpoint = format!("{component}.{port}");
             let incoming_edges = spec
@@ -504,7 +398,9 @@ fn validate_input_closure(
             let defaulted = signature.defaulted_inputs.contains(port);
             let generated_or_stateful = generated.contains(&endpoint);
             let preprocessed = preprocessed_inputs.contains(&endpoint);
-            let external = is_external_source
+            // Requests may bind any component.port. Without an explicit decoder I/O contract,
+            // absence of another source is not proof that the port is unbound, so fail open.
+            let external = !explicit_decoder_contract
                 && incoming_edges == 0
                 && !defaulted
                 && !generated_or_stateful
@@ -518,7 +414,7 @@ fn validate_input_closure(
             if binding_count == 0 {
                 return Err(admission_error(
                     &endpoint,
-                    "required ONNX graph input is unbound: it is neither an external request input on a source component, generated/stateful/defaulted, nor fed by a dataflow edge"
+                    "required ONNX graph input is unbound: no external, generated, stateful, default, preprocessing, or dataflow source is declared for this port"
                         .to_string(),
                     format!(
                         "regenerate the native sidecar so {endpoint} is fed by exactly one declared source"
@@ -540,17 +436,10 @@ fn validate_input_closure(
     Ok(())
 }
 
-fn generated_inputs(
-    spec: &PipelineSpec,
-    signatures: &BTreeMap<String, ComponentSignature>,
-    decoders: &BTreeSet<String>,
-) -> BTreeSet<String> {
+fn generated_inputs(spec: &PipelineSpec, decoders: &BTreeSet<String>) -> BTreeSet<String> {
     let mut generated = BTreeSet::new();
 
     for (component, model) in &spec.models {
-        let Some(signature) = signatures.get(component) else {
-            continue;
-        };
         if let Some(io) = model.io.as_ref() {
             for port in [
                 io.token_input.as_deref(),
@@ -571,19 +460,11 @@ fn generated_inputs(
             for port in io.kv_inputs.iter().flatten() {
                 generated.insert(format!("{component}.{port}"));
             }
+            for port in io.cross_kv_inputs.iter().flatten() {
+                generated.insert(format!("{component}.{port}"));
+            }
             for pair in io.state_pairs.iter().flatten() {
                 generated.insert(format!("{component}.{}", pair.input));
-            }
-        } else {
-            for port in signature.inputs.keys() {
-                if decoders.contains(component)
-                    && (is_token_input_name(port)
-                        || is_attention_mask_name(port)
-                        || is_position_input_name(port)
-                        || is_kv_input_name(port))
-                {
-                    generated.insert(format!("{component}.{port}"));
-                }
             }
         }
     }
@@ -709,23 +590,6 @@ fn collect_decoder_components(strategy: &PipelineStrategy, decoders: &mut BTreeS
     }
 }
 
-fn component_phase(
-    spec: &PipelineSpec,
-    component: &str,
-    decoders: &BTreeSet<String>,
-) -> PhaseRunOn {
-    spec.phases
-        .get(component)
-        .map(|phase| phase.run_on.clone())
-        .unwrap_or_else(|| {
-            if decoders.contains(component) {
-                PhaseRunOn::EveryStep
-            } else {
-                PhaseRunOn::PromptOnly
-            }
-        })
-}
-
 fn resolve_input_endpoint<'a>(
     endpoint: &str,
     signatures: &'a BTreeMap<String, ComponentSignature>,
@@ -781,30 +645,13 @@ fn admission_error(endpoint: &str, why: String, fix: String) -> OrtError {
     ))
 }
 
-fn is_token_input_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower == "input_ids"
-        || lower == "decoder_input_ids"
-        || lower.ends_with(".input_ids")
-        || lower.ends_with(".decoder_input_ids")
-}
-
-fn is_attention_mask_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower == "attention_mask" || lower.ends_with(".attention_mask")
-}
-
-fn is_position_input_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower == "position_ids" || lower.ends_with(".position_ids")
-}
-
-fn is_kv_input_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("past")
-        || lower.contains(".past")
-        || lower.starts_with("cache_k_in")
-        || lower.starts_with("cache_v_in")
+fn component_inspection_error(component: &str, path: &Path, cause: String) -> OrtError {
+    OrtError::InvalidArgument(format!(
+        "package admission rejected component '{component}': {cause} at model path '{}'. \
+         How to fix: regenerate the package with a valid ONNX graph and native sidecar for \
+         component '{component}'",
+        path.display()
+    ))
 }
 
 fn parse_dtype(value: &str) -> Option<DataType> {
