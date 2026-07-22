@@ -282,6 +282,43 @@ pub struct OrtPluginExport {
     pub register_symbol: String,
 }
 
+/// Resolved-shape facts needed by an EP's structural capture-region policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureRegionShapeStatus {
+    /// Every present node input has a concrete shape before capture.
+    pub inputs_resolved: bool,
+    /// Every node output has a concrete shape before capture.
+    pub outputs_resolved: bool,
+}
+
+/// Structural reason an EP excludes a node from a device-graph capture region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructuralCaptureDecline {
+    /// Host-driven control-flow or sequence semantics.
+    HostControlFlowOrSequence,
+    /// A data-dependent output shape was unresolved before capture.
+    UnresolvedOutputShape,
+    /// A data-dependent input shape was unresolved before capture.
+    UnresolvedInputShape,
+}
+
+impl StructuralCaptureDecline {
+    /// Stable diagnostic text matching the executor's original capture audit.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::HostControlFlowOrSequence => {
+                "control-flow and sequence nodes are not device-graph capturable"
+            }
+            Self::UnresolvedOutputShape => {
+                "data-dependent output shape was unresolved before capture"
+            }
+            Self::UnresolvedInputShape => {
+                "data-dependent input shape was unresolved before capture"
+            }
+        }
+    }
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -322,6 +359,31 @@ pub trait ExecutionProvider: Send + Sync {
     /// owning graph. EPs use it to select opset-specialized kernels (e.g. the
     /// opset-13 per-axis vs. the legacy opset-<13 2D-coercion `Softmax`).
     fn get_kernel(&self, op: &Node, shapes: &[Vec<usize>], opset: u64) -> Result<Box<dyn Kernel>>;
+
+    /// Apply EP-owned structural policy to one prospective capture-region node.
+    ///
+    /// The executor supplies only graph structure and resolved-shape presence.
+    /// Kernel warmth and the selected compiled kernel's capture support remain
+    /// executor-owned mechanism and are checked only after this hook admits the
+    /// node. Implementations must decline when either shape-status field is
+    /// false; admitting an unresolved shape violates the executor contract. The
+    /// default preserves the original predicate precedence exactly.
+    fn plan_capture_region(
+        &self,
+        node: &Node,
+        shape_status: CaptureRegionShapeStatus,
+    ) -> Option<StructuralCaptureDecline> {
+        if is_control_flow_or_sequence(node) {
+            return Some(StructuralCaptureDecline::HostControlFlowOrSequence);
+        }
+        if !shape_status.outputs_resolved {
+            return Some(StructuralCaptureDecline::UnresolvedOutputShape);
+        }
+        if !shape_status.inputs_resolved {
+            return Some(StructuralCaptureDecline::UnresolvedInputShape);
+        }
+        None
+    }
 
     /// Allocate device memory.
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer>;
@@ -574,6 +636,25 @@ pub trait ExecutionProvider: Send + Sync {
             ep: self.name().to_string(),
         })
     }
+}
+
+fn is_control_flow_or_sequence(node: &Node) -> bool {
+    if !(node.domain.is_empty() || node.domain == "ai.onnx") {
+        return false;
+    }
+    matches!(
+        node.op_type.as_str(),
+        "If" | "Loop"
+            | "Scan"
+            | "SequenceEmpty"
+            | "SequenceConstruct"
+            | "SequenceInsert"
+            | "SequenceErase"
+            | "SequenceAt"
+            | "SequenceLength"
+            | "SplitToSequence"
+            | "ConcatFromSequence"
+    )
 }
 
 #[cfg(test)]

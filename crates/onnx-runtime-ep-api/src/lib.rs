@@ -35,7 +35,10 @@ pub use kernel::{
     record_kernel_variant_selection, record_kernel_variant_stage_selection,
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
-pub use provider::{DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence, OrtPluginExport};
+pub use provider::{
+    CaptureRegionShapeStatus, DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence,
+    OrtPluginExport, StructuralCaptureDecline,
+};
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,

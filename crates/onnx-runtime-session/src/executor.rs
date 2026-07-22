@@ -48,9 +48,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, ExternalMmapRegion, Kernel,
-    KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary, ResidentWeight, TensorBacking,
-    TensorMut, TensorView, WeightHandle,
+    CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
+    ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
+    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMut, TensorView, WeightHandle,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
@@ -401,6 +401,21 @@ fn kernel_capture_decline(
     kernel.capture_support().reason().map(|reason| {
         CaptureDecline::node(node_id, node, SeamReason::KernelCaptureUnsupported, reason)
     })
+}
+
+fn structural_capture_decline(
+    node_id: NodeId,
+    node: &Node,
+    decline: StructuralCaptureDecline,
+) -> CaptureDecline {
+    let seam_reason = match decline {
+        StructuralCaptureDecline::HostControlFlowOrSequence => {
+            SeamReason::HostControlFlowOrSequence
+        }
+        StructuralCaptureDecline::UnresolvedOutputShape => SeamReason::UnresolvedOutputShape,
+        StructuralCaptureDecline::UnresolvedInputShape => SeamReason::UnresolvedInputShape,
+    };
+    CaptureDecline::node(node_id, node, seam_reason, decline.reason())
 }
 
 /// Whether verbose segmented-capture diagnostics are printed to stderr.
@@ -2656,45 +2671,39 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Option<CaptureDecline> {
         let node = self.graph.node(plan.node_id);
-        if is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
-        {
-            return Some(CaptureDecline::node(
-                plan.node_id,
-                node,
-                SeamReason::HostControlFlowOrSequence,
-                "control-flow and sequence nodes are not device-graph capturable",
-            ));
-        }
-        if plan
+        let outputs_resolved = plan
             .outputs
             .iter()
-            .any(|output| !resolved.contains_key(output))
-        {
-            return Some(CaptureDecline::node(
-                plan.node_id,
-                node,
-                SeamReason::UnresolvedOutputShape,
-                "data-dependent output shape was unresolved before capture",
-            ));
+            .all(|output| resolved.contains_key(output));
+        let inputs_resolved = plan.inputs.iter().all(|input| match input {
+            Some(value) => resolved.contains_key(value),
+            None => true,
+        });
+        if let Some(decline) = self.ep.plan_capture_region(
+            node,
+            CaptureRegionShapeStatus {
+                inputs_resolved,
+                outputs_resolved,
+            },
+        ) {
+            return Some(structural_capture_decline(plan.node_id, node, decline));
         }
-        let Some(input_shapes) = plan
+        assert!(
+            inputs_resolved && outputs_resolved,
+            "EP capture-region policy admitted a node with unresolved shapes"
+        );
+        let input_shapes = plan
             .inputs
             .iter()
             .map(|input| {
-                input
-                    .map(|value| resolved.get(&value).cloned())
-                    .unwrap_or(Some(Vec::new()))
+                input.map_or_else(Vec::new, |value| {
+                    resolved
+                        .get(&value)
+                        .cloned()
+                        .expect("resolved input shape checked above")
+                })
             })
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Some(CaptureDecline::node(
-                plan.node_id,
-                node,
-                SeamReason::UnresolvedInputShape,
-                "data-dependent input shape was unresolved before capture",
-            ));
-        };
+            .collect();
         let key = KernelKey {
             node: plan.node_id.0,
             shapes: input_shapes,
@@ -5861,6 +5870,161 @@ mod tests {
             assert_eq!(reason.label(), expected_label);
         }
         assert_eq!(CapturePathKind::CaptureRegion.label(), "capture-region");
+    }
+
+    #[test]
+    fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
+        use onnx_runtime_ir::static_shape;
+
+        fn legacy_node_capture_reason(
+            executor: &Executor,
+            plan: &NodePlan,
+            resolved: &HashMap<ValueId, Vec<usize>>,
+        ) -> Option<CaptureDecline> {
+            let node = executor.graph.node(plan.node_id);
+            if is_control_flow_op(&node.op_type, &node.domain)
+                || is_sequence_op(&node.op_type, &node.domain)
+            {
+                return Some(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    SeamReason::HostControlFlowOrSequence,
+                    "control-flow and sequence nodes are not device-graph capturable",
+                ));
+            }
+            if plan
+                .outputs
+                .iter()
+                .any(|output| !resolved.contains_key(output))
+            {
+                return Some(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    SeamReason::UnresolvedOutputShape,
+                    "data-dependent output shape was unresolved before capture",
+                ));
+            }
+            let Some(input_shapes) = plan
+                .inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| resolved.get(&value).cloned())
+                        .unwrap_or(Some(Vec::new()))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Some(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    SeamReason::UnresolvedInputShape,
+                    "data-dependent input shape was unresolved before capture",
+                ));
+            };
+            let key = KernelKey {
+                node: plan.node_id.0,
+                shapes: input_shapes,
+            };
+            let Some(kernel) = executor.cache.entries.get(&key) else {
+                return Some(CaptureDecline::node(
+                    plan.node_id,
+                    node,
+                    SeamReason::KernelNotWarmed,
+                    "kernel has not been warmed for the requested capture shape",
+                ));
+            };
+            kernel_capture_decline(plan.node_id, node, kernel.as_ref())
+        }
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        for index in 0..6 {
+            let input = graph.create_named_value(
+                format!("input_{index}"),
+                DataType::Float32,
+                static_shape([1]),
+            );
+            let output = graph.create_named_value(
+                format!("output_{index}"),
+                DataType::Float32,
+                static_shape([1]),
+            );
+            graph.add_input(input);
+            graph.add_output(output);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(input)],
+                vec![output],
+            ));
+        }
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().expect("CPU EP"),
+        )
+        .expect("representative static graph");
+        let mut resolved = executor
+            .value_shapes
+            .iter()
+            .filter_map(|(&value, shape)| as_static_shape(shape).map(|shape| (value, shape)))
+            .collect::<HashMap<_, _>>();
+        let keys = executor
+            .plan
+            .iter()
+            .map(|plan| KernelKey {
+                node: plan.node_id.0,
+                shapes: plan
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        input
+                            .map(|value| resolved[&value].clone())
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+
+        executor.graph.node_mut(executor.plan[0].node_id).op_type = "If".to_string();
+        resolved.remove(&executor.plan[0].outputs[0]);
+        resolved.remove(&executor.plan[0].inputs[0].expect("present input"));
+        resolved.remove(&executor.plan[1].outputs[0]);
+        resolved.remove(&executor.plan[1].inputs[0].expect("present input"));
+        resolved.remove(&executor.plan[2].inputs[0].expect("present input"));
+        executor.cache.entries.remove(&keys[3]);
+        executor
+            .cache
+            .entries
+            .insert(keys[4].clone(), Box::new(CaptureDecliningKernel));
+
+        let legacy = executor
+            .plan
+            .iter()
+            .map(|plan| legacy_node_capture_reason(&executor, plan, &resolved))
+            .collect::<Vec<_>>();
+        let refactored = executor
+            .plan
+            .iter()
+            .map(|plan| executor.node_capture_reason(plan, &resolved))
+            .collect::<Vec<_>>();
+
+        assert_eq!(refactored, legacy);
+        assert_eq!(
+            refactored
+                .iter()
+                .map(|decline| decline.as_ref().and_then(|decline| decline.seam_reason))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(SeamReason::HostControlFlowOrSequence),
+                Some(SeamReason::UnresolvedOutputShape),
+                Some(SeamReason::UnresolvedInputShape),
+                Some(SeamReason::KernelNotWarmed),
+                Some(SeamReason::KernelCaptureUnsupported),
+                None,
+            ]
+        );
     }
 
     #[test]
