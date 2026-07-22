@@ -4,9 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T09:30Z — DeepSeek DS-1 and DS-3 follow-ups landed. DS-1 extends generic dynamic `Slice -> Unsqueeze -> broadcast/movement` shape-chain propagation and unblocks native Rust DeepSeek-V2 decode. DS-3 strengthens standard Attention/MLA cached-decode conformance for asymmetric QK/V head dims, 3-D BSH, non-empty past K/V, GQA, and MQA._
+_Last updated: 2026-07-22T03:37Z — GQA scalar `seqlens_k` support and int8 fp16 default-zero-point parity coverage landed. The GQA fix unblocks Phi-4-mini and Qwen2.5-1.5B native decode._
 
 **Current `origin/main` implementation HEAD:** `d653879` (code); `ba86625` (docs).
+
+## 2026-07-22 — GQA scalar seqlens_k + int8 fp16 default-zp test merged
+
+- **GQA scalar `seqlens_k` ✅ (`4ceaa7b`):** declared unit-batch scalar key-sequence lengths are now accepted only for structurally detected GroupQueryAttention, strict-by-default for multi-batch and absent metadata, capture-safe, and schema-covered. This unblocks Phi-4-mini and Qwen2.5-1.5B native decode. (Roy 🟢)
+- **int8 fp16 implicit zero-point parity ✅ (`0d618de`):** Deckard added H200-validated GPU coverage for fp16 int8 block-32 MatMulNBits when zero-points are omitted, using default zp=128 plus bit-exact CUDA-graph replay parity; explicit-zp coverage remains green. (Tyrell 🟢)
 
 ## 2026-07-22 — DS-1 dynamic shape-chain propagation merged
 
