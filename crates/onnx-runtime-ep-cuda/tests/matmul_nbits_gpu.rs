@@ -505,7 +505,10 @@ fn run_f16_case_with_bits(
         let mut replayed = vec![0u8; n * 2];
         // SAFETY: output allocation contains `n` fp16 values.
         unsafe { runtime.dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))? };
-        assert_eq!(replayed, eager);
+        assert_eq!(
+            replayed, eager,
+            "fp16 CUDA graph replay must be bit-exact with the eager run"
+        );
         assert_eq!(runtime.allocation_counts(), allocation_counts);
         assert!(runtime.reset_graph()?);
     }
@@ -1483,12 +1486,18 @@ fn matmul_nbits_gpu_int8_fp16_block32_default_zero_point_matches_reference() {
     let scales: Vec<f16> = (0..n * blocks)
         .map(|index| f16::from_f32(0.001 + (index * 17 % 31) as f32 * 0.0002))
         .collect();
-    let zero_points = vec![128u8; n * blocks];
+    let expected_zero_points = vec![128u8; n * blocks];
     let actual =
         run_f16_case_with_bits(&ep, &activations, &packed, &scales, None, k, n, 8).unwrap();
     for (column, got) in actual.iter().enumerate() {
-        let expected =
-            f16_int8_reference_column(&activations, &packed, &scales, &zero_points, k, column);
+        let expected = f16_int8_reference_column(
+            &activations,
+            &packed,
+            &scales,
+            &expected_zero_points,
+            k,
+            column,
+        );
         let expected = f16::from_f32(expected).to_f32();
         let tolerance = 0.02f32.max(expected.abs() * 2e-3);
         assert!(
