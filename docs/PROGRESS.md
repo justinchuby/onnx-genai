@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T06:23Z — native proposer contract merged; Qwen0.5B H200 decode benchmarked._
+_Last updated: 2026-07-22T07:45Z — DS-1 native dynamic shape-chain unblocked and validated._
 
-**Current `origin/main` implementation HEAD:** `d28c0fd` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `00b6ad7` (code before this docs update).
+
+## 2026-07-22 — DS-1 native dynamic shape-chain validated
+
+- **DS-1 native dynamic shape-chain unblocked & validated ✅ (`00b6ad7`):** DeepSeek-V2 tiny now runs end-to-end on the NATIVE Rust backend (`ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu`), generating `[42, 237, 198, 2, 186, 81, 210, 149]`. Shape/Sub → Slice → Unsqueeze → Expand → Reshape → Concat → Less propagation is covered by `crates/onnx-runtime-session/tests/executor.rs::dynamic_slice_shape_propagates_through_movement_and_broadcast_chain`; dispatch remains ONNX op-category + effective opset only, with no model-name/architecture keys (RULES §2/§2.1).
 
 ## 2026-07-22 — Native proposer contract merged + Qwen0.5B H200 bench
 
