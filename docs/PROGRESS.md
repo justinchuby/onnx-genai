@@ -4,15 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T14:16Z — WP-B optional-modality contract landings._
+_Last updated: 2026-07-22T14:59Z — WP-B optional-modality contract completion + clippy cleanup._
 
-**Current `origin/main` implementation HEAD:** `bdf59b4` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `3d84b9b` (code before this docs update).
 
 ## 2026-07-22 — WP-B optional-modality contract landings
 
+- **ORT pipeline admission ✅ (`3d84b9b`):** WP-B3 now admits optional inputs by deriving dtype/rank/dimensions directly from raw `GraphProto.input` `ValueInfoProto` (`model.to_proto().graph.input`), not the loader IR projection (`model.graph.values`) that could copy initializer dtype/dims over symbolic graph-input shapes. Raw initializer names now drive only `defaulted_inputs`; `graph_builder.rs` is unchanged. Regression `admission_uses_raw_symbolic_shape_for_initializer_backed_optional_input` covers initializer-backed optional inputs with symbolic raw shapes. This completes the WP-B optional-modality contract (WP-B1 schema, WP-B2 engine runtime, WP-B3 ORT admission, WP-B4 Mobius exporter).
+- **Clippy cleanup ✅ (`6f217a4`):** fixed pre-existing `-D warnings` violations in three runtime entry crates: `real_model_cli.rs` resolves the Cargo bin path at runtime, `onnx-runtime-capi/src/lib.rs` exhaustively maps `RuntimeBroadcastIncompatible` to `InvalidArgument` with coverage, and `onnx-runtime-python/src/genai.rs` constructs `GenerateOptions` directly with targeted `too_many_arguments` allows.
 - **Optional-modality metadata + engine runtime ✅ (`a71c6f3`, `bdf59b4`):** WP-B1 froze the schema (`optional_inputs`, `OptionalInputSpec`, `AbsentInputSpec`, `AbsentInputKind::Zeros`, `TensorDimension`, `PhaseConfig.when_present`; Bryant 🟢). WP-B2 adds request presence sets, absent-modality zero tensors keyed by `component.input_name`, `when_present` skips for absent-gated components, and ONNX-dtype zeros (fp32/fp16/bf16/int64), with 8 CPU E2E tests in `crates/onnx-genai-engine/tests/optional_modality_pipeline_e2e.rs` (Cotton 🟢). Together these land the onnx-genai side of the Gemma4 image-only E2E contract (absent audio).
 - **Mobius exporter contract ✅ (`onnxruntime/mobius` PR #419, squash `54be48a`):** emits the frozen optional-modality contract, generic absent shape from `config.hidden_size` (no model-name branching), rank-2 masked-audio adapter via ONNX `Compress`, and BF16-safe flow (features cast fp32 for `Compress`, `CastLike` restores dtype) with a BF16 regression test. Wallace/Joshi 🟡→addressed.
-- **ORT pipeline admission ⏳:** WP-B3 remains in review (Chew re-reviewing Deckard's revision); not merged yet.
 
 ## 2026-07-22 — WP-C VLM pipeline admission gate landed
 
