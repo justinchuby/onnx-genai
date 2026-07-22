@@ -7,8 +7,10 @@
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
+use std::collections::BTreeMap;
 
 use super::gelu::tanh_gelu;
+use super::matmul::gemm;
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,10 +25,7 @@ pub(super) enum Activation {
 /// Factory for the ORT contrib `MoE` operator.
 pub struct MoEFactory;
 
-/// Correctness-first dense, per-row float MoE kernel.
-///
-/// Phase 2 can replace the row loop with batch-union expert grouping so each
-/// selected expert's weights are consumed once for all routed rows.
+/// Float MoE kernel that groups routed rows by expert before expert GEMMs.
 pub struct MoEKernel {
     attributes: MoeAttributes,
 }
@@ -249,6 +248,7 @@ impl Kernel for MoEKernel {
         let fc2 = to_dense_f32(&inputs[4])?;
         let mut output = vec![0.0f32; rows * hidden];
 
+        let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
         for row in 0..rows {
             let route = routing_weights(
                 &router[row * experts..(row + 1) * experts],
@@ -256,31 +256,40 @@ impl Kernel for MoEKernel {
                 self.attributes.k,
                 self.attributes.normalize_routing_weights,
             );
-            let input_row = &x[row * hidden..(row + 1) * hidden];
             for (expert, route_weight) in route {
-                let expert_out = run_expert(
-                    input_row,
-                    &fc1[expert * expected_fc1 * hidden..(expert + 1) * expected_fc1 * hidden],
-                    fc1_bias
-                        .as_deref()
-                        .map(|b| &b[expert * expected_fc1..(expert + 1) * expected_fc1]),
-                    &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
-                    fc2_bias
-                        .as_deref()
-                        .map(|b| &b[expert * hidden..(expert + 1) * hidden]),
-                    fc3.as_ref().map(|weights| {
-                        &weights[expert * inter * hidden..(expert + 1) * inter * hidden]
-                    }),
-                    fc3_bias
-                        .as_deref()
-                        .map(|b| &b[expert * inter..(expert + 1) * inter]),
-                    expected_fc1,
-                    hidden,
-                    inter,
-                    &self.attributes,
-                );
+                tasks.entry(expert).or_default().push((row, route_weight));
+            }
+        }
+        for (expert, expert_tasks) in tasks {
+            let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
+            for &(row, _) in &expert_tasks {
+                grouped_input.extend_from_slice(&x[row * hidden..(row + 1) * hidden]);
+            }
+            let expert_out = run_expert_grouped(
+                &grouped_input,
+                expert_tasks.len(),
+                &fc1[expert * expected_fc1 * hidden..(expert + 1) * expected_fc1 * hidden],
+                fc1_bias
+                    .as_deref()
+                    .map(|b| &b[expert * expected_fc1..(expert + 1) * expected_fc1]),
+                &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
+                fc2_bias
+                    .as_deref()
+                    .map(|b| &b[expert * hidden..(expert + 1) * hidden]),
+                fc3.as_ref().map(|weights| {
+                    &weights[expert * inter * hidden..(expert + 1) * inter * hidden]
+                }),
+                fc3_bias
+                    .as_deref()
+                    .map(|b| &b[expert * inter..(expert + 1) * inter]),
+                expected_fc1,
+                hidden,
+                inter,
+                &self.attributes,
+            )?;
+            for (grouped_row, &(row, route_weight)) in expert_tasks.iter().enumerate() {
                 for h in 0..hidden {
-                    output[row * hidden + h] += route_weight * expert_out[h];
+                    output[row * hidden + h] += route_weight * expert_out[grouped_row * hidden + h];
                 }
             }
         }
@@ -379,6 +388,133 @@ pub(super) fn run_expert(
         }
     };
     linear(&activated, fc2_weights, fc2_bias, hidden, inter)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_expert_grouped(
+    input: &[f32],
+    rows: usize,
+    fc1_weights: &[f32],
+    fc1_bias: Option<&[f32]>,
+    fc2_weights: &[f32],
+    fc2_bias: Option<&[f32]>,
+    fc3_weights: Option<&[f32]>,
+    fc3_bias: Option<&[f32]>,
+    fc1_size: usize,
+    hidden: usize,
+    inter: usize,
+    attributes: &MoeAttributes,
+) -> Result<Vec<f32>> {
+    if rows == 1 {
+        return Ok(run_expert(
+            input,
+            fc1_weights,
+            fc1_bias,
+            fc2_weights,
+            fc2_bias,
+            fc3_weights,
+            fc3_bias,
+            fc1_size,
+            hidden,
+            inter,
+            attributes,
+        ));
+    }
+    let mut fc1_out = linear_grouped(input, rows, fc1_weights, fc1_bias, fc1_size, hidden)?;
+    let activated = match attributes.activation {
+        Activation::Swiglu => {
+            let linear_part;
+            let gate_part;
+            if attributes.swiglu_fusion == 0 {
+                gate_part = fc1_out;
+                linear_part = linear_grouped(
+                    input,
+                    rows,
+                    fc3_weights.expect("validated unfused swiglu FC3"),
+                    fc3_bias,
+                    inter,
+                    hidden,
+                )?;
+            } else {
+                let mut gate = Vec::with_capacity(rows * inter);
+                let mut linear = Vec::with_capacity(rows * inter);
+                for row in fc1_out.chunks_exact(fc1_size) {
+                    if attributes.swiglu_fusion == 1 {
+                        for pair in row.chunks_exact(2) {
+                            gate.push(pair[0]);
+                            linear.push(pair[1]);
+                        }
+                    } else {
+                        gate.extend_from_slice(&row[..inter]);
+                        linear.extend_from_slice(&row[inter..]);
+                    }
+                }
+                gate_part = gate;
+                linear_part = linear;
+            }
+            gate_part
+                .into_iter()
+                .zip(linear_part)
+                .map(|(g, l)| attributes.swiglu(g, l))
+                .collect()
+        }
+        Activation::Silu if fc3_weights.is_some() => {
+            let linear_part = linear_grouped(
+                input,
+                rows,
+                fc3_weights.expect("validated SiLU gated FC3"),
+                fc3_bias,
+                inter,
+                hidden,
+            )?;
+            fc1_out
+                .into_iter()
+                .zip(linear_part)
+                .map(|(g, l)| attributes.swiglu(g, l))
+                .collect()
+        }
+        activation => {
+            for value in &mut fc1_out {
+                *value = activate(activation, *value);
+            }
+            fc1_out
+        }
+    };
+    linear_grouped(&activated, rows, fc2_weights, fc2_bias, hidden, inter)
+}
+
+fn linear_grouped(
+    input: &[f32],
+    rows: usize,
+    weights_nk: &[f32],
+    bias: Option<&[f32]>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<Vec<f32>> {
+    let mut weights_kn = vec![0.0f32; weights_nk.len()];
+    for output in 0..out_features {
+        for input_feature in 0..in_features {
+            weights_kn[input_feature * out_features + output] =
+                weights_nk[output * in_features + input_feature];
+        }
+    }
+    let mut output = vec![0.0f32; rows * out_features];
+    gemm(
+        input,
+        &weights_kn,
+        &mut output,
+        rows,
+        in_features,
+        out_features,
+    )?;
+    if let Some(bias) = bias {
+        for row in output.chunks_exact_mut(out_features) {
+            for (value, bias) in row.iter_mut().zip(bias) {
+                *value += bias;
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn linear(
@@ -539,6 +675,8 @@ mod tests {
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
     use onnx_runtime_loader::Model;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
 
     fn model_node(
         input_shapes: &[Option<&[usize]>],
@@ -590,6 +728,204 @@ mod tests {
             assert!(
                 (got - want).abs() <= 1e-5,
                 "index {i}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_moe_matches_per_token_dense_fallback_for_eight_experts_top2() {
+        const ROWS: usize = 6;
+        const HIDDEN: usize = 4;
+        const INTER: usize = 6;
+        const EXPERTS: usize = 8;
+        let shapes = [
+            Some(&[ROWS, HIDDEN][..]),
+            Some(&[ROWS, EXPERTS]),
+            Some(&[EXPERTS, INTER, HIDDEN]),
+            None,
+            Some(&[EXPERTS, HIDDEN, INTER]),
+        ];
+        let attrs = [
+            ("k", Attribute::Int(2)),
+            ("activation_type", Attribute::String(b"silu".to_vec())),
+            ("normalize_routing_weights", Attribute::Int(1)),
+        ];
+        let (graph, node) = model_node(&shapes, &[ROWS, HIDDEN], &attrs);
+        let input: Vec<f32> = (0..ROWS * HIDDEN)
+            .map(|index| (index as f32 * 0.17).sin())
+            .collect();
+        let router: Vec<f32> = (0..ROWS * EXPERTS)
+            .map(|index| ((index * 7 + index / EXPERTS * 3) % 19) as f32 - 9.0)
+            .collect();
+        let fc1: Vec<f32> = (0..EXPERTS * INTER * HIDDEN)
+            .map(|index| ((index * 11 % 23) as f32 - 11.0) * 0.03125)
+            .collect();
+        let fc2: Vec<f32> = (0..EXPERTS * HIDDEN * INTER)
+            .map(|index| ((index * 13 % 29) as f32 - 14.0) * 0.025)
+            .collect();
+        let x = Owned::f32(&[ROWS, HIDDEN], &input);
+        let router_tensor = Owned::f32(&[ROWS, EXPERTS], &router);
+        let fc1_tensor = Owned::f32(&[EXPERTS, INTER, HIDDEN], &fc1);
+        let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+        let mut grouped = Owned::zeros_f32(&[ROWS, HIDDEN]);
+        kernel(&graph, node)
+            .execute(
+                &[
+                    x.view(),
+                    router_tensor.view(),
+                    fc1_tensor.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2_tensor.view(),
+                ],
+                &mut [grouped.view_mut()],
+            )
+            .unwrap();
+
+        let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
+        let mut dense = vec![0.0f32; ROWS * HIDDEN];
+        for row in 0..ROWS {
+            for (expert, weight) in
+                routing_weights(&router[row * EXPERTS..(row + 1) * EXPERTS], None, 2, true)
+            {
+                let expert_output = run_expert(
+                    &input[row * HIDDEN..(row + 1) * HIDDEN],
+                    &fc1[expert * INTER * HIDDEN..(expert + 1) * INTER * HIDDEN],
+                    None,
+                    &fc2[expert * HIDDEN * INTER..(expert + 1) * HIDDEN * INTER],
+                    None,
+                    None,
+                    None,
+                    INTER,
+                    HIDDEN,
+                    INTER,
+                    &attributes,
+                );
+                for feature in 0..HIDDEN {
+                    dense[row * HIDDEN + feature] += weight * expert_output[feature];
+                }
+            }
+        }
+        assert_close(&grouped.to_f32(), &dense);
+    }
+
+    fn measure_grouped_vs_dense(rows: usize, iterations: usize) -> (Duration, Duration) {
+        const HIDDEN: usize = 128;
+        const INTER: usize = 256;
+        const EXPERTS: usize = 8;
+        let attributes = MoeAttributes {
+            k: 2,
+            activation: Activation::Silu,
+            normalize_routing_weights: true,
+            swiglu_fusion: 0,
+            activation_alpha: 1.0,
+            activation_beta: 0.0,
+            swiglu_limit: f32::INFINITY,
+        };
+        let input: Vec<f32> = (0..rows * HIDDEN)
+            .map(|index| ((index * 17 % 101) as f32 - 50.0) * 0.01)
+            .collect();
+        let fc1: Vec<f32> = (0..EXPERTS * INTER * HIDDEN)
+            .map(|index| ((index * 11 % 67) as f32 - 33.0) * 0.002)
+            .collect();
+        let fc2: Vec<f32> = (0..EXPERTS * HIDDEN * INTER)
+            .map(|index| ((index * 13 % 71) as f32 - 35.0) * 0.002)
+            .collect();
+        let routes: Vec<[(usize, f32); 2]> = (0..rows)
+            .map(|row| [(row % EXPERTS, 0.6), ((row + 1) % EXPERTS, 0.4)])
+            .collect();
+
+        let dense_start = Instant::now();
+        for _ in 0..iterations {
+            let mut selected = vec![0.0f32; rows * HIDDEN];
+            for row in 0..rows {
+                for expert in 0..EXPERTS {
+                    let expert_output = run_expert(
+                        &input[row * HIDDEN..(row + 1) * HIDDEN],
+                        &fc1[expert * INTER * HIDDEN..(expert + 1) * INTER * HIDDEN],
+                        None,
+                        &fc2[expert * HIDDEN * INTER..(expert + 1) * HIDDEN * INTER],
+                        None,
+                        None,
+                        None,
+                        INTER,
+                        HIDDEN,
+                        INTER,
+                        &attributes,
+                    );
+                    if let Some((_, weight)) = routes[row]
+                        .iter()
+                        .find(|&&(selected, _)| selected == expert)
+                    {
+                        for feature in 0..HIDDEN {
+                            selected[row * HIDDEN + feature] += weight * expert_output[feature];
+                        }
+                    }
+                }
+            }
+            black_box(selected);
+        }
+        let dense = dense_start.elapsed();
+
+        let grouped_start = Instant::now();
+        for _ in 0..iterations {
+            let mut output = vec![0.0f32; rows * HIDDEN];
+            for expert in 0..EXPERTS {
+                let tasks: Vec<(usize, f32)> = routes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(row, route)| {
+                        route
+                            .iter()
+                            .filter(move |&&(selected, _)| selected == expert)
+                            .map(move |&(_, weight)| (row, weight))
+                    })
+                    .collect();
+                if tasks.is_empty() {
+                    continue;
+                }
+                let mut grouped_input = Vec::with_capacity(tasks.len() * HIDDEN);
+                for &(row, _) in &tasks {
+                    grouped_input.extend_from_slice(&input[row * HIDDEN..(row + 1) * HIDDEN]);
+                }
+                let expert_output = run_expert_grouped(
+                    &grouped_input,
+                    tasks.len(),
+                    &fc1[expert * INTER * HIDDEN..(expert + 1) * INTER * HIDDEN],
+                    None,
+                    &fc2[expert * HIDDEN * INTER..(expert + 1) * HIDDEN * INTER],
+                    None,
+                    None,
+                    None,
+                    INTER,
+                    HIDDEN,
+                    INTER,
+                    &attributes,
+                )
+                .unwrap();
+                for (grouped_row, &(row, weight)) in tasks.iter().enumerate() {
+                    for feature in 0..HIDDEN {
+                        output[row * HIDDEN + feature] +=
+                            weight * expert_output[grouped_row * HIDDEN + feature];
+                    }
+                }
+            }
+            black_box(output);
+        }
+        (dense, grouped_start.elapsed())
+    }
+
+    #[test]
+    #[ignore = "performance characterization; run with --release --ignored --nocapture"]
+    fn grouped_moe_measures_benefit_over_dense_fallback_decode_and_prefill() {
+        for (name, rows, iterations) in [("decode", 1, 50), ("prefill", 64, 2)] {
+            let (dense, grouped) = measure_grouped_vs_dense(rows, iterations);
+            eprintln!(
+                "{name} M={rows}: dense={dense:?}, grouped={grouped:?}, speedup={:.2}x",
+                dense.as_secs_f64() / grouped.as_secs_f64()
+            );
+            assert!(
+                grouped < dense,
+                "{name} grouped path did not beat dense fallback: grouped={grouped:?}, dense={dense:?}"
             );
         }
     }

@@ -476,7 +476,7 @@ memory concepts, not KV tensor formats or KV connector APIs.
 | Area | Current integration point | Required future work |
 |---|---|---|
 | Mobius export | External exporter; contracts documented in `docs/OPERATORS.md` and `MODEL_METADATA.md` | Emit explicit router + `MoE`/`QMoE`; expert-major external data; dense reference mode; metadata validation |
-| CPU EP | `crates/onnx-runtime-ep-cpu/src/kernels/{matmul,gather,selection}.rs`, `mod.rs` | Reference MoE, then grouped quantized expert kernel and registration |
+| CPU EP | `crates/onnx-runtime-ep-cpu/src/kernels/{moe,qmoe,block_quantized_moe}.rs`, `mod.rs` | Grouped float and quantized expert execution is implemented; further packing/prepacking optimization remains |
 | CUDA EP | `crates/onnx-runtime-ep-cuda/src/kernels/{matmul,gemm,attention}.rs`, `mod.rs` | Device dispatch/scatter, grouped int4 expert GEMM, async residency |
 | Engine | `crates/onnx-genai-engine/src/{engine,batched}.rs` | Expert store lifecycle, leases, telemetry, batch residency plan |
 | Scheduler | `crates/onnx-genai-scheduler/src/{lib,policy,governor}.rs` | Expert/scratch byte accounting, affinity tie-breaker, imbalance-aware plans |
@@ -487,7 +487,11 @@ memory concepts, not KV tensor formats or KV connector APIs.
 
 ### Phase 1 — representation and dense-fallback correctness
 
-**Status: NOT YET IMPLEMENTED**
+**Status: PARTIALLY IMPLEMENTED**
+
+The CPU EP has float `MoE`, integer `QMoE`, and dequantized dense-oracle
+coverage. The full cross-toolchain gate below (Mobius export, source-framework
+routes/logits, fused ORT parity, and packing proof) is not claimed complete here.
 
 Deliverables:
 
@@ -513,7 +517,29 @@ grouped kernel is required.
 
 ### Phase 2 — grouped-expert kernels
 
-**Status: NOT YET IMPLEMENTED**
+**Status: PARTIALLY IMPLEMENTED — CPU COMPLETE; CUDA tracked separately**
+
+The CPU EP routes the complete token batch first, groups routed rows by expert,
+and invokes one expert computation per active expert. Multi-row expert groups use
+the CPU EP's shared GEMM backend; decode groups of one use the scalar GEMV path
+without issuing a per-token GEMM. `QMoE` and `BlockQuantizedMoE` dequantize only
+active experts, one expert at a time, then consume all rows routed to that expert.
+They do not materialize a full all-expert dequantization buffer.
+
+CPU differential coverage:
+
+- `grouped_moe_matches_per_token_dense_fallback_for_eight_experts_top2`
+  compares grouped float `MoE` with the per-token dense oracle.
+- `grouped_int4_qmoe_matches_per_token_dense_fallback_for_eight_experts_top2`
+  compares int4 `QMoE`, grouped float `MoE`, and the per-token dequantized oracle.
+- `route_first_bounds_dequantized_residency_when_all_experts_are_selected`
+  proves the mmap/offload path's peak dequantized window remains one expert.
+
+The ignored release-mode characterization
+`grouped_moe_measures_benefit_over_dense_fallback_decode_and_prefill` is the
+reproducible CPU performance gate. On the implementation host it measured a
+4.31x benefit at decode (`M=1`, 8 experts, top-2, H=128, I=256) and 1.71x at
+prefill (`M=64`) over the Phase-1 all-expert dense fallback.
 
 Deliverables:
 
@@ -525,6 +551,8 @@ Deliverables:
 
 Acceptance gate: no per-token expert GEMM launch, no full-expert dequantization, and
 measured benefit over the dense fallback at representative decode/prefill shapes.
+The CPU portion meets this gate via the grouped/GEMV split and tests above. This
+document does not make a CUDA completion claim.
 
 ### Phase 3 — expert offload, streaming, and routing-aware scheduling
 

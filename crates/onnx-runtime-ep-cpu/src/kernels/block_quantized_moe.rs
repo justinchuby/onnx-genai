@@ -7,7 +7,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{BlockFormat, dequantize_weight_kn};
-use super::moe::{MoeAttributes, routing_weights, run_expert};
+use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
 use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
 
 const OP: &str = "BlockQuantizedMoE";
@@ -135,28 +135,34 @@ impl Kernel for BlockQuantizedMoEKernel {
                 })
                 .transpose()?;
 
-            for (row, route_weight) in expert_tasks {
-                let expert_output = run_expert(
-                    &input[row * hidden..(row + 1) * hidden],
-                    &fc1,
-                    fc1_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
-                    &fc2,
-                    fc2_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
-                    fc3.as_deref(),
-                    fc3_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
-                    fc1_size,
-                    hidden,
-                    inter,
-                    &self.attributes,
-                );
+            let mut grouped_input = Vec::with_capacity(expert_tasks.len() * hidden);
+            for &(row, _) in &expert_tasks {
+                grouped_input.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
+            }
+            let expert_output = run_expert_grouped(
+                &grouped_input,
+                expert_tasks.len(),
+                &fc1,
+                fc1_bias
+                    .as_deref()
+                    .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                &fc2,
+                fc2_bias
+                    .as_deref()
+                    .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                fc3.as_deref(),
+                fc3_bias
+                    .as_deref()
+                    .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                fc1_size,
+                hidden,
+                inter,
+                &self.attributes,
+            )?;
+            for (grouped_row, (row, route_weight)) in expert_tasks.into_iter().enumerate() {
                 for feature in 0..hidden {
-                    output[row * hidden + feature] += route_weight * expert_output[feature];
+                    output[row * hidden + feature] +=
+                        route_weight * expert_output[grouped_row * hidden + feature];
                 }
             }
         }
