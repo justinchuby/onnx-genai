@@ -2298,13 +2298,27 @@ mod tests {
         graph
             .node_mut(node)
             .attributes
-            .insert("bits".into(), Attribute::Int(8));
+            .insert("bits".into(), Attribute::Int(3));
         let model = Model::new(&graph);
         let error = CpuExecutionProvider::new()
             .get_kernel(model.graph.node(node), &[], 1)
             .err()
-            .expect("bits=8 must be rejected");
-        assert!(format!("{error}").contains("only bits=2 and bits=4"));
+            .expect("bits=3 must be rejected");
+        assert!(format!("{error}").contains("supports bits in {2, 4, 8}"));
+    }
+
+    #[test]
+    fn matmulnbits_factory_accepts_bits8() {
+        let (graph, node) = model_node(&[1, 16], &[1, 1, 16], &[1], None, &[1, 1], 16, 1, 16);
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 must be accepted");
     }
 
     #[test]
