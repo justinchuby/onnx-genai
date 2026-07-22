@@ -7,7 +7,7 @@ use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_ort::Tokenizer;
-use onnx_runtime_ir::{DataType, DeviceType, Dim};
+use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DeviceAllocationCounts, DeviceBindingTransferStats,
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
@@ -83,6 +83,13 @@ struct DecodeCudaState {
     graph_fallbacks: u64,
     graph_fallback_reason: Option<String>,
     graph_fallback_report: Option<CaptureDeclineReport>,
+    /// Structural reasons, recorded at binding time, why one or more auxiliary
+    /// graph outputs could not be persistently bound (an unresolved symbolic
+    /// dimension that is not batch or query-seq). Non-empty here means CUDA
+    /// graph capture was declined up front and the eager device path is in
+    /// force for this generation. Empty when every auxiliary output was
+    /// statically bindable.
+    auxiliary_bind_declines: Vec<String>,
     /// When `false` (today's default), `NativeDecodeSession::rewind` invalidates
     /// the captured decode graph before rolling the device KV back — correct for
     /// the eager M=K verify path (option (b)), which captures nothing.
@@ -337,6 +344,18 @@ impl NativeDecodeSession {
         self.cuda
             .as_ref()
             .and_then(|state| state.graph_fallback_reason.as_deref())
+    }
+
+    /// Structural reasons, if any, why CUDA graph capture was declined at
+    /// binding time because an auxiliary graph output carries an unresolved
+    /// symbolic dimension (not batch or query-seq) that cannot be collapsed to
+    /// a fixed persistent device binding. Empty when every auxiliary output was
+    /// statically bindable. Decode still runs eagerly when this is non-empty.
+    pub fn cuda_auxiliary_bind_declines(&self) -> &[String] {
+        self.cuda
+            .as_ref()
+            .map(|state| state.auxiliary_bind_declines.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Structured reasons from the most recent CUDA graph fallback.
@@ -752,6 +771,39 @@ impl NativeDecodeSession {
 }
 
 impl DecodeCudaState {
+    /// Collect the symbolic dimension ids that the native decoder structurally
+    /// pins to `1` at decode time. Batch (axis 0 of every input) and query-seq
+    /// (the remaining `input_ids` / `position_ids` axes, which are bound to a
+    /// single token) are the only symbols that [`persistent_output_shape`] may
+    /// safely collapse to `1`. `batch_only` restricts collection to axis 0 for
+    /// inputs whose non-batch axes grow with the sequence (attention_mask and
+    /// the past-KV tensors, whose total_seq axis is *not* a decode unit).
+    fn collect_unit_symbols(shape: &[Dim], batch_only: bool, out: &mut HashSet<SymbolId>) {
+        for (axis, dim) in shape.iter().enumerate() {
+            if batch_only && axis != 0 {
+                continue;
+            }
+            if let Dim::Symbolic(symbol) = dim {
+                out.insert(*symbol);
+            }
+        }
+    }
+
+    /// First structurally-unresolved symbolic axis of an auxiliary output: a
+    /// `Dim::Symbolic` that is *not* one of the decode-unit (batch / query-seq)
+    /// symbols. Such a dimension is data-dependent (e.g. an accumulator indexed
+    /// by total_seq / past+1), so collapsing it to `1` in a persistent device
+    /// binding would under-allocate. Returns `(axis, symbol)` of the offender.
+    fn unresolved_symbolic_axis(
+        shape: &[Dim],
+        unit_symbols: &HashSet<SymbolId>,
+    ) -> Option<(usize, SymbolId)> {
+        shape.iter().enumerate().find_map(|(axis, dim)| match dim {
+            Dim::Symbolic(symbol) if !unit_symbols.contains(symbol) => Some((axis, *symbol)),
+            _ => None,
+        })
+    }
+
     fn persistent_output_shape(
         name: &str,
         dtype: DataType,
@@ -882,8 +934,69 @@ impl DecodeCudaState {
             .filter(|meta| meta.name != io.logits && !present_outputs.contains(&meta.name))
             .cloned()
             .collect::<Vec<_>>();
+
+        // Structural safe-collapse analysis for auxiliary outputs. The native
+        // decoder pins batch and query-seq to `1` at decode, so a symbolic aux
+        // dimension is only safe to collapse to `1` when it is one of those
+        // structurally-unit axes. Gather every symbol the decoder binds to `1`:
+        // input_ids / position_ids (bound to `[1, 1]`) on all axes, plus the
+        // batch axis (axis 0) of attention_mask and each past-KV input. Any
+        // other symbolic aux dim (e.g. one indexed by total_seq / past+1) is
+        // data-dependent and must not be collapsed. See RULES.md §2 — this is a
+        // purely structural signal, never a model-name gate.
+        let mut unit_symbols: HashSet<SymbolId> = HashSet::new();
+        if let Some(meta) = session
+            .inputs()
+            .iter()
+            .find(|meta| meta.name == io.input_ids)
+        {
+            Self::collect_unit_symbols(&meta.shape, false, &mut unit_symbols);
+        }
+        if let Some(position_ids) = io.position_ids
+            && let Some(meta) = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == position_ids)
+        {
+            Self::collect_unit_symbols(&meta.shape, false, &mut unit_symbols);
+        }
+        if let Some(meta) = session
+            .inputs()
+            .iter()
+            .find(|meta| meta.name == io.attention_mask)
+        {
+            Self::collect_unit_symbols(&meta.shape, true, &mut unit_symbols);
+        }
+        for past in present_to_past.values() {
+            if let Some(meta) = session.inputs().iter().find(|meta| &meta.name == past) {
+                Self::collect_unit_symbols(&meta.shape, true, &mut unit_symbols);
+            }
+        }
+
         let auxiliary_start = bindings.len();
+        let mut declined_auxiliary: Vec<String> = Vec::new();
         for meta in auxiliary_meta {
+            if let Some((axis, symbol)) = Self::unresolved_symbolic_axis(&meta.shape, &unit_symbols)
+            {
+                // The output's extent on this axis is data-dependent and not
+                // structurally identifiable as batch or query-seq. Collapsing
+                // it to `1` (as a persistent device binding requires) would
+                // under-allocate, so we deliberately do NOT bind it. The eager
+                // executor JIT-sizes and materializes this output every step,
+                // so decode still works; only CUDA graph capture is forfeited
+                // (capture demands a stable device address for every output).
+                let symbol_label = session
+                    .graph()
+                    .symbol_constraints
+                    .get(&symbol)
+                    .and_then(|constraints| constraints.name.clone())
+                    .unwrap_or_else(|| format!("symbol#{}", symbol.0));
+                declined_auxiliary.push(format!(
+                    "'{}' (axis {axis} is symbolic dim '{symbol_label}', not structurally batch or query-seq)",
+                    meta.name
+                ));
+                continue;
+            }
             let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape)?;
             bindings.push(
                 session
@@ -903,6 +1016,28 @@ impl DecodeCudaState {
         }
         let auxiliary_end = bindings.len();
         let base_binding_count = bindings.len();
+
+        // If any auxiliary output could not be persistently bound, CUDA graph
+        // capture is impossible (an unbound output would materialize on the
+        // host mid-capture). Decline capture up front, with a clear structural
+        // reason, and fall back to the eager device path — which still decodes
+        // correctly by dynamically allocating the unbindable output each step.
+        let graph_enabled = if !declined_auxiliary.is_empty() {
+            if graph_enabled {
+                tracing::warn!(
+                    "native CUDA decode graph capture disabled: auxiliary output(s) {} carry unresolved symbolic dimensions that cannot be collapsed to a fixed persistent device binding; decode continues eagerly with dynamic allocation for those outputs",
+                    declined_auxiliary.join(", ")
+                );
+            } else {
+                tracing::debug!(
+                    "native CUDA decode leaving auxiliary output(s) {} unbound (unresolved symbolic dimensions); eager path allocates them dynamically",
+                    declined_auxiliary.join(", ")
+                );
+            }
+            false
+        } else {
+            graph_enabled
+        };
 
         let input_ids_binding = bindings.len();
         bindings.push(session.allocate_device_binding(
@@ -959,6 +1094,7 @@ impl DecodeCudaState {
             graph_fallbacks: 0,
             graph_fallback_reason: None,
             graph_fallback_report: None,
+            auxiliary_bind_declines: declined_auxiliary,
             retain_graph_on_rewind: false,
             padded_query_capacity: None,
         })
@@ -1675,19 +1811,54 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
+    #[derive(Clone, Copy)]
+    enum AuxOutput {
+        /// Static `[1, 1]` auxiliary output produced by `Cast(input_ids)`. The
+        /// original capture-safe smoke case: no symbolic dims to reason about.
+        StaticUnit,
+        /// `[batch, 1]` auxiliary output whose leading dim is a *genuine*
+        /// symbolic `batch` dim shared with `input_ids`. It resolves to `1` at
+        /// decode, so it is structurally a decode unit and capture must still
+        /// succeed with the output persistently bound (collapsed to `[1, 1]`).
+        SymbolicBatch,
+        /// `[1, total_seq]` auxiliary output produced by `Cast(attention_mask)`,
+        /// whose trailing dim is the symbolic `total_seq` dim. That dim grows
+        /// with the sequence and is NOT batch/query-seq, so F1 must decline to
+        /// persistently bind it (collapsing to `[1, 1]` would under-allocate)
+        /// and fall back to eager, where the executor JIT-sizes it each step.
+        SymbolicTotalSeq,
+    }
+
+    #[cfg(feature = "cuda")]
     fn capture_safe_cuda_decoder(
         graph_capture: bool,
         max_len: usize,
+    ) -> anyhow::Result<NativeDecodeSession> {
+        build_cuda_decoder(graph_capture, max_len, AuxOutput::StaticUnit)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn build_cuda_decoder(
+        graph_capture: bool,
+        max_len: usize,
+        aux: AuxOutput,
     ) -> anyhow::Result<NativeDecodeSession> {
         use prost::Message;
 
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 13);
+        let batch = graph.intern_symbol("batch");
         let total = graph.intern_symbol("total");
         let past = graph.intern_symbol("past");
 
-        let input_ids =
-            graph.create_named_value("input_ids", DataType::Int64, vec![1.into(), 1.into()]);
+        // input_ids declares a symbolic batch dim for the SymbolicBatch case so
+        // the aux output can legitimately *share* it; it is bound to `[1, 1]` at
+        // decode regardless, so the other cases are unaffected.
+        let input_ids_shape = match aux {
+            AuxOutput::SymbolicBatch => vec![batch.into(), 1.into()],
+            _ => vec![1.into(), 1.into()],
+        };
+        let input_ids = graph.create_named_value("input_ids", DataType::Int64, input_ids_shape);
         let attention_mask = graph.create_named_value(
             "attention_mask",
             DataType::Int64,
@@ -1748,15 +1919,17 @@ mod tests {
             present_value,
             &[("to", Attribute::Int(DataType::Float32 as i64))],
         );
-        let auxiliary = graph.create_named_value(
-            "auxiliary_state",
-            DataType::Float32,
-            vec![1.into(), 1.into()],
-        );
+        // Auxiliary output geometry drives the F1 structural analysis.
+        let (aux_shape, aux_source): (Vec<Dim>, _) = match aux {
+            AuxOutput::StaticUnit => (vec![1.into(), 1.into()], input_ids),
+            AuxOutput::SymbolicBatch => (vec![batch.into(), 1.into()], input_ids),
+            AuxOutput::SymbolicTotalSeq => (vec![1.into(), total.into()], attention_mask),
+        };
+        let auxiliary = graph.create_named_value("auxiliary_state", DataType::Float32, aux_shape);
         insert_op(
             &mut graph,
             "Cast",
-            vec![input_ids],
+            vec![aux_source],
             auxiliary,
             &[("to", Attribute::Int(DataType::Float32 as i64))],
         );
@@ -2013,6 +2186,83 @@ mod tests {
         assert!(message.contains("export this output as a numeric tensor"));
     }
 
+    #[test]
+    fn unit_symbol_collection_is_structural_and_batch_aware() {
+        // input_ids / position_ids are bound to `[1, 1]` at decode, so *every*
+        // symbolic axis is a decode-unit (batch or query-seq). attention_mask
+        // and past-KV grow along their sequence axis, so only axis 0 (batch) is
+        // a unit; the total_seq / past symbols must NOT be collected.
+        let batch = SymbolId(0);
+        let query_seq = SymbolId(1);
+        let total = SymbolId(2);
+        let past = SymbolId(3);
+
+        let mut unit = HashSet::new();
+        // input_ids: [batch, query_seq]
+        DecodeCudaState::collect_unit_symbols(
+            &[Dim::Symbolic(batch), Dim::Symbolic(query_seq)],
+            false,
+            &mut unit,
+        );
+        // attention_mask: [batch, total] — batch only.
+        DecodeCudaState::collect_unit_symbols(
+            &[Dim::Symbolic(batch), Dim::Symbolic(total)],
+            true,
+            &mut unit,
+        );
+        // past-KV: [batch, heads, past, head_dim] — batch only.
+        DecodeCudaState::collect_unit_symbols(
+            &[
+                Dim::Symbolic(batch),
+                Dim::Static(4),
+                Dim::Symbolic(past),
+                Dim::Static(8),
+            ],
+            true,
+            &mut unit,
+        );
+
+        assert!(unit.contains(&batch));
+        assert!(unit.contains(&query_seq));
+        assert!(
+            !unit.contains(&total),
+            "total_seq must not be a decode unit"
+        );
+        assert!(!unit.contains(&past), "past must not be a decode unit");
+    }
+
+    #[test]
+    fn unresolved_symbolic_axis_flags_only_non_unit_symbols() {
+        let batch = SymbolId(0);
+        let query_seq = SymbolId(1);
+        let total = SymbolId(2);
+        let unit = HashSet::from([batch, query_seq]);
+
+        // Fully static aux output: always bindable.
+        assert_eq!(
+            DecodeCudaState::unresolved_symbolic_axis(&[Dim::Static(1), Dim::Static(1536)], &unit),
+            None
+        );
+        // Symbolic dim that IS a decode unit (batch): safe to collapse to 1.
+        assert_eq!(
+            DecodeCudaState::unresolved_symbolic_axis(
+                &[Dim::Symbolic(batch), Dim::Static(1536)],
+                &unit
+            ),
+            None
+        );
+        // Symbolic dim that is NOT batch/query-seq (an accumulator indexed by
+        // total_seq): flagged with its axis and symbol so decode declines to
+        // persistently bind it.
+        assert_eq!(
+            DecodeCudaState::unresolved_symbolic_axis(
+                &[Dim::Static(1), Dim::Symbolic(total), Dim::Static(64)],
+                &unit
+            ),
+            Some((1, total))
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn native_cuda_capture_replay_is_bit_exact_and_refreshes_decode_inputs() -> anyhow::Result<()> {
@@ -2090,6 +2340,118 @@ mod tests {
             second_stats.graph.replays,
             second_stats.graph.fallbacks,
             TOKENS.len()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_cuda_symbolic_batch_aux_captures_bit_exact() -> anyhow::Result<()> {
+        // F2 positive case: an auxiliary output with a *genuinely symbolic* dim
+        // (`batch`) that resolves to 1 at decode must remain persistently
+        // bindable and fully capturable — capture succeeds, no fallback, and
+        // replay is bit-exact with the eager device path.
+        if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+            eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+            return Ok(());
+        }
+
+        const MAX_LEN: usize = 16;
+        const TOKENS: [TokenId; 8] = [3, 17, 5, 29, 11, 23, 7, 31];
+
+        let mut eager = build_cuda_decoder(false, MAX_LEN, AuxOutput::SymbolicBatch)?;
+        let eager_addresses = binding_addresses(&eager);
+        let eager_logits = run_capture_safe_decode(&mut eager, &TOKENS, &eager_addresses, MAX_LEN)?;
+
+        let mut captured = build_cuda_decoder(true, MAX_LEN, AuxOutput::SymbolicBatch)?;
+        {
+            let state = captured.cuda.as_ref().expect("CUDA state");
+            // The symbolic-batch aux output is structurally a decode unit, so it
+            // is persistently bound (collapsed to [1, 1]) — F1 does NOT decline.
+            assert!(state.graph_enabled);
+            assert!(captured.cuda_auxiliary_bind_declines().is_empty());
+            let state = captured.cuda.as_ref().unwrap();
+            assert_eq!(state.auxiliary_binding_range.len(), 1);
+            assert_eq!(
+                state.bindings[state.auxiliary_binding_range.start].output_name(),
+                Some("auxiliary_state")
+            );
+        }
+        let captured_addresses = binding_addresses(&captured);
+        let captured_logits =
+            run_capture_safe_decode(&mut captured, &TOKENS, &captured_addresses, MAX_LEN)?;
+        let stats = captured.cuda_kv_debug_stats().expect("CUDA stats");
+        assert!(stats.graph.enabled);
+        assert_eq!(stats.graph.captures, 1);
+        assert_eq!(stats.graph.replays, TOKENS.len() as u64 - 2);
+        assert_eq!(stats.graph.fallbacks, 0);
+        assert!(captured.cuda_graph_fallback_reason().is_none());
+        assert_eq!(captured_logits, eager_logits);
+        assert_eq!(
+            captured_logits,
+            TOKENS
+                .iter()
+                .map(|&token| vec![(token as f32).to_bits()])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(captured_addresses, binding_addresses(&captured));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly()
+    -> anyhow::Result<()> {
+        // F2 negative case (the F1 path): an auxiliary output whose symbolic dim
+        // is `total_seq` — NOT batch/query-seq — cannot be collapsed to a fixed
+        // persistent binding without under-allocating. F1 must decline capture
+        // at binding time (leaving the output unbound), yet decode MUST still
+        // work via the eager device path, producing correct output.
+        if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+            eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+            return Ok(());
+        }
+
+        const MAX_LEN: usize = 16;
+        const TOKENS: [TokenId; 8] = [3, 17, 5, 29, 11, 23, 7, 31];
+
+        // Request graph capture; F1 must decline it structurally.
+        let mut declined = build_cuda_decoder(true, MAX_LEN, AuxOutput::SymbolicTotalSeq)?;
+        {
+            let state = declined.cuda.as_ref().expect("CUDA state");
+            assert!(
+                !state.graph_enabled,
+                "F1 must disable capture for an unresolved-symbolic aux output"
+            );
+            // The unbindable aux output is left out of the persistent bindings.
+            assert_eq!(state.auxiliary_binding_range.len(), 0);
+        }
+        let declines = declined.cuda_auxiliary_bind_declines();
+        assert_eq!(declines.len(), 1);
+        assert!(declines[0].contains("auxiliary_state"));
+        assert!(declines[0].contains("total"));
+        assert!(declines[0].contains("not structurally batch or query-seq"));
+
+        let addresses = binding_addresses(&declined);
+        let declined_logits = run_capture_safe_decode(&mut declined, &TOKENS, &addresses, MAX_LEN)?;
+        let stats = declined.cuda_kv_debug_stats().expect("CUDA stats");
+        assert!(!stats.graph.enabled);
+        assert_eq!(stats.graph.captures, 0);
+        assert_eq!(stats.graph.replays, 0);
+        assert_eq!(stats.graph.fallbacks, 0);
+
+        // Decode is bit-exact with a plain eager (graph_capture=false) run — the
+        // unresolved aux output changes nothing about the decode result.
+        let mut eager = build_cuda_decoder(false, MAX_LEN, AuxOutput::SymbolicTotalSeq)?;
+        let eager_addresses = binding_addresses(&eager);
+        let eager_logits = run_capture_safe_decode(&mut eager, &TOKENS, &eager_addresses, MAX_LEN)?;
+        assert_eq!(declined_logits, eager_logits);
+        assert_eq!(
+            declined_logits,
+            TOKENS
+                .iter()
+                .map(|&token| vec![(token as f32).to_bits()])
+                .collect::<Vec<_>>()
         );
         Ok(())
     }
