@@ -8,6 +8,10 @@ _Last updated: 2026-07-22T08:06Z — int4 zero-points, DS native E2E, VLM WP1, a
 
 **Current `origin/main` implementation HEAD:** `1b1f800` (code before this docs update).
 
+## 2026-07-22 — CUDA-graph auto-enable generalizes to Qwen2.5-7B
+
+- **Qwen2.5-7B int4 native CUDA decode ✅:** Gaff validated the metadata-driven auto-enable path on H200 with device-KV Owned, 128-token decode: structural CUDA-graph auto-enable (default) reached **231.73 tok/s (4.315 ms/token)** vs forced eager (`ONNX_GENAI_CUDA_GRAPH=0`) **180.50 tok/s (5.540 ms/token)**, a **+28.38%** throughput win. Output was token-exact across all 128 tokens with **0 fallbacks**; capture used one segment with zero eager seams. Roofline fraction improved **13.16% → 16.90%**. This is the third architecture-scale data point after Qwen2.5-0.5B (+87.7%) and Phi-4-mini (+41.0%), confirming the rule remains structural/model-agnostic (`device_is_cuda && kv_ownership == Owned`). The smaller relative gain is expected because 7B decode is more compute-bound (int4 dequant dominates), but graph capture is still a clear free win with zero correctness cost.
+
 ## 2026-07-22 — Metadata-driven CUDA-graph auto-enable merged
 
 - **Native decode CUDA-graph structural auto-enable ✅ (`610bde0`):** Batty landed whole-step CUDA graph capture on the native decode path when structural metadata says it is safe (`device_is_cuda && kv_ownership == Owned`), with no model-name or architecture branching (RULES §2/§2.1). Precedence is programmatic `graph_capture` override → explicit `ONNX_GENAI_CUDA_GRAPH` env → structural auto-decision when env is unset; existing `DecodeCudaState` decline/eager-fallback remains the runtime safety net for dynamic-shape seams. H200 token-exact, 0-fallback results: Qwen2.5-0.5B **441.49 → 828.54 tok/s (+87.7%)** and Phi-4-mini **67.32 → 94.91 tok/s (+41.0%)**; 828 tok/s is ~93.5% of the ~886 tok/s HBM roofline ceiling for 0.5B. (Leon 🟢)
