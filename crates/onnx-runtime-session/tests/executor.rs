@@ -383,6 +383,86 @@ fn gqa_decode_growing_cache_extends_present_to_logical_total() {
 }
 
 #[test]
+fn dynamic_slice_shape_propagates_directly_to_unsqueeze_and_comparison() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 17);
+
+    let data = input(&mut g, "data", DataType::Float32, &[4]);
+    let one = i64_init(&mut g, "one", &[1], &[1]);
+    let starts = i64_init(&mut g, "starts", &[1], &[0]);
+    let slice_axes = i64_init(&mut g, "slice_axes", &[1], &[0]);
+    let steps = i64_init(&mut g, "steps", &[1], &[1]);
+    let unsqueeze_axes = i64_init(&mut g, "unsqueeze_axes", &[1], &[-1]);
+    let thresholds = f32_init(&mut g, "thresholds", &[1, 2], &[1.5, 2.5]);
+    let dynamic_extent = g.intern_symbol("direct_dynamic_extent");
+
+    let data_shape = g.create_value(DataType::Int64, static_shape([1]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Shape",
+        vec![Some(data)],
+        vec![data_shape],
+    ));
+    let end = g.create_value(DataType::Int64, static_shape([1]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Sub",
+        vec![Some(data_shape), Some(one)],
+        vec![end],
+    ));
+
+    let sliced = g.create_value(DataType::Float32, vec![Dim::Symbolic(dynamic_extent)]);
+    g.mark_value_shape_unknown(sliced);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Slice",
+        vec![
+            Some(data),
+            Some(starts),
+            Some(end),
+            Some(slice_axes),
+            Some(steps),
+        ],
+        vec![sliced],
+    ));
+
+    let unsqueezed = g.create_value(
+        DataType::Float32,
+        vec![Dim::Symbolic(dynamic_extent), Dim::Static(1)],
+    );
+    g.mark_value_shape_unknown(unsqueezed);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Unsqueeze",
+        vec![Some(sliced), Some(unsqueeze_axes)],
+        vec![unsqueezed],
+    ));
+
+    let compared = g.create_value(
+        DataType::Bool,
+        vec![Dim::Symbolic(dynamic_extent), Dim::Static(2)],
+    );
+    g.mark_value_shape_unknown(compared);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Less",
+        vec![Some(unsqueezed), Some(thresholds)],
+        vec![compared],
+    ));
+    g.add_output(compared);
+
+    let mut session = InferenceSession::from_graph(g).expect("build direct dynamic-shape chain");
+    let data = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let outputs = session
+        .run(&[("data", &data)])
+        .expect("run Slice -> Unsqueeze -> Less chain");
+
+    assert_eq!(outputs[0].shape, vec![3, 2]);
+    assert_eq!(outputs[0].dtype, DataType::Bool);
+    assert_eq!(outputs[0].as_bytes(), &[1, 1, 0, 1, 0, 0]);
+}
+
+#[test]
 fn dynamic_slice_shape_propagates_through_movement_and_broadcast_chain() {
     let mut g = Graph::new();
     g.opset_imports.insert(String::new(), 17);
