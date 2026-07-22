@@ -50,6 +50,7 @@ pub(crate) struct VisionOutputBinding {
 enum ImageTokenCountSource {
     PerTile,
     PerPatch,
+    FromGrid,
 }
 
 #[derive(Debug, Clone)]
@@ -158,18 +159,14 @@ impl VisionExpansionSpec {
                      How: declare the number of image tokens emitted for each real patch.",
                 )?,
             ),
-            Some("from_grid") => anyhow::bail!(
-                "What: grid-derived image expansion metadata is incomplete. \
-                 Why: token_count_source='from_grid' does not name the processor-summary endpoint whose dtype/shape supplies each image grid. \
-                 How: add a typed grid-summary endpoint operation to pipeline.vision, then bind it to the declared preprocessing output."
-            ),
+            Some("from_grid") => (ImageTokenCountSource::FromGrid, 0),
             Some(other) => anyhow::bail!(
                 "What: image placeholder expansion metadata is unsupported. \
                  Why: token_count_source '{other}' has no registered server operation. \
                  How: use per_tile, per_patch, or from_grid, or add that typed metadata operation."
             ),
         };
-        if tokens_per_unit == 0 {
+        if !matches!(count_source, ImageTokenCountSource::FromGrid) && tokens_per_unit == 0 {
             anyhow::bail!(
                 "What: image placeholder expansion metadata is invalid. \
                  Why: the declared tokens-per-unit value is zero. \
@@ -316,6 +313,11 @@ impl VisionExpansionSpec {
 
     fn replacement_len(&self, image: &ImageExpansionSummary) -> anyhow::Result<usize> {
         match self.count_source {
+            ImageTokenCountSource::FromGrid => anyhow::bail!(
+                "What: grid-derived image expansion metadata is incomplete. \
+                 Why: token_count_source='from_grid' does not name the processor-summary endpoint whose dtype/shape supplies each image grid. \
+                 How: add a typed grid-summary endpoint operation to pipeline.vision, then bind it to the declared preprocessing output."
+            ),
             ImageTokenCountSource::PerPatch => image
                 .expansion_count
                 .checked_mul(self.tokens_per_unit)
@@ -388,6 +390,9 @@ impl VisionExpansionSpec {
             tokens.extend(std::iter::repeat_n(image_token, self.tokens_per_unit));
         };
         match self.count_source {
+            ImageTokenCountSource::FromGrid => {
+                unreachable!("from_grid expansion is rejected before materialization")
+            }
             ImageTokenCountSource::PerPatch => {
                 for _ in 0..image.expansion_count {
                     emit_unit(tokens);
@@ -479,7 +484,6 @@ pub(crate) async fn load_and_preprocess(
             _ => None,
         })
         .unwrap_or_default();
-
     Ok(ImageBundle {
         tensors,
         images: bundle.images,
@@ -581,6 +585,7 @@ async fn load_image_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
             .get(parsed_url)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| {
                 format!(
                     "What: image URL fetch failed for {safe_url}. Why: the remote host could not be reached within the timeout or redirect limit. How: verify the URL is reachable over HTTP(S), uses at most 3 redirects, and responds within 10 seconds."
@@ -612,11 +617,16 @@ async fn load_image_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
                 "What: image URL response allocation failed for {safe_url}. Why: memory could not be reserved for the declared {initial_capacity}-byte body. How: provide a smaller image."
             )
         })?;
-        while let Some(chunk) = response.chunk().await.with_context(|| {
-            format!(
-                "What: image URL response could not be read from {safe_url}. Why: the HTTP body ended with a transport or decoding error. How: verify the remote server returns a complete image response."
-            )
-        })? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| {
+                format!(
+                    "What: image URL response could not be read from {safe_url}. Why: the HTTP body ended with a transport or decoding error. How: verify the remote server returns a complete image response."
+                )
+            })?
+        {
             let next_len = bytes.len().checked_add(chunk.len()).context(
                 "What: image URL response length overflowed. Why: accumulated body length does not fit usize. How: provide an image no larger than the documented byte limit.",
             )?;

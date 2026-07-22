@@ -295,6 +295,39 @@ async fn unsupported_image_scheme_has_actionable_public_route_error() {
     assert!(!message.contains("/private/model/image.png"), "{message}");
 }
 
+#[tokio::test]
+async fn failed_http_image_fetch_redacts_path_query_and_token_on_public_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failing image server");
+    let address = listener.local_addr().expect("image server address");
+    let server = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.expect("accept image request");
+        drop(connection);
+    });
+    let origin = format!("http://{address}");
+    let secret_path = "/private/customer/image.png";
+    let secret_query = "token=super-secret-token";
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(format!("{origin}{secret_path}?{secret_query}"))
+        ]),
+        1,
+    )
+    .await;
+    server.await.expect("failing image server task");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, &format!("image URL fetch failed for {origin}"));
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(!message.contains(secret_path), "{message}");
+    assert!(!message.contains(secret_query), "{message}");
+    assert!(!message.contains("super-secret-token"), "{message}");
+}
+
 fn assert_structured_error(body: &Value, expected: &str) {
     let message = body["error"]["message"]
         .as_str()

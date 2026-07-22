@@ -38,8 +38,10 @@ fn tiny_state_with_debug() -> AppState {
 fn resource_state(allow_runtime_override: bool) -> AppState {
     let model_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
-    let mut engine_config = EngineConfig::default();
-    engine_config.allow_runtime_override = allow_runtime_override;
+    let engine_config = EngineConfig {
+        allow_runtime_override,
+        ..EngineConfig::default()
+    };
     AppState::load_with_config(
         &model_dir,
         Some("tiny-mtp-full".to_string()),
@@ -915,7 +917,7 @@ async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preproces
     let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], vision)
         .await
         .expect("server preprocessing executes");
-    assert_eq!(tensor.endpoint, "vision_encoder.pixel_values");
+    assert_eq!(tensor.tensors[0].endpoint, "vision_encoder.pixel_values");
     assert!(!tensor.data.is_empty());
     assert!(tensor.num_tiles > 0);
 }
