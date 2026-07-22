@@ -177,6 +177,37 @@
     }
   ],
   "$defs": {
+    "AbsentInputKind": {
+      "description": "Supported absent-input fallback kinds.",
+      "oneOf": [
+        {
+          "description": "Materialize a zero-initialized tensor.",
+          "type": "string",
+          "const": "zeros"
+        }
+      ]
+    },
+    "AbsentInputSpec": {
+      "description": "Explicit tensor fallback for an absent optional graph input.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Fallback materialization kind.",
+          "$ref": "#/$defs/AbsentInputKind"
+        },
+        "shape": {
+          "description": "Runtime-resolved shape of the fallback tensor.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TensorDimension"
+          }
+        }
+      },
+      "required": [
+        "kind",
+        "shape"
+      ]
+    },
     "AcceptanceMethod": {
       "description": "Speculative acceptance-rule vocabulary.",
       "type": "string",
@@ -1453,7 +1484,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
@@ -1607,6 +1639,13 @@
           ],
           "minLength": 1
         },
+        "optional_inputs": {
+          "description": "Optional graph inputs and their explicit absent-value contracts, keyed by\nthe real ONNX input port name.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/OptionalInputSpec"
+          }
+        },
         "position_ids_input": {
           "description": "Position-ids input, if the graph takes one.",
           "type": [
@@ -1705,6 +1744,25 @@
         }
       ]
     },
+    "OptionalInputSpec": {
+      "description": "Presence and absent-value contract for one optional graph input.",
+      "type": "object",
+      "properties": {
+        "absent": {
+          "description": "Tensor value supplied when the presence key is absent.",
+          "$ref": "#/$defs/AbsentInputSpec"
+        },
+        "presence": {
+          "description": "Opaque, non-empty request presence key; not a port or model name.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "presence",
+        "absent"
+      ]
+    },
     "PerformanceHints": {
       "description": "Publisher-provided speculative decoding performance guidance.",
       "type": "object",
@@ -1737,6 +1795,14 @@
         "run_on": {
           "description": "Pipeline phase in which the component runs.",
           "$ref": "#/$defs/PhaseRunOn"
+        },
+        "when_present": {
+          "description": "Opaque presence key required for this component to run.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
         }
       },
       "required": [
@@ -1804,7 +1870,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "tokenizer": {
           "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",
@@ -1888,7 +1955,8 @@
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/PhaseConfig"
-          }
+          },
+          "default": {}
         },
         "positions": {
           "description": "Declared position-id generation and prefill→decode continuation program.\n\nGeneric and architecture-neutral: parameterized by rank, axis labels, and\nsection sizes so it expresses both ordinary rank-2 linear positions and\nrank-N multimodal coordinates as data — never a model-family branch.",
@@ -3015,7 +3083,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null
         },
         "kv_mode": {
           "description": "Lifetime of the sidecar's KV state.\n\nDefaults to `proposal_local`.",
@@ -3470,6 +3539,22 @@
               "string"
             ]
           }
+        }
+      ]
+    },
+    "TensorDimension": {
+      "description": "One fixed or runtime-resolved tensor-shape dimension.",
+      "anyOf": [
+        {
+          "description": "A fixed, non-negative dimension.",
+          "type": "integer",
+          "format": "int64",
+          "minimum": 0
+        },
+        {
+          "description": "A runtime shape symbol.",
+          "type": "string",
+          "minLength": 1
         }
       ]
     },

@@ -14,7 +14,7 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -2647,6 +2647,7 @@ mod tests {
             cross_kv_outputs: None,
             kv_update: None,
             state_pairs: None,
+            optional_inputs: BTreeMap::new(),
         }
     }
 
