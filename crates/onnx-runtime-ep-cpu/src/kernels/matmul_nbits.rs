@@ -693,14 +693,65 @@ fn build_decode_pool(
 ) -> std::result::Result<Option<rayon::ThreadPool>, String> {
     threads
         .map(|threads| {
-            rayon::ThreadPoolBuilder::new()
+            let affinity_cpus = decode_affinity_cpus(threads)?;
+            let mut builder = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
-                .thread_name(|index| format!("onnx-genai-decode-{index}"))
+                .thread_name(|index| format!("onnx-genai-decode-{index}"));
+            if let Some(cpus) = affinity_cpus {
+                builder = builder.start_handler(move |worker_index| {
+                    // Pin each worker to a distinct CPU of the selected NUMA node
+                    // so the per-op fork-join barrier and the streamed weights
+                    // stay node-local. Best-effort: a restricted cgroup that
+                    // rejects the request is logged once, not fatal, so decode
+                    // still runs (unpinned) rather than failing outright.
+                    let cpu = cpus[worker_index % cpus.len()];
+                    if let Err(message) =
+                        crate::decode_affinity::pin_current_thread_to_cpu(cpu)
+                    {
+                        report_decode_affinity_failure(&message);
+                    }
+                });
+            }
+            builder
                 .build()
                 .map_err(|err| format!("failed to build {DECODE_THREADS_ENV} pool: {err}"))
         })
         .transpose()
 }
+
+/// Resolve the CPU set the decode pool should pin `threads` workers to, honoring
+/// the explicit [`decode_affinity::DECODE_AFFINITY_ENV`] switch and the queried
+/// NUMA topology. Returns `Ok(None)` when pinning is off or the host is single
+/// node; propagates malformed configuration as a clear error.
+fn decode_affinity_cpus(
+    threads: usize,
+) -> std::result::Result<Option<Vec<usize>>, String> {
+    use crate::decode_affinity::{DecodeAffinity, NumaTopology};
+
+    let affinity = DecodeAffinity::from_env()?;
+    if affinity == DecodeAffinity::Off {
+        return Ok(None);
+    }
+    let Some(topology) = NumaTopology::detect() else {
+        // A single-node (or non-Linux) host has no cross-node penalty to avoid;
+        // honor the request by simply leaving the workers unpinned.
+        return Ok(None);
+    };
+    Ok(topology.cpus_for(&affinity, threads)?.filter(|c| !c.is_empty()))
+}
+
+/// Log the first decode-affinity pinning failure once so a restricted
+/// environment surfaces the reason without spamming every worker.
+fn report_decode_affinity_failure(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        eprintln!(
+            "onnx-genai: decode-pool CPU affinity unavailable; \
+             continuing without pinning ({message})"
+        );
+    }
+}
+
 
 fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
     // If we are already resident inside a `with_decode_pool_scope` installation

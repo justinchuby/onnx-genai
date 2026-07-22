@@ -2151,6 +2151,7 @@ version = "0.1.0-dev.3"
 dependencies = [
  "criterion",
  "half",
+ "libc",
  "libm",
  "mlas-sys",
  "onnx-runtime-ep-api",

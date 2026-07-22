@@ -24,6 +24,7 @@ onnx-runtime-tracer = { workspace = true, optional = true }
 thiserror = { workspace = true }
 half = "2"
 rayon = "1"
+libc = "0.2"
 # Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by
 # the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9
 # off near zero and failed the upstream conformance suite's tight tolerance.
