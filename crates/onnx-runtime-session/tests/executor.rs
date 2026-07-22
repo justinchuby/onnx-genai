@@ -476,6 +476,134 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_comparison_and_transpose() {
 }
 
 #[test]
+fn elementwise_output_uses_live_shapes_after_data_dependent_chain() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let source = input(&mut graph, "source", DataType::Float32, &[1, 4, 4]);
+    let shape_seed = input(&mut graph, "shape_seed", DataType::Float32, &[1, 4]);
+    let reduce_axes = i64_init(&mut graph, "reduce_axes", &[1], &[1]);
+    let squeeze_axes = i64_init(&mut graph, "squeeze_axes", &[1], &[1]);
+    let starts = i64_init(&mut graph, "starts", &[1], &[0]);
+    let slice_axes = i64_init(&mut graph, "slice_axes", &[1], &[1]);
+    let steps = i64_init(&mut graph, "steps", &[1], &[1]);
+
+    let reduced = graph.create_named_value("reduced", DataType::Float32, static_shape([1, 1]));
+    let mut reduce = Node::new(
+        NodeId(0),
+        "ReduceSum",
+        vec![Some(shape_seed), Some(reduce_axes)],
+        vec![reduced],
+    );
+    reduce
+        .attributes
+        .insert("keepdims".into(), Attribute::Int(1));
+    graph.insert_node(reduce);
+
+    let squeezed = graph.create_named_value("squeezed", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Squeeze",
+        vec![Some(reduced), Some(squeeze_axes)],
+        vec![squeezed],
+    ));
+
+    let casted = graph.create_named_value("casted", DataType::Int64, static_shape([1]));
+    let mut cast = Node::new(NodeId(0), "Cast", vec![Some(squeezed)], vec![casted]);
+    cast.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int64 as i64));
+    graph.insert_node(cast);
+
+    let sliced = graph.create_named_value("sliced", DataType::Float32, static_shape([1, 1, 4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Slice",
+        vec![
+            Some(source),
+            Some(starts),
+            Some(casted),
+            Some(slice_axes),
+            Some(steps),
+        ],
+        vec![sliced],
+    ));
+
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1, 1, 4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(sliced), Some(sliced)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let model = encode_model(&Model::new(&graph)).expect("encode stale-shape model");
+    let mut session = InferenceSession::builder()
+        .model_bytes(&model)
+        .build()
+        .expect("load stale-shape model");
+    let source_data = (1..=16).map(|value| value as f32).collect::<Vec<_>>();
+    let source = Tensor::from_f32(&[1, 4, 4], &source_data).unwrap();
+    let shape_seed = Tensor::from_f32(&[1, 4], &[1.0; 4]).unwrap();
+
+    let outputs = session
+        .run(&[("source", &source), ("shape_seed", &shape_seed)])
+        .expect("live elementwise shapes must override stale loader output shapes");
+
+    assert_eq!(outputs[0].shape, vec![1, 4, 4]);
+    assert_close(
+        &outputs[0].to_vec_f32(),
+        &(1..=16).map(|value| (value * 2) as f32).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn live_elementwise_broadcast_mismatch_is_actionable() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a_extent = graph.intern_symbol("a_extent");
+    let b_extent = graph.intern_symbol("b_extent");
+    let a = input_shaped(
+        &mut graph,
+        "a",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(a_extent), Dim::Static(4)],
+    );
+    let b = input_shaped(
+        &mut graph,
+        "b",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(b_extent), Dim::Static(4)],
+    );
+    let output = graph.create_named_value(
+        "output",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(a_extent), Dim::Static(4)],
+    );
+    let mut add = Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![output]);
+    add.name = "runtime_broadcast".into();
+    graph.insert_node(add);
+    graph.add_output(output);
+
+    let mut session = InferenceSession::from_graph(graph).expect("build symbolic Add session");
+    let a = Tensor::from_f32(&[1, 4, 4], &[1.0; 16]).unwrap();
+    let b = Tensor::from_f32(&[1, 3, 4], &[1.0; 12]).unwrap();
+    let error = session
+        .run(&[("a", &a), ("b", &b)])
+        .expect_err("incompatible live broadcast must fail");
+    let message = error.to_string();
+
+    assert!(
+        matches!(error, SessionError::RuntimeBroadcastIncompatible { .. }),
+        "unexpected error: {message}"
+    );
+    assert!(message.contains("runtime_broadcast"), "{message}");
+    assert!(message.contains("[1, 4, 4]"), "{message}");
+    assert!(message.contains("[1, 3, 4]"), "{message}");
+    assert!(message.contains("equal or one of them is 1"), "{message}");
+}
+
+#[test]
 fn oversized_shape_input_is_rejected_before_host_materialization() {
     let len = MAX_SHAPE_DATA_ELEMS + 1;
     assert_shape_input_rejected_without_materialization(

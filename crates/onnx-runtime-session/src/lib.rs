@@ -209,6 +209,19 @@ mod error {
             got: usize,
         },
 
+        #[error(
+            "runtime broadcast shape resolution failed for node {node} ({domain}::{op_type}): \
+             concrete input shapes {input_shapes:?} are not broadcast-compatible, so no valid \
+             elementwise output shape exists. To fix: update the model or runtime inputs so each \
+             aligned dimension is equal or one of them is 1"
+        )]
+        RuntimeBroadcastIncompatible {
+            node: String,
+            domain: String,
+            op_type: String,
+            input_shapes: Vec<Vec<usize>>,
+        },
+
         #[error("input {name}: dtype mismatch (expected {expected}, got {got})")]
         DtypeMismatch {
             name: String,

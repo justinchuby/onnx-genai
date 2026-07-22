@@ -58,7 +58,7 @@ use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::{
     DataType, DeviceType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId,
-    WeightRef, as_static_shape, compute_contiguous_strides,
+    WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
@@ -1026,6 +1026,38 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
     node.domain == "com.microsoft"
         && node.op_type == "GroupQueryAttention"
         && matches!(input_index, 3 | 4)
+}
+
+/// Recompute the output shape of standard elementwise broadcasting ops from
+/// their concrete runtime inputs. Loader inference is only a prior: a
+/// data-dependent upstream value may acquire a different live shape.
+fn runtime_elementwise_output_shape(
+    node: &Node,
+    input_shapes: &[Vec<usize>],
+) -> Option<std::result::Result<Vec<usize>, onnx_runtime_ir::IrError>> {
+    if !(node.domain.is_empty() || node.domain == "ai.onnx") {
+        return None;
+    }
+
+    let input_count = match node.op_type.as_str() {
+        "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "BitShift" | "Less" | "Greater"
+        | "Equal" | "And" | "Or" | "Xor" | "LessOrEqual" | "GreaterOrEqual" => 2,
+        "Where" => 3,
+        "Min" | "Max" | "Sum" | "Mean" => input_shapes.len(),
+        _ => return None,
+    };
+    if input_count == 0 || input_shapes.len() < input_count {
+        return None;
+    }
+
+    let mut shape = input_shapes[0].clone();
+    for input in &input_shapes[1..input_count] {
+        shape = match broadcast_shapes(&shape, input) {
+            Ok(shape) => shape,
+            Err(error) => return Some(Err(error)),
+        };
+    }
+    Some(Ok(shape))
 }
 
 /// Compute concrete output shapes from already-resolved input shapes and the
@@ -2888,6 +2920,31 @@ impl Executor {
             .map(|v| v.map(|vid| resolved[&vid].clone()).unwrap_or_default())
             .collect();
 
+        let node = self.graph.node(node_id);
+        if let Some(output_shape) = runtime_elementwise_output_shape(node, &input_shapes) {
+            let output_shape = output_shape.map_err(|_| {
+                let node_name = if node.name.is_empty() {
+                    format!("<unnamed node #{}>", node_id.0)
+                } else {
+                    format!("{:?}", node.name)
+                };
+                SessionError::RuntimeBroadcastIncompatible {
+                    node: node_name,
+                    domain: canonical_domain(node),
+                    op_type: node.op_type.clone(),
+                    input_shapes: input_shapes.clone(),
+                }
+            })?;
+            if outputs.len() != 1 {
+                return Err(SessionError::OutputShapeCountMismatch {
+                    op: node.op_type.clone(),
+                    expected: outputs.len(),
+                    got: 1,
+                });
+            }
+            resolved.insert(outputs[0], output_shape);
+        }
+
         // Data-dependent shapes: if any output's shape is still unresolved,
         // compute it now from the concrete input shapes + the runtime *values*
         // of this node's integer inputs. Buffers are NOT sized here — a view
@@ -2900,7 +2957,6 @@ impl Executor {
                     v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
-            let node = self.graph.node(node_id);
             let out_shapes = dynamic_output_shapes(
                 node,
                 &input_shapes,
@@ -2934,9 +2990,7 @@ impl Executor {
                 resolved.insert(ovid, out_shapes[oi].clone());
             }
         }
-
         let output_shapes: Vec<Vec<usize>> = outputs.iter().map(|v| resolved[v].clone()).collect();
-        let node = self.graph.node(node_id);
         let capabilities = self.ep.capabilities();
         let accepts_lazy_weights =
             LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
