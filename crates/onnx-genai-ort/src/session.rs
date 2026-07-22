@@ -4,6 +4,7 @@ use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 
+pub use onnx_genai_runtime_config::CudaAttentionMode;
 use onnx_genai_runtime_config::{
     CudaDevice, EpSelection, ExecutionProviderEntry, IntraOpThreads, PluginSpec, runtime_config,
 };
@@ -328,21 +329,6 @@ pub mod ep_compat {
     }
 }
 
-/// CUDA attention implementation policy.
-///
-/// ONNX Runtime's default selects among optimized attention implementations.
-/// [`Self::Unfused`] pins the CUDA provider's `sdpa_kernel` option to its
-/// standard math implementation, disabling Flash, Lean, fused,
-/// memory-efficient, TensorRT-flash, and cuDNN-flash attention dispatch.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CudaAttentionMode {
-    /// Let ONNX Runtime select the attention implementation.
-    #[default]
-    Default,
-    /// Use ONNX Runtime's standard unfused math attention implementation.
-    Unfused,
-}
-
 /// Session configuration options.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
@@ -365,7 +351,8 @@ pub struct SessionOptions {
     pub webgpu_disable_validation: bool,
     /// CUDA attention implementation policy.
     ///
-    /// Defaults from `ONNX_GENAI_CUDA_ATTENTION` (`default` or `unfused`).
+    /// Defaults from the typed runtime configuration registry populated by
+    /// `ONNX_GENAI_CUDA_ATTENTION` (`auto`, `fused`, or `unfused`).
     /// `unfused` is a generic correctness workaround for graphs that encounter
     /// an ONNX Runtime optimized-attention kernel defect; it is never selected
     /// from model identity.
@@ -429,7 +416,7 @@ impl SessionOptions {
             inter_op_num_threads: 0,
             graph_capture: false,
             webgpu_disable_validation: false,
-            cuda_attention_mode: cuda_attention_mode_from_env(),
+            cuda_attention_mode: cuda_attention_mode_from_runtime_config(),
             auto_selected: false,
         }
     }
@@ -1325,24 +1312,20 @@ fn webgpu_disable_validation_from_env() -> bool {
     !runtime_config().webgpu_validation
 }
 
-/// CUDA attention mode from `ONNX_GENAI_CUDA_ATTENTION`.
+/// CUDA attention mode from the typed runtime configuration registry.
 ///
 /// ORT exposes the desired behavior as the CUDA provider option
 /// `sdpa_kernel=16` (the standard math implementation), so this configuration
 /// does not need to mutate ORT's process-wide attention environment variables.
-fn cuda_attention_mode_from_env() -> CudaAttentionMode {
-    let Some(value) = std::env::var_os("ONNX_GENAI_CUDA_ATTENTION") else {
-        return CudaAttentionMode::Default;
-    };
-    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
-        "" | "default" | "optimized" => CudaAttentionMode::Default,
-        "unfused" => CudaAttentionMode::Unfused,
-        invalid => {
+fn cuda_attention_mode_from_runtime_config() -> CudaAttentionMode {
+    match &runtime_config().cuda_attention_mode {
+        CudaAttentionMode::Invalid(invalid) => {
             tracing::warn!(
-                "Ignoring invalid ONNX_GENAI_CUDA_ATTENTION={invalid}; expected 'default' or 'unfused'"
+                "Ignoring invalid ONNX_GENAI_CUDA_ATTENTION={invalid}; expected 'auto', 'fused', or 'unfused'"
             );
-            CudaAttentionMode::Default
+            CudaAttentionMode::Auto
         }
+        mode => mode.clone(),
     }
 }
 
@@ -1452,7 +1435,7 @@ fn append_execution_providers(
             session_options,
             provider,
             options.graph_capture,
-            options.cuda_attention_mode,
+            &options.cuda_attention_mode,
             &available,
         )?;
     }
@@ -1464,7 +1447,7 @@ fn append_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     provider: &ResolvedEp,
     graph_capture: bool,
-    cuda_attention_mode: CudaAttentionMode,
+    cuda_attention_mode: &CudaAttentionMode,
     available: &[String],
 ) -> Result<()> {
     use ep_compat::AppendStrategy;
@@ -1820,7 +1803,7 @@ fn append_cuda_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     device_id: i32,
     graph_capture: bool,
-    attention_mode: CudaAttentionMode,
+    attention_mode: &CudaAttentionMode,
     available: &[String],
 ) -> Result<()> {
     const PROVIDER_NAME: &str = "CUDAExecutionProvider";
@@ -1913,13 +1896,13 @@ fn append_cuda_execution_provider(
 fn cuda_provider_options(
     device_id: String,
     graph_capture: bool,
-    attention_mode: CudaAttentionMode,
+    attention_mode: &CudaAttentionMode,
 ) -> Vec<(String, String)> {
     let mut options = vec![("device_id".to_string(), device_id)];
     if graph_capture {
         options.push(("enable_cuda_graph".to_string(), "1".to_string()));
     }
-    if attention_mode == CudaAttentionMode::Unfused {
+    if attention_mode == &CudaAttentionMode::Unfused {
         // ORT AttentionBackend::MATH is bit 16. A positive sdpa_kernel value is
         // an explicit backend mask, so all optimized paths are disabled without
         // process-global ORT_DISABLE_* environment state.
@@ -2405,7 +2388,7 @@ mod tests {
     #[test]
     fn unfused_cuda_attention_uses_math_provider_option() {
         assert_eq!(
-            cuda_provider_options("3".to_string(), true, CudaAttentionMode::Unfused),
+            cuda_provider_options("3".to_string(), true, &CudaAttentionMode::Unfused),
             vec![
                 ("device_id".to_string(), "3".to_string()),
                 ("enable_cuda_graph".to_string(), "1".to_string()),
@@ -2413,7 +2396,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            cuda_provider_options("0".to_string(), false, CudaAttentionMode::Default),
+            cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Auto),
+            vec![("device_id".to_string(), "0".to_string())]
+        );
+        assert_eq!(
+            cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Fused),
             vec![("device_id".to_string(), "0".to_string())]
         );
     }
@@ -2446,7 +2433,7 @@ mod tests {
             std::ptr::null_mut(),
             &resolved,
             false,
-            CudaAttentionMode::Default,
+            &CudaAttentionMode::Auto,
             &[],
         )
         .expect_err("CUDA must be rejected without the cargo feature");
