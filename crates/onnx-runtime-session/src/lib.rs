@@ -30,8 +30,9 @@ pub use epcontext::{
 };
 pub use error::SessionError;
 pub use executor::{
-    CacheStats, CaptureDecline, CaptureDeclineReport, ControlFlowStats, DeviceAllocationCounts,
-    DeviceGraphCaptureResult, ExecutionProviderDecline, ExecutionProviderFallbackReport,
+    CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
+    DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
+    ExecutionProviderFallbackReport, SeamReason,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -930,8 +931,8 @@ impl InferenceSession {
 
     /// Structured, transparent segment boundaries from the most recent capture:
     /// one entry per non-capturable seam node the EP ran eagerly between captured
-    /// segments (with its `CaptureSupport` decline reason). Empty for a
-    /// whole-subgraph capture.
+    /// segments (with its structural seam kind and `CaptureSupport` decline reason).
+    /// Empty for a whole-subgraph capture.
     pub fn capture_segmentation(&self) -> &[CaptureDecline] {
         self.exec.capture_segmentation()
     }

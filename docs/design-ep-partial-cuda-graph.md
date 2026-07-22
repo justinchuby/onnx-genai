@@ -468,7 +468,7 @@ gate — worst case it degrades to the exact eager path already shipping.
 Work items are sized for follow-up agents. Each phase is independently
 buildable/reviewable (RULES §9) and does not touch `docs/PROGRESS.md` here.
 
-### Phase 0 — Formalize the path-kind model (types + docs only)
+### Phase 0 — Formalize the path-kind model (types + docs only) (**DONE 2026-07-22**)
 - Introduce an EP-internal `CapturePathKind { CaptureRegion, EagerDeviceSeam, HostSeam }`
   and a `SeamReason` that sub-classifies today's `CaptureDecline`.
 - Wire seam sub-classification through `CaptureSchedule` (extend, don't rewrite).

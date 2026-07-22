@@ -11,6 +11,10 @@ and buffers; the next eligible step records and immediately launches the graph;
 later steps update the scalar device inputs and mask delta before replay. Logits
 are copied to the host only after capture or replay.
 
+Set `ONNX_GENAI_LOG_CAPTURE_SEGMENTS=1` to print each eager seam's structural
+path kind (`host-seam` or `eager-device-seam`) alongside its existing detailed
+capture-decline reason.
+
 Every compiled kernel is passed through `subgraph_graph_capturable` before stream
 capture. Any kernel that can allocate/free, compile lazily, perform D2H
 validation, or synchronize the stream rejects the whole step and native decode

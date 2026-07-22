@@ -121,10 +121,16 @@ fn log_capture_segmentation(schedule: &CaptureSchedule) {
     );
     for boundary in &schedule.boundaries {
         match boundary.node_id {
-            Some(id) => eprintln!(
-                "[onnx-genai-capture]   seam node {id} ({}::{}) ran eagerly: {}",
-                boundary.domain, boundary.op_type, boundary.reason
-            ),
+            Some(id) => {
+                let seam_label = boundary
+                    .seam_reason
+                    .map(SeamReason::label)
+                    .unwrap_or("unclassified-seam");
+                eprintln!(
+                    "[onnx-genai-capture]   seam node {id} ({}::{}) [{seam_label}] ran eagerly: {}",
+                    boundary.domain, boundary.op_type, boundary.reason
+                );
+            }
             None => eprintln!(
                 "[onnx-genai-capture]   seam ({}): {}",
                 boundary.op_type, boundary.reason
@@ -194,6 +200,61 @@ pub struct DeviceAllocationCounts {
     pub frees: u64,
 }
 
+/// Structural execution path used by a node during a captured run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePathKind {
+    /// Recorded into a device graph and replayed.
+    CaptureRegion,
+    /// Dispatched eagerly while remaining on the device.
+    EagerDeviceSeam,
+    /// Host-driven work or a host round-trip between captured regions.
+    HostSeam,
+}
+
+impl CapturePathKind {
+    /// Stable short label used by capture diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CaptureRegion => "capture-region",
+            Self::EagerDeviceSeam => "eager-device-seam",
+            Self::HostSeam => "host-seam",
+        }
+    }
+}
+
+/// Structural reason a node forms an eager seam during device-graph capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeamReason {
+    /// Host-driven control-flow or sequence semantics.
+    HostControlFlowOrSequence,
+    /// A data-dependent output shape was unresolved before capture.
+    UnresolvedOutputShape,
+    /// A data-dependent input shape was unresolved before capture.
+    UnresolvedInputShape,
+    /// The requested concrete kernel shape has not completed warmup.
+    KernelNotWarmed,
+    /// The selected device kernel explicitly opts out of capture.
+    KernelCaptureUnsupported,
+}
+
+impl SeamReason {
+    /// Execution path implied by this structural seam cause.
+    pub const fn path_kind(self) -> CapturePathKind {
+        match self {
+            Self::HostControlFlowOrSequence => CapturePathKind::HostSeam,
+            Self::UnresolvedOutputShape
+            | Self::UnresolvedInputShape
+            | Self::KernelNotWarmed
+            | Self::KernelCaptureUnsupported => CapturePathKind::EagerDeviceSeam,
+        }
+    }
+
+    /// Stable short path-kind label used by capture diagnostics.
+    pub const fn label(self) -> &'static str {
+        self.path_kind().label()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// One actionable reason a device-graph capture attempt was rejected.
 pub struct CaptureDecline {
@@ -205,15 +266,23 @@ pub struct CaptureDecline {
     pub domain: String,
     /// Failed precondition and, where applicable, how to reach the capture path.
     pub reason: String,
+    /// Structural seam classification, or `None` for graph-level hard preconditions.
+    pub seam_reason: Option<SeamReason>,
 }
 
 impl CaptureDecline {
-    fn node(node_id: NodeId, node: &Node, reason: impl Into<String>) -> Self {
+    fn node(
+        node_id: NodeId,
+        node: &Node,
+        seam_reason: SeamReason,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             node_id: Some(node_id.0),
             op_type: node.op_type.clone(),
             domain: canonical_domain(node),
             reason: reason.into(),
+            seam_reason: Some(seam_reason),
         }
     }
 
@@ -223,6 +292,7 @@ impl CaptureDecline {
             op_type: "<graph>".to_string(),
             domain: "nxrt".to_string(),
             reason: reason.into(),
+            seam_reason: None,
         }
     }
 }
@@ -328,10 +398,9 @@ fn kernel_capture_decline(
     node: &Node,
     kernel: &dyn Kernel,
 ) -> Option<CaptureDecline> {
-    kernel
-        .capture_support()
-        .reason()
-        .map(|reason| CaptureDecline::node(node_id, node, reason))
+    kernel.capture_support().reason().map(|reason| {
+        CaptureDecline::node(node_id, node, SeamReason::KernelCaptureUnsupported, reason)
+    })
 }
 
 /// Whether verbose segmented-capture diagnostics are printed to stderr.
@@ -2593,6 +2662,7 @@ impl Executor {
             return Some(CaptureDecline::node(
                 plan.node_id,
                 node,
+                SeamReason::HostControlFlowOrSequence,
                 "control-flow and sequence nodes are not device-graph capturable",
             ));
         }
@@ -2604,6 +2674,7 @@ impl Executor {
             return Some(CaptureDecline::node(
                 plan.node_id,
                 node,
+                SeamReason::UnresolvedOutputShape,
                 "data-dependent output shape was unresolved before capture",
             ));
         }
@@ -2620,6 +2691,7 @@ impl Executor {
             return Some(CaptureDecline::node(
                 plan.node_id,
                 node,
+                SeamReason::UnresolvedInputShape,
                 "data-dependent input shape was unresolved before capture",
             ));
         };
@@ -2631,6 +2703,7 @@ impl Executor {
             return Some(CaptureDecline::node(
                 plan.node_id,
                 node,
+                SeamReason::KernelNotWarmed,
                 "kernel has not been warmed for the requested capture shape",
             ));
         };
@@ -5742,6 +5815,7 @@ mod tests {
                 domain: "com.microsoft".to_string(),
                 reason: "requires M==1 decode GEMV without group_indices; got a prefill signature"
                     .to_string(),
+                seam_reason: Some(SeamReason::KernelCaptureUnsupported),
             }]
         );
         assert!(report.to_string().contains("node 9"));
@@ -5750,6 +5824,43 @@ mod tests {
                 .to_string()
                 .contains("requires M==1 decode GEMV without group_indices")
         );
+    }
+
+    #[test]
+    fn seam_reasons_map_to_structural_capture_paths() {
+        let cases = [
+            (
+                SeamReason::HostControlFlowOrSequence,
+                CapturePathKind::HostSeam,
+                "host-seam",
+            ),
+            (
+                SeamReason::UnresolvedOutputShape,
+                CapturePathKind::EagerDeviceSeam,
+                "eager-device-seam",
+            ),
+            (
+                SeamReason::UnresolvedInputShape,
+                CapturePathKind::EagerDeviceSeam,
+                "eager-device-seam",
+            ),
+            (
+                SeamReason::KernelNotWarmed,
+                CapturePathKind::EagerDeviceSeam,
+                "eager-device-seam",
+            ),
+            (
+                SeamReason::KernelCaptureUnsupported,
+                CapturePathKind::EagerDeviceSeam,
+                "eager-device-seam",
+            ),
+        ];
+
+        for (reason, expected_kind, expected_label) in cases {
+            assert_eq!(reason.path_kind(), expected_kind);
+            assert_eq!(reason.label(), expected_label);
+        }
+        assert_eq!(CapturePathKind::CaptureRegion.label(), "capture-region");
     }
 
     #[test]

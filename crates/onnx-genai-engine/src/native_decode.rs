@@ -2444,6 +2444,7 @@ mod tests {
                 reason:
                     "requires warmed f32 q_seq==1 k_seq==1 fixed-capacity device-KV reference path"
                         .to_string(),
+                seam_reason: Some(onnx_runtime_session::SeamReason::KernelCaptureUnsupported),
             }],
         };
         let (trace, events) = TraceContext::in_memory();
