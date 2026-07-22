@@ -7120,6 +7120,49 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_output_shapes_unsqueeze_supports_input_and_attribute_axes() {
+        use onnx_runtime_ir::Attribute;
+
+        let mut input_axes = Node::new(
+            NodeId(0),
+            "Unsqueeze",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        input_axes.domain = "ai.onnx".into();
+        assert_eq!(
+            dynamic_output_shapes(
+                &input_axes,
+                &[vec![2, 3], vec![2]],
+                &[DataType::Float32, DataType::Int64],
+                &[None, Some(vec![0, -1])],
+                17,
+            ),
+            Some(vec![vec![1, 2, 3, 1]])
+        );
+
+        let mut attribute_axes = Node::new(
+            NodeId(1),
+            "Unsqueeze",
+            vec![Some(ValueId(0))],
+            vec![ValueId(1)],
+        );
+        attribute_axes
+            .attributes
+            .insert("axes".into(), Attribute::Ints(vec![1, -1]));
+        assert_eq!(
+            dynamic_output_shapes(
+                &attribute_axes,
+                &[vec![2, 3]],
+                &[DataType::Float32],
+                &[None],
+                11,
+            ),
+            Some(vec![vec![2, 1, 3, 1]])
+        );
+    }
+
+    #[test]
     fn dynamic_output_shapes_gqa_supports_packed_qkv() {
         use onnx_runtime_ir::{Attribute, ValueId};
 
