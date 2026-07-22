@@ -485,6 +485,9 @@ fn run_f16_case_with_bits(
     )?;
     assert!(kernel.cuda_graph_compatible());
     if bits == 8 {
+        let mut eager = vec![0u8; n * 2];
+        // SAFETY: output allocation contains `n` fp16 values.
+        unsafe { runtime.dtoh(&mut eager, cuptr(output_buffer.as_ptr()))? };
         let allocation_counts = runtime.allocation_counts();
         runtime.begin_graph_capture(&[kernel.as_ref()])?;
         kernel.execute(
@@ -499,6 +502,10 @@ fn run_f16_case_with_bits(
         )?;
         runtime.end_graph_capture()?;
         runtime.replay_graph()?;
+        let mut replayed = vec![0u8; n * 2];
+        // SAFETY: output allocation contains `n` fp16 values.
+        unsafe { runtime.dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))? };
+        assert_eq!(replayed, eager);
         assert_eq!(runtime.allocation_counts(), allocation_counts);
         assert!(runtime.reset_graph()?);
     }
@@ -1449,6 +1456,36 @@ fn matmul_nbits_gpu_int8_fp16_block32_explicit_zero_points_match_reference() {
         8,
     )
     .unwrap();
+    for (column, got) in actual.iter().enumerate() {
+        let expected =
+            f16_int8_reference_column(&activations, &packed, &scales, &zero_points, k, column);
+        let expected = f16::from_f32(expected).to_f32();
+        let tolerance = 0.02f32.max(expected.abs() * 2e-3);
+        assert!(
+            (got.to_f32() - expected).abs() <= tolerance,
+            "column {column}: got={} expected={expected} tolerance={tolerance}",
+            got.to_f32()
+        );
+    }
+}
+
+#[test]
+fn matmul_nbits_gpu_int8_fp16_block32_default_zero_point_matches_reference() {
+    let Some(ep) = gpu() else { return };
+    let (k, n) = (77usize, 73usize);
+    let blocks = k.div_ceil(32);
+    let activations: Vec<f16> = (0..k)
+        .map(|index| f16::from_f32(((index * 29 % 257) as f32 - 128.0) / 97.0))
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * 32)
+        .map(|index| ((index * 37 + index / 11 + 19) & 255) as u8)
+        .collect();
+    let scales: Vec<f16> = (0..n * blocks)
+        .map(|index| f16::from_f32(0.001 + (index * 17 % 31) as f32 * 0.0002))
+        .collect();
+    let zero_points = vec![128u8; n * blocks];
+    let actual =
+        run_f16_case_with_bits(&ep, &activations, &packed, &scales, None, k, n, 8).unwrap();
     for (column, got) in actual.iter().enumerate() {
         let expected =
             f16_int8_reference_column(&activations, &packed, &scales, &zero_points, k, column);
