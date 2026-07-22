@@ -340,6 +340,33 @@ fn grid_for(n: usize) -> u32 {
     n.div_ceil(BLOCK as usize).clamp(1, MAX_BLOCKS) as u32
 }
 
+pub(crate) fn launch_silu_mul_f16_raw(
+    runtime: &CudaRuntime,
+    gate: CUdeviceptr,
+    up: CUdeviceptr,
+    output: CUdeviceptr,
+    n: usize,
+) -> Result<()> {
+    runtime.require_nvrtc_half_headers("SiluMul fp16")?;
+    let n_u64 = u64::try_from(n)
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep SiluMul: {n} elements exceed u64")))?;
+    let func = runtime.nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, "silu_mul_f16")?;
+    let mut builder = runtime.stream().launch_builder(&func);
+    builder.arg(&gate).arg(&up).arg(&output).arg(&n_u64);
+    // SAFETY: callers provide three live fp16 allocations covering `n`
+    // elements. The pointwise kernel permits `up == output`: every thread loads
+    // its input element before overwriting that same independent element.
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid_for(n), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|e| driver_err("launch silu_mul_f16", e))
+}
+
 /// Reject a strided (non-contiguous) view with a "materialise first" error.
 fn require_contiguous(op: &str, name: &str, contiguous: bool) -> Result<()> {
     if !contiguous {

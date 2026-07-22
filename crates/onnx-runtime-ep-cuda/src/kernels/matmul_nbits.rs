@@ -6,12 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmParams, WORKSPACE_BYTES};
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
@@ -1872,12 +1874,11 @@ impl MatMulNBitsKernel {
         .map_err(|err| driver_err("launch MatMulNBits int8 fp16 GEMV", err))
     }
 
-    /// Paired gate/up projection + SwiGLU decode path (see
+    /// Paired gate/up projection + SwiGLU path (see
     /// [`crate::optimizer::CudaGateUpSwiGluFusion`]). Inputs are
-    /// `[x, W_gate, scales_gate, W_up, scales_up]`; the kernel reads the shared
-    /// activation once, runs both int4 GEMVs, and writes `silu(gate)*up`. Gated
-    /// to the exact validated fp16 block-32 M=1 decode shape by the optimizer,
-    /// re-validated here before launch.
+    /// `[x, W_gate, scales_gate, W_up, scales_up]`. M=1 keeps the paired decode
+    /// GEMV unchanged; M>1 reuses the portable tiled prefill GEMM for both
+    /// projections before applying the existing fp16 `silu(gate)*up` kernel.
     fn run_f16_gate_up_swiglu(
         &self,
         inputs: &[TensorView],
@@ -1906,11 +1907,6 @@ impl MatMulNBitsKernel {
             )));
         }
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
-        if m != 1 || self.block_size != 32 {
-            return Err(error(
-                "gate/up SwiGLU fusion is only supported for the block-32 M=1 fp16 decode GEMV",
-            ));
-        }
         let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
         if outputs[0].shape != expected_output_shape {
             return Err(error(format!(
@@ -1919,6 +1915,14 @@ impl MatMulNBitsKernel {
             )));
         }
 
+        if self.block_size != 32 || self.bits != 4 {
+            return Err(error(format!(
+                "gate/up SwiGLU fusion received bits={} and block_size={}. Why: the fused fp16 \
+                 path implements the block-32 packed int4 layout. How to fix: export 4-bit \
+                 MatMulNBits weights with block_size=32 or disable this fusion",
+                self.bits, self.block_size
+            )));
+        }
         let k_blocks = self.k.div_ceil(self.block_size);
         let blob_size = self.block_size / 2;
         require_shape("W_gate", inputs[1].shape, &[self.n, k_blocks, blob_size])?;
@@ -1941,6 +1945,35 @@ impl MatMulNBitsKernel {
             }
         }
 
+        if m == 0 {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gate_up_swiglu_empty",
+                "M=0 gate/up SwiGLU has an empty output and requires no CUDA launch"
+            );
+            return Ok(());
+        }
+        if m > 1 {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gate_up_swiglu_prefill",
+                "M={} prefill: two portable block-32 int4 fp16 tiled GEMMs with fp32 \
+                 accumulation, followed by fp16 SiluMul; not advertised as CUDA-graph \
+                 capture-safe",
+                m
+            );
+            return self.launch_gate_up_swiglu_prefill(
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                &inputs[3],
+                &inputs[4],
+                &mut outputs[0],
+                m,
+                k_blocks,
+            );
+        }
+
         onnx_runtime_ep_api::record_kernel_variant!(
             "gate_up_swiglu_fused",
             "fp16 block-32 M==1 decode: fused paired gate/up int4 GEMV + SwiGLU \
@@ -1959,6 +1992,61 @@ impl MatMulNBitsKernel {
             k_blocks,
             blob_size,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_swiglu_prefill(
+        &self,
+        activation: &TensorView,
+        packed_gate: &TensorView,
+        scales_gate: &TensorView,
+        packed_up: &TensorView,
+        scales_up: &TensorView,
+        output: &mut TensorMut,
+        m: usize,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let scratch = self.runtime.alloc_raw(output.byte_size())?;
+        let scratch_shape = output.shape.to_vec();
+        let scratch_strides = output.strides.to_vec();
+        let mut gate_output = TensorMut::new(
+            DevicePtrMut(raw_ptr(scratch)),
+            DataType::Float16,
+            &scratch_shape,
+            &scratch_strides,
+            output.device,
+        );
+
+        let result = (|| {
+            self.launch_f16_gemm(
+                activation,
+                packed_gate,
+                scales_gate,
+                true,
+                None,
+                None,
+                &mut gate_output,
+                m,
+                k_blocks,
+            )?;
+            self.launch_f16_gemm(
+                activation, packed_up, scales_up, true, None, None, output, m, k_blocks,
+            )?;
+            let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+            crate::kernels::elementwise::launch_silu_mul_f16_raw(
+                &self.runtime,
+                scratch,
+                output_ptr,
+                output_ptr,
+                output.numel(),
+            )
+        })();
+
+        // Always release the prefill gate projection. `cuMemFree` waits for
+        // preceding stream work that uses this allocation, including SiluMul.
+        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly once.
+        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
+        result.and(free_scratch)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3359,11 +3447,10 @@ extern "C" __global__ void ref_silu_mul_f16(
 }
 "#;
 
-    /// The paired gate/up SwiGLU kernel must be byte-identical to running the two
-    /// standalone projection GEMVs and then `silu_mul_f16`. This is verified for
-    /// the Qwen decode shape (K=896, N=4864, the 762 tok/s non-regression path)
-    /// AND an unrelated non-Qwen shape, proving the fused kernel is generic — the
-    /// on-device token-identity guarantee holds regardless of K/N.
+    /// The paired gate/up SwiGLU path must be byte-identical to running two
+    /// standalone MatMulNBits projections and then `silu_mul_f16`. Decode covers
+    /// the Qwen shape and an unrelated shape; prefill covers the reported
+    /// five-token Qwen case plus M/N tails on a small unrelated shape.
     #[test]
     fn fp16_gate_up_swiglu_is_bit_exact_to_two_op_path() {
         let Some(runtime) = runtime() else {
@@ -3378,9 +3465,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             return;
         }
 
-        // (K=hidden, N=intermediate): Qwen first (non-regression), then a
-        // Llama-ish shape with unrelated dimensions.
-        for (k, n) in [(QWEN_DOWN_N, QWEN_DOWN_K), (2048usize, 5632usize)] {
+        // (M, K=hidden, N=intermediate): preserve both decode cases, then add
+        // Qwen M=5 prefill and unrelated row/column tails.
+        for (m, k, n) in [
+            (1usize, QWEN_DOWN_N, QWEN_DOWN_K),
+            (1, 2048, 5632),
+            (5, QWEN_DOWN_N, QWEN_DOWN_K),
+            (3, 96, 77),
+        ] {
             let block_size = 32usize;
             let k_blocks = k / block_size;
             let blob_size = block_size / 2;
@@ -3411,7 +3503,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 packed
             };
 
-            let activation: Vec<f16> = (0..k).map(|_| f16::from_f32(next())).collect();
+            let activation: Vec<f16> = (0..m * k).map(|_| f16::from_f32(next())).collect();
             let packed_gate = pack(&mut next);
             let scales_gate: Vec<f16> = (0..n * k_blocks)
                 .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
@@ -3426,10 +3518,11 @@ extern "C" __global__ void ref_silu_mul_f16(
             let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
             let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
             let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
-            let gate_out_dev = runtime.alloc_raw(n * 2).unwrap();
-            let up_out_dev = runtime.alloc_raw(n * 2).unwrap();
-            let ref_out_dev = runtime.alloc_raw(n * 2).unwrap();
-            let fused_out_dev = runtime.alloc_raw(n * 2).unwrap();
+            let output_elements = m * n;
+            let gate_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+            let up_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+            let ref_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+            let fused_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
             // SAFETY: device buffers exactly cover their source slices.
             unsafe {
                 runtime.htod(as_bytes(&activation), activation_dev).unwrap();
@@ -3442,13 +3535,13 @@ extern "C" __global__ void ref_silu_mul_f16(
             }
 
             let device = DeviceId::cuda(0);
-            let a_shape = [1usize, k];
+            let a_shape = [m, k];
             let a_strides = [k as i64, 1];
             let b_shape = [n, k_blocks, blob_size];
             let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
             let scales_shape = [n, k_blocks];
             let scales_strides = [k_blocks as i64, 1];
-            let y_shape = [1usize, n];
+            let y_shape = [m, n];
             let y_strides = [n as i64, 1];
             let activation_view = TensorView::new(
                 device_ptr(activation_dev),
@@ -3499,7 +3592,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 &y_strides,
                 device,
             );
-            let mut fused_out = TensorMut::new(
+            let fused_out = TensorMut::new(
                 device_ptr_mut(fused_out_dev),
                 DataType::Float16,
                 &y_shape,
@@ -3507,12 +3600,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                 device,
             );
 
-            let selection = select_f16_gemv_variant(k, n, block_size, true);
-            assert_eq!(
-                selection.variant,
-                F16GemvVariant::General,
-                "gate/up projections must use the general GEMV as the reference"
-            );
             let gemv_kernel = MatMulNBitsKernel {
                 runtime: runtime.clone(),
                 k,
@@ -3525,34 +3612,69 @@ extern "C" __global__ void ref_silu_mul_f16(
                 gate_up_swiglu: false,
                 last_call_capture_safe: AtomicBool::new(false),
             };
-            // Reference: two standalone projection GEMVs...
-            gemv_kernel
-                .launch_f16_gemv_variant(
-                    &activation_view,
-                    &packed_gate_view,
-                    &scales_gate_view,
-                    true,
-                    None,
-                    &mut gate_out,
-                    k_blocks,
-                    blob_size,
-                    selection,
-                )
-                .unwrap();
-            gemv_kernel
-                .launch_f16_gemv_variant(
-                    &activation_view,
-                    &packed_up_view,
-                    &scales_up_view,
-                    true,
-                    None,
-                    &mut up_out,
-                    k_blocks,
-                    blob_size,
-                    selection,
-                )
-                .unwrap();
-            // ...then the reference silu_mul (byte-identical to silu_mul_f16).
+            // Reference: two standalone MatMulNBits projections.
+            if m == 1 {
+                let selection = select_f16_gemv_variant(k, n, block_size, true);
+                assert_eq!(
+                    selection.variant,
+                    F16GemvVariant::General,
+                    "gate/up decode projections must use the general GEMV as the reference"
+                );
+                gemv_kernel
+                    .launch_f16_gemv_variant(
+                        &activation_view,
+                        &packed_gate_view,
+                        &scales_gate_view,
+                        true,
+                        None,
+                        &mut gate_out,
+                        k_blocks,
+                        blob_size,
+                        selection,
+                    )
+                    .unwrap();
+                gemv_kernel
+                    .launch_f16_gemv_variant(
+                        &activation_view,
+                        &packed_up_view,
+                        &scales_up_view,
+                        true,
+                        None,
+                        &mut up_out,
+                        k_blocks,
+                        blob_size,
+                        selection,
+                    )
+                    .unwrap();
+            } else {
+                gemv_kernel
+                    .launch_f16_gemm(
+                        &activation_view,
+                        &packed_gate_view,
+                        &scales_gate_view,
+                        true,
+                        None,
+                        None,
+                        &mut gate_out,
+                        m,
+                        k_blocks,
+                    )
+                    .unwrap();
+                gemv_kernel
+                    .launch_f16_gemm(
+                        &activation_view,
+                        &packed_up_view,
+                        &scales_up_view,
+                        true,
+                        None,
+                        None,
+                        &mut up_out,
+                        m,
+                        k_blocks,
+                    )
+                    .unwrap();
+            }
+            // Then the reference silu_mul (byte-identical to silu_mul_f16).
             let ref_function = runtime
                 .nvrtc_function(
                     "matmul_nbits_ref_silu_mul",
@@ -3563,41 +3685,45 @@ extern "C" __global__ void ref_silu_mul_f16(
             let gate_out_ptr = cuptr(device_ptr(gate_out_dev).0);
             let up_out_ptr = cuptr(device_ptr(up_out_dev).0);
             let ref_out_ptr = cuptr(device_ptr(ref_out_dev).0);
-            let n_i32 = n as i32;
+            let output_elements_i32 = output_elements as i32;
             let mut ref_builder = runtime.stream().launch_builder(&ref_function);
             ref_builder
                 .arg(&gate_out_ptr)
                 .arg(&up_out_ptr)
                 .arg(&ref_out_ptr)
-                .arg(&n_i32);
-            // SAFETY: all three buffers hold `n` fp16 values on this device.
+                .arg(&output_elements_i32);
+            // SAFETY: all three buffers hold `output_elements` fp16 values.
             unsafe {
                 ref_builder.launch(LaunchConfig {
-                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    grid_dim: (output_elements.div_ceil(256) as u32, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
             }
             .unwrap();
 
-            // Subject: the fused paired kernel.
+            // Subject: exercise the fused node's real M=1/M>1 dispatch.
+            let inputs = [
+                activation_view,
+                packed_gate_view,
+                scales_gate_view,
+                packed_up_view,
+                scales_up_view,
+            ];
+            let mut outputs = [fused_out];
             gemv_kernel
-                .launch_gate_up_swiglu(
-                    &activation_view,
-                    &packed_gate_view,
-                    &scales_gate_view,
-                    &packed_up_view,
-                    &scales_up_view,
-                    &mut fused_out,
-                    k_blocks,
-                    blob_size,
-                )
+                .run_f16_gate_up_swiglu(&inputs, &mut outputs)
                 .unwrap();
+            assert_eq!(
+                gemv_kernel.last_call_capture_safe.load(Ordering::Relaxed),
+                m == 1,
+                "only M=1 decode may be advertised capture-safe"
+            );
             runtime.synchronize().unwrap();
 
-            let mut reference = vec![f16::ZERO; n];
-            let mut fused = vec![f16::ZERO; n];
-            // SAFETY: both output allocations hold `n` fp16 values.
+            let mut reference = vec![f16::ZERO; output_elements];
+            let mut fused = vec![f16::ZERO; output_elements];
+            // SAFETY: both output allocations hold `output_elements` fp16 values.
             unsafe {
                 runtime
                     .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
@@ -3616,13 +3742,16 @@ extern "C" __global__ void ref_silu_mul_f16(
                 runtime.free_raw(fused_out_dev).unwrap();
             }
 
-            for col in 0..n {
+            for index in 0..output_elements {
                 assert_eq!(
-                    fused[col].to_bits(),
-                    reference[col].to_bits(),
-                    "paired gate/up SwiGLU diverged at column {col}: fused={:?} reference={:?}",
-                    fused[col],
-                    reference[col]
+                    fused[index].to_bits(),
+                    reference[index].to_bits(),
+                    "paired gate/up SwiGLU diverged at M={m}, K={k}, N={n}, row={}, column={}: \
+                     fused={:?} reference={:?}",
+                    index / n,
+                    index % n,
+                    fused[index],
+                    reference[index]
                 );
             }
         }
