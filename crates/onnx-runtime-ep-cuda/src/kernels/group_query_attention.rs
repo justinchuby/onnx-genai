@@ -1467,6 +1467,12 @@ impl GroupQueryAttentionKernel {
             0
         };
 
+        if inputs[5].dtype == DataType::Int32 && !inputs[5].is_contiguous() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep GroupQueryAttention: non-contiguous seqlens_k was provided; expected non-negative contiguous int32 with shape [batch_size] or [batch_size, 1]"
+                    .into(),
+            ));
+        }
         require_dense(&inputs[5], "seqlens_k", DataType::Int32)?;
         let sequence_lengths_layout = validate_sequence_lengths_shape(
             inputs[5].shape,

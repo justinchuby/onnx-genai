@@ -1898,7 +1898,10 @@ fn gqa_gpu_scalar_permission_preserves_dtype_layout_value_and_shape_validation()
     non_contiguous[5].as_mut().unwrap().strides = Some(vec![2]);
     let error = run_available(run(&ep, &attrs(&[]), &non_contiguous, &output_shapes))
         .expect_err("non-contiguous seqlens_k must fail");
-    assert!(format!("{error}").contains("non-contiguous seqlens_k"));
+    let message = format!("{error}");
+    assert!(message.contains("non-contiguous seqlens_k"));
+    assert!(message.contains("[batch_size]"));
+    assert!(message.contains("[batch_size, 1]"));
 
     let mut negative_scalar = base();
     negative_scalar[5] = Some(i32_tensor(&[], &[-1]));
