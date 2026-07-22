@@ -5,6 +5,91 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation -->
+## 2026-07-22 — VLM WP1/WP2/WP3 reconciliation and ORT CUDA attention review
+
+Decision archive gate checked at 2026-07-22T21-35-00Z: active ledger was 155203 bytes; no entries older than 2026-07-15T21:35Z were present to archive.
+
+<!-- source: .squad/decisions/inbox/badger-gemma4-text-closure.md -->
+### Gemma4 text-only image-modality closure
+**By:** Badger
+**Decision:** Mobius Gemma4 packages declare `embedding.image_features` as optional with `[0, hidden_size]` zero fallback under the opaque `image` presence key and gate `vision_encoder` on the same key.
+**Rationale:** Text-only requests skip vision execution while still providing a valid embedding input, matching the generic optional-audio contract without model-specific runtime logic.
+
+<!-- source: .squad/decisions/inbox/cambodia-vlm-wp3-stepexec.md -->
+### Land metadata-driven VLM WP3 step execution
+**By:** Cambodia
+**Decision:** Branch `squad/cambodia-wp3-step-exec` commit `7c82127` executes every `every_step` component topologically from declared metadata, publishes all outputs to the shared pool, re-reads decoder dataflow inputs each step, and keeps `prompt_only`/`final_only` phase behavior distinct.
+**Rationale:** Replaces one-output embedding-specific behavior with a generic component contract; engine tests, Clippy, fmt, VLM E2E tests, IR fixture validation, and architecture-name grep passed. Follow-up: remove transitional decode-side name fallbacks once packages provide complete `ModelIoSpec`.
+
+<!-- source: .squad/decisions/inbox/dave-pr421-review.md -->
+### Approve and merge Mobius PR #421 Gemma4 image optionality
+**By:** Dave
+**Decision:** APPROVE+merged PR #421 as `38cb789a51e68b5907d82fa67704a73fdef80902`.
+**Rationale:** Emitted metadata remains generic, graph declarations produce the `image` presence gate and optional zero-shaped `image_features`, text-only execution skips vision and preserves decoder routing, Ruff and targeted tests passed, and substantive CI passed except a queued infrastructure integration job.
+
+<!-- source: .squad/decisions/inbox/dave-vlm-wp1-emission.md -->
+### Land native VLM package emission
+**By:** Dave
+**Decision:** Branch `dave-wp1-vlm-emission` commit `a56e26b` emits VLM components with graph-derived typed I/O, topological dataflow, phases, embedding-to-decoder routes, sparse KV/fixed state pairs, preprocessing, expansion, position programs, runtime assets, schema v1, and WP0 capability names.
+**Rationale:** Processor selection is structural/config-driven, decoder state and positions use explicit registries, no model-family string controls pipeline structure, and Tiny IR acceptance packages validate for Gemma4 E2B, Qwen VL, and Phi4MM. Server grid-derived expansion remains runtime follow-up.
+
+<!-- source: .squad/decisions/inbox/eldon-hodge-wp2-review.md -->
+### Reject initial VLM WP2 named image processor
+**By:** Eldon
+**Verdict:** 🔴 REJECT commit `4c49b86f44807b3f8f964e093db120c3bdcc4237`; Sapper must revise and Hodge is locked out for this revision cycle.
+**Rationale:** The implementation validated `ImageOutputBinding::source` but discarded it by collapsing all transforms into one global `value_ops` sequence, so branch-selected outputs executed unrelated transforms. Scope, model-family grep, fmt, Clippy, and 44 offline tests passed, but a half-vs-quarter mutation regression proved the source binding was ignored.
+
+<!-- source: .squad/decisions/inbox/eldon-wp2-verdict.md -->
+### Approve and fast-forward merge VLM WP2 image processor revision
+**By:** Eldon
+**Verdict:** 🟢 APPROVE Sapper revision `386e083`, fast-forward merged as `2af64f55424860d8507cfea2eaaefaff23b104d8`.
+**Rationale:** Each output preserves and resolves its declared `source`, divergent half/quarter branches produce independent values, unsupported divergent structural branches fail explicitly, runtime logic has no model-family matches, fmt/Clippy/tests passed, and merge scope is only `crates/onnx-genai-preprocess/src/image.rs`.
+
+<!-- source: .squad/decisions/inbox/gaff-ort-review.md -->
+### Reject ORT CUDA attention branch pending RuntimeConfig registry integration
+**By:** Gaff
+**Verdict:** 🔴 REJECT Howie commit `7ff33496bda2`; Howie is locked out of this artifact and Deckard is the reviser.
+**Rationale:** `session.rs` reads `ONNX_GENAI_CUDA_ATTENTION` directly with `std::env::var_os`, violating the 2026-07-14 runtime-config decision that new runtime flags must be declared, parsed, documented, and tested in `onnx-genai-runtime-config::RuntimeConfig`, with call sites consuming only `runtime_config()`. CUDA-missing behavior, ORT option mapping evidence, model-family grep, fmt, Clippy, and tests otherwise passed.
+
+<!-- source: .squad/decisions/inbox/hodge-vlm-wp2-image.md -->
+### Implement initial WP2 named image preprocessing descriptors
+**By:** Hodge
+**Decision:** Branch `squad/hodge-wp2-image-processor` commit `4c49b86` preserved/validated WP0 transform inputs/outputs and output sources, executed generic image value operations, and retained typed named bundle outputs without model identity dispatch.
+**Rationale:** The work consumed the WP0 named operation graph and added runtime tests with pinned references and architecture-neutral fixtures, but Eldon later rejected it because branch source bindings were validated but not actually executed independently.
+
+<!-- source: .squad/decisions/inbox/howie-ort-cuda-attention.md -->
+### Record rejected ORT CUDA attention artifact context
+**By:** Howie
+**Decision:** Branch `squad/howie-ort-cuda-attention` commit `7ff3349` made explicit CUDA EP requests fail actionably when CUDA ORT providers are unavailable and exposed unfused ORT CUDA attention through a session/provider option and `ONNX_GENAI_CUDA_ATTENTION=unfused`.
+**Rationale:** The correctness workaround is generic and H200 reproduced coherent Qwen output with a 146.71 tok/s median, but Gaff rejected the artifact because the environment flag bypassed the required typed `RuntimeConfig` registry.
+
+<!-- source: .squad/decisions/inbox/nandez-wp3-review.md -->
+### Approve and merge VLM WP3 step-component execution
+**By:** Nandez
+**Verdict:** 🟢 APPROVED and fast-forward merged to main at `7c821278db17d66aef0672eb0decbb6b9c669da3`.
+**Rationale:** Scope is exactly the authorized files, `decode.rs` is untouched, pipeline model-name grep is empty, execution is metadata-driven/topological/generic with no `EmbedsStepBinding` special case, and fmt, Clippy, and engine tests passed.
+
+<!-- source: .squad/decisions/inbox/rachael-joi-verdict.md -->
+### Approve Gemma4 E2B native profiling report
+**By:** Rachael
+**Verdict:** 🟢 APPROVE Joi's `profile_native` pipeline/steady-window additions and Gemma4 E2B benchmark documentation; rebased merge commit `39b2add`.
+**Rationale:** Static review found metadata-driven pipeline selection without model-architecture assumptions; the 140.09 tok/s median is internally consistent, and fmt, package check, bench-native profile check, and Clippy passed. No GPU benchmark was run.
+
+<!-- source: .squad/decisions/inbox/resch-dave-wp1-review.md -->
+### Approve and merge Dave WP1 native VLM emission
+**By:** Resch
+**Verdict:** 🟢 APPROVED Dave's `dave-wp1-vlm-emission` work and squash-merged Mobius PR #420, advancing Mobius main to `38616311ed38db79b7ce0e6d5b2071f14f8da5b8`.
+**Rationale:** Production VLM dispatch is structural/config-driven with no model-identity branch, targeted tests and Ruff passed, and emitted position/dataflow/capability/enum values match onnx-genai Rust and JSON schemas.
+
+<!-- source: .squad/decisions/inbox/sapper-wp2-image-processor-rev.md -->
+### Revise WP2 image values into independent dataflow branches
+**By:** Sapper
+**Decision:** Revised `image.rs` so each `OutputSpec` retains its declared source, named rescale/normalize values compile from their own declared input lineage, outputs pack the selected branch, and unsupported structural branches are rejected explicitly.
+**Rationale:** Fixes Eldon's rejection of the collapsed global value-op chain; the half-vs-quarter regression proves independent branch selection.
+
+**Inbox:** Merged and cleared `badger-gemma4-text-closure.md`, `cambodia-vlm-wp3-stepexec.md`, `dave-pr421-review.md`, `dave-vlm-wp1-emission.md`, `eldon-hodge-wp2-review.md`, `eldon-wp2-verdict.md`, `gaff-ort-review.md`, `hodge-vlm-wp2-image.md`, `howie-ort-cuda-attention.md`, `nandez-wp3-review.md`, `rachael-joi-verdict.md`, `resch-dave-wp1-review.md`, `sapper-wp2-image-processor-rev.md`. Preserved living scope docs `keaton-native-specdecode-design.md`, `leon-vlm-scope.md`, `zhora-deepseek-scope.md`, and `joi-gemma4-e2b-gaps.md`.
+<!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation-end -->
 <!-- scribe-merge-2026-07-22T16-01-00Z-vlm-wp0-landed -->
 ## 2026-07-22 — VLM WP0 revision, DS-1 shape unblock, and inbox reconciliation
 

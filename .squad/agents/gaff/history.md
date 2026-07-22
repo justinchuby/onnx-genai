@@ -130,3 +130,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 2026-07-21T23:55Z — WP4 and DS-1 rejection lockouts recorded; DS-1 was revised by Holden and approved by Pris, while WP4 is with Batty.
 ## 2026-07-22T12:00:00Z — Qwen2.5-7B CUDA-graph benchmark
 - Measured Qwen2.5-7B int4 on H200: CUDA graph auto-enable reached **231.73 tok/s** vs forced eager **180.50 tok/s** (**+28.4%**), token-exact with zero fallbacks and one captured segment.
+
+## 2026-07-22T21-35-00Z — ORT CUDA attention review
+Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CUDA_ATTENTION` bypassed the typed `RuntimeConfig` registry. Named Deckard as reviser and locked Howie out of this artifact.
