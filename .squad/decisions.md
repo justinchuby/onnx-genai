@@ -5,6 +5,261 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-23T06-05-30Z-moe-phase1-and-perf-fixes -->
+## 2026-07-23 — MoE Phase 1, native GAP 2, Qwen3 perf fix, and model generality
+
+Decision archive gate checked at 2026-07-23T06:05Z: active ledger was 288450 bytes before merge; cutoff for seven-day retention was 2026-07-16T06:05Z. No active top-level dated sections older than 2026-07-16 were present, so no archive entries were eligible in this pass.
+
+<!-- source: .squad/decisions/inbox/hassan-model-generality.md -->
+### 2026-07-23: Llama-3.2-1B-Instruct generality + H200 bench
+**By:** Hassan
+**What:** Chose Llama-3.2-1B-Instruct, exported as Q4_K_M through Mobius's standard block-32 MatMulNBits path. Fast-path default: yes after a generic Mobius fix to emit `kv_cache.native_dtype` from model dtype. Native/ORT decode was 97.26/589.66 tok/s at 128 and 97.41/536.78 tok/s at 1024; median prefills were 26.529/3.350 ms and 27.843/3.583 ms respectively. Short output was coherent: “Paris. The capital of Germany is Berlin. The capital of Italy is Rome.”
+**Why:** Before the generic exporter fix, `kv_cache.native_dtype` was absent, so the runtime's GQA + supported-KV-dtype + max-sequence-length shared-buffer gate failed. With unmodified generated metadata and both device-KV/CUDA-graph environment overrides unset, native reported auto graph capture, zero fallbacks, and zero KV H2D/D2H transfers. Generality passes: no runtime architecture-name dispatch was found. Performance does not approach ORT because the Q6_K tied embedding/head is dequantized to fp16 and leaves an unfused initializer `Transpose` plus dense output-head `MatMul`, which dominates native trace time.
+<!-- source: .squad/decisions/inbox/hythe-deepseek-moe-phase1.md -->
+### 2026-07-23: DeepSeek MoE/QMoE Phase 1 (mobius export + dense fallback)
+**By:** Hythe
+**What:** Implemented and tested the coherent dense-reference subset of Phase 1. Mobius now documents its standard-ONNX per-expert path as the dense fallback, fixes DeepSeek grouped routing to mask excluded groups with negative infinity, distinguishes `noaux_tc` top-2-sum group scoring from group-limited maximum scoring, and passes a tiny CPU ONNX Runtime differential test including routed and shared experts. Decoder export now emits generic `model.mixture_of_experts` metadata: representation, routed/shared expert counts, experts per token, routed/shared intermediate sizes, activation, router score function, selection method, normalization, scaling, and grouped-routing parameters. onnx-genai adds matching typed schema declarations, generated JSON Schema, conditional grouped-router validation, tests, and status documentation. Mobius commit `ac7d110` is PR #423; onnx-genai commit `fd95bc0` is pushed on `squad/hythe-deepseek-moe-phase1`.
+**Why:** A standard-op dense graph is portable across CPU execution providers and provides the correctness oracle required before grouped kernels or streaming. Keeping router policy explicit preserves bias-corrected selection separately from aggregation and avoids every model-name/runtime heuristic prohibited by RULES.md §2/§2.1. Remaining Phase 1 work is fused `com.microsoft::MoE` export where the single-router-input schema is exact, fused `com.microsoft::QMoE` export with positional optional inputs, byte-for-byte or converted QMoE/MatMulNBits packing validation (layout, transpose, scales, zero points, prepacking), and fused-vs-dense differential tests.
+<!-- source: .squad/decisions/inbox/isidore-gqa-alias-fix.md -->
+### 2026-07-23: decode.rs GQA-alias consistency fix
+**By:** Isidore
+**What:** Updated `is_group_query_attention()` to accept `grouped_query` and `group_query` alongside the existing GQA spellings, and expanded unit coverage for normalized case, space, and hyphen variants plus non-GQA values. Branch: `squad/isidore-gqa-alias`; commit: `acffa2171532d4e1e4dd4a4137ba933bef5be9be`.
+**Why:** The metadata schema lists `grouped_query` as valid GQA vocabulary, but the runtime rejected it and disabled the shared-buffer KV fast path. The runtime now recognizes every GQA-family value listed by `ATTENTION_TYPE`, plus the symmetric `group_query` alias, without model-specific branching. Verification: `cargo test -p onnx-genai-engine --lib is_group_query -- --nocapture` passed (1 passed, 0 failed); `cargo clippy -p onnx-genai-engine --all-targets -- -D warnings` completed cleanly; `cargo fmt -p onnx-genai-engine` completed cleanly. Model-name grep found only the pre-existing Gemma/Mistral comment at decode.rs:1635 and no model names in new logic.
+<!-- source: .squad/decisions/inbox/joe-hythe-moe-review.md -->
+### 2026-07-23: Review — DeepSeek MoE/QMoE Phase 1 (dense-reference subset)
+
+**Verdict:** 🟢 APPROVED
+**Reviewer:** Joe (independent; author was Hythe)
+**Scope:** onnx-genai `squad/hythe-deepseek-moe-phase1` @ fd95bc0; mobius `squad/hythe-deepseek-moe-phase1` @ ac7d110 (PR #423)
+
+---
+
+## Summary
+
+Both repos deliver a clean, structural, additive Phase 1 dense-reference subset. No
+model-name gating in runtime logic, metadata is generic and append-only, JSON Schema
+matches the Rust schema, the router policy is kept separate from aggregation, and the
+CPU ONNXRuntime-vs-NumPy differential test genuinely exercises grouped routing with
+negative-infinity masking, `noaux_tc` top-2-sum group scoring, and routed + shared
+experts. All targeted tests pass on disk in read-only worktrees.
+
+---
+
+## Findings
+
+### 1. No model-name gating (RULES.md §2/§2.1) — PASS
+- **WHAT:** `grep -rniE "gemma|qwen|phi[^a-z]|llama|mistral|deepseek" crates/*/src/` returns
+  only pre-existing matches in `onnx-genai-bench` binaries (default model paths + doc
+  comments). None are introduced by this diff; `schema.rs` has zero matches.
+- **WHY:** The changed onnx-genai files (`schema.rs`, tests, docs, JSON schema) contain no
+  family branching in logic.
+- **HOW verified:** grepped `schema.rs` directly (NONE) and cross-checked `git diff
+  --name-only` against grep hits — no overlap.
+- **mobius:** `decoder_metadata.py::moe_metadata_from_config` is fully data-driven (reads
+  `num_local_experts`, `num_experts_per_tok`, `n_group`, `topk_method`, etc.). Branching is
+  on config *values* (e.g. `topk_method == "noaux_tc"`), never on a model name. The MoE
+  metadata emitted is structural: expert counts, widths, top-k, routing policy as data.
+  `deepseek.py` is a model-definition file (models/) and legitimately model-specific;
+  its branching is on `self.topk_method`, a config value.
+
+### 2. Metadata additive & explicit — PASS
+- **WHAT:** `MixtureOfExpertsSpec`/`MoERouterSpec` are new append-only fields on
+  `ModelCapabilities` (`mixture_of_experts: Option<...>`, `#[serde(default, skip_...)]`).
+  Vocabularies use the existing `extensible_string!` forward-compatible pattern.
+- **WHY:** No existing field changed types or semantics; optional with skip-if-none, so
+  existing metadata still round-trips.
+- **HOW verified:** Read full `schema.rs` diff; all additions. No implicit model-specific
+  defaults — every required field must be supplied; grouped fields are conditionally
+  required via `allOf/if/then` on `selection_method == grouped_top_k`.
+
+### 3. JSON schema matches Rust schema — PASS
+- **WHAT:** `schema/inference_metadata.schema.json` adds `MixtureOfExpertsSpec`,
+  `MoERouterSpec`, and the four extensible vocab defs, matching field names, `minimum`
+  bounds, nullability, and the grouped-router conditional `required`.
+- **HOW verified:** `tests/schema_sync.rs::committed_inference_metadata_schema_is_current`
+  PASSES — the committed JSON is byte-current with the generated schema.
+
+### 4. Conformance correctness — PASS (strongest evidence)
+- **WHAT:** `deepseek_test.py::test_deepseek_dense_moe_fallback_matches_numpy_reference`
+  builds a tiny grouped, bias-corrected MoE (`n_group=2, topk_group=1,
+  num_experts_per_tok=2, n_shared_experts=1, scoring_func=sigmoid, topk_method=noaux_tc`),
+  runs it under `CPUExecutionProvider`, and asserts allclose vs a NumPy reference.
+- **WHY it is a real test of the fix:** router logits are zeroed so all original sigmoid
+  scores = 0.5; the `e_score_correction_bias = [-0.7,-0.6,-1.5,-1.4]` makes the winning
+  group's corrected scores *negative*. If the gate multiplied by zero (the old bug),
+  excluded experts (score 0) would beat the selected group's negative scores in TopK. The
+  test only passes because excluded groups are masked with `-inf` (the fix in
+  `deepseek.py`). It also asserts `all(node.domain != "com.microsoft")` (true dense
+  standard-op fallback) and includes shared-expert aggregation. `noaux_tc` top-2-sum group
+  scoring vs `ReduceMax` group-limited scoring is correctly split by the `if
+  topk_method == "noaux_tc"` branch.
+- **HOW verified:** ran the test — PASS.
+
+### 5. Router policy separation — PASS
+- **WHAT:** Bias-corrected selection (grouped TopK over corrected scores + `-inf` mask)
+  operates on the routing scores; aggregation weights use the *original* scores
+  (normalized, `routed_scaling_factor` applied) separately. Metadata mirrors this:
+  `MoERouterSpec` carries `score_function`/`selection_method`/`normalize_weights`/
+  `scaling_factor`/group params independently of expert-FFN fields.
+- **HOW verified:** read `deepseek.py` gate + `moe_metadata_from_config`; the NumPy
+  reference in the passing test reconstructs selection and aggregation independently.
+
+### 6. Tests match disk reality (test-discipline) — PASS
+- New onnx-genai tests (`mixture_of_experts_contract_parses_structurally`,
+  `..._grouped_router_requires_group_contract`) assert exactly the fields present in the
+  schema; both pass. mobius `test_moe_metadata_from_config_is_structural` asserts the full
+  emitted dict, `MatMul` count `== 16`, and the incomplete-contract `ValueError` path — all
+  pass. Assertion counts correspond to the code under test.
+
+---
+
+## Advisory (non-blocking)
+- `moe_metadata_from_config` emits `selection_method="grouped_top_k"` only when
+  `group_count > 1 AND topk_method != "greedy"`; a config with `n_group>1` but greedy
+  routing emits plain `top_k` and drops group dims. Correct for the Phase 1 dense subset,
+  but worth an explicit note when fused `MoE`/`QMoE` export lands so grouped structure
+  isn't silently dropped for greedy-grouped variants.
+- `_moe.py` change is docstring-only (clarifies dense-fallback role); no behavior change —
+  fine.
+
+---
+
+## Tests run
+- **onnx-genai** (worktree `origin/squad/hythe-deepseek-moe-phase1`):
+  `cargo test -p onnx-genai-metadata` → **29 passed, 0 failed** (incl. 2 new MoE tests +
+  `schema_sync` current check).
+- **mobius** (worktree `origin/squad/hythe-deepseek-moe-phase1`, `.venv` py, PYTHONPATH →
+  worktree src): `pytest deepseek_test.py decoder_metadata_test.py` → **12 passed, 0
+  failed** (incl. the CPU ORT-vs-NumPy differential oracle).
+
+No blocking defects found. Recommend dispatching the merge agent.
+
+— Joe
+<!-- source: .squad/decisions/inbox/joi-qwen3-rebench-postfix.md -->
+### 2026-07-23: Qwen3 Mobius metadata fix restores default shared-KV performance
+**By:** Joi
+**What:** End-to-end H200 verification passed using Mobius export commit `820c1d7494b438f2f51f3ddeb5595914dfac0422`. Important repository-state caveat: after fetching, `origin/main` was `38cb789a51e68b5907d82fa67704a73fdef80902`, did not contain `820c1d7`, and PR #422 still reported OPEN, so the fresh export was made from the confirmed PR commit rather than current `main`.
+
+Fresh package: `/home/justinchu/mobius/.scratch/qwen3-0.6b-int4-cuda-postfix`
+
+```yaml
+model:
+  attention:
+    type: grouped_query_attention
+kv_cache:
+  native_dtype: float16
+```
+
+H200 ORT CUDA eager decode (`ONNX_GENAI_DEVICE_KV=1`, `ONNX_GENAI_CUDA_GRAPH=0`, 2 warmups, 3 runs):
+
+| Model/configuration | 128 tok/s | 1024 tok/s |
+|---|---:|---:|
+| Qwen3 old export | 197.49 | 64.01 |
+| Qwen3 fresh `820c1d7` export | **441.96** | **374.50** |
+| Qwen2.5-0.5B control, prior | 570.61 | 501.88 |
+| Qwen2.5-0.5B control, rerun | **577.24** | **498.67** |
+
+The Qwen3 fresh package required no metadata override. Its `ort.bind_inputs` stayed approximately constant at 52.35/54.51 us per token for 128/1024, versus the old growing-path 1.093/6.938 ms per token, confirming the fast shared-buffer KV path is now the default for the corrected export. The Qwen2.5 control remained within normal run variance, so no regression was observed.
+
+**Why:** Canonical `grouped_query_attention` plus `kv_cache.native_dtype: float16` satisfies the runtime metadata gate and eliminates the severe context-length throughput collapse. The requested `bench,cuda` Cargo feature spelling is stale; the current benchmark builds with `--features cuda-ort`. CUDA ORT also required `.ort-cuda-1.27/root/lib` before the CPU-only ORT directory in `LD_LIBRARY_PATH`.
+<!-- source: .squad/decisions/inbox/kandel-sebastian-gap2-review.md -->
+### 2026-07-23: Review — Sebastian Native GAP 2 (generic native decode step inputs)
+
+**By:** Kandel (architecture/interface reviewer — read-only, reviewer independence enforced)
+
+**What:** 🟢 **APPROVE**
+
+Reviewed branch `squad/sebastian-native-gap2` @ `a7a2a5b` (vs `origin/main`):
+`native_decode.rs` (+653/-146), `native_component.rs` (+8), `pipeline.rs` (+14).
+
+GAP 2 replaces `NativeDecodeSession`'s fixed `input_ids`/`attention_mask`/`position_ids`
+fields with a `Vec<NativeStepInputBinding>` (`name` + `source` role) covering
+`TokenIds | InputsEmbeds | AttentionMask | PositionIds | Routed`. All non-KV graph
+ports are enumerated and each resolves to a declared generated role or falls back to
+`Routed` (resolved by exact port name from pipeline-supplied tensors).
+
+**Checklist results (file:line evidence):**
+
+1. **No hardcoded architecture (RULES §2/§2.1) — PASS.** `grep` for family names hits
+   ONLY test identifiers/paths (`native_decode.rs:3882,3888,4017`). Binding is driven by
+   `sequence_source` + `ModelIoSpec` declared roles and exact port names — no model-name
+   or dimension-value branch gates logic (`native_decode.rs:857-909`).
+2. **Token path + CUDA fast path unchanged — PASS.** `decode()` now delegates to
+   `decode_with_step_inputs(..., &[])` (`:2168`); `decode_host` reproduces the old
+   token/mask/position construction and single-token `with_decode_pool_scope` gating
+   verbatim (`:249-338`). CUDA still routes to `decode_cuda` unchanged (`:224-231`);
+   generic path is additive.
+3. **KV present→past publication preserved — PASS.** `decode_host` KV fill + `present_to_past`
+   republication + seq-axis length check are identical to the removed code (`:314-382`).
+4. **Correct generality — PASS.** Duplicate declared-role collision (`:127-131`),
+   missing sequence-source input (`:148-155`), duplicate routed input (`:264-266`),
+   missing embeds/routed tensor (`:286-303`), and unknown/undeclared supplied ports
+   (`:307-313`) all error explicitly. Nothing is silently dropped or mis-routed.
+5. **GAP 3 boundary — PASS.** CUDA + embeds/routed bails clearly at load (`:158-168`) and
+   at step (`:225-229`); `pipeline.rs` still returns the actionable GAP 3 error naming the
+   precise next blocker (`pipeline.rs:205-213`). ORT every-step executor generality in
+   `pipeline.rs` (~L1952-2027, 2145-2259) is untouched — diff only edits doc/error text.
+6. **Build/clippy/tests — PASS.** `cargo build -p onnx-genai-engine --features native-backend`
+   OK; `cargo clippy --all-targets -- -D warnings` clean; 3 new tests
+   (`native_target_step_preserves_token_driven_binding`,
+   `..._binds_declared_inputs_embeds_instead_of_tokens`,
+   `..._resolves_routed_component_output_by_declared_port`) pass. Suite: 165 passed / 16
+   failed — the 16 are the pre-existing protobuf-fixture decode failures (confirmed
+   identical 16 on `origin/main`: 162 passed / 16 failed). **Zero new failures.**
+
+**Why:** Clean, additive generalization that binds arbitrary metadata-declared named step
+inputs (embeddings, attention mask, position ids, exact-name routed tensors) while
+preserving the token-driven decode and CUDA shared-buffer fast path byte-for-byte. Error
+boundaries are strong and explicit at every mismatch, and the GAP 3 stop is a clear error
+rather than a silent wrong result. Correctly targets the Gemma4-E2B-class contract
+(inputs_embeds + per-layer routed inputs + mixed-width KV) without any architecture
+hardcoding.
+
+**Non-blocking notes (no action required):**
+- The target decoder's `attention_mask` moved from required (`declared_or_detected_input`)
+  to optional (`optional_declared_or_detected_input`, `:772`). This is an intentional
+  relaxation — a token graph that genuinely lacks a mask port now loads maskless instead
+  of erroring. Common models still auto-detect `attention_mask` and behave identically.
+- `decode_with_step_inputs` still requires non-empty `token_ids` even for embeds models
+  (used for length/position bookkeeping, `:215`). By design; caller supplies token count.
+
+No reviewer-lockout reassignment needed (APPROVE).
+<!-- source: .squad/decisions/inbox/marlowe-hythe-moe-merge.md -->
+### 2026-07-23: Hythe DeepSeek MoE Phase 1 landing
+**By:** Marlowe
+**What:** Fast-forward landed the onnx-genai portion on `main` at `751f06838b29dce6afadd7e61f63c066765f65a9`. The metadata test run passed: 29 unit/fixture tests, 1 schema-sync integration test, and 0 doc tests failed. Mobius PR #423 was not merged, so it has no merge SHA.
+**Why:** The onnx-genai commit rebased cleanly onto `origin/main` at `a7a2a5b`; no conflicts or manual file edits were required. Fast-forward ancestry was confirmed immediately before pushing.
+
+Mobius PR #423 remained `BLOCKED` with red CI despite being mergeable and current with `main` (0 commits behind), so no base update was needed. Passing checks included architecture diff, benchmarks, build, CodeQL, L1/L3, and all Linux/Windows Python test matrices. Blocking checks were:
+
+- `Lint`: Ruff formatting failure in `src/mobius/integrations/onnx_genai/decoder_metadata.py`.
+- `Integration (fast)`: collection error because `libcudart.so.13` was unavailable.
+- `L5 Generation E2E`: collection error because `libcudart.so.13` was unavailable.
+- `codecov/patch`: failed.
+- L4 Golden Comparison was still pending.
+
+Per the green-only merge rule, PR #423 remains open and unmerged.
+<!-- source: .squad/decisions/inbox/marlowe-sebastian-gap2-merge.md -->
+### 2026-07-23: Sebastian Native GAP 2 merged
+**By:** Marlowe
+**What:** Fast-forwarded origin/main to `a7a2a5b3247e032ed581dc4ef598171e83498019` after rebasing `squad/sebastian-native-gap2` onto origin/main.
+**Validation:** Build passed; clippy passed; tests passed with 228 passed, 0 failed, and 16 ignored. Sebastian's 3 native-backend GAP-2 tests passed. Zero new failures.
+**Conflicts:** None; the rebase completed cleanly.
+<!-- source: .squad/decisions/inbox/rutger-isidore-gqa-review.md -->
+### 2026-07-23: Review of isidore GQA-alias fix
+**By:** Rutger
+**Verdict:** 🟢
+**What:** PASS — no blocking or minor findings.
+- **Correctness — What:** Exact matching now recognizes every GQA spelling in `ATTENTION_TYPE` (`grouped_query`, `group_query_attention`, `grouped_query_attention`, `gqa`) plus the requested `group_query` short alias. **Why:** Case folding and single space/hyphen normalization preserve existing behavior without admitting MHA or unrelated attention types. **How:** Compared `decode.rs` with `schema.rs:1967-1983`; tests reject `multi_head_attention`, `mha`, and empty input.
+- **Model/architecture rules — What:** No model-name or hardcoded-architecture logic was added. **Why:** The gate remains driven solely by `model.attention.type`, KV dtype metadata, maximum sequence length, and session capability. **How:** Changed-line grep for Gemma/Qwen/Phi/Llama/Mistral was empty; the diff changes only the generic matcher and its unit test.
+- **Tests/build — What:** Alias, normalization, and negative cases are covered and validation is clean. **Why:** The focused test exercises both new aliases and representative case/space/hyphen forms. **How:** `cargo test -p onnx-genai-engine --lib is_group_query -- --nocapture` passed (1/1); `cargo clippy -p onnx-genai-engine --all-targets -- -D warnings` passed.
+**Why:** The patch is a narrow metadata-vocabulary compatibility fix that enables the existing shared-buffer/device-KV path for structurally declared GQA while leaving non-GQA models on their prior path.
+<!-- source: .squad/decisions/inbox/sebastian-native-gap2.md -->
+### 2026-07-23: Native target decode accepts generic metadata-driven step inputs
+**By:** Sebastian
+**What:** GAP 2 landed on branch `squad/sebastian-native-gap2` at commit `a7a2a5b`. Changed `crates/onnx-genai-engine/src/native_decode.rs`, `native_component.rs`, and `pipeline.rs`. `NativeDecodeSession` now stores a graph-ordered generic binding list whose sources are token IDs, input embeddings, attention mask, position IDs, or an exact-name routed tensor. `decode_with_step_inputs` generates declared runtime roles, resolves every other non-KV graph input from named routed tensors, and preserves present-to-past KV publication. Token-driven decode and its CUDA fast path remain unchanged; generic embedding/routed execution is CPU-native. Added focused tiny-graph tests for token binding preservation, embedding-driven target binding, and component-output-to-target routed binding. Updated the native pipeline error to identify GAP 3 only.
+**Why:** Embedding-driven target graphs can require multiple refreshed decoder inputs, so fixed architecture-specific fields cannot express their contract. Exact metadata role names plus pipeline dataflow destination ports provide an architecture-neutral binding seam without model-name or dimension branches. Validation: default and native builds passed; strict native clippy passed with `-D warnings`; default engine/metadata tests passed; focused new native tests passed; full native-feature tests reported the unchanged 165 passed / 16 unrelated fixture failures / 1 ignored. `cargo fmt -p onnx-genai-engine -p onnx-genai-metadata` completed. The changed-Rust model-name grep was empty. GAP 2 is complete; GAP 3 remains converting `DecodeState` and `PipelineDecodeLoopBackend` from ORT `Value`/`Session` ownership to backend-neutral tensors/component sessions.
+
 <!-- scribe-merge-2026-07-23T01-00-00Z-gap1-mla-qwen3-merges -->
 ## 2026-07-23 — Native GAP 1, MLA conformance, Qwen3 bench, and inbox reconciliation
 

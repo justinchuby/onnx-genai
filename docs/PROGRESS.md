@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T01:00Z — native GAP 1 backend-neutral pipeline interface, DeepSeek MLA head-dim-asymmetry conformance, Qwen3-0.6B bench + perf-metadata gap._
+_Last updated: 2026-07-23T06:05Z — Qwen3 fast-path fix, Native GAP 2, DeepSeek MoE Phase 1, and Llama model-generality bench._
 
-**Current `origin/main` implementation HEAD:** `e04fc2d` (after the 2026-07-23T01:00Z batch).
+**Current `origin/main` implementation HEAD:** `751f068` (after the 2026-07-23T06:05Z batch).
+
+## 2026-07-23 — Qwen3 fast-path fix, Native GAP 2, DeepSeek MoE Phase 1, and model generality
+
+- **Qwen3-0.6B perf gap fixed ✅ (`joi-14`):** fast KV-share is now the default for corrected exports. H200 ORT CUDA eager decode reached **441.96 tok/s** at 128 and **374.50 tok/s** at 1024; the Qwen2.5-0.5B control rerun was **577.24/498.67 tok/s**. Root cause was the `decode.rs` dual gate (`grouped_query` alias + missing `kv_cache.native_dtype`), fixed by Isidore (`0c7be31`) plus Mobius metadata emitters.
+- **Native GAP 2 merged ✅ (`a7a2a5b`, `sebastian-31`):** `NativeDecodeSession` now binds arbitrary metadata-declared named step inputs, including embeddings and routed tensors, with 3 focused CPU-native tests.
+- **DeepSeek MoE Phase 1 merged ✅ (`751f068`, `hythe-1`):** generic MoE inference metadata landed in `schema.rs`, `inference_metadata.schema.json`, `MOE_SUPPORT.md`, and `DESIGN.md`. Router metadata preserves bias-corrected selection separately from aggregation, including `noaux_tc` top-2-sum group scoring. Mobius conformance PR #423 remains open, blocked on CI infra (`libcudart.so.13` missing) and Ruff lint.
+- **Model generality validated 🔄 (`hassan-1`):** Llama-3.2-1B-Instruct Q4_K_M exports through Mobius with fast-path defaults and coherent output. Native/ORT decode at 128 was **97.26/589.66 tok/s**; native remains ~6x slower due to the unfused fp16 `lm_head` (`Transpose` + dense `MatMul` from dequantized Q6_K tied embedding). Generic EP fusion is in progress (`roy-79`).
 
 ## 2026-07-23 — Native GAP 1 + DeepSeek MLA conformance + Qwen3-0.6B bench
 
