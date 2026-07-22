@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T10:07Z — Phase 1 EP capture hook, Mobius VLM emission, and Gemma4 E2B export._
+_Last updated: 2026-07-22T14:05Z — WP-C VLM pipeline admission gate._
 
-**Current `origin/main` implementation HEAD:** `4b0a10d` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `f3fd686` (code before this docs update).
+
+## 2026-07-22 — WP-C VLM pipeline admission gate landed
+
+- **VLM pipeline admission gate ✅ (`f3fd686`, plus `b36af6c`/`96deea2`/`a72674d`):** `onnx-genai-ort` now rejects non-executable VLM pipelines at load time, before inference, via metadata-driven/model-architecture-agnostic checks (grep-validated: no hardcoded model names). Errors include the model file path plus explicit regeneration guidance (RULES §1). The v4 fix validates unnamed graph input/output ports against the retained raw protobuf (`onnx_std Model::to_proto()`) before the loader projection strips empty names (`graph_builder.rs:118-121,143-147`); mutation-proven regressions make exactly the two unnamed-port tests fail. `pipeline_admission.rs` (~872 lines) and 11 admission tests pass. Deckard independently approved 🟢. This unblocks Gemma4 VLM native E2E image-path work; audio-optional remains pending WP-B optional-modality contract.
 
 ## 2026-07-22 — EP capture hook, Mobius VLM emission, and Gemma4 E2B export
 
