@@ -1,7 +1,9 @@
 # First-Class Mixture-of-Experts Support
 
-**Status:** Research and design only. Every implementation phase in this document is
-**NOT YET IMPLEMENTED** unless explicitly described as current behavior.
+**Status:** Phase 1 in progress. Mobius implements a standard-operator dense reference
+fallback plus generic typed inference metadata and a synthetic DeepSeek-style
+correctness test. Fused `MoE`/`QMoE`, QMoE packing validation, grouped kernels, and
+expert streaming are **NOT YET IMPLEMENTED**.
 
 ## 1. Executive recommendation
 

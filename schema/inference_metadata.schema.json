@@ -1342,6 +1342,241 @@
       ],
       "type": "object"
     },
+    "MixtureOfExpertsSpec": {
+      "description": "Explicit sparse mixture-of-experts structure and graph representation.",
+      "properties": {
+        "activation": {
+          "description": "Expert FFN activation name, such as `silu`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "expert_intermediate_size": {
+          "description": "Intermediate width of each routed expert FFN.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "experts_per_token": {
+          "description": "Number of routed experts selected for each token.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "representation": {
+          "$ref": "#/$defs/MoERepresentation",
+          "description": "Expert graph representation: `dense_fallback`, `moe`, or `qmoe`."
+        },
+        "routed_expert_count": {
+          "description": "Number of independently routed experts.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "router": {
+          "$ref": "#/$defs/MoERouterSpec",
+          "description": "Router scoring, selection, normalization, and scaling semantics."
+        },
+        "shared_expert_count": {
+          "description": "Number of dense shared experts evaluated for every token.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shared_expert_intermediate_size": {
+          "description": "Total intermediate width of the always-on shared-expert FFN.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "representation",
+        "routed_expert_count",
+        "shared_expert_count",
+        "experts_per_token",
+        "expert_intermediate_size",
+        "shared_expert_intermediate_size",
+        "activation",
+        "router"
+      ],
+      "type": "object"
+    },
+    "MoEGroupScore": {
+      "description": "Group-scoring reduction vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "maximum",
+            "top_2_sum"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "maximum",
+              "top_2_sum"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERepresentation": {
+      "description": "Sparse expert graph representation vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "dense_fallback",
+            "moe",
+            "qmoe"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "dense_fallback",
+              "moe",
+              "qmoe"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERouterScoreFunction": {
+      "description": "Router score-operation vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "softmax",
+            "sigmoid"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "softmax",
+              "sigmoid"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERouterSelectionMethod": {
+      "description": "Router expert-selection vocabulary.",
+      "oneOf": [
+        {
+          "enum": [
+            "top_k",
+            "grouped_top_k",
+            "sparse_mixer"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "top_k",
+              "grouped_top_k",
+              "sparse_mixer"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "MoERouterSpec": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "selection_method": {
+                "const": "grouped_top_k"
+              }
+            },
+            "required": [
+              "selection_method"
+            ]
+          },
+          "then": {
+            "required": [
+              "group_count",
+              "groups_per_token",
+              "group_score"
+            ]
+          }
+        }
+      ],
+      "description": "Explicit router semantics, kept separate from expert FFN execution.",
+      "properties": {
+        "group_count": {
+          "description": "Number of expert groups considered by grouped selection.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "group_score": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MoEGroupScore"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Reduction used to score a group before group TopK."
+        },
+        "groups_per_token": {
+          "description": "Number of groups retained per token by grouped selection.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "normalize_weights": {
+          "description": "Whether selected aggregation weights are normalized to sum to one.",
+          "type": "boolean"
+        },
+        "scaling_factor": {
+          "description": "Multiplicative scale applied to final aggregation weights.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "score_function": {
+          "$ref": "#/$defs/MoERouterScoreFunction",
+          "description": "Elementwise score operation applied to router logits."
+        },
+        "selection_method": {
+          "$ref": "#/$defs/MoERouterSelectionMethod",
+          "description": "Expert selection operation applied to the scores."
+        }
+      },
+      "required": [
+        "score_function",
+        "selection_method",
+        "normalize_weights",
+        "scaling_factor"
+      ],
+      "type": "object"
+    },
     "ModelCapabilities": {
       "description": "Model properties that are baked into the graph or advertised as configurable.",
       "properties": {
@@ -1376,6 +1611,17 @@
             "integer",
             "null"
           ]
+        },
+        "mixture_of_experts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MixtureOfExpertsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit sparse mixture-of-experts graph and routing contract.\n\nThis describes graph structure, never a model family. Runtimes use the\ndeclared representation and dimensions instead of inferring them from\nnode names, initializer shapes, or architecture strings."
         },
         "runtime_configurable": {
           "anyOf": [

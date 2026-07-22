@@ -9427,8 +9427,9 @@ only top-k FFN experts per token, so the runtime must preserve sparse routing th
 export, kernels, batching, and memory placement.
 
 The detailed architecture, Colibrì research, integration map, and phased plan are in
-[`MOE_SUPPORT.md`](MOE_SUPPORT.md). All MoE-specific implementation described there
-is currently **NOT YET IMPLEMENTED**.
+[`MOE_SUPPORT.md`](MOE_SUPPORT.md). Phase 1 is in progress: Mobius has a standard-op
+dense reference export and emits a generic typed MoE metadata contract. Fused
+`MoE`/`QMoE`, packing validation, and grouped runtime kernels remain unimplemented.
 
 ### 43.1 Graph contract
 
@@ -9508,8 +9509,9 @@ residency, per-token expert launches, and opaque scheduler behavior.
 
 Delivery order:
 
-1. **Phase 1 — NOT YET IMPLEMENTED:** Mobius `MoE`/`QMoE` export plus dense fallback
-   and differential correctness tests.
+1. **Phase 1 — IN PROGRESS:** Mobius dense fallback, generic MoE metadata, and a
+   synthetic DeepSeek-style differential test are implemented. Fused `MoE`/`QMoE`
+   export, QMoE packing validation, and fused-vs-reference differential tests remain.
 2. **Phase 2 — NOT YET IMPLEMENTED:** CPU/CUDA grouped-expert kernels and bounded
    routing scratch.
 3. **Phase 3 — NOT YET IMPLEMENTED:** governor-controlled expert streaming,
