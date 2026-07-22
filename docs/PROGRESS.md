@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T07:45Z — DS-1 native dynamic shape-chain unblocked and validated._
+_Last updated: 2026-07-22T08:06Z — int4 zero-points, DS native E2E, VLM WP1, and decode roofline profiling._
 
-**Current `origin/main` implementation HEAD:** `00b6ad7` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `1b1f800` (code before this docs update).
+
+## 2026-07-22 — int4 zero-points, DS native E2E, VLM WP1, and decode roofline
+
+- **Native CUDA int4 zero-point fix (BLOCKER #3) ✅ (`48de993`):** Sapper fixed fp16 int4 MatMulNBits GEMV (`M==1` decode) to support explicit `zero_points` for asymmetric int4 models such as Phi-4-mini: per-block zp = `(b&1)?(byte>>4):(byte&0xF)`, null defaults to 8, and `w=(q-zp)*scale`. This unblocks native Phi-4-mini decode. (Holden 🟢)
+- **DeepSeek-V2 native CPU E2E full pass ✅:** Deckard confirmed the native backend (`ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu`) produces exact ORT-parity tokens `[42, 237, 198, 2, 186, 81, 210, 149]` on the DeepSeek-V2-tiny E2E test; no code change was needed.
+- **VLM WP1 runtime preprocessing ✅ (`6147713`, `42a8ca3`):** dynamic VLM image-preprocessing metadata now executes in the runtime, and the image-patch packer temporal-ordering bug is fixed (channels-first flattens C,T,H,W; channels-last flattens T,H,W,C), matching HF Qwen2VL. Companion Mobius emission is PR #416. (Leon 🟢)
+- **Decode roofline profiling ✅:** Gaff profiled Qwen2.5-0.5B native CUDA decode on H200: baseline **435 tok/s** with **49.2% GPU busy**, **50.8% CPU launch/dispatch gaps**, and 226 kernels/token, confirming decode is launch-bound rather than bandwidth-bound. Whole-step CUDA-graph capture (`ONNX_GENAI_CUDA_GRAPH=1`) is token-exact with zero fallbacks at **825 tok/s (+89.6%)**.
 
 ## 2026-07-22 — DS-1 native dynamic shape-chain validated
 
