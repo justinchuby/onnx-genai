@@ -16,7 +16,7 @@ use onnx_genai_engine::FimConfig;
 use crate::{
     audio_input::AudioInputSpec,
     driver::EngineDriver,
-    image_input::VisionInputSpec,
+    image_input::{VisionInputSpec, VisionOutputBinding, metadata_dtype},
     models_config::ModelSpec,
     registry::{EvictionPolicy, ModelHandle, ModelRegistry},
     session::SessionRegistry,
@@ -406,44 +406,78 @@ fn build_pipeline_handle(
 
     let models = PipelineModels::load(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to inspect pipeline models: {e}"))?;
-    let vision_inputs = models
-        .sessions
-        .iter()
-        .flat_map(|(component, session)| {
-            session.inputs().iter().filter_map(move |input| {
-                (input.name == "pixel_values")
-                    .then_some((format!("{component}.{}", input.name), input))
-            })
-        })
-        .collect::<Vec<_>>();
-    let vision_input = match vision_inputs.as_slice() {
-        [] => None,
-        [(endpoint, input)] => {
-            if input.dtype != DataType::Float32 {
-                anyhow::bail!(
-                    "vision input '{endpoint}' must be Float32, but the model declares {:?}",
-                    input.dtype
-                );
+    let vision_input = match directory
+        .preprocessing
+        .as_ref()
+        .and_then(|preprocessing| preprocessing.image.as_ref())
+    {
+        None => None,
+        Some(program) => {
+            let vision = directory.spec.vision.as_ref().context(
+                "What: typed image processor binding discovery failed. \
+                 Why: preprocessing.image is declared, but pipeline.vision has no placeholder expansion contract. \
+                 How: add typed pipeline.vision metadata before serving image chat requests.",
+            )?;
+            let mut bindings = Vec::new();
+            let mut pixel_shape = None;
+            let mut endpoints = std::collections::HashSet::new();
+            for output in &program.outputs {
+                let resolved = resolve_image_output(&models, &output.name)?;
+                let Some((endpoint, input)) = resolved else {
+                    if output.optional.unwrap_or(false) {
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "What: image processor endpoint '{}' is missing. \
+                         Why: preprocessing.image.outputs declares content '{}' dtype '{}' but no ONNX component input matches that metadata endpoint. \
+                         How: name the exact component.input endpoint or add the missing graph input operation.",
+                        output.name,
+                        output.content,
+                        output.dtype
+                    );
+                };
+                let declared_dtype = metadata_dtype(&output.dtype)?;
+                if input.dtype != declared_dtype {
+                    anyhow::bail!(
+                        "What: image processor endpoint '{endpoint}' has an incompatible dtype. \
+                         Why: typed metadata declares {:?}, but the ONNX input expects {:?} shape {:?}. \
+                         How: correct preprocessing.image.outputs '{}' dtype or the graph input type.",
+                        declared_dtype,
+                        input.dtype,
+                        input.shape,
+                        output.name
+                    );
+                }
+                if !endpoints.insert(endpoint.clone()) {
+                    anyhow::bail!(
+                        "What: image processor endpoint '{endpoint}' is bound more than once. \
+                         Why: multiple preprocessing.image.outputs resolve to the same ONNX input. \
+                         How: give every typed output a unique component.input endpoint."
+                    );
+                }
+                if output.content == "pixels" && pixel_shape.is_none() {
+                    pixel_shape = Some(input.shape.clone());
+                }
+                bindings.push(VisionOutputBinding {
+                    metadata_name: output.name.clone(),
+                    endpoint,
+                    content: output.content.clone(),
+                    dtype: declared_dtype,
+                    shape: input.shape.clone(),
+                });
             }
-            let spec = if let Some(metadata_path) = directory.metadata_path.as_deref() {
-                VisionInputSpec::from_input_and_metadata(
-                    endpoint.clone(),
-                    &input.shape,
-                    Some(metadata_path),
-                )?
-            } else {
-                let program = directory
-                    .preprocessing
-                    .as_ref()
-                    .and_then(|preprocessing| preprocessing.image.as_ref())
-                    .context(
-                        "compatibility pipeline has no executable typed image preprocessing program",
-                    )?;
-                VisionInputSpec::from_input_and_program(endpoint.clone(), &input.shape, program)?
-            };
-            Some(spec)
+            let pixel_shape = pixel_shape.context(
+                "What: image processor initialization failed. \
+                 Why: preprocessing.image.outputs has no resolved content='pixels' endpoint with an expected dtype/shape. \
+                 How: declare a pixels output bound to the pipeline's primary image tensor input.",
+            )?;
+            Some(VisionInputSpec::from_program(
+                bindings,
+                &pixel_shape,
+                program,
+                vision,
+            )?)
         }
-        _ => anyhow::bail!("pipeline declares multiple pixel_values inputs"),
     };
     let audio_inputs = models
         .sessions
@@ -487,4 +521,41 @@ fn build_pipeline_handle(
         vision_input,
         audio_input,
     ))
+}
+
+fn resolve_image_output<'a>(
+    models: &'a PipelineModels,
+    metadata_endpoint: &str,
+) -> anyhow::Result<Option<(String, &'a onnx_genai_ort::TensorInfo)>> {
+    if let Some((component, input_name)) = metadata_endpoint.split_once('.')
+        && let Some(session) = models.sessions.get(component)
+    {
+        return Ok(session
+            .inputs()
+            .iter()
+            .find(|input| input.name == input_name)
+            .map(|input| (metadata_endpoint.to_string(), input)));
+    }
+
+    let matches = models
+        .sessions
+        .iter()
+        .flat_map(|(component, session)| {
+            session
+                .inputs()
+                .iter()
+                .filter(move |input| input.name == metadata_endpoint)
+                .map(move |input| (format!("{component}.{}", input.name), input))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [(endpoint, input)] => Ok(Some((endpoint.clone(), *input))),
+        _ => anyhow::bail!(
+            "What: image processor endpoint '{metadata_endpoint}' is ambiguous. \
+             Why: {} ONNX component inputs share that unqualified name. \
+             How: use an exact component.input name in preprocessing.image.outputs.",
+            matches.len()
+        ),
+    }
 }

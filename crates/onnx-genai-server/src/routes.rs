@@ -25,7 +25,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{DriverEvent, EngineDriver, GenerateSubmitError, PipelineInputTensor},
+    driver::{
+        DriverEvent, EngineDriver, GenerateSubmitError, PipelineInputBundle, PipelineInputTensor,
+        PipelineTensor,
+    },
     registry::ModelHandle,
     session::SessionRegistry,
     sse::{
@@ -948,11 +951,14 @@ pub(crate) async fn audio_transcriptions(
             .engine
             .generate_pipeline(
                 request,
-                Some(PipelineInputTensor {
-                    endpoint: input.endpoint,
-                    data: input.data,
-                    shape: input.shape,
-                    num_tiles: None,
+                Some(PipelineInputBundle {
+                    tensors: vec![PipelineTensor::Fp32(PipelineInputTensor {
+                        endpoint: input.endpoint,
+                        data: input.data,
+                        shape: input.shape,
+                        num_tiles: None,
+                    })],
+                    image_summaries: Vec::new(),
                 }),
             )
             .await
@@ -1286,6 +1292,23 @@ async fn run_chat_completion(
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
     }
+    let pipeline_input = if !image_urls.is_empty() {
+        Some(
+            preprocess_chat_images(
+                &image_urls,
+                handle
+                    .vision_input
+                    .as_ref()
+                    .expect("vision input checked before generation"),
+                &mut prepared,
+            )
+            .await?,
+        )
+    } else if let Some(audio) = input_audio.first() {
+        Some(preprocess_chat_audio(audio, &handle)?)
+    } else {
+        None
+    };
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
@@ -1302,27 +1325,6 @@ async fn run_chat_completion(
 
     let session_for_count = session_lookup;
     let wants_json_object = request.wants_json_object();
-    let pipeline_input = if !image_urls.is_empty() {
-        let image = crate::image_input::load_and_preprocess(
-            &image_urls,
-            handle
-                .vision_input
-                .as_ref()
-                .expect("vision input checked before generation"),
-        )
-        .await
-        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?;
-        Some(PipelineInputTensor {
-            endpoint: image.endpoint,
-            data: image.data,
-            shape: image.shape,
-            num_tiles: Some(image.num_tiles),
-        })
-    } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &handle)?)
-    } else {
-        None
-    };
     let result = collect_generation_result(if handle.pipeline {
         handle
             .engine
@@ -1438,6 +1440,23 @@ async fn stream_chat_completion(
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(&request, &handle.tokenizer)?;
     }
+    let pipeline_input = if !image_urls.is_empty() {
+        Some(
+            preprocess_chat_images(
+                &image_urls,
+                handle
+                    .vision_input
+                    .as_ref()
+                    .expect("vision input checked before generation"),
+                &mut prepared,
+            )
+            .await?,
+        )
+    } else if let Some(audio) = input_audio.first() {
+        Some(preprocess_chat_audio(audio, &handle)?)
+    } else {
+        None
+    };
     enforce_context_cap(
         prepared.prompt_tokens,
         request.max_tokens,
@@ -1449,27 +1468,6 @@ async fn stream_chat_completion(
     let (tx, rx) = mpsc::channel(16);
     let session_lookup = if let Some(id) = client_session_id.as_deref() {
         Some(get_or_create_session(&handle.engine, &state.sessions, id).await?)
-    } else {
-        None
-    };
-    let pipeline_input = if !image_urls.is_empty() {
-        let image = crate::image_input::load_and_preprocess(
-            &image_urls,
-            handle
-                .vision_input
-                .as_ref()
-                .expect("vision input checked before generation"),
-        )
-        .await
-        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err}")))?;
-        Some(PipelineInputTensor {
-            endpoint: image.endpoint,
-            data: image.data,
-            shape: image.shape,
-            num_tiles: Some(image.num_tiles),
-        })
-    } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, &handle)?)
     } else {
         None
     };
@@ -1670,7 +1668,7 @@ pub(crate) async fn collect_generation_result(
 fn preprocess_chat_audio(
     input: &InputAudio,
     handle: &ModelHandle,
-) -> Result<PipelineInputTensor, ApiError> {
+) -> Result<PipelineInputBundle, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
     let spec = handle
@@ -1679,11 +1677,51 @@ fn preprocess_chat_audio(
         .expect("audio input checked before generation");
     let input = crate::audio_input::preprocess_wav(&bytes, spec)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
-    Ok(PipelineInputTensor {
-        endpoint: input.endpoint,
-        data: input.data,
-        shape: input.shape,
-        num_tiles: None,
+    Ok(PipelineInputBundle {
+        tensors: vec![PipelineTensor::Fp32(PipelineInputTensor {
+            endpoint: input.endpoint,
+            shape: input.shape,
+            data: input.data,
+            num_tiles: None,
+        })],
+        image_summaries: Vec::new(),
+    })
+}
+
+async fn preprocess_chat_images(
+    image_urls: &[String],
+    spec: &crate::image_input::VisionInputSpec,
+    prepared: &mut PreparedGenerateRequest,
+) -> Result<PipelineInputBundle, ApiError> {
+    let bundle = crate::image_input::load_and_preprocess(image_urls, spec)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
+    let token_ids = match &prepared.request.prompt {
+        GeneratePrompt::TokenIds(token_ids) => token_ids,
+        GeneratePrompt::Text(_) => {
+            return Err(ApiError::internal(
+                "What: image placeholder expansion received an untokenized prompt. Why: the server preprocessing order was violated. How: tokenize before preprocessing and expansion.",
+            ));
+        }
+    };
+    let expanded = spec
+        .expand_prompt(token_ids, &bundle)
+        .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
+    prepared.prompt_tokens = expanded.len();
+    prepared.request.prompt = GeneratePrompt::TokenIds(expanded);
+    Ok(PipelineInputBundle {
+        tensors: bundle
+            .tensors
+            .into_iter()
+            .map(|tensor| PipelineTensor::Typed {
+                endpoint: tensor.endpoint,
+                expected_dtype: tensor.expected_dtype,
+                expected_shape: tensor.expected_shape,
+                shape: tensor.shape,
+                data: tensor.data,
+            })
+            .collect(),
+        image_summaries: bundle.images,
     })
 }
 
@@ -1830,10 +1868,16 @@ fn enforce_context_cap(
     };
     let total = prompt_tokens
         .checked_add(max_tokens)
-        .ok_or_else(|| ApiError::bad_request("prompt_tokens + max_tokens overflowed"))?;
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "What: request admission length overflowed. Why: final prefill length plus max_tokens does not fit usize. How: reduce the prompt, image expansion size, or max_tokens.",
+            )
+        })?;
     if total > model_max_context {
         return Err(ApiError::bad_request(format!(
-            "prompt token count ({prompt_tokens}) plus max_tokens ({max_tokens}) exceeds model context limit ({model_max_context})"
+            "What: request admission exceeded the model context limit. \
+             Why: final prefill length ({prompt_tokens}) after placeholder expansion plus max_tokens ({max_tokens}) is {total}, above {model_max_context}. \
+             How: reduce the prompt, image count/expansion size, or max_tokens."
         )));
     }
     Ok(())
