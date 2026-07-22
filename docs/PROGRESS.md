@@ -6,7 +6,15 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 _Last updated: 2026-07-22T08:20Z — H200 multi-model decode roofline bench landed: **Qwen2.5-0.5B native decisively beats ORT GenAI** on the same int4 ONNX (815 vs 725 tok/s +12% @128; 783 vs 663 tok/s +18% @1024) but reaches only ~9% of the simplistic HBM roofline. Coverage seams surfaced: Qwen2.5-1.5B blocked on generic scalar batch-1 GQA `seqlens_k`; Phi-4-mini blocked on block-32 **int8** MatMulNBits (kernel is int4-only). In flight: generic int8 block-32 CUDA GEMV (unblocks Phi-4-mini), capture-safety aux-dim decline hardening (review), VLM WP5 (server bundle — re-review after revision), and VLM WP6 (genai_config compat loader — revision)._
 
-**Current `origin/main` implementation HEAD:** `791e276` (code); `ba86625` (docs).
+**Current `origin/main` implementation HEAD:** `8d9ba95` (code); `ba86625` (docs).
+
+## 2026-07-22 — int8 block-32 MatMulNBits CUDA merged
+
+- **Generic int8 block-32 GEMV ✅ (`8d9ba95`):** structural dispatch for `bits==8 && block_size==32`, M=1, no `g_idx` — no model-name branch — with capture-safe f32/f16 paths, default zp=128 plus explicit unpacked-u8 zero points, bits-aware f32 dequant, cuBLAS batched fallback, and CPU reference parity for bits=8 (≤5.72e-6). SM-portable reductions use `__shfl_down_sync` + shared memory, no arch-gated PTX. (Roy 🟡 → closed with fp16 default-zp parity + bit-exact fp16 capture replay tests; 21/21 H200 GPU parity tests pass.)
+
+## 2026-07-22 — VLM WP5 multimodal tensor bundle merged
+
+- **Metadata-driven multimodal image bundle ✅ (`166b572`):** server admission now preserves prompt-order placeholders, bounds-checks placeholder expansion, strips URLs/paths/query/token from actionable image-fetch errors (RULES §1), and validates thumbnail ordering against tensor layout. Rebased cleanly over Leon's WP6 image-preprocessing API. (Luv 🟢; public-route URL-leak regression covered.)
 
 ## 2026-07-22 — VLM WP6 strict-compat pipeline loader merged
 
