@@ -79,19 +79,53 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             )
         })
     }?;
+    // Admission must inspect the retained protobuf before scanning the execution
+    // projection: graph_builder.rs:118-121 and 143-147 intentionally omit empty
+    // GraphProto input/output names from the loaded IR.
+    let source_proto = model.to_proto().map_err(|error| {
+        component_inspection_error(
+            component,
+            path,
+            format!("the retained ONNX protobuf could not be inspected: {error}"),
+        )
+    })?;
+    let source_graph = source_proto.graph.as_ref().ok_or_else(|| {
+        component_inspection_error(
+            component,
+            path,
+            "the retained ONNX protobuf has no graph".to_string(),
+        )
+    })?;
+    if source_graph.input.iter().any(|input| input.name.is_empty()) {
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected component '{component}': an ONNX graph input is \
+             unnamed at model path '{}', so the pipeline cannot bind it. How to fix: \
+             regenerate the graph with explicit input names and a matching native sidecar",
+            path.display()
+        )));
+    }
+    if source_graph
+        .output
+        .iter()
+        .any(|output| output.name.is_empty())
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "package admission rejected component '{component}': an ONNX graph output is \
+             unnamed at model path '{}', so dataflow cannot reference it. How to fix: \
+             regenerate the graph with explicit output names and a matching native sidecar",
+            path.display()
+        )));
+    }
+
     let graph = &model.graph;
     let mut signature = ComponentSignature::default();
 
     for input in &graph.inputs {
         let value = graph.value(*input);
-        let name = value.name.clone().ok_or_else(|| {
-            OrtError::InvalidArgument(format!(
-                "package admission rejected component '{component}': an ONNX graph input is \
-                 unnamed at model path '{}', so the pipeline cannot bind it. How to fix: \
-                 regenerate the graph with explicit input names and a matching native sidecar",
-                path.display()
-            ))
-        })?;
+        let name = value
+            .name
+            .clone()
+            .expect("validated GraphProto input names survive loader projection");
         if graph.initializers.contains_key(input) {
             signature.defaulted_inputs.insert(name.clone());
         }
@@ -106,14 +140,10 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
 
     for output in &graph.outputs {
         let value = graph.value(*output);
-        let name = value.name.clone().ok_or_else(|| {
-            OrtError::InvalidArgument(format!(
-                "package admission rejected component '{component}': an ONNX graph output is \
-                 unnamed at model path '{}', so dataflow cannot reference it. How to fix: \
-                 regenerate the graph with explicit output names and a matching native sidecar",
-                path.display()
-            ))
-        })?;
+        let name = value
+            .name
+            .clone()
+            .expect("validated GraphProto output names survive loader projection");
         signature.outputs.insert(
             name,
             PortSignature {

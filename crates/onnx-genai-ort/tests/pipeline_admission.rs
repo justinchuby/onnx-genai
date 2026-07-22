@@ -102,17 +102,9 @@ fn write_model_with_unnamed_port(path: &Path, unnamed_port: UnnamedPort) -> Test
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 13);
     let shape = vec![1.into()];
-    let input = match unnamed_port {
-        UnnamedPort::Input => graph.create_value(DataType::Float32, shape.clone()),
-        UnnamedPort::Output => {
-            graph.create_named_value("input", DataType::Undefined, shape.clone())
-        }
-    };
+    let input = graph.create_named_value("input", DataType::Float32, shape.clone());
     graph.add_input(input);
-    let output = match unnamed_port {
-        UnnamedPort::Input => graph.create_named_value("output", DataType::Undefined, shape),
-        UnnamedPort::Output => graph.create_value(DataType::Float32, shape),
-    };
+    let output = graph.create_named_value("output", DataType::Float32, shape.clone());
     graph.insert_node(Node::new(
         NodeId(0),
         "Identity",
@@ -120,22 +112,40 @@ fn write_model_with_unnamed_port(path: &Path, unnamed_port: UnnamedPort) -> Test
         vec![output],
     ));
     graph.add_output(output);
+    match unnamed_port {
+        UnnamedPort::Input => {
+            let unnamed = graph.create_value(DataType::Float32, shape);
+            graph.add_input(unnamed);
+        }
+        UnnamedPort::Output => {
+            let unnamed = graph.create_value(DataType::Float32, shape);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(input)],
+                vec![unnamed],
+            ));
+            graph.add_output(unnamed);
+        }
+    }
 
     let model = Model::new(graph);
     let proto = model.to_proto()?;
     let proto_graph = proto.graph.as_ref().expect("model must contain a graph");
     match unnamed_port {
-        UnnamedPort::Input => assert_eq!(proto_graph.input[0].name, ""),
-        UnnamedPort::Output => assert_eq!(proto_graph.output[0].name, ""),
+        UnnamedPort::Input => assert!(proto_graph.input.iter().any(|input| input.name.is_empty())),
+        UnnamedPort::Output => assert!(
+            proto_graph
+                .output
+                .iter()
+                .any(|output| output.name.is_empty())
+        ),
     }
     onnx_std::save_model(&model, path)?;
     Ok(())
 }
 
-fn assert_unnamed_port_inspection_error_contains_path(
-    fixture_name: &str,
-    unnamed_port: UnnamedPort,
-) -> TestResult {
+fn assert_unnamed_port_rejection(fixture_name: &str, unnamed_port: UnnamedPort) -> TestResult {
     let fixture = FixtureDir::new(fixture_name)?;
     let model_path = fixture.0.join("component.onnx");
     write_model_with_unnamed_port(&model_path, unnamed_port)?;
@@ -157,13 +167,20 @@ pipeline:
 "#,
     )?;
 
-    // The protobuf loader currently drops empty-name graph ValueInfo entries
-    // before admission can reach the dedicated unnamed-port branch. Undefined
-    // type information on the named peer forces the closest reachable component
-    // inspection error while preserving a genuinely unnamed port in the ONNX.
     let error = rejection(&fixture.0);
+    let (cause, fix) = match unnamed_port {
+        UnnamedPort::Input => (
+            "an ONNX graph input is unnamed",
+            "regenerate the graph with explicit input names and a matching native sidecar",
+        ),
+        UnnamedPort::Output => (
+            "an ONNX graph output is unnamed",
+            "regenerate the graph with explicit output names and a matching native sidecar",
+        ),
+    };
+    assert!(error.contains(cause), "{error}");
     assert!(error.contains(&model_path.display().to_string()), "{error}");
-    assert!(error.contains("could not be loaded"), "{error}");
+    assert!(error.contains(fix), "{error}");
     Ok(())
 }
 
@@ -582,13 +599,13 @@ pipeline:
 }
 
 #[test]
-fn admission_unnamed_input_inspection_error_contains_model_path() -> TestResult {
-    assert_unnamed_port_inspection_error_contains_path("unnamed-input", UnnamedPort::Input)
+fn admission_rejects_unnamed_graph_input_from_retained_proto() -> TestResult {
+    assert_unnamed_port_rejection("unnamed-input", UnnamedPort::Input)
 }
 
 #[test]
-fn admission_unnamed_output_inspection_error_contains_model_path() -> TestResult {
-    assert_unnamed_port_inspection_error_contains_path("unnamed-output", UnnamedPort::Output)
+fn admission_rejects_unnamed_graph_output_from_retained_proto() -> TestResult {
+    assert_unnamed_port_rejection("unnamed-output", UnnamedPort::Output)
 }
 
 #[test]
