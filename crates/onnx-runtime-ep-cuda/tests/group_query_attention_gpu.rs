@@ -1748,6 +1748,96 @@ fn gqa_gpu_declared_unit_batch_scalar_matches_cpu_oracle_and_cuda_vector() {
 }
 
 #[test]
+fn gqa_gpu_batch_trailing_singleton_seqlens_matches_vector_for_any_batch() {
+    let Some(ep) = gpu() else { return };
+    for case in [
+        ParityCase {
+            name: "seqlens-batch1".into(),
+            dtype: DataType::Float32,
+            batch: 1,
+            heads: 4,
+            kv_heads: 2,
+            q_seq: 2,
+            k_seq: 2,
+            dim: 64,
+            past_capacity: 0,
+            capacity: 2,
+            totals: vec![2],
+            rope: false,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 1.0,
+            seed: 1201,
+        },
+        ParityCase {
+            name: "seqlens-batch2-ragged".into(),
+            dtype: DataType::Float32,
+            batch: 2,
+            heads: 4,
+            kv_heads: 2,
+            q_seq: 1,
+            k_seq: 1,
+            dim: 64,
+            past_capacity: 2,
+            capacity: 3,
+            totals: vec![2, 3],
+            rope: false,
+            local_window: -1,
+            softcap: 0.0,
+            magnitude: 1.0,
+            seed: 1211,
+        },
+    ] {
+        let (attrs, vector_inputs, output_shapes) = parity_fixture(&case);
+        let mut trailing_singleton_inputs = vector_inputs.clone();
+        trailing_singleton_inputs[5].as_mut().unwrap().shape = vec![case.batch, 1];
+
+        let vector = run_available(run(&ep, &attrs, &vector_inputs, &output_shapes)).unwrap();
+        let trailing_singleton =
+            run_available(run(&ep, &attrs, &trailing_singleton_inputs, &output_shapes)).unwrap();
+        assert_eq!(
+            trailing_singleton, vector,
+            "{} must treat [batch_size, 1] seqlens_k identically to [batch_size]",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn gqa_gpu_rejects_noncanonical_seqlens_singleton_shapes_actionably() {
+    let Some(ep) = gpu() else { return };
+    let case = ParityCase {
+        name: "seqlens-invalid-layouts".into(),
+        dtype: DataType::Float32,
+        batch: 2,
+        heads: 4,
+        kv_heads: 2,
+        q_seq: 1,
+        k_seq: 1,
+        dim: 64,
+        past_capacity: 0,
+        capacity: 1,
+        totals: vec![1, 1],
+        rope: false,
+        local_window: -1,
+        softcap: 0.0,
+        magnitude: 1.0,
+        seed: 1221,
+    };
+    let (attrs, inputs, output_shapes) = parity_fixture(&case);
+
+    for shape in [vec![1, case.batch], vec![case.batch, 1, 1]] {
+        let mut invalid_inputs = inputs.clone();
+        invalid_inputs[5].as_mut().unwrap().shape = shape.clone();
+        let error = run_available(run(&ep, &attrs, &invalid_inputs, &output_shapes))
+            .expect_err("noncanonical seqlens_k singleton shape must fail");
+        let message = format!("{error}");
+        assert!(message.contains("[batch_size] or [batch_size, 1]"));
+        assert!(message.contains(&format!("got shape {shape:?}")));
+    }
+}
+
+#[test]
 fn gqa_gpu_declared_scalar_still_rejects_multi_batch() {
     let Some(ep) = gpu_allow_unit_batch_scalar() else {
         return;
@@ -1775,7 +1865,7 @@ fn gqa_gpu_declared_scalar_still_rejects_multi_batch() {
     .expect_err("scalar cannot encode multiple batch rows");
     let message = format!("{error}");
     assert!(message.contains("cannot represent batch 2"));
-    assert!(message.contains("contiguous int32 [batch_size]"));
+    assert!(message.contains("contiguous int32 [batch_size] or [batch_size, 1]"));
 }
 
 #[test]
@@ -1821,7 +1911,7 @@ fn gqa_gpu_scalar_permission_preserves_dtype_layout_value_and_shape_validation()
     let error = run_available(run(&ep, &attrs(&[]), &non_one_element, &output_shapes))
         .expect_err("non-one-element alternate shape must fail");
     let message = format!("{error}");
-    assert!(message.contains("shape [1]"));
+    assert!(message.contains("[batch_size] or [batch_size, 1]"));
     assert!(message.contains("got shape [2]"));
 }
 
