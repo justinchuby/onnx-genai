@@ -222,6 +222,15 @@ pub struct SpeculatorConfig {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Explicit proposer graph execution contract.
+    ///
+    /// This uses the same architecture-neutral I/O vocabulary as a target
+    /// decoder. `sequence_source` selects token ids versus embeddings,
+    /// `kv_ownership` selects private past/present state versus references to
+    /// target-owned cache, and the output fields assign semantic roles.
+    #[serde(default)]
+    pub io: Option<ModelIoSpec>,
+
     /// Target backbone hidden size `H` shared with the proposer.
     ///
     /// For `shared_kv`, `inputs_embeds` is `[B, q, 2*H]` and
@@ -369,6 +378,22 @@ pub struct SharedKvGroup {
     /// Target KV layer indices whose cache feeds this shared-KV slice.
     #[serde(default)]
     pub target_layers: Vec<usize>,
+
+    /// Proposer input receiving this group's shared key cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_input: Option<String>,
+
+    /// Proposer input receiving this group's shared value cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_input: Option<String>,
+
+    /// Target decoder past-KV input whose current key cache is referenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_key_input: Option<String>,
+
+    /// Target decoder past-KV input whose current value cache is referenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_value_input: Option<String>,
 }
 
 fn default_num_speculative_tokens() -> usize {
@@ -463,8 +488,22 @@ pub struct ModelCapabilities {
 /// emitters populate this block). Declaring an `io` block lets a graph use
 /// arbitrary tensor names — the runtime never infers a port by name or dtype
 /// for a declared port.
-#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct ModelIoSpec {
+    /// Which declared sequence port drives autoregressive execution.
+    ///
+    /// Absent preserves the historical `token_ids` behavior. Declaring
+    /// `inputs_embeds` requires `inputs_embeds_input`; declaring `token_ids`
+    /// requires `token_input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_source: Option<SequenceInputKind>,
+
+    /// Whether this graph owns past/present KV state or reads target-owned KV.
+    ///
+    /// Absent preserves the historical `owned` behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_ownership: Option<KvOwnership>,
+
     /// Token-id input (e.g. `input_ids`).
     ///
     /// A graph MAY declare this together with `inputs_embeds_input`: some fused
@@ -557,6 +596,27 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub state_pairs: Option<Vec<LoopStatePair>>,
+}
+
+/// Primary autoregressive sequence source for a decoder or proposer graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceInputKind {
+    /// Integer token ids supplied through `token_input`.
+    TokenIds,
+    /// Precomputed floating-point embeddings supplied through
+    /// `inputs_embeds_input`.
+    InputsEmbeds,
+}
+
+/// Ownership model for a graph's KV cache inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KvOwnership {
+    /// The graph consumes past KV and emits replacement/extended present KV.
+    Owned,
+    /// The graph reads references to KV owned and advanced by another decoder.
+    Shared,
 }
 
 /// One fixed-shape loop-carried recurrent-state port pair.

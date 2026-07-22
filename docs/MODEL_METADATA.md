@@ -163,6 +163,61 @@ single value across a multi-row or ragged batch; batch sizes greater than one
 still require the canonical `[batch_size]` representation. Omitting the field
 keeps strict canonical validation.
 
+## Native decoder and proposer execution contracts
+
+`model.io` (target decoder) and `speculative.io` (standalone proposer) use the
+same explicit, model-agnostic contract:
+
+- `sequence_source`: `token_ids` or `inputs_embeds`.
+- `token_input` / `inputs_embeds_input`: exact graph port selected by
+  `sequence_source`.
+- `kv_ownership`: `owned` when the graph carries positional
+  `kv_inputs`/`kv_outputs`, or `shared` when it references target-owned cache.
+- `logits_output`: output carrying token scores.
+- `hidden_output`: output carrying a hidden/projected recurrent state.
+
+Absent `sequence_source` and `kv_ownership` preserve the historical target and
+ordinary draft-model defaults: `token_ids` plus `owned` KV. A shared-KV
+proposer should declare all axes explicitly:
+
+```yaml
+model:
+  io:
+    sequence_source: token_ids
+    kv_ownership: owned
+    token_input: input_ids
+    attention_mask_input: attention_mask
+    position_ids_input: position_ids
+    logits_output: logits
+    hidden_output: target_hidden
+    kv_inputs: [past.0.key, past.0.value]
+    kv_outputs: [present.0.key, present.0.value]
+
+speculative:
+  proposal_type: shared_kv
+  model: assistant/model.onnx
+  io:
+    sequence_source: inputs_embeds
+    kv_ownership: shared
+    inputs_embeds_input: proposer_embeddings
+    attention_mask_input: proposer_mask
+    position_ids_input: proposer_positions
+    logits_output: draft_logits
+    hidden_output: projected_state
+  shared_kv:
+    - name: attention_group
+      key_input: assistant_cache.key
+      value_input: assistant_cache.value
+      target_key_input: past.0.key
+      target_value_input: past.0.value
+```
+
+Shared-KV port names are data. The runtime does not derive them from a model
+family, hidden size, or tensor-name convention. Native CPU execution supplies
+the target decoder's carried cache tensors to the proposer step; native CUDA
+device-buffer aliasing is a separate capability and fails with an actionable
+error rather than falling back to ORT.
+
 ## Colocation Groups
 
 Nodes with the same `onnx_runtime.group` value are treated as a colocation set.

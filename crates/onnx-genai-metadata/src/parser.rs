@@ -46,6 +46,8 @@ pub struct SharedKvProposerSpec {
     pub input_embedding: PathBuf,
     /// Shared-KV binding groups consumed by the assistant.
     pub shared_kv: Vec<SharedKvGroup>,
+    /// Fully resolved proposer execution contract.
+    pub io: crate::schema::ModelIoSpec,
 }
 
 /// Resolved Mobius MTP sidecar descriptor.
@@ -79,7 +81,7 @@ pub struct MtpProposerSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeculatorProposerStatus {
     /// A fully resolved shared-KV proposer.
-    SharedKv(SharedKvProposerSpec),
+    SharedKv(Box<SharedKvProposerSpec>),
     /// A fully resolved Mobius MTP sidecar.
     Mtp(MtpProposerSpec),
     NotYetSupported(SpeculatorProposerKind),
@@ -203,14 +205,9 @@ pub fn resolve_speculator_config(
 /// `target_layers` — degrade to [`SpeculatorProposerStatus::Unknown`] so a
 /// malformed descriptor never aborts model loading; the engine treats such
 /// descriptors as absent.
-fn resolve_shared_kv(
-    model_dir: &Path,
-    config: &SpeculatorConfig,
-) -> SpeculatorProposerStatus {
+fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorProposerStatus {
     let Some(model) = config.model.as_ref() else {
-        return SpeculatorProposerStatus::Unknown(
-            "shared_kv metadata is missing `model`".into(),
-        );
+        return SpeculatorProposerStatus::Unknown("shared_kv metadata is missing `model`".into());
     };
     let Some(backbone_hidden_size) = config.backbone_hidden_size else {
         return SpeculatorProposerStatus::Unknown(
@@ -244,7 +241,66 @@ fn resolve_shared_kv(
             group.name
         ));
     }
-    SpeculatorProposerStatus::SharedKv(SharedKvProposerSpec {
+    let io = config
+        .io
+        .clone()
+        .unwrap_or_else(|| crate::schema::ModelIoSpec {
+            sequence_source: Some(crate::schema::SequenceInputKind::InputsEmbeds),
+            kv_ownership: Some(crate::schema::KvOwnership::Shared),
+            token_input: None,
+            inputs_embeds_input: Some("inputs_embeds".into()),
+            attention_mask_input: Some("attention_mask".into()),
+            position_ids_input: Some("position_ids".into()),
+            logits_output: Some(
+                config
+                    .logits_output
+                    .clone()
+                    .unwrap_or_else(|| "logits".into()),
+            ),
+            hidden_output: Some(
+                config
+                    .projected_state_output
+                    .clone()
+                    .unwrap_or_else(|| "projected_state".into()),
+            ),
+            kv_inputs: None,
+            kv_outputs: None,
+            encoder_hidden_states_input: None,
+            cross_kv_inputs: None,
+            cross_kv_outputs: None,
+            kv_update: None,
+            state_pairs: None,
+        });
+    if io
+        .sequence_source
+        .unwrap_or(crate::schema::SequenceInputKind::TokenIds)
+        != crate::schema::SequenceInputKind::InputsEmbeds
+    {
+        return SpeculatorProposerStatus::Unknown(
+            "shared_kv metadata `io.sequence_source` must be `inputs_embeds`".into(),
+        );
+    }
+    if io.kv_ownership.unwrap_or(crate::schema::KvOwnership::Owned)
+        != crate::schema::KvOwnership::Shared
+    {
+        return SpeculatorProposerStatus::Unknown(
+            "shared_kv metadata `io.kv_ownership` must be `shared`".into(),
+        );
+    }
+    if io.inputs_embeds_input.as_deref().is_none_or(str::is_empty) {
+        return SpeculatorProposerStatus::Unknown(
+            "shared_kv metadata is missing `io.inputs_embeds_input`".into(),
+        );
+    }
+    if io.logits_output.as_deref().is_none_or(str::is_empty)
+        && io.hidden_output.as_deref().is_none_or(str::is_empty)
+    {
+        return SpeculatorProposerStatus::Unknown(
+            "shared_kv metadata must declare at least one output role: `io.logits_output` or `io.hidden_output`"
+                .into(),
+        );
+    }
+    SpeculatorProposerStatus::SharedKv(Box::new(SharedKvProposerSpec {
         model: model_dir.join(model),
         num_speculative_tokens: config.num_speculative_tokens,
         backbone_hidden_size,
@@ -259,7 +315,8 @@ fn resolve_shared_kv(
             .unwrap_or_else(|| "logits".to_string()),
         input_embedding: model_dir.join(input_embedding),
         shared_kv: config.shared_kv.clone(),
-    })
+        io,
+    }))
 }
 
 /// Load inference metadata from a file (YAML or JSON based on extension).
@@ -420,8 +477,7 @@ speculative:
       target_layers: [0]
 "
             );
-            let metadata: InferenceMetadata =
-                serde_yaml::from_str(&yaml).expect("metadata parses");
+            let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("metadata parses");
             let config = metadata.speculative.expect("speculative section present");
             assert!(
                 matches!(config.proposal_type, ProposalType::Unknown(_)),
@@ -473,6 +529,77 @@ speculative:
         );
         assert_eq!(spec.num_speculative_tokens, 4);
         assert_eq!(spec.shared_kv.len(), 1);
+        assert_eq!(
+            spec.io.sequence_source,
+            Some(crate::schema::SequenceInputKind::InputsEmbeds)
+        );
+        assert_eq!(
+            spec.io.kv_ownership,
+            Some(crate::schema::KvOwnership::Shared)
+        );
+        assert_eq!(
+            spec.io.inputs_embeds_input.as_deref(),
+            Some("inputs_embeds")
+        );
+        assert_eq!(spec.io.logits_output.as_deref(), Some("logits"));
+        assert_eq!(spec.io.hidden_output.as_deref(), Some("projected_state"));
+    }
+
+    #[test]
+    fn shared_kv_explicit_execution_contract_and_ports_are_preserved() {
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            "\
+speculative:
+  proposal_type: shared_kv
+  model: proposer.onnx
+  backbone_hidden_size: 6
+  vocab_size: 10
+  input_embedding: embedding.f32
+  io:
+    sequence_source: inputs_embeds
+    kv_ownership: shared
+    inputs_embeds_input: proposer_embeddings
+    logits_output: draft_scores
+    hidden_output: recurrent_projection
+  shared_kv:
+    - name: local
+      target_layers: [0]
+      key_input: proposer_cache_key
+      value_input: proposer_cache_value
+      target_key_input: target_cache_key
+      target_value_input: target_cache_value
+",
+        )
+        .expect("explicit proposer metadata parses");
+        let descriptor = SpeculatorDescriptor::from_config(
+            Path::new("/models/explicit"),
+            metadata.speculative.expect("speculative section"),
+            SpeculatorConfigSource::InferenceMetadata,
+        );
+        let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
+            panic!("expected shared-KV proposer");
+        };
+        assert_eq!(
+            spec.io.sequence_source,
+            Some(crate::schema::SequenceInputKind::InputsEmbeds)
+        );
+        assert_eq!(
+            spec.io.kv_ownership,
+            Some(crate::schema::KvOwnership::Shared)
+        );
+        assert_eq!(
+            spec.io.inputs_embeds_input.as_deref(),
+            Some("proposer_embeddings")
+        );
+        assert_eq!(spec.io.logits_output.as_deref(), Some("draft_scores"));
+        assert_eq!(
+            spec.io.hidden_output.as_deref(),
+            Some("recurrent_projection")
+        );
+        assert_eq!(
+            spec.shared_kv[0].target_key_input.as_deref(),
+            Some("target_cache_key")
+        );
     }
 
     #[test]

@@ -326,6 +326,9 @@ pub struct Engine {
     /// by the server's fallback driver in this first milestone.
     #[cfg(feature = "native-backend")]
     native_session: Option<crate::native_decode::NativeDecodeSession>,
+    /// Native shared-KV proposer loaded from the same metadata contract.
+    #[cfg(feature = "native-backend")]
+    native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
     /// Optional draft model used by the speculative decoding path.
     pub(crate) draft: Option<DraftModel>,
     /// Optional MTP head and target-side projections.
@@ -392,6 +395,14 @@ pub(crate) struct SharedKvProposerModel {
     /// half of each draft step's `inputs_embeds`.
     pub(crate) embedder: LinearEmbedder,
     pub(crate) num_speculative_tokens: usize,
+}
+
+#[cfg(feature = "native-backend")]
+pub(crate) struct NativeSharedKvProposerModel {
+    pub(crate) session: crate::native_decode::NativeProposerSession,
+    pub(crate) embedder: LinearEmbedder,
+    pub(crate) groups: Vec<onnx_genai_metadata::SharedKvGroup>,
+    pub(crate) hidden_size: usize,
 }
 
 impl Engine {
@@ -924,6 +935,8 @@ impl Engine {
             session: Some(Box::new(session)),
             #[cfg(feature = "native-backend")]
             native_session: None,
+            #[cfg(feature = "native-backend")]
+            native_shared_kv_proposer: None,
             draft,
             mtp,
             eagle3,
@@ -1011,8 +1024,11 @@ impl Engine {
                 native_device,
                 governor.weight_offload_host_cache(),
                 gqa_sequence_lengths_policy,
+                metadata.model.as_ref().and_then(|model| model.io.as_ref()),
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
+        let (native_shared_kv_proposer, speculative_mode) =
+            load_native_shared_kv_proposer(&metadata, &model_directory.root, native_device)?;
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
 
@@ -1029,6 +1045,7 @@ impl Engine {
             sessions: HashMap::new(),
             session: None,
             native_session: Some(native_session),
+            native_shared_kv_proposer,
             draft: None,
             mtp: None,
             eagle3: None,
@@ -1036,7 +1053,7 @@ impl Engine {
             tokenizer,
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
-            speculative_mode: SpeculativeMode::None,
+            speculative_mode,
             last_speculative_stats: SpeculativeStats::default(),
             connector,
             _environment: environment,
@@ -1057,10 +1074,13 @@ impl Engine {
     #[cfg(feature = "native-backend")]
     fn generate_native_with_callback(
         &mut self,
-        request: GenerateRequest,
+        mut request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
+        if request.options.speculative_mode.is_none() && self.native_shared_kv_proposer.is_some() {
+            request.options.speculative_mode = Some(self.speculative_mode.clone());
+        }
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
@@ -1083,12 +1103,29 @@ impl Engine {
                 .native_session
                 .as_mut()
                 .context("native decoder session is unavailable")?;
-            let mut driver = crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
-                native_session,
-                plan.ngram,
-                plan.max_tokens,
-                plan.width,
-            )?;
+            let mut driver = match plan.kind {
+                NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
+                    crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
+                        native_session,
+                        ngram,
+                        max_tokens,
+                        plan.width,
+                    )?
+                }
+                NativeSpeculationKind::SharedKv => {
+                    let proposer = self.native_shared_kv_proposer.as_mut().context(
+                        "native shared-KV speculation requested without a loaded proposer session",
+                    )?;
+                    crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
+                        native_session,
+                        &mut proposer.session,
+                        &proposer.embedder,
+                        &proposer.groups,
+                        proposer.hidden_size,
+                        plan.width,
+                    )?
+                }
+            };
             let result = augment_backend_error(
                 driver.generate(
                     &prompt_tokens,
@@ -2383,7 +2420,7 @@ pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result
         })?;
         let model = onnx_runtime_loader::proto::ModelProto::decode(bytes.as_slice())
             .context("Failed to parse ONNX model while selecting decoder backend")?;
-        return Ok(model_proto_requires_native_backend(&model));
+        Ok(model_proto_requires_native_backend(&model))
     }
     #[cfg(not(feature = "native-backend"))]
     {
@@ -2420,7 +2457,7 @@ fn reject_native_request_speculation(options: &GenerateOptions) -> anyhow::Resul
         Some(SpeculativeMode::DraftModel) => Some("draft-model"),
         Some(SpeculativeMode::Mtp(_)) => Some("MTP"),
         Some(SpeculativeMode::Eagle3(_)) => Some("EAGLE-3"),
-        Some(SpeculativeMode::SharedKv(_)) => Some("shared-KV"),
+        Some(SpeculativeMode::SharedKv(_)) => None,
     };
     if let Some(mode) = unsupported {
         anyhow::bail!(
@@ -2432,7 +2469,7 @@ fn reject_native_request_speculation(options: &GenerateOptions) -> anyhow::Resul
     if options.num_speculative_tokens.is_some()
         && !matches!(
             options.speculative_mode.as_ref(),
-            Some(SpeculativeMode::PromptLookup { .. })
+            Some(SpeculativeMode::PromptLookup { .. } | SpeculativeMode::SharedKv(_))
         )
     {
         anyhow::bail!(
@@ -2445,9 +2482,15 @@ fn reject_native_request_speculation(options: &GenerateOptions) -> anyhow::Resul
 /// Prompt-lookup speculation parameters resolved for a native request.
 #[cfg(feature = "native-backend")]
 struct NativeSpeculationPlan {
-    ngram: usize,
-    max_tokens: usize,
+    kind: NativeSpeculationKind,
     width: usize,
+}
+
+#[cfg(feature = "native-backend")]
+#[derive(Clone, Copy)]
+enum NativeSpeculationKind {
+    PromptLookup { ngram: usize, max_tokens: usize },
+    SharedKv,
 }
 
 /// Decide whether a native request should run through the speculative driver.
@@ -2462,20 +2505,32 @@ fn native_speculation_plan(
     options: &GenerateOptions,
     chain: &crate::logits::ProcessorChain,
 ) -> Option<NativeSpeculationPlan> {
-    let (ngram, max_tokens) = match options.speculative_mode.as_ref()? {
-        SpeculativeMode::PromptLookup { ngram, max_tokens } => (*ngram, *max_tokens),
+    let (kind, default_width) = match options.speculative_mode.as_ref()? {
+        SpeculativeMode::PromptLookup { ngram, max_tokens } => (
+            NativeSpeculationKind::PromptLookup {
+                ngram: *ngram,
+                max_tokens: *max_tokens,
+            },
+            *max_tokens,
+        ),
+        SpeculativeMode::SharedKv(config) => (
+            NativeSpeculationKind::SharedKv,
+            config.num_speculative_tokens.saturating_add(1),
+        ),
         _ => return None,
     };
     let greedy = options.greedy || options.temperature == 0.0;
     if !greedy || !chain.is_empty() || options.top_logprobs.is_some() {
         return None;
     }
-    let width = options.num_speculative_tokens.unwrap_or(max_tokens).max(1);
-    Some(NativeSpeculationPlan {
-        ngram,
-        max_tokens,
-        width,
-    })
+    let width = options
+        .num_speculative_tokens
+        .map(|value| {
+            value.saturating_add(usize::from(matches!(kind, NativeSpeculationKind::SharedKv)))
+        })
+        .unwrap_or(default_width)
+        .max(1);
+    Some(NativeSpeculationPlan { kind, width })
 }
 
 fn default_inference_metadata() -> InferenceMetadata {
@@ -2675,6 +2730,95 @@ fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
         .collect())
+}
+
+#[cfg(feature = "native-backend")]
+fn load_native_shared_kv_proposer(
+    metadata: &InferenceMetadata,
+    model_dir: &Path,
+    device: crate::native_decode::NativeDecodeDevice,
+) -> anyhow::Result<(Option<NativeSharedKvProposerModel>, SpeculativeMode)> {
+    let Some(config) = metadata.speculative.as_ref() else {
+        return Ok((None, SpeculativeMode::None));
+    };
+    if config.proposal_type != ProposalType::SharedKv {
+        return Ok((None, SpeculativeMode::None));
+    }
+    if config.io.is_none() {
+        tracing::warn!(
+            "shared-KV proposer metadata has no explicit speculative.io execution contract; native target decode remains available, but the proposer stays disabled until sequence_source, kv_ownership, and output roles are declared"
+        );
+        return Ok((None, SpeculativeMode::None));
+    }
+    let descriptor = onnx_genai_metadata::resolve_speculator_config(model_dir, config.clone());
+    let spec = match descriptor.proposer {
+        SpeculatorProposerStatus::SharedKv(spec) => spec,
+        SpeculatorProposerStatus::Unknown(reason) => {
+            anyhow::bail!("invalid native shared-KV proposer metadata: {reason}")
+        }
+        other => {
+            anyhow::bail!("shared-KV metadata resolved to unexpected proposer status {other:?}")
+        }
+    };
+    let target_hidden_output = metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref())
+            .and_then(|io| io.hidden_output.clone())
+            .context(
+                "native shared-KV speculation requires model.io.hidden_output to name the target decoder hidden-state output; add the exact graph output name to inference metadata",
+            )?;
+    for group in &spec.shared_kv {
+        for (field, value) in [
+            ("key_input", group.key_input.as_deref()),
+            ("value_input", group.value_input.as_deref()),
+            ("target_key_input", group.target_key_input.as_deref()),
+            ("target_value_input", group.target_value_input.as_deref()),
+        ] {
+            if value.is_none_or(str::is_empty) {
+                anyhow::bail!(
+                    "native shared-KV group '{}' is missing `{field}`; declare exact proposer and target KV port names so the runtime never infers cache roles from model or tensor names",
+                    group.name
+                );
+            }
+        }
+    }
+    let weights = read_f32_weights(&spec.input_embedding)?;
+    let embedder = LinearEmbedder::new(weights, spec.vocab_size, spec.backbone_hidden_size)
+        .context("build native shared-KV target embedding lookup")?;
+    let session =
+        crate::native_decode::NativeProposerSession::load(&spec.model, device, Some(&spec.io))
+            .with_context(|| {
+                format!(
+                    "load native shared-KV proposer graph '{}'",
+                    spec.model.display()
+                )
+            })?;
+    let mode = SpeculativeMode::SharedKv(SharedKvProposerConfig {
+        assistant_model: spec.model,
+        target_hidden_output,
+        input_embedding_weights: spec.input_embedding,
+        backbone_hidden_size: spec.backbone_hidden_size,
+        vocab_size: spec.vocab_size,
+        num_speculative_tokens: spec.num_speculative_tokens,
+        shared_kv: spec
+            .shared_kv
+            .iter()
+            .map(|group| SharedKvBinding {
+                name: group.name.clone(),
+                target_layers: group.target_layers.clone(),
+            })
+            .collect(),
+    });
+    Ok((
+        Some(NativeSharedKvProposerModel {
+            session,
+            embedder,
+            groups: spec.shared_kv,
+            hidden_size: spec.backbone_hidden_size,
+        }),
+        mode,
+    ))
 }
 
 /// Resolve a native MTP runtime configuration from the already-loaded metadata.
@@ -2967,8 +3111,10 @@ mod tests {
         );
         std::fs::remove_file(&with_control_flow).ok();
 
-        let plain =
-            write_scan_model_with_weights(&[("", "MatMul"), ("", "GroupQueryAttention")], weight_floats);
+        let plain = write_scan_model_with_weights(
+            &[("", "MatMul"), ("", "GroupQueryAttention")],
+            weight_floats,
+        );
         assert!(
             !model_has_control_flow_nodes(&plain),
             "a large inline-weight model without control flow must remain capture-eligible"

@@ -2930,6 +2930,7 @@ mod tests {
             head_dim: Some(64),
             sliding_window: None,
             sink_tokens: None,
+            key_sequence_lengths: None,
             fallback_behavior: None,
         }
     }

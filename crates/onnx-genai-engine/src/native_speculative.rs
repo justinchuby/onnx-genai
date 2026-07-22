@@ -32,11 +32,12 @@ use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, finish_result, reached_context_limit,
 };
 use crate::logits::{ProcessorChain, TokenId};
-use crate::native_decode::NativeDecodeSession;
+use crate::native_decode::{NativeDecodeSession, NativeProposerSession};
 use crate::processors::ensure_constrained_finish;
 use crate::sampling::sample_greedy;
 use crate::speculative::{
-    NgramProposer, SpeculativeProposer, SpeculativeProposerContext, SpeculativeStats,
+    LinearEmbedder, NgramProposer, SpeculativeProposer, SpeculativeProposerContext,
+    SpeculativeStats, TokenEmbedder, argmax,
 };
 use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
@@ -48,9 +49,19 @@ use onnx_genai_ort::Tokenizer;
 /// backend contract is one token per step.
 pub(crate) struct NativeSpeculativeDriver<'a> {
     session: &'a mut NativeDecodeSession,
-    proposer: NgramProposer,
+    proposer: NativeProposer<'a>,
     /// Maximum draft width proposed per verify pass.
     draft_width: usize,
+}
+
+enum NativeProposer<'a> {
+    PromptLookup(NgramProposer),
+    SharedKv {
+        session: &'a mut NativeProposerSession,
+        embedder: &'a LinearEmbedder,
+        groups: &'a [onnx_genai_metadata::SharedKvGroup],
+        hidden_size: usize,
+    },
 }
 
 impl<'a> NativeSpeculativeDriver<'a> {
@@ -63,7 +74,34 @@ impl<'a> NativeSpeculativeDriver<'a> {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             session,
-            proposer: NgramProposer::new(ngram, max_tokens)?,
+            proposer: NativeProposer::PromptLookup(NgramProposer::new(ngram, max_tokens)?),
+            draft_width: draft_width.max(1),
+        })
+    }
+
+    pub(crate) fn new_shared_kv(
+        session: &'a mut NativeDecodeSession,
+        proposer_session: &'a mut NativeProposerSession,
+        embedder: &'a LinearEmbedder,
+        groups: &'a [onnx_genai_metadata::SharedKvGroup],
+        hidden_size: usize,
+        draft_width: usize,
+    ) -> anyhow::Result<Self> {
+        if hidden_size == 0 || embedder.hidden_size() != hidden_size {
+            anyhow::bail!(
+                "native shared-KV proposer hidden size {hidden_size} does not match embedding width {}",
+                embedder.hidden_size()
+            );
+        }
+        proposer_session.reset();
+        Ok(Self {
+            session,
+            proposer: NativeProposer::SharedKv {
+                session: proposer_session,
+                embedder,
+                groups,
+                hidden_size,
+            },
             draft_width: draft_width.max(1),
         })
     }
@@ -146,20 +184,83 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 .copied()
                 .chain(state.generated_tokens.iter().copied())
                 .collect();
-            let proposer_context = SpeculativeProposerContext {
-                width,
-                context_tokens: &context_tokens,
-                generated_tokens: &state.generated_tokens,
-                generated_text: &state.generated_text,
-                first_step: state.step,
-                options,
-                chain,
-                target_hidden: None,
-                target_hidden_layers: None,
-                guaranteed_token: None,
-                shared_kv_slices: None,
+            let mut draft = match &mut self.proposer {
+                NativeProposer::PromptLookup(proposer) => {
+                    let proposer_context = SpeculativeProposerContext {
+                        width,
+                        context_tokens: &context_tokens,
+                        generated_tokens: &state.generated_tokens,
+                        generated_text: &state.generated_text,
+                        first_step: state.step,
+                        options,
+                        chain,
+                        target_hidden: None,
+                        target_hidden_layers: None,
+                        guaranteed_token: None,
+                        shared_kv_slices: None,
+                    };
+                    proposer.propose(&proposer_context)?.tokens
+                }
+                NativeProposer::SharedKv {
+                    session: proposer,
+                    embedder,
+                    groups,
+                    hidden_size,
+                } => {
+                    let target_hidden = self.session.last_hidden().with_context(|| {
+                        "native shared-KV proposer requires the target decoder's declared io.hidden_output; the target forward produced no hidden state"
+                    })?;
+                    if target_hidden.len() != *hidden_size {
+                        anyhow::bail!(
+                            "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix model.io.hidden_output or speculative.backbone_hidden_size",
+                            target_hidden.len(),
+                            hidden_size
+                        );
+                    }
+                    let guaranteed = TokenId::try_from(
+                        argmax(&base_logits).context("native target logits were empty")?,
+                    )
+                    .context("native target token id exceeds u32 range")?;
+                    let shared_inputs = self.session.shared_kv_inputs(groups)?;
+                    let seed = *context_tokens
+                        .last()
+                        .context("native shared-KV proposer requires at least one context token")?;
+                    let mut hidden = target_hidden.to_vec();
+                    let mut token = seed;
+                    let mut embeddings = vec![0.0; hidden_size.saturating_mul(2)];
+                    let mut tokens = Vec::with_capacity(width);
+                    tokens.push(guaranteed);
+                    let position = context_tokens.len().saturating_sub(1);
+                    for step in 0..width {
+                        embedder.embed(token, &mut embeddings[..*hidden_size])?;
+                        embeddings[*hidden_size..].copy_from_slice(&hidden);
+                        let output =
+                            proposer.step_inputs_embeds(&embeddings, position, &shared_inputs)?;
+                        hidden = output.projected_state.with_context(|| {
+                            "native shared-KV proposer metadata must assign io.hidden_output to its projected recurrent state"
+                        })?;
+                        let logits = output.logits.with_context(
+                            || "native shared-KV proposer metadata must assign io.logits_output",
+                        )?;
+                        let drafted = TokenId::try_from(
+                            argmax(
+                                logits
+                                    .last()
+                                    .context("native shared-KV proposer emitted no logits rows")?,
+                            )
+                            .context("native shared-KV proposer logits row was empty")?,
+                        )
+                        .context("native shared-KV proposer token id exceeds u32 range")?;
+                        if step == 0 {
+                            token = guaranteed;
+                        } else {
+                            tokens.push(drafted);
+                            token = drafted;
+                        }
+                    }
+                    tokens
+                }
             };
-            let mut draft = self.proposer.propose(&proposer_context)?.tokens;
             draft.truncate(width);
 
             if draft.is_empty() {

@@ -1172,6 +1172,21 @@
         }
       }
     },
+    "KvOwnership": {
+      "description": "Ownership model for a graph's KV cache inputs.",
+      "oneOf": [
+        {
+          "description": "The graph consumes past KV and emits replacement/extended present KV.",
+          "type": "string",
+          "const": "owned"
+        },
+        {
+          "description": "The graph reads references to KV owned and advanced by another decoder.",
+          "type": "string",
+          "const": "shared"
+        }
+      ]
+    },
     "KvQuantTolerance": {
       "description": "Precision tolerance for key and value cache components.",
       "type": "object",
@@ -1436,6 +1451,17 @@
             "minLength": 1
           }
         },
+        "kv_ownership": {
+          "description": "Whether this graph owns past/present KV state or reads target-owned KV.\n\nAbsent preserves the historical `owned` behavior.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvOwnership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "kv_update": {
           "description": "How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.\n\nThis declares GROWING/append versus fixed shared-buffer cache semantics\nexplicitly, and is deliberately kept separate from `state_pairs` (which\ndescribes fixed recurrent tensors that are wholly REPLACED). The KV pair\nlists are the authoritative sparse layer ports: the runtime binds exactly\nthe ports named in `kv_inputs`/`kv_outputs` and never expands them from a\ntotal layer count. Absent means the historical growing-cache default.",
           "anyOf": [
@@ -1462,6 +1488,17 @@
             "null"
           ],
           "minLength": 1
+        },
+        "sequence_source": {
+          "description": "Which declared sequence port drives autoregressive execution.\n\nAbsent preserves the historical `token_ids` behavior. Declaring\n`inputs_embeds` requires `inputs_embeds_input`; declaring `token_ids`\nrequires `token_input`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceInputKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "state_pairs": {
           "description": "Fixed-shape loop-carried recurrent state ports, distinct from KV cache.\n\nEach pair binds an input port to its matching output port and declares\nhow the input is initialized and how the output feeds the next step\n(`replace` semantics for fixed recurrent tensors). These are neither KV\ncache nor fixed conditioning; the sparse set of state ports comes from\nthis declared list, never expanded from a layer count.",
@@ -2629,6 +2666,21 @@
         "kind"
       ]
     },
+    "SequenceInputKind": {
+      "description": "Primary autoregressive sequence source for a decoder or proposer graph.",
+      "oneOf": [
+        {
+          "description": "Integer token ids supplied through `token_input`.",
+          "type": "string",
+          "const": "token_ids"
+        },
+        {
+          "description": "Precomputed floating-point embeddings supplied through\n`inputs_embeds_input`.",
+          "type": "string",
+          "const": "inputs_embeds"
+        }
+      ]
+    },
     "SequenceLengthScalarBroadcast": {
       "description": "Permitted scalar compatibility for attention key-sequence lengths.",
       "oneOf": [
@@ -2643,9 +2695,23 @@
       "description": "One shared-KV binding group for a shared-KV proposer.\n\nA `shared_kv` proposer graph exposes `shared_kv.<name>.key` and\n`shared_kv.<name>.value` inputs bound to slices of the target model's paged\nKV cache. `target_layers` lists the target KV layer indices feeding this\nslice.",
       "type": "object",
       "properties": {
+        "key_input": {
+          "description": "Proposer input receiving this group's shared key cache.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "description": "Assistant input prefix, e.g. `sliding_attention` or `full_attention`.",
           "type": "string"
+        },
+        "target_key_input": {
+          "description": "Target decoder past-KV input whose current key cache is referenced.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "target_layers": {
           "description": "Target KV layer indices whose cache feeds this shared-KV slice.",
@@ -2656,6 +2722,20 @@
             "format": "uint",
             "minimum": 0
           }
+        },
+        "target_value_input": {
+          "description": "Target decoder past-KV input whose current value cache is referenced.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value_input": {
+          "description": "Proposer input receiving this group's shared value cache.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2799,6 +2879,17 @@
             "null"
           ],
           "default": null
+        },
+        "io": {
+          "description": "Explicit proposer graph execution contract.\n\nThis uses the same architecture-neutral I/O vocabulary as a target\ndecoder. `sequence_source` selects token ids versus embeddings,\n`kv_ownership` selects private past/present state versus references to\ntarget-owned cache, and the output fields assign semantic roles.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "kv_mode": {
           "description": "Lifetime of the sidecar's KV state.\n\nDefaults to `proposal_local`.",
