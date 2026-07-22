@@ -127,6 +127,13 @@ impl CpuBackend {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline]
 pub fn has_simd_x86() -> bool {
+    #[cfg(test)]
+    if matches!(
+        std::env::var("ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86").as_deref(),
+        Ok("1")
+    ) {
+        return false;
+    }
     std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 }
 
