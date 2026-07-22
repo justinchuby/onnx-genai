@@ -1985,6 +1985,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
+ "onnx-runtime-loader",
  "onnx-std",
  "serde",
  "serde_json",

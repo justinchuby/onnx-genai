@@ -2,16 +2,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{
-    PipelineSpec, PipelineStrategy, PipelineStrategyKind, PreprocessingSpec,
+    PipelineSpec, PipelineStrategy, PipelineStrategyKind, PreprocessingSpec, TensorDimension,
 };
-use onnx_std::ir::{DataType, Dim, SymbolId};
+use onnx_runtime_loader::proto::onnx::{ValueInfoProto, tensor_shape_proto, type_proto};
+use onnx_std::ir::{DataType, Dim};
 
 use crate::{OrtError, Result};
 
 #[derive(Debug, Clone)]
 struct PortSignature {
     dtype: DataType,
-    shape: Vec<Dim>,
+    shape: Vec<PortDimension>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PortDimension {
+    Static(usize),
+    Dynamic,
 }
 
 impl PortSignature {
@@ -34,6 +41,7 @@ pub(crate) fn validate_pipeline_admission(
 ) -> Result<()> {
     let signatures = inspect_component_signatures(model_paths)?;
     validate_edges(spec, &signatures)?;
+    validate_optional_inputs(spec, &signatures)?;
 
     let preprocessed_inputs = validate_image_program(spec, preprocessing, &signatures)?;
     validate_input_closure(spec, &signatures, &preprocessed_inputs)
@@ -117,29 +125,25 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         )));
     }
 
-    let graph = &model.graph;
     let mut signature = ComponentSignature::default();
+    let initializer_names = source_graph
+        .initializer
+        .iter()
+        .map(|initializer| initializer.name.as_str())
+        .collect::<BTreeSet<_>>();
 
-    for input in &graph.inputs {
-        let value = graph.value(*input);
-        let name = value
-            .name
-            .clone()
-            .expect("validated GraphProto input names survive loader projection");
-        if graph.initializers.contains_key(input) {
+    for input in &source_graph.input {
+        let name = input.name.clone();
+        if initializer_names.contains(name.as_str()) {
             signature.defaulted_inputs.insert(name.clone());
         }
-        signature.inputs.insert(
-            name,
-            PortSignature {
-                dtype: value.dtype,
-                shape: value.shape.clone(),
-            },
-        );
+        signature
+            .inputs
+            .insert(name, raw_input_signature(component, path, input)?);
     }
 
-    for output in &graph.outputs {
-        let value = graph.value(*output);
+    for output in &model.graph.outputs {
+        let value = model.graph.value(*output);
         let name = value
             .name
             .clone()
@@ -148,12 +152,131 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
             name,
             PortSignature {
                 dtype: value.dtype,
-                shape: value.shape.clone(),
+                shape: value
+                    .shape
+                    .iter()
+                    .map(|dimension| match dimension {
+                        Dim::Static(value) => PortDimension::Static(*value),
+                        Dim::Symbolic(_) => PortDimension::Dynamic,
+                    })
+                    .collect(),
             },
         );
     }
 
     Ok(signature)
+}
+
+fn raw_input_signature(
+    component: &str,
+    path: &Path,
+    input: &ValueInfoProto,
+) -> Result<PortSignature> {
+    let tensor = input
+        .r#type
+        .as_ref()
+        .and_then(|input_type| input_type.value.as_ref())
+        .and_then(|input_type| match input_type {
+            type_proto::Value::TensorType(tensor) => Some(tensor),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            component_inspection_error(
+                component,
+                path,
+                format!(
+                    "ONNX graph input '{}' does not declare a tensor type",
+                    input.name
+                ),
+            )
+        })?;
+    let dtype = DataType::from_onnx(tensor.elem_type).ok_or_else(|| {
+        component_inspection_error(
+            component,
+            path,
+            format!(
+                "ONNX graph input '{}' declares unsupported tensor dtype {}",
+                input.name, tensor.elem_type
+            ),
+        )
+    })?;
+    let shape = tensor
+        .shape
+        .as_ref()
+        .map(|shape| {
+            shape
+                .dim
+                .iter()
+                .map(|dimension| match dimension.value.as_ref() {
+                    Some(tensor_shape_proto::dimension::Value::DimValue(value)) if *value >= 0 => {
+                        PortDimension::Static(*value as usize)
+                    }
+                    _ => PortDimension::Dynamic,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PortSignature { dtype, shape })
+}
+
+fn validate_optional_inputs(
+    spec: &PipelineSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for (component, model) in &spec.models {
+        let Some(io) = model.io.as_ref() else {
+            continue;
+        };
+        let signature = signatures
+            .get(component)
+            .expect("inspected declared component");
+        for (port, optional) in &io.optional_inputs {
+            let endpoint = format!("{component}.{port}");
+            let input = signature.inputs.get(port).ok_or_else(|| {
+                admission_error(
+                    &endpoint,
+                    format!(
+                        "optional input '{endpoint}' is not an ONNX graph input of component '{component}'"
+                    ),
+                    "regenerate the native sidecar so optional_inputs names a retained ONNX GraphProto input"
+                        .to_string(),
+                )
+            })?;
+            if optional.absent.shape.len() != input.rank() {
+                return Err(admission_error(
+                    &endpoint,
+                    format!(
+                        "optional zero fallback rank {} does not match ONNX graph input rank {}",
+                        optional.absent.shape.len(),
+                        input.rank()
+                    ),
+                    format!(
+                        "regenerate the native sidecar so optional_inputs.{port}.absent.shape has {} dimensions",
+                        input.rank()
+                    ),
+                ));
+            }
+            for (index, (fallback, required)) in
+                optional.absent.shape.iter().zip(&input.shape).enumerate()
+            {
+                if let (TensorDimension::Fixed(actual), PortDimension::Static(expected)) =
+                    (fallback, required)
+                    && usize::try_from(*actual).ok() != Some(*expected)
+                {
+                    return Err(admission_error(
+                        &endpoint,
+                        format!(
+                            "optional zero fallback dimension {index} is {actual}, but the ONNX graph input requires static dimension {expected}"
+                        ),
+                        format!(
+                            "regenerate the native sidecar so optional_inputs.{port}.absent.shape matches the retained ONNX graph input"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_edges(
@@ -415,6 +538,15 @@ fn validate_input_closure(
     let generated = generated_inputs(spec, &decoders);
 
     for (component, signature) in signatures {
+        let component_presence = spec
+            .phases
+            .get(component)
+            .and_then(|phase| phase.when_present.as_deref());
+        let optional_inputs = spec
+            .models
+            .get(component)
+            .and_then(|model| model.io.as_ref())
+            .map(|io| &io.optional_inputs);
         let explicit_decoder_contract = decoders.contains(component)
             && spec
                 .models
@@ -430,9 +562,11 @@ fn validate_input_closure(
             let defaulted = signature.defaulted_inputs.contains(port);
             let generated_or_stateful = generated.contains(&endpoint);
             let preprocessed = preprocessed_inputs.contains(&endpoint);
+            let optional = optional_inputs.and_then(|inputs| inputs.get(port));
             // Requests may bind any component.port. Without an explicit decoder I/O contract,
             // absence of another source is not proof that the port is unbound, so fail open.
-            let external = !explicit_decoder_contract
+            // A declared optional input is also an explicit request-time source contract.
+            let external = (!explicit_decoder_contract || optional.is_some())
                 && incoming_edges == 0
                 && !defaulted
                 && !generated_or_stateful
@@ -462,6 +596,31 @@ fn validate_input_closure(
                         "regenerate the native sidecar so {endpoint} is fed by exactly one external, generated, stateful, default, or dataflow source"
                     ),
                 ));
+            }
+
+            for edge in spec.dataflow.iter().filter(|edge| edge.to == endpoint) {
+                let (producer, _) = parse_endpoint(&edge.from)?;
+                let producer_presence = spec
+                    .phases
+                    .get(producer)
+                    .and_then(|phase| phase.when_present.as_deref());
+                let absent_branch_closed = producer_presence.is_none_or(|presence| {
+                    component_presence == Some(presence)
+                        || optional.is_some_and(|optional| optional.presence == presence)
+                });
+                if !absent_branch_closed {
+                    let presence = producer_presence.expect("checked gated producer");
+                    return Err(admission_error(
+                        &endpoint,
+                        format!(
+                            "dataflow source '{}' is unavailable when presence key '{presence}' is absent, but required destination '{endpoint}' has no matching fallback or component gate",
+                            edge.from
+                        ),
+                        format!(
+                            "declare optional_inputs.{port} with presence '{presence}', gate component '{component}' with the same key, or provide an always-available source"
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -563,7 +722,7 @@ fn collect_synthetic_outputs<'a>(
                     (decoder, "output_ids"),
                     PortSignature {
                         dtype: DataType::Int64,
-                        shape: vec![Dim::Static(1), Dim::Symbolic(SymbolId(u32::MAX))],
+                        shape: vec![PortDimension::Static(1), PortDimension::Dynamic],
                     },
                 );
             }
@@ -575,9 +734,9 @@ fn collect_synthetic_outputs<'a>(
                     PortSignature {
                         dtype: DataType::Int64,
                         shape: vec![
-                            Dim::Static(1),
-                            Dim::Symbolic(SymbolId(u32::MAX)),
-                            Dim::Symbolic(SymbolId(u32::MAX - 1)),
+                            PortDimension::Static(1),
+                            PortDimension::Dynamic,
+                            PortDimension::Dynamic,
                         ],
                     },
                 );

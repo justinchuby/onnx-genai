@@ -45,6 +45,7 @@ onnx-genai-genai-config = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
+onnx-runtime-loader = { workspace = true }
 onnx-std = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
