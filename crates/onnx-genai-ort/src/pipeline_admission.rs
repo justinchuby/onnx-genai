@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{
-    PipelineSpec, PipelineStrategy, PipelineStrategyKind, PreprocessingSpec,
+    OptionalInputSpec, PipelineSpec, PipelineStrategy, PipelineStrategyKind, PreprocessingSpec,
+    TensorDimension,
 };
 use onnx_std::ir::{DataType, Dim, SymbolId};
 
@@ -33,10 +34,113 @@ pub(crate) fn validate_pipeline_admission(
     model_paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let signatures = inspect_component_signatures(model_paths)?;
+    validate_optional_inputs(spec, &signatures)?;
     validate_edges(spec, &signatures)?;
 
     let preprocessed_inputs = validate_image_program(spec, preprocessing, &signatures)?;
     validate_input_closure(spec, &signatures, &preprocessed_inputs)
+}
+
+fn validate_optional_inputs(
+    spec: &PipelineSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for (component, model) in &spec.models {
+        let Some(io) = model.io.as_ref() else {
+            continue;
+        };
+        let signature = signatures
+            .get(component)
+            .expect("inspected declared component");
+        for (port, optional) in &io.optional_inputs {
+            let endpoint = format!("{component}.{port}");
+            let input = signature.inputs.get(port).ok_or_else(|| {
+                admission_error(
+                    &endpoint,
+                    format!(
+                        "optional input '{endpoint}' is not an ONNX graph input of component '{component}'"
+                    ),
+                    format!(
+                        "regenerate the native sidecar so optional_inputs names a real input of component '{component}'"
+                    ),
+                )
+            })?;
+            if optional.presence.is_empty() {
+                return Err(admission_error(
+                    &endpoint,
+                    "optional input presence key must be a non-empty string".to_string(),
+                    "regenerate the native sidecar with a non-empty opaque presence key"
+                        .to_string(),
+                ));
+            }
+            validate_fallback_shape(&endpoint, optional, input)?;
+        }
+    }
+
+    for (component, phase) in &spec.phases {
+        if phase.when_present.as_ref().is_some_and(String::is_empty) {
+            return Err(admission_error(
+                component,
+                "component phase presence key must be a non-empty string".to_string(),
+                "regenerate the native sidecar with a non-empty opaque presence key".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fallback_shape(
+    endpoint: &str,
+    optional: &OptionalInputSpec,
+    input: &PortSignature,
+) -> Result<()> {
+    if optional.absent.shape.len() != input.rank() {
+        return Err(admission_error(
+            endpoint,
+            format!(
+                "optional zero fallback has rank {}, but the ONNX graph input has rank {}",
+                optional.absent.shape.len(),
+                input.rank()
+            ),
+            "regenerate the native sidecar with a fallback shape whose rank matches the graph input"
+                .to_string(),
+        ));
+    }
+
+    for (axis, (declared, graph)) in optional.absent.shape.iter().zip(&input.shape).enumerate() {
+        match (declared, graph) {
+            (TensorDimension::Fixed(value), _) if *value < 0 => {
+                return Err(admission_error(
+                    endpoint,
+                    format!("optional zero fallback dimension {axis} is negative ({value})"),
+                    "regenerate the native sidecar with non-negative fallback dimensions"
+                        .to_string(),
+                ));
+            }
+            (TensorDimension::Fixed(value), Dim::Static(graph_value))
+                if usize::try_from(*value).ok() != Some(*graph_value) =>
+            {
+                return Err(admission_error(
+                    endpoint,
+                    format!(
+                        "optional zero fallback dimension {axis} is {value}, but the ONNX graph input requires static dimension {graph_value}"
+                    ),
+                    "regenerate the native sidecar with fallback static dimensions that match the graph input"
+                        .to_string(),
+                ));
+            }
+            (TensorDimension::Symbol(symbol), _) if symbol.is_empty() => {
+                return Err(admission_error(
+                    endpoint,
+                    format!("optional zero fallback dimension {axis} has an empty runtime symbol"),
+                    "regenerate the native sidecar with a non-empty runtime shape symbol"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn inspect_component_signatures(
@@ -426,18 +530,21 @@ fn validate_input_closure(
                 .dataflow
                 .iter()
                 .filter(|edge| edge.to == endpoint)
-                .count();
+                .collect::<Vec<_>>();
             let defaulted = signature.defaulted_inputs.contains(port);
             let generated_or_stateful = generated.contains(&endpoint);
             let preprocessed = preprocessed_inputs.contains(&endpoint);
+            let optional = optional_input(spec, component, port);
             // Requests may bind any component.port. Without an explicit decoder I/O contract,
             // absence of another source is not proof that the port is unbound, so fail open.
-            let external = !explicit_decoder_contract
-                && incoming_edges == 0
+            // A declared optional input also explicitly permits a request binding on its
+            // present branch, even when the component has a decoder I/O contract.
+            let external = (optional.is_some() || !explicit_decoder_contract)
+                && incoming_edges.is_empty()
                 && !defaulted
                 && !generated_or_stateful
                 && !preprocessed;
-            let binding_count = incoming_edges
+            let binding_count = incoming_edges.len()
                 + usize::from(defaulted)
                 + usize::from(generated_or_stateful)
                 + usize::from(preprocessed)
@@ -456,16 +563,61 @@ fn validate_input_closure(
             if binding_count > 1 {
                 return Err(admission_error(
                     &endpoint,
-                    "required ONNX graph input has multiple binding sources, so execution would be ambiguous"
+                    "ONNX graph input has multiple normal binding sources, so its present branch would be ambiguous"
                         .to_string(),
                     format!(
                         "regenerate the native sidecar so {endpoint} is fed by exactly one external, generated, stateful, default, or dataflow source"
                     ),
                 ));
             }
+
+            let source_presence = incoming_edges.first().and_then(|edge| {
+                let (source_component, _) =
+                    parse_endpoint(&edge.from).expect("validated dataflow endpoint");
+                component_presence(spec, source_component)
+            });
+            if let Some(source_presence) = source_presence {
+                let destination_presence = component_presence(spec, component);
+                let optional_presence = optional.map(|optional| optional.presence.as_str());
+                if destination_presence != Some(source_presence)
+                    && optional_presence != Some(source_presence)
+                {
+                    let branch = if optional.is_some() {
+                        "present"
+                    } else {
+                        "required"
+                    };
+                    return Err(admission_error(
+                        &endpoint,
+                        format!(
+                            "{branch} branch is not closed: its only dataflow producer is skipped when presence key '{source_presence}' is absent"
+                        ),
+                        format!(
+                            "gate component '{component}' with the same presence key, declare {endpoint} optional with that key, or provide an always-active source"
+                        ),
+                    ));
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn optional_input<'a>(
+    spec: &'a PipelineSpec,
+    component: &str,
+    port: &str,
+) -> Option<&'a OptionalInputSpec> {
+    spec.models
+        .get(component)
+        .and_then(|model| model.io.as_ref())
+        .and_then(|io| io.optional_inputs.get(port))
+}
+
+fn component_presence<'a>(spec: &'a PipelineSpec, component: &str) -> Option<&'a str> {
+    spec.phases
+        .get(component)
+        .and_then(|phase| phase.when_present.as_deref())
 }
 
 fn generated_inputs(spec: &PipelineSpec, decoders: &BTreeSet<String>) -> BTreeSet<String> {

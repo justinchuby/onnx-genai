@@ -98,6 +98,46 @@ fn write_identity_model(
     Ok(())
 }
 
+fn write_single_node_model(
+    path: &Path,
+    input: Port<'_>,
+    output: Port<'_>,
+    op_type: &str,
+) -> TestResult {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let input_shape = input
+        .shape
+        .into_iter()
+        .map(|dim| match dim {
+            ShapeDim::Dynamic(name) => graph.intern_symbol(name).into(),
+            ShapeDim::Static(value) => value.into(),
+        })
+        .collect();
+    let input_id = graph.create_named_value(input.name, input.dtype, input_shape);
+    graph.add_input(input_id);
+    let output_shape = output
+        .shape
+        .into_iter()
+        .map(|dim| match dim {
+            ShapeDim::Dynamic(name) => graph.intern_symbol(name).into(),
+            ShapeDim::Static(value) => value.into(),
+        })
+        .collect();
+    let output_id = graph.create_named_value(output.name, output.dtype, output_shape);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        op_type,
+        vec![Some(input_id)],
+        vec![output_id],
+    ));
+    graph.add_output(output_id);
+    let model = Model::new(graph);
+    model.to_proto()?;
+    onnx_std::save_model(&model, path)?;
+    Ok(())
+}
+
 fn write_model_with_unnamed_port(path: &Path, unnamed_port: UnnamedPort) -> TestResult {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 13);
@@ -681,5 +721,360 @@ pipeline:
     assert!(error.contains("vision_encoder.pixel_values"), "{error}");
     assert!(error.contains("cannot be constructed"), "{error}");
     assert!(error.contains("preprocessing.image"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn admission_accepts_optional_external_input_with_zero_length_fallback() -> TestResult {
+    let fixture = FixtureDir::new("optional-image-only")?;
+    write_identity_model(
+        &fixture.0.join("embedding.onnx"),
+        vec![Port {
+            name: "audio_features",
+            dtype: DataType::Float16,
+            shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(8)],
+        }],
+        vec![("inputs_embeds", "audio_features")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    embedding:
+      filename: embedding.onnx
+      type: encoder
+      io:
+        optional_inputs:
+          audio_features:
+            presence: audio
+            absent:
+              kind: zeros
+              shape: [0, 8]
+  dataflow: []
+  strategy:
+    kind: single_pass
+    model: embedding
+  phases:
+    embedding:
+      run_on: prompt_only
+"#,
+    )?;
+
+    let directory = PipelineModelDirectory::load(&fixture.0)?;
+    let optional = &directory.spec.models["embedding"]
+        .io
+        .as_ref()
+        .expect("I/O contract")
+        .optional_inputs["audio_features"];
+    assert_eq!(optional.presence, "audio");
+    Ok(())
+}
+
+#[test]
+fn admission_accepts_present_branch_external_rank_two_input() -> TestResult {
+    let fixture = FixtureDir::new("optional-present-external")?;
+    write_identity_model(
+        &fixture.0.join("embedding.onnx"),
+        vec![Port {
+            name: "request_features",
+            dtype: DataType::Float32,
+            shape: vec![ShapeDim::Dynamic("request_tokens"), ShapeDim::Static(16)],
+        }],
+        vec![("output", "request_features")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    embedding:
+      filename: embedding.onnx
+      type: encoder
+      io:
+        optional_inputs:
+          request_features:
+            presence: features
+            absent:
+              kind: zeros
+              shape: [request_tokens, 16]
+  dataflow: []
+  strategy:
+    kind: single_pass
+    model: embedding
+  phases:
+    embedding:
+      run_on: prompt_only
+"#,
+    )?;
+
+    PipelineModelDirectory::load(&fixture.0)?;
+    Ok(())
+}
+
+#[test]
+fn admission_accepts_gated_producer_adapter_consumer_chain() -> TestResult {
+    let fixture = FixtureDir::new("optional-adapter-chain")?;
+    write_identity_model(
+        &fixture.0.join("producer.onnx"),
+        vec![Port {
+            name: "raw",
+            dtype: DataType::Float16,
+            shape: vec![
+                ShapeDim::Dynamic("batch"),
+                ShapeDim::Dynamic("frames"),
+                ShapeDim::Static(8),
+            ],
+        }],
+        vec![("encoded", "raw")],
+    )?;
+    write_single_node_model(
+        &fixture.0.join("adapter.onnx"),
+        Port {
+            name: "encoded",
+            dtype: DataType::Float16,
+            shape: vec![
+                ShapeDim::Dynamic("batch"),
+                ShapeDim::Dynamic("frames"),
+                ShapeDim::Static(8),
+            ],
+        },
+        Port {
+            name: "adapted",
+            dtype: DataType::Float16,
+            shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(8)],
+        },
+        "Flatten",
+    )?;
+    write_identity_model(
+        &fixture.0.join("consumer.onnx"),
+        vec![Port {
+            name: "features",
+            dtype: DataType::Float16,
+            shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(8)],
+        }],
+        vec![("output", "features")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    producer:
+      filename: producer.onnx
+      type: encoder
+    adapter:
+      filename: adapter.onnx
+      type: encoder
+    consumer:
+      filename: consumer.onnx
+      type: encoder
+      io:
+        optional_inputs:
+          features:
+            presence: audio
+            absent:
+              kind: zeros
+              shape: [0, 8]
+  dataflow:
+    - from: producer.encoded
+      to: adapter.encoded
+      dtype: fp16
+    - from: adapter.adapted
+      to: consumer.features
+      dtype: fp16
+  strategy:
+    kind: composite
+    stages:
+      - name: producer
+        strategy:
+          kind: single_pass
+          model: producer
+        run_on: prompt_only
+      - name: adapter
+        strategy:
+          kind: single_pass
+          model: adapter
+        run_on: prompt_only
+      - name: consumer
+        strategy:
+          kind: single_pass
+          model: consumer
+        run_on: prompt_only
+  phases:
+    producer:
+      run_on: prompt_only
+      when_present: audio
+    adapter:
+      run_on: prompt_only
+      when_present: audio
+    consumer:
+      run_on: prompt_only
+"#,
+    )?;
+
+    PipelineModelDirectory::load(&fixture.0)?;
+    Ok(())
+}
+
+#[test]
+fn admission_rejects_optional_fallback_rank_and_static_width_mismatches() -> TestResult {
+    for (name, shape, expected) in [
+        ("optional-fallback-rank", "[0]", "fallback has rank 1"),
+        (
+            "optional-fallback-width",
+            "[0, 7]",
+            "dimension 1 is 7, but the ONNX graph input requires static dimension 8",
+        ),
+    ] {
+        let fixture = FixtureDir::new(name)?;
+        write_identity_model(
+            &fixture.0.join("consumer.onnx"),
+            vec![Port {
+                name: "features",
+                dtype: DataType::Float16,
+                shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(8)],
+            }],
+            vec![("output", "features")],
+        )?;
+        write_metadata(
+            &fixture.0,
+            &format!(
+                r#"
+pipeline:
+  models:
+    consumer:
+      filename: consumer.onnx
+      type: encoder
+      io:
+        optional_inputs:
+          features:
+            presence: audio
+            absent:
+              kind: zeros
+              shape: {shape}
+  dataflow: []
+  strategy:
+    kind: single_pass
+    model: consumer
+  phases:
+    consumer:
+      run_on: prompt_only
+"#
+            ),
+        )?;
+
+        let error = rejection(&fixture.0);
+        assert!(error.contains("consumer.features"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn admission_rejects_required_input_from_skipped_producer() -> TestResult {
+    let fixture = FixtureDir::new("required-from-skipped-producer")?;
+    write_identity_model(
+        &fixture.0.join("producer.onnx"),
+        vec![Port {
+            name: "seed",
+            dtype: DataType::Float32,
+            shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(4)],
+        }],
+        vec![("features", "seed")],
+    )?;
+    write_identity_model(
+        &fixture.0.join("consumer.onnx"),
+        vec![Port {
+            name: "features",
+            dtype: DataType::Float32,
+            shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(4)],
+        }],
+        vec![("output", "features")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    producer:
+      filename: producer.onnx
+      type: encoder
+    consumer:
+      filename: consumer.onnx
+      type: encoder
+  dataflow:
+    - from: producer.features
+      to: consumer.features
+      dtype: fp32
+  strategy:
+    kind: composite
+    stages:
+      - name: producer
+        strategy:
+          kind: single_pass
+          model: producer
+        run_on: prompt_only
+      - name: consumer
+        strategy:
+          kind: single_pass
+          model: consumer
+        run_on: prompt_only
+  phases:
+    producer:
+      run_on: prompt_only
+      when_present: audio
+    consumer:
+      run_on: prompt_only
+"#,
+    )?;
+
+    let error = rejection(&fixture.0);
+    assert!(error.contains("consumer.features"), "{error}");
+    assert!(error.contains("required branch is not closed"), "{error}");
+    assert!(error.contains("producer is skipped"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn admission_rejects_optional_port_that_is_not_graph_input() -> TestResult {
+    let fixture = FixtureDir::new("optional-missing-port")?;
+    write_identity_model(
+        &fixture.0.join("consumer.onnx"),
+        vec![Port {
+            name: "features",
+            dtype: DataType::Float16,
+            shape: vec![ShapeDim::Dynamic("tokens"), ShapeDim::Static(8)],
+        }],
+        vec![("output", "features")],
+    )?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    consumer:
+      filename: consumer.onnx
+      type: encoder
+      io:
+        optional_inputs:
+          missing_features:
+            presence: audio
+            absent:
+              kind: zeros
+              shape: [0, 8]
+  dataflow: []
+  strategy:
+    kind: single_pass
+    model: consumer
+  phases:
+    consumer:
+      run_on: prompt_only
+"#,
+    )?;
+
+    let error = rejection(&fixture.0);
+    assert!(error.contains("consumer.missing_features"), "{error}");
+    assert!(error.contains("not an ONNX graph input"), "{error}");
     Ok(())
 }
