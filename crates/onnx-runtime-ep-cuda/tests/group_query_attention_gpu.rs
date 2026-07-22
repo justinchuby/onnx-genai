@@ -5,9 +5,10 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
-    CudaExecutionProvider, GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE,
-    GQA_CAPTURE_ERROR_POSITION, GQA_CAPTURE_ERROR_QUERY_NEGATIVE, GQA_CAPTURE_ERROR_TOTAL_OVERFLOW,
-    GroupQueryAttentionBackend, GroupQueryAttentionKernel, gqa_capture_error_description,
+    CudaExecutionProvider, CudaExecutionProviderOptions, GQA_CAPTURE_ERROR_PAST_CAPACITY,
+    GQA_CAPTURE_ERROR_PAST_NEGATIVE, GQA_CAPTURE_ERROR_POSITION, GQA_CAPTURE_ERROR_QUERY_NEGATIVE,
+    GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GqaSequenceLengthsPolicy, GroupQueryAttentionBackend,
+    GroupQueryAttentionKernel, gqa_capture_error_description,
 };
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
@@ -19,6 +20,7 @@ use std::time::Instant;
 struct HostTensor {
     dtype: DataType,
     shape: Vec<usize>,
+    strides: Option<Vec<i64>>,
     bytes: Vec<u8>,
 }
 
@@ -50,6 +52,7 @@ fn float_tensor(dtype: DataType, shape: &[usize], values: &[f32]) -> HostTensor 
     HostTensor {
         dtype,
         shape: shape.to_vec(),
+        strides: None,
         bytes,
     }
 }
@@ -58,6 +61,7 @@ fn i32_tensor(shape: &[usize], values: &[i32]) -> HostTensor {
     HostTensor {
         dtype: DataType::Int32,
         shape: shape.to_vec(),
+        strides: None,
         bytes: typed_bytes(values),
     }
 }
@@ -66,6 +70,7 @@ fn i64_tensor(shape: &[usize], values: &[i64]) -> HostTensor {
     HostTensor {
         dtype: DataType::Int64,
         shape: shape.to_vec(),
+        strides: None,
         bytes: typed_bytes(values),
     }
 }
@@ -101,6 +106,21 @@ fn quantize(values: &[f32], dtype: DataType) -> Vec<f32> {
 
 fn gpu() -> Option<CudaExecutionProvider> {
     match CudaExecutionProvider::new_default() {
+        Ok(ep) => Some(ep),
+        Err(error) => {
+            eprintln!("skip: no CUDA GPU available ({error})");
+            None
+        }
+    }
+}
+
+fn gpu_allow_unit_batch_scalar() -> Option<CudaExecutionProvider> {
+    match CudaExecutionProvider::new_with_options(
+        0,
+        CudaExecutionProviderOptions {
+            gqa_sequence_lengths_policy: GqaSequenceLengthsPolicy::AllowUnitBatchScalar,
+        },
+    ) {
         Ok(ep) => Some(ep),
         Err(error) => {
             eprintln!("skip: no CUDA GPU available ({error})");
@@ -227,9 +247,12 @@ fn run_with_backend(
     let input_strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|tensor| compute_contiguous_strides(&tensor.shape))
+            input.as_ref().map(|tensor| {
+                tensor
+                    .strides
+                    .clone()
+                    .unwrap_or_else(|| compute_contiguous_strides(&tensor.shape))
+            })
         })
         .collect();
     let input_views: Vec<_> = inputs
@@ -354,18 +377,50 @@ fn execute_in_place_packed_f32_gqa(
     output: &mut DeviceBuffer,
     query_sequence_length: usize,
 ) -> onnx_runtime_ep_api::Result<()> {
+    execute_in_place_packed_f32_gqa_with_seqlens_shape(
+        kernel,
+        ep,
+        packed_qkv,
+        cache_k,
+        cache_v,
+        seqlens,
+        total,
+        cos,
+        sin,
+        positions,
+        output,
+        query_sequence_length,
+        &[1],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
+    kernel: &GroupQueryAttentionKernel,
+    ep: &CudaExecutionProvider,
+    packed_qkv: &DeviceBuffer,
+    cache_k: &mut DeviceBuffer,
+    cache_v: &mut DeviceBuffer,
+    seqlens: &DeviceBuffer,
+    total: &DeviceBuffer,
+    cos: &DeviceBuffer,
+    sin: &DeviceBuffer,
+    positions: &DeviceBuffer,
+    output: &mut DeviceBuffer,
+    query_sequence_length: usize,
+    seqlens_shape: &[usize],
+) -> onnx_runtime_ep_api::Result<()> {
     let device = ep.device_id();
     let packed_shape = [1, query_sequence_length, 16];
     let output_shape = [1, query_sequence_length, 8];
     let cache_shape = [1, 2, 5, 2];
-    let seqlens_shape = [1];
     let total_shape = [1];
     let rotary_cache_shape = [5, 1];
     let positions_shape = [1, query_sequence_length];
     let packed_strides = compute_contiguous_strides(&packed_shape);
     let output_strides = compute_contiguous_strides(&output_shape);
     let cache_strides = compute_contiguous_strides(&cache_shape);
-    let seqlens_strides = compute_contiguous_strides(&seqlens_shape);
+    let seqlens_strides = compute_contiguous_strides(seqlens_shape);
     let total_strides = compute_contiguous_strides(&total_shape);
     let rotary_cache_strides = compute_contiguous_strides(&rotary_cache_shape);
     let positions_strides = compute_contiguous_strides(&positions_shape);
@@ -400,7 +455,7 @@ fn execute_in_place_packed_f32_gqa(
         TensorView::new(
             DevicePtr(seqlens.as_ptr()),
             DataType::Int32,
-            &seqlens_shape,
+            seqlens_shape,
             &seqlens_strides,
             device,
         ),
@@ -1639,13 +1694,148 @@ fn gqa_gpu_head_sharing_matches_manual_repeat_kv_reference() {
 }
 
 #[test]
+fn gqa_gpu_strict_policy_rejects_scalar_seqlens_with_actionable_metadata_key() {
+    let Some(ep) = gpu() else { return };
+    let mut inputs = base_inputs(
+        &[1, 1, 8],
+        &[1., 0., 1., 0., 0., 1., 0., 1.],
+        &[1, 1, 4],
+        &[1., 0., 0., 1.],
+        &[1., 2., 10., 20.],
+        None,
+        None,
+        &[0],
+        1,
+    );
+    inputs[5].as_mut().unwrap().shape.clear();
+    let error = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &inputs,
+        &[vec![1, 1, 8], vec![1, 2, 1, 2], vec![1, 2, 1, 2]],
+    ))
+    .expect_err("strict policy must reject scalar seqlens_k");
+    let message = format!("{error}");
+    assert!(message.contains("scalar seqlens_k is not enabled"));
+    assert!(message.contains("model.attention.key_sequence_lengths.scalar_broadcast: unit_batch"));
+}
+
+#[test]
+fn gqa_gpu_declared_unit_batch_scalar_matches_cpu_oracle_and_cuda_vector() {
+    let Some(ep) = gpu_allow_unit_batch_scalar() else {
+        return;
+    };
+    let q = [1., 0., 1., 0., 0., 1., 0., 1.];
+    let k = [1., 0., 0., 1.];
+    let v = [1., 2., 10., 20.];
+    let output_shapes = [vec![1, 1, 8], vec![1, 2, 1, 2], vec![1, 2, 1, 2]];
+    let vector_inputs = base_inputs(&[1, 1, 8], &q, &[1, 1, 4], &k, &v, None, None, &[0], 1);
+    let mut scalar_inputs = vector_inputs.clone();
+    scalar_inputs[5].as_mut().unwrap().shape.clear();
+
+    let vector = run_available(run(&ep, &attrs(&[]), &vector_inputs, &output_shapes)).unwrap();
+    let scalar = run_available(run(&ep, &attrs(&[]), &scalar_inputs, &output_shapes)).unwrap();
+    assert_eq!(scalar, vector);
+
+    let cpu_oracle = [
+        vec![1., 2., 1., 2., 10., 20., 10., 20.],
+        vec![1., 0., 0., 1.],
+        vec![1., 2., 10., 20.],
+    ];
+    for (got, expected) in scalar.iter().zip(cpu_oracle.iter()) {
+        close(got, expected);
+    }
+}
+
+#[test]
+fn gqa_gpu_declared_scalar_still_rejects_multi_batch() {
+    let Some(ep) = gpu_allow_unit_batch_scalar() else {
+        return;
+    };
+    let mut inputs = base_inputs(
+        &[2, 1, 8],
+        &[
+            1., 0., 1., 0., 0., 1., 0., 1., 1., 0., 1., 0., 0., 1., 0., 1.,
+        ],
+        &[2, 1, 4],
+        &[1., 0., 0., 1., 1., 0., 0., 1.],
+        &[1., 2., 10., 20., 3., 4., 30., 40.],
+        None,
+        None,
+        &[0],
+        1,
+    );
+    inputs[5].as_mut().unwrap().shape.clear();
+    let error = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &inputs,
+        &[vec![2, 1, 8], vec![2, 2, 1, 2], vec![2, 2, 1, 2]],
+    ))
+    .expect_err("scalar cannot encode multiple batch rows");
+    let message = format!("{error}");
+    assert!(message.contains("cannot represent batch 2"));
+    assert!(message.contains("contiguous int32 [batch_size]"));
+}
+
+#[test]
+fn gqa_gpu_scalar_permission_preserves_dtype_layout_value_and_shape_validation() {
+    let Some(ep) = gpu_allow_unit_batch_scalar() else {
+        return;
+    };
+    let base = || {
+        base_inputs(
+            &[1, 1, 8],
+            &[1., 0., 1., 0., 0., 1., 0., 1.],
+            &[1, 1, 4],
+            &[1., 0., 0., 1.],
+            &[1., 2., 10., 20.],
+            None,
+            None,
+            &[0],
+            1,
+        )
+    };
+    let output_shapes = [vec![1, 1, 8], vec![1, 2, 1, 2], vec![1, 2, 1, 2]];
+
+    let mut wrong_dtype = base();
+    wrong_dtype[5] = Some(i64_tensor(&[], &[0]));
+    let error = run_available(run(&ep, &attrs(&[]), &wrong_dtype, &output_shapes))
+        .expect_err("wrong dtype must fail");
+    assert!(format!("{error}").contains("seqlens_k must have dtype Int32"));
+
+    let mut non_contiguous = base();
+    non_contiguous[5].as_mut().unwrap().strides = Some(vec![2]);
+    let error = run_available(run(&ep, &attrs(&[]), &non_contiguous, &output_shapes))
+        .expect_err("non-contiguous seqlens_k must fail");
+    assert!(format!("{error}").contains("non-contiguous seqlens_k"));
+
+    let mut negative_scalar = base();
+    negative_scalar[5] = Some(i32_tensor(&[], &[-1]));
+    let error = run_available(run(&ep, &attrs(&[]), &negative_scalar, &output_shapes))
+        .expect_err("negative scalar must fail");
+    assert!(format!("{error}").contains("seqlens_k must be non-negative"));
+
+    let mut non_one_element = base();
+    non_one_element[5] = Some(i32_tensor(&[2], &[0, 0]));
+    let error = run_available(run(&ep, &attrs(&[]), &non_one_element, &output_shapes))
+        .expect_err("non-one-element alternate shape must fail");
+    let message = format!("{error}");
+    assert!(message.contains("shape [1]"));
+    assert!(message.contains("got shape [2]"));
+}
+
+#[test]
 fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let Some(ep) = gpu() else { return };
     let runtime = ep.runtime();
-    let kernel =
-        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+    let kernel = GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0)
+        .unwrap()
+        .with_sequence_lengths_policy(GqaSequenceLengthsPolicy::AllowUnitBatchScalar);
     let eager_kernel =
-        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0)
+            .unwrap()
+            .with_sequence_lengths_policy(GqaSequenceLengthsPolicy::AllowUnitBatchScalar);
     assert!(!kernel.cuda_graph_compatible());
 
     let packed_host = f32_tensor(
@@ -1668,7 +1858,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
             65., 66.,
         ],
     );
-    let seqlens_host = i32_tensor(&[1], &[1]);
+    let seqlens_host = i32_tensor(&[], &[1]);
     let total_host = i32_tensor(&[1], &[5]);
     let cos_host = f32_tensor(&[5, 1], &[1.0, 0.0, -1.0, 0.5, -0.5]);
     let sin_host = f32_tensor(&[5, 1], &[0.0, 1.0, 0.0, 0.866_025_4, 0.866_025_4]);
@@ -1689,7 +1879,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let eager_positions = upload(&ep, &positions_host).unwrap();
     let mut eager_output = ep.allocate(output_bytes, 256).unwrap();
 
-    execute_in_place_packed_f32_gqa(
+    execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &kernel,
         &ep,
         &packed,
@@ -1702,9 +1892,10 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         &positions,
         &mut output,
         1,
+        &[],
     )
     .unwrap();
-    execute_in_place_packed_f32_gqa(
+    execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &eager_kernel,
         &ep,
         &packed,
@@ -1717,6 +1908,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         &eager_positions,
         &mut eager_output,
         1,
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -1728,7 +1920,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let allocation_counts = runtime.allocation_counts();
     let kernels: [&dyn Kernel; 1] = [&kernel];
     runtime.begin_graph_capture(&kernels).unwrap();
-    execute_in_place_packed_f32_gqa(
+    execute_in_place_packed_f32_gqa_with_seqlens_shape(
         &kernel,
         &ep,
         &packed,
@@ -1741,6 +1933,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         &positions,
         &mut output,
         1,
+        &[],
     )
     .unwrap();
     runtime.end_graph_capture().unwrap();
@@ -1754,7 +1947,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
         overwrite(&ep, &eager_seqlens, &seqlens_step).unwrap();
         overwrite(&ep, &eager_positions, &positions_step).unwrap();
 
-        execute_in_place_packed_f32_gqa(
+        execute_in_place_packed_f32_gqa_with_seqlens_shape(
             &eager_kernel,
             &ep,
             &packed,
@@ -1767,6 +1960,7 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
             &eager_positions,
             &mut eager_output,
             1,
+            &[],
         )
         .unwrap();
         runtime.replay_graph().unwrap();
@@ -1776,6 +1970,17 @@ fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
             replayed, eager,
             "capture replay diverged at decode step {step}"
         );
+        assert_eq!(
+            read_bytes(&ep, &cache_k, cache_k.len()).unwrap(),
+            read_bytes(&ep, &eager_cache_k, eager_cache_k.len()).unwrap(),
+            "captured present key diverged at decode step {step}"
+        );
+        assert_eq!(
+            read_bytes(&ep, &cache_v, cache_v.len()).unwrap(),
+            read_bytes(&ep, &eager_cache_v, eager_cache_v.len()).unwrap(),
+            "captured present value diverged at decode step {step}"
+        );
+        assert_eq!(runtime.check_capture_error().unwrap(), 0);
         assert_ne!(
             replayed, previous,
             "attention output did not change when the valid window grew at step {step}"

@@ -624,9 +624,34 @@ pub struct AttentionConfig {
     #[schemars(range(min = 0))]
     pub sink_tokens: Option<usize>,
 
+    /// Representation compatibility for the attention key-sequence lengths.
+    ///
+    /// Absent means the canonical contiguous `int32 [batch_size]` representation
+    /// is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_sequence_lengths: Option<KeySequenceLengthsSpec>,
+
     /// Compatible attention behavior for runtimes that do not recognize `type`.
     #[schemars(with = "Option<schema_vocabulary::AttentionType>")]
     pub fallback_behavior: Option<String>,
+}
+
+/// Explicit compatibility rules for attention key-sequence-length metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct KeySequenceLengthsSpec {
+    /// Optional scalar compatibility. `unit_batch` authorizes a contiguous
+    /// rank-0 one-element `int32` tensor only when the attention batch is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scalar_broadcast: Option<SequenceLengthScalarBroadcast>,
+}
+
+/// Permitted scalar compatibility for attention key-sequence lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceLengthScalarBroadcast {
+    /// Interpret one rank-0 value as the canonical one-element vector only for
+    /// an attention batch of exactly one.
+    UnitBatch,
 }
 
 /// Build-time support for self-contained speculative decoding.

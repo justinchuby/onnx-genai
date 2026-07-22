@@ -790,6 +790,7 @@ pub const GQA_CAPTURE_ERROR_POSITION: u32 = 32;
 
 pub struct GroupQueryAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub sequence_lengths_policy: GqaSequenceLengthsPolicy,
 }
 
 impl KernelFactory for GroupQueryAttentionFactory {
@@ -845,22 +846,35 @@ impl KernelFactory for GroupQueryAttentionFactory {
                 "cuda_ep GroupQueryAttention: softcap must be non-negative".into(),
             ));
         }
-        Ok(Box::new(GroupQueryAttentionKernel::new(
-            self.runtime.clone(),
-            num_heads,
-            kv_num_heads,
-            node.attr("scale").and_then(|a| a.as_float()),
-            node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
-            node.attr("rotary_interleaved")
-                .and_then(|a| a.as_int())
-                .unwrap_or(0)
-                != 0,
-            node.attr("local_window_size")
-                .and_then(|a| a.as_int())
-                .unwrap_or(-1),
-            softcap,
-        )?))
+        Ok(Box::new(
+            GroupQueryAttentionKernel::new(
+                self.runtime.clone(),
+                num_heads,
+                kv_num_heads,
+                node.attr("scale").and_then(|a| a.as_float()),
+                node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
+                node.attr("rotary_interleaved")
+                    .and_then(|a| a.as_int())
+                    .unwrap_or(0)
+                    != 0,
+                node.attr("local_window_size")
+                    .and_then(|a| a.as_int())
+                    .unwrap_or(-1),
+                softcap,
+            )?
+            .with_sequence_lengths_policy(self.sequence_lengths_policy),
+        ))
     }
+}
+
+/// Compatibility policy for `GroupQueryAttention` key-sequence lengths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GqaSequenceLengthsPolicy {
+    /// Require the canonical contiguous `int32 [batch_size]` representation.
+    #[default]
+    PerBatchOnly,
+    /// Also allow one contiguous rank-0 `int32` value when batch is exactly one.
+    AllowUnitBatchScalar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -880,6 +894,7 @@ pub struct GroupQueryAttentionKernel {
     rotary_interleaved: bool,
     local_window_size: i64,
     softcap: f32,
+    sequence_lengths_policy: GqaSequenceLengthsPolicy,
     backend: GroupQueryAttentionBackend,
     prep_fusion_disabled: bool,
     workspace: Mutex<GqaWorkspace>,
@@ -1127,6 +1142,7 @@ impl GroupQueryAttentionKernel {
             rotary_interleaved,
             local_window_size,
             softcap,
+            sequence_lengths_policy: GqaSequenceLengthsPolicy::PerBatchOnly,
             backend: GroupQueryAttentionBackend::Auto,
             prep_fusion_disabled: false,
             last_capture_safe_signature: Mutex::new(None),
@@ -1135,6 +1151,11 @@ impl GroupQueryAttentionKernel {
 
     pub fn with_backend(mut self, backend: GroupQueryAttentionBackend) -> Self {
         self.backend = backend;
+        self
+    }
+
+    pub fn with_sequence_lengths_policy(mut self, policy: GqaSequenceLengthsPolicy) -> Self {
+        self.sequence_lengths_policy = policy;
         self
     }
 
@@ -1408,10 +1429,28 @@ impl GroupQueryAttentionKernel {
 
         require_dense(&inputs[5], "seqlens_k", DataType::Int32)?;
         if inputs[5].shape != [batch] {
-            return Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: seqlens_k must be non-negative int32 [batch_size]"
-                    .into(),
-            ));
+            let scalar = inputs[5].shape.is_empty() && inputs[5].numel() == 1;
+            if scalar {
+                match (self.sequence_lengths_policy, batch) {
+                    (GqaSequenceLengthsPolicy::AllowUnitBatchScalar, 1) => {}
+                    (GqaSequenceLengthsPolicy::AllowUnitBatchScalar, _) => {
+                        return Err(EpError::KernelFailed(format!(
+                            "cuda_ep GroupQueryAttention: scalar seqlens_k cannot represent batch {batch}; model.attention.key_sequence_lengths.scalar_broadcast: unit_batch only permits a scalar when batch_size is exactly 1, so provide contiguous int32 [batch_size] values for every row"
+                        )));
+                    }
+                    (GqaSequenceLengthsPolicy::PerBatchOnly, _) => {
+                        return Err(EpError::KernelFailed(
+                            "cuda_ep GroupQueryAttention: scalar seqlens_k is not enabled; the canonical shape is contiguous int32 [batch_size]. If this graph structurally produces a scalar only for unit-batch attention, declare model.attention.key_sequence_lengths.scalar_broadcast: unit_batch in inference metadata"
+                                .into(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep GroupQueryAttention: seqlens_k must be non-negative contiguous int32 [batch_size] with shape [{batch}], got shape {:?}",
+                    inputs[5].shape
+                )));
+            }
         }
         require_dense(&inputs[6], "total_sequence_length", DataType::Int32)?;
         if inputs[6].numel() != 1 {

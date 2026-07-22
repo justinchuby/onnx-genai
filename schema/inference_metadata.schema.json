@@ -226,6 +226,17 @@
           "format": "uint",
           "minimum": 1
         },
+        "key_sequence_lengths": {
+          "description": "Representation compatibility for the attention key-sequence lengths.\n\nAbsent means the canonical contiguous `int32 [batch_size]` representation\nis required.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeySequenceLengthsSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "num_attention_heads": {
           "description": "Number of query/attention heads.",
           "type": [
@@ -1024,6 +1035,23 @@
           }
         }
       ]
+    },
+    "KeySequenceLengthsSpec": {
+      "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
+      "type": "object",
+      "properties": {
+        "scalar_broadcast": {
+          "description": "Optional scalar compatibility. `unit_batch` authorizes a contiguous\nrank-0 one-element `int32` tensor only when the attention batch is one.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceLengthScalarBroadcast"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
     },
     "KvCacheOperations": {
       "description": "Operational guarantees for mutable KV-cache state.",
@@ -2599,6 +2627,16 @@
       },
       "required": [
         "kind"
+      ]
+    },
+    "SequenceLengthScalarBroadcast": {
+      "description": "Permitted scalar compatibility for attention key-sequence lengths.",
+      "oneOf": [
+        {
+          "description": "Interpret one rank-0 value as the canonical one-element vector only for\nan attention batch of exactly one.",
+          "type": "string",
+          "const": "unit_batch"
+        }
       ]
     },
     "SharedKvGroup": {

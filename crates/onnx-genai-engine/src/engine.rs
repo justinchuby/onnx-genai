@@ -991,11 +991,26 @@ impl Engine {
         }
         let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
         let connector = build_connector_bridge(&config.kv_connector, &model_directory, None)?;
+        let gqa_sequence_lengths_policy = metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.attention.as_ref())
+            .and_then(|attention| attention.key_sequence_lengths.as_ref())
+            .and_then(|spec| spec.scalar_broadcast)
+            .map_or(
+                crate::native_decode::NativeGqaSequenceLengthsPolicy::PerBatchOnly,
+                |permission| match permission {
+                    onnx_genai_metadata::SequenceLengthScalarBroadcast::UnitBatch => {
+                        crate::native_decode::NativeGqaSequenceLengthsPolicy::AllowUnitBatchScalar
+                    }
+                },
+            );
         let native_session =
             crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
                 &model_directory.model_path,
                 native_device,
                 governor.weight_offload_host_cache(),
+                gqa_sequence_lengths_policy,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
         let environment = Environment::new("onnx-genai-engine")

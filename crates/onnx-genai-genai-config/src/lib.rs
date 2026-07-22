@@ -611,6 +611,12 @@ impl GenAiConfig {
             self.model.decoder.num_attention_heads,
         );
         insert_usize(&mut attention, "head_dim", self.model.decoder.head_size);
+        if self.uses_group_query_attention_op() {
+            attention.insert(
+                "key_sequence_lengths".into(),
+                json!({ "scalar_broadcast": "unit_batch" }),
+            );
+        }
         Value::Object(attention)
     }
 
@@ -2121,6 +2127,13 @@ mod tests {
         assert_eq!(attention.num_attention_heads, Some(14));
         assert_eq!(attention.head_dim, Some(64));
         assert_eq!(
+            attention
+                .key_sequence_lengths
+                .as_ref()
+                .and_then(|spec| spec.scalar_broadcast),
+            Some(onnx_genai_metadata::SequenceLengthScalarBroadcast::UnitBatch)
+        );
+        assert_eq!(
             md.model.as_ref().and_then(|m| m.max_sequence_length),
             Some(32768)
         );
@@ -2178,8 +2191,30 @@ mod tests {
         assert!(cfg.shared_kv_buffer_supported());
         assert!(md.kv_cache.is_some());
         assert_eq!(
-            md.model.and_then(|m| m.attention).map(|a| a.attention_type),
-            Some("group_query_attention".to_string())
+            md.model
+                .and_then(|m| m.attention)
+                .map(|a| (a.attention_type, a.key_sequence_lengths)),
+            Some((
+                "group_query_attention".to_string(),
+                Some(onnx_genai_metadata::KeySequenceLengthsSpec {
+                    scalar_broadcast: Some(
+                        onnx_genai_metadata::SequenceLengthScalarBroadcast::UnitBatch
+                    ),
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn non_gqa_op_omits_scalar_key_sequence_lengths_permission() {
+        let mut cfg = qwen_config();
+        cfg.model.decoder.num_key_value_heads = None;
+        let md = cfg.to_inference_metadata(Some("float16")).unwrap();
+        assert_eq!(
+            md.model
+                .and_then(|m| m.attention)
+                .map(|a| (a.attention_type, a.key_sequence_lengths)),
+            Some(("multi_head_attention".to_string(), None))
         );
     }
 

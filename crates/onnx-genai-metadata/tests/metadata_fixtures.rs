@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{
-    MetadataError, PipelineStrategyKind, RuntimeCapabilities, load_metadata, load_pipeline_spec,
-    validate, validate_pipeline_spec,
+    InferenceMetadata, MetadataError, PipelineStrategyKind, RuntimeCapabilities,
+    SequenceLengthScalarBroadcast, load_metadata, load_pipeline_spec, validate,
+    validate_pipeline_spec,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -82,6 +83,75 @@ fn parses_valid_json_fixture() {
             .dtype,
         ["fp16", "fp8_e5m2"]
     );
+}
+
+#[test]
+fn attention_key_sequence_lengths_unit_batch_parses_and_round_trips() {
+    let yaml = r#"
+model:
+  attention:
+    type: grouped_query
+    key_sequence_lengths:
+      scalar_broadcast: unit_batch
+"#;
+    let metadata: InferenceMetadata = serde_yaml::from_str(yaml).expect("metadata parses");
+    let scalar_broadcast = metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.attention.as_ref())
+        .and_then(|attention| attention.key_sequence_lengths.as_ref())
+        .and_then(|spec| spec.scalar_broadcast);
+    assert_eq!(
+        scalar_broadcast,
+        Some(SequenceLengthScalarBroadcast::UnitBatch)
+    );
+
+    let value: serde_json::Value =
+        serde_yaml::from_str(yaml).expect("YAML converts to a generic value");
+    let round_tripped: InferenceMetadata =
+        serde_json::from_value(value).expect("JSON value round-trips");
+    assert_eq!(
+        round_tripped
+            .model
+            .and_then(|model| model.attention)
+            .and_then(|attention| attention.key_sequence_lengths)
+            .and_then(|spec| spec.scalar_broadcast),
+        Some(SequenceLengthScalarBroadcast::UnitBatch)
+    );
+}
+
+#[test]
+fn attention_key_sequence_lengths_absence_is_strict_default() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+model:
+  attention:
+    type: grouped_query
+"#,
+    )
+    .expect("metadata parses");
+    assert!(
+        metadata
+            .model
+            .and_then(|model| model.attention)
+            .and_then(|attention| attention.key_sequence_lengths)
+            .is_none()
+    );
+}
+
+#[test]
+fn attention_key_sequence_lengths_rejects_unknown_scalar_broadcast() {
+    let error = serde_yaml::from_str::<InferenceMetadata>(
+        r#"
+model:
+  attention:
+    type: grouped_query
+    key_sequence_lengths:
+      scalar_broadcast: every_batch
+"#,
+    )
+    .expect_err("unknown compatibility mode must fail");
+    assert!(error.to_string().contains("unit_batch"));
 }
 
 #[test]

@@ -249,3 +249,78 @@ fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
     assert!(cuda_tokens.iter().all(|&token| token == 1));
     Ok(())
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn engine_native_scalar_gqa_metadata_enables_cuda_and_absence_rejects() -> anyhow::Result<()> {
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping native scalar GQA CUDA parity; CUDA is unavailable: {error}");
+        return Ok(());
+    }
+
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-scalar-gqa");
+    let config = |native_device| EngineConfig {
+        decode_backend: EngineDecodeBackend::Native,
+        native_device: Some(native_device),
+        ..EngineConfig::default()
+    };
+    let generate = |engine: &mut Engine| -> anyhow::Result<Vec<u32>> {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 4;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        Ok(engine.generate(request)?.token_ids)
+    };
+
+    let mut cpu = Engine::from_dir(&fixture, config(NativeDecodeDevice::Cpu))?;
+    let mut cuda = Engine::from_dir(
+        &fixture,
+        config(NativeDecodeDevice::Cuda { index: Some(0) }),
+    )?;
+    let cpu_tokens = generate(&mut cpu)?;
+    let cuda_tokens = generate(&mut cuda)?;
+    assert_eq!(cpu_tokens, vec![1, 1, 1, 1]);
+    assert_eq!(cuda_tokens, cpu_tokens);
+
+    let strict_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/native-engine-scalar-gqa-strict")
+        .join(std::process::id().to_string());
+    if strict_fixture.exists() {
+        std::fs::remove_dir_all(&strict_fixture)?;
+    }
+    std::fs::create_dir_all(&strict_fixture)?;
+    for file in ["model.onnx", "tokenizer.json"] {
+        std::fs::copy(fixture.join(file), strict_fixture.join(file))?;
+    }
+    let metadata = std::fs::read_to_string(fixture.join("inference_metadata.yaml"))?;
+    let strict_metadata = metadata.replace(
+        "    key_sequence_lengths:\n      scalar_broadcast: unit_batch\n",
+        "",
+    );
+    assert_ne!(
+        strict_metadata, metadata,
+        "metadata permission was not removed"
+    );
+    std::fs::write(
+        strict_fixture.join("inference_metadata.yaml"),
+        strict_metadata,
+    )?;
+
+    let mut strict_cuda = Engine::from_dir(
+        &strict_fixture,
+        config(NativeDecodeDevice::Cuda { index: Some(0) }),
+    )?;
+    let error = generate(&mut strict_cuda).expect_err("missing metadata permission must reject");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("scalar seqlens_k is not enabled"),
+        "{message}"
+    );
+    assert!(
+        message.contains("model.attention.key_sequence_lengths.scalar_broadcast: unit_batch"),
+        "{message}"
+    );
+    std::fs::remove_dir_all(strict_fixture)?;
+    Ok(())
+}

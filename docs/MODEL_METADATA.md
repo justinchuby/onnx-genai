@@ -142,6 +142,27 @@ For conflicting strengths:
 - `force` from any source = always respected (error if contradicting forces)
 - `prefer` from higher-priority source overrides lower-priority `prefer`
 
+## Attention key-sequence lengths
+
+The canonical `com.microsoft::GroupQueryAttention` key-sequence-length metadata
+is a contiguous `int32 [batch_size]` tensor. Model packages whose graph
+structurally produces a rank-0 value for unit-batch decode may explicitly
+declare:
+
+```yaml
+model:
+  attention:
+    type: group_query_attention
+    key_sequence_lengths:
+      scalar_broadcast: unit_batch
+```
+
+This permits only a contiguous rank-0, one-element `int32` tensor when the
+executing attention batch is exactly one. It does not authorize broadcasting a
+single value across a multi-row or ragged batch; batch sizes greater than one
+still require the canonical `[batch_size]` representation. Omitting the field
+keeps strict canonical validation.
+
 ## Colocation Groups
 
 Nodes with the same `onnx_runtime.group` value are treated as a colocation set.

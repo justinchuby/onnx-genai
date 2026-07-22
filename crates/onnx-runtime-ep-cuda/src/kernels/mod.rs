@@ -199,7 +199,11 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
 /// The shared [`CudaRuntime`] (context + stream + cuBLASLt handle) is threaded
 /// into every factory so kernels submit onto the EP's single stream.
 pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
-    build_cuda_registry_with_metrics(runtime, Arc::new(csa_checkpoint::CsaMetrics::default()))
+    build_cuda_registry_with_metrics(
+        runtime,
+        Arc::new(csa_checkpoint::CsaMetrics::default()),
+        group_query_attention::GqaSequenceLengthsPolicy::default(),
+    )
 }
 
 /// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry
@@ -210,6 +214,7 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
 pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+    gqa_sequence_lengths_policy: group_query_attention::GqaSequenceLengthsPolicy,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
@@ -505,6 +510,7 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
             runtime: runtime.clone(),
+            sequence_lengths_policy: gqa_sequence_lengths_policy,
         }),
     );
 

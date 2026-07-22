@@ -30,6 +30,7 @@ use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout}
 
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
+use crate::kernels::group_query_attention::GqaSequenceLengthsPolicy;
 use crate::optimizer::cuda_optimization_passes;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
@@ -47,6 +48,13 @@ pub struct CudaExecutionProvider {
     csa_metrics: Arc<CsaMetrics>,
 }
 
+/// Explicit CUDA EP compatibility options. Defaults preserve canonical ONNX
+/// tensor representations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaExecutionProviderOptions {
+    pub gqa_sequence_lengths_policy: GqaSequenceLengthsPolicy,
+}
+
 impl std::fmt::Debug for CudaExecutionProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CudaExecutionProvider")
@@ -61,9 +69,18 @@ impl CudaExecutionProvider {
     /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
+        Self::new_with_options(ordinal, CudaExecutionProviderOptions::default())
+    }
+
+    /// Construct a CUDA EP with explicit compatibility options.
+    pub fn new_with_options(ordinal: u32, options: CudaExecutionProviderOptions) -> Result<Self> {
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
         let csa_metrics = Arc::new(CsaMetrics::default());
-        let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
+        let registry = build_cuda_registry_with_metrics(
+            runtime.clone(),
+            csa_metrics.clone(),
+            options.gqa_sequence_lengths_policy,
+        );
         Ok(Self {
             device: DeviceId::cuda(ordinal),
             runtime,
@@ -71,6 +88,16 @@ impl CudaExecutionProvider {
             registry,
             csa_metrics,
         })
+    }
+
+    /// Construct and initialize a CUDA EP with explicit compatibility options.
+    pub fn initialized_with_options(
+        ordinal: u32,
+        options: CudaExecutionProviderOptions,
+    ) -> Result<Self> {
+        let mut ep = Self::new_with_options(ordinal, options)?;
+        ep.initialize(&EpConfig::default())?;
+        Ok(ep)
     }
 
     /// Construct a CUDA EP on the default device (`CUDA:0`).

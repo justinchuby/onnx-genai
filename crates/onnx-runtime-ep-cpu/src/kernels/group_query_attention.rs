@@ -881,6 +881,35 @@ mod tests {
     }
 
     #[test]
+    fn unit_batch_scalar_seqlens_matches_canonical_vector() {
+        let q = [1., 0., 1., 0., 0., 1., 0., 1.];
+        let k = [1., 0., 0., 1.];
+        let v = [1., 2., 10., 20.];
+        let run = |seqlens_shape: &[usize]| {
+            let mut out = Owned::zeros_f32(&[1, 1, 8]);
+            let mut present_k = Owned::zeros_f32(&[1, 2, 1, 2]);
+            let mut present_v = Owned::zeros_f32(&[1, 2, 1, 2]);
+            gqa_kernel(&[])
+                .execute(
+                    &[
+                        Owned::f32(&[1, 1, 8], &q).view(),
+                        Owned::f32(&[1, 1, 4], &k).view(),
+                        Owned::f32(&[1, 1, 4], &v).view(),
+                        absent(),
+                        absent(),
+                        Owned::i32(seqlens_shape, &[0]).view(),
+                        Owned::i32(&[], &[1]).view(),
+                    ],
+                    &mut [out.view_mut(), present_k.view_mut(), present_v.view_mut()],
+                )
+                .unwrap();
+            (out.to_f32(), present_k.to_f32(), present_v.to_f32())
+        };
+
+        assert_eq!(run(&[]), run(&[1]));
+    }
+
+    #[test]
     fn large_prefill_parallel_path_matches_reference() {
         let seq = 160;
         let q = (0..seq * 8)

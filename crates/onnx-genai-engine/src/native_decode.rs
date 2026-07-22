@@ -33,6 +33,13 @@ pub struct NativeDecodeCudaOptions {
     pub graph_capture: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NativeGqaSequenceLengthsPolicy {
+    #[default]
+    PerBatchOnly,
+    AllowUnitBatchScalar,
+}
+
 const DEFAULT_CUDA_KV_MAX_LEN: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +163,7 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
+        gqa_sequence_lengths_policy: NativeGqaSequenceLengthsPolicy,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -168,6 +176,27 @@ impl NativeDecodeSession {
                     host_cache,
                 )
                 .context("initialize native CPU execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = gqa_sequence_lengths_policy;
+        #[cfg(feature = "cuda")]
+        if let NativeDecodeDevice::Cuda { index } = device {
+            let gqa_sequence_lengths_policy = match gqa_sequence_lengths_policy {
+                NativeGqaSequenceLengthsPolicy::PerBatchOnly => {
+                    onnx_runtime_ep_cuda::GqaSequenceLengthsPolicy::PerBatchOnly
+                }
+                NativeGqaSequenceLengthsPolicy::AllowUnitBatchScalar => {
+                    onnx_runtime_ep_cuda::GqaSequenceLengthsPolicy::AllowUnitBatchScalar
+                }
+            };
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized_with_options(
+                index.unwrap_or(0),
+                onnx_runtime_ep_cuda::CudaExecutionProviderOptions {
+                    gqa_sequence_lengths_policy,
+                },
+            )
+            .context("initialize native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
