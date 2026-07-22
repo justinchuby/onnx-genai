@@ -4,9 +4,19 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T15:33Z — H200 native CUDA decode benchmark report._
+_Last updated: 2026-07-22T17:55Z — VLM metadata/runtime/admission landings and Gemma4 E2B validation._
 
-**Current `origin/main` implementation HEAD:** `3d84b9b` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `6ddcb68` (code/docs before this update).
+
+## 2026-07-22 — VLM metadata/runtime/admission landings + Gemma4 E2B validation
+
+- **VLM WP0 metadata contract ✅ (`156853c`):** `crates/onnx-genai-metadata/src/schema.rs` now carries the typed, architecture-neutral multimodal contract: `optional_inputs`, `OptionalInputSpec`, `AbsentInputSpec`, and `PhaseConfig.when_present`.
+- **VLM WP1 native package emission ✅ (upstream Mobius PR #420):** `onnxruntime/mobius` landed typed native VLM package emission as PR #420 (`3861631` squash). This is an upstream Mobius landing, not an onnx-genai commit.
+- **VLM WP3 every-step executor ✅ (`3aec9f3`, `7c82127`):** `crates/onnx-genai-engine/src/pipeline.rs` now runs generic metadata-driven/topological every-step components, replacing the embedding special case; `decode.rs` was untouched.
+- **Optional-modality runtime ✅ (`a71c6f3`, `bdf59b4`, `fc3a011`):** schema, engine runtime, and docs landed for absent-modality fallbacks and `when_present` component gating.
+- **VLM admission gate (WP-C) ✅ (`a72674d`, `96deea2`, `f3fd686`, `d02e400`):** package load now rejects non-executable pipelines using metadata-driven admission and raw graph port-name validation, with docs recorded.
+- **Gemma4 E2B text decode validation 🟡 (`squad/joi-gemma4-e2b`, not merged):** `PipelineEngine` + ORT CUDA on H200 generated the correct output, `"The capital of France is Paris."`, at **140.09 tok/s median**. The pure-Rust native pipeline path is not complete yet for the larger two-stage model with per-layer inputs.
+- **VLM WP2 image processor 🔄:** the generic multi-output image processor in `crates/onnx-genai-preprocess/src/image.rs` is in revision after the first attempt was rejected; do not count it as landed yet.
 
 ## 2026-07-22 — H200 native CUDA decode benchmark report
 
@@ -26,7 +36,7 @@ _Last updated: 2026-07-22T15:33Z — H200 native CUDA decode benchmark report._
 ## 2026-07-22 — EP capture hook, Mobius VLM emission, and Gemma4 E2B export
 
 - **Partial-CUDA-graph EP-claim Phase 1 ✅ (`4b0a10d`):** structural capture-region policy moved from the session executor into `ExecutionProvider::plan_capture_region(node, shape_status) -> Option<StructuralCaptureDecline>`. Kernel-mechanism predicates (`kernel-not-warmed`, `kernel-capture-unsupported`) remain executor-side and apply only after the EP admits a node. Behavior is byte-identical to legacy (independently reviewed 🟢; parity asserts the refactored == legacy 6-node `SeamReason` sequence), completing Phase 1 of `docs/design-ep-partial-cuda-graph.md` after Phase 0 (`3c94a57`), with model-agnostic structural policy per RULES §2.
-- **Mobius VLM WP1 emission + Windows CI fix ✅ (PRs #416, #417):** Mobius now emits native onnx-genai metadata for VLM packages, and the Windows ONNX temp-file lock in parity tests is released/ignored.
+- **Mobius VLM WP1 emission ✅ (upstream PR #420):** Mobius now emits typed native onnx-genai metadata for VLM packages. Earlier Windows temp-file cleanup landed separately in PR #417.
 - **Gemma4 E2B real export for native-VLM testing ✅:** `google/gemma-4-E2B-it` exported via Mobius (`task=gemma4`, fp16, CUDA-optimized) as a four-model package (vision encoder + audio encoder + embedding + decoder), 11.3GB, with 15 mixed-256/512 head-dim KV pairs. The decoder has no `position`/`input_ids` input and consumes `inputs_embeds` + `per_layer_inputs` + `attention_mask`, grounding the exact I/O contract and feeding generic follow-ups now in flight: WP-A Mobius executable-contract emission (`per_layer_inputs` edge + embedding `every_step` + closure validator) and WP-C runtime package admission gate. All metadata/structural; no model-name dispatch (RULES §2).
 
 ## 2026-07-22 — CUDA-graph auto-enable generalizes to Qwen2.5-7B
@@ -114,7 +124,7 @@ _Last updated: 2026-07-22T15:33Z — H200 native CUDA decode benchmark report._
 - **Leon KV logical-shape fix ✅ (`4de2ee2`):** the session executor now exposes the **logical** KV sequence length (not physical buffer capacity) to kernel bindings, unblocking native standard-Attention prefill. Logical-geometry is threaded through `tensor.rs`; capacity-bounded aliased outputs and the GQA inputs-3/4 exception are preserved. (Leon build → Gaff 🟢 opus, DeepSeek tokens exact-match.)
 - **Generic fp16 GroupQueryAttention empty-present K/V + shared past cache ✅ (`33f4de9`):** decode zero-append path with shared past cache, no model-specific assumptions. (Pris 🟡, merged.)
 - **DeepSeek DS-3 MLA conformance ✅ (`794c527`):** tests cover `qk_head_dim != v_head_dim` — present-K uses QK width, present-V uses V width — for both prefill and decode parity. (Gaff 🟡, merged.)
-- **VLM WP2/WP3/WP4 ✅ (`5c48ba5`, `a1cab6b`):** native image processor (bit-exact, 36 tests) plus multimodal positions and fixed-state pairs threaded through the PipelineEngine public path. WP5 (server multimodal bundle + admission ordering) and WP6 (genai_config compat loader) in flight.
+- **VLM WP3/WP4 ✅ (`3aec9f3`, `7c82127`, `a1cab6b`):** generic every-step component execution plus multimodal positions and fixed-state pairs are threaded through the PipelineEngine public path. **WP2** generic multi-output image processing remains in revision in `crates/onnx-genai-preprocess/src/image.rs` after the first attempt was rejected; do not count it as landed yet.
 - **ScatterElements ✅ (`5b01a01`):** fp16/bf16/fp32/int64 data × int32/int64 indices, SM-portable serial reduction.
 
 ## 2026-07-21 — Native CUDA fp16 decode wave-4 (759 @256 / 789 @1024)
