@@ -1055,6 +1055,28 @@ fn conformance_values(len: usize, salt: usize) -> Vec<f32> {
         .collect()
 }
 
+fn concat_bsh(
+    first: &[f32],
+    second: &[f32],
+    batch: usize,
+    first_seq: usize,
+    second_seq: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    let total_seq = first_seq + second_seq;
+    let mut dst = vec![0.0; batch * total_seq * hidden];
+    for b in 0..batch {
+        let first_src = b * first_seq * hidden;
+        let second_src = b * second_seq * hidden;
+        let dst_base = b * total_seq * hidden;
+        dst[dst_base..dst_base + first_seq * hidden]
+            .copy_from_slice(&first[first_src..first_src + first_seq * hidden]);
+        dst[dst_base + first_seq * hidden..dst_base + total_seq * hidden]
+            .copy_from_slice(&second[second_src..second_src + second_seq * hidden]);
+    }
+    dst
+}
+
 fn asymmetric_3d_prefill_decode_cpu_cuda_case(kv_heads: usize) {
     let (batch, q_heads, prefill_seq, decode_seq) = (1usize, 4usize, 3usize, 1usize);
     let (qk_head_dim, v_head_dim) = (192usize, 128usize);
@@ -1201,6 +1223,94 @@ fn asymmetric_3d_prefill_decode_cpu_cuda_case(kv_heads: usize) {
         assert_close(&gpu, &cpu);
         assert!(gpu.iter().all(|value| value.is_finite()), "{name}");
     }
+
+    let full_inputs = vec![
+        Some(tensor(
+            DataType::Float32,
+            &[batch, total_seq, q_heads * qk_head_dim],
+            &concat_bsh(
+                &q_prefill,
+                &q_decode,
+                batch,
+                prefill_seq,
+                decode_seq,
+                q_heads * qk_head_dim,
+            ),
+        )),
+        Some(tensor(
+            DataType::Float32,
+            &[batch, total_seq, kv_heads * qk_head_dim],
+            &concat_bsh(
+                &k_prefill,
+                &k_decode,
+                batch,
+                prefill_seq,
+                decode_seq,
+                kv_heads * qk_head_dim,
+            ),
+        )),
+        Some(tensor(
+            DataType::Float32,
+            &[batch, total_seq, kv_heads * v_head_dim],
+            &concat_bsh(
+                &v_prefill,
+                &v_decode,
+                batch,
+                prefill_seq,
+                decode_seq,
+                kv_heads * v_head_dim,
+            ),
+        )),
+    ];
+    let full_outputs = vec![
+        (
+            DataType::Float32,
+            vec![batch, total_seq, q_heads * v_head_dim],
+        ),
+        (
+            DataType::Float32,
+            vec![batch, kv_heads, total_seq, qk_head_dim],
+        ),
+        (
+            DataType::Float32,
+            vec![batch, kv_heads, total_seq, v_head_dim],
+        ),
+    ];
+    let full_cpu = run_cpu_opt("Attention", 23, &full_inputs, &full_outputs, &attrs);
+    let full_gpu = run_opt("Attention", 23, &full_inputs, &full_outputs, &attrs);
+    for (name, gpu, cpu) in [
+        ("full prefill Y", &full_gpu[0], &full_cpu[0]),
+        ("full prefill present_key", &full_gpu[1], &full_cpu[1]),
+        ("full prefill present_value", &full_gpu[2], &full_cpu[2]),
+    ] {
+        let gpu = f32s(gpu);
+        let cpu = f32s(cpu);
+        assert_close(&gpu, &cpu);
+        assert!(gpu.iter().all(|value| value.is_finite()), "{name}");
+    }
+
+    let expected_cpu_y = concat_bsh(
+        &f32s(&prefill_cpu[0]),
+        &f32s(&decode_cpu[0]),
+        batch,
+        prefill_seq,
+        decode_seq,
+        q_heads * v_head_dim,
+    );
+    let expected_gpu_y = concat_bsh(
+        &f32s(&prefill_gpu[0]),
+        &f32s(&decode_gpu[0]),
+        batch,
+        prefill_seq,
+        decode_seq,
+        q_heads * v_head_dim,
+    );
+    assert_close(&f32s(&full_cpu[0]), &expected_cpu_y);
+    assert_close(&f32s(&full_gpu[0]), &expected_gpu_y);
+    assert_close(&f32s(&full_cpu[1]), &f32s(&decode_cpu[1]));
+    assert_close(&f32s(&full_cpu[2]), &f32s(&decode_cpu[2]));
+    assert_close(&f32s(&full_gpu[1]), &f32s(&decode_gpu[1]));
+    assert_close(&f32s(&full_gpu[2]), &f32s(&decode_gpu[2]));
 }
 
 #[test]

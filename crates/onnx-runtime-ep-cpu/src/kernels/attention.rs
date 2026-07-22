@@ -750,6 +750,28 @@ mod tests {
         dst
     }
 
+    fn concat_bsh(
+        first: &[f32],
+        second: &[f32],
+        batch: usize,
+        first_seq: usize,
+        second_seq: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let total_seq = first_seq + second_seq;
+        let mut dst = vec![0.0; batch * total_seq * hidden];
+        for b in 0..batch {
+            let first_src = b * first_seq * hidden;
+            let second_src = b * second_seq * hidden;
+            let dst_base = b * total_seq * hidden;
+            dst[dst_base..dst_base + first_seq * hidden]
+                .copy_from_slice(&first[first_src..first_src + first_seq * hidden]);
+            dst[dst_base + first_seq * hidden..dst_base + total_seq * hidden]
+                .copy_from_slice(&second[second_src..second_src + second_seq * hidden]);
+        }
+        dst
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn concat_bhsd(
         past: &[f32],
@@ -1083,6 +1105,62 @@ mod tests {
         approx(&decode_y.to_f32(), &decode_oracle, 1e-5);
         assert_eq!(decode_present_key.to_f32(), full_key);
         assert_eq!(decode_present_value.to_f32(), full_value);
+
+        let full_q_bsh = concat_bsh(
+            &q_prefill,
+            &q_decode,
+            batch,
+            prefill_seq,
+            decode_seq,
+            q_heads * qk_head_dim,
+        );
+        let full_k_bsh = concat_bsh(
+            &k_prefill,
+            &k_decode,
+            batch,
+            prefill_seq,
+            decode_seq,
+            kv_heads * qk_head_dim,
+        );
+        let full_v_bsh = concat_bsh(
+            &v_prefill,
+            &v_decode,
+            batch,
+            prefill_seq,
+            decode_seq,
+            kv_heads * v_head_dim,
+        );
+        let mut full_y = Owned::zeros_f32(&[batch, total_seq, q_heads * v_head_dim]);
+        let mut full_present_key =
+            Owned::zeros_f32(&[batch, kv_heads, total_seq, qk_head_dim]);
+        let mut full_present_value =
+            Owned::zeros_f32(&[batch, kv_heads, total_seq, v_head_dim]);
+        kernel(None, true, Some(q_heads), Some(kv_heads), 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[batch, total_seq, q_heads * qk_head_dim], &full_q_bsh).view(),
+                    Owned::f32(&[batch, total_seq, kv_heads * qk_head_dim], &full_k_bsh).view(),
+                    Owned::f32(&[batch, total_seq, kv_heads * v_head_dim], &full_v_bsh).view(),
+                ],
+                &mut [
+                    full_y.view_mut(),
+                    full_present_key.view_mut(),
+                    full_present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        let expected_full_y = concat_bsh(
+            &prefill_oracle,
+            &decode_oracle,
+            batch,
+            prefill_seq,
+            decode_seq,
+            q_heads * v_head_dim,
+        );
+        approx(&full_y.to_f32(), &expected_full_y, 1e-5);
+        assert_eq!(full_present_key.to_f32(), decode_present_key.to_f32());
+        assert_eq!(full_present_value.to_f32(), decode_present_value.to_f32());
     }
 
     #[test]
