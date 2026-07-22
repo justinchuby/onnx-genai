@@ -8,6 +8,10 @@ _Last updated: 2026-07-22T17:55Z — VLM metadata/runtime/admission landings and
 
 **Current `origin/main` implementation HEAD:** `6ddcb68` (code/docs before this update).
 
+## 2026-07-22 — Qwen2.5-1.5B/7B H200 decode roofline ladder
+
+- **Qwen2.5 H200 decode ladder ✅ (`c9190c6`):** native CUDA device-KV + whole-step CUDA graph replay, with **0 fallbacks / 0 transfers**, now has the merged 1.5B/7B report at `docs/benchmarks/qwen-1.5b-7b-h200-2026-07-22.md`: Qwen2.5-1.5B int4 reached **487.66 tok/s** at 128 tokens (**2.051 ms/token**) and **457.88 tok/s** at 1024 (**2.184 ms/token**), while Qwen2.5-7B int4 reached **230.47 tok/s** at 128 (**4.339 ms/token**) and **223.38 tok/s** at 1024 (**4.477 ms/token**). Against the explicit streamed-weight + fp16-KV HBM roofline model at **3.35 TB/s** effective bandwidth, the ceilings are ~**3,811 tok/s** for 1.5B (**12.8%/12.2%**) and ~**840 tok/s** for 7B (**27.5%/26.8%**). This extends the existing 0.5B (~810/778 tok/s) and Phi-4-mini (94.5/93.2 tok/s) ladder; 7B lands at the higher roofline fraction because decode is more compute-bound (int4 dequant dominates), making fixed per-token launch overhead a smaller share.
+
 ## 2026-07-22 — VLM metadata/runtime/admission landings + Gemma4 E2B validation
 
 - **VLM WP0 metadata contract ✅ (`156853c`):** `crates/onnx-genai-metadata/src/schema.rs` now carries the typed, architecture-neutral multimodal contract: `optional_inputs`, `OptionalInputSpec`, `AbsentInputSpec`, and `PhaseConfig.when_present`.
