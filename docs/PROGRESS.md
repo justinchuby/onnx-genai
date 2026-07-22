@@ -4,9 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T05:52Z — fused SwiGLU M>1 prefill blocker resolved and merged._
+_Last updated: 2026-07-22T06:20Z — partial rotary blocker resolved and native prefill re-benchmarked._
 
-**Current `origin/main` implementation HEAD:** `97e0cb4` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `d28c0fd` (code before this docs update).
+
+## 2026-07-22 — Partial rotary (Phi-4-mini) blocker resolved + native prefill re-benchmarked
+
+- **Partial-rotary CUDA GQA ✅ (`d28c0fd`):** Holden made the fused+unfused GQA RoPE generic — derives `rotary_dim = cos_cache.shape[1]*2` and rotates only the leading `rotary_dim` dims of each Q/K head, passing the remainder through unchanged. This unblocks Phi-4-mini (rotary_dim=96 < head_size=128). `rotary_dim==head_size` (Qwen) stays bit-exact (max_rope_abs==0.0). f32/f16/bf16, capture-safe, both interleaved and NeoX layouts verified. (Pris 🟢, independently verified 25 GQA tests on H200)
+- **Native prefill+decode re-benchmark (Qwen2.5-1.5B, main `97e0cb4`):** With fused SwiGLU M>1 landed, multi-token prefill (M=5) now executes end-to-end and output is coherent. Prefill ≈ 201.5 tok/s; decode 302.71 tok/s median (+3.64% vs prior 292.09); ≈ 8.47% of the ~3,572 tok/s weight-bound H200 roofline. (Gaff)
 
 ## 2026-07-22 — Fused SwiGLU M>1 prefill blocker resolved
 
