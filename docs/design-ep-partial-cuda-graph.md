@@ -35,7 +35,40 @@ one of which (`KernelMatch`) is currently framed as "the claim." The claim is no
 boolean; it is the root of a small decision tree. This document makes that tree
 explicit and, crucially, closes the gap for **partial** capture.
 
-### 1.2 The partial-capture opportunity for decode
+### 1.2 Measured evidence (2026-07-22, H200, Qwen2.5-0.5B)
+
+Gaff's native-CUDA decode profile
+(`.squad/decisions/inbox/gaff-decode-profile.md`, ORT 1.27) establishes the
+size and source of the opportunity:
+
+- With CUDA graph capture off, steady decode measured **435.34 tok/s median**
+  (**2.297 ms/token**) and **226 kernels/token**. GPU activity occupied only
+  **49.2%** of wall time: **46.1% kernel execution + 3.0% memcpy + 50.8% CPU
+  dispatch/launch/idle gaps**, with an effective gap of about **5.2 us per
+  launch**. KV traffic was **0 H2D / 0 D2H bytes**; the KV cache was already
+  device-resident.
+- The largest per-token kernel groups were skip RMSNorm (48 launches,
+  0.253 ms), int4 GEMV (49, 0.213 ms), down-projection GEMV (24, 0.175 ms),
+  gate/up SwiGLU GEMV (24, 0.154 ms), and GQA (24, 0.151 ms).
+- Whole-step capture already succeeds on current `main` for this structurally
+  eligible decode path. `ONNX_GENAI_CUDA_GRAPH=1` measured **825.51 tok/s
+  median** (**1.211 ms/token, +89.6%, 1.90x**), with token-exact output,
+  `enabled=true`, one capture, 30 replays, and **zero fallbacks**. That is
+  **93.2%** of the approximately **886 tok/s** gap-free ceiling.
+
+This workload is decisively **launch/CPU-dispatch-bound, not
+HBM-bandwidth-bound**. The architectural priority is therefore:
+
+1. when a decode step has device-resident owned KV, fixed addresses, static
+   per-step topology, and no dynamic seam, capture the **whole step**;
+2. use the partial-capture design below only when structural or declared
+   metadata identifies dynamic seams that make whole-step capture decline.
+
+Both decisions are metadata/structure-driven. The successful fixture's model
+name is evidence, never a dispatch key; whole-step and partial eligibility must
+not depend on model or architecture identity.
+
+### 1.3 The partial-capture opportunity for decode
 
 The single most valuable capture target is the steady-state one-token decode
 subgraph: a fixed `[1,1]` token/position, a fixed-capacity attention mask, a
@@ -44,22 +77,20 @@ fixed-address shared KV cache, and a persistent `[1,1,vocab]` logits output
 launches into one `cudaGraphLaunch`, which is where the H200 roofline gap lives on
 the decode hot path.
 
-The blocker is well understood from prior findings: a decode subgraph almost never
-captures *whole*. A handful of **shape-massaging / dynamic** nodes — data-dependent
+Whole-step capture is the simplest and highest-value case, and §1.2 shows that it
+already works when the structural invariants hold. The remaining blocker is for
+decode graphs that contain **shape-massaging / dynamic** nodes — data-dependent
 `Gather`/`Slice`, host-visible sequence-length math, control-flow, mask-delta
-construction, ops whose output shape is only known at runtime — sit interleaved with
-a large **static-shape core** of GEMMs, attention, norms, and elementwise ops that
-*are* perfectly capture-safe. Under an all-or-nothing gate, one massaging node
-poisons the entire step and the whole decode falls back to eager
-(`docs/CUDA_GRAPH_CAPTURE.md`: *"The current Qwen int4 decode graph still falls back
-because kernels including MatMulNBits, GQA, Gather, and broadcast elementwise
-operations are deliberately marked non-capturable"*).
+construction, or ops whose output shape is only known at runtime — interleaved
+with a **static-shape core** of GEMMs, attention, norms, and elementwise ops that
+are capture-safe. Under an all-or-nothing gate, one such node poisons the whole
+step and forces eager execution.
 
 The whole point of this design: **claim the whole subgraph, capture the static core,
 and run the dynamic/host-massaging seams eagerly** — instead of surrendering capture
 because the subgraph is not uniformly capturable.
 
-### 1.3 Where we already are (do not reinvent)
+### 1.4 Where we already are (do not reinvent)
 
 The session executor already contains a first-generation implementation of exactly
 this idea — **segmented capture** (`crates/onnx-runtime-session/src/executor.rs`):
@@ -247,18 +278,49 @@ copy host results into the region's persistent input buffers on every step
 already does `copy_from_host` for inputs before executing; partial capture makes this
 a *per-step* obligation for every host→region boundary, not just the graph inputs.
 
-### 4.3 KV cache across replay
+### 4.3 Seam output shape and valid-extent invariant
 
-The shared KV cache is fixed-address and device-resident by construction, so
-attention kernels inside a capture region address it stably. The KV *write* (append
-of this step's key/value) must itself be either (a) inside the capture region if the
-write kernel is capture-safe and writes at a computed-but-static offset, or (b) an
-`EagerDeviceSeam` when the write offset is a host-visible sequence length that would
-otherwise force a data-dependent launch. The choice is structural: if the append
-offset is a device scalar updated in place, the write can be interior; if it drives
-launch geometry, it is a seam. Either way the KV *storage* never moves.
+A seam may perform internally data-dependent work, but any output consumed by a
+following `CaptureRegion` must still have a **statically resolved physical
+shape, fixed allocation extent, and stable address** for the lifetime of that
+capture. If the seam produces a variable logical length inside a fixed-capacity
+buffer, that valid length must be supplied as refreshed device data (for
+example, a scalar or mask), and every captured consumer must provably bound its
+reads to that logical extent.
 
-### 4.4 Process-unique annotation ids
+A dynamic seam output whose physical shape changes, whose extent changes a
+consumer's launch geometry, or whose stale tail could be observed by the
+captured consumer cannot terminate at that boundary. The seam must extend
+through the dependent nodes (or the remainder must stay eager) until a static,
+fixed-extent boundary is reached.
+
+### 4.4 KV cache across replay
+
+The shared KV cache being fixed-address and device-resident is necessary but
+not sufficient. A captured append must **not bake a growing sequence-length
+offset into host launch parameters**: replaying such a graph would overwrite
+the same slot and silently corrupt the cache.
+
+KV append remains capture-interior only under the fixed-topology invariant:
+physical KV capacity and pointers stay fixed; the graph has a fixed query
+topology (the current M=1 decode case, or the generalized padded **M=maxK**
+design); the append destination and attention read bound come from a
+device-resident logical-length/index value refreshed in place; and rewind
+changes only logical length/mask contents, not graph topology or bindings.
+Under that invariant, a captured kernel may write a different logical slot on
+each replay without changing its launch geometry.
+
+Gaff's profile measured this successful whole-step case: device-resident KV,
+token-exact output, one capture / 30 replays, and zero fallbacks. That validates
+keeping KV append interior for graphs that satisfy the invariant; it is not a
+model-name exception.
+
+KV append is instead an `EagerDeviceSeam` when the offset is a host scalar baked
+into kernel parameters, when sequence length changes grid/block/workspace, when
+KV storage or output extent can move, or when rewind requires a different
+topology. The classification is structural and metadata-driven in every case.
+
+### 4.5 Process-unique annotation ids
 
 Prior lesson from the ORT-backed path (`crates/onnx-genai-ort/src/session.rs`:
 `gpu_graph_id` / `graph_annotation_id`): each captured graph must carry a
@@ -271,12 +333,14 @@ never reuse an id, so a stale replay can be detected rather than launching a wro
 graph. This is a hardening of today's `graph_index` (which is only unique within one
 schedule).
 
-### 4.5 Boundary summary invariant
+### 4.6 Boundary summary invariant
 
 > Every value that crosses a region/seam boundary lives in a persistent, fixed-address
 > device buffer; host-produced boundary values are re-copied into those buffers every
-> step before replay; captured executables address KV and boundary buffers by stable
-> pointer and are keyed by a process-unique id.
+> step before replay; a seam's captured consumer sees a static physical shape and
+> fixed extent, with any changing logical extent supplied as bounded device data;
+> captured executables address KV and boundary buffers by stable pointer and are
+> keyed by a process-unique id.
 
 ---
 
@@ -365,7 +429,7 @@ on the CUDA EP (placement never changes):
    (`docs/CUDA_GRAPH_CAPTURE.md`). A later step re-warms and re-captures a fresh
    schedule; a live executable is never reused across incompatible bindings. Partial
    capture inherits this wholesale and additionally re-assigns fresh process-unique ids
-   (§4.4) on re-capture.
+   (§4.5) on re-capture.
 4. **Diagnostics.** Every seam boundary keeps its structured reason
    (`CaptureDecline` with node id, op type, domain, reason), surfaced via
    `ONNX_GENAI_LOG_CAPTURE_SEGMENTS` (already implemented in
@@ -394,7 +458,7 @@ gate — worst case it degrades to the exact eager path already shipping.
   `KernelMatch`/`CaptureSupport` reason, keeping the partitioner arch-agnostic
   (consistent with `docs/CROSS_PLATFORM.md` PTX/arch handling).
 - The ORT-backed path (`onnx-genai-ort`, `gpu_graph_id`) is **out of scope** here but
-  shares the annotation-id lesson (§4.4); its `graph_capture` capability gating is
+  shares the annotation-id lesson (§4.5); its `graph_capture` capability gating is
   unchanged.
 
 ---
@@ -410,6 +474,21 @@ buildable/reviewable (RULES §9) and does not touch `docs/PROGRESS.md` here.
 - Wire seam sub-classification through `CaptureSchedule` (extend, don't rewrite).
 - **Acceptance:** builds on CUDA and non-CUDA targets; existing capture tests pass
   unchanged; `ONNX_GENAI_LOG_CAPTURE_SEGMENTS` now prints seam *kind* alongside reason.
+
+### Phase 0.5 — Measurement spike (**DONE 2026-07-22**)
+- Gaff reused the existing capture-segment diagnostics and native decode
+  instrumentation on the real H200 fixture before implementation investment.
+- The spike quantified the launch-bound gap (226 kernels/token; 50.8% dispatch,
+  launch, and idle gaps) and directly measured whole-step capture at 1.90x eager
+  throughput with token-exact output and zero fallbacks (§1.2).
+- For this fixture the result is stronger than a partial-region histogram: the
+  structural plan admits one whole-step capture with no dynamic seam. Partial
+  capture is therefore gated on separate fixtures whose structural diagnostics
+  report actual seam positions and sufficiently large maximal static regions.
+- **Acceptance: complete.** Evidence is recorded in
+  `.squad/decisions/inbox/gaff-decode-profile.md`; whole-step capture is the
+  first-line path, while partial capture remains justified for measured
+  dynamic-seam cases.
 
 ### Phase 1 — Move region-detection policy into the EP
 - Add an EP hook (e.g. `ExecutionProvider::plan_capture_regions(graph, resolved,
@@ -445,9 +524,10 @@ buildable/reviewable (RULES §9) and does not touch `docs/PROGRESS.md` here.
   KV-append seam/interior classification.
 - Add a capture-vs-eager **token-equivalence** conformance test on the decode fixture
   and a boundary-stability test (buffers do not move across N replays).
-- **Acceptance:** on a real decode graph the static core captures into ≥1 region with
-  dynamic seams eager; measured decode tokens/sec improves vs the fully-eager fallback;
-  captured and eager tokens are byte-identical.
+- **Acceptance:** on a real graph that diagnostics show contains dynamic seams, the
+  static core captures into ≥1 viable region with those seams eager; measured
+  tokens/sec improves vs the fully-eager fallback; captured and eager tokens are
+  byte-identical. Whole-step-eligible graphs continue to use one whole-step capture.
 
 ### Phase 5 — Metadata & policy knobs
 - Add declared `cuda.capture.min_region_nodes` (viability floor) and any needed
@@ -464,12 +544,15 @@ buildable/reviewable (RULES §9) and does not touch `docs/PROGRESS.md` here.
    returning a plan the executor realizes. Alternative: the EP returns per-node path
    annotations and the executor forms regions. The hook keeps *policy* in the EP and
    *mechanism* in the executor; confirm this split with reviewers before Phase 1.
-2. **KV-append classification.** §4.3 hinges on whether the append offset drives launch
-   geometry. Needs a concrete audit of the current GQA/KV kernels to know how many
-   real decode graphs keep the append *interior* vs. forced to a seam.
-3. **Seam count vs benefit.** Many small capture regions separated by seams may not beat
-   one eager pass if per-region launch/replay overhead dominates. The viability floor
-   (§3.3/§6) mitigates, but the right default is empirical (Phase 4 benchmarking).
+2. **KV-append prevalence.** §4.4 resolves the correctness classification:
+   fixed-topology, device-indexed append may be interior; host-baked or
+   launch-shaping offsets force a seam. The remaining audit is empirical: how
+   often do dynamic-seam graphs satisfy the interior case?
+3. **Seam count vs benefit.** The completed Phase 0.5 measurement proves the
+   whole-step launch-gap benefit, but not the region-size distribution for
+   graphs that actually contain seams. Many small regions may not beat one
+   eager pass. The viability floor (§3.3/§6) mitigates this; each target graph
+   class must expose its region histogram before Phase 4 investment.
 4. **Re-capture churn.** Frequent invalidation (variable prompt handling, rewind-heavy
    workloads) could re-warm/re-capture often. Need a policy for when to *stop* trying to
    capture and stay eager after N invalidations — declared, not heuristic.
