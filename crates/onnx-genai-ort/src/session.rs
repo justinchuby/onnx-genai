@@ -176,9 +176,22 @@ pub mod ep_compat {
 
     impl ResolvedEp {
         /// A strict provider must NOT silently fall back to CPU on load failure.
-        /// Today only self-registering plugin EPs (Metal) are strict.
+        /// Explicit CUDA and self-registering plugin EPs are strict.
         pub(crate) fn is_strict(&self) -> bool {
-            matches!(self.strategy, AppendStrategy::PluginLibrary { .. })
+            #[cfg(feature = "cuda")]
+            {
+                matches!(
+                    self.strategy,
+                    AppendStrategy::CudaTyped { .. } | AppendStrategy::PluginLibrary { .. }
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                matches!(
+                    self.strategy,
+                    AppendStrategy::CudaUnavailable | AppendStrategy::PluginLibrary { .. }
+                )
+            }
         }
     }
 
@@ -315,6 +328,21 @@ pub mod ep_compat {
     }
 }
 
+/// CUDA attention implementation policy.
+///
+/// ONNX Runtime's default selects among optimized attention implementations.
+/// [`Self::Unfused`] pins the CUDA provider's `sdpa_kernel` option to its
+/// standard math implementation, disabling Flash, Lean, fused,
+/// memory-efficient, TensorRT-flash, and cuDNN-flash attention dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CudaAttentionMode {
+    /// Let ONNX Runtime select the attention implementation.
+    #[default]
+    Default,
+    /// Use ONNX Runtime's standard unfused math attention implementation.
+    Unfused,
+}
+
 /// Session configuration options.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
@@ -335,6 +363,13 @@ pub struct SessionOptions {
     /// when a WebGPU execution provider is selected. Validation is a
     /// debug-oriented overhead layer; disabling it is safe for trusted graphs.
     pub webgpu_disable_validation: bool,
+    /// CUDA attention implementation policy.
+    ///
+    /// Defaults from `ONNX_GENAI_CUDA_ATTENTION` (`default` or `unfused`).
+    /// `unfused` is a generic correctness workaround for graphs that encounter
+    /// an ONNX Runtime optimized-attention kernel defect; it is never selected
+    /// from model identity.
+    pub cuda_attention_mode: CudaAttentionMode,
     /// Whether the non-CPU execution provider was auto-selected for this platform
     /// (e.g. the macOS MLX/Metal default) rather than explicitly requested. An
     /// auto-selected provider must fall back to CPU on load failure, even if the
@@ -394,6 +429,7 @@ impl SessionOptions {
             inter_op_num_threads: 0,
             graph_capture: false,
             webgpu_disable_validation: false,
+            cuda_attention_mode: cuda_attention_mode_from_env(),
             auto_selected: false,
         }
     }
@@ -458,6 +494,17 @@ impl SessionOptions {
     /// Values less than or equal to zero leave thread selection to ORT.
     pub fn with_intra_op_threads(mut self, threads: i32) -> Self {
         self.intra_op_num_threads = threads;
+        self
+    }
+
+    /// Select the CUDA attention implementation policy.
+    ///
+    /// Use [`CudaAttentionMode::Unfused`] when an optimized ONNX Runtime CUDA
+    /// attention implementation rejects an otherwise valid graph. This maps to
+    /// the real CUDA provider option `sdpa_kernel=16` rather than mutating the
+    /// process-wide `ORT_DISABLE_*ATTENTION` environment variables.
+    pub fn with_cuda_attention_mode(mut self, mode: CudaAttentionMode) -> Self {
+        self.cuda_attention_mode = mode;
         self
     }
 }
@@ -630,8 +677,8 @@ impl Session {
             };
 
         // Auto-selected providers (e.g. the macOS MLX default) always fall back
-        // to CPU; explicitly requested providers only fall back when they are
-        // non-strict.
+        // to CPU; explicitly requested strict providers (CUDA and plugin EPs)
+        // fail rather than silently changing the requested device.
         let allow_cpu_fallback = options.auto_selected
             || (requested_non_cpu_provider(&options) && !requested_strict_provider(&options));
 
@@ -1278,6 +1325,27 @@ fn webgpu_disable_validation_from_env() -> bool {
     !runtime_config().webgpu_validation
 }
 
+/// CUDA attention mode from `ONNX_GENAI_CUDA_ATTENTION`.
+///
+/// ORT exposes the desired behavior as the CUDA provider option
+/// `sdpa_kernel=16` (the standard math implementation), so this configuration
+/// does not need to mutate ORT's process-wide attention environment variables.
+fn cuda_attention_mode_from_env() -> CudaAttentionMode {
+    let Some(value) = std::env::var_os("ONNX_GENAI_CUDA_ATTENTION") else {
+        return CudaAttentionMode::Default;
+    };
+    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "optimized" => CudaAttentionMode::Default,
+        "unfused" => CudaAttentionMode::Unfused,
+        invalid => {
+            tracing::warn!(
+                "Ignoring invalid ONNX_GENAI_CUDA_ATTENTION={invalid}; expected 'default' or 'unfused'"
+            );
+            CudaAttentionMode::Default
+        }
+    }
+}
+
 /// Whether device-resident KV buffers are enabled. Default **false**: on the
 /// ORT 1.27 WebGPU EP, binding a user-pre-allocated `WebGPU_Buffer` device
 /// tensor as a persistent in-place `past`/`present` share-buffer segfaults
@@ -1384,6 +1452,7 @@ fn append_execution_providers(
             session_options,
             provider,
             options.graph_capture,
+            options.cuda_attention_mode,
             &available,
         )?;
     }
@@ -1395,18 +1464,28 @@ fn append_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     provider: &ResolvedEp,
     graph_capture: bool,
+    cuda_attention_mode: CudaAttentionMode,
     available: &[String],
 ) -> Result<()> {
     use ep_compat::AppendStrategy;
     match &provider.strategy {
         AppendStrategy::HostDefault => Ok(()),
         #[cfg(feature = "cuda")]
-        AppendStrategy::CudaTyped { device_id } => {
-            append_cuda_execution_provider(session_options, *device_id, graph_capture, available)
-        }
+        AppendStrategy::CudaTyped { device_id } => append_cuda_execution_provider(
+            session_options,
+            *device_id,
+            graph_capture,
+            cuda_attention_mode,
+            available,
+        ),
         #[cfg(not(feature = "cuda"))]
         AppendStrategy::CudaUnavailable => {
-            let _ = (session_options, graph_capture, available);
+            let _ = (
+                session_options,
+                graph_capture,
+                cuda_attention_mode,
+                available,
+            );
             Err(OrtError::InvalidArgument(
                 "CUDA support not compiled in; rebuild with --features cuda".into(),
             ))
@@ -1741,15 +1820,12 @@ fn append_cuda_execution_provider(
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     device_id: i32,
     graph_capture: bool,
+    attention_mode: CudaAttentionMode,
     available: &[String],
 ) -> Result<()> {
     const PROVIDER_NAME: &str = "CUDAExecutionProvider";
     if !provider_is_available(PROVIDER_NAME, available) {
-        tracing::warn!(
-            "Requested ONNX Runtime execution provider CUDA is unavailable in this build; falling back to CPU. Available providers: {:?}",
-            available
-        );
-        return Ok(());
+        return Err(cuda_provider_unavailable_error(available));
     }
 
     let api = crate::error::api()?;
@@ -1773,14 +1849,11 @@ fn append_cuda_execution_provider(
     crate::error::check_status(unsafe { create(&mut cuda_options) })?;
     let result = (|| {
         let device_id = device_id.to_string();
-        let mut provider_options = vec![("device_id", device_id.as_str())];
-        if graph_capture {
-            provider_options.push(("enable_cuda_graph", "1"));
-        }
+        let provider_options = cuda_provider_options(device_id, graph_capture, attention_mode);
         let option_keys = provider_options
             .iter()
             .map(|(key, _)| {
-                CString::new(*key).map_err(|_| {
+                CString::new(key.as_str()).map_err(|_| {
                     OrtError::InvalidArgument("CUDA provider option key contains NUL".into())
                 })
             })
@@ -1788,7 +1861,7 @@ fn append_cuda_execution_provider(
         let option_values = provider_options
             .iter()
             .map(|(_, value)| {
-                CString::new(*value).map_err(|_| {
+                CString::new(value.as_str()).map_err(|_| {
                     OrtError::InvalidArgument("CUDA provider option value contains NUL".into())
                 })
             })
@@ -1821,17 +1894,82 @@ fn append_cuda_execution_provider(
             tracing::info!(
                 device_id,
                 graph_capture,
+                ?attention_mode,
                 "Enabled ONNX Runtime CUDA execution provider"
             );
             Ok(())
         }
-        Err(err) => {
-            tracing::warn!(
-                "Failed to enable ONNX Runtime CUDA execution provider: {err}; falling back to CPU"
-            );
-            Ok(())
-        }
+        Err(err) => Err(OrtError::SessionCreation(format!(
+            "failed to initialize requested CUDAExecutionProvider for device {device_id}: {err}. \
+             Verify that {} and its CUDA/cuDNN dependencies are loadable from {}; \
+             to intentionally run on CPU, request it explicitly with ONNX_GENAI_EP=cpu",
+            cuda_provider_library_name(),
+            cuda_library_search_path()
+        ))),
     }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_provider_options(
+    device_id: String,
+    graph_capture: bool,
+    attention_mode: CudaAttentionMode,
+) -> Vec<(String, String)> {
+    let mut options = vec![("device_id".to_string(), device_id)];
+    if graph_capture {
+        options.push(("enable_cuda_graph".to_string(), "1".to_string()));
+    }
+    if attention_mode == CudaAttentionMode::Unfused {
+        // ORT AttentionBackend::MATH is bit 16. A positive sdpa_kernel value is
+        // an explicit backend mask, so all optimized paths are disabled without
+        // process-global ORT_DISABLE_* environment state.
+        options.push(("sdpa_kernel".to_string(), "16".to_string()));
+    }
+    options
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_provider_unavailable_error(available: &[String]) -> OrtError {
+    OrtError::SessionCreation(format!(
+        "CUDAExecutionProvider was requested, but the linked ONNX Runtime does not report it \
+         (available providers: {available:?}). The CUDA provider library '{}' is missing or could \
+         not be loaded. Put the directory containing both the ONNX Runtime core library and '{}' \
+         first in {}, and ensure its CUDA/cuDNN dependencies are loadable; to intentionally run \
+         on CPU, request it explicitly with ONNX_GENAI_EP=cpu",
+        cuda_provider_library_name(),
+        cuda_provider_library_name(),
+        cuda_library_search_path()
+    ))
+}
+
+#[cfg(all(feature = "cuda", target_os = "windows"))]
+fn cuda_provider_library_name() -> &'static str {
+    "onnxruntime_providers_cuda.dll"
+}
+
+#[cfg(all(feature = "cuda", target_os = "macos"))]
+fn cuda_provider_library_name() -> &'static str {
+    "libonnxruntime_providers_cuda.dylib"
+}
+
+#[cfg(all(feature = "cuda", not(any(target_os = "windows", target_os = "macos"))))]
+fn cuda_provider_library_name() -> &'static str {
+    "libonnxruntime_providers_cuda.so"
+}
+
+#[cfg(all(feature = "cuda", target_os = "windows"))]
+fn cuda_library_search_path() -> &'static str {
+    "PATH"
+}
+
+#[cfg(all(feature = "cuda", target_os = "macos"))]
+fn cuda_library_search_path() -> &'static str {
+    "DYLD_LIBRARY_PATH"
+}
+
+#[cfg(all(feature = "cuda", not(any(target_os = "windows", target_os = "macos"))))]
+fn cuda_library_search_path() -> &'static str {
+    "LD_LIBRARY_PATH"
 }
 
 fn append_named_execution_provider(
@@ -2243,9 +2381,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_provider_is_plugin_only() {
-        // Metal (a plugin library) is strict: load failure must not silently
-        // fall back to CPU. Named-generic providers (WebGPU) are non-strict.
+    fn strict_providers_include_cuda_and_plugins() {
+        // CUDA and Metal (a plugin library) are strict: load failure must not
+        // silently fall back to CPU. Named-generic providers are non-strict.
+        let cuda = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        assert!(requested_non_cpu_provider(&cuda));
+        assert!(requested_strict_provider(&cuda));
+
         let metal = SessionOptions::with_execution_provider(ep_selection("metal"));
         assert!(requested_non_cpu_provider(&metal));
         assert!(requested_strict_provider(&metal));
@@ -2257,6 +2399,34 @@ mod tests {
         let cpu = SessionOptions::cpu();
         assert!(!requested_non_cpu_provider(&cpu));
         assert!(!requested_strict_provider(&cpu));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn unfused_cuda_attention_uses_math_provider_option() {
+        assert_eq!(
+            cuda_provider_options("3".to_string(), true, CudaAttentionMode::Unfused),
+            vec![
+                ("device_id".to_string(), "3".to_string()),
+                ("enable_cuda_graph".to_string(), "1".to_string()),
+                ("sdpa_kernel".to_string(), "16".to_string()),
+            ]
+        );
+        assert_eq!(
+            cuda_provider_options("0".to_string(), false, CudaAttentionMode::Default),
+            vec![("device_id".to_string(), "0".to_string())]
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn unavailable_cuda_error_is_actionable() {
+        let error = cuda_provider_unavailable_error(&["CPUExecutionProvider".to_string()]);
+        let message = error.to_string();
+        assert!(message.contains("CUDAExecutionProvider was requested"));
+        assert!(message.contains(cuda_provider_library_name()));
+        assert!(message.contains(cuda_library_search_path()));
+        assert!(message.contains("ONNX_GENAI_EP=cpu"));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2276,6 +2446,7 @@ mod tests {
             std::ptr::null_mut(),
             &resolved,
             false,
+            CudaAttentionMode::Default,
             &[],
         )
         .expect_err("CUDA must be rejected without the cargo feature");
