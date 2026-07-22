@@ -26,10 +26,12 @@
 //! ### Precision contract (RULES.md §4 / cross-EP parity)
 //! Softmax uses the **exact** `(score - max) as f64).exp() as f32` path, unchanged
 //! from the original.  The dot-product and AXPY SIMD paths may reorder f32
-//! additions (parallel accumulator reduction); the induced error is bounded by
-//! `f32::EPSILON × n × max(|a|)` and does not change greedy token ids in
-//! practice.  The exact scalar dot-product reference is exercised in unit tests
-//! and remains callable from `#[cfg(test)]` for cross-checking.
+//! additions (parallel accumulator reduction).  Under the standard
+//! floating-point model, a length-`n` dot product has forward error proportional
+//! to `γ_n × Σ|a_i b_i|`, where `γ_n = n u / (1 - n u)` and the unit roundoff
+//! for round-to-nearest f32 is `u = 0.5 × f32::EPSILON`.  This is a numerical
+//! parity contract, not a universal greedy-token identity guarantee; model-level
+//! greedy parity is established empirically by profiling.
 
 use std::borrow::Cow;
 
@@ -378,8 +380,10 @@ fn write_decode_output(out: &mut TensorMut, data: &[f32]) -> Result<()> {
 /// lengths that are not a multiple of 16.
 ///
 /// The AVX2 path reorders f32 additions across the two accumulators relative to
-/// a purely sequential scalar sum.  The numerical difference is bounded by
-/// `f32::EPSILON × n × max(|a|, |b|)` and does not affect greedy token ids.
+/// a purely sequential scalar sum.  Its standard forward-error scale is
+/// `γ_n × Σ|a_i b_i|`, where `γ_n = n u / (1 - n u)` and
+/// `u = 0.5 × f32::EPSILON`; cancellation can therefore make a relative-error
+/// bound inappropriate.
 #[inline(always)]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -967,6 +971,92 @@ mod tests {
         out
     }
 
+    fn reference_with_geometry(
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        query_sequence_length: usize,
+        total_sequence_length: usize,
+        past_sequence_length: usize,
+        query_head_count: usize,
+        key_value_head_count: usize,
+        head_width: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0; query_sequence_length * query_head_count * head_width];
+        for sequence_index in 0..query_sequence_length {
+            for query_head_index in 0..query_head_count {
+                let key_value_head_index =
+                    query_head_index / (query_head_count / key_value_head_count);
+                let attended_key_count = past_sequence_length + sequence_index + 1;
+                let mut scores = vec![0.0; attended_key_count];
+                for (key_index, score) in scores.iter_mut().enumerate() {
+                    let query_base =
+                        (sequence_index * query_head_count + query_head_index) * head_width;
+                    let key_base =
+                        (key_value_head_index * total_sequence_length + key_index) * head_width;
+                    *score = query[query_base..query_base + head_width]
+                        .iter()
+                        .zip(&key[key_base..key_base + head_width])
+                        .map(|(query_element, key_element)| query_element * key_element)
+                        .sum::<f32>()
+                        / (head_width as f32).sqrt();
+                }
+                let maximum_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let probability_sum: f32 = scores
+                    .iter_mut()
+                    .map(|score| {
+                        *score = ((*score - maximum_score) as f64).exp() as f32;
+                        *score
+                    })
+                    .sum();
+                for score in &mut scores {
+                    *score /= probability_sum;
+                }
+                let output_base =
+                    (sequence_index * query_head_count + query_head_index) * head_width;
+                for dimension_index in 0..head_width {
+                    output[output_base + dimension_index] = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(key_index, probability)| {
+                            probability
+                                * value[(key_value_head_index * total_sequence_length + key_index)
+                                    * head_width
+                                    + dimension_index]
+                        })
+                        .sum();
+                }
+            }
+        }
+        output
+    }
+
+    fn mixed_scale_value(index: usize, seed: u64) -> f32 {
+        let mut state = (index as u64)
+            .wrapping_add(seed)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        state ^= state >> 30;
+        state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        state ^= state >> 27;
+        state = state.wrapping_mul(0x94d0_49bb_1331_11eb);
+        state ^= state >> 31;
+        let signed_unit = (((state >> 40) as u32) as f32 / ((1_u32 << 24) as f32)) * 2.0 - 1.0;
+        let scale = [0.03125_f32, 0.125, 0.5, 2.0][((state >> 8) & 3) as usize];
+        signed_unit * scale
+    }
+
+    fn dot_comparison_tolerance(left: &[f32], right: &[f32]) -> f32 {
+        let unit_roundoff = 0.5 * f32::EPSILON;
+        let operation_count = left.len() as f32;
+        let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
+        let absolute_product_sum: f32 = left
+            .iter()
+            .zip(right)
+            .map(|(left_element, right_element)| (left_element * right_element).abs())
+            .sum();
+        2.0 * gamma * absolute_product_sum + 2.0 * f32::MIN_POSITIVE
+    }
+
     fn close(got: &[f32], want: &[f32]) {
         assert_eq!(got.len(), want.len());
         for (i, (a, b)) in got.iter().zip(want).enumerate() {
@@ -1531,96 +1621,147 @@ mod tests {
 
     // ── New tests covering the vectorized decode hot path ──────────────────
 
-    /// Verifies that M=1 decode at long context (512-token past cache) produces
-    /// exactly the same output as the `reference` scalar computation.  This is
-    /// the primary regression guard for the vectorized QK+AXPY optimizations.
+    /// Verifies realistic-width M=1 decode against a scalar full-attention
+    /// implementation. The pseudo-random mixed-scale inputs are non-periodic
+    /// over the fixture and produce cancellation in the 128-element dot products.
+    ///
+    /// The tolerance covers both dot-product reordering and hundreds of fused
+    /// probability-weighted value accumulations. On x86 test hosts, AVX2+FMA is
+    /// required so this regression cannot silently exercise only scalar tails.
     #[test]
     fn gqa_decode_long_context_matches_reference() {
-        const PAST: usize = 511;
-        const TOTAL: usize = PAST + 1; // = 512
-        let (qh, kvh, d) = (4usize, 2usize, 2usize);
+        const PAST_SEQUENCE_LENGTH: usize = 255;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 128;
 
-        // Use small values in [-1, 1] so floating-point accumulation errors stay
-        // within the 1e-5 absolute tolerance the existing `close` helper applies.
-        let q: Vec<f32> = (0..qh * d)
-            .map(|i| ((i % 7) as f32 - 3.0) / 7.0)
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(
+            crate::backend::has_simd_x86(),
+            "this x86 regression requires AVX2+FMA to validate the production path"
+        );
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x1234))
             .collect();
-        let cur_k: Vec<f32> = (0..kvh * d)
-            .map(|i| ((i % 5) as f32 - 2.0) / 5.0)
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x5678))
             .collect();
-        let cur_v: Vec<f32> = (0..kvh * d)
-            .map(|i| ((i % 11) as f32 - 5.0) / 11.0)
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x9abc))
             .collect();
-        let past_k: Vec<f32> = (0..kvh * PAST * d)
-            .map(|i| ((i % 13) as f32 - 6.0) / 13.0)
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xdef0))
             .collect();
-        let past_v: Vec<f32> = (0..kvh * PAST * d)
-            .map(|i| ((i % 17) as f32 - 8.0) / 17.0)
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x2468))
             .collect();
 
-        // Build the full present KV (BNSH) the reference function expects:
-        // [1, kvh, TOTAL, d].
-        let mut full_k = vec![0.0f32; kvh * TOTAL * d];
-        let mut full_v = vec![0.0f32; kvh * TOTAL * d];
-        for h in 0..kvh {
-            full_k[h * TOTAL * d..h * TOTAL * d + PAST * d]
-                .copy_from_slice(&past_k[h * PAST * d..(h + 1) * PAST * d]);
-            full_v[h * TOTAL * d..h * TOTAL * d + PAST * d]
-                .copy_from_slice(&past_v[h * PAST * d..(h + 1) * PAST * d]);
-            for dd in 0..d {
-                full_k[h * TOTAL * d + PAST * d + dd] = cur_k[h * d + dd];
-                full_v[h * TOTAL * d + PAST * d + dd] = cur_v[h * d + dd];
+        let mut full_key = vec![0.0f32; KEY_VALUE_HEAD_COUNT * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH];
+        let mut full_value =
+            vec![0.0f32; KEY_VALUE_HEAD_COUNT * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH];
+        for head_index in 0..KEY_VALUE_HEAD_COUNT {
+            let past_base = head_index * PAST_SEQUENCE_LENGTH * HEAD_WIDTH;
+            let full_base = head_index * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH;
+            full_key[full_base..full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH].copy_from_slice(
+                &past_key[past_base..past_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH],
+            );
+            full_value[full_base..full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH].copy_from_slice(
+                &past_value[past_base..past_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH],
+            );
+            for dimension_index in 0..HEAD_WIDTH {
+                full_key[full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH + dimension_index] =
+                    current_key[head_index * HEAD_WIDTH + dimension_index];
+                full_value[full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH + dimension_index] =
+                    current_value[head_index * HEAD_WIDTH + dimension_index];
             }
         }
 
-        let want = reference(&q, &full_k, &full_v, 1, TOTAL, PAST);
+        let expected = reference_with_geometry(
+            &query,
+            &full_key,
+            &full_value,
+            1,
+            TOTAL_SEQUENCE_LENGTH,
+            PAST_SEQUENCE_LENGTH,
+            QUERY_HEAD_COUNT,
+            KEY_VALUE_HEAD_COUNT,
+            HEAD_WIDTH,
+        );
 
-        let mut out = Owned::zeros_f32(&[1, 1, qh * d]);
-        let mut pk = Owned::zeros_f32(&[1, kvh, TOTAL, d]);
-        let mut pv = Owned::zeros_f32(&[1, kvh, TOTAL, d]);
+        let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+        let mut present_key =
+            Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+        let mut present_value =
+            Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
         gqa_kernel(&[])
             .execute(
                 &[
-                    Owned::f32(&[1, 1, qh * d], &q).view(),
-                    Owned::f32(&[1, 1, kvh * d], &cur_k).view(),
-                    Owned::f32(&[1, 1, kvh * d], &cur_v).view(),
-                    Owned::f32(&[1, kvh, PAST, d], &past_k).view(),
-                    Owned::f32(&[1, kvh, PAST, d], &past_v).view(),
-                    Owned::i32(&[1], &[(PAST as i32)]).view(),
-                    Owned::i32(&[], &[(TOTAL as i32)]).view(),
+                    Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                    Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key).view(),
+                    Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_value).view(),
+                    Owned::f32(
+                        &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                        &past_key,
+                    )
+                    .view(),
+                    Owned::f32(
+                        &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                        &past_value,
+                    )
+                    .view(),
+                    Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                    Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
                 ],
-                &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
+                &mut [
+                    output.view_mut(),
+                    present_key.view_mut(),
+                    present_value.view_mut(),
+                ],
             )
             .unwrap();
 
-        close(&out.to_f32(), &want);
+        for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+            let tolerance = 2.0e-5 + 2.0e-5 * expected.abs();
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "attention output {index}: actual {actual}, expected {expected}, difference {}, tolerance {tolerance}",
+                (actual - expected).abs()
+            );
+        }
     }
 
-    /// Verifies that the `dot_f32` helper produces results within 1e-4 relative
-    /// error of a scalar reference for various slice lengths, including sizes
-    /// with non-zero tails after 8-element or 16-element boundaries.
-    ///
-    /// AVX2 parallel accumulation may produce slightly different f32 results
-    /// from the scalar sequential sum; this tolerance reflects the bounded error.
+    /// Verifies SIMD dot products against a scalar sequential sum using the
+    /// standard `2 γ_n Σ|a_i b_i|` comparison tolerance. The factor two accounts
+    /// for comparing two rounded evaluation orders rather than either one to the
+    /// exact real-number dot product.
     #[test]
     fn dot_f32_matches_scalar_reference_for_various_lengths() {
         let lengths = [1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133];
-        for n in lengths {
-            // Values in [-1, 1] using cycling to keep magnitudes small.
-            let a: Vec<f32> = (0..n)
-                .map(|i| ((i % 11) as f32 - 5.0) / 11.0)
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(
+            crate::backend::has_simd_x86(),
+            "this x86 regression requires AVX2+FMA"
+        );
+        for length in lengths {
+            let left: Vec<f32> = (0..length)
+                .map(|index| mixed_scale_value(index, 0x1357))
                 .collect();
-            let b: Vec<f32> = (0..n)
-                .map(|i| ((i % 13) as f32 - 6.0) / 13.0)
+            let right: Vec<f32> = (0..length)
+                .map(|index| mixed_scale_value(index, 0x9753))
                 .collect();
-            let scalar: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
-            let got = dot_f32(&a, &b);
-            // Bound: f32::EPSILON * n * 1.0 (max element magnitude ≤ 1).
-            let tolerance = (n as f32) * f32::EPSILON * 4.0;
+            let scalar: f32 = left
+                .iter()
+                .zip(&right)
+                .map(|(left_element, right_element)| left_element * right_element)
+                .sum();
+            let actual = dot_f32(&left, &right);
+            let tolerance = dot_comparison_tolerance(&left, &right);
             assert!(
-                (got - scalar).abs() <= tolerance.max(1e-6),
-                "dot_f32 n={n}: got {got}, scalar {scalar}, diff {}, tolerance {}",
-                (got - scalar).abs(),
+                (actual - scalar).abs() <= tolerance,
+                "dot_f32 length={length}: actual {actual}, scalar {scalar}, difference {}, tolerance {}",
+                (actual - scalar).abs(),
                 tolerance
             );
         }
@@ -1632,12 +1773,8 @@ mod tests {
     fn axpy_f32_matches_scalar_reference_for_various_lengths() {
         let lengths = [1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133];
         for n in lengths {
-            let src: Vec<f32> = (0..n)
-                .map(|i| ((i % 13) as f32 - 6.0) / 13.0)
-                .collect();
-            let init: Vec<f32> = (0..n)
-                .map(|i| ((i % 7) as f32 - 3.0) / 7.0)
-                .collect();
+            let src: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) / 13.0).collect();
+            let init: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) / 7.0).collect();
             let scalar_val = 0.37_f32;
 
             // Scalar reference.
@@ -1656,6 +1793,62 @@ mod tests {
                     "axpy_f32 n={n} i={i}: got {g}, want {w}"
                 );
             }
+        }
+    }
+
+    /// Mirrors the P·V decode loop by applying 257 probability-weighted value
+    /// rows. This covers repeated AVX2 FMADD accumulation rather than only one
+    /// helper call.
+    #[test]
+    fn axpy_f32_many_weighted_rows_matches_scalar_reference() {
+        const KEY_COUNT: usize = 257;
+        const HEAD_WIDTH: usize = 128;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(
+            crate::backend::has_simd_x86(),
+            "this x86 regression requires AVX2+FMA"
+        );
+
+        let unnormalized_probabilities: Vec<f32> = (0..KEY_COUNT)
+            .map(|key_index| (mixed_scale_value(key_index, 0xabcd).abs() + 0.01).exp())
+            .collect();
+        let probability_sum: f32 = unnormalized_probabilities.iter().sum();
+        let probabilities: Vec<f32> = unnormalized_probabilities
+            .iter()
+            .map(|probability| probability / probability_sum)
+            .collect();
+        let values: Vec<f32> = (0..KEY_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xcafe))
+            .collect();
+
+        let mut expected = vec![0.0_f32; HEAD_WIDTH];
+        let mut actual = vec![0.0_f32; HEAD_WIDTH];
+        for (key_index, probability) in probabilities.iter().copied().enumerate() {
+            let value_row = &values[key_index * HEAD_WIDTH..(key_index + 1) * HEAD_WIDTH];
+            for (destination, source) in expected.iter_mut().zip(value_row) {
+                *destination += probability * source;
+            }
+            axpy_f32(&mut actual, probability, value_row);
+        }
+
+        for dimension_index in 0..HEAD_WIDTH {
+            let absolute_term_sum: f32 = (0..KEY_COUNT)
+                .map(|key_index| {
+                    (probabilities[key_index] * values[key_index * HEAD_WIDTH + dimension_index])
+                        .abs()
+                })
+                .sum();
+            let unit_roundoff = 0.5 * f32::EPSILON;
+            let gamma = KEY_COUNT as f32 * unit_roundoff / (1.0 - KEY_COUNT as f32 * unit_roundoff);
+            let tolerance = 2.0 * gamma * absolute_term_sum + 2.0 * f32::MIN_POSITIVE;
+            assert!(
+                (actual[dimension_index] - expected[dimension_index]).abs() <= tolerance,
+                "P·V dimension {dimension_index}: actual {}, expected {}, difference {}, tolerance {tolerance}",
+                actual[dimension_index],
+                expected[dimension_index],
+                (actual[dimension_index] - expected[dimension_index]).abs()
+            );
         }
     }
 }

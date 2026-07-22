@@ -1,0 +1,4 @@
+### 2026-07-22: Harden CPU GQA SIMD numerical validation
+**By:** Leon
+**What:** Replaced the incorrect dot-product error claim with the standard `γ_n × Σ|a_i b_i|` forward-error scale, made the long-context parity fixture exercise 128-wide AVX2+FMA dot and AXPY paths with mixed-scale cancellation-heavy data, and added a 257-key weighted-value accumulation regression.
+**Why:** Chew rejected the original tests because head width 2 bypassed SIMD and a single AXPY update did not represent decode. Both AVX2 regressions failed under temporary helper mutations and passed after restoration; the required MLAS GQA suite passed 17 tests. A 16-token Qwen2.5-Coder-7B profiler comparison produced identical optimized and forced-scalar token IDs `[2014, 5978, 34776, 19753, 11, 279, 6500, 21896, 6529, 16895, 6337, 5711, 264, 76369, 729, 448]`.
