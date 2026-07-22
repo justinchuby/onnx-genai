@@ -9,10 +9,10 @@
 //! and its graph I/O metadata and named-tensor execution are exposed without any
 //! ORT type appearing on the engine's construction path.
 //!
-//! Note this covers GAP 1 (the component-session seam) only. Wiring these
-//! backend-neutral sessions into the pipeline decode loop — which still routes
-//! state through ORT `Value`/`Session` — is the remaining native work (GAPs
-//! 2/3); see [`crate::pipeline`].
+//! This provides the GAP 1 component-session seam. GAP 2's native target
+//! step-input binding lives in [`crate::native_decode`]; wiring these neutral
+//! sessions and tensors into the ORT-owned pipeline decode loop is the remaining
+//! GAP 3 work; see [`crate::pipeline`].
 
 use crate::native_decode::NativeDecodeDevice;
 use onnx_genai_metadata::{

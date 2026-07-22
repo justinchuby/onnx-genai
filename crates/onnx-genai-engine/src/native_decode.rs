@@ -14,7 +14,9 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -190,9 +192,7 @@ fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
 pub struct NativeDecodeSession {
     session: InferenceSession,
-    input_ids: String,
-    attention_mask: String,
-    position_ids: Option<String>,
+    step_inputs: Vec<NativeStepInputBinding>,
     logits: String,
     hidden_output: Option<String>,
     kv_inputs: Vec<String>,
@@ -202,6 +202,21 @@ pub struct NativeDecodeSession {
     trace: TraceContext,
     current_len: usize,
     last_hidden: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeStepInputSource {
+    TokenIds,
+    InputsEmbeds,
+    AttentionMask,
+    PositionIds,
+    Routed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeStepInputBinding {
+    name: String,
+    source: NativeStepInputSource,
 }
 
 impl NativeDecodeSession {
@@ -716,18 +731,45 @@ impl NativeDecodeSession {
         let sequence_source = io
             .and_then(|io| io.sequence_source)
             .unwrap_or(SequenceInputKind::TokenIds);
-        if sequence_source != SequenceInputKind::TokenIds {
-            bail!(
-                "native target decoder requires metadata sequence_source 'token_ids'; got '{sequence_source:?}'. Embedding-driven graphs are supported as proposer sessions, while generation still requires a token-driven target decoder"
-            );
-        }
-        let input_ids = declared_or_detected_input(
-            &input_names,
-            io.and_then(|io| io.token_input.as_deref()),
-            &["input_ids", "decoder_input_ids"],
-            "token_input",
-        )?;
-        let attention_mask = declared_or_detected_input(
+        let token_input = if sequence_source == SequenceInputKind::TokenIds {
+            Some(declared_or_detected_input(
+                &input_names,
+                io.and_then(|io| io.token_input.as_deref()),
+                &["input_ids", "decoder_input_ids"],
+                "token_input",
+            )?)
+        } else {
+            io.and_then(|io| io.token_input.as_deref())
+                .map(|name| {
+                    declared_or_detected_input(
+                        &input_names,
+                        Some(name),
+                        &["input_ids", "decoder_input_ids"],
+                        "token_input",
+                    )
+                })
+                .transpose()?
+        };
+        let inputs_embeds_input = if sequence_source == SequenceInputKind::InputsEmbeds {
+            Some(declared_or_detected_input(
+                &input_names,
+                io.and_then(|io| io.inputs_embeds_input.as_deref()),
+                &["inputs_embeds"],
+                "inputs_embeds_input",
+            )?)
+        } else {
+            io.and_then(|io| io.inputs_embeds_input.as_deref())
+                .map(|name| {
+                    declared_or_detected_input(
+                        &input_names,
+                        Some(name),
+                        &["inputs_embeds"],
+                        "inputs_embeds_input",
+                    )
+                })
+                .transpose()?
+        };
+        let attention_mask = optional_declared_or_detected_input(
             &input_names,
             io.and_then(|io| io.attention_mask_input.as_deref()),
             &["attention_mask"],
@@ -815,7 +857,71 @@ impl NativeDecodeSession {
             );
         }
 
+        let mut declared_sources = HashMap::new();
+        for (name, source) in [
+            (token_input.as_deref(), NativeStepInputSource::TokenIds),
+            (
+                inputs_embeds_input.as_deref(),
+                NativeStepInputSource::InputsEmbeds,
+            ),
+            (
+                attention_mask.as_deref(),
+                NativeStepInputSource::AttentionMask,
+            ),
+            (position_ids.as_deref(), NativeStepInputSource::PositionIds),
+        ] {
+            let Some(name) = name else {
+                continue;
+            };
+            if let Some(existing) = declared_sources.insert(name.to_owned(), source) {
+                bail!(
+                    "native target decoder metadata assigns input '{name}' to both {existing:?} and {source:?}; each generated step-input role must name a distinct graph port"
+                );
+            }
+        }
+        let step_inputs = input_names
+            .iter()
+            .filter(|name| !kv_inputs.contains(name))
+            .map(|name| NativeStepInputBinding {
+                name: name.clone(),
+                source: declared_sources
+                    .get(name)
+                    .copied()
+                    .unwrap_or(NativeStepInputSource::Routed),
+            })
+            .collect::<Vec<_>>();
+        let required_sequence_source = match sequence_source {
+            SequenceInputKind::TokenIds => NativeStepInputSource::TokenIds,
+            SequenceInputKind::InputsEmbeds => NativeStepInputSource::InputsEmbeds,
+        };
+        if !step_inputs
+            .iter()
+            .any(|binding| binding.source == required_sequence_source)
+        {
+            bail!(
+                "native target decoder metadata sequence_source '{sequence_source:?}' has no matching declared graph input"
+            );
+        }
+
         let cuda = if session.device_id().device_type == DeviceType::Cuda {
+            if sequence_source != SequenceInputKind::TokenIds
+                || step_inputs.iter().any(|binding| {
+                    matches!(
+                        binding.source,
+                        NativeStepInputSource::InputsEmbeds | NativeStepInputSource::Routed
+                    )
+                })
+            {
+                bail!(
+                    "native CUDA target decode does not yet support metadata-declared embedding or routed step inputs; use the CPU native device for this contract until generic device bindings are implemented"
+                );
+            }
+            let token_input = token_input
+                .as_deref()
+                .context("native CUDA target decode is missing its token input binding")?;
+            let attention_mask = attention_mask
+                .as_deref()
+                .context("native CUDA target decode requires a declared attention-mask input")?;
             let max_len = match cuda_options.kv_max_len {
                 Some(0) => bail!("CUDA KV max length must be greater than zero"),
                 Some(value) => value,
@@ -834,8 +940,8 @@ impl NativeDecodeSession {
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
-                    input_ids: &input_ids,
-                    attention_mask: &attention_mask,
+                    input_ids: token_input,
+                    attention_mask,
                     position_ids: position_ids.as_deref(),
                     logits: &logits,
                 },
@@ -849,9 +955,7 @@ impl NativeDecodeSession {
 
         Ok(Self {
             session,
-            input_ids,
-            attention_mask,
-            position_ids,
+            step_inputs,
             logits,
             hidden_output,
             kv_inputs,
@@ -1007,6 +1111,36 @@ impl NativeDecodeSession {
         <Self as DecodeBackend>::decode(self, token_ids, past_len)
     }
 
+    /// Run one target step with arbitrary named tensors supplied by pipeline
+    /// routing. Generated roles (token ids, attention mask, and position ids)
+    /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its
+    /// exact graph port name from `step_inputs`.
+    pub(crate) fn decode_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if token_ids.is_empty() {
+            bail!("native decode requires at least one token");
+        }
+        if past_len != self.current_len {
+            bail!(
+                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
+                self.current_len
+            );
+        }
+        if self.cuda.is_some() {
+            if !step_inputs.is_empty() {
+                bail!(
+                    "native CUDA target decode does not yet accept routed host step inputs; use the CPU native device until generic device bindings are implemented"
+                );
+            }
+            return self.decode_cuda(token_ids, past_len);
+        }
+        self.decode_host(token_ids, past_len, step_inputs)
+    }
+
     /// Rewind by prefix-slicing every carried host KV tensor.
     pub fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
         <Self as DecodeBackend>::rewind(self, target_len)
@@ -1061,6 +1195,151 @@ impl NativeDecodeSession {
         make_empty_input_tensor(&self.session, name)
     }
 
+    fn step_input_name(&self, source: NativeStepInputSource) -> Option<&str> {
+        self.step_inputs
+            .iter()
+            .find(|binding| binding.source == source)
+            .map(|binding| binding.name.as_str())
+    }
+
+    fn decode_host(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        supplied_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let total_len = past_len
+            .checked_add(token_ids.len())
+            .context("native decode context length overflow")?;
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let mut supplied = HashMap::with_capacity(supplied_inputs.len());
+        for (name, tensor) in supplied_inputs {
+            if supplied.insert(name.as_str(), tensor).is_some() {
+                bail!("native decode received duplicate routed step input '{name}'");
+            }
+        }
+
+        let mut owned = Vec::with_capacity(self.step_inputs.len() + self.kv_inputs.len());
+        for binding in &self.step_inputs {
+            let tensor = match binding.source {
+                NativeStepInputSource::TokenIds => {
+                    Tensor::from_i64(&[1, token_ids.len()], &ids)?
+                }
+                NativeStepInputSource::AttentionMask => {
+                    Tensor::from_i64(&[1, total_len], &vec![1; total_len])?
+                }
+                NativeStepInputSource::PositionIds => {
+                    let positions = (past_len..total_len)
+                        .map(|position| {
+                            i64::try_from(position).context("position id exceeds i64 range")
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    Tensor::from_i64(&[1, token_ids.len()], &positions)?
+                }
+                NativeStepInputSource::InputsEmbeds => supplied
+                    .remove(binding.name.as_str())
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "declared inputs_embeds input '{}' was not supplied to the native decode step; route the current embedding component output to this exact decoder port",
+                            binding.name
+                        )
+                    })?,
+                NativeStepInputSource::Routed => supplied
+                    .remove(binding.name.as_str())
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "native decode graph input '{}' has no generated role and no routed step tensor; declare a pipeline dataflow edge to this exact decoder port",
+                            binding.name
+                        )
+                    })?,
+            };
+            owned.push((binding.name.clone(), tensor));
+        }
+        if !supplied.is_empty() {
+            let mut unknown = supplied.keys().copied().collect::<Vec<_>>();
+            unknown.sort_unstable();
+            bail!(
+                "native decode received routed step inputs that are not declared graph ports: {unknown:?}"
+            );
+        }
+        for name in &self.kv_inputs {
+            let tensor = match self.past.remove(name) {
+                Some(tensor) => tensor,
+                None => self.make_empty_past(name)?,
+            };
+            owned.push((name.clone(), tensor));
+        }
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let run_result: anyhow::Result<_> = if token_ids.len() == 1 {
+            onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
+                self.session.run(&bindings).map_err(anyhow::Error::from)
+            })
+        } else {
+            self.session.run(&bindings).map_err(anyhow::Error::from)
+        };
+        let outputs = match run_result {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native decoder forward pass failed{diagnosis}: {error}");
+            }
+        };
+        let names = self
+            .session
+            .outputs()
+            .iter()
+            .map(|meta| meta.name.clone())
+            .collect::<Vec<_>>();
+        let mut named = names.into_iter().zip(outputs).collect::<HashMap<_, _>>();
+        let logits = named
+            .remove(&self.logits)
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        let logits = extract_logits(&logits)?;
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
+        self.last_hidden = self
+            .hidden_output
+            .as_ref()
+            .map(|name| {
+                let tensor = named.remove(name).with_context(|| {
+                    format!("native decoder omitted declared hidden output '{name}'")
+                })?;
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))
+            })
+            .transpose()?;
+
+        let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
+        for (present, past) in &self.present_to_past {
+            let tensor = named
+                .remove(present)
+                .with_context(|| format!("native decoder omitted present output '{present}'"))?;
+            let seq_axis =
+                tensor.shape.len().checked_sub(2).with_context(|| {
+                    format!("native present tensor '{present}' rank is below 2")
+                })?;
+            if tensor.shape[seq_axis] != total_len {
+                bail!(
+                    "native present tensor '{present}' sequence length {} does not match {total_len}",
+                    tensor.shape[seq_axis]
+                );
+            }
+            next_past.insert(past.clone(), tensor);
+        }
+        self.past = next_past;
+        self.current_len = total_len;
+        Ok(logits)
+    }
+
     fn decode_cuda(
         &mut self,
         token_ids: &[TokenId],
@@ -1069,6 +1348,13 @@ impl NativeDecodeSession {
         let total_len = past_len
             .checked_add(token_ids.len())
             .context("native decode context length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
         let state = self
             .cuda
             .as_mut()
@@ -1115,13 +1401,13 @@ impl NativeDecodeSession {
             .collect::<Vec<_>>();
         let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
         let mut owned = Vec::with_capacity(2);
-        owned.push((self.input_ids.clone(), input_ids));
-        if let Some(position_ids_name) = &self.position_ids {
+        owned.push((token_input, input_ids));
+        if let Some(position_ids_name) = position_input {
             let positions = (past_len..total_len)
                 .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             owned.push((
-                position_ids_name.clone(),
+                position_ids_name,
                 Tensor::from_i64(&[1, token_ids.len()], &positions)?,
             ));
         }
@@ -1227,6 +1513,13 @@ impl NativeDecodeSession {
         let total_len = past_len
             .checked_add(token_ids.len())
             .context("native decode context length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
         let state = self
             .cuda
             .as_mut()
@@ -1245,13 +1538,13 @@ impl NativeDecodeSession {
             .collect::<Vec<_>>();
         let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
         let mut owned = Vec::with_capacity(2);
-        owned.push((self.input_ids.clone(), input_ids));
-        if let Some(position_ids_name) = &self.position_ids {
+        owned.push((token_input, input_ids));
+        if let Some(position_ids_name) = position_input {
             let positions = (past_len..total_len)
                 .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             owned.push((
-                position_ids_name.clone(),
+                position_ids_name,
                 Tensor::from_i64(&[1, token_ids.len()], &positions)?,
             ));
         }
@@ -1875,114 +2168,7 @@ impl DecodeBackend for NativeDecodeSession {
     }
 
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
-        if token_ids.is_empty() {
-            bail!("native decode requires at least one token");
-        }
-        if past_len != self.current_len {
-            bail!(
-                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
-                self.current_len
-            );
-        }
-        if self.cuda.is_some() {
-            return self.decode_cuda(token_ids, past_len);
-        }
-        let total_len = past_len
-            .checked_add(token_ids.len())
-            .context("native decode context length overflow")?;
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
-        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
-        let attention_mask = Tensor::from_i64(&[1, total_len], &vec![1; total_len])?;
-
-        let mut owned = Vec::with_capacity(3 + self.kv_inputs.len());
-        owned.push((self.input_ids.clone(), input_ids));
-        owned.push((self.attention_mask.clone(), attention_mask));
-        if let Some(position_ids_name) = &self.position_ids {
-            let positions = (past_len..total_len)
-                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let position_ids = Tensor::from_i64(&[1, token_ids.len()], &positions)?;
-            owned.push((position_ids_name.clone(), position_ids));
-        }
-        for name in &self.kv_inputs {
-            let tensor = match self.past.remove(name) {
-                Some(tensor) => tensor,
-                None => self.make_empty_past(name)?,
-            };
-            owned.push((name.clone(), tensor));
-        }
-        let bindings = owned
-            .iter()
-            .map(|(name, tensor)| (name.as_str(), tensor))
-            .collect::<Vec<_>>();
-        // Single-token CPU decode: run the whole forward inside one decode-pool
-        // installation so the ~121 per-op `MatMulNBits` projections execute
-        // inline on resident workers instead of each re-installing the pool
-        // (eliminating the per-op fork-join crossing). Prefill (M>1) and the CUDA
-        // path (handled above) must keep using the global pool, so gate on M==1.
-        let run_result: anyhow::Result<_> = if token_ids.len() == 1 {
-            onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
-                self.session.run(&bindings).map_err(anyhow::Error::from)
-            })
-        } else {
-            self.session.run(&bindings).map_err(anyhow::Error::from)
-        };
-        let outputs = match run_result {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native decoder forward pass failed{diagnosis}: {error}");
-            }
-        };
-        let names = self
-            .session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.clone())
-            .collect::<Vec<_>>();
-        let mut named = names.into_iter().zip(outputs).collect::<HashMap<_, _>>();
-        let logits = named
-            .remove(&self.logits)
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let logits = extract_logits(&logits)?;
-        if logits.iter().flatten().any(|value| !value.is_finite()) {
-            bail!("native decoder produced non-finite logits");
-        }
-        self.last_hidden = self
-            .hidden_output
-            .as_ref()
-            .map(|name| {
-                let tensor = named.remove(name).with_context(|| {
-                    format!("native decoder omitted declared hidden output '{name}'")
-                })?;
-                extract_last_row(&tensor)
-                    .with_context(|| format!("read native decoder hidden output '{name}'"))
-            })
-            .transpose()?;
-
-        let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
-        for (present, past) in &self.present_to_past {
-            let tensor = named
-                .remove(present)
-                .with_context(|| format!("native decoder omitted present output '{present}'"))?;
-            let seq_axis =
-                tensor.shape.len().checked_sub(2).with_context(|| {
-                    format!("native present tensor '{present}' rank is below 2")
-                })?;
-            if tensor.shape[seq_axis] != total_len {
-                bail!(
-                    "native present tensor '{present}' sequence length {} does not match {total_len}",
-                    tensor.shape[seq_axis]
-                );
-            }
-            next_past.insert(past.clone(), tensor);
-        }
-        self.past = next_past;
-        self.current_len = total_len;
-        Ok(logits)
+        self.decode_with_step_inputs(token_ids, past_len, &[])
     }
 
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
@@ -2614,6 +2800,125 @@ mod tests {
         InferenceSession::from_graph(graph).expect("build tiny decoder")
     }
 
+    fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
+        ModelIoSpec {
+            sequence_source: Some(sequence_source),
+            kv_ownership: Some(KvOwnership::Owned),
+            token_input: (sequence_source == SequenceInputKind::TokenIds)
+                .then(|| "input_ids".into()),
+            inputs_embeds_input: (sequence_source == SequenceInputKind::InputsEmbeds)
+                .then(|| "embedded_sequence".into()),
+            attention_mask_input: Some("attention_mask".into()),
+            position_ids_input: None,
+            logits_output: Some("logits".into()),
+            hidden_output: None,
+            kv_inputs: Some(vec!["cache_key".into()]),
+            kv_outputs: Some(vec!["next_key".into()]),
+            encoder_hidden_states_input: None,
+            cross_kv_inputs: None,
+            cross_kv_outputs: None,
+            kv_update: None,
+            state_pairs: None,
+            optional_inputs: BTreeMap::new(),
+        }
+    }
+
+    fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 11);
+        let batch = graph.intern_symbol("batch");
+        let sequence = graph.intern_symbol("sequence");
+        let total = graph.intern_symbol("total");
+        let past = graph.intern_symbol("past");
+        let embedded_sequence = graph.create_named_value(
+            "embedded_sequence",
+            DataType::Float32,
+            vec![batch.into(), sequence.into(), 1.into()],
+        );
+        let attention_mask = graph.create_named_value(
+            "attention_mask",
+            DataType::Int64,
+            vec![batch.into(), total.into()],
+        );
+        let routed = with_routed_input.then(|| {
+            graph.create_named_value(
+                "routed_features",
+                DataType::Float32,
+                vec![batch.into(), sequence.into(), 1.into()],
+            )
+        });
+        let cache_key = graph.create_named_value(
+            "cache_key",
+            DataType::Float32,
+            vec![batch.into(), 1.into(), past.into(), 1.into()],
+        );
+        graph.add_input(embedded_sequence);
+        graph.add_input(attention_mask);
+        if let Some(routed) = routed {
+            graph.add_input(routed);
+        }
+        graph.add_input(cache_key);
+
+        let logits = graph.create_named_value(
+            "logits",
+            DataType::Float32,
+            vec![batch.into(), sequence.into(), 1.into()],
+        );
+        if let Some(routed) = routed {
+            insert_op(
+                &mut graph,
+                "Add",
+                vec![embedded_sequence, routed],
+                logits,
+                &[],
+            );
+        } else {
+            insert_op(&mut graph, "Identity", vec![embedded_sequence], logits, &[]);
+        }
+        let next_key = graph.create_named_value(
+            "next_key",
+            DataType::Float32,
+            vec![1.into(), 1.into(), 2.into(), 1.into()],
+        );
+        insert_op(
+            &mut graph,
+            "Constant",
+            vec![],
+            next_key,
+            &[(
+                "value",
+                Attribute::Tensor(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![1, 1, 2, 1],
+                    vec![0; 2 * std::mem::size_of::<f32>()],
+                )),
+            )],
+        );
+        for output in [logits, next_key] {
+            graph.add_output(output);
+        }
+        session_from_graph(graph)
+    }
+
+    fn tiny_step_producer() -> InferenceSession {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let input = graph.create_named_value(
+            "producer_input",
+            DataType::Float32,
+            vec![1.into(), 2.into(), 1.into()],
+        );
+        let output = graph.create_named_value(
+            "producer_output",
+            DataType::Float32,
+            vec![1.into(), 2.into(), 1.into()],
+        );
+        graph.add_input(input);
+        insert_op(&mut graph, "Identity", vec![input], output, &[]);
+        graph.add_output(output);
+        session_from_graph(graph)
+    }
+
     fn session_from_graph(graph: Graph) -> InferenceSession {
         let bytes = onnx_std::Model::new(graph)
             .to_proto()
@@ -3058,6 +3363,84 @@ mod tests {
         assert_eq!(session.current_len(), 2);
         session.decode(&[5], 2).expect("decode after rewind");
         assert_eq!(session.current_len(), 3);
+    }
+
+    #[test]
+    fn native_target_step_preserves_token_driven_binding() {
+        let mut session =
+            NativeDecodeSession::from_session(tiny_decoder(false)).expect("load token target");
+        assert!(session.step_inputs.iter().any(|binding| {
+            binding.name == "input_ids" && binding.source == NativeStepInputSource::TokenIds
+        }));
+        assert!(
+            !session
+                .step_inputs
+                .iter()
+                .any(|binding| binding.source == NativeStepInputSource::Routed)
+        );
+
+        let logits = session.decode(&[3, 5], 0).expect("token target step");
+        assert_eq!(logits, vec![vec![3.0], vec![5.0]]);
+    }
+
+    #[test]
+    fn native_target_step_binds_declared_inputs_embeds_instead_of_tokens() {
+        let io = target_io(SequenceInputKind::InputsEmbeds);
+        let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+            tiny_embedding_target(false),
+            None,
+            Some(&io),
+        )
+        .expect("load embedding target");
+        assert!(session.step_inputs.iter().any(|binding| {
+            binding.name == "embedded_sequence"
+                && binding.source == NativeStepInputSource::InputsEmbeds
+        }));
+        assert!(
+            !session
+                .step_inputs
+                .iter()
+                .any(|binding| binding.source == NativeStepInputSource::TokenIds)
+        );
+
+        let embeddings = Tensor::from_f32(&[1, 2, 1], &[1.25, 2.5]).expect("embedding tensor");
+        let logits = session
+            .decode_with_step_inputs(&[101, 102], 0, &[("embedded_sequence".into(), embeddings)])
+            .expect("embedding target step");
+        assert_eq!(logits, vec![vec![1.25], vec![2.5]]);
+    }
+
+    #[test]
+    fn native_target_step_resolves_routed_component_output_by_declared_port() {
+        let mut producer = tiny_step_producer();
+        let producer_input = Tensor::from_f32(&[1, 2, 1], &[10.0, 20.0]).expect("producer input");
+        let mut producer_outputs = producer
+            .run(&[("producer_input", &producer_input)])
+            .expect("producer step");
+        let routed = producer_outputs.remove(0);
+
+        let io = target_io(SequenceInputKind::InputsEmbeds);
+        let mut target = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+            tiny_embedding_target(true),
+            None,
+            Some(&io),
+        )
+        .expect("load routed target");
+        assert!(target.step_inputs.iter().any(|binding| {
+            binding.name == "routed_features" && binding.source == NativeStepInputSource::Routed
+        }));
+        let embeddings = Tensor::from_f32(&[1, 2, 1], &[1.0, 2.0]).expect("embedding tensor");
+        let logits = target
+            .decode_with_step_inputs(
+                &[7, 8],
+                0,
+                &[
+                    ("embedded_sequence".into(), embeddings),
+                    ("routed_features".into(), routed),
+                ],
+            )
+            .expect("routed target step");
+        assert_eq!(logits, vec![vec![11.0], vec![22.0]]);
     }
 
     #[test]

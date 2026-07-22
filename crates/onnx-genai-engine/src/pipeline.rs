@@ -187,7 +187,7 @@ fn native_backend_not_compiled_error() -> anyhow::Error {
 /// Backend-neutral construction (GAP 1) is complete once every component loads
 /// and exposes graph I/O metadata through the trait. Wiring those neutral
 /// sessions into the pipeline decode loop — which still routes per-step state
-/// through ORT `Value`/`Session` — is the remaining native work (GAPs 2/3), so
+/// through ORT `Value`/`Session` — is the remaining native work (GAP 3), so
 /// this returns a clear, actionable error naming that precise next blocker
 /// rather than a blanket "native backend not supported" rejection at
 /// construction.
@@ -205,12 +205,12 @@ fn build_native_pipeline_and_report_gap(
         "native pipeline decode is not yet implemented. All {} pipeline component(s) loaded \
          successfully on the native backend and expose their graph I/O through the \
          backend-neutral component-session interface (components: {}), so backend selection and \
-         construction are backend-neutral. The remaining work is wiring these native sessions \
-         into the pipeline decode loop, which still routes per-step decode state through ORT \
-         tensors/sessions: (next) generalize native target decode beyond token-id-only sessions \
-         to metadata-declared embedding inputs (`inputs_embeds`) and routed per-layer inputs, \
-         then convert `DecodeState`/pipeline execution off ORT `Value`/`Session`. To run this \
-         pipeline today, set decode_backend = EngineDecodeBackend::Ort (or \
+         construction are backend-neutral. Native target decode now accepts metadata-declared \
+         token or embedding sequence inputs plus arbitrary named routed step tensors. The \
+         remaining GAP 3 work is replacing `DecodeState` and `PipelineDecodeLoopBackend` ownership \
+         of ORT `Value`/`Session` with backend-neutral tensors/component sessions, then invoking \
+         the native target step with those routed tensors. To run this pipeline today, set \
+         decode_backend = EngineDecodeBackend::Ort (or \
          ONNX_GENAI_BACKEND=ort).",
         components.len(),
         component_list,
