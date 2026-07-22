@@ -30,10 +30,14 @@ pub mod capabilities {
     pub const DUAL_SEQUENCE_INPUTS: &str = "dual_sequence_inputs";
 }
 
+pub mod component;
 pub mod parser;
 pub mod schema;
 pub mod validation;
 
+pub use component::{
+    ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
+};
 pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, load_metadata,
