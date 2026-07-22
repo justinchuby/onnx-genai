@@ -777,6 +777,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
     const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
     __half* __restrict__ output,
     const int k,
@@ -784,6 +785,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
     const int block_size,
     const int k_blocks,
     const int blob_size,
+    const int zp_row_bytes,
     const int scales_fp16,
     const int bias_post_round)
 {
@@ -805,14 +807,31 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
                     ((long)column * k_blocks + block) * blob_size + quarter * 4;
                 const unsigned int packed_word =
                     *reinterpret_cast<const unsigned int*>(packed + packed_start);
+                int zero_point = 8;
+                if (zero_points) {
+                    const unsigned char zp =
+                        zero_points[(long)column * zp_row_bytes + block / 2];
+                    zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+                }
                 if (depth + 8 <= k) {
-                    block_partial = dot_int4x8_f16(packed_word, activation + depth);
+                    if (zero_points) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int q =
+                                (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            block_partial +=
+                                (float)q * __half2float(activation[depth + i]);
+                        }
+                    } else {
+                        block_partial = dot_int4x8_f16(packed_word, activation + depth);
+                    }
                 } else if (depth < k) {
                     const int valid = min(8, k - depth);
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         if (i < valid) {
-                            const int q = (int)((packed_word >> (i * 4)) & 15u) - 8;
+                            const int q =
+                                (int)((packed_word >> (i * 4)) & 15u) - zero_point;
                             block_partial +=
                                 (float)q * __half2float(activation[depth + i]);
                         }
@@ -845,6 +864,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
     const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
     __half* __restrict__ output,
     const int k,
@@ -852,10 +872,13 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
     const int block_size,
     const int k_blocks,
     const int blob_size,
+    const int zp_row_bytes,
     const int scales_fp16,
     const int bias_post_round)
 {
     (void)block_size;
+    (void)zero_points;
+    (void)zp_row_bytes;
     (void)scales_fp16;
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
@@ -1076,6 +1099,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
     const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
     __half* __restrict__ output,
     const int k,
@@ -1083,10 +1107,13 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     const int block_size,
     const int k_blocks,
     const int blob_size,
+    const int zp_row_bytes,
     const int scales_fp16,
     const int bias_post_round)
 {
     (void)block_size;
+    (void)zero_points;
+    (void)zp_row_bytes;
     (void)scales_fp16;
     extern __shared__ uint4 activation_shared[];
     __shared__ float warp_sums[8][8];
@@ -1178,6 +1205,7 @@ struct F16GemvSelection {
 /// hard constraints, all derived from the kernel body:
 ///
 /// * `scales_fp16` and 4-bit weights (this fp16 GEMV path is always 4-bit),
+/// * no explicit zero-points (the specialized half2/down kernels encode zp=8),
 /// * `block_size == 32` and `K % 32 == 0` (full K-blocks; the kernel has no
 ///   partial-block tail),
 /// * the staged activation (`K * sizeof(f16)` bytes) plus the static
@@ -1192,9 +1220,11 @@ fn select_f16_gemv_variant(
     n: usize,
     block_size: usize,
     scales_fp16: bool,
+    has_zero_points: bool,
 ) -> F16GemvSelection {
     let staged_smem = k * std::mem::size_of::<half::f16>() + GEMV_F16_DOWN_STATIC_SMEM_BYTES;
-    let down_eligible = scales_fp16
+    let down_eligible = !has_zero_points
+        && scales_fp16
         && block_size == GEMV_F16_DOWN_BLOCK_SIZE
         && k.is_multiple_of(GEMV_F16_DOWN_BLOCK_SIZE)
         && staged_smem <= GEMV_F16_DOWN_MAX_SMEM_BYTES
@@ -1208,8 +1238,12 @@ fn select_f16_gemv_variant(
     } else {
         F16GemvSelection {
             variant: F16GemvVariant::General,
-            reason: "variant=general;class=not(tall_skinny K>N & block_size=32 & \
-                     scales=fp16 & K%32==0 & activation_smem<=48KiB)",
+            reason: if has_zero_points {
+                "variant=general;zero_points=explicit;down_projection requires symmetric zp=8"
+            } else {
+                "variant=general;class=not(tall_skinny K>N & block_size=32 & \
+                 scales=fp16 & K%32==0 & activation_smem<=48KiB)"
+            },
         }
     }
 }
@@ -1621,9 +1655,9 @@ impl MatMulNBitsKernel {
         require_flat_or_matrix_shape("scales", inputs[2].shape, self.n, k_blocks)?;
 
         let zero_points = optional_input(inputs, 3);
+        let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
         if let Some(zero_points) = zero_points {
             require_dtype("zero_points", zero_points.dtype, DataType::Uint8)?;
-            let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
             require_flat_or_matrix_shape("zero_points", zero_points.shape, self.n, zp_row_bytes)?;
         }
         let group_indices = optional_input(inputs, 4);
@@ -1717,24 +1751,17 @@ impl MatMulNBitsKernel {
                 k_blocks,
             );
         }
-        if zero_points.is_some() {
-            self.last_call_capture_safe.store(false, Ordering::Relaxed);
-            return Err(error(
-                "MatMulNBits CUDA fp16 int4 GEMV does not support explicit zero_points. Why: its \
-                 vectorized kernel is specialized for the symmetric zero point 8. How to fix: \
-                 omit symmetric int4 zero_points, use f32 activations, or select another execution \
-                 provider",
-            ));
-        }
         self.launch_f16_gemv(
             &inputs[0],
             &inputs[1],
             &inputs[2],
             scales_fp16,
+            zero_points,
             bias,
             &mut outputs[0],
             k_blocks,
             blob_size,
+            zp_row_bytes,
         )
     }
 
@@ -2113,19 +2140,28 @@ impl MatMulNBitsKernel {
         packed: &TensorView,
         scales: &TensorView,
         scales_fp16: bool,
+        zero_points: Option<&TensorView>,
         bias: Option<&TensorView>,
         output: &mut TensorMut,
         k_blocks: usize,
         blob_size: usize,
+        zp_row_bytes: usize,
     ) -> Result<()> {
-        let selection = select_f16_gemv_variant(self.k, self.n, self.block_size, scales_fp16);
+        let selection = select_f16_gemv_variant(
+            self.k,
+            self.n,
+            self.block_size,
+            scales_fp16,
+            zero_points.is_some(),
+        );
         let variant_name = match selection.variant {
             F16GemvVariant::DownProjection => "gemv_f16_down_projection",
             F16GemvVariant::General => "gemv_f16_general",
         };
         onnx_runtime_ep_api::record_kernel_variant!(
             variant_name,
-            "fp16-activation x int4 M==1 decode GEMV: {}",
+            "fp16-activation x int4 M==1 decode GEMV: zero_points={}; {}",
+            zero_points.is_some(),
             selection.reason
         );
         if bias.is_some() {
@@ -2149,10 +2185,12 @@ impl MatMulNBitsKernel {
             packed,
             scales,
             scales_fp16,
+            zero_points,
             bias,
             output,
             k_blocks,
             blob_size,
+            zp_row_bytes,
             selection,
         )
     }
@@ -2164,17 +2202,21 @@ impl MatMulNBitsKernel {
         packed: &TensorView,
         scales: &TensorView,
         scales_fp16: bool,
+        zero_points: Option<&TensorView>,
         bias: Option<&TensorView>,
         output: &mut TensorMut,
         k_blocks: usize,
         blob_size: usize,
+        zp_row_bytes: usize,
         selection: F16GemvSelection,
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 GEMV")?;
         let entry = match selection.variant {
             F16GemvVariant::DownProjection => GEMV_F16_DOWN_ENTRY,
-            F16GemvVariant::General if scales_fp16 => GEMV_F16_SCALES_F16_ENTRY,
+            F16GemvVariant::General if scales_fp16 && zero_points.is_none() => {
+                GEMV_F16_SCALES_F16_ENTRY
+            }
             F16GemvVariant::General => GEMV_F16_ENTRY,
         };
         let function = self
@@ -2183,6 +2225,9 @@ impl MatMulNBitsKernel {
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
         let bias_ptr = bias
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
             .unwrap_or(0);
@@ -2192,6 +2237,7 @@ impl MatMulNBitsKernel {
         let block_size = as_i32("block_size", self.block_size)?;
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
+        let zp_row_bytes = as_i32("zero-point row byte count", zp_row_bytes)?;
         let scales_fp16_flag: i32 = scales_fp16 as i32;
         let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
         let (threads, columns_per_block, shared_mem_bytes) = match selection.variant {
@@ -2214,6 +2260,7 @@ impl MatMulNBitsKernel {
             .arg(&activation_ptr)
             .arg(&packed_ptr)
             .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
             .arg(&bias_ptr)
             .arg(&output_ptr)
             .arg(&k)
@@ -2221,13 +2268,15 @@ impl MatMulNBitsKernel {
             .arg(&block_size)
             .arg(&k_blocks)
             .arg(&blob_size)
+            .arg(&zp_row_bytes)
             .arg(&scales_fp16_flag)
             .arg(&bias_post_round_flag);
-        // SAFETY: this path is restricted to symmetric block-32 M=1 fp16 inputs;
-        // all tensors were dtype/shape/contiguity validated above, the scalar ABI
-        // matches the selected fp16 GEMV entry point. Both variants use only
-        // registers and launch-time shared memory (no per-call alloc or sync), so
-        // the launch is legal to record into and replay from a CUDA graph.
+        // SAFETY: this path is restricted to block-32 M=1 fp16 inputs; all tensors
+        // were dtype/shape/contiguity validated above, including the optional
+        // packed per-block zero-point rows. The scalar ABI matches the selected
+        // fp16 GEMV entry point. Both variants use only registers and launch-time
+        // shared memory (no per-call alloc or sync), so the launch is legal to
+        // record into and replay from a CUDA graph.
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
@@ -2975,7 +3024,7 @@ mod tests {
         // the generalized selection is correct beyond one architecture.
         for (k, n) in [(QWEN_DOWN_K, QWEN_DOWN_N), (5632usize, 2048usize)] {
             assert_eq!(
-                select_f16_gemv_variant(k, n, 32, true).variant,
+                select_f16_gemv_variant(k, n, 32, true, false).variant,
                 F16GemvVariant::DownProjection,
                 "shape K={k}, N={n} must select the down variant under test"
             );
@@ -3068,9 +3117,11 @@ mod tests {
                     &scales_view,
                     true,
                     None,
+                    None,
                     &mut general_output,
                     k_blocks,
                     blob_size,
+                    k_blocks.div_ceil(2),
                     F16GemvSelection {
                         variant: F16GemvVariant::General,
                         reason: "variant=general;test=forced_reference",
@@ -3084,10 +3135,12 @@ mod tests {
                     &scales_view,
                     true,
                     None,
+                    None,
                     &mut down_output,
                     k_blocks,
                     blob_size,
-                    select_f16_gemv_variant(k, n, block_size, true),
+                    k_blocks.div_ceil(2),
+                    select_f16_gemv_variant(k, n, block_size, true, false),
                 )
                 .unwrap();
             runtime.synchronize().unwrap();
@@ -3132,7 +3185,7 @@ mod tests {
     fn fp16_gemv_variant_selection_is_structural() {
         // The down variant is selected by the tall-skinny (K>N) block-32 fp16
         // shape *class*, generalizing across models — not by a magic K/N.
-        let qwen = select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, true);
+        let qwen = select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, true, false);
         assert_eq!(qwen.variant, F16GemvVariant::DownProjection);
         assert_eq!(
             qwen.reason,
@@ -3142,7 +3195,7 @@ mod tests {
 
         // Non-Qwen tall-skinny down/output projections must also select it.
         for (k, n) in [(5632, 2048), (11008, 4096), (2048, 512), (4096, 4096 - 32)] {
-            let selection = select_f16_gemv_variant(k, n, 32, true);
+            let selection = select_f16_gemv_variant(k, n, 32, true, false);
             assert_eq!(
                 selection.variant,
                 F16GemvVariant::DownProjection,
@@ -3161,7 +3214,7 @@ mod tests {
             (4864, 896, 64, true),    // block_size != 32
         ];
         for (k, n, block_size, scales_fp16) in general_cases {
-            let selection = select_f16_gemv_variant(k, n, block_size, scales_fp16);
+            let selection = select_f16_gemv_variant(k, n, block_size, scales_fp16, false);
             assert_eq!(
                 selection.variant,
                 F16GemvVariant::General,
@@ -3171,8 +3224,15 @@ mod tests {
 
         // fp32 scales are never down-eligible even for a tall-skinny shape.
         assert_eq!(
-            select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, false).variant,
+            select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, false, false).variant,
             F16GemvVariant::General,
+        );
+
+        let asymmetric = select_f16_gemv_variant(QWEN_DOWN_K, QWEN_DOWN_N, 32, true, true);
+        assert_eq!(asymmetric.variant, F16GemvVariant::General);
+        assert_eq!(
+            asymmetric.reason,
+            "variant=general;zero_points=explicit;down_projection requires symmetric zp=8"
         );
     }
 
@@ -3336,7 +3396,7 @@ mod tests {
             device,
         );
 
-        let selection = select_f16_gemv_variant(k, n, block_size, true);
+        let selection = select_f16_gemv_variant(k, n, block_size, true, false);
         let kernel_nobias = MatMulNBitsKernel {
             runtime: runtime.clone(),
             k,
@@ -3368,9 +3428,11 @@ mod tests {
                 &scales_view,
                 true,
                 None,
+                None,
                 &mut nobias_output,
                 k_blocks,
                 blob_size,
+                k_blocks.div_ceil(2),
                 selection,
             )
             .unwrap();
@@ -3380,10 +3442,12 @@ mod tests {
                 &packed_view,
                 &scales_view,
                 true,
+                None,
                 Some(&bias_view),
                 &mut fused_output,
                 k_blocks,
                 blob_size,
+                k_blocks.div_ceil(2),
                 selection,
             )
             .unwrap();
@@ -3614,7 +3678,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             };
             // Reference: two standalone MatMulNBits projections.
             if m == 1 {
-                let selection = select_f16_gemv_variant(k, n, block_size, true);
+                let selection = select_f16_gemv_variant(k, n, block_size, true, false);
                 assert_eq!(
                     selection.variant,
                     F16GemvVariant::General,
@@ -3627,9 +3691,11 @@ extern "C" __global__ void ref_silu_mul_f16(
                         &scales_gate_view,
                         true,
                         None,
+                        None,
                         &mut gate_out,
                         k_blocks,
                         blob_size,
+                        k_blocks.div_ceil(2),
                         selection,
                     )
                     .unwrap();
@@ -3640,9 +3706,11 @@ extern "C" __global__ void ref_silu_mul_f16(
                         &scales_up_view,
                         true,
                         None,
+                        None,
                         &mut up_out,
                         k_blocks,
                         blob_size,
+                        k_blocks.div_ceil(2),
                         selection,
                     )
                     .unwrap();

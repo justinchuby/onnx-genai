@@ -553,7 +553,7 @@ fn run_f16_case_with_bits_and_shape(
         )],
     )?;
     assert_eq!(kernel.cuda_graph_compatible(), m == 1);
-    if bits == 8 && m == 1 {
+    if m == 1 && (bits == 8 || zero_points.is_some()) {
         let mut eager = vec![0u8; output_len * 2];
         // SAFETY: output allocation contains `output_len` fp16 values.
         unsafe { runtime.dtoh(&mut eager, cuptr(output_buffer.as_ptr()))? };
@@ -1666,6 +1666,61 @@ fn run_fp16_prefill_parity(bits: usize) {
 #[test]
 fn matmul_nbits_gpu_int4_fp16_prefill_matches_f64_reference() {
     run_fp16_prefill_parity(4);
+}
+
+#[test]
+fn matmul_nbits_gpu_int4_fp16_explicit_zero_points_match_cpu_reference() {
+    let Some(ep) = gpu() else { return };
+    let (k, n) = (77usize, 37usize);
+    let blocks = k.div_ceil(32);
+    let zp_row_bytes = blocks.div_ceil(2);
+    let activations: Vec<f16> = (0..k)
+        .map(|index| f16::from_f32(((index * 29 % 257) as f32 - 128.0) / 97.0))
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * 16)
+        .map(|index| ((index * 37 + index / 11 + 19) & 255) as u8)
+        .collect();
+    let scales: Vec<f16> = (0..n * blocks)
+        .map(|index| f16::from_f32(0.003 + (index * 17 % 31) as f32 * 0.0004))
+        .collect();
+    let mut zero_points = vec![0u8; n * zp_row_bytes];
+    for column in 0..n {
+        for block in 0..blocks {
+            let zero_point = ((column * 7 + block * 5 + 3) % 16) as u8;
+            zero_points[column * zp_row_bytes + block / 2] |= zero_point << (4 * (block % 2));
+        }
+    }
+
+    let actual = run_f16_case_with_bits(
+        &ep,
+        &activations,
+        &packed,
+        &scales,
+        Some(&zero_points),
+        k,
+        n,
+        4,
+    )
+    .unwrap();
+    let expected = f16_prefill_reference(
+        &activations,
+        &packed,
+        F16TestScales::F16(&scales),
+        Some(&zero_points),
+        1,
+        k,
+        n,
+        4,
+    );
+    for (column, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+        let want = f16::from_f32(want).to_f32();
+        let tolerance = 0.02f32.max(want.abs() * 2e-3);
+        assert!(
+            (got.to_f32() - want).abs() <= tolerance,
+            "column {column}: got={} expected={want} tolerance={tolerance}",
+            got.to_f32()
+        );
+    }
 }
 
 #[test]
