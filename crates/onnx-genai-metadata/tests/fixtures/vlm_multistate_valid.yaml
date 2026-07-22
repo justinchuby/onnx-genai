@@ -52,6 +52,8 @@ pipeline:
   positions:
     input: position_ids
     rank: 3
+    tensor_rank: 3
+    generation: processor_coordinates
     axes: [temporal, height, width]
     sections: [16, 24, 24]
     dtype: int64

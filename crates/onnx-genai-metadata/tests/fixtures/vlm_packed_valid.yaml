@@ -9,29 +9,67 @@ required_capabilities:
 preprocessing:
   image:
     transforms:
-      - op: decode_rgb
+      - op: decode
+        outputs: [decoded]
+      - op: convert_rgb
+        inputs: [decoded]
+        outputs: [rgb]
       - op: resize
+        inputs: [rgb]
+        outputs: [resized]
         size: 896
         mode: pad
         interpolation: bicubic
       - op: rescale
+        inputs: [resized]
+        outputs: [rescaled]
         scale: 0.00392156862745098
       - op: normalize
+        inputs: [rescaled]
+        outputs: [normalized]
         mean: [0.5, 0.5, 0.5]
         std: [0.5, 0.5, 0.5]
+      - op: tile
+        inputs: [normalized]
+        outputs: [tiles]
+        tile_size: 448
+        max_tiles: 4
+        include_thumbnail: true
+        thumbnail_order: prepend
       - op: patchify
+        inputs: [tiles]
+        outputs: [patches]
         patch_size: 14
-        flatten: true
+        flatten: false
+      - op: flatten
+        inputs: [patches]
+        outputs: [flat_patches]
+      - op: emit_original_size
+        inputs: [rgb]
+        outputs: [original_size_summary]
+      - op: emit_validity_mask
+        inputs: [tiles]
+        outputs: [validity_summary]
+      - op: emit_patch_coordinates
+        inputs: [patches]
+        outputs: [patch_coordinates]
+      - op: emit_grid_coordinates
+        inputs: [patches]
+        outputs: [grid_summary]
       - op: pad
+        inputs: [flat_patches, patch_coordinates]
+        outputs: [padded_patches, padded_patch_coordinates]
         pad_value: 0.0
         target_length: 4096
     outputs:
       # First packed output: flattened patch pixels bound to an arbitrary port.
-      - name: pixel_values
+      - source: padded_patches
+        name: vision_encoder.pixel_values
         content: pixels
         dtype: float32
       # Second packed output: per-patch coordinates with a sentinel pad value.
-      - name: pixel_position_ids
+      - source: padded_patch_coordinates
+        name: vision_encoder.pixel_position_ids
         content: patch_coordinates
         dtype: int64
         pad_value: -1
@@ -91,9 +129,11 @@ pipeline:
     image_placeholder_token_id: 262144
     image_token_id: 262145
     token_count_source: per_patch
+    token_count_summary: grid_summary
     tokens_per_patch: 1
     tokens_per_tile: 256
     placeholder_per_image: true
+    image_correspondence: prompt_order
     row_separator_token_id: 262146
     column_separator_token_id: 262147
     thumbnail_order: prepend

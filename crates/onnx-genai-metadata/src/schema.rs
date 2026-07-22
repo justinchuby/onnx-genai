@@ -452,7 +452,7 @@ pub enum ProposalType {
     Mtp,
     /// D-Flash proposer.
     DFlash,
-    /// Shared-KV proposer (originally introduced for Gemma4 `*-assistant`).
+    /// Shared-KV proposer: the draft model shares the target's KV cache.
     SharedKv,
     /// Future proposal architecture not recognized by this runtime version.
     Unknown(String),
@@ -725,6 +725,7 @@ pub enum KvOwnership {
 /// shared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`
 /// and `kv_update`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[schemars(transform = schema_helpers::loop_state_pair)]
 pub struct LoopStatePair {
     /// Graph input port that receives the carried state for this step.
     #[schemars(length(min = 1))]
@@ -736,12 +737,12 @@ pub struct LoopStatePair {
 
     /// How `input` is initialized before the first step (e.g. `zeros`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<schema_vocabulary::StateInitKind>")]
+    #[schemars(with = "schema_vocabulary::StateInitKind")]
     pub init: Option<String>,
 
     /// How `output` becomes the next step's `input` (fixed state uses `replace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<schema_vocabulary::StateUpdateKind>")]
+    #[schemars(with = "schema_vocabulary::StateUpdateKind")]
     pub update: Option<String>,
 }
 
@@ -995,15 +996,35 @@ pub struct PositionProgram {
     #[schemars(length(min = 1))]
     pub input: String,
 
-    /// Number of position axes / leading rank of the position tensor.
+    /// Number of coordinate streams carried by the position tensor.
     ///
     /// `1` is an ordinary linear position stream; values `> 1` describe
-    /// multi-axis multimodal coordinates. This is declared data, never a
-    /// hardcoded constant in the runtime.
+    /// multi-axis multimodal coordinates. The physical ONNX tensor rank is
+    /// declared separately by `tensor_rank`.
     #[schemars(range(min = 1))]
     pub rank: usize,
 
-    /// Optional per-axis labels, one per axis (DATA, e.g. `["t", "h", "w"]`).
+    /// Physical ONNX tensor rank.
+    ///
+    /// Rank 2 declares a conventional `[batch, sequence]` linear input. Higher
+    /// ranks declare an explicit coordinate axis in addition to batch/sequence
+    /// axes. Absent preserves the legacy mapping (`rank == 1` means tensor rank
+    /// 2; otherwise tensor rank 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 2))]
+    pub tensor_rank: Option<usize>,
+
+    /// How the position values are generated for prefill.
+    ///
+    /// `linear` generates ordinary sequence positions. `processor_coordinates`
+    /// consumes the declared processor summaries to construct multi-axis
+    /// coordinates. Future generation programs remain extensible capability
+    /// strings rather than model-family branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::PositionGeneration>")]
+    pub generation: Option<String>,
+
+    /// Optional coordinate-stream labels, one per stream (DATA).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(length(min = 1)))]
     pub axes: Option<Vec<String>>,
@@ -1071,6 +1092,16 @@ pub struct PipelineVisionConfig {
     #[schemars(with = "Option<schema_vocabulary::ImageTokenCountSource>")]
     pub token_count_source: Option<String>,
 
+    /// Named preprocessing value that supplies per-image counts or grid
+    /// dimensions when `token_count_source` is data-derived.
+    ///
+    /// This is an arbitrary processor output name. A runtime resolves the name
+    /// from the declared preprocessing program; it never dispatches on familiar
+    /// tensor names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub token_count_summary: Option<String>,
+
     /// Number of image tokens each patch expands to, used when the count source
     /// is per patch. Declared data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1081,6 +1112,19 @@ pub struct PipelineVisionConfig {
     /// prompt order. Absent means the historical one-placeholder-per-image rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder_per_image: Option<bool>,
+
+    /// How prompt placeholders correspond to input images.
+    ///
+    /// `prompt_order` pairs each placeholder with the next input image.
+    /// `explicit_indices` reads correspondence from `correspondence_summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::ImageCorrespondence>")]
+    pub image_correspondence: Option<String>,
+
+    /// Named preprocessing value containing explicit image correspondence data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub correspondence_summary: Option<String>,
 
     /// Optional token ID emitted between rows of a tiled image grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1135,6 +1179,22 @@ pub struct ImageTransform {
     /// Generic operation selector (e.g. `resize`, `normalize`, `patchify`).
     #[schemars(with = "schema_vocabulary::ImageTransformOp")]
     pub op: String,
+
+    /// Named values consumed by this transform.
+    ///
+    /// Absent means the operation consumes the immediately preceding value.
+    /// Explicit names allow branching programs without tensor-name heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub inputs: Option<Vec<String>>,
+
+    /// Named values produced by this transform.
+    ///
+    /// These names are processor-local data. Final graph bindings select them
+    /// through `ImageOutputBinding::source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub outputs: Option<Vec<String>>,
 
     /// Target size for a `resize` operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1281,8 +1341,15 @@ pub enum ImageSizeSpec {
 /// identity, and the dtype is always explicit rather than derived from the model.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct ImageOutputBinding {
+    /// Named value produced by a transform.
+    ///
+    /// Absent preserves the legacy content-derived binding behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub source: Option<String>,
+
     /// Arbitrary pipeline endpoint name this tensor is bound to (model DATA).
-    #[schemars(length(min = 1), example = &"pixel_values")]
+    #[schemars(length(min = 1), example = &"vision_encoder.pixel_values")]
     pub name: String,
 
     /// Generic content role this tensor carries (pixels, coordinates, grid,
@@ -1504,7 +1571,7 @@ pub struct PipelineStrategy {
 
     /// Outer autoregressive decoder for a `nested_autoregressive` stage.
     ///
-    /// The multi-decoder TTS (Qwen3-TTS-style) shape: one outer step is one
+    /// The multi-decoder TTS shape: one outer step is one
     /// audio frame. The outer decoder (talker) produces a per-frame
     /// `last_hidden_state` that seeds the inner loop (see `inner`).
     #[serde(default)]
@@ -1531,7 +1598,7 @@ pub struct PipelineStrategy {
     /// `nested_autoregressive` stage through `inputs_embeds` instead of
     /// `input_ids`.
     ///
-    /// A real Qwen3-TTS talker is not driven by token ids: each step's
+    /// A codec-driven TTS talker is not driven by token ids: each step's
     /// `inputs_embeds` is materialized from the PREVIOUS frame's codes as
     /// `codec_sum(+ text_embed)` (where
     /// `codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).
@@ -1555,7 +1622,7 @@ pub struct PipelineStrategy {
     /// (talker) with its real frame-0 PREFILL sequence and the per-frame
     /// trailing-text conditioning of a `nested_autoregressive` stage.
     ///
-    /// The real Qwen3-TTS talker is prefilled with a multi-position embedding
+    /// The talker is prefilled with a multi-position embedding
     /// sequence built from the tokenized prompt, and each subsequent frame is
     /// conditioned on one trailing-text embedding. This component materializes
     /// both from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs
@@ -2082,13 +2149,21 @@ mod schema_vocabulary {
         image_transform_op,
         IMAGE_TRANSFORM_OP,
         [
+            "decode",
             "decode_rgb",
+            "convert_rgb",
             "resize",
             "rescale",
             "normalize",
             "tile",
+            "flatten",
             "patchify",
-            "pad"
+            "pad",
+            "emit_original_size",
+            "emit_transformed_size",
+            "emit_validity_mask",
+            "emit_patch_coordinates",
+            "emit_grid_coordinates"
         ]
     );
 
@@ -2116,11 +2191,27 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
+        /// Prompt-placeholder to image correspondence vocabulary.
+        ImageCorrespondence,
+        image_correspondence,
+        IMAGE_CORRESPONDENCE,
+        ["prompt_order", "explicit_indices"]
+    );
+
+    extensible_string!(
         /// Optional-thumbnail ordering vocabulary.
         ThumbnailOrder,
         thumbnail_order,
         THUMBNAIL_ORDER,
         ["none", "prepend", "append"]
+    );
+
+    extensible_string!(
+        /// Position-value generation vocabulary.
+        PositionGeneration,
+        position_generation,
+        POSITION_GENERATION,
+        ["linear", "processor_coordinates"]
     );
 
     extensible_string!(
@@ -2206,6 +2297,20 @@ mod schema_helpers {
             ]),
         );
         forbid_both(schema, "num_speculative_tokens", "tokens_per_step");
+    }
+
+    pub(super) fn loop_state_pair(schema: &mut Schema) {
+        let required = schema
+            .ensure_object()
+            .entry("required")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("required inserted as an array");
+        for property in ["init", "update"] {
+            if !required.iter().any(|name| name == property) {
+                required.push(json!(property));
+            }
+        }
     }
 
     pub(super) fn proposal_type(schema: &mut Schema) {
@@ -2324,12 +2429,20 @@ mod schema_helpers {
         extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TOKEN_COUNT_SOURCE);
     }
 
+    pub(super) fn image_correspondence(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_CORRESPONDENCE);
+    }
+
     pub(super) fn thumbnail_order(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
     }
 
     pub(super) fn position_continuation(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::POSITION_CONTINUATION);
+    }
+
+    pub(super) fn position_generation(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::POSITION_GENERATION);
     }
 
     pub(super) fn kv_update_kind(schema: &mut Schema) {

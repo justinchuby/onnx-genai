@@ -762,6 +762,29 @@
         }
       }
     },
+    "ImageCorrespondence": {
+      "description": "Prompt-placeholder to image correspondence vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "prompt_order",
+            "explicit_indices"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "prompt_order",
+              "explicit_indices"
+            ]
+          }
+        }
+      ]
+    },
     "ImageOutputBinding": {
       "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a generic content role to an ARBITRARY endpoint name with a\nDECLARED dtype. Neither the name nor the content role is inferred from a model\nidentity, and the dtype is always explicit rather than derived from the model.",
       "type": "object",
@@ -778,7 +801,7 @@
           "description": "Arbitrary pipeline endpoint name this tensor is bound to (model DATA).",
           "type": "string",
           "examples": [
-            "pixel_values"
+            "vision_encoder.pixel_values"
           ],
           "minLength": 1
         },
@@ -796,6 +819,14 @@
             "null"
           ],
           "format": "double"
+        },
+        "source": {
+          "description": "Named value produced by a transform.\n\nAbsent preserves the legacy content-derived binding behavior.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
         }
       },
       "required": [
@@ -959,6 +990,18 @@
             "null"
           ]
         },
+        "inputs": {
+          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
         "interpolation": {
           "description": "Interpolation filter for a `resize` operation — generic string data.",
           "type": [
@@ -1043,6 +1086,18 @@
         "op": {
           "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`).",
           "$ref": "#/$defs/ImageTransformOp"
+        },
+        "outputs": {
+          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `ImageOutputBinding::source`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
         },
         "pad_value": {
           "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
@@ -1167,13 +1222,21 @@
         {
           "title": "Known standard value",
           "enum": [
+            "decode",
             "decode_rgb",
+            "convert_rgb",
             "resize",
             "rescale",
             "normalize",
             "tile",
+            "flatten",
             "patchify",
-            "pad"
+            "pad",
+            "emit_original_size",
+            "emit_transformed_size",
+            "emit_validity_mask",
+            "emit_patch_coordinates",
+            "emit_grid_coordinates"
           ]
         },
         {
@@ -1181,13 +1244,21 @@
           "type": "string",
           "not": {
             "enum": [
+              "decode",
               "decode_rgb",
+              "convert_rgb",
               "resize",
               "rescale",
               "normalize",
               "tile",
+              "flatten",
               "patchify",
-              "pad"
+              "pad",
+              "emit_original_size",
+              "emit_transformed_size",
+              "emit_validity_mask",
+              "emit_patch_coordinates",
+              "emit_grid_coordinates"
             ]
           }
         }
@@ -1424,14 +1495,7 @@
       "properties": {
         "init": {
           "description": "How `input` is initialized before the first step (e.g. `zeros`).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StateInitKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/StateInitKind"
         },
         "input": {
           "description": "Graph input port that receives the carried state for this step.",
@@ -1445,19 +1509,14 @@
         },
         "update": {
           "description": "How `output` becomes the next step's `input` (fixed state uses `replace`).",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StateUpdateKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/StateUpdateKind"
         }
       },
       "required": [
         "input",
-        "output"
+        "output",
+        "init",
+        "update"
       ]
     },
     "ModelCapabilities": {
@@ -2079,7 +2138,7 @@
           "minimum": 1
         },
         "outer": {
-          "description": "Outer autoregressive decoder for a `nested_autoregressive` stage.\n\nThe multi-decoder TTS (Qwen3-TTS-style) shape: one outer step is one\naudio frame. The outer decoder (talker) produces a per-frame\n`last_hidden_state` that seeds the inner loop (see `inner`).",
+          "description": "Outer autoregressive decoder for a `nested_autoregressive` stage.\n\nThe multi-decoder TTS shape: one outer step is one\naudio frame. The outer decoder (talker) produces a per-frame\n`last_hidden_state` that seeds the inner loop (see `inner`).",
           "type": [
             "string",
             "null"
@@ -2087,7 +2146,7 @@
           "default": null
         },
         "pre_embedder": {
-          "description": "Optional pre-embedder component driving the outer decoder (talker) of a\n`nested_autoregressive` stage through `inputs_embeds` instead of\n`input_ids`.\n\nA real Qwen3-TTS talker is not driven by token ids: each step's\n`inputs_embeds` is materialized from the PREVIOUS frame's codes as\n`codec_sum(+ text_embed)` (where\n`codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).\nWhen this field names such a component (inputs\n`frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,\nhidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds\nthe outer decoder's per-step `inputs_embeds` through it, keeping the engine\ngeneric. Requires a dataflow edge\n`{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.\n\nWhen absent the outer loop is `input_ids`-driven (backward compatible).\n\nAll graph-specific port bindings (the pre-embedder's `frame_codes` /\noptional `text_embed` inputs and the output feeding the outer decoder)\nare declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses\nthem by tensor name or dtype.",
+          "description": "Optional pre-embedder component driving the outer decoder (talker) of a\n`nested_autoregressive` stage through `inputs_embeds` instead of\n`input_ids`.\n\nA codec-driven TTS talker is not driven by token ids: each step's\n`inputs_embeds` is materialized from the PREVIOUS frame's codes as\n`codec_sum(+ text_embed)` (where\n`codec_sum = codec_embed(code_0) + Σ_i cp_codec_weights[i][codes[i+1]]`).\nWhen this field names such a component (inputs\n`frame_codes [batch, num_code_groups]` int64 `[+ text_embed [batch, 1,\nhidden]]` → output `inputs_embeds [batch, 1, hidden]`), the runtime builds\nthe outer decoder's per-step `inputs_embeds` through it, keeping the engine\ngeneric. Requires a dataflow edge\n`{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds`.\n\nWhen absent the outer loop is `input_ids`-driven (backward compatible).\n\nAll graph-specific port bindings (the pre-embedder's `frame_codes` /\noptional `text_embed` inputs and the output feeding the outer decoder)\nare declared explicitly in [`PreEmbedderSpec`]; the runtime never guesses\nthem by tensor name or dtype.",
           "anyOf": [
             {
               "$ref": "#/$defs/PreEmbedderSpec"
@@ -2098,7 +2157,7 @@
           ]
         },
         "prefill_embedder": {
-          "description": "Optional prefill embedder component that supplies the outer decoder\n(talker) with its real frame-0 PREFILL sequence and the per-frame\ntrailing-text conditioning of a `nested_autoregressive` stage.\n\nThe real Qwen3-TTS talker is prefilled with a multi-position embedding\nsequence built from the tokenized prompt, and each subsequent frame is\nconditioned on one trailing-text embedding. This component materializes\nboth from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs\n`prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the\ntalker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,\ntrailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`\nas the pre-embedder's `text_embed`). It runs once in the prompt phase\n(`run_on: prompt_only`); its `text_ids` input is auto-seeded from the\ntokenized prompt.\n\nOnly meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`\npath feeds the trailing-text vectors through it). When absent, frame 0\nuses a zero seed and every `text_embed` is zero (backward compatible).\n\nAll graph-specific port bindings (the prompt input plus the prefill and\ntrailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];\nthe runtime never guesses them by tensor name or dtype.",
+          "description": "Optional prefill embedder component that supplies the outer decoder\n(talker) with its real frame-0 PREFILL sequence and the per-frame\ntrailing-text conditioning of a `nested_autoregressive` stage.\n\nThe talker is prefilled with a multi-position embedding\nsequence built from the tokenized prompt, and each subsequent frame is\nconditioned on one trailing-text embedding. This component materializes\nboth from `text_ids`: inputs `text_ids [batch, text_len]` int64 → outputs\n`prefill_embeds [batch, prefill_len, hidden]` float (fed DIRECTLY to the\ntalker's `inputs_embeds` on frame 0) and `trailing_text_embeds [batch,\ntrailing_len, hidden]` float (one vector consumed per outer frame `k >= 1`\nas the pre-embedder's `text_embed`). It runs once in the prompt phase\n(`run_on: prompt_only`); its `text_ids` input is auto-seeded from the\ntokenized prompt.\n\nOnly meaningful together with [`Self::pre_embedder`] (the frame-`k >= 1`\npath feeds the trailing-text vectors through it). When absent, frame 0\nuses a zero seed and every `text_embed` is zero (backward compatible).\n\nAll graph-specific port bindings (the prompt input plus the prefill and\ntrailing-text outputs) are declared explicitly in [`PrefillEmbedderSpec`];\nthe runtime never guesses them by tensor name or dtype.",
           "anyOf": [
             {
               "$ref": "#/$defs/PrefillEmbedderSpec"
@@ -2261,6 +2320,25 @@
           ],
           "format": "int64"
         },
+        "correspondence_summary": {
+          "description": "Named preprocessing value containing explicit image correspondence data.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "image_correspondence": {
+          "description": "How prompt placeholders correspond to input images.\n\n`prompt_order` pairs each placeholder with the next input image.\n`explicit_indices` reads correspondence from `correspondence_summary`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageCorrespondence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "image_placeholder_token_id": {
           "description": "Token ID of the image placeholder in the tokenized prompt.\n\nThe engine replaces every occurrence of this token with the expanded\nimage token sequence before sequence-length and KV-cache sizing.",
           "type": [
@@ -2314,6 +2392,14 @@
             }
           ]
         },
+        "token_count_summary": {
+          "description": "Named preprocessing value that supplies per-image counts or grid\ndimensions when `token_count_source` is data-derived.\n\nThis is an arbitrary processor output name. A runtime resolves the name\nfrom the declared preprocessing program; it never dispatches on familiar\ntensor names.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
         "tokens_per_patch": {
           "description": "Number of image tokens each patch expands to, used when the count source\nis per patch. Declared data.",
           "type": [
@@ -2359,12 +2445,35 @@
         }
       ]
     },
+    "PositionGeneration": {
+      "description": "Position-value generation vocabulary.",
+      "type": "string",
+      "oneOf": [
+        {
+          "title": "Known standard value",
+          "enum": [
+            "linear",
+            "processor_coordinates"
+          ]
+        },
+        {
+          "title": "Forward-compatible extension value",
+          "type": "string",
+          "not": {
+            "enum": [
+              "linear",
+              "processor_coordinates"
+            ]
+          }
+        }
+      ]
+    },
     "PositionProgram": {
       "description": "Declared position-id program for a decoder graph.\n\nThe runtime constructs the position tensor from these declared parameters\ninstead of assuming a fixed rank-2 layout. `rank` 1 (with a single axis)\nexpresses ordinary linear positions; `rank` N expresses multi-axis\nmultimodal coordinates. Axis labels and section sizes are opaque DATA — the\nruntime never infers them from a model name.",
       "type": "object",
       "properties": {
         "axes": {
-          "description": "Optional per-axis labels, one per axis (DATA, e.g. `[\"t\", \"h\", \"w\"]`).",
+          "description": "Optional coordinate-stream labels, one per stream (DATA).",
           "type": [
             "array",
             "null"
@@ -2396,6 +2505,17 @@
             }
           ]
         },
+        "generation": {
+          "description": "How the position values are generated for prefill.\n\n`linear` generates ordinary sequence positions. `processor_coordinates`\nconsumes the declared processor summaries to construct multi-axis\ncoordinates. Future generation programs remain extensible capability\nstrings rather than model-family branches.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositionGeneration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "input": {
           "description": "Graph input port that receives the position ids (arbitrary name, DATA).",
           "type": "string",
@@ -2413,7 +2533,7 @@
           }
         },
         "rank": {
-          "description": "Number of position axes / leading rank of the position tensor.\n\n`1` is an ordinary linear position stream; values `> 1` describe\nmulti-axis multimodal coordinates. This is declared data, never a\nhardcoded constant in the runtime.",
+          "description": "Number of coordinate streams carried by the position tensor.\n\n`1` is an ordinary linear position stream; values `> 1` describe\nmulti-axis multimodal coordinates. The physical ONNX tensor rank is\ndeclared separately by `tensor_rank`.",
           "type": "integer",
           "format": "uint",
           "minimum": 1
@@ -2429,6 +2549,15 @@
             "format": "uint",
             "minimum": 0
           }
+        },
+        "tensor_rank": {
+          "description": "Physical ONNX tensor rank.\n\nRank 2 declares a conventional `[batch, sequence]` linear input. Higher\nranks declare an explicit coordinate axis in addition to batch/sequence\naxes. Absent preserves the legacy mapping (`rank == 1` means tensor rank\n2; otherwise tensor rank 3).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 2
         }
       },
       "required": [

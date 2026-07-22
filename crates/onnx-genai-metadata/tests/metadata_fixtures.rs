@@ -469,18 +469,48 @@ fn vlm_packed_fixture_deserializes_and_validates_against_schema() {
     let image = preprocessing.image.expect("image program");
     assert_eq!(
         image.transforms.first().expect("first transform").op,
-        "decode_rgb"
+        "decode"
     );
     assert!(
         image.transforms.iter().any(|t| t.op == "patchify"),
         "program declares a generic patchify op"
     );
+    let declared_ops = image
+        .transforms
+        .iter()
+        .map(|transform| transform.op.as_str())
+        .collect::<Vec<_>>();
+    for required_op in [
+        "decode",
+        "convert_rgb",
+        "resize",
+        "rescale",
+        "normalize",
+        "tile",
+        "flatten",
+        "patchify",
+        "pad",
+        "emit_original_size",
+        "emit_validity_mask",
+        "emit_patch_coordinates",
+        "emit_grid_coordinates",
+    ] {
+        assert!(
+            declared_ops.contains(&required_op),
+            "packed fixture must declare generic operation {required_op}"
+        );
+    }
     // Exactly two packed image outputs, bound to arbitrary endpoint names.
     assert_eq!(image.outputs.len(), 2);
-    assert_eq!(image.outputs[0].name, "pixel_values");
+    assert_eq!(image.outputs[0].source.as_deref(), Some("padded_patches"));
+    assert_eq!(image.outputs[0].name, "vision_encoder.pixel_values");
     assert_eq!(image.outputs[0].content, "pixels");
     assert_eq!(image.outputs[0].dtype, "float32");
-    assert_eq!(image.outputs[1].name, "pixel_position_ids");
+    assert_eq!(
+        image.outputs[1].source.as_deref(),
+        Some("padded_patch_coordinates")
+    );
+    assert_eq!(image.outputs[1].name, "vision_encoder.pixel_position_ids");
     assert_eq!(image.outputs[1].content, "patch_coordinates");
     assert_eq!(image.outputs[1].dtype, "int64");
     assert_eq!(image.outputs[1].pad_value, Some(-1.0));
@@ -491,6 +521,8 @@ fn vlm_packed_fixture_deserializes_and_validates_against_schema() {
     assert_eq!(vision.image_placeholder_token_id, Some(262144));
     assert_eq!(vision.image_token_id, Some(262145));
     assert_eq!(vision.token_count_source.as_deref(), Some("per_patch"));
+    assert_eq!(vision.token_count_summary.as_deref(), Some("grid_summary"));
+    assert_eq!(vision.image_correspondence.as_deref(), Some("prompt_order"));
     assert_eq!(vision.row_separator_token_id, Some(262146));
     assert_eq!(vision.column_separator_token_id, Some(262147));
     assert_eq!(vision.thumbnail_order.as_deref(), Some("prepend"));
@@ -515,6 +547,11 @@ fn vlm_multistate_fixture_deserializes_and_validates_against_schema() {
     let positions = spec.positions.expect("position program");
     assert_eq!(positions.input, "position_ids");
     assert_eq!(positions.rank, 3);
+    assert_eq!(positions.tensor_rank, Some(3));
+    assert_eq!(
+        positions.generation.as_deref(),
+        Some("processor_coordinates")
+    );
     assert_eq!(
         positions.axes.as_deref(),
         Some(
@@ -547,6 +584,88 @@ fn vlm_multistate_fixture_deserializes_and_validates_against_schema() {
     if let Err(error) = validator.validate(&instance) {
         panic!("multistate VLM fixture failed JSON-schema validation: {error}");
     }
+}
+
+#[test]
+fn linear_position_program_declares_rank_two_generation() {
+    let yaml = r#"
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+  positions:
+    input: position_ids
+    rank: 1
+    tensor_rank: 2
+    generation: linear
+    axes: [sequence]
+    dtype: int64
+    continuation: linear_increment
+"#;
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("rank-2 linear position program parses");
+    let positions = metadata
+        .pipeline
+        .as_ref()
+        .and_then(|pipeline| pipeline.positions.as_ref())
+        .expect("position program");
+    assert_eq!(positions.rank, 1);
+    assert_eq!(positions.tensor_rank, Some(2));
+    assert_eq!(positions.generation.as_deref(), Some("linear"));
+
+    let instance: serde_json::Value =
+        serde_yaml::from_str(yaml).expect("linear fixture converts to JSON");
+    schema_validator()
+        .validate(&instance)
+        .expect("rank-2 linear position program validates against JSON schema");
+}
+
+#[test]
+fn multimodal_fixtures_report_precise_missing_capabilities() {
+    let packed =
+        load_metadata(&crate_fixture("vlm_packed_valid.yaml")).expect("packed fixture loads");
+    let multistate = load_metadata(&crate_fixture("vlm_multistate_valid.yaml"))
+        .expect("multistate fixture loads");
+    let unsupported_runtime = RuntimeCapabilities {
+        supported: Vec::new(),
+    };
+
+    assert_eq!(
+        validate(&packed, &unsupported_runtime).expect_err("packed capabilities are required"),
+        ["image_preprocessing_program", "packed_image_outputs"]
+    );
+    assert_eq!(
+        validate(&multistate, &unsupported_runtime)
+            .expect_err("position and state capabilities are required"),
+        [
+            "position_program",
+            "multi_axis_positions",
+            "loop_carried_state",
+            "dual_sequence_inputs"
+        ]
+    );
+}
+
+#[test]
+fn fixed_state_schema_requires_init_and_update_programs() {
+    let mut instance = fixture_json("vlm_multistate_valid.yaml");
+    let state_pairs = instance
+        .pointer_mut("/pipeline/models/decoder/io/state_pairs")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("state-pair array");
+    state_pairs[0]
+        .as_object_mut()
+        .expect("state-pair object")
+        .remove("update");
+
+    assert!(
+        !schema_validator().is_valid(&instance),
+        "fixed replacement state pairs without update semantics must fail schema validation"
+    );
 }
 
 #[test]
