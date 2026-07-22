@@ -8,6 +8,7 @@ use super::gelu::{exact_gelu, tanh_gelu};
 use super::layernorm::layer_norm_dense;
 use super::rmsnorm::rms_norm_dense;
 use super::{check_arity, to_dense_f32, write_dense_f32};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 fn last_dim_bias(x_shape: &[usize], bias: &[f32], op: &str) -> Result<usize> {
     let Some(&width) = x_shape.last() else {
@@ -231,11 +232,12 @@ impl KernelFactory for SimplifiedLayerNormFactory {
 
 impl Kernel for SimplifiedLayerNormKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        const OP: &str = "SimplifiedLayerNormalization";
         // ORT SimplifiedLayerNormalization: `output` (0, required) plus optional
         // `inv_std_var` (1). Only the primary output is mandatory.
-        check_arity("SimplifiedLayerNormalization", inputs, outputs, 2, 2, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let scale = to_dense_f32(&inputs[1])?;
+        check_arity(OP, inputs, outputs, 2, 2, 1)?;
+        let x = to_dense_f32_widen(OP, &inputs[0])?;
+        let scale = to_dense_f32_widen(OP, &inputs[1])?;
         // Reuse the shared RMSNorm core, honouring `axis` (default -1) so the
         // group spans dims `[axis..rank)` and `scale` broadcasts over it.
         let y = rms_norm_dense(
@@ -246,7 +248,7 @@ impl Kernel for SimplifiedLayerNormKernel {
             self.axis,
             self.epsilon,
         )?;
-        write_dense_f32(&mut outputs[0], &y)?;
+        write_dense_f32_narrow(OP, &mut outputs[0], &y)?;
         // Optional InvStdDev output: the per-group `1 / sqrt(mean(x²) + eps)`,
         // one value per normalized group (reduced shape). `rms_norm_dense`
         // already validated `axis`, so normalization here cannot fail.
@@ -266,7 +268,7 @@ impl Kernel for SimplifiedLayerNormKernel {
                     1.0 / (mean_sq + self.epsilon).sqrt()
                 })
                 .collect::<Vec<_>>();
-            write_dense_f32(&mut outputs[1], &inv_std)?;
+            write_dense_f32_narrow(OP, &mut outputs[1], &inv_std)?;
         }
         Ok(())
     }
@@ -392,6 +394,133 @@ mod tests {
             want.extend((0..4).map(|i| row[i] * inv * scale_data[i]));
         }
         assert_close(&out.to_f32(), &want);
+    }
+
+    fn owned_float(dtype: DataType, shape: &[usize], data: &[f32]) -> Owned {
+        match dtype {
+            DataType::Float16 => Owned::f16(shape, data),
+            DataType::BFloat16 => Owned::bf16(shape, data),
+            DataType::Float32 => Owned::f32(shape, data),
+            DataType::Float64 => {
+                let data = data.iter().map(|&value| value as f64).collect::<Vec<_>>();
+                Owned::f64(shape, &data)
+            }
+            _ => panic!("test helper requires a supported floating-point dtype"),
+        }
+    }
+
+    fn owned_float_as_f32(value: &Owned) -> Vec<f32> {
+        match value.dtype {
+            DataType::Float16 => value.to_f16_as_f32(),
+            DataType::BFloat16 => value.to_bf16_as_f32(),
+            DataType::Float32 => value.to_f32(),
+            DataType::Float64 => value
+                .to_f64()
+                .into_iter()
+                .map(|element| element as f32)
+                .collect(),
+            _ => panic!("test helper requires a supported floating-point dtype"),
+        }
+    }
+
+    fn simplified_layer_norm_reference(
+        x: &[f32],
+        scale: &[f32],
+        norm_size: usize,
+        epsilon: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut output = Vec::with_capacity(x.len());
+        let mut inv_std = Vec::with_capacity(x.len() / norm_size);
+        for group in x.chunks_exact(norm_size) {
+            let inv = 1.0
+                / (group.iter().map(|value| value * value).sum::<f32>() / norm_size as f32
+                    + epsilon)
+                    .sqrt();
+            inv_std.push(inv);
+            output.extend(
+                group
+                    .iter()
+                    .zip(scale)
+                    .map(|(&value, &weight)| value * inv * weight),
+            );
+        }
+        (output, inv_std)
+    }
+
+    #[test]
+    fn simplified_layer_norm_supports_floating_dtypes_and_shapes() {
+        const EPSILON: f32 = 1e-5;
+        let cases = [
+            (
+                vec![2, 3],
+                -1,
+                vec![3],
+                vec![1.0, 2.0, 3.0, -1.0, -2.0, -3.0],
+                vec![1.0, 0.5, 1.5],
+            ),
+            (
+                vec![2, 2, 3],
+                1,
+                vec![2, 3],
+                vec![
+                    0.5, 1.0, 1.5, 2.0, 2.5, 3.0, -0.5, -1.0, -1.5, -2.0, -2.5, -3.0,
+                ],
+                vec![1.0, 0.5, 1.5, 2.0, 0.25, 0.75],
+            ),
+        ];
+
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            for (x_shape, axis, scale_shape, x_data, scale_data) in &cases {
+                let axis_index = if *axis < 0 {
+                    (*axis + x_shape.len() as i64) as usize
+                } else {
+                    *axis as usize
+                };
+                let norm_size = x_shape[axis_index..].iter().product();
+                let (want, want_inv_std) =
+                    simplified_layer_norm_reference(x_data, scale_data, norm_size, EPSILON);
+                let x = owned_float(dtype, x_shape, x_data);
+                let scale = owned_float(dtype, scale_shape, scale_data);
+                let mut output = Owned::zeros(dtype, x_shape);
+                let mut stats_shape = x_shape.clone();
+                stats_shape[axis_index..].fill(1);
+                let mut inv_std = Owned::zeros(dtype, &stats_shape);
+
+                SimplifiedLayerNormKernel {
+                    axis: *axis,
+                    epsilon: EPSILON,
+                }
+                .execute(
+                    &[x.view(), scale.view()],
+                    &mut [output.view_mut(), inv_std.view_mut()],
+                )
+                .unwrap();
+
+                let tolerance = match dtype {
+                    DataType::Float16 => 2e-3,
+                    DataType::BFloat16 => 2e-2,
+                    DataType::Float32 | DataType::Float64 => 1e-5,
+                    _ => unreachable!(),
+                };
+                for (got, want) in owned_float_as_f32(&output).iter().zip(&want) {
+                    assert!(
+                        (got - want).abs() < tolerance,
+                        "{dtype:?} output: got {got}, want {want}"
+                    );
+                }
+                for (got, want) in owned_float_as_f32(&inv_std).iter().zip(&want_inv_std) {
+                    assert!(
+                        (got - want).abs() < tolerance,
+                        "{dtype:?} inv_std: got {got}, want {want}"
+                    );
+                }
+            }
+        }
     }
 
     fn simplified_layer_norm_kernel(domain: &str, opset: u64) -> Box<dyn Kernel> {
