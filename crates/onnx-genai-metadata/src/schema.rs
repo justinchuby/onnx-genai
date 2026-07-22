@@ -994,6 +994,31 @@ pub struct ImageTransform {
     #[schemars(length(min = 1))]
     pub interpolation: Option<String>,
 
+    /// Minimum pixel area for an aspect-preserving `pixel_area` resize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub min_pixels: Option<usize>,
+
+    /// Maximum pixel area for an aspect-preserving `pixel_area` resize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_pixels: Option<usize>,
+
+    /// Required divisibility of both resized dimensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub size_multiple: Option<usize>,
+
+    /// Maximum number of spatial patches for a patch-budget resize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_patches: Option<usize>,
+
+    /// Spatial pooling edge used when resolving a patch-budget resize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub pooling_kernel_size: Option<usize>,
+
     /// Scalar multiplier for a `rescale` operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
@@ -1020,10 +1045,49 @@ pub struct ImageTransform {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_thumbnail: Option<bool>,
 
+    /// Ordering of a global thumbnail relative to local tiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::ThumbnailOrder>")]
+    pub thumbnail_order: Option<String>,
+
+    /// Interpolation filter used specifically for a global thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub thumbnail_interpolation: Option<String>,
+
+    /// RGB canvas fill value applied before dynamic tiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_pad_value: Option<f64>,
+
+    /// Pixel edge represented by one validity-mask cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub mask_patch_size: Option<usize>,
+
     /// Edge length of a square patch for a `patchify` operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub patch_size: Option<usize>,
+
+    /// Number of identical temporal frames packed into each spatial patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub temporal_patch_size: Option<usize>,
+
+    /// Spatial patch-group edge controlling packed patch traversal order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub merge_size: Option<usize>,
+
+    /// Flattened patch feature order (`channels_first` or `channels_last`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub channel_order: Option<String>,
+
+    /// Patch-coordinate component order (`yx` or `xy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub coordinate_order: Option<String>,
 
     /// Whether `patchify` flattens each patch into a single feature vector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1032,6 +1096,11 @@ pub struct ImageTransform {
     /// Fill value for a `pad` operation, or sentinel for padded coordinates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pad_value: Option<f64>,
+
+    /// Exact first-axis length produced by a `pad` operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub target_length: Option<usize>,
 }
 
 /// A square size or an explicit width/height for an image transform.
@@ -1853,6 +1922,7 @@ mod schema_vocabulary {
             "patch_coordinates",
             "grid_dimensions",
             "original_size",
+            "transformed_size",
             "validity_mask"
         ]
     );

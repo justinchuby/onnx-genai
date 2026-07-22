@@ -784,6 +784,7 @@
             "patch_coordinates",
             "grid_dimensions",
             "original_size",
+            "transformed_size",
             "validity_mask"
           ]
         },
@@ -796,6 +797,7 @@
               "patch_coordinates",
               "grid_dimensions",
               "original_size",
+              "transformed_size",
               "validity_mask"
             ]
           }
@@ -888,6 +890,30 @@
       "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
       "type": "object",
       "properties": {
+        "canvas_pad_value": {
+          "description": "RGB canvas fill value applied before dynamic tiling.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "channel_order": {
+          "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "coordinate_order": {
+          "description": "Patch-coordinate component order (`yx` or `xy`).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
         "flatten": {
           "description": "Whether `patchify` flattens each patch into a single feature vector.",
           "type": [
@@ -910,6 +936,33 @@
           ],
           "minLength": 1
         },
+        "mask_patch_size": {
+          "description": "Pixel edge represented by one validity-mask cell.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "max_patches": {
+          "description": "Maximum number of spatial patches for a patch-budget resize.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "max_pixels": {
+          "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
         "max_tiles": {
           "description": "Maximum number of local tiles for a `tile` operation.",
           "type": [
@@ -929,6 +982,24 @@
             "type": "number",
             "format": "float"
           }
+        },
+        "merge_size": {
+          "description": "Spatial patch-group edge controlling packed patch traversal order.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "min_pixels": {
+          "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
         },
         "mode": {
           "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
@@ -959,6 +1030,15 @@
           "format": "uint",
           "minimum": 1
         },
+        "pooling_kernel_size": {
+          "description": "Spatial pooling edge used when resolving a patch-budget resize.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
         "scale": {
           "description": "Scalar multiplier for a `rescale` operation.",
           "type": [
@@ -978,6 +1058,15 @@
             }
           ]
         },
+        "size_multiple": {
+          "description": "Required divisibility of both resized dimensions.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
         "std": {
           "description": "Per-channel standard deviation for a `normalize` operation.",
           "type": [
@@ -988,6 +1077,43 @@
             "type": "number",
             "format": "float"
           }
+        },
+        "target_length": {
+          "description": "Exact first-axis length produced by a `pad` operation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "temporal_patch_size": {
+          "description": "Number of identical temporal frames packed into each spatial patch.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 1
+        },
+        "thumbnail_interpolation": {
+          "description": "Interpolation filter used specifically for a global thumbnail.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "thumbnail_order": {
+          "description": "Ordering of a global thumbnail relative to local tiles.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThumbnailOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tile_size": {
           "description": "Edge length of a square tile for a `tile` operation.",

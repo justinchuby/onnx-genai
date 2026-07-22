@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 
 use anyhow::Context;
 
-use super::{ImageLayout, MAX_IMAGE_COUNT, MAX_TENSOR_ELEMENTS, ThumbnailPosition, TileGrid};
+use super::{
+    CoordinateOrder, ImageLayout, MAX_IMAGE_COUNT, MAX_TENSOR_ELEMENTS, PatchChannelOrder,
+    PatchifySpec, ThumbnailPosition, TileGrid,
+};
 
 /// Declared tensor element type for an image processor output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,18 +162,20 @@ pub(super) struct OutputSpec {
 #[derive(Debug)]
 pub(super) struct PreparedImage {
     pub original_size: (u32, u32),
+    pub transformed_size: (u32, u32),
     pub tile_grid: TileGrid,
+    pub tile_size: (usize, usize),
     /// Channel-first normalized tiles.
     pub tiles: Vec<Vec<f32>>,
+    pub validity_masks: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Debug)]
 pub(super) struct PackSpec {
-    pub width: usize,
-    pub height: usize,
     pub layout: ImageLayout,
-    pub patch_size: Option<usize>,
+    pub patchify: Option<PatchifySpec>,
     pub pad_value: Option<f64>,
+    pub target_length: Option<usize>,
     pub outputs: Vec<OutputSpec>,
     pub declared_pixel_shape: Vec<i64>,
 }
@@ -208,46 +213,46 @@ pub(super) fn build_bundle(
         tile_grids.push(image.tile_grid);
     }
 
-    let (packed, feature_size) = match spec.patch_size {
-        Some(patch_size) => {
+    let (packed, feature_size) = match &spec.patchify {
+        Some(patchify) => {
+            let patch_size = patchify.patch_size;
             if patch_size == 0 {
                 anyhow::bail!("image patchify patch_size must be greater than zero");
             }
-            if !spec.width.is_multiple_of(patch_size) || !spec.height.is_multiple_of(patch_size) {
-                anyhow::bail!(
-                    "image dimensions {}x{} are not divisible by declared patch_size {patch_size}",
-                    spec.width,
-                    spec.height
-                );
-            }
             let feature_size = checked_element_product(
                 "image patch feature dimension",
-                &[3, patch_size, patch_size],
+                &[3, patch_size, patchify.temporal_patch_size, patch_size],
             )?;
-            let patches_per_tile = (spec.width / patch_size)
-                .checked_mul(spec.height / patch_size)
-                .context("image patches per tile overflowed")?;
-            let total_patch_count = num_tiles
-                .checked_mul(patches_per_tile)
-                .context("total image patch count overflowed")?;
+            let mut packed = try_vec_with_capacity(prepared.len(), "packed image batch")?;
+            for image in &prepared {
+                packed.push(pack_image(image, patchify)?);
+            }
+            let total_patch_count = packed.iter().try_fold(0usize, |total, image| {
+                total
+                    .checked_add(image.patch_count)
+                    .context("total image patch count overflowed")
+            })?;
             checked_element_product(
                 "packed image pixel storage",
                 &[total_patch_count, feature_size],
             )?;
             checked_element_product("packed image coordinate storage", &[total_patch_count, 2])?;
-            let mut packed = try_vec_with_capacity(prepared.len(), "packed image batch")?;
-            for image in &prepared {
-                packed.push(pack_image(image, spec.width, spec.height, patch_size)?);
-            }
             (Some(packed), Some(feature_size))
         }
         None => (None, None),
     };
 
-    let max_patches = packed
+    let actual_max_patches = packed
         .as_ref()
         .and_then(|images| images.iter().map(|image| image.patch_count).max())
         .unwrap_or(0);
+    let max_patches = match spec.target_length {
+        Some(target) if target < actual_max_patches => anyhow::bail!(
+            "image pad target_length {target} is smaller than the produced patch count {actual_max_patches}"
+        ),
+        Some(target) => target,
+        None => actual_max_patches,
+    };
     let total_patches = packed
         .as_ref()
         .map(|images| {
@@ -260,7 +265,7 @@ pub(super) fn build_bundle(
         .transpose()?
         .unwrap_or(0);
     ensure_element_limit(total_patches, "total image patch count")?;
-    let padded = spec.patch_size.is_some() && spec.pad_value.is_some();
+    let padded = spec.patchify.is_some() && spec.target_length.is_some();
     validate_total_output_elements(
         &prepared,
         packed.as_deref(),
@@ -308,6 +313,7 @@ pub(super) fn build_bundle(
                 ),
             },
             "original_size" => Some(build_original_sizes(&prepared, output)?),
+            "transformed_size" => Some(build_transformed_sizes(&prepared, output)?),
             "validity_mask" => Some(build_validity_mask(
                 &prepared,
                 packed.as_deref(),
@@ -363,7 +369,12 @@ fn validate_total_output_elements(
                 )?,
                 None => checked_element_product(
                     &format!("rank-4 pixel output '{}'", output.name),
-                    &[num_tiles, 3, spec.width, spec.height],
+                    &[
+                        num_tiles,
+                        3,
+                        prepared.first().map_or(0, |image| image.tile_size.0),
+                        prepared.first().map_or(0, |image| image.tile_size.1),
+                    ],
                 )?,
             },
             "patch_coordinates" => match packed {
@@ -396,8 +407,29 @@ fn validate_total_output_elements(
                 &format!("original-size output '{}'", output.name),
                 &[prepared.len(), 2],
             )?,
+            "transformed_size" => checked_element_product(
+                &format!("transformed-size output '{}'", output.name),
+                &[prepared.len(), 2],
+            )?,
             "validity_mask" => {
-                if padded {
+                if prepared.iter().any(|image| image.validity_masks.is_some()) {
+                    prepared.iter().try_fold(0usize, |total, image| {
+                        let masks = image.validity_masks.as_ref().with_context(|| {
+                            format!(
+                                "image output '{}' requires validity masks for every image",
+                                output.name
+                            )
+                        })?;
+                        let mask_elements = masks.iter().try_fold(0usize, |count, mask| {
+                            count
+                                .checked_add(mask.len())
+                                .context("validity mask element count overflowed")
+                        })?;
+                        total
+                            .checked_add(mask_elements)
+                            .context("validity mask element count overflowed")
+                    })?
+                } else if padded {
                     checked_element_product(
                         &format!("padded validity mask '{}'", output.name),
                         &[prepared.len(), max_patches],
@@ -494,14 +526,24 @@ fn validate_outputs(outputs: &[OutputSpec]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn pack_image(
-    image: &PreparedImage,
-    width: usize,
-    height: usize,
-    patch_size: usize,
-) -> anyhow::Result<PackedImage> {
+fn pack_image(image: &PreparedImage, patchify: &PatchifySpec) -> anyhow::Result<PackedImage> {
+    let (width, height) = image.tile_size;
+    let patch_size = patchify.patch_size;
     let patches_w = width / patch_size;
     let patches_h = height / patch_size;
+    if !width.is_multiple_of(patch_size) || !height.is_multiple_of(patch_size) {
+        anyhow::bail!(
+            "image dimensions {width}x{height} are not divisible by declared patch_size {patch_size}"
+        );
+    }
+    if !patches_w.is_multiple_of(patchify.merge_size)
+        || !patches_h.is_multiple_of(patchify.merge_size)
+    {
+        anyhow::bail!(
+            "image patch grid {patches_w}x{patches_h} is not divisible by merge_size {}",
+            patchify.merge_size
+        );
+    }
     let per_tile = patches_w
         .checked_mul(patches_h)
         .context("image patch count is too large")?;
@@ -513,7 +555,7 @@ fn pack_image(
     ensure_element_limit(patch_count, "image patch count")?;
     let feature_size = checked_element_product(
         "image patch feature dimension",
-        &[3, patch_size, patch_size],
+        &[3, patch_size, patchify.temporal_patch_size, patch_size],
     )?;
     let patch_elements =
         checked_element_product("packed image pixel output", &[patch_count, feature_size])?;
@@ -533,28 +575,59 @@ fn pack_image(
                 height
             );
         }
-        for patch_y in 0..patches_h {
-            for patch_x in 0..patches_w {
-                for channel in 0..3 {
-                    let channel_offset = channel * width * height;
-                    for y in 0..patch_size {
-                        let row = (patch_y * patch_size + y) * width;
-                        let start = channel_offset + row + patch_x * patch_size;
-                        patches.extend_from_slice(&tile[start..start + patch_size]);
-                    }
-                }
-                coordinates.push(
-                    i64::try_from(
-                        tile_index
+        for group_y in 0..patches_h / patchify.merge_size {
+            for group_x in 0..patches_w / patchify.merge_size {
+                for local_y in 0..patchify.merge_size {
+                    for local_x in 0..patchify.merge_size {
+                        let patch_y = group_y * patchify.merge_size + local_y;
+                        let patch_x = group_x * patchify.merge_size + local_x;
+                        match patchify.channel_order {
+                            PatchChannelOrder::ChannelsFirst => {
+                                for channel in 0..3 {
+                                    let channel_offset = channel * width * height;
+                                    for y in 0..patch_size {
+                                        let row = (patch_y * patch_size + y) * width;
+                                        for _ in 0..patchify.temporal_patch_size {
+                                            let start = channel_offset + row + patch_x * patch_size;
+                                            patches.extend_from_slice(
+                                                &tile[start..start + patch_size],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            PatchChannelOrder::ChannelsLast => {
+                                for y in 0..patch_size {
+                                    let row = (patch_y * patch_size + y) * width;
+                                    for x in 0..patch_size {
+                                        for _ in 0..patchify.temporal_patch_size {
+                                            for channel in 0..3 {
+                                                patches.push(
+                                                    tile[channel * width * height
+                                                        + row
+                                                        + patch_x * patch_size
+                                                        + x],
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let y = tile_index
                             .checked_mul(patches_h)
                             .and_then(|value| value.checked_add(patch_y))
-                            .context("image patch row coordinate overflowed")?,
-                    )
-                    .context("image patch row coordinate is too large")?,
-                );
-                coordinates.push(
-                    i64::try_from(patch_x).context("image patch column coordinate is too large")?,
-                );
+                            .context("image patch row coordinate overflowed")?;
+                        let y =
+                            i64::try_from(y).context("image patch row coordinate is too large")?;
+                        let x = i64::try_from(patch_x)
+                            .context("image patch column coordinate is too large")?;
+                        match patchify.coordinate_order {
+                            CoordinateOrder::Yx => coordinates.extend_from_slice(&[y, x]),
+                            CoordinateOrder::Xy => coordinates.extend_from_slice(&[x, y]),
+                        }
+                    }
+                }
             }
         }
     }
@@ -633,6 +706,19 @@ fn build_pixels(
             )
         }
     } else {
+        let (width, height) = prepared
+            .first()
+            .map(|image| image.tile_size)
+            .context("rank-4 pixel output requires at least one prepared image")?;
+        if prepared
+            .iter()
+            .any(|image| image.tile_size != (width, height))
+        {
+            anyhow::bail!(
+                "rank-4 pixel output '{}' requires a common tile size across the image batch",
+                output.name
+            );
+        }
         let tile_count = prepared.iter().try_fold(0usize, |total, image| {
             total
                 .checked_add(image.tiles.len())
@@ -640,10 +726,9 @@ fn build_pixels(
         })?;
         let element_count = checked_element_product(
             &format!("rank-4 pixel output '{}'", output.name),
-            &[tile_count, 3, spec.width, spec.height],
+            &[tile_count, 3, width, height],
         )?;
-        let pixels_per_tile =
-            checked_element_product("image tile spatial size", &[spec.width, spec.height])?;
+        let pixels_per_tile = checked_element_product("image tile spatial size", &[width, height])?;
         let mut values = try_vec_with_capacity(
             element_count,
             &format!("rank-4 pixel output '{}'", output.name),
@@ -666,13 +751,13 @@ fn build_pixels(
             ImageLayout::Nchw => vec![
                 to_i64(tile_count, "image tile count")?,
                 3,
-                to_i64(spec.height, "image height")?,
-                to_i64(spec.width, "image width")?,
+                to_i64(height, "image height")?,
+                to_i64(width, "image width")?,
             ],
             ImageLayout::Nhwc => vec![
                 to_i64(tile_count, "image tile count")?,
-                to_i64(spec.height, "image height")?,
-                to_i64(spec.width, "image width")?,
+                to_i64(height, "image height")?,
+                to_i64(width, "image width")?,
                 3,
             ],
         };
@@ -792,6 +877,31 @@ fn build_original_sizes(
     })
 }
 
+fn build_transformed_sizes(
+    prepared: &[PreparedImage],
+    output: &OutputSpec,
+) -> anyhow::Result<NamedImageTensor> {
+    let element_count = checked_element_product(
+        &format!("transformed-size output '{}'", output.name),
+        &[prepared.len(), 2],
+    )?;
+    let mut values = try_vec_with_capacity(
+        element_count,
+        &format!("transformed-size output '{}'", output.name),
+    )?;
+    for image in prepared {
+        values.push(i64::from(image.transformed_size.1));
+        values.push(i64::from(image.transformed_size.0));
+    }
+    Ok(NamedImageTensor {
+        name: output.name.clone(),
+        content: output.content.clone(),
+        dtype: output.dtype,
+        shape: vec![to_i64(prepared.len(), "image batch")?, 2],
+        data: convert_i64(values, output.dtype, &output.name)?,
+    })
+}
+
 fn build_validity_mask(
     prepared: &[PreparedImage],
     packed: Option<&[PackedImage]>,
@@ -800,56 +910,99 @@ fn build_validity_mask(
     padded: bool,
     output: &OutputSpec,
 ) -> anyhow::Result<NamedImageTensor> {
-    let (shape, values) = match packed {
-        Some(packed) if padded => {
-            let element_count = checked_element_product(
-                &format!("padded validity mask '{}'", output.name),
-                &[packed.len(), max_patches],
-            )?;
-            let mut values = try_filled_vec(
-                element_count,
-                0_i64,
-                &format!("padded validity mask '{}'", output.name),
-            )?;
-            for (image_index, image) in packed.iter().enumerate() {
-                let start = image_index
-                    .checked_mul(max_patches)
-                    .context("padded validity-mask offset overflowed")?;
-                let end = start
-                    .checked_add(image.patch_count)
-                    .context("padded validity-mask range overflowed")?;
-                values[start..end].fill(1);
+    let dynamic_masks = prepared
+        .iter()
+        .map(|image| image.validity_masks.as_ref())
+        .collect::<Option<Vec<_>>>();
+    let (shape, values) = if let Some(masks_by_image) = dynamic_masks {
+        let first_mask = masks_by_image
+            .first()
+            .and_then(|masks| masks.first())
+            .context("dynamic validity mask output requires at least one mask")?;
+        let mask_edge = (first_mask.len() as f64).sqrt() as usize;
+        if mask_edge * mask_edge != first_mask.len() {
+            anyhow::bail!("dynamic validity mask cells must form a square");
+        }
+        let total_masks = masks_by_image.iter().try_fold(0usize, |total, masks| {
+            total
+                .checked_add(masks.len())
+                .context("dynamic validity mask count overflowed")
+        })?;
+        let mut values = try_vec_with_capacity(
+            total_masks * mask_edge * mask_edge,
+            &format!("dynamic validity mask '{}'", output.name),
+        )?;
+        for masks in masks_by_image {
+            for mask in masks {
+                if mask.len() != mask_edge * mask_edge {
+                    anyhow::bail!(
+                        "dynamic validity masks for output '{}' have inconsistent shapes",
+                        output.name
+                    );
+                }
+                values.extend(mask.iter().map(|value| i64::from(*value)));
             }
-            (
-                vec![
-                    to_i64(packed.len(), "image batch")?,
-                    to_i64(max_patches, "padded patch count")?,
-                ],
-                values,
-            )
         }
-        Some(_) => {
-            ensure_element_limit(total_patches, "validity mask element count")?;
-            (
-                vec![to_i64(total_patches, "total patch count")?],
-                try_filled_vec(
-                    total_patches,
-                    1,
-                    &format!("validity mask '{}'", output.name),
-                )?,
-            )
-        }
-        None => {
-            let count = prepared.iter().try_fold(0usize, |total, image| {
-                total
-                    .checked_add(image.tiles.len())
-                    .context("image tile count overflowed")
-            })?;
-            ensure_element_limit(count, "validity mask element count")?;
-            (
-                vec![to_i64(count, "image tile count")?],
-                try_filled_vec(count, 1, &format!("validity mask '{}'", output.name))?,
-            )
+        (
+            vec![
+                to_i64(total_masks, "dynamic validity mask count")?,
+                to_i64(mask_edge, "dynamic validity mask height")?,
+                to_i64(mask_edge, "dynamic validity mask width")?,
+            ],
+            values,
+        )
+    } else {
+        match packed {
+            Some(packed) if padded => {
+                let element_count = checked_element_product(
+                    &format!("padded validity mask '{}'", output.name),
+                    &[packed.len(), max_patches],
+                )?;
+                let mut values = try_filled_vec(
+                    element_count,
+                    0_i64,
+                    &format!("padded validity mask '{}'", output.name),
+                )?;
+                for (image_index, image) in packed.iter().enumerate() {
+                    let start = image_index
+                        .checked_mul(max_patches)
+                        .context("padded validity-mask offset overflowed")?;
+                    let end = start
+                        .checked_add(image.patch_count)
+                        .context("padded validity-mask range overflowed")?;
+                    values[start..end].fill(1);
+                }
+                (
+                    vec![
+                        to_i64(packed.len(), "image batch")?,
+                        to_i64(max_patches, "padded patch count")?,
+                    ],
+                    values,
+                )
+            }
+            Some(_) => {
+                ensure_element_limit(total_patches, "validity mask element count")?;
+                (
+                    vec![to_i64(total_patches, "total patch count")?],
+                    try_filled_vec(
+                        total_patches,
+                        1,
+                        &format!("validity mask '{}'", output.name),
+                    )?,
+                )
+            }
+            None => {
+                let count = prepared.iter().try_fold(0usize, |total, image| {
+                    total
+                        .checked_add(image.tiles.len())
+                        .context("image tile count overflowed")
+                })?;
+                ensure_element_limit(count, "validity mask element count")?;
+                (
+                    vec![to_i64(count, "image tile count")?],
+                    try_filled_vec(count, 1, &format!("validity mask '{}'", output.name))?,
+                )
+            }
         }
     };
     Ok(NamedImageTensor {
@@ -1106,17 +1259,27 @@ mod tests {
             optional: false,
         };
         let spec = PackSpec {
-            width: 4_096,
-            height: 4_096,
             layout: ImageLayout::Nchw,
-            patch_size: None,
+            patchify: None,
             pad_value: None,
+            target_length: None,
             outputs: vec![output("pixels_a"), output("pixels_b")],
             declared_pixel_shape: vec![-1, 3, 4_096, 4_096],
         };
+        let prepared = [PreparedImage {
+            original_size: (4_096, 4_096),
+            transformed_size: (4_096, 4_096),
+            tile_grid: TileGrid {
+                columns: 1,
+                rows: 1,
+            },
+            tile_size: (4_096, 4_096),
+            tiles: Vec::new(),
+            validity_masks: None,
+        }];
 
-        let error =
-            validate_total_output_elements(&[], None, None, 0, 0, 1, false, &spec).unwrap_err();
+        let error = validate_total_output_elements(&prepared, None, None, 0, 0, 1, false, &spec)
+            .unwrap_err();
         assert!(error.to_string().contains("across declared tensors"));
     }
 }
