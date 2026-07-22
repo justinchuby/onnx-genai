@@ -32,39 +32,54 @@ const DEFAULT_DECODE_THREADS: usize = 8;
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
 
-/// Env knob for the MLAS SQNBit int4 prefill/decode crossover (`m` row count).
-/// MatMulNBits with `m < NXRT_SQNBIT_PREFILL_MIN` falls back to the specialized
-/// hand-written int4 GEMV path (`int4_matmul_m1`/`int8_matmul`), which wins the
-/// bandwidth-bound M=1 decode; MLAS `MlasQNBitGemmBatch` is only used once `m`
-/// reaches the threshold, where its cache-tiled kernels win prefill.
+/// Env knob for the int4 MatMulNBits hand-decode ↔ MLAS SQNBit crossover (`m`
+/// row count). MatMulNBits int4 with `m < NXRT_SQNBIT_DECODE_MIN` uses the
+/// specialized hand-written int4/int8 decode path (`int4_matmul_m1` for block-32
+/// symmetric M=1, `int8_matmul` otherwise), which ties MLAS on the
+/// bandwidth-bound M=1 decode while avoiding int8 activation rounding; `m` at or
+/// above the threshold routes to MLAS `MlasQNBitGemmBatch`, whose cache-tiled
+/// kernels win prefill by 6--9x.
 #[cfg(feature = "mlas")]
-const SQNBIT_PREFILL_MIN_ENV: &str = "NXRT_SQNBIT_PREFILL_MIN";
+const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 
-/// Default MLAS SQNBit int4 prefill threshold. Measured on Sapphire Rapids
-/// (Xeon 8480C): the hand int4 path leads for small `m` and MLAS overtakes it
-/// around `m` in the mid-teens, so decode (`m == 1`) keeps the hand path while
-/// prefill batches route to MLAS. Override with `NXRT_SQNBIT_PREFILL_MIN`.
+/// Default int4 MatMulNBits hand-decode ↔ MLAS crossover. Measured on Sapphire
+/// Rapids (Xeon 8480C):
+///
+/// * Isolated GEMV microbench (`matmulnbits_mlas_perf`, weights L3-resident)
+///   reports MLAS int4 M=1 ~1.7--1.9x faster, but that is a cache artifact.
+/// * Cold, DRAM-streamed full-decode-step microbench
+///   (`matmulnbits_mlas_decode_step`, one distinct 3.5 GB weight set per token,
+///   32 threads) has the hand path and MLAS CompInt8 **tie** at ~90 GB/s
+///   (~25 tok/s) for M=1 -- decode is memory-bandwidth bound, so the int4 path
+///   choice is a wash and the hand path is preferred (no int8 rounding).
+/// * End-to-end Qwen2.5-Coder-7B decode is the same (~8 tok/s) with either M=1
+///   route; the 2.3x gap vs ORT/foundry is per-op Rayon fork-join and NUMA
+///   locality, not the MatMulNBits kernel (see docs/BENCH_MLAS_INT4_E2E.md).
+///
+/// MLAS overtakes the hand path in the mid-teens of `m`, so decode/tiny batches
+/// keep the hand path and prefill routes to MLAS. Override with
+/// `NXRT_SQNBIT_DECODE_MIN`.
 #[cfg(feature = "mlas")]
-const DEFAULT_SQNBIT_PREFILL_MIN: usize = 16;
+const DEFAULT_SQNBIT_DECODE_MIN: usize = 16;
 
 #[cfg(feature = "mlas")]
-static SQNBIT_PREFILL_MIN: OnceLock<usize> = OnceLock::new();
+static SQNBIT_DECODE_MIN: OnceLock<usize> = OnceLock::new();
 
-/// Smallest `m` (batch·seq row count) that routes MatMulNBits int4 to MLAS
-/// SQNBit; smaller `m` falls back to the hand int4 path. Parsed once from
-/// `NXRT_SQNBIT_PREFILL_MIN`, defaulting to [`DEFAULT_SQNBIT_PREFILL_MIN`].
+/// Smallest `m` (batch·seq row count) that routes int4 MatMulNBits to MLAS
+/// SQNBit; smaller `m` uses the hand int4/int8 decode path. Parsed once from
+/// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`DEFAULT_SQNBIT_DECODE_MIN`].
 #[cfg(feature = "mlas")]
-fn sqnbit_prefill_min() -> usize {
-    *SQNBIT_PREFILL_MIN
-        .get_or_init(|| resolve_prefill_min(std::env::var(SQNBIT_PREFILL_MIN_ENV).ok().as_deref()))
+fn sqnbit_decode_min() -> usize {
+    *SQNBIT_DECODE_MIN
+        .get_or_init(|| resolve_decode_min(std::env::var(SQNBIT_DECODE_MIN_ENV).ok().as_deref()))
 }
 
-/// Parse the SQNBit prefill threshold, falling back to
-/// [`DEFAULT_SQNBIT_PREFILL_MIN`] for absent, empty, or malformed values.
+/// Parse the SQNBit decode crossover, falling back to
+/// [`DEFAULT_SQNBIT_DECODE_MIN`] for absent, empty, or malformed values.
 #[cfg(feature = "mlas")]
-fn resolve_prefill_min(raw: Option<&str>) -> usize {
+fn resolve_decode_min(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SQNBIT_PREFILL_MIN)
+        .unwrap_or(DEFAULT_SQNBIT_DECODE_MIN)
 }
 
 pub struct MatMulNBitsKernel {
@@ -370,13 +385,18 @@ impl MatMulNBitsKernel {
     /// `Ok(Some(()))` when it filled `result` (the caller writes output and
     /// returns), or `Ok(None)` to signal a fall back to the hand-written paths.
     ///
-    /// Fallback cases (return `Ok(None)`): `m` is below the SQNBit prefill
-    /// threshold ([`sqnbit_prefill_min`]) so decode keeps the fast hand int4
-    /// path, backend is not MLAS, `bits != 4` (2-bit is left to the existing
-    /// correctness path), `g_idx` is present (MLAS SQNBit has no per-row group
-    /// indices), or MLAS reports no kernel is available for this shape on the
-    /// host. Bias, when present, is added by MLAS itself, so the caller's
-    /// post-loop bias add is skipped on this path.
+    /// Fallback cases (return `Ok(None)`): the decode regime (`m` below the
+    /// crossover [`sqnbit_decode_min`]) when the hand path is a *fast*
+    /// specialized int4/int8 route (`bits == 4 && accuracy_level == 4`), which
+    /// ties MLAS on bandwidth-bound M=1 while avoiding int8 activation rounding;
+    /// backend is not MLAS; `bits != 4` (2-bit is left to the existing
+    /// correctness path); `g_idx` is present (MLAS SQNBit has no per-row group
+    /// indices); or MLAS reports no kernel is available for this shape on the
+    /// host. A small-`m` case whose hand path would instead fall to the slow
+    /// full-f32-dequant GEMV (e.g. `accuracy_level != 4`) is **not** dropped
+    /// here: MLAS SQNBit (CompFp32) beats a dequantize-then-GEMM there. Bias,
+    /// when present, is added by MLAS itself, so the caller's post-loop bias add
+    /// is skipped on this path.
     #[cfg(feature = "mlas")]
     #[allow(clippy::too_many_arguments)]
     fn try_mlas_sqnbit(
@@ -393,9 +413,13 @@ impl MatMulNBitsKernel {
     ) -> Result<Option<()>> {
         use crate::backend::CpuBackend;
 
-        // Cheapest gate first: small `m` (decode/GEMV) is bandwidth-bound and the
-        // hand int4 path beats MLAS there, so fall back before any weight packing.
-        if m < sqnbit_prefill_min() {
+        // Cheapest gate first: in the decode regime (small `m`), keep the fast
+        // hand int4/int8 path -- it ties MLAS on the bandwidth-bound M=1 GEMV
+        // and avoids int8 activation rounding -- so fall back before any weight
+        // packing. A slow-hand-path case (`accuracy_level != 4`, which would
+        // dequantize to f32 and run a dense GEMV) is left for MLAS below.
+        let hand_decode_is_fast = self.bits == 4 && self.accuracy_level == 4;
+        if m < sqnbit_decode_min() && hand_decode_is_fast {
             return Ok(None);
         }
 
@@ -2532,17 +2556,17 @@ mod tests {
         );
     }
 
-    /// The SQNBit prefill threshold parses `NXRT_SQNBIT_PREFILL_MIN`, falling
+    /// The SQNBit decode crossover parses `NXRT_SQNBIT_DECODE_MIN`, falling
     /// back to the measured default for absent, empty, or malformed values.
     #[cfg(feature = "mlas")]
     #[test]
-    fn matmulnbits_resolve_prefill_min_parses_or_defaults() {
-        assert_eq!(resolve_prefill_min(None), DEFAULT_SQNBIT_PREFILL_MIN);
-        assert_eq!(resolve_prefill_min(Some("")), DEFAULT_SQNBIT_PREFILL_MIN);
-        assert_eq!(resolve_prefill_min(Some("abc")), DEFAULT_SQNBIT_PREFILL_MIN);
-        assert_eq!(resolve_prefill_min(Some("32")), 32);
-        assert_eq!(resolve_prefill_min(Some("  8 ")), 8);
-        assert_eq!(resolve_prefill_min(Some("1")), 1);
+    fn matmulnbits_resolve_decode_min_parses_or_defaults() {
+        assert_eq!(resolve_decode_min(None), DEFAULT_SQNBIT_DECODE_MIN);
+        assert_eq!(resolve_decode_min(Some("")), DEFAULT_SQNBIT_DECODE_MIN);
+        assert_eq!(resolve_decode_min(Some("abc")), DEFAULT_SQNBIT_DECODE_MIN);
+        assert_eq!(resolve_decode_min(Some("32")), 32);
+        assert_eq!(resolve_decode_min(Some("  8 ")), 8);
+        assert_eq!(resolve_decode_min(Some("1")), 1);
     }
 
     /// Serialize the few tests that mutate `NXRT_CPU_GEMM_BACKEND` so the global
@@ -2553,12 +2577,13 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    /// M-based hybrid routing gate: with an otherwise-eligible int4 case and the
-    /// MLAS backend selected, `try_mlas_sqnbit` must still fall back
-    /// (`Ok(None)`) for `m` below the prefill threshold (decode keeps the hand
-    /// path) and serve MLAS (`Ok(Some(()))`) for `m` at/above it (prefill). This
-    /// regression-locks the decode/prefill split. Uses the default threshold
-    /// ([`DEFAULT_SQNBIT_PREFILL_MIN`]); the host must have an MLAS SQNBit int4
+    /// M-based hybrid routing gate: with an otherwise-eligible int4 case
+    /// (`accuracy_level == 4`, so the hand decode path is fast) and the MLAS
+    /// backend selected, `try_mlas_sqnbit` must still fall back (`Ok(None)`) for
+    /// `m` below the decode crossover (decode keeps the hand path) and serve
+    /// MLAS (`Ok(Some(()))`) for `m` at/above it (prefill). This regression-locks
+    /// the decode/prefill split. Uses the default threshold
+    /// ([`DEFAULT_SQNBIT_DECODE_MIN`]); the host must have an MLAS SQNBit int4
     /// kernel or the assertions are skipped.
     #[cfg(feature = "mlas")]
     #[test]
@@ -2590,8 +2615,8 @@ mod tests {
         let b = Owned::u8(&[n, k_blocks, blob], &packed_bytes);
         let scales_t = Owned::f32(&[n, k_blocks], &scales);
 
-        let below = DEFAULT_SQNBIT_PREFILL_MIN - 1;
-        let at = DEFAULT_SQNBIT_PREFILL_MIN;
+        let below = DEFAULT_SQNBIT_DECODE_MIN - 1;
+        let at = DEFAULT_SQNBIT_DECODE_MIN;
 
         let _guard = backend_env_lock().lock().unwrap();
         let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
@@ -2629,13 +2654,88 @@ mod tests {
 
         assert_eq!(
             decode, None,
-            "m={below} (< {DEFAULT_SQNBIT_PREFILL_MIN}) must fall back to the hand int4 path",
+            "m={below} (< {DEFAULT_SQNBIT_DECODE_MIN}) must fall back to the hand int4 path",
         );
         assert_eq!(
             prefill,
             Some(()),
-            "m={at} (>= {DEFAULT_SQNBIT_PREFILL_MIN}) must route to MLAS SQNBit",
+            "m={at} (>= {DEFAULT_SQNBIT_DECODE_MIN}) must route to MLAS SQNBit",
         );
+    }
+
+    /// Slow-hand-path decode routing: for `m == 1` with `bits == 4` but
+    /// `accuracy_level != 4`, the hand path would dequantize the whole weight to
+    /// f32 and run a dense GEMV. MLAS SQNBit (CompFp32) beats that, so
+    /// `try_mlas_sqnbit` must route this small-`m` case to MLAS
+    /// (`Ok(Some(()))`), unlike the fast `accuracy_level == 4` decode case which
+    /// stays on the hand path. Skipped when the host lacks the MLAS kernel.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_try_mlas_serves_slow_dequant_decode() {
+        let (n, k, block_size) = (32usize, 64usize, 32usize);
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let weights_nk = pseudo(n * k, 0.3);
+        let (packed_bytes, scales, _zps, dq) = quantize(&weights_nk, n, k, block_size, false);
+
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Fp32,
+            &packed_bytes,
+            &scales,
+            None,
+        )
+        .is_none()
+        {
+            eprintln!("MLAS SQNBit int4 CompFp32 kernel unavailable; skipping slow-decode test");
+            return;
+        }
+
+        // accuracy_level 0 => hand path would use the slow f32 dequant GEMV.
+        let kernel = test_kernel(k, n, block_size);
+        let b = Owned::u8(&[n, k_blocks, blob], &packed_bytes);
+        let scales_t = Owned::f32(&[n, k_blocks], &scales);
+
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var.
+        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+
+        let a = pseudo(k, 0.8);
+        let mut result = vec![0.0f32; n];
+        let served = kernel
+            .try_mlas_sqnbit(
+                &b.view(),
+                &scales_t.view(),
+                None,
+                None,
+                false,
+                &a,
+                1,
+                None,
+                &mut result,
+            )
+            .unwrap();
+
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+            }
+        }
+
+        assert_eq!(
+            served,
+            Some(()),
+            "m=1 bits=4 accuracy_level=0 (slow hand dequant GEMV) must route to MLAS SQNBit",
+        );
+        // CompFp32 dequant is near-exact, so it must match the f32 reference.
+        let expected = reference(&a, &dq, 1, k, n);
+        mlas_close(&result, &expected, 2e-3, "slow-dequant m1 CompFp32");
     }
 
     /// Before/after perf for int4 MatMulNBits: the existing hand-written VNNI
@@ -2733,5 +2833,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Full M=1 decode-step probe at real 7B (Qwen2.5-Coder-7B) projection
+    /// shapes: replays the exact per-token MatMulNBits op sequence (qkv, o,
+    /// gate, up, down per layer, plus the lm_head) back-to-back inside one
+    /// decode-pool residency, so it captures the *sequential per-op dispatch*
+    /// overhead the isolated `matmulnbits_mlas_perf` probe misses. Compares the
+    /// hand int4 GEMV path against MLAS SQNBit CompInt8 at the real decode
+    /// thread count. Shapes come from the model (read once, listed here only as
+    /// a probe fixture); production routing never hardcodes them.
+    ///
+    ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
+    ///     matmulnbits_mlas_decode_step -- --ignored --nocapture
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn matmulnbits_mlas_decode_step() {
+        use std::time::Instant;
+
+        // (K, N, count-per-token) for one Qwen2.5-Coder-7B decode step.
+        let layers = 28usize;
+        let ops: &[(usize, usize, usize)] = &[
+            (3584, 4608, layers),    // qkv_proj
+            (3584, 3584, layers),    // o_proj
+            (3584, 18944, layers),   // gate_proj
+            (3584, 18944, layers),   // up_proj
+            (18944, 3584, layers),   // down_proj
+            (3584, 152064, 1),       // lm_head
+        ];
+        let block_size = 32usize;
+        let dot_kernel = selected_dot_kernel();
+
+        struct Weights {
+            k: usize,
+            n: usize,
+            int4: PackedInt4Weight,
+            mlas: mlas_sys::SQNBitPackedB,
+        }
+
+        // Build one *distinct* weight per op instance so the step streams the
+        // full ~3.5 GB of cold int4 weights from DRAM, exactly like the model
+        // (reusing a handful of buffers would keep them L3-resident and report
+        // fantasy bandwidth). Distinct scale seeds also defeat page dedup.
+        let mut built: Vec<Weights> = Vec::new();
+        let mut weight_bytes = 0u64;
+        for (shape_index, &(k, n, count)) in ops.iter().enumerate() {
+            for instance in 0..count {
+                let seed = 0.3 + shape_index as f32 * 0.11 + instance as f32 * 0.001;
+                let weights_nk = pseudo(n * k, seed);
+                let (packed_bytes, scales, _zps, _dq) =
+                    quantize(&weights_nk, n, k, block_size, false);
+                let Some(mlas) = mlas_sys::SQNBitPackedB::new(
+                    n,
+                    k,
+                    4,
+                    block_size,
+                    mlas_sys::SQNBitComputeType::Int8,
+                    &packed_bytes,
+                    &scales,
+                    None,
+                ) else {
+                    eprintln!("MLAS SQNBit int4 kernel unavailable; skipping decode-step probe");
+                    return;
+                };
+                weight_bytes += (n as u64) * (k as u64) / 2;
+                built.push(Weights {
+                    k,
+                    n,
+                    int4: PackedInt4Weight {
+                        values: packed_bytes,
+                        scales,
+                    },
+                    mlas,
+                });
+            }
+        }
+
+        let threads = configured_decode_threads().unwrap_or(DEFAULT_DECODE_THREADS);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+
+        let run_hand = || {
+            for w in &built {
+                let a = vec![0.03f32; w.k];
+                let mut out = vec![0.0f32; w.n];
+                int4_matmul_m1(&a, &w.int4, &mut out, w.k, w.n, dot_kernel);
+            }
+        };
+        let run_mlas = || {
+            for w in &built {
+                let a = vec![0.03f32; w.k];
+                let mut out = vec![0.0f32; w.n];
+                mlas_sys::sqnbit_gemm(&w.mlas, 1, &a, None, &mut out, true);
+            }
+        };
+
+        let step = |label: &str, run: &(dyn Fn() + Sync)| {
+            pool.install(|| {
+                for _ in 0..3 {
+                    run();
+                }
+                let iters = 20u32;
+                let start = Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                let per_step = start.elapsed().as_secs_f64() / iters as f64;
+                let gbs = weight_bytes as f64 / per_step / 1e9;
+                eprintln!(
+                    "decode-step {label}: {:.2} ms/step  {:.2} tok/s  {:.1} GB/s ({threads}t)",
+                    per_step * 1e3,
+                    1.0 / per_step,
+                    gbs,
+                );
+            });
+        };
+
+        eprintln!(
+            "decode-step probe: {} weight bytes/token, {threads} decode threads",
+            weight_bytes
+        );
+        step("hand", &run_hand);
+        step("mlas", &run_mlas);
     }
 }

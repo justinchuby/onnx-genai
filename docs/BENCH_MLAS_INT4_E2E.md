@@ -98,7 +98,7 @@ this small model.
 **Date:** 2026-07-20T05:40Z — same host (Xeon 8480C, 96 hardware threads).
 
 `try_mlas_sqnbit` now gates on `M`: MatMulNBits int4 with `m <
-NXRT_SQNBIT_PREFILL_MIN` (default **16**) falls back to the specialized hand
+NXRT_SQNBIT_DECODE_MIN` (default **16**) falls back to the specialized hand
 int4 GEMV (`int4_matmul_m1`), and MLAS `MlasQNBitGemmBatch` is used only once `m`
 reaches the threshold (prefill). The `NXRT_CPU_GEMM_BACKEND=mlas` f32 backend is
 left untouched.
@@ -107,7 +107,7 @@ left untouched.
 |---|---|---|---:|
 | Baseline (no env) | hand | SimdX86 | **18.14 tok/s** (55.138 ms/step) |
 | MLAS + M-gate (default 16) | hand | MLAS | **18.37 tok/s** (54.444 ms/step) |
-| MLAS, gate disabled (`NXRT_SQNBIT_PREFILL_MIN=0`, old behavior) | MLAS | MLAS | 9.62 tok/s (103.936 ms/step) |
+| MLAS, gate disabled (`NXRT_SQNBIT_DECODE_MIN=0`, old behavior) | MLAS | MLAS | 9.62 tok/s (103.936 ms/step) |
 
 Decode with the gate **fully recovers** to the hand-path baseline (+1.3%). The
 only difference between the recovered run and the regressed run is int4 routing
@@ -145,7 +145,7 @@ wins by 6–9× even at 8 threads, so prefill still belongs on MLAS.
 **Crossover:** in the deployed many-thread regime, M=1 favors the hand path
 (~1.9×), M=32 favors MLAS (6–9×). The default threshold **16** keeps decode and
 tiny batches on the hand path while routing real prefill (typically ≫16 tokens)
-to MLAS. Tune with `NXRT_SQNBIT_PREFILL_MIN`.
+to MLAS. Tune with `NXRT_SQNBIT_DECODE_MIN`.
 
 ### Commands
 
@@ -163,7 +163,7 @@ NXRT_CPU_GEMM_BACKEND=mlas ./target/release/profile_native \
   --tokens 128 --warmups 2 --runs 3 --ep cpu --prompt "The capital of France is"
 
 # regression repro (gate off)
-NXRT_CPU_GEMM_BACKEND=mlas NXRT_SQNBIT_PREFILL_MIN=0 ./target/release/profile_native \
+NXRT_CPU_GEMM_BACKEND=mlas NXRT_SQNBIT_DECODE_MIN=0 ./target/release/profile_native \
   --model /home/justinchu/qwen2.5-0.5b-int4-onnx \
   --tokens 128 --warmups 2 --runs 3 --ep cpu --prompt "The capital of France is"
 
@@ -171,3 +171,82 @@ NXRT_CPU_GEMM_BACKEND=mlas NXRT_SQNBIT_PREFILL_MIN=0 ./target/release/profile_na
 cargo test -p onnx-runtime-ep-cpu --features mlas --release \
   matmulnbits_mlas_perf -- --ignored --nocapture
 ```
+
+---
+
+## 7B addendum — re-profiling M=1 at production scale (perf/cpu-ep-mlas)
+
+**Date:** 2026-07-22 — host Xeon 8480C (Sapphire Rapids, AMX + AVX512-VNNI), 2
+NUMA nodes (node0 cpus 0–47, node1 48–95), 32 decode threads. Model:
+Qwen2.5-Coder-7B-Instruct int4 generic-cpu (all MatMulNBits `block_size=32`,
+`bits=4`, `accuracy_level=4`).
+
+The 0.5B measurements above were re-validated against the 7B decode shapes
+because the earlier "hand beats MLAS at M=1" conclusion was measured on a small
+model. **The conclusion holds at 7B, but the reason is different and the gap to
+ORT is not a kernel-choice problem.**
+
+### Real per-token MatMulNBits shapes (7B, extracted from the ONNX graph)
+
+| Projection | K | N | ops/token |
+|---|---:|---:|---:|
+| lm_head | 3584 | 152064 | 1 |
+| gate + up | 3584 | 18944 | 56 |
+| down | 18944 | 3584 | 28 |
+| qkv | 3584 | 4608 | 28 |
+| o_proj | 3584 | 3584 | 28 |
+
+~3.5 GB of int4 weights are streamed per token (141 MatMulNBits ops).
+
+### Cold vs cache-hot micro-benchmark (the earlier win was a cache artifact)
+
+The `matmulnbits_mlas_perf` probe reuses the same activation/weight buffers
+across iterations, so weights stay L3-resident — MLAS reports a 1.7–1.97× M=1
+"win". That is a fantasy for decode, where every op touches a **distinct**
+DRAM-resident weight. The new `matmulnbits_mlas_decode_step` probe replays the
+real 7B op sequence with distinct cold buffers:
+
+| Path (cold, distinct DRAM weights, M=1) | Throughput | Bandwidth |
+|---|---:|---:|
+| hand int4 GEMV | ~26 tok/s | ~92.9 GB/s |
+| MLAS SQNBit CompInt8 | ~25 tok/s | ~89.2 GB/s |
+
+At production scale M=1 decode is **memory-bound and the two paths tie**. MLAS
+CompInt8 does not win, and it would add int8 requantization rounding — so per
+rules 4/5 the hand path is retained for M=1 `accuracy_level=4`.
+
+### Where the 2.3× end-to-end gap actually is
+
+`perf record` over end-to-end decode:
+
+| Bucket | Share | Notes |
+|---|---:|---|
+| MatMulNBits compute | ~44% | the actual GEMM work |
+| rayon / crossbeam-epoch fork-join | ~27% | threads idle-spinning at per-op join barriers |
+| `to_dense_bytes` | ~7.5% | one-time weight materialization |
+| `prepack_int8_weight` | ~4.5% | one-time, cached in OnceLock |
+
+141 ops/token × up to 64 `par_chunks_mut` tasks each means the process pays a
+fork-join barrier ~141 times per token. NUMA test: `numactl --cpunodebind=0
+--membind=0` yields **+25% (~10 tok/s)** but plateaus at ~10 even with 48
+threads, using only ~14% of memory bandwidth → the decode loop is
+**latency/sync-bound**, not bandwidth- or kernel-bound.
+
+**Conclusion:** switching M=1 int4 decode to MLAS does not close the gap to ORT
+(20.12 tok/s); the gap is engine-level per-op fork-join overhead plus NUMA weight
+placement, which is cross-crate (loader + decode pool + executor) and out of
+scope for the kernel. Recommended follow-up: reduce per-op fork-join barriers
+(ORT-style persistent worker pool / fewer join points per token), and
+NUMA-aware weight placement + thread pinning.
+
+### Change shipped on this branch
+
+- Renamed the knob `NXRT_SQNBIT_PREFILL_MIN` → **`NXRT_SQNBIT_DECODE_MIN`**
+  (default **16**). It gates the `M` below which int4 decode with a *fast* hand
+  path stays on the hand kernel; at/above it, MLAS SQNBit is used (prefill).
+- The M=1 gate is now dtype/accuracy-driven, not just `M`-driven: only
+  `bits==4 && accuracy_level==4` (the fast `int4_matmul_m1`/`int8_matmul`
+  hand paths) are kept on the hand path for small `M`. Slow dequant-to-f32 M=1
+  cases (e.g. `bits==4, accuracy_level!=4`) now route to MLAS CompFp32, a
+  genuine generic win, while `g_idx` / 2-bit cases MLAS can't serve still fall
+  back to the hand path. No model identity is used (rule 2).
