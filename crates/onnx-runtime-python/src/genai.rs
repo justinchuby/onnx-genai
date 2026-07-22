@@ -78,19 +78,20 @@ fn build_options(
             "top_p must be finite and between 0 and 1 inclusive",
         ));
     }
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = max_tokens;
-    options.temperature = temperature;
-    options.top_p = top_p;
-    options.top_k = top_k;
-    options.seed = seed;
-    options.greedy = temperature == 0.0;
-    options.stop_sequences = stop
-        .unwrap_or_default()
-        .into_iter()
-        .map(StopSequence::Text)
-        .collect();
-    Ok(options)
+    Ok(GenerateOptions {
+        max_new_tokens: max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        seed,
+        greedy: temperature == 0.0,
+        stop_sequences: stop
+            .unwrap_or_default()
+            .into_iter()
+            .map(StopSequence::Text)
+            .collect(),
+        ..GenerateOptions::default()
+    })
 }
 
 fn request(
@@ -195,6 +196,8 @@ impl Engine {
     }
 
     #[pyo3(signature = (prompt, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
+    // The Python API intentionally exposes each generation option as a keyword argument.
+    #[allow(clippy::too_many_arguments)]
     fn generate(
         &self,
         py: Python<'_>,
@@ -217,6 +220,8 @@ impl Engine {
     }
 
     #[pyo3(signature = (prompt, callback, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
+    // The Python API intentionally exposes each generation option as a keyword argument.
+    #[allow(clippy::too_many_arguments)]
     fn generate_stream(
         &self,
         py: Python<'_>,

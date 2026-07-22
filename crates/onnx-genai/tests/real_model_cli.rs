@@ -10,7 +10,7 @@ fn tinystories_cli_generates_coherent_english() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+    let output = Command::new(std::env::var("CARGO_BIN_EXE_onnx-genai")?)
         .args([
             "generate",
             "--model",
@@ -55,7 +55,7 @@ fn qwen_cli_generates_chatml_answer() -> anyhow::Result<()> {
     }
 
     let prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2? Answer briefly.<|im_end|>\n<|im_start|>assistant\n";
-    let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+    let output = Command::new(std::env::var("CARGO_BIN_EXE_onnx-genai")?)
         .args([
             "generate",
             "--model",

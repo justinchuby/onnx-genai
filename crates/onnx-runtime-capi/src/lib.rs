@@ -126,7 +126,8 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::InvalidOption { .. }
         | E::DynamicShape { .. }
         | E::SymbolConflict { .. }
-        | E::RankMismatch { .. } => OrtErrorCode::InvalidArgument,
+        | E::RankMismatch { .. }
+        | E::RuntimeBroadcastIncompatible { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,
@@ -911,6 +912,15 @@ mod tests {
                 name: "x".into(),
                 expected: 2,
                 got: 3,
+            }),
+            OrtErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            map_session_error(&E::RuntimeBroadcastIncompatible {
+                node: "add".into(),
+                domain: String::new(),
+                op_type: "Add".into(),
+                input_shapes: vec![vec![2, 3], vec![2, 4]],
             }),
             OrtErrorCode::InvalidArgument
         );
