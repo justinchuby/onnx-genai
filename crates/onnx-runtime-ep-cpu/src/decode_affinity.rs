@@ -8,9 +8,33 @@
 //! whatever node first touched them. Pinning the workers to the CPUs of a single
 //! NUMA node keeps both the barrier traffic and the weight reads node-local.
 //!
-//! Topology is *queried* from the running machine (`/sys/devices/system/node`
-//! on Linux), never hardcoded, and the behaviour is selected through an explicit
-//! environment switch so it stays inspectable.
+//! Topology is *queried* from the running machine, never hardcoded:
+//! `/sys/devices/system/node` on Linux, `GetLogicalProcessorInformationEx`
+//! (`RelationNumaNode`) on Windows. macOS exposes no thread-to-core affinity, so
+//! pinning there is a documented, logged no-op; any other target falls back to
+//! unpinned decode. The behaviour is selected through an explicit environment
+//! switch so it stays inspectable, and — when that switch is unset — an
+//! auto-enable policy pins `compact` on multi-node hosts where it is safe (see
+//! [`plan_decode_affinity`]).
+//!
+//! ## Cross-processor CPU identity
+//!
+//! CPU indices in [`NumaTopology`] are opaque, OS-defined handles, never assumed
+//! to be dense or socket-ordered. On Linux they are the kernel's logical CPU
+//! ids. On Windows, where a host with more than 64 logical CPUs is partitioned
+//! into *processor groups* of up to 64 CPUs each, a CPU is encoded as
+//! `group * 64 + bit`, so pinning recovers the group and in-group mask exactly
+//! (`group = cpu / 64`, `mask = 1 << (cpu % 64)`); this handles >64-CPU hosts
+//! correctly instead of silently truncating to one group.
+//!
+//! ## Container / cgroup / taskset safety
+//!
+//! Before pinning, the OS-discovered topology is intersected with the process's
+//! actual allowed CPU set (Linux `sched_getaffinity`, Windows
+//! `GetThreadGroupAffinity`), so a container or `taskset`-restricted host never
+//! tries to pin to a CPU it is not permitted to run on. If that intersection
+//! leaves fewer than two NUMA nodes, auto-enable declines and decode stays
+//! unpinned (logged once).
 
 use std::collections::BTreeMap;
 
@@ -45,8 +69,9 @@ fn available_nodes_clause(topology: Option<&NumaTopology>) -> String {
                 .join(", ");
             format!("available NUMA nodes are [{list}]")
         }
-        _ => "NUMA topology is unavailable on this host (single NUMA node or non-Linux), \
-              so no node selector can be honored"
+        _ => "NUMA topology is unavailable on this host (single NUMA node or a \
+              platform without discoverable NUMA topology), so no node selector \
+              can be honored"
             .to_string(),
     }
 }
@@ -171,14 +196,22 @@ pub struct NumaTopology {
 
 impl NumaTopology {
     /// Detect the NUMA topology of the running host, returning `None` when the
-    /// platform exposes no node information (e.g. non-Linux or a single node).
+    /// platform exposes no multi-node information (a single node, or a target
+    /// without discoverable NUMA topology such as macOS or an unsupported OS).
     pub fn detect() -> Option<Self> {
         #[cfg(target_os = "linux")]
         {
             Self::detect_linux()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
         {
+            Self::detect_windows()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            // macOS exposes no thread-to-core affinity and, in practice, a
+            // single NUMA node; every other target has no discoverable topology
+            // here. Report "no multi-node topology" so decode stays unpinned.
             None
         }
     }
@@ -206,6 +239,49 @@ impl NumaTopology {
             }
         }
         (nodes.len() > 1).then_some(Self { nodes })
+    }
+
+    /// Detect NUMA topology on Windows via `GetLogicalProcessorInformationEx`
+    /// with `RelationNumaNode`, returning `None` when the host has a single node
+    /// or the API is unavailable.
+    ///
+    /// Each `NUMA_NODE_RELATIONSHIP` carries a `GROUP_AFFINITY` naming the
+    /// processor group and a 64-bit CPU mask within it, so a CPU is encoded as
+    /// `group * 64 + bit`. This spans processor groups correctly, so a host with
+    /// more than 64 logical CPUs is not silently truncated to its first group.
+    #[cfg(target_os = "windows")]
+    fn detect_windows() -> Option<Self> {
+        let nodes = windows_imp::numa_nodes()?;
+        let nodes: BTreeMap<usize, Vec<usize>> = nodes
+            .into_iter()
+            .filter(|(_, cpus)| !cpus.is_empty())
+            .collect();
+        (nodes.len() > 1).then_some(Self { nodes })
+    }
+
+    /// Intersect every node's CPU list with `allowed`, dropping any CPU the
+    /// process may not run on and any node left empty. Returns the restricted
+    /// topology (which may have fewer nodes, or be empty).
+    ///
+    /// `allowed == None` means the allowed set could not be determined, so the
+    /// topology is returned unchanged (we do not guess a restriction). This is
+    /// the cgroup/cpuset/taskset safety gate: pinning only ever targets CPUs the
+    /// intersection proves the process is permitted to use.
+    pub fn restrict_to_allowed(&self, allowed: Option<&[usize]>) -> Self {
+        let Some(allowed) = allowed else {
+            return self.clone();
+        };
+        let allowed: std::collections::BTreeSet<usize> = allowed.iter().copied().collect();
+        let nodes = self
+            .nodes
+            .iter()
+            .filter_map(|(&index, cpus)| {
+                let kept: Vec<usize> =
+                    cpus.iter().copied().filter(|c| allowed.contains(c)).collect();
+                (!kept.is_empty()).then_some((index, kept))
+            })
+            .collect();
+        Self { nodes }
     }
 
     /// The number of NUMA nodes discovered.
@@ -291,6 +367,7 @@ impl NumaTopology {
 }
 
 /// Parse a Linux `cpulist` string such as `"0-3,8,10-11"` into CPU indices.
+#[cfg(any(target_os = "linux", test))]
 fn parse_cpu_list(list: &str) -> Vec<usize> {
     let mut cpus = Vec::new();
     for part in list.trim().split(',') {
@@ -361,9 +438,378 @@ pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> 
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn pin_current_thread_to_cpu(_cpu: usize) -> std::result::Result<(), String> {
-    Err("thread affinity is only implemented on Linux".to_string())
+#[cfg(target_os = "windows")]
+pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    windows_imp::pin_current_thread_to_cpu(cpu)
+}
+
+/// macOS exposes no public thread-to-core affinity API (the old
+/// `thread_policy_set(THREAD_AFFINITY_POLICY)` is an advisory hint the scheduler
+/// is free to ignore and is unavailable on Apple Silicon), so pinning is a
+/// documented no-op. It reports an error string so the caller logs the no-op
+/// once and continues with an unpinned decode pool. In practice this path is not
+/// reached, because [`pinning_supported`] is `false` on macOS, so auto-enable
+/// never builds a pinning pool there.
+#[cfg(target_os = "macos")]
+pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    Err(format!(
+        "thread-to-core affinity is not supported on macOS; \
+         decode worker for cpu {cpu} runs unpinned (no-op)"
+    ))
+}
+
+/// Any other target: no affinity mechanism is implemented, so pinning is a
+/// graceful, logged no-op and decode runs unpinned. Like the macOS path this is
+/// not reached in practice because [`pinning_supported`] gates it off.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+pub fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+    Err(format!(
+        "thread-to-core affinity is not implemented on this platform; \
+         decode worker for cpu {cpu} runs unpinned (no-op)"
+    ))
+}
+
+/// Whether this OS can actually pin a thread to a CPU. Drives the auto-enable
+/// policy: on a platform that cannot pin, auto-enable stays `off` rather than
+/// building a pool whose pinning would be a silent no-op.
+pub const fn pinning_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "windows"))
+}
+
+/// The CPUs the current process is actually permitted to run on, or `None` when
+/// the allowed set cannot be determined on this platform.
+///
+/// This is the cgroup/cpuset/taskset safety input: intersecting it with the
+/// discovered topology (see [`NumaTopology::restrict_to_allowed`]) guarantees we
+/// never try to pin to a CPU outside the process's cpuset. `None` means "do not
+/// restrict" — we could not learn the mask, so we do not guess one.
+pub fn allowed_cpus() -> Option<Vec<usize>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_allowed_cpus()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_imp::allowed_cpus()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Read the current process's CPU affinity mask via `sched_getaffinity` and
+/// return the set CPU indices. The mask buffer is grown on `EINVAL` (the kernel
+/// signalling it is too small for the host's CPU count), so hosts with more than
+/// 1024 CPUs are handled without a fixed `cpu_set_t`. Returns `None` on any
+/// error so the caller treats the allowed set as unknown (unrestricted).
+#[cfg(target_os = "linux")]
+fn linux_allowed_cpus() -> Option<Vec<usize>> {
+    let bits_per_word = 8 * std::mem::size_of::<libc::c_ulong>();
+    // Start comfortably above a typical core count and grow on EINVAL.
+    let mut words = 128 / bits_per_word.max(1);
+    words = words.max(16);
+    loop {
+        let mut mask = vec![0 as libc::c_ulong; words];
+        let byte_len = words * std::mem::size_of::<libc::c_ulong>();
+        // SAFETY: `mask` is a live `byte_len`-sized buffer of `unsigned long`
+        // words in the `cpu_set_t` layout the syscall fills; we pass its true
+        // byte length and query the current process (`pid == 0`). The buffer
+        // outlives the call and is only written by the kernel up to `byte_len`.
+        let result = unsafe {
+            libc::sched_getaffinity(0, byte_len, mask.as_mut_ptr() as *mut libc::cpu_set_t)
+        };
+        if result == 0 {
+            let mut cpus = Vec::new();
+            for (word_index, &word) in mask.iter().enumerate() {
+                for bit in 0..bits_per_word {
+                    if word & ((1 as libc::c_ulong) << bit) != 0 {
+                        cpus.push(word_index * bits_per_word + bit);
+                    }
+                }
+            }
+            return (!cpus.is_empty()).then_some(cpus);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINVAL) {
+            // Buffer too small for the host's CPU count: double and retry, with a
+            // sane ceiling so a persistent EINVAL cannot loop forever.
+            words = words.checked_mul(2)?;
+            if words * bits_per_word > 1 << 20 {
+                return None;
+            }
+            continue;
+        }
+        return None;
+    }
+}
+
+/// A resolved decode-affinity plan: the CPUs to pin the pool's workers to (round
+/// robin), plus an optional one-time human-readable explanation of the chosen
+/// policy for the caller to log at info.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodePlan {
+    /// `Some(cpus)` -> pin each worker to `cpus[worker % cpus.len()]`.
+    /// `None` -> leave the pool unpinned.
+    pub cpus: Option<Vec<usize>>,
+    /// A single line describing the auto-enable/decline decision, or `None` when
+    /// the behaviour is fully explicit (an operator-set mode) and needs no note.
+    pub log: Option<String>,
+}
+
+/// Decide the effective decode affinity, applying the auto-enable policy.
+///
+/// `raw` is the raw environment value (`None` = unset). `restricted` is the
+/// topology already intersected with the process's allowed CPU set (so it may
+/// have fewer nodes than the host). `host_is_multinode` records whether the
+/// *unrestricted* host had more than one NUMA node, so a drop to a single node
+/// can be attributed to a cpuset restriction. `pinning_supported` reports
+/// whether this OS can pin at all.
+///
+/// Policy:
+/// * env unset + pinning unsupported -> `off` (logged once).
+/// * env unset + >=2 restricted nodes -> `compact` auto-enabled (logged once).
+/// * env unset + host multi-node but restricted to <2 nodes -> `off`, cpuset
+///   declines auto-enable (logged once).
+/// * env unset + single-node host -> `off`, unchanged, no log.
+/// * env `off` -> `off`, explicit opt-out, no auto log.
+/// * any other explicit mode -> parsed and validated against `restricted`.
+fn decide_affinity(
+    raw: Option<&str>,
+    restricted: Option<&NumaTopology>,
+    host_is_multinode: bool,
+    pinning_supported: bool,
+) -> std::result::Result<(DecodeAffinity, Option<String>), String> {
+    let restricted_nodes = restricted.map(NumaTopology::node_count).unwrap_or(0);
+    // Treat an unset or empty/whitespace value as "unset" for auto-enable.
+    let is_unset = raw.map(|value| value.trim().is_empty()).unwrap_or(true);
+    if is_unset {
+        if !pinning_supported {
+            return Ok((
+                DecodeAffinity::Off,
+                Some(format!(
+                    "{DECODE_AFFINITY_ENV} unset and CPU pinning is not supported on this OS; \
+                     decode pool left unpinned"
+                )),
+            ));
+        }
+        if restricted_nodes >= 2 {
+            return Ok((
+                DecodeAffinity::Compact,
+                Some(format!(
+                    "{DECODE_AFFINITY_ENV} unset and host has {restricted_nodes} usable NUMA \
+                     nodes; auto-enabling `compact` (pin the decode pool to one node for \
+                     bandwidth/barrier locality). Set {DECODE_AFFINITY_ENV}=off to opt out, or \
+                     any explicit mode ({ACCEPTED_MODES}) to override"
+                )),
+            ));
+        }
+        if host_is_multinode {
+            return Ok((
+                DecodeAffinity::Off,
+                Some(format!(
+                    "{DECODE_AFFINITY_ENV} unset; host is multi-node but the process cpuset spans \
+                     fewer than two NUMA nodes, so auto-enable declines and the decode pool is \
+                     left unpinned (safe under container/taskset restriction)"
+                )),
+            ));
+        }
+        // Single-node host: unchanged behaviour, nothing noteworthy to log.
+        return Ok((DecodeAffinity::Off, None));
+    }
+
+    // Explicit value: `off` opts out; anything else is validated against the
+    // (allowed-restricted) topology, so an explicit mode also never pins outside
+    // the process cpuset.
+    match DecodeAffinity::resolve(raw, restricted)? {
+        DecodeAffinity::Off => Ok((DecodeAffinity::Off, None)),
+        affinity => Ok((affinity, None)),
+    }
+}
+
+/// Resolve the full decode-affinity plan for the running host: detect topology,
+/// intersect it with the process's allowed CPU set, apply the auto-enable
+/// policy, and return the CPUs to pin `worker_count` workers to plus a one-time
+/// log line. This is the single entry point the decode-pool builder uses.
+pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePlan, String> {
+    let raw = std::env::var(DECODE_AFFINITY_ENV).ok();
+    let full = NumaTopology::detect();
+    let host_is_multinode = full.as_ref().map(|t| t.node_count() >= 2).unwrap_or(false);
+    let allowed = allowed_cpus();
+    let restricted = full
+        .as_ref()
+        .map(|t| t.restrict_to_allowed(allowed.as_deref()));
+    let usable = restricted.as_ref().filter(|t| t.node_count() >= 1);
+
+    let (affinity, log) = decide_affinity(
+        raw.as_deref(),
+        usable,
+        host_is_multinode,
+        pinning_supported(),
+    )?;
+
+    let cpus = match usable {
+        Some(topology) => topology
+            .cpus_for(&affinity, worker_count)?
+            .filter(|cpus| !cpus.is_empty()),
+        None => None,
+    };
+    Ok(DecodePlan { cpus, log })
+}
+
+
+/// Windows NUMA topology discovery and per-thread pinning.
+///
+/// All Win32 calls here are bounded (fixed-size or single-call-sized buffers),
+/// null-checked, and fall back gracefully (`None` / `Err`) instead of panicking
+/// so an unavailable API never aborts decode. CPU indices use the crate-wide
+/// `group * 64 + bit` encoding (see the module docs), which round-trips through
+/// `GROUP_AFFINITY { Group, Mask }` and handles hosts with more than 64 logical
+/// CPUs (multiple processor groups) correctly.
+#[cfg(target_os = "windows")]
+mod windows_imp {
+    use std::mem::{size_of, zeroed};
+
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationNumaNode,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, GetThreadGroupAffinity, SetThreadGroupAffinity,
+    };
+
+    /// Bits per processor group mask (`KAFFINITY` is 64-bit on x64/arm64 Windows).
+    const GROUP_BITS: usize = 64;
+
+    /// Expand a `GROUP_AFFINITY` (a group number and its 64-bit CPU mask) into the
+    /// crate-wide `group * 64 + bit` CPU indices it names.
+    fn cpus_from_mask(group: u16, mask: usize) -> Vec<usize> {
+        let base = group as usize * GROUP_BITS;
+        (0..GROUP_BITS)
+            .filter(|bit| mask & (1usize << bit) != 0)
+            .map(|bit| base + bit)
+            .collect()
+    }
+
+    /// Discover NUMA nodes as `(node_index, cpu_indices)` pairs via
+    /// `GetLogicalProcessorInformationEx(RelationNumaNode)`. Returns `None` if the
+    /// API cannot be queried; an empty/one-node result is left for the caller to
+    /// reject.
+    pub(super) fn numa_nodes() -> Option<Vec<(usize, Vec<usize>)>> {
+        // First call with a null buffer to learn the required byte length.
+        let mut len: u32 = 0;
+        // SAFETY: passing a null buffer with length 0 is the documented "size
+        // query" form; it only writes `len` and returns FALSE with
+        // ERROR_INSUFFICIENT_BUFFER.
+        unsafe {
+            GetLogicalProcessorInformationEx(RelationNumaNode, std::ptr::null_mut(), &mut len);
+        }
+        if len == 0 {
+            return None;
+        }
+        // Over-allocate as `u8` and keep the buffer alive for the whole walk.
+        let mut buffer = vec![0u8; len as usize];
+        // SAFETY: `buffer` is a live `len`-byte allocation; we pass its true
+        // length. On success the OS fills it with a packed sequence of
+        // variable-length `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` records.
+        let ok = unsafe {
+            GetLogicalProcessorInformationEx(
+                RelationNumaNode,
+                buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+
+        let mut nodes: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut offset = 0usize;
+        let end = len as usize;
+        while offset + size_of::<u32>() * 2 <= end {
+            // Read an owned copy with `read_unaligned`: the records live in a
+            // `Vec<u8>` (alignment 1), so forming a `&SYSTEM_LOGICAL_PROCESSOR_
+            // INFORMATION_EX` reference would be unaligned-reference UB. The
+            // struct is `Copy`, so a by-value read is sound and cheap.
+            // SAFETY: `offset` leaves at least the header (`Relationship`+`Size`)
+            // inside the filled buffer, and the source is a valid, initialized
+            // record the OS wrote; `read_unaligned` needs no alignment guarantee.
+            let record = unsafe {
+                std::ptr::read_unaligned(
+                    buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                )
+            };
+            let size = record.Size as usize;
+            if size == 0 || offset + size > end {
+                break;
+            }
+            if record.Relationship == RelationNumaNode {
+                // SAFETY: the record's relationship is RelationNumaNode, so the
+                // `NumaNode` union arm is the active one.
+                let numa = unsafe { record.Anonymous.NumaNode };
+                let node_index = numa.NodeNumber as usize;
+                // A NUMA node names its CPUs by a single `GroupMask` group
+                // affinity; recover the (group, mask) and expand to CPU indices.
+                // SAFETY: reading the `GroupMask` arm of the group-mask union is
+                // valid for a NUMA-node record.
+                let group_mask = unsafe { numa.Anonymous.GroupMask };
+                let cpus = cpus_from_mask(group_mask.Group, group_mask.Mask as usize);
+                if !cpus.is_empty() {
+                    nodes.push((node_index, cpus));
+                }
+            }
+            offset += size;
+        }
+        Some(nodes)
+    }
+
+    /// Pin the calling thread to `cpu` (encoded `group * 64 + bit`) via
+    /// `SetThreadGroupAffinity`, which is group-aware and therefore correct on
+    /// hosts with more than 64 logical CPUs. Best-effort: a failure is returned
+    /// as a message so the caller logs it once and continues unpinned.
+    pub(super) fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
+        let group = (cpu / GROUP_BITS) as u16;
+        let bit = cpu % GROUP_BITS;
+        // SAFETY: `GROUP_AFFINITY` is plain-old-data; zeroing it and setting the
+        // single group + mask we want is a valid initialization.
+        let mut affinity = unsafe { zeroed::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>() };
+        affinity.Group = group;
+        affinity.Mask = 1usize << bit;
+        // SAFETY: `GetCurrentThread` returns a pseudo-handle valid for the call;
+        // `affinity` is a live, fully-initialized `GROUP_AFFINITY`; passing a null
+        // previous-affinity out-param is documented as "not returned".
+        let ok = unsafe {
+            SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut())
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "SetThreadGroupAffinity(group={group}, cpu={cpu}) failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+
+    /// The current process's allowed CPUs, derived from the calling thread's
+    /// group affinity (`GetThreadGroupAffinity`). A Windows thread's affinity is
+    /// always within a single processor group, so this reports the allowed CPUs
+    /// of that group — the common case, and always complete on hosts with <= 64
+    /// CPUs. Returns `None` on failure so the caller treats the set as unknown
+    /// (unrestricted) rather than guessing.
+    pub(super) fn allowed_cpus() -> Option<Vec<usize>> {
+        // SAFETY: zero-initialize the POD out-param, then let the OS fill it.
+        let mut affinity =
+            unsafe { zeroed::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>() };
+        // SAFETY: `GetCurrentThread` pseudo-handle is valid for the call and
+        // `affinity` is a live, writable `GROUP_AFFINITY`.
+        let ok = unsafe { GetThreadGroupAffinity(GetCurrentThread(), &mut affinity) };
+        if ok == 0 {
+            return None;
+        }
+        let cpus = cpus_from_mask(affinity.Group, affinity.Mask as usize);
+        (!cpus.is_empty()).then_some(cpus)
+    }
 }
 
 #[cfg(test)]
@@ -577,5 +1023,129 @@ mod tests {
         let topology = NumaTopology { nodes };
         assert!(topology.split_workers(4).is_none());
         assert!(topology.split_workers(0).is_none());
+    }
+
+    fn two_node_topology() -> NumaTopology {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..8).collect::<Vec<_>>());
+        nodes.insert(1, (8..16).collect::<Vec<_>>());
+        NumaTopology { nodes }
+    }
+
+    #[test]
+    fn restrict_to_allowed_filters_cpus_and_drops_empty_nodes() {
+        let topology = two_node_topology();
+
+        // Unknown allowed set (None) leaves the topology unchanged.
+        assert_eq!(topology.restrict_to_allowed(None), topology);
+
+        // A cpuset that spans both nodes keeps only the permitted CPUs per node.
+        let allowed = vec![1, 2, 9, 10];
+        let restricted = topology.restrict_to_allowed(Some(&allowed));
+        assert_eq!(restricted.node_count(), 2);
+        assert_eq!(restricted.cpus_for_node(0).unwrap(), &[1, 2]);
+        assert_eq!(restricted.cpus_for_node(1).unwrap(), &[9, 10]);
+
+        // A cpuset confined to one node drops the other node entirely.
+        let allowed = vec![0, 1, 2];
+        let restricted = topology.restrict_to_allowed(Some(&allowed));
+        assert_eq!(restricted.node_count(), 1);
+        assert_eq!(restricted.cpus_for_node(0).unwrap(), &[0, 1, 2]);
+        assert!(restricted.cpus_for_node(1).is_none());
+
+        // A cpuset naming no discovered CPU leaves an empty topology.
+        let restricted = topology.restrict_to_allowed(Some(&[999]));
+        assert_eq!(restricted.node_count(), 0);
+    }
+
+    #[test]
+    fn auto_enable_pins_compact_on_multi_node_host() {
+        // Env unset + >= 2 usable nodes + pinning supported -> auto `compact`.
+        let topology = two_node_topology();
+        let (affinity, log) = decide_affinity(None, Some(&topology), true, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Compact);
+        let log = log.expect("auto-enable logs its decision");
+        assert!(log.contains("auto-enabling `compact`"), "{log}");
+        assert!(log.contains("off"), "mentions the opt-out: {log}");
+    }
+
+    #[test]
+    fn auto_enable_declines_on_single_node_host() {
+        // Single-node host (no multi-node topology): unchanged, quiet.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..8).collect::<Vec<_>>());
+        let single = NumaTopology { nodes };
+        let (affinity, log) = decide_affinity(None, Some(&single), false, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Off);
+        assert!(log.is_none(), "single-node auto-decision is quiet: {log:?}");
+
+        // No topology at all behaves the same.
+        let (affinity, log) = decide_affinity(None, None, false, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Off);
+        assert!(log.is_none());
+    }
+
+    #[test]
+    fn auto_enable_declines_when_cpuset_restricts_to_one_node() {
+        // Host is multi-node, but the allowed set left < 2 usable nodes: decline
+        // and log the container/taskset-safe reason.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..4).collect::<Vec<_>>());
+        let restricted = NumaTopology { nodes };
+        let (affinity, log) = decide_affinity(None, Some(&restricted), true, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Off);
+        let log = log.expect("cpuset decline logs its decision");
+        assert!(log.contains("cpuset"), "{log}");
+        assert!(log.contains("fewer than two"), "{log}");
+    }
+
+    #[test]
+    fn auto_enable_declines_when_pinning_unsupported() {
+        // Multi-node host but the OS cannot pin (e.g. macOS): stay off, log why.
+        let topology = two_node_topology();
+        let (affinity, log) = decide_affinity(None, Some(&topology), true, false).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Off);
+        let log = log.expect("unsupported-OS decision logs why");
+        assert!(log.contains("not supported on this OS"), "{log}");
+    }
+
+    #[test]
+    fn explicit_off_opts_out_without_auto_log() {
+        // An explicit `off` on a multi-node host disables pinning and adds no
+        // auto-policy note (the operator asked for it).
+        let topology = two_node_topology();
+        let (affinity, log) = decide_affinity(Some("off"), Some(&topology), true, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Off);
+        assert!(log.is_none());
+    }
+
+    #[test]
+    fn explicit_modes_are_honored_and_validated_against_restricted_topology() {
+        let topology = two_node_topology();
+
+        let (affinity, log) =
+            decide_affinity(Some("compact"), Some(&topology), true, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Compact);
+        assert!(log.is_none(), "explicit modes carry no auto note");
+
+        let (affinity, _) = decide_affinity(Some("node:1"), Some(&topology), true, true).unwrap();
+        assert_eq!(affinity, DecodeAffinity::Node(1));
+
+        // An explicit node index absent from the (restricted) topology is a clear
+        // error, so an explicit mode never silently pins outside the cpuset.
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..4).collect::<Vec<_>>());
+        let restricted = NumaTopology { nodes };
+        let err = decide_affinity(Some("node:1"), Some(&restricted), true, true).unwrap_err();
+        assert!(err.contains("node:1"), "{err}");
+    }
+
+    #[test]
+    fn pinning_supported_matches_target_os() {
+        // Compile-time sanity: the constant tracks the OSes that can actually pin.
+        assert_eq!(
+            pinning_supported(),
+            cfg!(any(target_os = "linux", target_os = "windows"))
+        );
     }
 }

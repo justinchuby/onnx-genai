@@ -759,24 +759,26 @@ fn build_decode_pool(
 }
 
 /// Resolve the CPU set the decode pool should pin `threads` workers to, honoring
-/// the explicit [`decode_affinity::DECODE_AFFINITY_ENV`] switch and the queried
-/// NUMA topology. Returns `Ok(None)` when pinning is off or the host is single
-/// node; propagates malformed configuration as a clear error.
-fn decode_affinity_cpus(
-    threads: usize,
-) -> std::result::Result<Option<Vec<usize>>, String> {
-    use crate::decode_affinity::{DecodeAffinity, NumaTopology};
-
-    let affinity = DecodeAffinity::from_env()?;
-    if affinity == DecodeAffinity::Off {
-        return Ok(None);
+/// the explicit [`crate::decode_affinity::DECODE_AFFINITY_ENV`] switch, the
+/// auto-enable policy, and the process's allowed CPU set (cpuset/taskset). The
+/// chosen auto-policy is logged once at info. Returns `Ok(None)` when pinning is
+/// off, unsupported, or declined; propagates malformed configuration as a clear
+/// error.
+fn decode_affinity_cpus(threads: usize) -> std::result::Result<Option<Vec<usize>>, String> {
+    let plan = crate::decode_affinity::plan_decode_affinity(threads)?;
+    if let Some(message) = plan.log {
+        report_decode_affinity_policy(&message);
     }
-    let Some(topology) = NumaTopology::detect() else {
-        // A single-node (or non-Linux) host has no cross-node penalty to avoid;
-        // honor the request by simply leaving the workers unpinned.
-        return Ok(None);
-    };
-    Ok(topology.cpus_for(&affinity, threads)?.filter(|c| !c.is_empty()))
+    Ok(plan.cpus)
+}
+
+/// Log the decode-affinity auto-policy decision once (info): whether pinning was
+/// auto-enabled, declined (cpuset/single-node/unsupported OS), and why.
+fn report_decode_affinity_policy(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        eprintln!("onnx-genai: decode affinity policy: {message}");
+    }
 }
 
 /// Log the first decode-affinity pinning failure once so a restricted

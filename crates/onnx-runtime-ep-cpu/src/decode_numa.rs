@@ -245,15 +245,21 @@ pub fn build_from_env(threads: Option<usize>) -> Option<NumaDecodePools> {
     };
     let Some(topology) = NumaTopology::detect() else {
         report_numa_fallback(
-            "host exposes no multi-node topology (single node or non-Linux); \
-             numa-split falls back to flat single-node decode",
+            "host exposes no multi-node topology (single node or a platform without \
+             discoverable NUMA topology); numa-split falls back to flat single-node decode",
         );
         return None;
     };
+    // cgroup/cpuset/taskset safety (gap #7): only ever pin to CPUs the process is
+    // actually allowed to run on. Intersect the discovered topology with the
+    // process's allowed CPU set before splitting so a container-restricted host
+    // never tries to pin outside its cpuset.
+    let allowed = crate::decode_affinity::allowed_cpus();
+    let topology = topology.restrict_to_allowed(allowed.as_deref());
     let Some(shards) = topology.split_workers(total) else {
         report_numa_fallback(
-            "fewer than two NUMA nodes received workers; \
-             numa-split falls back to flat single-node decode",
+            "fewer than two NUMA nodes received workers (single-node host, or the process \
+             cpuset spans fewer than two nodes); numa-split falls back to flat single-node decode",
         );
         return None;
     };
