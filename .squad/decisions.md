@@ -1674,6 +1674,760 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **Why:** These artifacts remain active references and should not be collapsed into the ledger yet.
 
 <!-- scribe-merge-2026-07-21T23:55Z -->
+<!-- scribe-merge-2026-07-22T21-00-00Z-cpu-ep-perf -->
+## 2026-07-22 — CPU EP performance campaign reconciliation
+
+Decision archive gate checked at 2026-07-22T21-00-00Z: the active ledger contains no dated entries older than 2026-07-15; no entries were eligible for archival.
+
+<!-- source: .squad/decisions/inbox/batty-native-decode-parallel.md -->
+# Batty — Native CPU decode: parallel-runtime overhead
+
+Branch: `perf/cpu-ep-mlas` (no push/merge). Commit `32a122e`.
+
+## Goal
+
+Cut the ~55 ms/step engine-level parallel-runtime overhead on native CPU int4
+decode (Qwen2.5-Coder-7B, Sapphire Rapids Xeon 8480C, 2×48 cores, 2 NUMA nodes),
+target ≥20 tok/s steady M=1. Profile-first (RULES.md rule 4).
+
+## Methodology
+
+- Build: `cargo build --release -p onnx-genai-bench --features mlas --bin profile_native`.
+- Steady M=1 isolation: `profile_native ... --tokens 24 --runs 5 --warmups 1
+  --steady --decode-skip 8`, reporting the tool's `steady_median`.
+- 32 decode threads (`ONNX_GENAI_CPU_DECODE_THREADS=32`) unless noted.
+- Shared 96-core host is noisy and drifts warmer across a run (run 1 is usually
+  the fastest), so I interleaved A/B conditions across ≥2–3 rounds and report
+  **median and best**, not a single run.
+- Bit-parity: greedy `generated_token_ids` were identical for every non-numeric
+  change (baseline and every affinity mode all produced
+  `[576, 729, 1265, 1896, 264, 1140, 438, 458, 5693, 323, 470, 264, 501, 1140,
+  429, 374, 10615, 304, 35388, 1973, 13, 1446, 1265, 537]`).
+
+## Profile (what actually costs time)
+
+Per-op split (`ONNX_GENAI_PROFILE_OPS=1`, steady step ≈70 ms):
+`MatMulNBits` 58.2 ms (82 %, 141 calls, ~0.41 ms/call), `Silu` 5.3 ms,
+`SkipSimplifiedLayerNormalization` 2.5 ms, `Add` 2.1 ms, `GroupQueryAttention`
+2.1 ms, everything else <1 ms. **The matmuls dominate.** The isolated op-mix
+runs the same 141 matmuls in ~33 ms with L3-resident weights (~108 GB/s); the
+in-engine 58 ms is ~58 GB/s effective. So real decode is **memory-latency
+bound**, not DRAM-bandwidth bound and not kernel-compute bound — the extra time
+is cold weight streaming plus per-op fork-join barrier latency, both of which
+are worse when workers and weights span two sockets.
+
+## What worked — NUMA-local decode-pool affinity (shipped)
+
+`ONNX_GENAI_CPU_DECODE_AFFINITY` (`off` default / `compact` / `node:<index>`)
+pins the bounded M=1 decode workers to the CPUs of one NUMA node. Topology is
+queried from `/sys/devices/system/node/node*/cpulist` (no hardcoded counts,
+rule 2); it is opt-in and inspectable (rule 5); single-node/non-Linux/cgroup
+rejection falls back to unpinned, logged once (rule 1); a bad value is a clear
+kernel error naming the accepted modes / available nodes. The packed int4
+weights are lazily first-touched inside `with_decode_pool_scope` on a pinned
+worker, so both barrier traffic and the weight stream become node-local.
+Verified at runtime: the N decode workers each pin to a distinct node-0 CPU
+(`Cpus_allowed_list` = 0..N) while the global pool stays unpinned.
+
+Steady M=1, 32 threads, 5 runs × 3 rounds:
+
+| Affinity | decode median | best | spread |
+| --- | --- | --- | --- |
+| `off` | **13.1 tok/s** (76.4 ms) | 14.4 | 12.6–14.4, jittery |
+| `compact` | **16.3 tok/s** (61.2 ms) | 16.4 | 16.3–16.4, stable |
+
+≈ **+25 % median, +14 % best**, and pinning removes the OS-migration jitter that
+makes the unpinned pool swing run-to-run. Full 120-token generation also
+improved (11.5 → 12.0 tok/s; smaller because it includes prefill).
+
+### Thread scaling after (compact affinity, steady)
+
+16 t → 14.9 · 32 t → 16.6 · 40 t → 16.5 · 48 t → 15.3 tok/s. Saturates at ~32 on
+one node (node 0 has 48 cores; 48 t contends with the OS/main thread on the
+shared host). The unpinned >32 regression (the original 8.85/11.97/12.59/9.62
+at 8/16/32/48) is a cross-socket-barrier artifact; pinning to one node removes
+the cross-socket sync, so scaling no longer collapses — it just plateaus once
+the single node's memory subsystem is saturated.
+
+## What didn't work
+
+- **`numactl --cpunodebind=0 --membind=0`** (external, full pipeline): noise-level
+  in my runs (11.66 vs 11.50) — it restricts to a node but still lets the OS
+  migrate workers within it and pins the whole process incl. prefill. Explicit
+  per-worker pinning of just the decode pool is what delivered the clean win.
+- **Dual-node for 2× bandwidth (naive):** a 64-thread pool spanning both sockets
+  with `numactl --interleave=all` measured **11.1 tok/s vs 16.3** for single-node
+  `compact`. Every per-op fork-join barrier across 64 cross-socket threads pays a
+  coherency round trip that dwarfs the extra bandwidth. Confirms cross-socket
+  barrier sync is the toxic term.
+- **Existing `ONNX_GENAI_PROJECTION_FUSION` (gate+up):** still regresses, even
+  with affinity on (16.3 → 13.0–14.0). Its `Split` op materializes and copies the
+  fused gate+up output every token, and it only removes one barrier per layer, so
+  it is a net loss. Left OFF (bit-parity holds). Not a win as written; a real
+  grouping win needs a fused gate/up/Silu/Mul kernel that writes the two outputs
+  directly (no `Split`), which I did not attempt here.
+
+## Remaining gap and the next lever
+
+Shipped: ~13.1 → ~16.3 tok/s steady median (and ~10.9 → ~16.3 vs the original
+project baseline). Still short of ORT (26.9) / genai (20.8) and the 20 tok/s
+target. The evidence points at one remaining big lever: **use both sockets'
+memory bandwidth without a cross-socket per-op barrier.** That means per-node
+decode sub-pools, each streaming a node-local shard of every projection's rows,
+joined by a two-level (node-local then single cross-node) barrier — steps 4–5 of
+`docs/numa-decode-plan.md`. It is the highest-upside but also the highest-risk
+change (touches the hot `MatMulNBits` M=1 path Deckard just finalized); I scoped
+it out of this commit deliberately and documented the design + the failure mode
+of the naive version so the next iteration starts from evidence.
+
+## Files
+
+- `crates/onnx-runtime-ep-cpu/src/decode_affinity.rs` (new): topology query,
+  affinity parsing, `sched_setaffinity` pinning, unit tests.
+- `crates/onnx-runtime-ep-cpu/src/kernels/matmul_nbits.rs`: pool builder applies
+  a `start_handler` that pins workers; clear error / once-logged fallback.
+- `crates/onnx-runtime-ep-cpu/src/lib.rs`, `Cargo.toml` (+`libc`), `Cargo.lock`,
+  `docs/numa-decode-plan.md`.
+
+Tests: `cargo test -p onnx-runtime-ep-cpu --features mlas` → 665 passed
+(4 new affinity unit tests). Non-author review pending (Chew/Gaff; rule 9).
+
+<!-- source: .squad/decisions/inbox/chew-perf-numerics-review.md -->
+### 2026-07-22: Numerics review of CPU MatMulNBits and GQA decode optimizations
+**By:** Chew
+**What:** `58a3324` is **APPROVE-WITH-NONBLOCKING**. `145549a` is **REJECT**; Deckard should own the revision because Sapper, the original author, is locked out.
+**Why:**
+
+#### `58a3324` — APPROVE-WITH-NONBLOCKING
+
+- Routing is generic: `try_mlas_sqnbit` selects from `m`, bit width, `accuracy_level`, `g_idx`, and the configured/runtime-available backend (`matmul_nbits.rs:416-460`). There is no model-identity or production hardcoded-shape gate. The `g_idx` and 2-bit fallbacks remain intact.
+- The new M=1 `accuracy_level != 4` route uses MLAS CompFp32 and is directly checked against the dequantized f32 oracle (`matmul_nbits.rs:2666-2738`). The broader MLAS parity matrix covers M=1/M=5, block sizes 32/64/128, symmetric/asymmetric zero points, bias, and both compute types (`matmul_nbits.rs:2411-2491`).
+- The hybrid `2e-3` absolute-or-relative tolerance is reasonable for the tested CompFp32 dequantization plus reordered f32 reduction; targeted tests passed. It is not a proof of identical logits or greedy tokens for every model. Unlike the unchanged `accuracy_level == 4` hand route, affected `accuracy_level != 4` outputs are not bit-identical and a sufficiently small downstream logit margin can change argmax.
+- Nonblocking follow-up: add a production-scale K/N CompFp32 parity case and an end-to-end greedy parity fixture for an affected `accuracy_level != 4` model, reporting maximum logit delta and minimum top-1 margin.
+- Rule 1 is not implicated by a new failure path: unsupported MLAS cases explicitly fall back rather than emitting a new opaque error. Rule 8 is satisfied by route and numerical-oracle tests.
+- The uncommitted `mlas_fp32` decode-step probe only extends the ignored performance probe to compare hand, MLAS Int8, and MLAS Fp32. It adds no correctness assertion and does not change this verdict.
+
+#### `145549a` — REJECT
+
+- The runtime AVX2+FMA gate and scalar/non-x86 fallback are structurally correct (`group_query_attention.rs:383-409`), and the attended-window indexing is equivalent for finite inputs.
+- The stated dot-product bound is incorrect. `n × ε × max(|a|, |b|)` is dimensionally insufficient; the standard forward-error term depends on the products, e.g. a reduction-specific `γ × Σ|a_i b_i|`. A local float32 simulation found a counterexample at `n=32`, input scale 10: difference `9.15527e-5` exceeded the claimed `8.73423e-5` bound.
+- The primary “long-context” parity test uses `head_dim=2` (`group_query_attention.rs:1538-1596`). It therefore executes only the scalar tails of both AVX2 helpers and does not test the vectorized production path. Its periodic values in `[-1,1]` also avoid realistic head width, magnitudes, and cancellation.
+- The helper dot test reaches width 128, but only on one benign periodic pattern. The AXPY helper test performs one update, not the hundreds/thousands of probability-weighted accumulations changed by the P·V loop. The repository test does not prove greedy-token identity; a 16-token external observation cannot establish it universally.
+- Normalizing probabilities once does not add overflow risk because stable softmax exponentials are in `[0,1]`. Per-output accumulation order across keys is preserved; FMA changes rounding and generally improves each multiply-add. Catastrophic cancellation risk is therefore not materially worse, but it is insufficiently exercised.
+- Required revision by Deckard: correct the numerical bound/documentation; make the integrated long-context test use a realistic SIMD head width (at least 128), non-periodic realistic and cancellation-heavy data, and verify the AVX2 path on supported x86; add multi-key AXPY/output parity and retain scalar/non-x86 coverage. Any greedy-token claim must be backed by a checked-in end-to-end fixture with logit deltas/margins or softened to an empirical statement.
+
+Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas matmul_nbits` passed 32 tests (2 ignored); `cargo test -p onnx-runtime-ep-cpu --features mlas group_query` passed 16 tests.
+
+### 2026-07-22: Re-review Leon's GQA numerics revision
+**By:** Chew
+**What:** `c9762b6` is **APPROVE-WITH-NONBLOCKING**. It resolves the blocking findings on `145549a`; Sapper remains locked out and Leon's revision is accepted.
+**Why:**
+
+- The documentation now states the standard absolute forward-error scale `γ_n Σ|a_i b_i|`, with `γ_n = n u / (1 - n u)` and `u = 0.5 ε`. Tests correctly use `2 γ_n Σ|a_i b_i|` when comparing two separately rounded evaluation orders (`group_query_attention.rs:1048-1057`, `1735-1766`). A randomized float32 stress probe across lengths through 1024 and scales through 1000 found no counterexample; the worst observed difference used 24.1% of the bound.
+- The integrated decode parity fixture now uses head width 128, 256 attended keys, four query heads, mixed non-periodic signed values at scales 0.03125/0.125/0.5/2.0, and a scalar full-attention oracle (`group_query_attention.rs:1624-1732`). On x86 it asserts `has_simd_x86()`, and this host satisfied the assertion, so both the AVX2 dot and AVX2 AXPY bodies execute rather than scalar tails.
+- The 257-key, width-128 AXPY test mirrors the production key-outer accumulation, uses normalized positive probabilities and signed mixed-scale values, and compares every dimension against sequential scalar accumulation under the same two-order γ bound (`group_query_attention.rs:1799-1852`). This is representative and cancellation-sensitive.
+- The greedy-token statement is now correctly empirical rather than universal. Runtime SIMD gating and non-x86 scalar compilation remain unchanged.
+- Nonblocking portability note: the new assertions make the test suite fail on older x86 hosts without AVX2+FMA even though the runtime supports scalar fallback. Prefer an explicit capability skip plus dedicated AVX2 CI coverage. Also consider accumulating the test-only `Σ|a_i b_i|` in f64 so the theoretical tolerance oracle cannot be rounded downward in f32.
+
+Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas group_query` passed all 17 tests. The prior rejection is cleared.
+
+### 2026-07-22: Review contiguous f32 kernel I/O bulk copies
+**By:** Chew
+**What:** `2e982c7` is **APPROVE-WITH-NONBLOCKING**.
+**Why:**
+
+- The fast path follows `TensorView::validate`/`TensorMut::validate`, dtype validation, and element-count validation. `is_contiguous()` requires strides to exactly equal the canonical row-major strides for the complete shape (`onnx-runtime-ir/src/layout.rs:10-23`). Zero-stride broadcasts, transposes, negative strides, and overlapping noncanonical layouts therefore cannot enter the bulk-copy branch. Empty tensors return before pointer slicing, and byte offsets are already incorporated in the validated origin pointer (`kernels/mod.rs:869-909`, `1008-1055`).
+- `extend_from_slice` and `copy_from_slice` copy the same consecutive f32 bit patterns that the prior logical element loads/stores produced. No arithmetic, reduction, dtype conversion, or ordering change occurs. The f16/bf16 widening and narrowing helpers are separate and unchanged, so no f32→f16→f32 rounding contract is affected.
+- Tests cover contiguous read/write and transposed strided read/write. The full CPU EP suite passed: 661 unit tests passed with 3 ignored, 10 numerical regression tests passed, and one doctest remained intentionally ignored.
+- Nonblocking coverage gap: no focused zero-stride broadcast or other overlapping-stride accessor test was added. The exact canonical-stride predicate makes the implementation safe by inspection, but add read-side broadcast and write-side overlapping-view regressions to lock that exclusion down.
+
+<!-- source: .squad/decisions/inbox/coordinator-cpu-perf-baseline.md -->
+## 2026-07-22 — CPU EP performance baseline vs ORT/foundry
+
+### Establish native CPU decode baseline and the gap to close
+**By:** Coordinator (measured); requested by Justin Chu
+**What:** On Sapphire Rapids Xeon 8480C (AMX + AVX512-VNNI), Qwen2.5-Coder-7B int4 (foundry `generic-cpu-4`, fp32 activations), 32 decode threads, greedy, 24-token decode:
+- onnxruntime-genai 0.14.1 (foundry's runtime): **20.62 tok/s**
+- ORT wrapper via `profile_decode` (our decode loop + ORT CPU kernels): **20.12 tok/s**
+- native nxrt CPU via `profile_native --ep cpu` (mlas feature on): **8.83 tok/s**
+
+Native CPU is **~2.3× slower than ORT/foundry**. Goal: beat ORT.
+**Why:** ORT/foundry route int4 MatMul through MLAS SQNBit **int8** compute (AMX/VNNI). Our native M=1 decode path deliberately bypasses MLAS (`NXRT_SQNBIT_DECODE_MIN`) for a hand int4 path — a conclusion drawn on 0.5B that likely does not hold on 7B. Prime suspect for the gap.
+
+**Repro / harness notes (repository facts):**
+- Build: `cargo build --release -p onnx-genai-bench --features mlas --bin profile_native` and `--features bench-ort --bin profile_decode`.
+- Both bins link `libonnxruntime.so.1`; set `LD_LIBRARY_PATH=$PWD/target/release/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib`.
+- Native CPU threads knob: `ONNX_GENAI_CPU_DECODE_THREADS=N` (profile_native has no `--threads`; profile_decode does).
+- Fair CPU model = foundry **generic-cpu** int4 (fp32 A). The `cuda-gpu-4` exports use fp16 A, which native CPU MatMulNBits rejects (`A must have dtype Float32`) — a separate gap.
+- onnxruntime-genai reference: `pip install --user onnxruntime-genai` (0.14.1), `/tmp/og_bench.py`.
+
+<!-- source: .squad/decisions/inbox/deckard-matmulnbits-m1-mlas.md -->
+# Decision: MatMulNBits M=1 int4 decode routing (MLAS vs hand path)
+
+- **Author:** Deckard (Systems Dev)
+- **Date:** 2026-07-22
+- **Branch:** perf/cpu-ep-mlas (not merged)
+- **Reviewer gate:** Chew (numerics) — rule 9, do not self-approve.
+- **Host:** Xeon 8480C (Sapphire Rapids, AMX + AVX512-VNNI), 96 hardware
+  threads, 2 NUMA nodes (node0 cpus 0–47, node1 48–95), 32 decode threads.
+- **Model:** Qwen2.5-Coder-7B-Instruct int4 generic-cpu (all MatMulNBits
+  `block_size=32`, `bits=4`, `accuracy_level=4`).
+
+## Task hypothesis — REFUTED by profiling (rule 4, profile before replacing)
+
+The mission hypothesized that routing M=1 int4 decode to MLAS SQNBit CompInt8
+(AMX/VNNI int8 compute) would close the ~2.3× gap to ORT/foundry
+(20.12 tok/s native target vs ~8.8 tok/s native). Profiling at real 7B shapes
+shows this is false: at M=1 the hand int4 GEMV and MLAS SQNBit **tie** (or hand
+wins) because decode is memory-bound, and the 2.3× gap is **engine-level
+fork-join + NUMA overhead**, not the MatMulNBits kernel choice.
+
+## Real per-token MatMulNBits shapes (extracted from the ONNX graph, not hardcoded)
+
+| Projection | K | N | ops/token |
+|---|---:|---:|---:|
+| lm_head | 3584 | 152064 | 1 |
+| gate + up | 3584 | 18944 | 56 |
+| down | 18944 | 3584 | 28 |
+| qkv | 3584 | 4608 | 28 |
+| o_proj | 3584 | 3584 | 28 |
+
+141 MatMulNBits ops/token; ~3.5 GB int4 weights streamed per token.
+
+## Micro-benchmark: the earlier "MLAS wins M=1" was a cache artifact
+
+`matmulnbits_mlas_perf` reuses the same buffers across iterations, so weights
+stay L3-resident and MLAS reports a 1.7–1.97× M=1 "win" — a fantasy for decode,
+where each op touches a **distinct DRAM-resident** weight. New probe
+`matmulnbits_mlas_decode_step` replays the real 7B op sequence with distinct
+cold buffers:
+
+| Path (cold, distinct DRAM weights, M=1, 32t) | Throughput | Bandwidth |
+|---|---:|---:|
+| hand int4 GEMV (lightly loaded host) | ~26 tok/s | ~92.9 GB/s |
+| MLAS SQNBit CompInt8 (lightly loaded host) | ~25 tok/s | ~89.2 GB/s |
+| hand int4 GEMV (heavily loaded host, load avg 67) | 22.55 tok/s | 79.7 GB/s |
+| MLAS SQNBit CompInt8 (heavily loaded host) | 18.56 tok/s | 65.6 GB/s |
+
+M=1 decode is bandwidth/latency-bound; MLAS CompInt8 never beats the hand path
+and would add int8 activation-requantization rounding. Per rules 4/5, keep the
+hand path for M=1 `accuracy_level=4`.
+
+## Where the 2.3× gap actually is (`perf record`, end-to-end decode)
+
+| Bucket | Share | Notes |
+|---|---:|---|
+| MatMulNBits compute | ~44% | the actual GEMM work |
+| rayon / crossbeam-epoch fork-join | ~27% | threads idle-spinning at per-op join barriers |
+| `to_dense_bytes` | ~7.5% | one-time weight materialization |
+| `prepack_int8_weight` | ~4.5% | one-time, cached in OnceLock |
+
+141 ops/token × up to 64 `par_chunks_mut` tasks each ⇒ ~141 fork-join barriers
+per token. NUMA test: `numactl --cpunodebind=0 --membind=0` gives **+25%
+(~10 tok/s)** but plateaus at ~10 even with 48 threads, at only ~14% of memory
+bandwidth ⇒ latency/sync-bound, not bandwidth- or kernel-bound.
+
+## Weight prepacking is already once-per-weight (verified)
+
+`build_mlas_packed` result is cached in the kernel's `OnceLock` (`mlas_packed`),
+and the executor kernel cache (`get_or_create`, keyed by node + input shapes)
+persists kernels across decode steps, so decode steps are pack-free. No change
+needed here.
+
+## Change shipped on this branch
+
+1. **Renamed the knob** `NXRT_SQNBIT_PREFILL_MIN` → **`NXRT_SQNBIT_DECODE_MIN`**
+   (default **16**), with measured rationale in the docstring (cold-tie, the
+   cache artifact, the fork-join/NUMA gap). It is the `M` crossover below which
+   int4 decode on a *fast* hand path stays on the hand kernel; at/above it MLAS
+   SQNBit is used (prefill). Overridable by the env var as before.
+2. **Generic, shape/dtype-driven M=1 gate** (rule 2 — no model identity):
+   - `bits==4 && accuracy_level==4` (fast `int4_matmul_m1`/`int8_matmul` hand
+     paths) → keep on hand path for `m < NXRT_SQNBIT_DECODE_MIN`.
+   - `bits==4 && accuracy_level!=4` (slow hand path dequantizes to f32 then runs
+     a dense GEMV) → route M=1 to **MLAS SQNBit CompFp32**: a genuine generic
+     win (MLAS beats dequant-then-GEMM), added without model-name coupling.
+   - `g_idx` present or `bits!=4` (2-bit) → hand path (MLAS SQNBit can't serve).
+
+## Numerics evidence (rule 8 tests in the same commit)
+
+- The M=1 `accuracy_level=4` route is **unchanged** ⇒ bit-identical output; the
+  7B model is `accuracy_level=4`, so end-to-end tokens are identical to baseline
+  ("... return a new list that is sorted in ascending order ...").
+- New test `matmulnbits_try_mlas_serves_slow_dequant_decode`: m=1, bits=4,
+  accuracy_level=0 routes to MLAS (`Ok(Some)`) and matches the f32 reference
+  within `2e-3` (CompFp32 dequant is near-exact).
+- Renamed test `matmulnbits_resolve_decode_min_parses_or_defaults`; updated
+  `matmulnbits_try_mlas_gates_decode_by_m_threshold` for the new constant.
+- Added ignored probe `matmulnbits_mlas_decode_step` (cold distinct-buffer
+  hand-vs-MLAS 7B decode-step harness).
+- `cargo test -p onnx-runtime-ep-cpu --features mlas matmul_nbits`: **32 passed,
+  2 ignored**.
+
+## End-to-end before/after (honest)
+
+Shared host, heavily loaded (load avg ~67 during measurement), ±1 tok/s noise:
+
+| | tok/s |
+|---|---:|
+| baseline (before) | ~7.5 |
+| after (7B, acc4 ⇒ routing unchanged for M=1) | ~7.5 |
+
+For the 7B `accuracy_level=4` model the shipped change is **behavior-neutral at
+M=1** (correctly so — rule 4: don't replace what already wins). It does **not**
+reach the 20.12 tok/s ORT target, because that gap is not in the kernel.
+
+## Follow-up recommendation (out of scope for this kernel change)
+
+To Roy (engine/executor) and Chew (numerics): the real win is at the threading
+layer, not MatMulNBits routing:
+1. **Reduce per-op fork-join barriers** — 141 join points/token dominate.
+   Consider an ORT-style persistent worker pool / fewer synchronization points
+   per token (fuse the per-op parallelism, or a graph-level parallel section).
+2. **NUMA-aware weight placement + thread pinning** — first-touch places weights
+   on one node; cross-node decode threads pay remote latency. `numactl` pinning
+   already shows +25%. This is cross-crate (loader + decode pool) and should be
+   designed, not shipped as a half-baked heuristic.
+
+---
+
+## Update (2026-07-22, later) — definitive 3-way micro-bench + a shipped contained win
+
+Following Sebastian's authoritative profile (MatMulNBits = 77.1% of the 83.4 ms
+M=1 decode step; 64.3 ms), I re-settled the MLAS-vs-hand question rigorously and
+then pivoted to the hand-path glue overhead.
+
+### Definitive 3-way decode-step micro-benchmark (cold distinct DRAM, 32 threads)
+
+`matmulnbits_mlas_decode_step` now measures all three candidates:
+
+| Path (M=1, cold, real 7B op mix) | ms/step | tok/s | GB/s |
+|---|---:|---:|---:|
+| hand int4 GEMV | 33.88 | 29.52 | 104.3 |
+| MLAS SQNBit CompInt8 | 32.68 | 30.60 | 108.2 |
+| MLAS SQNBit CompFp32 | 41.94 | 23.84 | 84.3 |
+
+hand and CompInt8 **tie** (within ~3–4%, and the sign flips with host load;
+under heavy load hand led 22.6 vs 18.6 tok/s). CompFp32 is **clearly worst**.
+So for M=1 `accuracy_level=4` the hand path stays (ties the best, no int8
+rounding). Routing confirmed, not model-name based (rule 2).
+
+### The real per-op gap is executor/fork-join glue, and part of it is fixable
+
+The isolated kernel probe runs the *entire* 7B MatMulNBits op mix in **~33 ms**,
+yet the real decode MatMulNBits bucket is **64.3 ms** — ~30 ms of per-op glue
+sits on top of the kernels. A chunk of that glue was a **serial, non-vectorized
+per-element strided copy**: every op called `to_dense_f32` on its activation and
+`write_dense_f32` on its output, walking elements one at a time with multi-dim
+index bookkeeping — ~2.5 M serial iterations/token, off the parallel path.
+
+**Shipped fix (contained, generic, rule 8 tested):** add a contiguous
+row-major **bulk-copy fast path** to `to_dense_f32` and `write_dense_f32`
+(`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs`). Contiguous tensors (the
+common decode/prefill case) now `copy_from_slice`/`extend_from_slice` instead of
+the strided walk; non-contiguous views keep the exact strided path. Benefits
+every f32 kernel, not just MatMulNBits.
+
+### End-to-end before/after (same host window, 32 threads, 6 runs each; noisy shared host)
+
+| | best ms/step | best tok/s | median tok/s |
+|---|---:|---:|---:|
+| before (contiguous strided walk) | 104.0 | 9.61 | ~9.2 |
+| after (bulk-copy fast path) | 87.8 | 11.39 | ~10.2 |
+
+~15% faster step at best-case, ~+11% median. Generated text unchanged/coherent.
+Numerics: bit-identical (pure data-movement fast path; both new tests plus the
+existing `dense_roundtrip_contiguous` / `dense_reads_transposed_view` prove the
+fast and strided paths agree).
+
+### Still-open gap to 20 tok/s (cross-crate — for Roy/Chew)
+
+After the fix, real decode best is ~88 ms/step vs the isolated kernel's ~33 ms.
+The remaining ~55 ms is per-op **Rayon fork-join re-entry**, executor dispatch,
+NUMA remote-weight latency, and the non-MatMulNBits ops. Closing to ORT's
+20.12 tok/s needs the architectural work, ranked:
+1. **Projection grouping** — fuse the two independent MLP MatMulNBits (gate, up)
+   that share the same input A into one op: halves MLP fork-joins and reuses the
+   activation quantization. The optimizer pass framework
+   (`onnx_runtime_optimizer::run_passes`, cf. `fuse_silu_patterns`) is the right
+   home; detect by graph structure (shared input, compatible bits/block/acc),
+   never by model name (rule 2).
+2. **Fewer per-op fork-join barriers** — 141 MatMulNBits ops/token each fork+join
+   the decode pool; an ORT-style persistent/looser barrier model would cut the
+   ~27% fork-join share and fix the >32-thread scaling regression.
+3. **NUMA-aware weight placement + thread pinning** — `numactl --membind` is
+   already +25%; make it intrinsic (loader first-touch + decode-pool affinity).
+
+### Tests added/changed this update
+- `write_dense_contiguous_bulk_copies`, `write_dense_strided_matches_logical_order`
+  (`kernels/mod.rs`) — cover the new fast path and the retained strided path.
+- `matmulnbits_mlas_decode_step` extended to the 3-way hand / CompInt8 / CompFp32
+  comparison.
+
+<!-- source: .squad/decisions/inbox/deckard-numa-affinity-fix.md -->
+### 2026-07-22: NUMA decode-affinity — revised to clear Gaff's rejection
+**By:** Deckard (non-author reviser; Batty locked out per Rule 9)
+**What:** Fixed the three findings Gaff raised against commit `32a122e`. All edits
+are confined to `crates/onnx-runtime-ep-cpu/src/decode_affinity.rs` (the caller in
+`kernels/matmul_nbits.rs` is untouched — see rebase note 1). The optimization
+itself (NUMA-local pinning of the bounded M=1 decode pool, +25% / 13.1→16.3
+tok/s) is unchanged; only correctness/quality was addressed.
+
+**Fixes:**
+1. **`cpu_set_t` overflow / OOB (correctness, portability).** Replaced the fixed
+   1024-bit `libc::cpu_set_t` + `CPU_SET` with a dynamically sized mask built
+   from the runtime CPU index. New private helper `build_cpu_mask(cpu)` returns a
+   `Vec<libc::c_ulong>` — the exact word layout `sched_setaffinity` expects — with
+   only `cpu`'s bit set, sized to `cpu/word_bits + 1` words, so a CPU id at or
+   above `CPU_SETSIZE` grows the buffer instead of writing out of bounds. It
+   returns `None` on word-count overflow, and `pin_current_thread_to_cpu` then
+   falls back to unpinned (no panic, no OOB). `sched_setaffinity` receives the
+   mask's true byte length. `unsafe` is reduced to the single syscall with a
+   justified SAFETY note; the buffer is safe, owned Rust.
+   - **Mask approach note:** the review suggested `CPU_ALLOC`/`CPU_SET_S`; those
+     symbols are **not exposed by the `libc` 0.2 crate for `x86_64-*-linux-gnu`**
+     (only android/hurd/cygwin/l4re), so they do not compile on our target. The
+     hand-built `Vec<c_ulong>` implements the same option-(a) semantics
+     (dynamically sized mask covering `cpu`, true byte length passed to the
+     syscall) with *less* `unsafe` and a pure, directly unit-testable sizing
+     helper.
+2. **Diagnostics (Rule 1) — consistent across every invalid path.** Added
+   `const ACCEPTED_MODES` plus helpers `available_nodes_clause(topology)` and
+   `invalid_selector_error(value, topology)`. New
+   `DecodeAffinity::resolve(raw, topology)` parses AND validates against topology
+   so every invalid value — malformed mode, non-integer index, unknown node
+   index, and a `node:<index>` on a host with no discoverable topology — produces
+   one message naming (i) the rejected value, (ii) all accepted modes, and (iii)
+   the available-node list or an explicit "NUMA topology is unavailable"
+   statement. `DecodeAffinity::from_env` now detects topology and calls
+   `resolve`, so the existing `matmul_nbits.rs` caller (unchanged) reports an
+   unknown node even on a single-node / `/sys`-unavailable host instead of
+   silently unpinning. `cpus_for`'s unknown-node error was upgraded to the same
+   three-part content. `compact`/`off` without topology stay honored as
+   "leave unpinned".
+3. **`compact` selection semantics.** Changed `min_by_key(|c| c.len())` (fewest
+   CPUs) to `.values().find(|c| c.len() >= worker_count)`. Because `nodes` is a
+   `BTreeMap`, `.values()` is ascending index order, so this selects the
+   smallest-index fitting node — matching the documented policy.
+
+**Tests added (Rule 8); existing 4 kept green (8 pass total):**
+- `resolve_reports_consistent_diagnostics_for_invalid_values` — asserts rejected
+  value + all accepted modes + available-node list appear for malformed mode,
+  non-integer index, and unknown node index.
+- `resolve_reports_topology_unavailable_for_node_without_topology` — asserts the
+  topology-unavailable statement (plus value + modes) for `node:<index>` with no
+  topology, and that `compact`/`off` still resolve without topology.
+- `build_cpu_mask_sizes_beyond_cpu_setsize_without_oob` (Linux) — asserts a CPU
+  id ≥ `CPU_SETSIZE` grows the mask beyond a fixed `cpu_set_t`, sets the correct
+  bit/word with earlier words zero, and stays sound far beyond `CPU_SETSIZE`.
+- `compact_prefers_smallest_index_not_fewest_cpus` — distinguishes the new
+  smallest-index policy from the old fewest-CPU behavior.
+
+**⚠️ Bryant — rebase notes (numa-split feature shares this file):**
+1. `matmul_nbits.rs` is UNCHANGED in my commit; it still calls
+   `DecodeAffinity::from_env()?`. `from_env` is retained (not removed) and now
+   internally does `resolve(raw, NumaTopology::detect())`. If your feature needs
+   topology-aware parsing at the env boundary, prefer `from_env`/`resolve`.
+2. New `DecodeAffinity::resolve(raw: Option<&str>, topology: Option<&NumaTopology>)
+   -> Result<Self, String>` is the single validation entry point.
+3. `ACCEPTED_MODES` currently lists `off`, `compact`, `node:<index>`. When you
+   add the `NumaSplit` variant + `numa-split` mode, **add `numa-split` to
+   `ACCEPTED_MODES`** so diagnostics stay consistent, add a `parse` arm, and make
+   `resolve` pass it through as valid.
+4. `compact` now uses `.find` (smallest-index), not `min_by_key(len)`.
+5. `pin_current_thread_to_cpu` internals now use `build_cpu_mask`; signature
+   unchanged.
+6. `NodeShard` / `split_workers` and `decode_numa.rs` are NOT in my commit
+   (removed from the working tree per the coordinator, who preserved your patches
+   in `.squad/tmp-bryant/`). Rebase them onto my commit in your worktree.
+
+**Validation:** `cargo test -p onnx-runtime-ep-cpu --features mlas` → 669 passed,
+0 failed, 3 ignored. `cargo clippy -p onnx-runtime-ep-cpu --features mlas` →
+clean. Committed to `perf/cpu-ep-mlas` (NOT pushed). Non-author re-review by Gaff
+to follow.
+
+<!-- source: .squad/decisions/inbox/gaff-numa-affinity-review.md -->
+### 2026-07-22: NUMA decode-affinity review — rejected pending revision
+**By:** Gaff
+**What:** Reviewed non-author commit `32a122e` (`perf(cpu): NUMA-local CPU affinity for the M=1 decode pool`) and rejected it.
+**Why:** The change correctly confines affinity to the bounded decode Rayon pool, discovers topology at runtime from `/sys`, defaults to `off`, and uses a race-free `OnceLock` for best-effort per-worker fallback. Its fixed `libc::cpu_set_t` mask, however, is only 1024 bits on Linux and is not sized from the runtime CPU index. A discovered CPU ID at or above `CPU_SETSIZE` can make `CPU_SET` index beyond the fixed mask (rather than return the intended graceful affinity failure), so `sched_setaffinity` is not sound or portable to large CPU-ID hosts. Revise the pinning helper to construct a dynamically sized mask that covers `cpu` (or validate the index before `CPU_SET` and log/fall back without panicking), and pass that mask's actual byte length to `sched_setaffinity`.
+
+The diagnostics also do not meet Rule 1's requested combined contract. Malformed modes name accepted modes but not available nodes; unknown `node:<index>` names available nodes but not accepted modes; and on a single-node or `/sys`-unavailable host `node:<index>` is silently treated as the topology fallback, so an unknown selector is not reported. Make every invalid value error include the rejected value, all accepted modes, and the discovered available-node list (or state that topology is unavailable), with focused assertions for those messages.
+
+`compact` is also documented as selecting the smallest-index fitting node, but `min_by_key(|cpus| cpus.len())` selects the fitting node with the fewest CPUs (using index only as an equal-size tie-breaker). Make the selection match the documented smallest-index policy, or document the capacity-minimizing policy precisely.
+
+`cargo test -p onnx-runtime-ep-cpu --features mlas` passed: 665 passed, 0 failed, 3 ignored. `cargo clippy -p onnx-runtime-ep-cpu --features mlas` passed. The four unit tests cover parser modes, CPU-list parsing, compact selection, and unknown-node detection, but they do not cover the required diagnostic content or high CPU-index/fallback safety. Per Rule 9, Batty is locked out from revising this artifact; a different author must make the required fixes.
+
+### 2026-07-22: NUMA decode-affinity revision review — approved
+**By:** Gaff
+**What:** Re-reviewed Deckard's independent revision, commit `046414b`, against the required fixes from the prior rejection.
+**Why:** `build_cpu_mask` correctly allocates `cpu / (8 * size_of::<c_ulong>()) + 1` words and sets bit `cpu % bits_per_word`, so IDs at and above the fixed `CPU_SETSIZE` cannot index a fixed-size `cpu_set_t` out of bounds. The syscall receives exactly `mask.len() * size_of::<c_ulong>()` bytes; the buffer is aligned as `c_ulong`, remains live for the call, and is read-only, making the sole FFI `unsafe` sound. Its checked index-size construction returns an error on arithmetic failure, and a kernel affinity failure is handled by the existing pool start handler's once-logged unpinned fallback.
+
+`DecodeAffinity::resolve` now unifies malformed, non-integer, unknown-node, and no-topology node-selector errors: each names the rejected selector, all three accepted modes, and either the ordered node list or an explicit topology-unavailable statement. `from_env` supplies detected topology to this validation. `compact` now uses `find` over ordered `BTreeMap` values, correctly choosing the smallest-index fitting node. The four new tests assert diagnostic content (including unavailable topology), masks beyond CPU_SETSIZE, and the differing-size smallest-index case. Validation passed: `cargo test -p onnx-runtime-ep-cpu --features mlas` and `cargo clippy -p onnx-runtime-ep-cpu --features mlas`.
+
+<!-- source: .squad/decisions/inbox/leon-gqa-revision.md -->
+### 2026-07-22: Harden CPU GQA SIMD numerical validation
+**By:** Leon
+**What:** Replaced the incorrect dot-product error claim with the standard `γ_n × Σ|a_i b_i|` forward-error scale, made the long-context parity fixture exercise 128-wide AVX2+FMA dot and AXPY paths with mixed-scale cancellation-heavy data, and added a 257-key weighted-value accumulation regression.
+**Why:** Chew rejected the original tests because head width 2 bypassed SIMD and a single AXPY update did not represent decode. Both AVX2 regressions failed under temporary helper mutations and passed after restoration; the required MLAS GQA suite passed 17 tests. A 16-token Qwen2.5-Coder-7B profiler comparison produced identical optimized and forced-scalar token IDs `[2014, 5978, 34776, 19753, 11, 279, 6500, 21896, 6529, 16895, 6337, 5711, 264, 76369, 729, 448]`.
+
+<!-- source: .squad/decisions/inbox/sapper-gqa-cpu-decode.md -->
+# Decision: GQA CPU decode optimization (perf/cpu-ep-mlas)
+
+**Author**: Sapper  
+**Date**: 2026-07-22  
+**Branch**: perf/cpu-ep-mlas  
+**File**: `crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`
+
+---
+
+## What changed
+
+Three targeted optimizations to the M=1 decode hot path in `GroupQueryAttentionKernel::execute`.
+
+### 1. Attended-window scoring only
+
+`scores` is now allocated with `attended = causal_limit + 1 - local_start` elements
+(the actual causal window) instead of `total_sequence_length` (full sequence).
+For full causal attention these are equal, but the shorter allocation avoids
+initializing and iterating over masked-out positions in all downstream code.
+
+### 2. SIMD dot-product for QK scores (`dot_f32` / `dot_avx2_fma`)
+
+New `dot_avx2_fma` with `#[target_feature(enable = "avx2,fma")]` and a safe
+dispatch wrapper `dot_f32`. Uses two 8-wide AVX2 accumulators to hide FMA
+latency, processes 16 elements per iteration, with a scalar tail for non-pow-2
+head sizes. Runtime-gated via `crate::backend::has_simd_x86()` (same check the
+MLAS GEMM uses). Scalar fallback preserved for non-x86 targets.
+
+### 3. Cache-friendly P·V accumulation (`axpy_f32` / `axpy_avx2_fma`)
+
+P·V loop reordered from **d-outer, ks-inner** to **ks-outer, d-inner**. The
+original ks-inner loop accessed `present_v` at stride `head_dim` (stride-128
+for Qwen2.5-7B), causing one L1 cache miss per key position per output
+dimension. The new ks-outer order reads each V row as a contiguous
+`head_dim × sizeof(f32)` block, then accumulates via an AVX2 FMADD AXPY
+(`axpy_avx2_fma`). Scores are normalized once (in-place divide by sum) before
+the P·V loop, eliminating per-element division.
+
+---
+
+## Benchmark results
+
+Machine: development workstation (not the Sapphire Rapids Xeon 8480C in
+Sebastian's profile — results are directionally correct but absolute numbers
+will differ on target hardware).
+
+Model: Qwen2.5-Coder-7B int4, CPU EP, 32 decode threads.
+
+### Short context ("Write a function to sort a list.", 24 generated tokens)
+
+| Step | GQA ms/step (baseline) | GQA ms/step (optimized) | Speedup |
+|------|------------------------|--------------------------|---------|
+| Step 1 (~8 context tokens) | 3.34 ms | 1.77 ms | **1.89×** |
+| Step 12 (~20 context tokens) | 5.15 ms | 2.05 ms | **2.51×** |
+| Step 24 (~32 context tokens) | 7.55 ms | 2.37 ms | **3.18×** |
+
+**Short context end-to-end:**
+- Baseline: 8.73 tok/s (114.5 ms/step)
+- Optimized: 9.23 tok/s (108.3 ms/step)
+- Improvement: **+5.7%**
+
+### Long context (~1000-token prompt, 32 generated tokens)
+
+| Metric | Baseline | Optimized | Improvement |
+|--------|----------|-----------|-------------|
+| GQA ms / 28 calls per step | 85–89 ms | 66–68 ms | **1.28×** |
+| GQA ms/call | 3.1 ms | 2.4 ms | **1.27×** |
+| Overall step latency | ~163–168 ms | ~143–150 ms | **1.12×** |
+| End-to-end throughput | 0.36 tok/s | 0.41 tok/s | **+14%** |
+
+---
+
+## Precision / numerics evidence
+
+The softmax path is **unchanged**: each score still uses
+`(score_f32 - max_f32) as f64).exp() as f32` (CUDA cross-EP parity contract).
+
+The AVX2 dot-product uses two parallel f32 accumulators; the induced rounding
+difference vs sequential scalar is bounded by `n × f32::EPSILON × max(|q|, |k|)`
+(≈ 128 × 1.2e-7 × 1.0 = 1.5e-5 for head_dim=128, normalized inputs).
+
+**Greedy token-id parity verified**: 16-token decode from the same long
+prompt produces identical token ids on baseline and optimized builds:
+
+```
+[31075, 264, 4583, 7868, 2711, 4916, 304, 13027, 448, 5656, 11, 3698, 11, 2711, 11, 323]
+```
+
+---
+
+## Tests added (RULES.md §8)
+
+Three new unit tests in `group_query_attention.rs`:
+
+- `gqa_decode_long_context_matches_reference`: M=1 decode with 511-token past
+  cache; output matches the scalar `reference()` within existing 1e-5 tolerance.
+- `dot_f32_matches_scalar_reference_for_various_lengths`: `dot_f32` vs scalar
+  for lengths 1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133 with bounded tolerance.
+- `axpy_f32_matches_scalar_reference_for_various_lengths`: `axpy_f32` vs scalar
+  same length set.
+
+All 16 GQA tests pass.
+
+---
+
+## Rules compliance
+
+- **Rule 2**: No hardcoded shapes. SIMD dispatch uses head_dim at runtime.
+- **Rule 4**: Reuses `crate::backend::has_simd_x86()` runtime gate (same as MLAS
+  GEMM). Reference scalar path preserved. Optimized and reference both testable.
+- **Rule 8**: Tests in same commit.
+- **Rule 9**: Chew review needed for numerics (AVX2 dot product reordering).
+
+## Remaining work (not in this commit)
+
+- **Scratch buffer reuse** across decode steps: kernel is stateless; a
+  `thread_local!` or `Mutex<Vec<f32>>` in the kernel struct would eliminate
+  `Vec` allocations in `compute_row`. Deferred for a follow-up.
+- **Validation on Sapphire Rapids**: absolute latency numbers above are from a
+  dev workstation. Reproduce on target with `ONNX_GENAI_PROFILE_OPS=1` at
+  sequence length ≥1024 to confirm the cache-line locality gain holds.
+- **AVX-512 dot-product**: the Xeon 8480C supports AVX-512, enabling 16-wide
+  FMADD. The current 8-wide path leaves ~2× on the table for the QK scoring
+  loop at long head_dim. Gating on `avx512f` is a follow-up.
+
+<!-- source: .squad/decisions/inbox/sebastian-cpu-profile.md -->
+### 2026-07-22: Native 7B CPU decode profile
+**By:** Sebastian
+
+## Method
+
+- Host: dual-socket Intel Xeon Platinum 8480C, 96 physical cores, no SMT, two NUMA nodes.
+- Model: Foundry Qwen2.5-Coder-7B int4 v4; prompt `Write a function to sort a list.` (8 tokens); greedy 24-token generation.
+- Build: `cargo build --release -p onnx-genai-bench --features mlas --bin profile_native`.
+- No CPU pinning; runs were sequential on the otherwise shared host.
+- Per-node timing used the existing zero-cost-when-disabled `ONNX_GENAI_PROFILE_OPS=1` executor hook. The table is the mean of 23 measured M=1 forwards after the measured prefill.
+- `ONNX_GENAI_PROFILE=1` measured host sampling separately. `profile_native` now resets warmup statistics and prints this existing stage profiler; the focused synthetic integration test covers enabled reporting.
+
+## Important correction to the headline latency
+
+The reported approximately 113 ms/generated-token number is **not one M=1 decode step**. `profile_native`'s default throughput timer includes one 8-token prompt prefill per 24 generated tokens.
+
+At 32 decode threads in this run:
+
+| measurement | result |
+|---|---:|
+| Default 24-token end-to-end benchmark | 116.662 ms/token, 8.57 tok/s |
+| Steady M=1 decode (`--steady --decode-skip 8`, combined two runs) | 79.456 ms/token, 12.59 tok/s |
+| Prefill/reset amortization in the default benchmark | 37.206 ms/generated token (31.9%) |
+
+Thus only about 68% of the headline 116.7 ms/token is steady M=1 decode. Optimization claims must state which metric they improve.
+
+## M=1 per-stage breakdown
+
+The matched profiled generation measured 83.394 ms per M=1 step (profiling/load overhead makes this about 5% slower than the unprofiled 79.456 ms). Percentages are the robust result:
+
+| stage | ms/M=1 step | share |
+|---|---:|---:|
+| `MatMulNBits` projections (141 calls) | 64.334 | **77.1%** |
+| Elementwise/activation: `Silu` + `Add` + `Mul` | 7.934 | **9.5%** |
+| GQA/attention, including RoPE | 5.335 | **6.4%** |
+| RMSNorm/LayerNorm | 3.275 | **3.9%** |
+| Sampling/host argmax | 0.079 | **0.1%** |
+| Executor/native-decode orchestration and remaining tiny nodes | 2.437 | **2.9%** |
+| **Total** | **83.394** | **100%** |
+
+The residual is an upper bound because it also contains enabled-profiler bookkeeping. Sampling, token commit, and detokenization together are below 0.1 ms/token and are not material.
+
+## MatMulNBits routing
+
+M=1 does **not** use MLAS SQNBit under the current configuration. `NXRT_SQNBIT_PREFILL_MIN` was unset, so the default threshold is 16; `try_mlas_sqnbit` returns before packing when `m < 16`. The benchmark therefore uses the specialized packed hand int4/VNNI path for M=1. Building with `--features mlas` does not change this routing.
+
+An exploratory `NXRT_SQNBIT_PREFILL_MIN=2` run kept M=1 on the hand path while sending the 8-row prompt to MLAS; it measured 8.43 tok/s versus 8.57 tok/s at the default threshold, so lowering the crossover is not an optimization on this workload.
+
+## Thread scaling
+
+Requested default-harness results (one prefill per 24 generated tokens, two measured runs):
+
+| `ONNX_GENAI_CPU_DECODE_THREADS` | ms/generated token | tok/s | vs. 32 |
+|---:|---:|---:|---:|
+| 8 | 150.908 | 6.63 | -22.6% |
+| 16 | 125.908 | 7.94 | -7.4% |
+| **32** | **116.662** | **8.57** | — |
+| 48 | 131.342 | 7.61 | -11.2% |
+
+Steady M=1 combined across the two runs:
+
+| threads | ms/M=1 token | tok/s |
+|---:|---:|---:|
+| 8 | 112.992 | 8.85 |
+| 16 | 83.569 | 11.97 |
+| **32** | **79.456** | **12.59** |
+| 48 | 103.928 | 9.62 |
+
+Thirty-two threads is the clear operating point for this 7B model on this dual-socket host; 48 crosses into synchronization/NUMA regression.
+
+## Ranked optimization targets
+
+1. **MatMulNBits cross-node efficiency (77.1%)** — keep the hand int4/VNNI M=1 backend, but target projection grouping, activation-quantization reuse, direct executor-output writes, and fewer per-projection barriers. A 20% local reduction is a 15.4% M=1 latency reduction; a 30% local reduction is 23.1%.
+2. **Fuse projection-adjacent elementwise work (9.5%)** — combine eligible bias/residual and gate/up SiLU work structurally, preserving generic fallbacks. Recovering half this bucket yields about 4.8% lower M=1 latency; the absolute ceiling is 9.5%.
+3. **GQA/attention (6.4% here, increasing with context)** — reduce remaining per-layer attention setup/copies and reuse scratch/static KV views. Halving this bucket yields about 3.2% at this short context, with larger upside at long context.
+
+RMSNorm is the next target at 3.9%, preferably as part of residual-plus-normalization fusion. Sampling and generic loop orchestration are not priority work.
+
+## Follow-up: decode-to-decode runtime comparison
+
+All three runtimes used the same model directory, bare 8-token prompt, greedy decoding, and one warmup. The ORT wrapper explicitly used 32 intra-op threads. Native used 32 decode threads. OGA 0.14.1 does not expose the ORT intra-op setting through its Python configuration surface, so its model-default CPU threading remained in effect.
+
+### Comparable 24-token end-to-end request
+
+These numbers include per-request setup and prompt prefill, but exclude model loading and prompt tokenization:
+
+| runtime | ms/generated token | tok/s | native-relative |
+|---|---:|---:|---:|
+| Native nxrt CPU | 116.662 | 8.57 | 1.00x |
+| ORT wrapper, 32 threads | 45.633 | **21.91** | **2.56x** |
+| onnxruntime-genai | 53.179 | **18.80** | **2.19x** |
+
+The repository `oga_bench.py` originally reported 21.04 tok/s at 24 tokens because its timer begins **after** `Generator.append_tokens`, excluding OGA's prompt prefill. A separate timer around generator setup, append, and decode gives the comparable 18.80 tok/s above. OGA spent about 1.1 ms in generator setup and 101.8 ms in prompt append/prefill per request.
+
+### Clean 128-token steady decode
+
+Each runtime generated 128 tokens and the steady window excluded the first eight emitted tokens. Native and ORT produced the same continuation; OGA produced a different greedy continuation despite the same raw prompt/model, so its number is a throughput comparison at identical lengths rather than token-identical execution.
+
+| runtime | steady window | ms/M=1 token | tok/s | native-relative |
+|---|---:|---:|---:|---:|
+| Native nxrt CPU, 32 threads | tokens 9-128 | 91.447 | 10.94 | 1.00x |
+| ORT wrapper, 32 threads | tokens 9-128 | 37.145 | **26.92** | **2.46x** |
+| onnxruntime-genai | tokens 9-128 | 48.101 | **20.79** | **1.90x** |
+
+The earlier native 12.59 tok/s value covered only a short 24-token request. Extending all runtimes to the same 128-token context lowers native to 10.94 tok/s; the clean decode gap is therefore 2.46x to the ORT wrapper and 1.90x to OGA. ORT's full 128-token request measured 26.43 tok/s including prefill and one final logits materialization.
+
+## Follow-up: decomposing native prefill versus reset
+
+A prefill-only native run (`--tokens 1 --warmups 1 --runs 3`, node profiling enabled) directly separates graph execution from everything outside executor nodes:
+
+| component per request | time | share |
+|---|---:|---:|
+| M=8 executor-node compute, mean | 748.617 ms | 99.2% |
+| Reset, input/output allocation, sampling, detokenization, and profiler bookkeeping combined | at most 5.880 ms | at most 0.8% |
+| Total mean wall time | 754.497 ms | 100% |
+
+The three measured M=8 node times were 1079.810, 583.353, and 582.688 ms, demonstrating substantial host/cache noise but consistently dwarfing reset overhead. Mean M=8 compute attribution was:
+
+| prefill operator | mean ms | compute share |
+|---|---:|---:|
+| `MatMulNBits` | 607.858 | **81.2%** |
+| GQA/attention | 45.686 | 6.1% |
+| `Silu` | 45.236 | 6.0% |
+| RMSNorm/LayerNorm | 28.302 | 3.8% |
+| `Add` + `Mul` and remaining nodes | 21.535 | 2.9% |
+
+This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 model compute, not benchmark reset/allocation. The native M=8 prefill is roughly 0.58-1.08 seconds versus 63.5 ms for the 32-thread ORT wrapper first forward and about 102 ms for OGA prompt append/prefill. Lowering `NXRT_SQNBIT_PREFILL_MIN` to route M=8 through MLAS did not improve end-to-end throughput (8.43 versus 8.57 tok/s).
+
+**Decision:** assign dedicated CPU prefill optimization work if TTFT or short-request throughput matters. It will not improve steady M=1 decode, but the measured M=8 compute is a real product bottleneck and is overwhelmingly `MatMulNBits`, not harness overhead.
+
 ## 2026-07-21 — VLM WP2/WP3, opset-24 CUDA, ScatterElements, and DS-1
 
 ### Land VLM WP0 metadata contract and source-compatible hotfix
