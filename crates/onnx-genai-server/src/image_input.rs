@@ -26,6 +26,7 @@ pub(crate) struct ImageTensor {
 pub(crate) struct ImageBundle {
     pub(crate) tensors: Vec<ImageTensor>,
     pub(crate) images: Vec<ImageExpansionSummary>,
+    pub(crate) thumbnail_position: ThumbnailPosition,
     /// Compatibility view of the first fp32 tensor for existing unit tests.
     #[cfg(test)]
     pub(crate) shape: Vec<i64>,
@@ -123,7 +124,12 @@ impl VisionInputSpec {
              Why: the server has image tensors but no typed pipeline.vision expansion contract. \
              How: declare image_placeholder_token_id, image_token_id, token_count_source, and its required count field.",
         )?;
-        expansion.expand(prompt_token_ids, &bundle.images, max_prompt_tokens)
+        expansion.expand(
+            prompt_token_ids,
+            &bundle.images,
+            bundle.thumbnail_position,
+            max_prompt_tokens,
+        )
     }
 }
 
@@ -209,8 +215,18 @@ impl VisionExpansionSpec {
         &self,
         prompt_token_ids: &[u32],
         images: &[ImageExpansionSummary],
+        tensor_thumbnail_position: ThumbnailPosition,
         max_prompt_tokens: usize,
     ) -> anyhow::Result<Vec<u32>> {
+        if self.thumbnail_position != tensor_thumbnail_position {
+            anyhow::bail!(
+                "What: image thumbnail ordering validation failed. \
+                 Why: pipeline.vision.thumbnail_order declares {:?}, but preprocessing emitted tensors with {:?} thumbnail ordering. \
+                 How: make pipeline.vision.thumbnail_order match the preprocessing.image tile layout.",
+                self.thumbnail_position,
+                tensor_thumbnail_position
+            );
+        }
         let placeholder = u32::try_from(self.placeholder_token_id).with_context(|| {
             format!(
                 "What: image placeholder expansion could not start. Why: placeholder token ID {} is outside u32. How: declare a non-negative tokenizer token ID.",
@@ -487,6 +503,7 @@ pub(crate) async fn load_and_preprocess(
     Ok(ImageBundle {
         tensors,
         images: bundle.images,
+        thumbnail_position: bundle.thumbnail_position,
         #[cfg(test)]
         shape,
         #[cfg(test)]
@@ -678,4 +695,41 @@ fn safe_url_scheme(url: &str) -> &str {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
         })
         .unwrap_or("<missing or invalid>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_thumbnail_order_that_disagrees_with_tensor_layout() {
+        let expansion = VisionExpansionSpec {
+            placeholder_token_id: 7,
+            image_token_id: 7,
+            count_source: ImageTokenCountSource::PerTile,
+            tokens_per_unit: 1,
+            row_separator_token_id: None,
+            column_separator_token_id: None,
+            thumbnail_position: ThumbnailPosition::Append,
+        };
+        let images = [ImageExpansionSummary {
+            image_index: 0,
+            original_size: (2, 2),
+            tile_grid: onnx_genai_preprocess::image::TileGrid {
+                columns: 1,
+                rows: 1,
+            },
+            tile_count: 2,
+            expansion_count: 2,
+            tensor_offset: 0,
+            tensor_length: 2,
+        }];
+
+        let error = expansion
+            .expand(&[7], &images, ThumbnailPosition::Prepend, 16)
+            .expect_err("mismatched thumbnail order must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("thumbnail ordering validation failed"));
+        assert!(message.contains("How:"));
+    }
 }
