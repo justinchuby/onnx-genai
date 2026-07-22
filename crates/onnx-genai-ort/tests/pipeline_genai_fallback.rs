@@ -8,49 +8,19 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn assert_complete_vlm(directory: &PipelineModelDirectory) {
-    let preprocessing = directory
-        .preprocessing
-        .as_ref()
-        .and_then(|preprocessing| preprocessing.image.as_ref())
-        .expect("typed image preprocessing");
-    let decoder_io = directory.spec.models["decoder"]
-        .io
-        .as_ref()
-        .expect("decoder io");
-
-    assert_eq!(
-        preprocessing
-            .outputs
-            .iter()
-            .map(|output| output.name.as_str())
-            .collect::<Vec<_>>(),
-        ["pixel_values", "image_grid_thw"]
-    );
-    assert_eq!(
-        directory
-            .spec
-            .positions
-            .as_ref()
-            .expect("position program")
-            .rank,
-        3
-    );
-    assert_eq!(decoder_io.kv_inputs.as_ref().map(Vec::len), Some(16));
-    assert_eq!(decoder_io.kv_outputs.as_ref().map(Vec::len), Some(16));
-    assert_eq!(decoder_io.state_pairs.as_ref().map(Vec::len), Some(48));
-}
-
 #[test]
-fn complete_genai_package_loads_as_pipeline_without_native_sidecar() {
-    let directory = PipelineModelDirectory::load(fixture("vlm-complete"))
-        .expect("complete compatibility package loads");
+fn complete_genai_metadata_still_rejects_non_executable_edge_rank() {
+    let error = PipelineModelDirectory::load(fixture("vlm-complete"))
+        .expect_err("rank-mismatched compatibility package must fail admission")
+        .to_string();
 
+    assert!(error.contains("embedding.image_features"), "{error}");
+    assert!(error.contains("incompatible ranks"), "{error}");
     assert!(
-        directory.metadata_path.is_none(),
-        "compatibility config must not masquerade as native inference metadata"
+        error.contains("producer rank 2, consumer rank 3"),
+        "{error}"
     );
-    assert_complete_vlm(&directory);
+    assert!(error.contains("regenerate the native sidecar"), "{error}");
 }
 
 #[test]

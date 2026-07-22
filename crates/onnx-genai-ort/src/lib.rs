@@ -20,6 +20,7 @@ pub mod env;
 pub mod error;
 pub mod shared_kv_proposer;
 pub mod loader;
+mod pipeline_admission;
 pub mod mtp;
 pub mod profile;
 pub mod session;

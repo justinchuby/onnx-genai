@@ -177,6 +177,12 @@ impl PipelineModelDirectory {
             per_component: per_component_tokenizers,
         };
 
+        crate::pipeline_admission::validate_pipeline_admission(
+            &spec,
+            preprocessing.as_ref(),
+            &model_paths,
+        )?;
+
         Ok(Self {
             root: root.to_path_buf(),
             metadata_path,
