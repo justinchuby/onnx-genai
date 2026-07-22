@@ -4,9 +4,15 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T08:06Z — int4 zero-points, DS native E2E, VLM WP1, and decode roofline profiling._
+_Last updated: 2026-07-22T10:07Z — Phase 1 EP capture hook, Mobius VLM emission, and Gemma4 E2B export._
 
-**Current `origin/main` implementation HEAD:** `1b1f800` (code before this docs update).
+**Current `origin/main` implementation HEAD:** `4b0a10d` (code before this docs update).
+
+## 2026-07-22 — EP capture hook, Mobius VLM emission, and Gemma4 E2B export
+
+- **Partial-CUDA-graph EP-claim Phase 1 ✅ (`4b0a10d`):** structural capture-region policy moved from the session executor into `ExecutionProvider::plan_capture_region(node, shape_status) -> Option<StructuralCaptureDecline>`. Kernel-mechanism predicates (`kernel-not-warmed`, `kernel-capture-unsupported`) remain executor-side and apply only after the EP admits a node. Behavior is byte-identical to legacy (independently reviewed 🟢; parity asserts the refactored == legacy 6-node `SeamReason` sequence), completing Phase 1 of `docs/design-ep-partial-cuda-graph.md` after Phase 0 (`3c94a57`), with model-agnostic structural policy per RULES §2.
+- **Mobius VLM WP1 emission + Windows CI fix ✅ (PRs #416, #417):** Mobius now emits native onnx-genai metadata for VLM packages, and the Windows ONNX temp-file lock in parity tests is released/ignored.
+- **Gemma4 E2B real export for native-VLM testing ✅:** `google/gemma-4-E2B-it` exported via Mobius (`task=gemma4`, fp16, CUDA-optimized) as a four-model package (vision encoder + audio encoder + embedding + decoder), 11.3GB, with 15 mixed-256/512 head-dim KV pairs. The decoder has no `position`/`input_ids` input and consumes `inputs_embeds` + `per_layer_inputs` + `attention_mask`, grounding the exact I/O contract and feeding generic follow-ups now in flight: WP-A Mobius executable-contract emission (`per_layer_inputs` edge + embedding `every_step` + closure validator) and WP-C runtime package admission gate. All metadata/structural; no model-name dispatch (RULES §2).
 
 ## 2026-07-22 — CUDA-graph auto-enable generalizes to Qwen2.5-7B
 
