@@ -5,6 +5,75 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T09:30Z -->
+## 2026-07-22 — DeepSeek shape-chain, MLA conformance, and active inbox fold
+
+### Land DS-1 generic dynamic shape-chain propagation
+**By:** Chew; reviewed by Rachael 🟢
+**What:** Land commit `d653879` (reviewed work `chew-79`) extending generic runtime shape-chain propagation so a dynamically resolved `Slice` can feed `Unsqueeze` and subsequent broadcast/movement. `Unsqueeze` output rank is computed as input rank plus `len(axes)`, using the ONNX domain/opset registry and no node-name keying. Native Rust DeepSeek-V2 tiny CPU E2E now generates `[42, 237, 198, 2, 186, 81, 210, 149]`.
+**Why:** Dynamic output sizing must remain model-agnostic and registry-driven while covering DeepSeek-V2 decode graphs that pass shape values through movement/broadcast chains.
+
+### Land DS-3 MLA cached-decode parity coverage
+**By:** Pris; reviewed by Tyrell 🟢
+**What:** Land commit `8aba045` strengthening standard Attention/MLA tests for `qk_head_dim != v_head_dim` (192 vs 128), 3-D BSH, explicit head attrs, non-empty past K/V, prefill+decode+full-seq parity, GQA (`kv=2`) and MQA (`kv=1`), with an independent scalar SDPA oracle. CPU 33/33 and CUDA 23/23 pass.
+**Why:** Cached decode must preserve asymmetric QK/V head-width semantics and parity across CPU/CUDA without relying on model-specific assumptions.
+
+### Keep generic scalar `seqlens_k` GQA support explicit and unit-batch scoped
+**By:** Pris and Deckard
+**What:** Preserve the long-lived scalar-seqlens implementation plan, and fold Deckard's landed decision to emit `model.attention.key_sequence_lengths.scalar_broadcast: unit_batch` only for structurally detected ORT-GenAI GroupQueryAttention exports.
+**Why:** Scalar key sequence lengths should be accepted only under a declared, validated unit-batch GQA contract, not as a broad shape coercion.
+
+### Fold remaining processed inbox decisions and reviews
+**By:** Scribe
+**What:** Processed and deduplicated the non-preserved decision inbox notes. Key folded outcomes: block-32 int8 MatMulNBits CUDA support and review; VLM WP1/WP5/WP6 metadata/loader/server-bundle work and reviews; Gemma4 auxiliary output binding plus structural capture guard; H200 multi-model roofline and megakernel feasibility notes; KV logical-shape and fp16 GQA decode coverage; and DeepSeek validation/review records already represented by the DS-1/DS-3 entries above. Processed files:
+- `ana-fp16-next-levers.md`
+- `ana-h200-baseline-roofline.md`
+- `ana-megakernel-feasibility.md`
+- `ana-wave2-roofline-558.md`
+- `ana-wave3-roofline-691.md`
+- `batty-auxbind.md`
+- `chew-ds1-shape-chain.md`
+- `chew-ds3-mla.md`
+- `chew-leon-auxguard-review.md`
+- `deckard-gqa-fp16.md`
+- `deckard-gqa-scalar-seqlens.md`
+- `deckard-int8-matmulnbits.md`
+- `gaff-ds3-review.md`
+- `gaff-kv-review.md`
+- `leon-auxbind-review.md`
+- `leon-auxguard.md`
+- `leon-kv-logical-shape.md`
+- `leon-vlm-wp5-finalize.md`
+- `leon-vlm-wp5-rebase.md`
+- `leon-vlm-wp5-urlfix.md`
+- `luv-vlm-wp5-rereview.md`
+- `luv-vlm-wp5-rereview2.md`
+- `luv-vlm-wp5-review.md`
+- `luv-vlm-wp6-rereview.md`
+- `luv-vlm-wp6-review.md`
+- `luv-wp4-review.md`
+- `pris-deepseek-e2e-val.md`
+- `pris-ds3-mla-conformance.md`
+- `pris-gqa-fp16-review.md`
+- `rachael-ds1-review.md`
+- `rachael-vlm-wp5.md`
+- `roy-int8-matmulnbits-review.md`
+- `sapper-glm-pr404.md`
+- `sapper-vlm-wp1-emission.md`
+- `sapper-vlm-wp6-fix.md`
+- `sebastian-gemma4-perf.md`
+- `sebastian-gemma4-reprobe.md`
+- `sebastian-h200-multimodel-bench.md`
+- `tyrell-ds3-review.md`
+- `zhora-vlm-wp5-fix.md`
+- `zhora-vlm-wp6.md`
+**Why:** The inbox should retain only long-lived active research/scope artifacts while merged decisions live in the current ledger.
+
+### Preserve active research and scope artifacts in the inbox
+**By:** Scribe
+**What:** Left `zhora-deepseek-scope.md`, `leon-vlm-scope.md`, `pris-gqa-scalar-seqlens-plan.md`, and `keaton-native-specdecode-design.md` in `.squad/decisions/inbox/`.
+**Why:** These artifacts remain active references and should not be collapsed into the ledger yet.
+
 <!-- scribe-merge-2026-07-21T23:55Z -->
 ## 2026-07-21 — VLM WP2/WP3, opset-24 CUDA, ScatterElements, and DS-1
 

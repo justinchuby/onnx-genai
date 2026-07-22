@@ -4,9 +4,17 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-22T08:20Z — H200 multi-model decode roofline bench landed: **Qwen2.5-0.5B native decisively beats ORT GenAI** on the same int4 ONNX (815 vs 725 tok/s +12% @128; 783 vs 663 tok/s +18% @1024) but reaches only ~9% of the simplistic HBM roofline. Coverage seams surfaced: Qwen2.5-1.5B blocked on generic scalar batch-1 GQA `seqlens_k`; Phi-4-mini blocked on block-32 **int8** MatMulNBits (kernel is int4-only). In flight: generic int8 block-32 CUDA GEMV (unblocks Phi-4-mini), capture-safety aux-dim decline hardening (review), VLM WP5 (server bundle — re-review after revision), and VLM WP6 (genai_config compat loader — revision)._
+_Last updated: 2026-07-22T09:30Z — DeepSeek DS-1 and DS-3 follow-ups landed. DS-1 extends generic dynamic `Slice -> Unsqueeze -> broadcast/movement` shape-chain propagation and unblocks native Rust DeepSeek-V2 decode. DS-3 strengthens standard Attention/MLA cached-decode conformance for asymmetric QK/V head dims, 3-D BSH, non-empty past K/V, GQA, and MQA._
 
-**Current `origin/main` implementation HEAD:** `8d9ba95` (code); `ba86625` (docs).
+**Current `origin/main` implementation HEAD:** `d653879` (code); `ba86625` (docs).
+
+## 2026-07-22 — DS-1 dynamic shape-chain propagation merged
+
+- **Generic dynamic shape-chain propagation ✅ (`d653879`):** dynamically resolved `Slice` shapes now feed `Unsqueeze` and subsequent broadcast/movement through the ONNX domain/opset registry, with `Unsqueeze` output rank computed as input rank plus axes length and no node-name keying. This unblocks native Rust DeepSeek-V2 decode; `ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu` DeepSeek-V2-tiny E2E generates `[42, 237, 198, 2, 186, 81, 210, 149]`. (Rachael 🟢)
+
+## 2026-07-22 — DS-3 MLA cached-decode conformance merged
+
+- **Standard Attention / MLA parity coverage ✅ (`8aba045`):** Pris strengthened test-only conformance for `qk_head_dim != v_head_dim` (192 vs 128), 3-D BSH inputs, explicit head attrs, non-empty past K/V, prefill+decode+full-seq parity, GQA (`kv=2`) and MQA (`kv=1`), with an independent scalar SDPA oracle. CPU 33/33 and CUDA 23/23 pass. (Tyrell 🟢)
 
 ## 2026-07-22 — int8 block-32 MatMulNBits CUDA merged
 
