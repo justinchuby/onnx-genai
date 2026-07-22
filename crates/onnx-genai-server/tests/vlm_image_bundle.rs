@@ -24,24 +24,36 @@ impl FixtureDir {
         Self::with_tokens_per_patch(max_context, 3)
     }
 
-    fn with_tokens_per_patch(max_context: usize, tokens_per_patch: usize) -> Self {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/vlm-image-bundle-tests")
-            .join(format!(
-                "{}-{}",
-                std::process::id(),
-                FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
-            ));
+    fn rank4(max_context: usize) -> Self {
+        let root = fixture_root();
         fs::create_dir_all(&root).expect("create fixture directory");
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-gemma4-vlm");
-        for name in [
-            "embedding.onnx.textproto",
-            "decoder.onnx.textproto",
-            "tokenizer.json",
-        ] {
-            fs::copy(source.join(name), root.join(name)).expect("copy shared fixture asset");
-        }
+        copy_shared_assets(&source, &root);
+        let vision_model = fs::read_to_string(source.join("vision_encoder.onnx.textproto"))
+            .expect("read rank-4 vision model")
+            .replace("pixel_values", "image_tensor");
+        fs::write(root.join("vision_encoder.onnx.textproto"), vision_model)
+            .expect("write renamed rank-4 vision model");
+        fs::write(
+            root.join("inference_metadata.yaml"),
+            rank4_metadata(max_context),
+        )
+        .expect("write rank-4 fixture metadata");
+        fs::write(
+            root.join("chat_template.jinja"),
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+        )
+        .expect("write fixture chat template");
+        Self(root)
+    }
+
+    fn with_tokens_per_patch(max_context: usize, tokens_per_patch: usize) -> Self {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-gemma4-vlm");
+        copy_shared_assets(&source, &root);
         fs::write(
             root.join("vision_encoder.onnx.textproto"),
             VISION_MODEL_TEXTPROTO,
@@ -58,6 +70,26 @@ impl FixtureDir {
         )
         .expect("write fixture chat template");
         Self(root)
+    }
+}
+
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/vlm-image-bundle-tests")
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+}
+
+fn copy_shared_assets(source: &Path, root: &Path) {
+    for name in [
+        "embedding.onnx.textproto",
+        "decoder.onnx.textproto",
+        "tokenizer.json",
+    ] {
+        fs::copy(source.join(name), root.join(name)).expect("copy shared fixture asset");
     }
 }
 
@@ -151,6 +183,23 @@ async fn public_chat_path_injects_both_vision_inputs_and_expands_placeholder() {
 
     assert_eq!(status, StatusCode::OK, "{body:#}");
     assert_eq!(body["choices"][0]["message"]["content"], "five six five");
+    assert_eq!(body["usage"]["prompt_tokens"], 4);
+}
+
+#[tokio::test]
+async fn metadata_declared_rank4_endpoint_preserves_legacy_image_path() {
+    let fixture = FixtureDir::rank4(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(patterned_data_uri(1))
+        ]),
+        4,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body:#}");
     assert_eq!(body["usage"]["prompt_tokens"], 4);
 }
 
@@ -417,6 +466,85 @@ pipeline:
     image_token_id: 7
     token_count_source: per_patch
     tokens_per_patch: {tokens_per_patch}
+    placeholder_per_image: true
+    thumbnail_order: none
+"#
+    )
+}
+
+fn rank4_metadata(max_context: usize) -> String {
+    format!(
+        r#"schema_version: v1
+model:
+  max_sequence_length: {max_context}
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 2
+        mode: stretch
+        interpolation: bicubic
+      - op: rescale
+        scale: 0.00392156862745098
+    outputs:
+      - name: vision_encoder.image_tensor
+        content: pixels
+        dtype: float32
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx.textproto
+      type: vision_encoder
+    embedding:
+      filename: embedding.onnx.textproto
+      type: encoder
+      io:
+        token_input: input_ids
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+  dataflow:
+    - from: vision_encoder.image_features
+      to: embedding.image_features
+      dtype: fp32
+      device_transfer: false
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_vision
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: fuse_embeddings
+        strategy:
+          kind: single_pass
+          model: embedding
+        run_on: every_step
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 4
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    embedding:
+      run_on: every_step
+    decoder:
+      run_on: every_step
+  vision:
+    image_placeholder_token_id: 7
+    image_token_id: 7
+    token_count_source: per_tile
+    tokens_per_tile: 3
     placeholder_per_image: true
     thumbnail_order: none
 "#
