@@ -34,6 +34,54 @@ pub struct NativeDecodeCudaOptions {
     pub graph_capture: Option<bool>,
 }
 
+/// Purely structural signals that gate whether whole-step CUDA graph capture is
+/// *auto-attempted* on the native decode path. Never derived from a model or
+/// architecture name (RULES.md §2/§2.1) — only from device placement and the
+/// declared KV-ownership metadata. When these hold, per-step decode topology is
+/// static and the KV cache is device-resident and owned, so a captured graph can
+/// replay safely. The runtime decline machinery in `DecodeCudaState::new`
+/// remains the final safety net: if a would-be capture still carries a dynamic
+/// auxiliary seam it is transparently declined and decode continues eagerly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphCaptureStructuralSafety {
+    /// Decode runs on a CUDA device (device-resident, replayable bindings).
+    device_is_cuda: bool,
+    /// KV cache is owned/device-resident (not a borrowed shared-KV proposer).
+    kv_ownership: KvOwnership,
+}
+
+impl GraphCaptureStructuralSafety {
+    /// True when structural conditions make whole-step capture safe to attempt.
+    fn is_capture_safe(self) -> bool {
+        self.device_is_cuda && self.kv_ownership == KvOwnership::Owned
+    }
+}
+
+/// Resolve whether whole-step CUDA graph capture should be attempted for the
+/// native decode path, honoring explicit overrides before the structural
+/// auto-decision.
+///
+/// Precedence:
+/// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) always wins.
+/// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
+///    forces ON) is honored next.
+/// 3. When neither is set, auto-decide from `structural` safety: attempt capture
+///    only when the decode topology is structurally graph-safe.
+fn resolve_graph_capture_enabled(
+    programmatic: Option<bool>,
+    env_explicit: bool,
+    env_value: bool,
+    structural: GraphCaptureStructuralSafety,
+) -> bool {
+    if let Some(explicit) = programmatic {
+        return explicit;
+    }
+    if env_explicit {
+        return env_value;
+    }
+    structural.is_capture_safe()
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum NativeGqaSequenceLengthsPolicy {
     #[default]
@@ -598,8 +646,13 @@ impl NativeDecodeSession {
         )
     }
 
-    /// Load with explicit native-CUDA decode options. Unspecified graph capture
-    /// follows `ONNX_GENAI_CUDA_GRAPH` and remains disabled by default.
+    /// Load with explicit native-CUDA decode options. When graph capture is
+    /// unspecified (`None`) and `ONNX_GENAI_CUDA_GRAPH` is unset, capture is
+    /// auto-enabled whenever the decode topology is structurally graph-safe
+    /// (CUDA device with owned, device-resident KV), and transparently declines
+    /// to eager execution otherwise. An explicit `ONNX_GENAI_CUDA_GRAPH=0`/`=1`
+    /// or a programmatic `graph_capture` value always overrides the
+    /// auto-decision.
     pub fn load_with_cuda_options(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
@@ -768,9 +821,16 @@ impl NativeDecodeSession {
                 Some(value) => value,
                 None => cuda_kv_max_len_from_env()?,
             };
-            let graph_enabled = cuda_options
-                .graph_capture
-                .unwrap_or_else(|| onnx_genai_runtime_config::runtime_config().cuda_graph);
+            let runtime_config = onnx_genai_runtime_config::runtime_config();
+            let graph_enabled = resolve_graph_capture_enabled(
+                cuda_options.graph_capture,
+                runtime_config.cuda_graph_explicit,
+                runtime_config.cuda_graph,
+                GraphCaptureStructuralSafety {
+                    device_is_cuda: true,
+                    kv_ownership,
+                },
+            );
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
@@ -2302,6 +2362,77 @@ mod tests {
     use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
     use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
     use prost::Message;
+
+    #[test]
+    fn graph_capture_auto_enables_for_owned_cuda_kv() {
+        let structural = GraphCaptureStructuralSafety {
+            device_is_cuda: true,
+            kv_ownership: KvOwnership::Owned,
+        };
+        assert!(structural.is_capture_safe());
+        // Env unset, no programmatic override -> auto-enable from structure.
+        assert!(resolve_graph_capture_enabled(
+            None, false, false, structural
+        ));
+    }
+
+    #[test]
+    fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
+        let shared = GraphCaptureStructuralSafety {
+            device_is_cuda: true,
+            kv_ownership: KvOwnership::Shared,
+        };
+        assert!(!shared.is_capture_safe());
+        assert!(!resolve_graph_capture_enabled(None, false, false, shared));
+
+        let cpu_owned = GraphCaptureStructuralSafety {
+            device_is_cuda: false,
+            kv_ownership: KvOwnership::Owned,
+        };
+        assert!(!cpu_owned.is_capture_safe());
+        assert!(!resolve_graph_capture_enabled(
+            None, false, false, cpu_owned
+        ));
+    }
+
+    #[test]
+    fn graph_capture_env_explicit_overrides_auto_decision() {
+        let safe = GraphCaptureStructuralSafety {
+            device_is_cuda: true,
+            kv_ownership: KvOwnership::Owned,
+        };
+        let unsafe_structural = GraphCaptureStructuralSafety {
+            device_is_cuda: true,
+            kv_ownership: KvOwnership::Shared,
+        };
+        // ONNX_GENAI_CUDA_GRAPH=0 forces OFF even when structurally safe.
+        assert!(!resolve_graph_capture_enabled(None, true, false, safe));
+        // ONNX_GENAI_CUDA_GRAPH=1 forces ON even when structure would decline
+        // (the runtime decline machinery is still the final safety net).
+        assert!(resolve_graph_capture_enabled(
+            None,
+            true,
+            true,
+            unsafe_structural
+        ));
+    }
+
+    #[test]
+    fn graph_capture_programmatic_override_wins_over_env_and_structure() {
+        let safe = GraphCaptureStructuralSafety {
+            device_is_cuda: true,
+            kv_ownership: KvOwnership::Owned,
+        };
+        // Programmatic Some(false) beats explicit env=1 and safe structure.
+        assert!(!resolve_graph_capture_enabled(
+            Some(false),
+            true,
+            true,
+            safe
+        ));
+        // Programmatic Some(true) beats explicit env=0.
+        assert!(resolve_graph_capture_enabled(Some(true), true, false, safe));
+    }
 
     #[test]
     fn capture_fallback_emits_each_structured_decline_to_tracer() {
