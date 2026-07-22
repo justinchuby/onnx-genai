@@ -8,6 +8,10 @@ _Last updated: 2026-07-22T08:06Z — int4 zero-points, DS native E2E, VLM WP1, a
 
 **Current `origin/main` implementation HEAD:** `1b1f800` (code before this docs update).
 
+## 2026-07-22 — Metadata-driven CUDA-graph auto-enable merged
+
+- **Native decode CUDA-graph structural auto-enable ✅ (`610bde0`):** Batty landed whole-step CUDA graph capture on the native decode path when structural metadata says it is safe (`device_is_cuda && kv_ownership == Owned`), with no model-name or architecture branching (RULES §2/§2.1). Precedence is programmatic `graph_capture` override → explicit `ONNX_GENAI_CUDA_GRAPH` env → structural auto-decision when env is unset; existing `DecodeCudaState` decline/eager-fallback remains the runtime safety net for dynamic-shape seams. H200 token-exact, 0-fallback results: Qwen2.5-0.5B **441.49 → 828.54 tok/s (+87.7%)** and Phi-4-mini **67.32 → 94.91 tok/s (+41.0%)**; 828 tok/s is ~93.5% of the ~886 tok/s HBM roofline ceiling for 0.5B. (Leon 🟢)
+
 ## 2026-07-22 — int4 zero-points, DS native E2E, VLM WP1, and decode roofline
 
 - **Native CUDA int4 zero-point fix (BLOCKER #3) ✅ (`48de993`):** Sapper fixed fp16 int4 MatMulNBits GEMV (`M==1` decode) to support explicit `zero_points` for asymmetric int4 models such as Phi-4-mini: per-block zp = `(b&1)?(byte>>4):(byte&0xF)`, null defaults to 8, and `w=(q-zp)*scale`. This unblocks native Phi-4-mini decode. (Holden 🟢)
