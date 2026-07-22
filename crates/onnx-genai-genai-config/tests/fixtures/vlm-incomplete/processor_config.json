@@ -15,7 +15,7 @@
           "attrs": {
             "width": 960,
             "height": 672,
-            "smart_resize": 1
+            "smart_resize": 0
           }
         }
       },

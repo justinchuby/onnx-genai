@@ -867,6 +867,7 @@ async fn image_decode_and_preprocessing_use_pipeline_tensor_shape() {
         eprintln!("skipping image preprocessing test: tiny-vlm fixture is absent");
         return;
     }
+
     let models = PipelineModels::load(&model_dir).unwrap();
     let encoder = models.session("encoder").expect("encoder");
     let input = encoder
@@ -890,6 +891,33 @@ async fn image_decode_and_preprocessing_use_pipeline_tensor_shape() {
         input.shape.iter().product::<i64>() as usize
     );
     assert!(tensor.data.iter().all(|value| (0.0..=1.0).contains(value)));
+}
+
+#[tokio::test]
+async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../onnx-genai-genai-config/tests/fixtures/vlm-complete");
+    let handle = crate::state::build_handle(
+        &ModelSpec {
+            id: "compat-vlm".to_owned(),
+            path: model_dir,
+            eager: true,
+        },
+        &ServerConfig::default(),
+    )
+    .expect("the real server model-loading path accepts the compatibility package");
+
+    assert!(handle.pipeline);
+    let vision = handle
+        .vision_input
+        .as_ref()
+        .expect("server constructed executable vision preprocessing");
+    let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], vision)
+        .await
+        .expect("server preprocessing executes");
+    assert_eq!(tensor.endpoint, "vision_encoder.pixel_values");
+    assert!(!tensor.data.is_empty());
+    assert!(tensor.num_tiles > 0);
 }
 
 #[tokio::test]

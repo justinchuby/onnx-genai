@@ -2,7 +2,8 @@ use std::{path::Path, time::Duration};
 
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use onnx_genai_preprocess::image::ImagePreprocessor;
+use onnx_genai_metadata::ImagePreprocessingProgram;
+use onnx_genai_preprocess::image::{ImagePreprocessor, ImageTensorData};
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
@@ -39,6 +40,19 @@ impl VisionInputSpec {
             preprocessor,
         })
     }
+
+    pub(crate) fn from_input_and_program(
+        endpoint: String,
+        shape: &[i64],
+        program: &ImagePreprocessingProgram,
+    ) -> anyhow::Result<Self> {
+        let preprocessor = ImagePreprocessor::from_input_and_program(shape, program)
+            .with_context(|| format!("invalid preprocessing for vision input '{endpoint}'"))?;
+        Ok(Self {
+            endpoint,
+            preprocessor,
+        })
+    }
 }
 
 pub(crate) async fn load_and_preprocess(
@@ -49,15 +63,33 @@ pub(crate) async fn load_and_preprocess(
     for url in urls {
         images.push(load_image_bytes(url).await?);
     }
-    let tensor = spec
+    let bundle = spec
         .preprocessor
         .preprocess_encoded(&images)
         .with_context(|| format!("failed to preprocess image for {}", spec.endpoint))?;
+    let pixels = bundle
+        .tensors
+        .into_iter()
+        .find(|tensor| tensor.content == "pixels")
+        .with_context(|| {
+            format!(
+                "image preprocessing for {} did not emit a pixels tensor",
+                spec.endpoint
+            )
+        })?;
+    let data = match pixels.data {
+        ImageTensorData::Fp32(data) => data,
+        other => anyhow::bail!(
+            "image preprocessing for {} emitted pixels as {:?}, but the server pipeline input requires fp32",
+            spec.endpoint,
+            other
+        ),
+    };
     Ok(ImageTensor {
         endpoint: spec.endpoint.clone(),
-        shape: tensor.shape,
-        data: tensor.data,
-        num_tiles: tensor.num_tiles,
+        shape: pixels.shape,
+        data,
+        num_tiles: bundle.num_tiles,
     })
 }
 

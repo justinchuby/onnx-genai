@@ -24,7 +24,7 @@
           "attrs": {
             "width": 960,
             "height": 672,
-            "smart_resize": 1
+            "smart_resize": 0
           }
         }
       },
@@ -53,7 +53,7 @@
           "type": "PatchImage",
           "attrs": {
             "patch_size": 16,
-            "temporal_patch_size": 2,
+            "temporal_patch_size": 1,
             "merge_size": 2
           }
         }

@@ -32,3 +32,17 @@ fn resolves_multi_model_pipeline_directory() {
             .ends_with("decoder-tokenizer.json")
     );
 }
+
+#[test]
+fn native_metadata_precedes_invalid_genai_config_fallback() {
+    let directory = PipelineModelDirectory::load(fixture("multi-model-pipeline"))
+        .expect("native metadata must bypass the invalid compatibility file");
+
+    assert!(
+        directory
+            .metadata_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("inference_metadata.yaml"))
+    );
+    assert_eq!(directory.spec.models.len(), 2);
+}

@@ -94,7 +94,13 @@ fn load() -> std::result::Result<CudaRt, String> {
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
         let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
         match (memcpy, memset, device_synchronize, set_device, get_device) {
-            (Ok(memcpy), Ok(memset), Ok(device_synchronize), Ok(set_device), Ok(get_device)) => {
+            (
+                Ok(memcpy),
+                Ok(memset),
+                Ok(device_synchronize),
+                Ok(set_device),
+                Ok(get_device),
+            ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
                 let memcpy = *memcpy;

@@ -349,22 +349,23 @@ fn load_model_max_context(metadata_path: Option<&Path>) -> anyhow::Result<Option
 pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::Result<ModelHandle> {
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
+    let chat_template = load_chat_template(model_dir)?;
+    if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
+    {
+        let model_max_context = load_model_max_context(directory.metadata_path.as_deref())?;
+        return build_pipeline_handle(
+            model_dir,
+            model_id,
+            config,
+            model_max_context,
+            chat_template,
+            directory,
+        );
+    }
     let model_directory = ModelDirectory::load(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
-    let chat_template = load_chat_template(model_dir)?;
-    let metadata = model_directory
-        .metadata_path
-        .as_deref()
-        .map(onnx_genai_metadata::load_metadata)
-        .transpose()
-        .with_context(|| format!("failed to load metadata from {}", model_dir.display()))?;
-    if metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.pipeline.is_some())
-    {
-        return build_pipeline_handle(model_dir, model_id, config, model_max_context, chat_template);
-    }
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
     let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
@@ -389,9 +390,8 @@ fn build_pipeline_handle(
     config: &ServerConfig,
     model_max_context: Option<usize>,
     chat_template: Option<ChatTemplate>,
+    directory: PipelineModelDirectory,
 ) -> anyhow::Result<ModelHandle> {
-    let directory = PipelineModelDirectory::load(model_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline directory: {e}"))?;
     let tokenizer_path = directory
         .spec
         .models
@@ -425,11 +425,23 @@ fn build_pipeline_handle(
                     input.dtype
                 );
             }
-            Some(VisionInputSpec::from_input_and_metadata(
-                endpoint.clone(),
-                &input.shape,
-                Some(&directory.metadata_path),
-            )?)
+            let spec = if let Some(metadata_path) = directory.metadata_path.as_deref() {
+                VisionInputSpec::from_input_and_metadata(
+                    endpoint.clone(),
+                    &input.shape,
+                    Some(metadata_path),
+                )?
+            } else {
+                let program = directory
+                    .preprocessing
+                    .as_ref()
+                    .and_then(|preprocessing| preprocessing.image.as_ref())
+                    .context(
+                        "compatibility pipeline has no executable typed image preprocessing program",
+                    )?;
+                VisionInputSpec::from_input_and_program(endpoint.clone(), &input.shape, program)?
+            };
+            Some(spec)
         }
         _ => anyhow::bail!("pipeline declares multiple pixel_values inputs"),
     };

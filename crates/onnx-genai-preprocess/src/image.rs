@@ -6,6 +6,9 @@ use std::path::Path;
 
 use anyhow::Context;
 use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
+use onnx_genai_metadata::{
+    ImageOutputBinding, ImagePreprocessingProgram, ImageSizeSpec, ImageTransform,
+};
 use serde::Deserialize;
 
 pub use packed::{
@@ -412,6 +415,21 @@ enum ValueOp {
 }
 
 impl ImagePreprocessor {
+    /// Resolves preprocessing directly from a typed metadata program.
+    pub fn from_input_and_program(
+        shape: &[i64],
+        program: &ImagePreprocessingProgram,
+    ) -> anyhow::Result<Self> {
+        Self::from_metadata_document(
+            shape,
+            Some(MetadataDocument {
+                preprocessing: Some(PreprocessingMetadata {
+                    image: Some(Self::image_metadata_from_program(program)),
+                }),
+            }),
+        )
+    }
+
     /// Resolves preprocessing from a model pixel input and optional metadata file.
     pub fn from_input_and_metadata(
         shape: &[i64],
@@ -427,6 +445,58 @@ impl ImagePreprocessor {
             })
             .transpose()?;
         Self::from_metadata_document(shape, document)
+    }
+
+    fn image_metadata_from_program(program: &ImagePreprocessingProgram) -> ImageMetadata {
+        ImageMetadata {
+            resize: None,
+            tiling: None,
+            normalize: None,
+            transforms: program
+                .transforms
+                .iter()
+                .map(Self::image_transform_metadata)
+                .collect(),
+            outputs: program
+                .outputs
+                .iter()
+                .map(Self::image_output_metadata)
+                .collect(),
+        }
+    }
+
+    fn image_transform_metadata(transform: &ImageTransform) -> ImageTransformMetadata {
+        ImageTransformMetadata {
+            op: transform.op.clone(),
+            size: transform.size.as_ref().map(|size| match size {
+                ImageSizeSpec::Square(edge) => ImageSize::Square(*edge),
+                ImageSizeSpec::Dimensions { width, height } => ImageSize::Dimensions {
+                    width: *width,
+                    height: *height,
+                },
+            }),
+            mode: transform.mode.clone(),
+            interpolation: transform.interpolation.clone(),
+            scale: transform.scale,
+            mean: transform.mean.clone(),
+            std: transform.std.clone(),
+            tile_size: transform.tile_size,
+            max_tiles: transform.max_tiles,
+            include_thumbnail: transform.include_thumbnail,
+            patch_size: transform.patch_size,
+            flatten: transform.flatten,
+            pad_value: transform.pad_value,
+        }
+    }
+
+    fn image_output_metadata(output: &ImageOutputBinding) -> ImageOutputMetadata {
+        ImageOutputMetadata {
+            name: output.name.clone(),
+            content: output.content.clone(),
+            dtype: output.dtype.clone(),
+            pad_value: output.pad_value,
+            optional: output.optional,
+        }
     }
 
     fn from_metadata_document(

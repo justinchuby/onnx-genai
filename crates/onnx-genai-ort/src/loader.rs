@@ -87,7 +87,11 @@ impl PipelineTokenizerPaths {
 #[derive(Debug, Clone)]
 pub struct PipelineModelDirectory {
     pub root: PathBuf,
-    pub metadata_path: PathBuf,
+    /// Native inference metadata path, when the package provides one.
+    ///
+    /// Compatibility packages synthesize typed metadata in memory and therefore
+    /// leave this unset rather than mislabeling `genai_config.json` as native metadata.
+    pub metadata_path: Option<PathBuf>,
     pub spec: PipelineSpec,
     /// Typed preprocessing synthesized from compatibility config or loaded natively.
     pub preprocessing: Option<PreprocessingSpec>,
@@ -96,6 +100,39 @@ pub struct PipelineModelDirectory {
 }
 
 impl PipelineModelDirectory {
+    /// Resolve a pipeline only when the package structurally declares one.
+    ///
+    /// Native metadata is authoritative. Without native metadata, a compatibility
+    /// package is considered a pipeline only when it explicitly declares both
+    /// vision and embedding components.
+    pub fn load_if_declared(root: impl AsRef<Path>) -> Result<Option<Self>> {
+        let root = root.as_ref();
+        if !root.is_dir() {
+            return Err(OrtError::InvalidArgument(format!(
+                "model directory does not exist: {}",
+                root.display()
+            )));
+        }
+        if let Some(metadata_path) = find_metadata_path(root) {
+            let metadata = load_metadata(&metadata_path)
+                .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+            return if metadata.pipeline.is_some() {
+                Self::load(root).map(Some)
+            } else {
+                Ok(None)
+            };
+        }
+        let Some(genai_path) = onnx_genai_genai_config::find_in_dir(root) else {
+            return Ok(None);
+        };
+        let config = onnx_genai_genai_config::load(&genai_path)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        if config.model.vision.is_none() || config.model.embedding.is_none() {
+            return Ok(None);
+        }
+        Self::load(root).map(Some)
+    }
+
     /// Resolve the validated pipeline spec and all referenced model/tokenizer files.
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
@@ -114,7 +151,7 @@ impl PipelineModelDirectory {
             let preprocessing = load_metadata(&metadata_path)
                 .map_err(|err| OrtError::InvalidArgument(err.to_string()))?
                 .preprocessing;
-            (metadata_path, spec, preprocessing)
+            (Some(metadata_path), spec, preprocessing)
         } else {
             load_compatibility_pipeline(root)?
         };
@@ -287,7 +324,7 @@ fn find_metadata_path(root: &Path) -> Option<PathBuf> {
 
 fn load_compatibility_pipeline(
     root: &Path,
-) -> Result<(PathBuf, PipelineSpec, Option<PreprocessingSpec>)> {
+) -> Result<(Option<PathBuf>, PipelineSpec, Option<PreprocessingSpec>)> {
     let genai_path = onnx_genai_genai_config::find_in_dir(root).ok_or_else(|| {
         OrtError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -338,7 +375,7 @@ fn load_compatibility_pipeline(
         .ok_or_else(|| incomplete_compatibility_error(root, "the synthesized metadata pipeline"))?;
     onnx_genai_metadata::validate_pipeline_spec(&spec)
         .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-    Ok((genai_path, spec, preprocessing))
+    Ok((None, spec, preprocessing))
 }
 
 fn compatibility_filename(root: &Path, value: Option<&str>, field: &str) -> Result<PathBuf> {

@@ -478,11 +478,8 @@ impl CaptureState {
         self.input_ids.write_i64_prefix(&[token])?;
         self.position_ids.write_i64_prefix(&[position])?;
         if valid_len > self.mask_valid_len {
-            self.attention_mask.fill_i64_range(
-                self.mask_valid_len,
-                valid_len - self.mask_valid_len,
-                1,
-            )?;
+            self.attention_mask
+                .fill_i64_range(self.mask_valid_len, valid_len - self.mask_valid_len, 1)?;
         } else if valid_len < self.mask_valid_len {
             // Defensive: a shrink without an intervening reset — clear the tail
             // that is no longer valid so it does not leak into this step.
@@ -516,8 +513,7 @@ impl CaptureState {
         valid_len: usize,
     ) -> Result<()> {
         let device_id = self.device_id;
-        self.input_ids
-            .write_i64_prefix_device(&[token], device_id)?;
+        self.input_ids.write_i64_prefix_device(&[token], device_id)?;
         self.position_ids
             .write_i64_prefix_device(&[position], device_id)?;
         if valid_len > self.mask_valid_len {
@@ -558,8 +554,7 @@ impl CaptureState {
             self.mask_valid_len = 0;
             return Ok(());
         }
-        self.attention_mask
-            .fill_i64_range(0, self.mask_valid_len, 0)?;
+        self.attention_mask.fill_i64_range(0, self.mask_valid_len, 0)?;
         self.mask_valid_len = 0;
         Ok(())
     }
@@ -1186,7 +1181,8 @@ impl<'a> DecodeSession<'a> {
                     // attention mask's masked-out tail must read zero, so zero
                     // the whole mask buffer once here.
                     let device_input_ids = Value::empty_in(&[1, 1], DataType::Int64, allocator)?;
-                    let device_position_ids = Value::empty_in(&[1, 1], DataType::Int64, allocator)?;
+                    let device_position_ids =
+                        Value::empty_in(&[1, 1], DataType::Int64, allocator)?;
                     let device_attention_mask =
                         Value::empty_in(&[1, mask_len as i64], DataType::Int64, allocator)?;
                     device_input_ids.write_i64_prefix_device(&[0], device_id)?;
@@ -1805,6 +1801,7 @@ fn grow_kv_value(
             grow_kv_value_cuda(old, new_shape, seq_axis, valid_len, allocator)
         }
     }
+
 }
 
 /// Grow a host-resident KV buffer: read the old contents, rearrange the prefix
@@ -1866,8 +1863,7 @@ fn grow_kv_value_cuda(
             )));
         }
         let dst = Value::empty_in(new_shape, dtype, device_allocator)?;
-        let plan =
-            plan_kv_prefix_copy(old.shape(), new_shape, seq_axis, valid_len, dtype.size_of());
+        let plan = plan_kv_prefix_copy(old.shape(), new_shape, seq_axis, valid_len, dtype.size_of());
 
         let src_addr = old.data_ptr_addr()?;
         let dst_addr = dst.data_ptr_addr()?;
@@ -1926,10 +1922,7 @@ fn copy_seq_prefix<T: Copy + Default>(
     seq_axis: usize,
     valid_len: usize,
 ) -> Vec<T> {
-    let inner: usize = dst_shape[seq_axis + 1..]
-        .iter()
-        .map(|&d| d as usize)
-        .product();
+    let inner: usize = dst_shape[seq_axis + 1..].iter().map(|&d| d as usize).product();
     let blocks: usize = dst_shape[..seq_axis].iter().map(|&d| d as usize).product();
     let src_cap = src_shape[seq_axis] as usize;
     let dst_cap = dst_shape[seq_axis] as usize;
@@ -1987,10 +1980,7 @@ fn plan_kv_prefix_copy(
     valid_len: usize,
     elem_size: usize,
 ) -> KvPrefixCopyPlan {
-    let inner: usize = dst_shape[seq_axis + 1..]
-        .iter()
-        .map(|&d| d as usize)
-        .product();
+    let inner: usize = dst_shape[seq_axis + 1..].iter().map(|&d| d as usize).product();
     let blocks: usize = dst_shape[..seq_axis].iter().map(|&d| d as usize).product();
     let src_cap = src_shape[seq_axis] as usize;
     let dst_cap = dst_shape[seq_axis] as usize;
@@ -4154,14 +4144,12 @@ mod tests {
     fn grow_kv_value_cpu_preserves_fp16_bits() {
         // The fp16 arm round-trips raw 16-bit patterns unchanged.
         let old_shape = [1i64, 1, 4, 2];
-        let bits: Vec<u16> = vec![
-            0x3c00, 0xc000, 0x4000, 0x4200, 0x4400, 0x4500, 0x0000, 0x0000,
-        ];
+        let bits: Vec<u16> = vec![0x3c00, 0xc000, 0x4000, 0x4200, 0x4400, 0x4500, 0x0000, 0x0000];
         let old = Value::from_vec_f16_bits(bits.clone(), &old_shape).expect("old fp16 kv");
 
         let new_shape = [1i64, 1, 8, 2];
-        let grown =
-            grow_kv_value(&old, &new_shape, 2, 2, GrowDevice::Host, None).expect("grown fp16 kv");
+        let grown = grow_kv_value(&old, &new_shape, 2, 2, GrowDevice::Host, None)
+            .expect("grown fp16 kv");
         let grown_bits = grown.to_vec_f16_bits().expect("grown fp16 bits");
         // valid_len 2 => first 2 positions (4 elems) preserved, rest zero.
         assert_eq!(&grown_bits[0..4], &bits[0..4]);
@@ -4186,11 +4174,7 @@ mod tests {
         assert_eq!(
             plan.segments,
             vec![
-                KvCopySegment {
-                    src_offset: 0,
-                    dst_offset: 0,
-                    len: run
-                },
+                KvCopySegment { src_offset: 0, dst_offset: 0, len: run },
                 KvCopySegment {
                     src_offset: src_stride,
                     dst_offset: dst_stride,

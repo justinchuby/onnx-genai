@@ -12,6 +12,7 @@ categories = ["science", "multimedia"]
 anyhow = { workspace = true }
 hound = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+onnx-genai-metadata = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

@@ -46,7 +46,10 @@ fn complete_genai_package_loads_as_pipeline_without_native_sidecar() {
     let directory = PipelineModelDirectory::load(fixture("vlm-complete"))
         .expect("complete compatibility package loads");
 
-    assert!(directory.metadata_path.ends_with("genai_config.json"));
+    assert!(
+        directory.metadata_path.is_none(),
+        "compatibility config must not masquerade as native inference metadata"
+    );
     assert_complete_vlm(&directory);
 }
 
@@ -65,7 +68,7 @@ fn incomplete_genai_package_fails_with_regeneration_guidance() {
 }
 
 #[test]
-fn real_foundry_package_loads_when_installed() {
+fn real_foundry_package_fails_loudly_when_preprocessing_is_not_executable() {
     let model_dir =
         Path::new("/home/justinchu/.foundry/cache/models/Microsoft/qwen3.5-9b-generic-cpu-2/v2");
     if !model_dir.is_dir() {
@@ -73,7 +76,10 @@ fn real_foundry_package_loads_when_installed() {
         return;
     }
 
-    let directory =
-        PipelineModelDirectory::load(model_dir).expect("real Foundry Qwen3.5 package loads");
-    assert_complete_vlm(&directory);
+    let error = PipelineModelDirectory::load(model_dir)
+        .expect_err("unsupported smart resize must not load")
+        .to_string();
+    assert!(error.contains("smart_resize=false"));
+    assert!(error.contains("Why:"));
+    assert!(error.contains("How to fix:"));
 }

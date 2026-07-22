@@ -25,12 +25,13 @@
 //!
 //! The KV native dtype (which lives in the ONNX graph, not in
 //! `genai_config.json`) is passed in by the caller, so this crate only depends
-//! on `serde`/`serde_json` and the metadata spec — never on `onnx-genai-ort`.
+//! on the metadata and preprocessing crates — never on `onnx-genai-ort`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{InferenceMetadata, SCHEMA_VERSION, capabilities};
+use onnx_genai_preprocess::image::ImagePreprocessor;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -1289,7 +1290,31 @@ impl GenAiConfig {
             root.insert("kv_cache".into(), json!({ "native_dtype": kv_dtype }));
         }
 
-        Ok(serde_json::from_value(Value::Object(root))?)
+        let metadata: InferenceMetadata = serde_json::from_value(Value::Object(root))?;
+        let image_program = metadata
+            .preprocessing
+            .as_ref()
+            .and_then(|preprocessing| preprocessing.image.as_ref())
+            .ok_or_else(|| incomplete("synthesized typed image preprocessing program"))?;
+        let pixel_shape = vision_pixel_info
+            .dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                Some(dimension) => i64::try_from(*dimension).map_err(|_| {
+                    incomplete(format!(
+                        "vision pixel input '{}' dimension {dimension} fits in i64",
+                        vision_pixel_info.name
+                    ))
+                }),
+                None => Ok(-1),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ImagePreprocessor::from_input_and_program(&pixel_shape, image_program).map_err(|error| {
+            incomplete(format!(
+                "synthesized image preprocessing program is not executable by ImagePreprocessor: {error}"
+            ))
+        })?;
+        Ok(metadata)
     }
 
     fn strict_decoder_state(
@@ -1344,7 +1369,16 @@ impl GenAiConfig {
             require_same_dtype(past_key, present_key, "key cache input/output")?;
             require_same_dtype(past_value, present_value, "value cache input/output")?;
             require_same_dtype(past_key, past_value, "key/value cache")?;
-            kv_dtype.get_or_insert_with(|| past_key.dtype.clone());
+            if let Some(canonical_dtype) = kv_dtype.as_deref() {
+                if canonical_dtype != past_key.dtype {
+                    return Err(incomplete(format!(
+                        "all decoder key/value cache tensors must use one dtype: canonical dtype is {canonical_dtype}, but '{}' is {}",
+                        past_key.name, past_key.dtype
+                    )));
+                }
+            } else {
+                kv_dtype = Some(past_key.dtype.clone());
+            }
             kv_inputs.extend([past_key.name.clone(), past_value.name.clone()]);
             kv_outputs.extend([present_key.name.clone(), present_value.name.clone()]);
         }
@@ -1509,20 +1543,16 @@ fn processor_program_json(
             "Resize" => {
                 let width = required_attr_u32(&operation.attrs, "width", "Resize")?;
                 let height = required_attr_u32(&operation.attrs, "height", "Resize")?;
-                let mode = if operation
-                    .attrs
-                    .get("smart_resize")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|value| value != 0)
-                {
-                    "smart"
-                } else {
-                    "stretch"
-                };
+                let smart_resize = required_attr_flag(&operation.attrs, "smart_resize", "Resize")?;
+                if smart_resize {
+                    return Err(incomplete(
+                        "processor Resize.attrs.smart_resize=false; smart resize is not representable by the runtime's stretch/crop/pad resize modes",
+                    ));
+                }
                 transforms.push(json!({
                     "op": "resize",
                     "size": { "width": width, "height": height },
-                    "mode": mode
+                    "mode": "stretch"
                 }));
                 seen.insert("resize");
             }
@@ -1543,7 +1573,13 @@ fn processor_program_json(
             }
             "PatchImage" => {
                 let patch_size = required_attr_usize(&operation.attrs, "patch_size", "PatchImage")?;
-                required_attr_usize(&operation.attrs, "temporal_patch_size", "PatchImage")?;
+                let temporal_patch_size =
+                    required_attr_usize(&operation.attrs, "temporal_patch_size", "PatchImage")?;
+                if temporal_patch_size != 1 {
+                    return Err(incomplete(format!(
+                        "processor PatchImage.attrs.temporal_patch_size=1; the runtime processes independent still images and cannot execute temporal patch size {temporal_patch_size}"
+                    )));
+                }
                 let merge_size = required_attr_usize(&operation.attrs, "merge_size", "PatchImage")?;
                 if vision.patch_size != Some(patch_size) {
                     return Err(incomplete(format!(
@@ -1551,6 +1587,7 @@ fn processor_program_json(
                         vision.patch_size
                     )));
                 }
+
                 if vision.spatial_merge_size != Some(merge_size) {
                     return Err(incomplete(format!(
                         "processor PatchImage merge_size ({merge_size}) must match model.vision.spatial_merge_size ({:?})",
@@ -1605,6 +1642,20 @@ fn processor_program_json(
             "outputs": outputs
         }
     }))
+}
+
+fn required_attr_flag(
+    attrs: &Map<String, Value>,
+    name: &str,
+    operation: &str,
+) -> Result<bool, GenAiConfigError> {
+    match attrs.get(name).and_then(Value::as_u64) {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(incomplete(format!(
+            "processor {operation}.attrs.{name} must be the numeric flag 0 or 1"
+        ))),
+    }
 }
 
 fn required_attr_u32(
@@ -1895,6 +1946,137 @@ fn is_share_buffer_kv_dtype(dtype: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn processor_config(smart_resize: Value, temporal_patch_size: Value) -> ProcessorConfig {
+        serde_json::from_value(json!({
+            "processor": {
+                "transforms": [
+                    { "operation": { "type": "DecodeImage" } },
+                    {
+                        "operation": {
+                            "type": "Resize",
+                            "attrs": {
+                                "width": 32,
+                                "height": 32,
+                                "smart_resize": smart_resize
+                            }
+                        }
+                    },
+                    {
+                        "operation": {
+                            "type": "Rescale",
+                            "attrs": { "rescale_factor": 0.00392156862745098_f64 }
+                        }
+                    },
+                    {
+                        "operation": {
+                            "type": "Normalize",
+                            "attrs": {
+                                "mean": [0.5, 0.5, 0.5],
+                                "std": [0.5, 0.5, 0.5]
+                            }
+                        }
+                    },
+                    {
+                        "operation": {
+                            "type": "PatchImage",
+                            "attrs": {
+                                "patch_size": 16,
+                                "temporal_patch_size": temporal_patch_size,
+                                "merge_size": 2
+                            }
+                        }
+                    }
+                ]
+            }
+        }))
+        .expect("processor fixture")
+    }
+
+    fn processor_vision() -> GenAiVision {
+        serde_json::from_value(json!({
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "inputs": {
+                "pixel_values": "pixel_values",
+                "image_grid_thw": "image_grid_thw"
+            }
+        }))
+        .expect("vision fixture")
+    }
+
+    fn processor_tensor(name: &str, dtype: &str) -> GraphTensorInfo {
+        GraphTensorInfo {
+            name: name.to_owned(),
+            dtype: dtype.to_owned(),
+            dimensions: vec![None, None],
+        }
+    }
+
+    #[test]
+    fn processor_requires_numeric_smart_resize_flag() {
+        let mut missing = processor_config(json!(0), json!(1));
+        missing
+            .processor
+            .transforms
+            .iter_mut()
+            .find(|transform| transform.operation.operation_type == "Resize")
+            .expect("resize transform")
+            .operation
+            .attrs
+            .remove("smart_resize");
+        let missing_error = processor_program_json(
+            &missing,
+            &processor_vision(),
+            &processor_tensor("pixel_values", "float32"),
+            &processor_tensor("image_grid_thw", "int64"),
+        )
+        .expect_err("missing smart_resize must fail")
+        .to_string();
+        assert!(missing_error.contains("smart_resize"));
+        assert!(missing_error.contains("numeric flag 0 or 1"));
+
+        for value in [Value::Null, json!("false"), json!(2)] {
+            let error = processor_program_json(
+                &processor_config(value, json!(1)),
+                &processor_vision(),
+                &processor_tensor("pixel_values", "float32"),
+                &processor_tensor("image_grid_thw", "int64"),
+            )
+            .expect_err("invalid smart_resize must fail")
+            .to_string();
+            assert!(error.contains("smart_resize"));
+            assert!(error.contains("numeric flag 0 or 1"));
+        }
+    }
+
+    #[test]
+    fn processor_rejects_unexecutable_smart_resize() {
+        let error = processor_program_json(
+            &processor_config(json!(1), json!(1)),
+            &processor_vision(),
+            &processor_tensor("pixel_values", "float32"),
+            &processor_tensor("image_grid_thw", "int64"),
+        )
+        .expect_err("smart resize must fail until executable")
+        .to_string();
+        assert!(error.contains("smart_resize=false"));
+        assert!(error.contains("stretch/crop/pad"));
+    }
+
+    #[test]
+    fn processor_rejects_unexecutable_temporal_patch_size() {
+        let error = processor_program_json(
+            &processor_config(json!(0), json!(2)),
+            &processor_vision(),
+            &processor_tensor("pixel_values", "float32"),
+            &processor_tensor("image_grid_thw", "int64"),
+        )
+        .expect_err("temporal patching must fail until executable")
+        .to_string();
+        assert!(error.contains("temporal_patch_size=1"));
+        assert!(error.contains("cannot execute temporal patch size 2"));
+    }
 
     fn qwen_config() -> GenAiConfig {
         serde_json::from_str(

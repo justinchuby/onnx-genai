@@ -131,3 +131,34 @@ fn incomplete_config_fails_with_actionable_no_guess_error() {
     assert!(error.contains("How to fix:"));
     assert!(error.contains("native inference_metadata.json"));
 }
+
+#[test]
+fn mixed_sparse_kv_dtypes_fail_loudly() {
+    let mut graphs = graph_inventory();
+    for tensor in graphs
+        .decoder
+        .inputs
+        .iter_mut()
+        .chain(graphs.decoder.outputs.iter_mut())
+        .filter(|tensor| {
+            matches!(
+                tensor.name.as_str(),
+                "past_key_values.31.key"
+                    | "past_key_values.31.value"
+                    | "present.31.key"
+                    | "present.31.value"
+            )
+        })
+    {
+        tensor.dtype = "float16".to_owned();
+    }
+
+    let error = pipeline_inference_metadata_from_dir(&fixture("vlm-complete"), &graphs)
+        .expect_err("mixed KV dtypes must fail")
+        .to_string();
+
+    assert!(error.contains("missing required semantics"));
+    assert!(error.contains("one dtype"));
+    assert!(error.contains("past_key_values.31.key"));
+    assert!(error.contains("float16"));
+}

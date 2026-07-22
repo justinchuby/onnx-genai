@@ -1231,10 +1231,8 @@ mod cuda_device_write_tests {
     use crate::{Allocator, Environment, Session, SessionOptions, ep_selection};
     use std::path::Path;
 
-    const TINY_LLM: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/tiny-llm/model.onnx"
-    );
+    const TINY_LLM: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/tiny-llm/model.onnx");
 
     /// Build a CUDA session and return its device KV allocator together with the
     /// EP-bound device id and the owning [`Environment`], or `None` when CUDA is
@@ -1356,3 +1354,4 @@ mod cuda_device_write_tests {
         release_cuda_resources_in_order(mask, allocator, session, env);
     }
 }
+

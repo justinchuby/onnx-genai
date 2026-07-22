@@ -1943,6 +1943,7 @@ name = "onnx-genai-genai-config"
 version = "0.1.0-dev.3"
 dependencies = [
  "onnx-genai-metadata",
+ "onnx-genai-preprocess",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2008,6 +2009,7 @@ dependencies = [
  "anyhow",
  "hound",
  "image",
+ "onnx-genai-metadata",
  "rustfft",
  "serde",
  "serde_yaml",
