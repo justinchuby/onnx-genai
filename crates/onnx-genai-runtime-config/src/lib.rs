@@ -87,6 +87,20 @@ pub enum CudaDevice {
     Invalid(String),
 }
 
+/// Parsed `ONNX_GENAI_CUDA_ATTENTION` value.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CudaAttentionMode {
+    /// Let ONNX Runtime select the CUDA attention implementation.
+    #[default]
+    Auto,
+    /// Keep ONNX Runtime's optimized/fused attention selection enabled.
+    Fused,
+    /// Force ONNX Runtime's standard unfused math attention implementation.
+    Unfused,
+    /// An invalid value retained so the ORT layer can preserve its warning.
+    Invalid(String),
+}
+
 /// Parsed `ONNX_GENAI_INTRA_OP_THREADS` value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntraOpThreads {
@@ -110,6 +124,10 @@ pub struct RuntimeConfig {
     pub execution_providers: Vec<ExecutionProviderEntry>,
     /// `ONNX_GENAI_CUDA_DEVICE` (`CudaDevice`, default: device 0): selects the CUDA device.
     pub cuda_device: CudaDevice,
+    /// `ONNX_GENAI_CUDA_ATTENTION` (`CudaAttentionMode`, default: `auto`):
+    /// selects the CUDA attention policy. Valid values are `auto`, `fused`, and
+    /// `unfused`; `default` and `optimized` remain accepted aliases for `auto`.
+    pub cuda_attention_mode: CudaAttentionMode,
     /// `ONNX_GENAI_INTRA_OP_THREADS` (`IntraOpThreads`, default: unset): overrides ORT intra-op threads when positive.
     pub intra_op_threads: IntraOpThreads,
     /// `ONNX_GENAI_WEBGPU_VALIDATION` (`bool`, default: false): keeps WebGPU validation enabled.
@@ -226,6 +244,15 @@ impl RuntimeConfig {
                 .unwrap_or_else(|| CudaDevice::Invalid(value)),
             None => CudaDevice::Id(0),
         };
+        let cuda_attention_mode = match env_string(&lookup, "ONNX_GENAI_CUDA_ATTENTION") {
+            Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "" | "auto" | "default" | "optimized" => CudaAttentionMode::Auto,
+                "fused" => CudaAttentionMode::Fused,
+                "unfused" => CudaAttentionMode::Unfused,
+                _ => CudaAttentionMode::Invalid(value),
+            },
+            None => CudaAttentionMode::Auto,
+        };
         let intra_op_threads = match env_string(&lookup, "ONNX_GENAI_INTRA_OP_THREADS") {
             Some(value) => match value.trim().parse::<i32>() {
                 Ok(threads) if threads > 0 => IntraOpThreads::Count(threads),
@@ -237,6 +264,7 @@ impl RuntimeConfig {
         Self {
             execution_providers,
             cuda_device,
+            cuda_attention_mode,
             intra_op_threads,
             webgpu_validation: env_bool(&lookup, "ONNX_GENAI_WEBGPU_VALIDATION", false),
             webgpu_graph_capture: env_bool(&lookup, "ONNX_GENAI_WEBGPU_GRAPH_CAPTURE", false),
@@ -459,7 +487,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CudaDevice, EpSelection, ExecutionProviderEntry, IntraOpThreads, PluginSpec, RuntimeConfig,
+        CudaAttentionMode, CudaDevice, EpSelection, ExecutionProviderEntry, IntraOpThreads,
+        PluginSpec, RuntimeConfig,
     };
 
     fn config(entries: &[(&str, &str)]) -> RuntimeConfig {
@@ -476,6 +505,7 @@ mod tests {
         let actual = config(&[]);
         assert_eq!(actual.execution_providers, Vec::new());
         assert_eq!(actual.cuda_device, CudaDevice::Id(0));
+        assert_eq!(actual.cuda_attention_mode, CudaAttentionMode::Auto);
         assert_eq!(actual.intra_op_threads, IntraOpThreads::Unset);
         assert!(!actual.webgpu_validation);
         assert!(!actual.webgpu_graph_capture);
@@ -500,6 +530,31 @@ mod tests {
         assert_eq!(actual.mb_target, None);
         assert_eq!(actual.mb_prompt, "<bos>The capital of France is");
         assert_eq!(actual.mb_max, 64);
+    }
+
+    #[test]
+    fn cuda_attention_mode_parses_valid_values() {
+        for (value, expected) in [
+            ("auto", CudaAttentionMode::Auto),
+            ("fused", CudaAttentionMode::Fused),
+            ("unfused", CudaAttentionMode::Unfused),
+            (" DEFAULT ", CudaAttentionMode::Auto),
+            ("optimized", CudaAttentionMode::Auto),
+            ("", CudaAttentionMode::Auto),
+        ] {
+            assert_eq!(
+                config(&[("ONNX_GENAI_CUDA_ATTENTION", value)]).cuda_attention_mode,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_attention_mode_preserves_invalid_value() {
+        assert_eq!(
+            config(&[("ONNX_GENAI_CUDA_ATTENTION", "flash-only")]).cuda_attention_mode,
+            CudaAttentionMode::Invalid("flash-only".to_owned())
+        );
     }
 
     #[test]
