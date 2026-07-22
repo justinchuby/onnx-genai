@@ -5,6 +5,54 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-22T16-01-00Z-vlm-wp0-landed -->
+## 2026-07-22 — VLM WP0 revision, DS-1 shape unblock, and inbox reconciliation
+
+<!-- source: .squad/decisions/inbox/deckard-vlm-wp0-revision.md -->
+### VLM WP0 revised and merged
+**By:** Deckard
+**Decision:** Landed `156853c58e74deaf1e29a3f6da4ac552447e3bbf` after generalizing four doc-comments, rebasing onto `ea2c0b9260eaebcb83358463da351ab426e64958`, and fast-forward merging to main.
+**Rationale:** RULES.md §2 model-name gate is now empty; metadata tests, clippy, and fmt are green.
+
+<!-- source: .squad/decisions/inbox/eldon-vlm-wp0-review.md -->
+### Reject original VLM WP0 metadata contract
+**By:** Eldon
+**Decision:** 🔴 Rejected `61dfc4ca209afd19ceaf7fcea695b86abb688ebd`; Stelline was locked out for this revision cycle and Deckard was named reviser.
+**Rationale:** The required whole-file RULES.md §2 gate still reported model-family references in `schema.rs`, even though the branch otherwise passed metadata test, clippy, and fmt and preserved the frozen WP-B1 optional-modality fields.
+
+<!-- source: .squad/decisions/inbox/kowalski-ds1-shape-unblock.md -->
+### Validate DS-1 native dynamic shape-chain propagation
+**By:** Kowalski
+**Decision:** Native execution now resolves data-dependent standard-domain `Slice` shapes from runtime integer inputs and reuses ONNX shape inference through `Unsqueeze` and broadcast consumers; the focused regression covers `Shape/Sub -> Slice -> Unsqueeze -> Less` and the DeepSeek-V2 tiny CPU E2E generated eight tokens.
+**Rationale:** `cargo fmt -p onnx-runtime-session`, combined session/shape-inference clippy, `cargo test -p onnx-runtime-session`, `cargo test -p onnx-runtime-shape-inference`, and native CPU DS-1 E2E passed; no next native blocker was found.
+
+<!-- source: .squad/decisions/inbox/morton-ds1-review.md -->
+### Approve DS-1 dynamic Slice shape regression
+**By:** Morton
+**Decision:** 🟢 Approved rebased commit `ed8b58e` for merge.
+**Rationale:** The regression executes the intended dynamic path without constant folding, uses generic shape-driven ONNX operators, has correct broadcast assertions, and passed fmt, clippy, and the targeted locked test.
+
+<!-- source: .squad/decisions/inbox/niander-h200-bench.md -->
+### Record H200 native decode roofline check
+**By:** Niander
+**Decision:** On main `3d84b9b`, Qwen2.5-0.5B native CUDA with device KV and whole-step graph replay measured 820.65 tok/s at length 128 and 781.20 tok/s at 1024, exceeding the RTX 4060 baseline by roughly 2.1x; eager remained much slower and graph smoke tests had zero fallbacks/KV transfers.
+**Rationale:** Qwen stayed near the supplied 886 tok/s roofline, Phi-4-mini remained lower utilization, and ORT profiler comparison was excluded because request setup dominated rather than steady decode.
+
+<!-- source: .squad/decisions/inbox/rachael-wp-b-optional-modality-design.md -->
+### Preserve WP-B optional-modality typed contract design
+**By:** Rachael
+**Decision:** WP-B should use opaque request presence keys, `phases.<component>.when_present`, and `io.optional_inputs.<port>.absent` zero fallbacks keyed by real ONNX input ports; tensor presence consistency is explicit and fallbacks are materialized at destination endpoints.
+**Rationale:** The design rejects conditional-edge and runtime rank-adapter scope for WP-B, keeps semantic adaptation in exporter-emitted ONNX graphs, defines WP-B1/B2/B3/B4 ordering, and requires Python ONNX fixtures to use the `onnx_ir` IR API.
+
+<!-- source: .squad/decisions/inbox/stelline-vlm-wp0-metadata.md -->
+### Record original VLM WP0 metadata contract attempt
+**By:** Stelline
+**Decision:** Commit `61dfc4c` added a model-agnostic VLM declaration surface for image preprocessing transforms/outputs, vision prompt expansion, multimodal positions, sparse KV/fixed state pairs, and required capabilities while leaving frozen WP-B optional-modality fields unchanged.
+**Rationale:** This was superseded by Eldon's rejection and Deckard's revision because the whole-file RULES.md §2 model-name gate was not clean until the comments were generalized.
+
+**Inbox:** Merged and cleared `deckard-vlm-wp0-revision.md`, `eldon-vlm-wp0-review.md`, `kowalski-ds1-shape-unblock.md`, `morton-ds1-review.md`, `niander-h200-bench.md`, `rachael-wp-b-optional-modality-design.md`, `stelline-vlm-wp0-metadata.md`. Preserved canonical inbox files `keaton-native-specdecode-design.md`, `leon-vlm-scope.md`, and `zhora-deepseek-scope.md`.
+<!-- scribe-merge-2026-07-22T16-01-00Z-vlm-wp0-landed-end -->
+
 <!-- scribe-merge-2026-07-22T14-59-36+0000-wp-b-landed -->
 ## 2026-07-22 — WP-B optional-modality epic landed and clippy cleanup reconciled
 
