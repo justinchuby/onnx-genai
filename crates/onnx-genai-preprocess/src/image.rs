@@ -38,6 +38,8 @@ pub enum ResizeMode {
     ShortestEdgeCenterCrop,
     Fixed,
     LongestEdgePad,
+    PixelArea,
+    PatchBudget,
 }
 
 /// Resize interpolation selected by §35 metadata.
@@ -54,6 +56,7 @@ pub enum TilingMode {
     None,
     FixedGrid,
     DynamicAnyres,
+    DynamicHd,
 }
 
 /// A tile grid expressed as columns × rows.
@@ -122,6 +125,7 @@ pub struct ImageTilingConfig {
     pub max_tiles: usize,
     pub aspect_ratios: Vec<TileGrid>,
     pub include_thumbnail: bool,
+    pub thumbnail_position: ThumbnailPosition,
 }
 
 /// Pixel normalization selected by §35 metadata.
@@ -379,15 +383,29 @@ struct ImageTransformMetadata {
     size: Option<ImageSize>,
     mode: Option<String>,
     interpolation: Option<String>,
+    min_pixels: Option<usize>,
+    max_pixels: Option<usize>,
+    size_multiple: Option<usize>,
+    max_patches: Option<usize>,
+    pooling_kernel_size: Option<usize>,
     scale: Option<f64>,
     mean: Option<Vec<f32>>,
     std: Option<Vec<f32>>,
     tile_size: Option<usize>,
     max_tiles: Option<usize>,
     include_thumbnail: Option<bool>,
+    thumbnail_order: Option<String>,
+    thumbnail_interpolation: Option<String>,
+    canvas_pad_value: Option<f64>,
+    mask_patch_size: Option<usize>,
     patch_size: Option<usize>,
+    temporal_patch_size: Option<usize>,
+    merge_size: Option<usize>,
+    channel_order: Option<String>,
+    coordinate_order: Option<String>,
     flatten: Option<bool>,
     pad_value: Option<f64>,
+    target_length: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,9 +420,54 @@ struct ImageOutputMetadata {
 #[derive(Debug, Clone)]
 struct ImageProgram {
     value_ops: Vec<ValueOp>,
-    patch_size: Option<usize>,
+    patchify: Option<PatchifySpec>,
     pad_value: Option<f64>,
+    target_length: Option<usize>,
+    dynamic_resize: Option<DynamicResize>,
+    dynamic_hd: Option<DynamicHdSpec>,
     outputs: Vec<OutputSpec>,
+}
+
+#[derive(Debug, Clone)]
+struct PatchifySpec {
+    patch_size: usize,
+    temporal_patch_size: usize,
+    merge_size: usize,
+    channel_order: PatchChannelOrder,
+    coordinate_order: CoordinateOrder,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PatchChannelOrder {
+    ChannelsFirst,
+    ChannelsLast,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoordinateOrder {
+    Yx,
+    Xy,
+}
+
+#[derive(Debug, Clone)]
+enum DynamicResize {
+    PixelArea {
+        min_pixels: usize,
+        max_pixels: usize,
+        size_multiple: usize,
+    },
+    PatchBudget {
+        patch_size: usize,
+        max_patches: usize,
+        pooling_kernel_size: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DynamicHdSpec {
+    mask_patch_size: usize,
+    canvas_pad_value: u8,
+    thumbnail_interpolation: Interpolation,
 }
 
 #[derive(Debug, Clone)]
@@ -477,15 +540,29 @@ impl ImagePreprocessor {
             }),
             mode: transform.mode.clone(),
             interpolation: transform.interpolation.clone(),
+            min_pixels: transform.min_pixels,
+            max_pixels: transform.max_pixels,
+            size_multiple: transform.size_multiple,
+            max_patches: transform.max_patches,
+            pooling_kernel_size: transform.pooling_kernel_size,
             scale: transform.scale,
             mean: transform.mean.clone(),
             std: transform.std.clone(),
             tile_size: transform.tile_size,
             max_tiles: transform.max_tiles,
             include_thumbnail: transform.include_thumbnail,
+            thumbnail_order: transform.thumbnail_order.clone(),
+            thumbnail_interpolation: transform.thumbnail_interpolation.clone(),
+            canvas_pad_value: transform.canvas_pad_value,
+            mask_patch_size: transform.mask_patch_size,
             patch_size: transform.patch_size,
+            temporal_patch_size: transform.temporal_patch_size,
+            merge_size: transform.merge_size,
+            channel_order: transform.channel_order.clone(),
+            coordinate_order: transform.coordinate_order.clone(),
             flatten: transform.flatten,
             pad_value: transform.pad_value,
+            target_length: transform.target_length,
         }
     }
 
@@ -623,9 +700,6 @@ impl ImagePreprocessor {
                 images.len()
             );
         }
-        let width = self.config.width as usize;
-        let height = self.config.height as usize;
-        let tile_elements = checked_image_elements(width, height, "normalized image tile")?;
         let mut prepared_elements = 0usize;
         let mut prepared = Vec::new();
         prepared
@@ -633,7 +707,9 @@ impl ImagePreprocessor {
             .context("failed to allocate prepared image batch")?;
         for (image_index, image) in images.iter().enumerate() {
             validate_source_image(image, image_index)?;
-            let (grid, image_tiles) = tile_image(image, &self.config)?;
+            let tiled = tile_image(image, &self.config, &self.program)?;
+            let grid = tiled.grid;
+            let image_tiles = tiled.tiles;
             if image_tiles.len() > MAX_TILES_PER_IMAGE + 1 {
                 anyhow::bail!(
                     "image {image_index} produced {} tiles, exceeding the supported limit of {}; reduce max_tiles",
@@ -641,10 +717,16 @@ impl ImagePreprocessor {
                     MAX_TILES_PER_IMAGE + 1
                 );
             }
-            let image_elements = image_tiles
-                .len()
-                .checked_mul(tile_elements)
-                .context("prepared image element count overflowed")?;
+            let image_elements = image_tiles.iter().try_fold(0usize, |total, tile| {
+                let elements = checked_image_elements(
+                    tile.width() as usize,
+                    tile.height() as usize,
+                    "normalized image tile",
+                )?;
+                total
+                    .checked_add(elements)
+                    .context("prepared image element count overflowed")
+            })?;
             prepared_elements = prepared_elements
                 .checked_add(image_elements)
                 .context("prepared image batch element count overflowed")?;
@@ -660,34 +742,34 @@ impl ImagePreprocessor {
             for tile in &image_tiles {
                 tiles.push(normalize_tile(
                     tile,
-                    width,
-                    height,
+                    tile.width() as usize,
+                    tile.height() as usize,
                     &self.program.value_ops,
                 )?);
             }
             prepared.push(PreparedImage {
                 original_size: (image.width(), image.height()),
+                transformed_size: tiled.transformed_size,
                 tile_grid: grid,
+                tile_size: image_tiles
+                    .first()
+                    .map(|tile| (tile.width() as usize, tile.height() as usize))
+                    .context("image preprocessing produced no tiles")?,
                 tiles,
+                validity_masks: tiled.validity_masks,
             });
         }
-        let thumbnail_position = if self.config.tiling.include_thumbnail {
-            ThumbnailPosition::Prepend
-        } else {
-            ThumbnailPosition::None
-        };
         packed::build_bundle(
             prepared,
             &PackSpec {
-                width,
-                height,
                 layout: self.layout,
-                patch_size: self.program.patch_size,
+                patchify: self.program.patchify.clone(),
                 pad_value: self.program.pad_value,
+                target_length: self.program.target_length,
                 outputs: self.program.outputs.clone(),
                 declared_pixel_shape: self.shape.clone(),
             },
-            thumbnail_position,
+            self.config.tiling.thumbnail_position,
         )
     }
 }
@@ -705,8 +787,11 @@ fn legacy_program(config: &ImagePreprocessConfig) -> anyhow::Result<ImageProgram
     };
     Ok(ImageProgram {
         value_ops,
-        patch_size: None,
+        patchify: None,
         pad_value: None,
+        target_length: None,
+        dynamic_resize: None,
+        dynamic_hd: None,
         outputs: vec![OutputSpec {
             name: "pixels".to_owned(),
             content: "pixels".to_owned(),
@@ -753,8 +838,11 @@ fn typed_program_from_metadata(
     let mut resize = None;
     let mut tiling = None;
     let mut value_ops = Vec::new();
-    let mut patch_size = None;
+    let mut patchify = None;
     let mut pad_value = None;
+    let mut target_length = None;
+    let mut dynamic_resize = None;
+    let mut dynamic_hd = None;
     let mut decoded = false;
     let mut patchified = false;
     let mut padded = false;
@@ -777,18 +865,85 @@ fn typed_program_from_metadata(
                         "resize must occur once and before tile, rescale, normalize, patchify, or pad"
                     );
                 }
-                let size = transform
-                    .size
-                    .context("image resize transform requires size metadata")?;
-                let mode = match transform.mode.as_deref().unwrap_or("stretch") {
+                let mode_name = transform.mode.as_deref().unwrap_or("stretch");
+                let mode = match mode_name {
                     "stretch" | "fixed" | "fixed_size" => ResizeMode::Fixed,
                     "crop" | "shortest_edge" | "shortest_edge_center_crop" => {
                         ResizeMode::ShortestEdgeCenterCrop
                     }
                     "pad" | "longest_edge_pad" => ResizeMode::LongestEdgePad,
+                    "pixel_area" => {
+                        let min_pixels = transform
+                            .min_pixels
+                            .context("pixel_area resize requires min_pixels metadata")?;
+                        let max_pixels = transform
+                            .max_pixels
+                            .context("pixel_area resize requires max_pixels metadata")?;
+                        let size_multiple = transform
+                            .size_multiple
+                            .context("pixel_area resize requires size_multiple metadata")?;
+                        if min_pixels == 0
+                            || max_pixels == 0
+                            || size_multiple == 0
+                            || min_pixels > max_pixels
+                        {
+                            anyhow::bail!(
+                                "pixel_area resize requires 0 < min_pixels <= max_pixels and size_multiple > 0"
+                            );
+                        }
+                        dynamic_resize = Some(DynamicResize::PixelArea {
+                            min_pixels,
+                            max_pixels,
+                            size_multiple,
+                        });
+                        ResizeMode::PixelArea
+                    }
+                    "aspect_ratio_patch_budget" => {
+                        let patch_size = transform.patch_size.context(
+                            "aspect_ratio_patch_budget resize requires patch_size metadata",
+                        )?;
+                        let max_patches = transform.max_patches.context(
+                            "aspect_ratio_patch_budget resize requires max_patches metadata",
+                        )?;
+                        let pooling_kernel_size = transform.pooling_kernel_size.context(
+                            "aspect_ratio_patch_budget resize requires pooling_kernel_size metadata",
+                        )?;
+                        if patch_size == 0 || max_patches == 0 || pooling_kernel_size == 0 {
+                            anyhow::bail!(
+                                "aspect_ratio_patch_budget resize parameters must be greater than zero"
+                            );
+                        }
+                        dynamic_resize = Some(DynamicResize::PatchBudget {
+                            patch_size,
+                            max_patches,
+                            pooling_kernel_size,
+                        });
+                        ResizeMode::PatchBudget
+                    }
                     other => anyhow::bail!(
-                        "unsupported image resize transform mode '{other}'; expected stretch, crop, or pad"
+                        "unsupported image resize transform mode '{other}'; expected stretch, crop, pad, pixel_area, or aspect_ratio_patch_budget"
                     ),
+                };
+                let size = match mode {
+                    ResizeMode::PixelArea | ResizeMode::PatchBudget => {
+                        if transform.size.is_some() {
+                            anyhow::bail!(
+                                "{mode_name} resize computes its target from the source image and must not declare size"
+                            );
+                        }
+                        ImageSize::Square(
+                            u32::try_from(transform.size_multiple.unwrap_or_else(|| {
+                                transform
+                                    .patch_size
+                                    .unwrap_or(1)
+                                    .saturating_mul(transform.pooling_kernel_size.unwrap_or(1))
+                            }))
+                            .context("dynamic resize alignment is too large")?,
+                        )
+                    }
+                    _ => transform
+                        .size
+                        .context("image resize transform requires size metadata")?,
                 };
                 let interpolation = parse_interpolation(transform.interpolation.as_deref())?;
                 resize = Some((size, mode, interpolation));
@@ -843,12 +998,53 @@ fn typed_program_from_metadata(
                         "image tile transform max_tiles {max_tiles} exceeds the supported limit of {MAX_TILES_PER_IMAGE}; reduce max_tiles"
                     );
                 }
+                let mode = match transform.mode.as_deref().unwrap_or("dynamic_anyres") {
+                    "dynamic_anyres" => TilingMode::DynamicAnyres,
+                    "fixed_grid" => TilingMode::FixedGrid,
+                    "dynamic_hd" => TilingMode::DynamicHd,
+                    other => anyhow::bail!(
+                        "unsupported image tile transform mode '{other}'; expected dynamic_anyres, fixed_grid, or dynamic_hd"
+                    ),
+                };
+                let thumbnail_position =
+                    parse_thumbnail_position(transform.thumbnail_order.as_deref())?;
+                let include_thumbnail = transform.include_thumbnail.unwrap_or(false);
+                if include_thumbnail != (thumbnail_position != ThumbnailPosition::None) {
+                    anyhow::bail!(
+                        "image tile include_thumbnail={include_thumbnail} conflicts with thumbnail_order={thumbnail_position:?}"
+                    );
+                }
+                if mode == TilingMode::DynamicHd {
+                    let mask_patch_size = transform
+                        .mask_patch_size
+                        .context("dynamic_hd tile requires mask_patch_size metadata")?;
+                    if mask_patch_size == 0 || !(tile_size as usize).is_multiple_of(mask_patch_size)
+                    {
+                        anyhow::bail!(
+                            "dynamic_hd mask_patch_size must be greater than zero and divide tile_size"
+                        );
+                    }
+                    let canvas_pad_value = exact_u8(
+                        transform
+                            .canvas_pad_value
+                            .context("dynamic_hd tile requires canvas_pad_value metadata")?,
+                        "dynamic_hd canvas_pad_value",
+                    )?;
+                    dynamic_hd = Some(DynamicHdSpec {
+                        mask_patch_size,
+                        canvas_pad_value,
+                        thumbnail_interpolation: parse_interpolation(
+                            transform.thumbnail_interpolation.as_deref(),
+                        )?,
+                    });
+                }
                 tiling = Some(ImageTilingConfig {
-                    mode: TilingMode::DynamicAnyres,
+                    mode,
                     tile_size,
                     max_tiles,
                     aspect_ratios: default_anyres_grids(),
-                    include_thumbnail: transform.include_thumbnail.unwrap_or(false),
+                    include_thumbnail,
+                    thumbnail_position,
                 });
             }
             "patchify" => {
@@ -866,7 +1062,38 @@ fn typed_program_from_metadata(
                 if size == 0 {
                     anyhow::bail!("image patchify patch_size must be greater than zero");
                 }
-                patch_size = Some(size);
+                let temporal_patch_size = transform.temporal_patch_size.unwrap_or(1);
+                let merge_size = transform.merge_size.unwrap_or(1);
+                if temporal_patch_size == 0 || merge_size == 0 {
+                    anyhow::bail!(
+                        "image patchify temporal_patch_size and merge_size must be greater than zero"
+                    );
+                }
+                let channel_order = match transform
+                    .channel_order
+                    .as_deref()
+                    .unwrap_or("channels_first")
+                {
+                    "channels_first" | "chw" => PatchChannelOrder::ChannelsFirst,
+                    "channels_last" | "hwc" => PatchChannelOrder::ChannelsLast,
+                    other => anyhow::bail!(
+                        "unsupported image patchify channel_order '{other}'; expected channels_first or channels_last"
+                    ),
+                };
+                let coordinate_order = match transform.coordinate_order.as_deref().unwrap_or("yx") {
+                    "yx" => CoordinateOrder::Yx,
+                    "xy" => CoordinateOrder::Xy,
+                    other => anyhow::bail!(
+                        "unsupported image patchify coordinate_order '{other}'; expected yx or xy"
+                    ),
+                };
+                patchify = Some(PatchifySpec {
+                    patch_size: size,
+                    temporal_patch_size,
+                    merge_size,
+                    channel_order,
+                    coordinate_order,
+                });
                 patchified = true;
             }
             "pad" => {
@@ -881,6 +1108,11 @@ fn typed_program_from_metadata(
                     anyhow::bail!("image pad transform pad_value must be finite");
                 }
                 pad_value = Some(value);
+                target_length = Some(
+                    transform
+                        .target_length
+                        .context("image pad transform requires target_length metadata")?,
+                );
                 padded = true;
             }
             other => anyhow::bail!(
@@ -921,6 +1153,7 @@ fn typed_program_from_metadata(
                 rows: 1,
             }],
             include_thumbnail: false,
+            thumbnail_position: ThumbnailPosition::None,
         },
     };
     let mut outputs = Vec::new();
@@ -948,8 +1181,11 @@ fn typed_program_from_metadata(
         },
         ImageProgram {
             value_ops,
-            patch_size,
+            patchify,
             pad_value,
+            target_length,
+            dynamic_resize,
+            dynamic_hd,
             outputs,
         },
     ))
@@ -1071,6 +1307,7 @@ fn tiling_from_metadata(
                 rows: 1,
             }],
             include_thumbnail: false,
+            thumbnail_position: ThumbnailPosition::None,
         });
     }
 
@@ -1107,6 +1344,7 @@ fn tiling_from_metadata(
             rows: 1,
         }],
         (TilingMode::DynamicAnyres, None) => default_anyres_grids(),
+        (TilingMode::DynamicHd, None) => default_anyres_grids(),
         (_, Some(ratios)) => {
             let mut grids = Vec::new();
             grids
@@ -1148,15 +1386,39 @@ fn tiling_from_metadata(
         anyhow::bail!("no dynamic_anyres aspect ratio fits max_tiles {max_tiles}");
     }
 
+    let include_thumbnail = metadata
+        .and_then(|tiling| tiling.include_thumbnail)
+        .unwrap_or(true);
     Ok(ImageTilingConfig {
         mode,
         tile_size,
         max_tiles,
         aspect_ratios,
-        include_thumbnail: metadata
-            .and_then(|tiling| tiling.include_thumbnail)
-            .unwrap_or(true),
+        include_thumbnail,
+        thumbnail_position: if include_thumbnail {
+            ThumbnailPosition::Prepend
+        } else {
+            ThumbnailPosition::None
+        },
     })
+}
+
+fn parse_thumbnail_position(value: Option<&str>) -> anyhow::Result<ThumbnailPosition> {
+    match value.unwrap_or("none") {
+        "none" => Ok(ThumbnailPosition::None),
+        "prepend" => Ok(ThumbnailPosition::Prepend),
+        "append" => Ok(ThumbnailPosition::Append),
+        other => anyhow::bail!(
+            "unsupported image thumbnail_order '{other}'; expected none, prepend, or append"
+        ),
+    }
+}
+
+fn exact_u8(value: f64, description: &str) -> anyhow::Result<u8> {
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=255.0).contains(&value) {
+        anyhow::bail!("{description} must be an integer in the range 0..=255, got {value}");
+    }
+    Ok(value as u8)
 }
 
 fn default_anyres_grids() -> Vec<TileGrid> {
@@ -1246,21 +1508,35 @@ fn resolve_dimension(name: &str, model: i64, configured: Option<u32>) -> anyhow:
     }
 }
 
+struct TiledImage {
+    grid: TileGrid,
+    transformed_size: (u32, u32),
+    tiles: Vec<RgbImage>,
+    validity_masks: Option<Vec<Vec<u8>>>,
+}
+
 fn tile_image(
     image: &DynamicImage,
     config: &ImagePreprocessConfig,
-) -> anyhow::Result<(TileGrid, Vec<RgbImage>)> {
+    program: &ImageProgram,
+) -> anyhow::Result<TiledImage> {
     match config.tiling.mode {
-        TilingMode::None => Ok((
-            TileGrid {
-                columns: 1,
-                rows: 1,
-            },
-            vec![resize_image(image, config)?],
-        )),
+        TilingMode::None => {
+            let resized = resize_image(image, config, program.dynamic_resize.as_ref())?;
+            let transformed_size = resized.dimensions();
+            Ok(TiledImage {
+                grid: TileGrid {
+                    columns: 1,
+                    rows: 1,
+                },
+                transformed_size,
+                tiles: vec![resized],
+                validity_masks: None,
+            })
+        }
         TilingMode::FixedGrid => {
             let grid = config.tiling.aspect_ratios[0];
-            Ok((grid, tiled_image_for_grid(image, config, grid)?))
+            tiled_image_for_grid(image, config, grid)
         }
         TilingMode::DynamicAnyres => {
             let grid = select_best_grid(
@@ -1270,16 +1546,186 @@ fn tile_image(
                 config.tiling.max_tiles,
                 &config.tiling.aspect_ratios,
             )?;
-            Ok((grid, tiled_image_for_grid(image, config, grid)?))
+            tiled_image_for_grid(image, config, grid)
+        }
+        TilingMode::DynamicHd => dynamic_hd_image(
+            image,
+            config,
+            program
+                .dynamic_hd
+                .as_ref()
+                .context("dynamic_hd tile metadata is missing")?,
+        ),
+    }
+}
+
+fn dynamic_hd_image(
+    image: &DynamicImage,
+    config: &ImagePreprocessConfig,
+    dynamic_hd: &DynamicHdSpec,
+) -> anyhow::Result<TiledImage> {
+    let tile_size = config.tiling.tile_size;
+    let mut columns = image.width().div_ceil(tile_size);
+    let mut rows = image.height().div_ceil(tile_size);
+    if usize::try_from(columns)
+        .ok()
+        .and_then(|columns| {
+            usize::try_from(rows)
+                .ok()
+                .and_then(|rows| columns.checked_mul(rows))
+        })
+        .is_none_or(|count| count > config.tiling.max_tiles)
+    {
+        let aspect_ratio = image.width() as f64 / image.height() as f64;
+        let area = u64::from(image.width()) * u64::from(image.height());
+        let mut candidates = Vec::new();
+        for candidate_columns in 1..=config.tiling.max_tiles {
+            for candidate_rows in 1..=config.tiling.max_tiles / candidate_columns {
+                candidates.push((candidate_columns, candidate_rows));
+            }
+        }
+        candidates.sort_unstable_by_key(|&(columns, rows)| (columns * rows, columns, rows));
+        candidates.dedup();
+        let mut best = None;
+        for (candidate_columns, candidate_rows) in candidates {
+            let difference =
+                (aspect_ratio - candidate_columns as f64 / candidate_rows as f64).abs();
+            let prefer_larger = area
+                > u64::from(tile_size)
+                    * u64::from(tile_size)
+                    * candidate_columns as u64
+                    * candidate_rows as u64
+                    / 2;
+            if best.is_none_or(|(_, _, best_difference): (usize, usize, f64)| {
+                difference < best_difference || (difference == best_difference && prefer_larger)
+            }) {
+                best = Some((candidate_columns, candidate_rows, difference));
+            }
+        }
+        let (best_columns, best_rows, _) =
+            best.context("dynamic_hd could not resolve a tile grid")?;
+        columns = u32::try_from(best_columns).context("dynamic_hd grid width is too large")?;
+        rows = u32::try_from(best_rows).context("dynamic_hd grid height is too large")?;
+    }
+    let grid = TileGrid { columns, rows };
+    let canvas_width = columns
+        .checked_mul(tile_size)
+        .context("dynamic_hd canvas width is too large")?;
+    let canvas_height = rows
+        .checked_mul(tile_size)
+        .context("dynamic_hd canvas height is too large")?;
+    validate_image_dimensions(canvas_width, canvas_height, "dynamic_hd canvas")?;
+
+    let width_ratio = canvas_width as f64 / image.width() as f64;
+    let height_ratio = canvas_height as f64 / image.height() as f64;
+    let (resized_width, resized_height) = if width_ratio < height_ratio {
+        (
+            canvas_width,
+            (image.height() as f64 * width_ratio).floor() as u32,
+        )
+    } else {
+        (
+            (image.width() as f64 * height_ratio).floor() as u32,
+            canvas_height,
+        )
+    };
+    if resized_width < 10 || resized_height < 10 {
+        anyhow::bail!(
+            "dynamic_hd resize produced extreme dimensions {resized_width}x{resized_height}; provide a less extreme source image"
+        );
+    }
+    let resized = resize_rgb(
+        &image.to_rgb8(),
+        resized_width,
+        resized_height,
+        config.interpolation,
+    )?;
+    let mut canvas = RgbImage::from_pixel(
+        canvas_width,
+        canvas_height,
+        Rgb([dynamic_hd.canvas_pad_value; 3]),
+    );
+    image::imageops::replace(&mut canvas, &resized, 0, 0);
+
+    let mask_edge = tile_size as usize / dynamic_hd.mask_patch_size;
+    let mask_width = columns as usize * mask_edge;
+    let mask_height = rows as usize * mask_edge;
+    let mut canvas_mask = vec![1_u8; mask_width * mask_height];
+    let padding_width = canvas_width - resized_width;
+    let padding_height = canvas_height - resized_height;
+    let invalid_columns = padding_width as usize / dynamic_hd.mask_patch_size;
+    let invalid_rows = padding_height as usize / dynamic_hd.mask_patch_size;
+    if invalid_columns > 0 {
+        for row in 0..mask_height {
+            canvas_mask[row * mask_width + mask_width - invalid_columns..(row + 1) * mask_width]
+                .fill(0);
         }
     }
+    if invalid_rows > 0 {
+        canvas_mask[(mask_height - invalid_rows) * mask_width..].fill(0);
+    }
+
+    let local_count = grid.tile_count()?;
+    let total_count = local_count
+        .checked_add(usize::from(config.tiling.include_thumbnail))
+        .context("dynamic_hd tile count overflowed")?;
+    let mut tiles = Vec::new();
+    let mut masks = Vec::new();
+    tiles
+        .try_reserve_exact(total_count)
+        .context("failed to allocate dynamic_hd tiles")?;
+    masks
+        .try_reserve_exact(total_count)
+        .context("failed to allocate dynamic_hd masks")?;
+    let thumbnail = resize_rgb(
+        &canvas,
+        tile_size,
+        tile_size,
+        dynamic_hd.thumbnail_interpolation,
+    )?;
+    let thumbnail_mask = vec![1_u8; mask_edge * mask_edge];
+    if config.tiling.thumbnail_position == ThumbnailPosition::Prepend {
+        tiles.push(thumbnail.clone());
+        masks.push(thumbnail_mask.clone());
+    }
+    for row in 0..rows {
+        for column in 0..columns {
+            tiles.push(
+                image::imageops::crop_imm(
+                    &canvas,
+                    column * tile_size,
+                    row * tile_size,
+                    tile_size,
+                    tile_size,
+                )
+                .to_image(),
+            );
+            let mut mask = Vec::with_capacity(mask_edge * mask_edge);
+            for mask_row in 0..mask_edge {
+                let start = (row as usize * mask_edge + mask_row) * mask_width
+                    + column as usize * mask_edge;
+                mask.extend_from_slice(&canvas_mask[start..start + mask_edge]);
+            }
+            masks.push(mask);
+        }
+    }
+    if config.tiling.thumbnail_position == ThumbnailPosition::Append {
+        tiles.push(thumbnail);
+        masks.push(thumbnail_mask);
+    }
+    Ok(TiledImage {
+        grid,
+        transformed_size: (canvas_width, canvas_height),
+        tiles,
+        validity_masks: Some(masks),
+    })
 }
 
 fn tiled_image_for_grid(
     image: &DynamicImage,
     config: &ImagePreprocessConfig,
     grid: TileGrid,
-) -> anyhow::Result<Vec<RgbImage>> {
+) -> anyhow::Result<TiledImage> {
     let tile_size = config.tiling.tile_size;
     let width = grid
         .columns
@@ -1305,9 +1751,9 @@ fn tiled_image_for_grid(
     tiles
         .try_reserve_exact(tile_count)
         .context("failed to allocate image tile batch")?;
-    // Encoder conventions place the global view before row-major local tiles.
-    if config.tiling.include_thumbnail {
-        tiles.push(resize_image_to(image, config, tile_size, tile_size)?);
+    let thumbnail = resize_image_to(image, config, tile_size, tile_size)?;
+    if config.tiling.thumbnail_position == ThumbnailPosition::Prepend {
+        tiles.push(thumbnail.clone());
     }
     for row in 0..grid.rows {
         for column in 0..grid.columns {
@@ -1323,7 +1769,160 @@ fn tiled_image_for_grid(
             );
         }
     }
-    Ok(tiles)
+    if config.tiling.thumbnail_position == ThumbnailPosition::Append {
+        tiles.push(thumbnail);
+    }
+    Ok(TiledImage {
+        grid,
+        transformed_size: (width, height),
+        tiles,
+        validity_masks: None,
+    })
+}
+
+fn resize_image(
+    image: &DynamicImage,
+    config: &ImagePreprocessConfig,
+    dynamic_resize: Option<&DynamicResize>,
+) -> anyhow::Result<RgbImage> {
+    let (width, height) = match dynamic_resize {
+        Some(DynamicResize::PixelArea {
+            min_pixels,
+            max_pixels,
+            size_multiple,
+        }) => pixel_area_size(
+            image.width(),
+            image.height(),
+            *min_pixels,
+            *max_pixels,
+            *size_multiple,
+        )?,
+        Some(DynamicResize::PatchBudget {
+            patch_size,
+            max_patches,
+            pooling_kernel_size,
+        }) => patch_budget_size(
+            image.width(),
+            image.height(),
+            *patch_size,
+            *max_patches,
+            *pooling_kernel_size,
+        )?,
+        None => (config.width, config.height),
+    };
+    resize_image_to(image, config, width, height)
+}
+
+fn pixel_area_size(
+    width: u32,
+    height: u32,
+    min_pixels: usize,
+    max_pixels: usize,
+    multiple: usize,
+) -> anyhow::Result<(u32, u32)> {
+    let aspect = width.max(height) as f64 / width.min(height) as f64;
+    if aspect > 200.0 {
+        anyhow::bail!("pixel_area resize requires absolute aspect ratio <= 200, got {aspect}");
+    }
+    let multiple = u32::try_from(multiple).context("pixel_area size_multiple is too large")?;
+    let mut resized_height = round_to_multiple_ties_even(height, multiple);
+    let mut resized_width = round_to_multiple_ties_even(width, multiple);
+    let area = u64::from(resized_width) * u64::from(resized_height);
+    if area > max_pixels as u64 {
+        let beta = ((u64::from(width) * u64::from(height)) as f64 / max_pixels as f64).sqrt();
+        resized_height =
+            ((height as f64 / beta / multiple as f64).floor() as u32).max(1) * multiple;
+        resized_width = ((width as f64 / beta / multiple as f64).floor() as u32).max(1) * multiple;
+    } else if area < min_pixels as u64 {
+        let beta = (min_pixels as f64 / (u64::from(width) * u64::from(height)) as f64).sqrt();
+        resized_height = ((height as f64 * beta / multiple as f64).ceil() as u32).max(1) * multiple;
+        resized_width = ((width as f64 * beta / multiple as f64).ceil() as u32).max(1) * multiple;
+    }
+    validate_image_dimensions(resized_width, resized_height, "pixel_area resize")?;
+    Ok((resized_width, resized_height))
+}
+
+fn round_to_multiple_ties_even(value: u32, multiple: u32) -> u32 {
+    let quotient = value / multiple;
+    let remainder = value % multiple;
+    let rounded = match remainder.cmp(&(multiple - remainder)) {
+        std::cmp::Ordering::Less => quotient,
+        std::cmp::Ordering::Greater => quotient + 1,
+        std::cmp::Ordering::Equal if quotient.is_multiple_of(2) => quotient,
+        std::cmp::Ordering::Equal => quotient + 1,
+    };
+    rounded.saturating_mul(multiple)
+}
+
+fn patch_budget_size(
+    width: u32,
+    height: u32,
+    patch_size: usize,
+    max_patches: usize,
+    pooling_kernel_size: usize,
+) -> anyhow::Result<(u32, u32)> {
+    let target_pixels = max_patches
+        .checked_mul(patch_size)
+        .and_then(|value| value.checked_mul(patch_size))
+        .context("patch-budget target pixel count overflowed")?;
+    let factor = (target_pixels as f64 / (u64::from(width) * u64::from(height)) as f64).sqrt();
+    let side_multiple = patch_size
+        .checked_mul(pooling_kernel_size)
+        .context("patch-budget size multiple overflowed")?;
+    let mut target_height =
+        (height as f64 * factor / side_multiple as f64).floor() as usize * side_multiple;
+    let mut target_width =
+        (width as f64 * factor / side_multiple as f64).floor() as usize * side_multiple;
+    if target_height == 0 && target_width == 0 {
+        anyhow::bail!(
+            "patch-budget resize for {width}x{height} rounded both dimensions to zero at size multiple {side_multiple}"
+        );
+    }
+    let pooled_patch_count = pooling_kernel_size
+        .checked_mul(pooling_kernel_size)
+        .context("patch-budget pooling area overflowed")?;
+    let max_side_length = max_patches
+        .checked_div(pooled_patch_count)
+        .and_then(|value| value.checked_mul(side_multiple))
+        .context("patch-budget maximum side length overflowed")?;
+    if target_height == 0 {
+        target_height = side_multiple;
+        target_width = ((width / height) as usize)
+            .saturating_mul(side_multiple)
+            .min(max_side_length);
+    } else if target_width == 0 {
+        target_width = side_multiple;
+        target_height = ((height / width) as usize)
+            .saturating_mul(side_multiple)
+            .min(max_side_length);
+    }
+    if target_height
+        .checked_mul(target_width)
+        .is_none_or(|pixels| pixels > target_pixels)
+    {
+        anyhow::bail!(
+            "patch-budget resize {target_width}x{target_height} exceeds max_patches {max_patches} at patch_size {patch_size}"
+        );
+    }
+    let target_width = u32::try_from(target_width).context("patch-budget width is too large")?;
+    let target_height = u32::try_from(target_height).context("patch-budget height is too large")?;
+    validate_image_dimensions(target_width, target_height, "patch-budget resize")?;
+    Ok((target_width, target_height))
+}
+
+fn resize_rgb(
+    rgb: &RgbImage,
+    width: u32,
+    height: u32,
+    interpolation: Interpolation,
+) -> anyhow::Result<RgbImage> {
+    validate_image_dimensions(width, height, "resized image")?;
+    let filter = match interpolation {
+        Interpolation::Bicubic => FilterType::CatmullRom,
+        Interpolation::Bilinear => FilterType::Triangle,
+        Interpolation::Lanczos3 => FilterType::Lanczos3,
+    };
+    Ok(image::imageops::resize(rgb, width, height, filter))
 }
 
 /// Selects the LLaVA-style best resolution.
@@ -1369,10 +1968,6 @@ fn select_best_grid(
         .context("no image tiling aspect ratio fits max_tiles")
 }
 
-fn resize_image(image: &DynamicImage, config: &ImagePreprocessConfig) -> anyhow::Result<RgbImage> {
-    resize_image_to(image, config, config.width, config.height)
-}
-
 fn resize_image_to(
     image: &DynamicImage,
     config: &ImagePreprocessConfig,
@@ -1387,7 +1982,9 @@ fn resize_image_to(
         Interpolation::Lanczos3 => FilterType::Lanczos3,
     };
     match config.resize_mode {
-        ResizeMode::Fixed => Ok(image::imageops::resize(&rgb, width, height, filter)),
+        ResizeMode::Fixed | ResizeMode::PixelArea | ResizeMode::PatchBudget => {
+            Ok(image::imageops::resize(&rgb, width, height, filter))
+        }
         ResizeMode::ShortestEdgeCenterCrop => {
             let scale =
                 (width as f64 / rgb.width() as f64).max(height as f64 / rgb.height() as f64);
@@ -1688,6 +2285,7 @@ mod tests {
                     rows: 1,
                 }],
                 include_thumbnail: false,
+                thumbnail_position: ThumbnailPosition::None,
             },
             normalization: Normalization::ZeroToOne,
         };
@@ -1698,7 +2296,10 @@ mod tests {
                 Rgb([0, 0, 255])
             }
         }));
-        assert_eq!(resize_image(&image, &config).unwrap().dimensions(), (4, 4));
+        assert_eq!(
+            resize_image(&image, &config, None).unwrap().dimensions(),
+            (4, 4)
+        );
     }
 
     #[test]
@@ -1721,6 +2322,7 @@ mod tests {
                         rows: 1,
                     }],
                     include_thumbnail: false,
+                    thumbnail_position: ThumbnailPosition::None,
                 },
                 normalization: Normalization::MeanStd {
                     mean: [0.48145466, 0.4578275, 0.40821073],
@@ -1735,8 +2337,11 @@ mod tests {
                         std: [0.26862954, 0.261_302_6, 0.275_777_1],
                     },
                 ],
-                patch_size: None,
+                patchify: None,
                 pad_value: None,
+                target_length: None,
+                dynamic_resize: None,
+                dynamic_hd: None,
                 outputs: vec![OutputSpec {
                     name: "pixels".to_owned(),
                     content: "pixels".to_owned(),
@@ -1809,6 +2414,7 @@ mod tests {
                     },
                 ],
                 include_thumbnail: true,
+                thumbnail_position: ThumbnailPosition::Prepend,
             }
         );
     }
@@ -1887,13 +2493,17 @@ preprocessing:
                     max_tiles,
                     aspect_ratios: grids,
                     include_thumbnail: true,
+                    thumbnail_position: ThumbnailPosition::Prepend,
                 },
                 normalization: Normalization::ZeroToOne,
             },
             program: ImageProgram {
                 value_ops: vec![ValueOp::Rescale(1.0 / 255.0)],
-                patch_size: None,
+                patchify: None,
                 pad_value: None,
+                target_length: None,
+                dynamic_resize: None,
+                dynamic_hd: None,
                 outputs: vec![OutputSpec {
                     name: "pixels".to_owned(),
                     content: "pixels".to_owned(),
@@ -2195,6 +2805,7 @@ preprocessing:
         flatten: true
       - op: pad
         pad_value: 0
+        target_length: 8
     outputs:
       - name: image_pixels
         content: pixels
@@ -2336,6 +2947,7 @@ preprocessing:
         flatten: true
       - op: pad
         pad_value: 0
+        target_length: 8
     outputs:
       - name: image_pixels
         content: pixels
@@ -2381,6 +2993,160 @@ preprocessing:
             bundle.tensor("patch_mask").unwrap().data,
             ImageTensorData::Bool(hf_reference::PHI_MASK.to_vec())
         );
+    }
+
+    #[test]
+    fn qwen_area_resize_and_temporal_patch_packing_are_executable() {
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: pixel_area
+        min_pixels: 65536
+        max_pixels: 16777216
+        size_multiple: 32
+        interpolation: bicubic
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+      - op: patchify
+        patch_size: 16
+        temporal_patch_size: 2
+        merge_size: 2
+        channel_order: channels_first
+        flatten: true
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+      - name: image_grid_thw
+        content: grid_dimensions
+        dtype: int64
+"#;
+        let preprocessor = typed_preprocessor(&[-1, 1536], PROGRAM);
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(500, 300, Rgb([0, 0, 0])));
+        let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+        assert_eq!(bundle.tensor("pixel_values").unwrap().shape, [576, 1536]);
+        assert_eq!(
+            bundle.tensor("image_grid_thw").unwrap().data,
+            ImageTensorData::Int64(vec![1, 18, 32])
+        );
+    }
+
+    #[test]
+    fn pixel_area_rounding_matches_python_ties_to_even() {
+        assert_eq!(round_to_multiple_ties_even(16, 32), 0);
+        assert_eq!(round_to_multiple_ties_even(48, 32), 64);
+    }
+
+    #[test]
+    fn gemma_patch_budget_resize_pads_to_declared_2520_patches() {
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        mode: aspect_ratio_patch_budget
+        patch_size: 16
+        max_patches: 2520
+        pooling_kernel_size: 3
+        interpolation: bicubic
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: patchify
+        patch_size: 16
+        channel_order: channels_last
+        coordinate_order: xy
+        flatten: true
+      - op: pad
+        pad_value: 0
+        target_length: 2520
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+      - name: pixel_position_ids
+        content: patch_coordinates
+        dtype: int64
+        pad_value: -1
+"#;
+        let preprocessor = typed_preprocessor(&[-1, 2520, 768], PROGRAM);
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(500, 300, Rgb([0, 0, 0])));
+        let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+        assert_eq!(bundle.tensor("pixel_values").unwrap().shape, [1, 2520, 768]);
+        assert_eq!(
+            bundle.tensor("pixel_position_ids").unwrap().shape,
+            [1, 2520, 2]
+        );
+        assert_eq!(bundle.images[0].expansion_count, 2268);
+        assert_eq!(bundle.images[0].tensor_length, 2520);
+    }
+
+    #[test]
+    fn dynamic_hd_emits_transformed_size_and_patch_validity_masks() {
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: tile
+        mode: dynamic_hd
+        tile_size: 448
+        max_tiles: 36
+        include_thumbnail: true
+        thumbnail_order: prepend
+        interpolation: bilinear
+        thumbnail_interpolation: bicubic
+        canvas_pad_value: 255
+        mask_patch_size: 14
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+    outputs:
+      - name: pixel_values
+        content: pixels
+        dtype: fp32
+      - name: image_sizes
+        content: transformed_size
+        dtype: int64
+      - name: image_attention_mask
+        content: validity_mask
+        dtype: fp32
+        pad_value: 0
+"#;
+        let preprocessor = typed_preprocessor(&[-1, 3, 448, 448], PROGRAM);
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(500, 300, Rgb([0, 0, 0])));
+        let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+        assert_eq!(
+            bundle.tensor("pixel_values").unwrap().shape,
+            [3, 3, 448, 448]
+        );
+        assert_eq!(
+            bundle.tensor("image_sizes").unwrap().data,
+            ImageTensorData::Int64(vec![448, 896])
+        );
+        assert_eq!(
+            bundle.tensor("image_attention_mask").unwrap().shape,
+            [3, 32, 32]
+        );
+        let mask = bundle
+            .tensor("image_attention_mask")
+            .unwrap()
+            .data
+            .as_f32_slice()
+            .unwrap();
+        assert!(mask.contains(&0.0));
+        assert!(mask.contains(&1.0));
     }
 
     #[test]

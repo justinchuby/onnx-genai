@@ -1581,11 +1581,6 @@ fn processor_program_json(
                 let patch_size = required_attr_usize(&operation.attrs, "patch_size", "PatchImage")?;
                 let temporal_patch_size =
                     required_attr_usize(&operation.attrs, "temporal_patch_size", "PatchImage")?;
-                if temporal_patch_size != 1 {
-                    return Err(incomplete(format!(
-                        "processor PatchImage.attrs.temporal_patch_size=1; the runtime processes independent still images and cannot execute temporal patch size {temporal_patch_size}"
-                    )));
-                }
                 let merge_size = required_attr_usize(&operation.attrs, "merge_size", "PatchImage")?;
                 if vision.patch_size != Some(patch_size) {
                     return Err(incomplete(format!(
@@ -1603,6 +1598,9 @@ fn processor_program_json(
                 transforms.push(json!({
                     "op": "patchify",
                     "patch_size": patch_size,
+                    "temporal_patch_size": temporal_patch_size,
+                    "merge_size": merge_size,
+                    "channel_order": "channels_first",
                     "flatten": true
                 }));
                 seen.insert("patchify");
@@ -2071,17 +2069,23 @@ mod tests {
     }
 
     #[test]
-    fn processor_rejects_unexecutable_temporal_patch_size() {
-        let error = processor_program_json(
+    fn processor_emits_executable_temporal_patch_size() {
+        let program = processor_program_json(
             &processor_config(json!(0), json!(2)),
             &processor_vision(),
             &processor_tensor("pixel_values", "float32"),
             &processor_tensor("image_grid_thw", "int64"),
         )
-        .expect_err("temporal patching must fail until executable")
-        .to_string();
-        assert!(error.contains("temporal_patch_size=1"));
-        assert!(error.contains("cannot execute temporal patch size 2"));
+        .expect("temporal patching is executable");
+        let patchify = program["image"]["transforms"]
+            .as_array()
+            .expect("transforms")
+            .iter()
+            .find(|transform| transform["op"] == "patchify")
+            .expect("patchify");
+        assert_eq!(patchify["temporal_patch_size"], 2);
+        assert_eq!(patchify["merge_size"], 2);
+        assert_eq!(patchify["channel_order"], "channels_first");
     }
 
     fn qwen_config() -> GenAiConfig {

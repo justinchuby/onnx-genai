@@ -24,6 +24,7 @@ preprocessing:
         flatten: true
       - op: pad
         pad_value: 0.0
+        target_length: 4096
     outputs:
       # First packed output: flattened patch pixels bound to an arbitrary port.
       - name: pixel_values
