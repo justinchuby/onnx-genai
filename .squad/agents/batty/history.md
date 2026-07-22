@@ -49,3 +49,5 @@ Under Deckard's strict reviewer lockout, revised native serving in `2ae464b`: ex
 ## 2026-07-21 — Wave-2 and CI milestone
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
 - 2026-07-21T23:55Z — Native CUDA opset-24 ConstantOfShape/Gelu/OneHot landed; WP4 revision is the active correction after Zhora/Gaff lockout; clippy hygiene folded.
+
+- 2026-07-22T00:00:00Z — CUDA graph auto-enable in native decode merged to main as `610bde0`; H200 Qwen2.5-0.5B improved 441.49→828.54 tok/s and Phi-4-mini 67.32→94.91 tok/s, token-exact with zero fallbacks. Leon reviewed 🟢.

@@ -101,3 +101,5 @@ Loader opset-import validation for file, from-parts, and nested-subgraph paths m
 ## 2026-07-21 — Wave-2 and CI milestone
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
 - 2026-07-21T23:55Z — VLM WP2 native image processor landed via Sapper revision after Chew rejection; living VLM scope artifact preserved in inbox.
+
+- 2026-07-22T00:00:00Z — Reviewed Batty CUDA-graph auto-enable 🟢 GREEN: 7/7 criteria passed, no model-name gating, correct env/metadata precedence, and capture-safety fallback intact.
