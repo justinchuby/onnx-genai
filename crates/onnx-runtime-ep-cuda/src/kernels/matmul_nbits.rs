@@ -1,5 +1,5 @@
-//! `com.microsoft::MatMulNBits`: decode-specialized packed INT4 GEMV plus the
-//! block-wise dequantization and f32 cuBLASLt GEMM fallback used for prefill.
+//! `com.microsoft::MatMulNBits`: decode-specialized packed INT4/INT8 GEMV plus
+//! the block-wise dequantization and f32 cuBLASLt GEMM fallback used for prefill.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,7 @@ const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
 const GEMV_MODULE: &str = "matmul_nbits_gemv";
 const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
+const GEMV_INT8_F32_ENTRY: &str = "matmul_nbits_gemv_int8_f32";
 const QUANTIZE_ACCURACY4_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32";
 const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
 const ACCURACY4_MODULE: &str = "matmul_nbits_accuracy4";
@@ -27,6 +28,7 @@ const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
 const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
+const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
 const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
 const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
 const GEMV_F16_SMALL_THREADS: u32 = 64;
@@ -63,7 +65,8 @@ extern "C" __global__ void matmul_nbits_dequant_f32(
     const int block_size,
     const int k_blocks,
     const int blob_size,
-    const int zp_row_bytes)
+    const int zp_row_bytes,
+    const int bits)
 {
     const long total = (long)k * n;
     for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -72,18 +75,22 @@ extern "C" __global__ void matmul_nbits_dequant_f32(
         const int output = (int)(idx % n);
         const int block = depth / block_size;
         const int within = depth - block * block_size;
+        const int bit_offset = within * bits;
         const unsigned char byte =
-            packed[((long)output * k_blocks + block) * blob_size + within / 2];
-        const int quantized = (within & 1) ? (byte >> 4) : (byte & 15);
+            packed[((long)output * k_blocks + block) * blob_size + bit_offset / 8];
+        const int mask = bits == 8 ? 255 : ((1 << bits) - 1);
+        const int quantized = (byte >> (bit_offset & 7)) & mask;
         const int group = group_indices ? group_indices[depth] : block;
         if (group < 0 || group >= k_blocks) {
             weight_kn[idx] = 0.0f;
             continue;
         }
-        int zero_point = 8;
+        int zero_point = 1 << (bits - 1);
         if (zero_points) {
-            const unsigned char zp = zero_points[(long)output * zp_row_bytes + group / 2];
-            zero_point = (group & 1) ? (zp >> 4) : (zp & 15);
+            const int zp_bit_offset = group * bits;
+            const unsigned char zp =
+                zero_points[(long)output * zp_row_bytes + zp_bit_offset / 8];
+            zero_point = (zp >> (zp_bit_offset & 7)) & mask;
         }
         weight_kn[idx] =
             ((float)quantized - (float)zero_point) * scales[(long)output * k_blocks + group];
@@ -146,6 +153,40 @@ extern "C" __global__ void matmul_nbits_gemv_f32(
                 zero_points[(long)column * zp_row_bytes + block / 2];
             zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
         }
+        value += activation[depth] * ((float)quantized - (float)zero_point)
+            * scales[(long)column * k_blocks + block];
+    }
+
+    value = block_sum(value);
+    if (threadIdx.x == 0) {
+        output[column] = value + (bias ? bias[column] : 0.0f);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_int8_f32(
+    const float* activation,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    const int column = (int)blockIdx.x;
+    if (column >= n) {
+        return;
+    }
+
+    float value = 0.0f;
+    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+        const int block = depth >> 5;
+        const int within = depth & 31;
+        const int quantized =
+            (int)packed[((long)column * k_blocks + block) * 32 + within];
+        const int zero_point =
+            zero_points ? (int)zero_points[(long)column * k_blocks + block] : 128;
         value += activation[depth] * ((float)quantized - (float)zero_point)
             * scales[(long)column * k_blocks + block];
     }
@@ -382,6 +423,51 @@ __device__ __forceinline__ __half fold_bias_f16(
         return __float2half(__half2float(rounded) + b);
     }
     return __float2half(value + b);
+}
+
+// One warp per output column. Block-32 INT8 stores one unsigned quantized
+// weight byte per K element and one optional uint8 zero point per block.
+extern "C" __global__ void matmul_nbits_gemv_int8_f16(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    float value = 0.0f;
+    if (column < n) {
+        for (int block = 0; block < k_blocks; ++block) {
+            const int depth = block * 32 + lane;
+            if (depth < k) {
+                const int quantized =
+                    (int)packed[((long)column * k_blocks + block) * 32 + lane];
+                const int zero_point =
+                    zero_points ? (int)zero_points[(long)column * k_blocks + block] : 128;
+                const float scale = scales_fp16
+                    ? __half2float(reinterpret_cast<const __half*>(scales_raw)
+                        [(long)column * k_blocks + block])
+                    : reinterpret_cast<const float*>(scales_raw)
+                        [(long)column * k_blocks + block];
+                value += __half2float(activation[depth])
+                    * ((float)quantized - (float)zero_point) * scale;
+            }
+        }
+    }
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
 }
 
 __device__ __forceinline__ void int4x8_to_half2x4(
@@ -1042,9 +1128,11 @@ impl KernelFactory for MatMulNBitsFactory {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
         let bits = optional_int_attr(node, "bits")?.unwrap_or(4);
-        if bits != 4 {
+        if !matches!(bits, 4 | 8) {
             return Err(error(format!(
-                "only bits=4 is supported in the CUDA kernel, got {bits}"
+                "MatMulNBits CUDA supports bits in {{4, 8}}, got bits={bits}. Why: the native \
+                 kernels implement packed int4 and block-32 int8 layouts. How to fix: export \
+                 bits=4, or export bits=8 with block_size=32, or select another execution provider"
             )));
         }
         let weight_prepacked = optional_int_attr(node, "weight_prepacked")?.unwrap_or(0);
@@ -1059,12 +1147,20 @@ impl KernelFactory for MatMulNBitsFactory {
                 "block_size must be a power of two and at least 16, got {block_size}"
             )));
         }
+        if bits == 8 && block_size != 32 {
+            return Err(error(format!(
+                "MatMulNBits CUDA received bits=8 with block_size={block_size}. Why: the native \
+                 int8 GEMV currently implements the standard one-byte-per-weight block-32 layout. \
+                 How to fix: export bits=8 with block_size=32, use bits=4, or select another \
+                 execution provider"
+            )));
+        }
         let accuracy_level = node
             .attr("accuracy_level")
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
-        let accuracy4_workspace = if accuracy_level == 4 && block_size == 32 {
+        let accuracy4_workspace = if bits == 4 && accuracy_level == 4 && block_size == 32 {
             Some(Mutex::new(Accuracy4Workspace::new(
                 self.runtime.clone(),
                 k,
@@ -1076,6 +1172,7 @@ impl KernelFactory for MatMulNBitsFactory {
             runtime: self.runtime.clone(),
             k,
             n,
+            bits: bits as usize,
             block_size,
             accuracy_level,
             accuracy4_workspace,
@@ -1129,6 +1226,7 @@ pub struct MatMulNBitsKernel {
     runtime: Arc<CudaRuntime>,
     k: usize,
     n: usize,
+    bits: usize,
     block_size: usize,
     accuracy_level: i64,
     accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
@@ -1180,12 +1278,12 @@ impl MatMulNBitsKernel {
         }
 
         let k_blocks = self.k.div_ceil(self.block_size);
-        let blob_size = self.block_size / 2;
+        let blob_size = self.block_size * self.bits / 8;
         require_shape("B", inputs[1].shape, &[self.n, k_blocks, blob_size])?;
         require_flat_or_matrix_shape("scales", inputs[2].shape, self.n, k_blocks)?;
 
         let zero_points = optional_input(inputs, 3);
-        let zp_row_bytes = k_blocks.div_ceil(2);
+        let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
         if let Some(zp) = zero_points {
             require_dtype("zero_points", zp.dtype, DataType::Uint8)?;
             require_flat_or_matrix_shape("zero_points", zp.shape, self.n, zp_row_bytes)?;
@@ -1252,6 +1350,21 @@ impl MatMulNBitsKernel {
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
+            if self.bits == 8 {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_int8_f32",
+                    "M==1 decode: bits=8, block_size=32 → direct capture-safe f32 GEMV"
+                );
+                return self.launch_int8_f32_gemv(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                );
+            }
             if self.accuracy_level == 4 && self.block_size == 32 && zero_points.is_none() {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemv_accuracy4_int8",
@@ -1286,7 +1399,7 @@ impl MatMulNBitsKernel {
                 );
             }
         }
-        if self.accuracy_level == 4 && group_indices.is_none() {
+        if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemm_tiled_accuracy4",
                 "M={} (GEMV requires M==1), accuracy_level==4, no g_idx → tiled accuracy4 GEMM",
@@ -1375,12 +1488,10 @@ impl MatMulNBitsKernel {
         result.and(free_workspace).and(free_weight)
     }
 
-    /// Direct fp16-activation x int4-weight decode path. Validates fp16 A/Y
-    /// (scales may be fp16 or f32) and launches the capture-safe GEMV that
-    /// dequantizes weights on the fly with no separate int8 activation-quant
-    /// pass. Restricted to the symmetric block-32 M=1 decode shape this model
-    /// uses; any other fp16 shape is rejected with a clear message rather than
-    /// silently mis-computing.
+    /// Direct fp16-activation x int4/int8-weight decode path. Scales may be
+    /// fp16 or f32. Both block-32 GEMVs dequantize weights on the fly without
+    /// allocations or host synchronization; int8 additionally supports explicit
+    /// unpacked uint8 zero points.
     fn run_f16(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         require_dtype("A", inputs[0].dtype, DataType::Float16)?;
         require_dtype("B", inputs[1].dtype, DataType::Uint8)?;
@@ -1411,11 +1522,16 @@ impl MatMulNBitsKernel {
         }
 
         let k_blocks = self.k.div_ceil(self.block_size);
-        let blob_size = self.block_size / 2;
+        let blob_size = self.block_size * self.bits / 8;
         require_shape("B", inputs[1].shape, &[self.n, k_blocks, blob_size])?;
         require_flat_or_matrix_shape("scales", inputs[2].shape, self.n, k_blocks)?;
 
         let zero_points = optional_input(inputs, 3);
+        if let Some(zero_points) = zero_points {
+            require_dtype("zero_points", zero_points.dtype, DataType::Uint8)?;
+            let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
+            require_flat_or_matrix_shape("zero_points", zero_points.shape, self.n, zp_row_bytes)?;
+        }
         let group_indices = optional_input(inputs, 4);
         let bias = optional_input(inputs, 5);
         if let Some(bias) = bias {
@@ -1427,6 +1543,10 @@ impl MatMulNBitsKernel {
             ("A", inputs[0].is_contiguous()),
             ("B", inputs[1].is_contiguous()),
             ("scales", inputs[2].is_contiguous()),
+            (
+                "zero_points",
+                zero_points.is_none_or(TensorView::is_contiguous),
+            ),
             ("bias", bias.is_none_or(TensorView::is_contiguous)),
             ("Y", outputs[0].is_contiguous()),
         ] {
@@ -1438,14 +1558,42 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
-        if m != 1 || self.block_size != 32 || zero_points.is_some() || group_indices.is_some() {
+        if m != 1 || self.block_size != 32 || group_indices.is_some() {
             return Err(error(
-                "fp16 activations are only supported for the symmetric block-32 M=1 decode GEMV \
-                 (no zero_points, no g_idx)",
+                "MatMulNBits CUDA fp16 activations require block_size=32, M=1, and no g_idx. \
+                 Why: only the capture-safe decode GEMVs implement fp16 activations. How to fix: \
+                 use a block-32 decode shape without g_idx, or provide f32 activations",
             ));
         }
 
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        if self.bits == 8 {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gemv_int8_f16",
+                "M==1 decode: fp16 activation, bits=8, block_size=32, zero_points={} → direct \
+                 capture-safe GEMV",
+                zero_points.is_some()
+            );
+            return self.launch_int8_f16_gemv(
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                scales_fp16,
+                zero_points,
+                bias,
+                &mut outputs[0],
+                k_blocks,
+            );
+        }
+        if zero_points.is_some() {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            return Err(error(
+                "MatMulNBits CUDA fp16 int4 GEMV does not support explicit zero_points. Why: its \
+                 vectorized kernel is specialized for the symmetric zero point 8. How to fix: \
+                 omit symmetric int4 zero_points, use f32 activations, or select another execution \
+                 provider",
+            ));
+        }
         self.launch_f16_gemv(
             &inputs[0],
             &inputs[1],
@@ -1456,6 +1604,72 @@ impl MatMulNBitsKernel {
             k_blocks,
             blob_size,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int8_f16_gemv(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits int8 fp16 GEMV")?;
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, GEMV_INT8_F16_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let scales_fp16_flag = scales_fp16 as i32;
+        let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+        let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+            GEMV_F16_SMALL_THREADS
+        } else {
+            GEMV_F16_LARGE_THREADS
+        };
+        let columns_per_block = (threads / 32) as usize;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks)
+            .arg(&scales_fp16_flag)
+            .arg(&bias_post_round_flag);
+        // SAFETY: validation restricts this entry to dense fp16 block-32 M=1
+        // tensors. The kernel uses fixed device pointers, registers, and warp
+        // shuffles only, so it performs no allocation or synchronization and is
+        // legal to capture and replay on every CUDA SM supported by this crate.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits int8 fp16 GEMV", err))
     }
 
     /// Paired gate/up projection + SwiGLU decode path (see
@@ -1743,6 +1957,59 @@ impl MatMulNBitsKernel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn launch_int8_f32_gemv(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_INT8_F32_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks);
+        // SAFETY: dense tensors were validated for the one-byte-per-weight
+        // block-32 layout. This fixed-geometry launch uses no dynamic allocation,
+        // host synchronization, or architecture-specific instructions, so it is
+        // CUDA-graph-capturable and portable across supported SM versions.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n as u32, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits int8 f32 GEMV", err))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn launch_f32_gemv(
         &self,
         activation: &TensorView,
@@ -1977,6 +2244,7 @@ impl MatMulNBitsKernel {
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
         let zp_row_bytes = as_i32("zero-point row size", zp_row_bytes)?;
+        let bits = as_i32("bits", self.bits)?;
         let total = self.k * self.n;
         let blocks = total.div_ceil(BLOCK_THREADS as usize).clamp(1, 65_535) as u32;
         let function = self
@@ -1994,7 +2262,8 @@ impl MatMulNBitsKernel {
             .arg(&block_size)
             .arg(&k_blocks)
             .arg(&blob_size)
-            .arg(&zp_row_bytes);
+            .arg(&zp_row_bytes)
+            .arg(&bits);
         // SAFETY: argument order/types match the CUDA entry point; all device
         // buffers were shape-validated and `weight` has K*N f32 elements.
         unsafe {
@@ -2346,6 +2615,7 @@ mod tests {
             runtime: runtime.clone(),
             k,
             n,
+            bits: 4,
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
@@ -2493,6 +2763,7 @@ mod tests {
                 runtime: runtime.clone(),
                 k,
                 n,
+                bits: 4,
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
@@ -2780,6 +3051,7 @@ mod tests {
             runtime: runtime.clone(),
             k,
             n,
+            bits: 4,
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
@@ -2791,6 +3063,7 @@ mod tests {
             runtime: runtime.clone(),
             k,
             n,
+            bits: 4,
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
@@ -3042,6 +3315,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 runtime: runtime.clone(),
                 k,
                 n,
+                bits: 4,
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,

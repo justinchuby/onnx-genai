@@ -1,5 +1,5 @@
 //! Correctness-first `com.microsoft::MatMulNBits` for f32 activations and
-//! block-quantized 2-bit or 4-bit weights.
+//! block-quantized 2-bit, 4-bit, or 8-bit weights.
 //!
 //! ORT stores `B` as
 //! `[N, ceil(K / block_size), block_size * bits / 8]`, least-significant bits
@@ -9,7 +9,8 @@
 //! dot product. Other int4 accuracy-level-4 shapes keep the weights in int8 and
 //! quantize each activation row to int8. The 2-bit correctness path and default
 //! int4 path dequantize to f32; batched shapes then use the shared CPU GEMM,
-//! including its SIMD backend.
+//! including its SIMD backend. The 8-bit correctness path uses the same affine
+//! dequantization with one uint8 weight and optional uint8 zero point per block.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -98,9 +99,11 @@ impl KernelFactory for MatMulNBitsFactory {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
         let bits = optional_int_attr(node, "bits")?.unwrap_or(4);
-        if !matches!(bits, 2 | 4) {
+        if !matches!(bits, 2 | 4 | 8) {
             return Err(error(format!(
-                "only bits=2 and bits=4 are supported in the CPU kernel, got {bits}"
+                "MatMulNBits CPU supports bits in {{2, 4, 8}}, got bits={bits}. Why: other packed \
+                 widths do not have a validated dequantization path. How to fix: export bits=2, \
+                 bits=4, or bits=8, or select another execution provider"
             )));
         }
         let weight_prepacked = optional_int_attr(node, "weight_prepacked")?.unwrap_or(0);
@@ -540,7 +543,11 @@ impl MatMulNBitsKernel {
 
         let blob_size = self.block_size * self.bits / 8;
         let zp_row_bytes = (k_blocks * self.bits).div_ceil(8);
-        let quantized_mask = (1u8 << self.bits) - 1;
+        let quantized_mask = if self.bits == 8 {
+            u8::MAX
+        } else {
+            (1u8 << self.bits) - 1
+        };
         let default_zero_point = 1u8 << (self.bits - 1);
         let mut weight_kn = vec![0.0f32; self.k * self.n];
         for output in 0..self.n {
