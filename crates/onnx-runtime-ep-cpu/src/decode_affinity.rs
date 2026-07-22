@@ -21,11 +21,15 @@ use std::collections::BTreeMap;
 ///   node (the smallest-index node whose CPU count covers the pool size, so all
 ///   workers, their fork-join barriers, and their weight reads stay node-local).
 /// * `node:<index>` -- pin the workers to the CPUs of the named NUMA node.
+/// * `numa-split` -- spread the workers across *every* NUMA node as node-pinned
+///   sub-pools and shard each M=1 projection's output rows across them, so both
+///   sockets' memory bandwidth is used while each per-op barrier stays
+///   node-local (see [`crate::decode_numa`]).
 pub const DECODE_AFFINITY_ENV: &str = "ONNX_GENAI_CPU_DECODE_AFFINITY";
 
 /// The complete set of accepted affinity modes, named in every diagnostic so a
 /// rejected value always sees the full menu of valid options.
-const ACCEPTED_MODES: &str = "`off`, `compact`, `node:<index>`";
+const ACCEPTED_MODES: &str = "`off`, `compact`, `node:<index>`, `numa-split`";
 
 /// Render the discovered available-node list for a diagnostic, or state plainly
 /// that topology is unavailable, so every invalid value reports the same three
@@ -67,6 +71,20 @@ pub enum DecodeAffinity {
     Compact,
     /// Pin the pool to the CPUs of the named NUMA node.
     Node(usize),
+    /// Shard M=1 decode across per-node sub-pools spanning every NUMA node.
+    NumaSplit,
+}
+
+/// One NUMA node's share of a [`DecodeAffinity::NumaSplit`] decode layout:
+/// which node, which CPUs it may pin to, and how many workers it receives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeShard {
+    /// The NUMA node index this shard pins to.
+    pub index: usize,
+    /// The CPUs of the node the shard's workers may run on.
+    pub cpus: Vec<usize>,
+    /// The number of decode workers assigned to this node.
+    pub workers: usize,
 }
 
 impl DecodeAffinity {
@@ -79,6 +97,7 @@ impl DecodeAffinity {
         match trimmed {
             "" | "off" | "0" => Ok(Self::Off),
             "compact" => Ok(Self::Compact),
+            "numa-split" => Ok(Self::NumaSplit),
             other => {
                 if let Some(index) = other.strip_prefix("node:") {
                     index
@@ -229,7 +248,45 @@ impl NumaTopology {
                 let chosen = fitting.or_else(|| self.nodes.values().max_by_key(|cpus| cpus.len()));
                 Ok(chosen.map(|cpus| cpus.to_vec()))
             }
+            DecodeAffinity::NumaSplit => {
+                // NumaSplit does not pin a single flat pool; the per-node
+                // sub-pools are built from `split_workers`. Leaving the single
+                // fallback pool unpinned keeps the escape hatch well-defined.
+                Ok(None)
+            }
         }
+    }
+
+    /// Spread `total_workers` across *every* NUMA node for the
+    /// [`DecodeAffinity::NumaSplit`] layout, returning one [`NodeShard`] per node
+    /// that receives at least one worker.
+    ///
+    /// Workers are distributed as evenly as possible (nodes with a lower index
+    /// absorb the remainder first) and a node never receives more workers than
+    /// it has CPUs. Returns `None` when fewer than two nodes would receive a
+    /// worker, since a single-node layout has no cross-socket bandwidth to gain
+    /// and the caller should fall back to the flat single-node path.
+    pub fn split_workers(&self, total_workers: usize) -> Option<Vec<NodeShard>> {
+        if total_workers == 0 || self.nodes.len() < 2 {
+            return None;
+        }
+        let node_count = self.nodes.len();
+        let base = total_workers / node_count;
+        let remainder = total_workers % node_count;
+        let mut shards = Vec::with_capacity(node_count);
+        for (position, (&index, cpus)) in self.nodes.iter().enumerate() {
+            let requested = base + usize::from(position < remainder);
+            let workers = requested.min(cpus.len());
+            if workers == 0 {
+                continue;
+            }
+            shards.push(NodeShard {
+                index,
+                cpus: cpus.clone(),
+                workers,
+            });
+        }
+        (shards.len() >= 2).then_some(shards)
     }
 }
 
@@ -327,6 +384,10 @@ mod tests {
         assert_eq!(
             DecodeAffinity::parse(Some("node:1")).unwrap(),
             DecodeAffinity::Node(1)
+        );
+        assert_eq!(
+            DecodeAffinity::parse(Some("numa-split")).unwrap(),
+            DecodeAffinity::NumaSplit
         );
         assert!(DecodeAffinity::parse(Some("node:x")).is_err());
         assert!(DecodeAffinity::parse(Some("bogus")).is_err());
@@ -473,5 +534,48 @@ mod tests {
             .unwrap();
         assert_eq!(cpus[0], 0);
         assert_eq!(cpus.len(), 64);
+    }
+
+    #[test]
+    fn split_workers_spreads_evenly_across_nodes() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, (0..48).collect::<Vec<_>>());
+        nodes.insert(1, (48..96).collect::<Vec<_>>());
+        let topology = NumaTopology { nodes };
+
+        let shards = topology.split_workers(32).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].index, 0);
+        assert_eq!(shards[0].workers, 16);
+        assert_eq!(shards[0].cpus[0], 0);
+        assert_eq!(shards[1].index, 1);
+        assert_eq!(shards[1].workers, 16);
+        assert_eq!(shards[1].cpus[0], 48);
+
+        // Odd totals give the remainder to the lower-index node.
+        let odd = topology.split_workers(33).unwrap();
+        assert_eq!(odd[0].workers, 17);
+        assert_eq!(odd[1].workers, 16);
+    }
+
+    #[test]
+    fn split_workers_caps_workers_at_node_cpu_count() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, vec![0, 1]);
+        nodes.insert(1, vec![2, 3]);
+        let topology = NumaTopology { nodes };
+        // Requesting 8 workers over 2x2 CPUs caps each node at its 2 CPUs.
+        let shards = topology.split_workers(8).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert!(shards.iter().all(|shard| shard.workers == 2));
+    }
+
+    #[test]
+    fn split_workers_needs_two_populated_nodes() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, vec![0, 1]);
+        let topology = NumaTopology { nodes };
+        assert!(topology.split_workers(4).is_none());
+        assert!(topology.split_workers(0).is_none());
     }
 }

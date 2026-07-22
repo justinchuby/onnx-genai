@@ -267,16 +267,18 @@ impl Kernel for MatMulNBitsKernel {
                         values: to_dense_bytes(&inputs[1])?,
                         scales: to_dense_f32(&inputs[2])?,
                     };
+                    let weight = numa_place_int4(weight, self.n);
                     let _ = self.packed_int4_weight.set(weight);
                     self.packed_int4_weight
                         .get()
                         .expect("constant MatMulNBits packed int4 weight was just initialized")
                 }
             } else {
-                owned_weight = PackedInt4Weight {
+                let built = PackedInt4Weight {
                     values: to_dense_bytes(&inputs[1])?,
                     scales: to_dense_f32(&inputs[2])?,
                 };
+                owned_weight = numa_place_int4(built, self.n);
                 &owned_weight
             };
             with_decode_pool(|| {
@@ -296,13 +298,15 @@ impl Kernel for MatMulNBitsKernel {
                     weight
                 } else {
                     let weight = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
+                    let weight = numa_place_int8(weight, self.n);
                     let _ = self.int8_weight.set(weight);
                     self.int8_weight
                         .get()
                         .expect("constant MatMulNBits int8 prepack was just initialized")
                 }
             } else {
-                owned_weight = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
+                let built = self.prepack_int8_weight(&inputs[1], &inputs[2], zero_points)?;
+                owned_weight = numa_place_int8(built, self.n);
                 &owned_weight
             };
             let mut matmul = || {
@@ -335,19 +339,21 @@ impl Kernel for MatMulNBitsKernel {
                         group_indices,
                         WeightLayout::Nk,
                     )?;
+                    let weight = numa_place_nk(weight, self.n);
                     let _ = self.weight_nk.set(weight);
                     self.weight_nk
                         .get()
                         .expect("constant MatMulNBits prepack was just initialized")
                 }
             } else {
-                owned_weight = self.dequantize_weight(
+                let built = self.dequantize_weight(
                     &inputs[1],
                     &inputs[2],
                     zero_points,
                     group_indices,
                     WeightLayout::Nk,
                 )?;
+                owned_weight = numa_place_nk(built, self.n);
                 &owned_weight
             };
             with_decode_pool(|| {
@@ -777,6 +783,114 @@ thread_local! {
     /// worker that runs the wrapped forward pass so the inner [`with_decode_pool`]
     /// calls run inline instead of re-installing.
     static IN_DECODE_POOL: Cell<bool> = const { Cell::new(false) };
+
+    /// Per-thread flag marking that the current thread is running the forward
+    /// pass inside a `numa-split` [`with_decode_pool_scope`] installation. Set on
+    /// the dispatcher worker that runs the forward so each M=1 projection fans
+    /// its output rows out across the per-node sub-pools (see
+    /// [`parallel_output_rows`] and [`crate::decode_numa`]).
+    static IN_NUMA_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The lazily built `numa-split` decode layout, or `None` when the mode is not
+/// requested or the host cannot be split (fallback, logged once).
+fn numa_pools() -> Option<&'static crate::decode_numa::NumaDecodePools> {
+    static NUMA_POOLS: OnceLock<Option<crate::decode_numa::NumaDecodePools>> = OnceLock::new();
+    NUMA_POOLS
+        .get_or_init(|| crate::decode_numa::build_from_env(configured_decode_threads()))
+        .as_ref()
+}
+
+/// The active `numa-split` layout when the current thread is running a
+/// `numa-split` decode forward; `None` otherwise (so prefill, non-decode work,
+/// and the flat single-node modes keep their existing behaviour).
+fn numa_decode_active() -> Option<&'static crate::decode_numa::NumaDecodePools> {
+    if IN_NUMA_SCOPE.with(Cell::get) {
+        numa_pools()
+    } else {
+        None
+    }
+}
+
+/// Fan a projection's output rows out across the decode workers.
+///
+/// With `numa-split` active, the rows are sharded across the per-node sub-pools
+/// (node-local weights, single cross-node join). Otherwise the flat single-node
+/// pool chunks them as before. `compute(output_start, outputs)` fills the rows
+/// `output_start .. output_start + outputs.len()`, so the math is identical
+/// regardless of how the rows are partitioned (row-sharding a GEMV is exactly
+/// associative -- no cross-row reduction -- so results are bit-identical).
+fn parallel_output_rows<F>(result: &mut [f32], k: usize, compute: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    if let Some(numa) = numa_decode_active() {
+        numa.dispatch_output_rows(result, k, &compute);
+        return;
+    }
+    let chunk = output_chunk_len(result.len(), k);
+    if chunk < result.len() {
+        result
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+    } else {
+        compute(0, result);
+    }
+}
+
+/// First-touch each row-major weight component on the NUMA node that will read
+/// it under `numa-split`, so each sub-pool streams node-local memory. A no-op
+/// (returns the input) when `numa-split` is not the active decode mode.
+fn numa_place_int4(weight: PackedInt4Weight, n: usize) -> PackedInt4Weight {
+    match numa_decode_active() {
+        Some(numa) => PackedInt4Weight {
+            values: numa.place_rows(&weight.values, n),
+            scales: numa.place_rows(&weight.scales, n),
+        },
+        None => weight,
+    }
+}
+
+/// Node-local first-touch for the prepacked int8 weight (see [`numa_place_int4`]).
+fn numa_place_int8(weight: Int8Weight, n: usize) -> Int8Weight {
+    match numa_decode_active() {
+        Some(numa) => Int8Weight {
+            values: numa.place_rows(&weight.values, n),
+            scales: numa.place_rows(&weight.scales, n),
+            block_sums: numa.place_rows(&weight.block_sums, n),
+        },
+        None => weight,
+    }
+}
+
+/// Node-local first-touch for the dequantized `[N, K]` weight (see
+/// [`numa_place_int4`]).
+fn numa_place_nk(weight: Vec<f32>, n: usize) -> Vec<f32> {
+    match numa_decode_active() {
+        Some(numa) => numa.place_rows(&weight, n),
+        None => weight,
+    }
+}
+
+/// RAII guard that marks the current thread as running a `numa-split` decode
+/// forward and restores the previous state on drop (including on panic).
+struct NumaScopeGuard {
+    previous: bool,
+}
+
+impl NumaScopeGuard {
+    fn enter() -> Self {
+        let previous = IN_NUMA_SCOPE.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for NumaScopeGuard {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        IN_NUMA_SCOPE.with(|flag| flag.set(previous));
+    }
 }
 
 /// RAII guard that marks the current thread as resident inside the decode pool
@@ -821,6 +935,19 @@ impl Drop for DecodeResidencyGuard {
 /// Callers should enter this scope only for the M=1 CPU decode case; prefill
 /// (M>1) and non-CPU paths must keep using the global pool.
 pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    // `numa-split`: run the forward on the dispatcher pool and let each M=1
+    // projection fan its output rows out across the per-node sub-pools. The
+    // decode-residency flag is set too, so the inner `with_decode_pool` calls
+    // run inline on the dispatcher worker (they must not re-install the flat
+    // single-node pool); the numa-scope flag makes `parallel_output_rows`
+    // choose the two-level per-node dispatch.
+    if let Some(numa) = numa_pools() {
+        return numa.install_scope(move || {
+            let _numa_guard = NumaScopeGuard::enter();
+            let _decode_guard = DecodeResidencyGuard::enter();
+            f()
+        });
+    }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => pool.install(move || {
             let _guard = DecodeResidencyGuard::enter();
@@ -910,15 +1037,7 @@ fn int4_matmul_m1(
         }
     };
 
-    let chunk = output_chunk_len(n, padded_k);
-    if chunk < n {
-        result
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
-    } else {
-        compute(0, result);
-    }
+    parallel_output_rows(result, padded_k, compute);
 }
 
 fn int4_dot_row(
@@ -1148,10 +1267,7 @@ fn int8_row(
 
     let chunk = output_chunk_len(result.len(), padded_k);
     if parallel && chunk < result.len() {
-        result
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+        parallel_output_rows(result, padded_k, compute);
     } else {
         compute(0, result);
     }
@@ -1245,10 +1361,7 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     };
     let chunk = output_chunk_len(n, k);
     if chunk < n {
-        result
-            .par_chunks_mut(chunk)
-            .enumerate()
-            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+        parallel_output_rows(result, k, compute);
     } else {
         compute(0, result);
     }
@@ -1260,7 +1373,7 @@ const MANY_THREAD_DOT_PRODUCTS_PER_THREAD: usize = 64 * 1024;
 const MIN_OUTPUTS_PER_TASK: usize = 16;
 const MANY_THREAD_CUTOFF: usize = 48;
 
-fn output_chunk_len(n: usize, k: usize) -> usize {
+pub(crate) fn output_chunk_len(n: usize, k: usize) -> usize {
     let threads = rayon::current_num_threads();
     let total_work = n.saturating_mul(k);
     // Small projections amortize Rayon well on one socket, but dispatching each
