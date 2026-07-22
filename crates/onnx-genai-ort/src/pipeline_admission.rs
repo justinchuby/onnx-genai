@@ -87,8 +87,9 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         let name = value.name.clone().ok_or_else(|| {
             OrtError::InvalidArgument(format!(
                 "package admission rejected component '{component}': an ONNX graph input is \
-                 unnamed, so the pipeline cannot bind it. Regenerate the graph with explicit \
-                 input names and a matching native sidecar"
+                 unnamed at model path '{}', so the pipeline cannot bind it. How to fix: \
+                 regenerate the graph with explicit input names and a matching native sidecar",
+                path.display()
             ))
         })?;
         if graph.initializers.contains_key(input) {
@@ -108,8 +109,9 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         let name = value.name.clone().ok_or_else(|| {
             OrtError::InvalidArgument(format!(
                 "package admission rejected component '{component}': an ONNX graph output is \
-                 unnamed, so dataflow cannot reference it. Regenerate the graph with explicit \
-                 output names and a matching native sidecar"
+                 unnamed at model path '{}', so dataflow cannot reference it. How to fix: \
+                 regenerate the graph with explicit output names and a matching native sidecar",
+                path.display()
             ))
         })?;
         signature.outputs.insert(

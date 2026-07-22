@@ -43,6 +43,12 @@ enum ShapeDim<'a> {
     Static(usize),
 }
 
+#[derive(Clone, Copy)]
+enum UnnamedPort {
+    Input,
+    Output,
+}
+
 fn symbolic_shape<'a>(names: &[&'a str], tail: usize) -> Vec<ShapeDim<'a>> {
     let mut shape = names
         .iter()
@@ -89,6 +95,75 @@ fn write_identity_model(
     let model = Model::new(graph);
     model.to_proto()?;
     onnx_std::save_model(&model, path)?;
+    Ok(())
+}
+
+fn write_model_with_unnamed_port(path: &Path, unnamed_port: UnnamedPort) -> TestResult {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let shape = vec![1.into()];
+    let input = match unnamed_port {
+        UnnamedPort::Input => graph.create_value(DataType::Float32, shape.clone()),
+        UnnamedPort::Output => {
+            graph.create_named_value("input", DataType::Undefined, shape.clone())
+        }
+    };
+    graph.add_input(input);
+    let output = match unnamed_port {
+        UnnamedPort::Input => graph.create_named_value("output", DataType::Undefined, shape),
+        UnnamedPort::Output => graph.create_value(DataType::Float32, shape),
+    };
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let model = Model::new(graph);
+    let proto = model.to_proto()?;
+    let proto_graph = proto.graph.as_ref().expect("model must contain a graph");
+    match unnamed_port {
+        UnnamedPort::Input => assert_eq!(proto_graph.input[0].name, ""),
+        UnnamedPort::Output => assert_eq!(proto_graph.output[0].name, ""),
+    }
+    onnx_std::save_model(&model, path)?;
+    Ok(())
+}
+
+fn assert_unnamed_port_inspection_error_contains_path(
+    fixture_name: &str,
+    unnamed_port: UnnamedPort,
+) -> TestResult {
+    let fixture = FixtureDir::new(fixture_name)?;
+    let model_path = fixture.0.join("component.onnx");
+    write_model_with_unnamed_port(&model_path, unnamed_port)?;
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    component:
+      filename: component.onnx
+      type: encoder
+  dataflow: []
+  strategy:
+    kind: single_pass
+    model: component
+  phases:
+    component:
+      run_on: prompt_only
+"#,
+    )?;
+
+    // The protobuf loader currently drops empty-name graph ValueInfo entries
+    // before admission can reach the dedicated unnamed-port branch. Undefined
+    // type information on the named peer forces the closest reachable component
+    // inspection error while preserving a genuinely unnamed port in the ONNX.
+    let error = rejection(&fixture.0);
+    assert!(error.contains(&model_path.display().to_string()), "{error}");
+    assert!(error.contains("could not be loaded"), "{error}");
     Ok(())
 }
 
@@ -504,6 +579,16 @@ pipeline:
     assert!(error.contains("could not be loaded"), "{error}");
     assert!(error.contains("How to fix"), "{error}");
     Ok(())
+}
+
+#[test]
+fn admission_unnamed_input_inspection_error_contains_model_path() -> TestResult {
+    assert_unnamed_port_inspection_error_contains_path("unnamed-input", UnnamedPort::Input)
+}
+
+#[test]
+fn admission_unnamed_output_inspection_error_contains_model_path() -> TestResult {
+    assert_unnamed_port_inspection_error_contains_path("unnamed-output", UnnamedPort::Output)
 }
 
 #[test]
