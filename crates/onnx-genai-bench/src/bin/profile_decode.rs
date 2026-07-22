@@ -183,6 +183,11 @@ fn request(args: &Args, prompt: &str) -> GenerateRequest {
     request
 }
 
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
 fn main() {
     let args = parse_args();
     println!(
@@ -215,16 +220,66 @@ fn main() {
 
     let mut total_tokens = 0u64;
     let mut last_text = String::new();
+    let mut prefills_ms = Vec::with_capacity(args.runs);
+    let mut decode_ms_per_token = Vec::with_capacity(args.runs);
+    let mut decode_throughputs = Vec::with_capacity(args.runs);
+    let mut measured_runs = Vec::with_capacity(args.runs);
     let start = Instant::now();
-    for _ in 0..args.runs {
+    for run in 1..=args.runs {
+        let run_start = Instant::now();
+        let mut token_times = Vec::with_capacity(args.tokens);
+        let mut callback = |_| {
+            token_times.push(run_start.elapsed());
+            Ok(())
+        };
         let result = engine
-            .generate(request(&args, &prompt))
+            .generate_with_callback(request(&args, &prompt), Some(&mut callback))
             .expect("measured generate");
+        if token_times.is_empty() {
+            panic!("measured generation emitted no tokens");
+        }
+        let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
+        prefills_ms.push(prefill_ms);
+        if token_times.len() > 1 {
+            let decode_tokens = token_times.len() - 1;
+            let decode_wall = token_times[token_times.len() - 1] - token_times[0];
+            let decode_ms = decode_wall.as_secs_f64() * 1_000.0 / decode_tokens as f64;
+            let decode_tok_s = decode_tokens as f64 / decode_wall.as_secs_f64();
+            measured_runs.push((
+                run,
+                prefill_ms,
+                decode_tokens,
+                decode_wall.as_secs_f64() * 1_000.0,
+                decode_ms,
+                decode_tok_s,
+            ));
+            decode_ms_per_token.push(decode_ms);
+            decode_throughputs.push(decode_tok_s);
+        }
         total_tokens += result.token_ids.len() as u64;
         last_text = result.text.clone();
         std::hint::black_box(&result);
     }
     let elapsed = start.elapsed();
+
+    for (run, prefill_ms, decode_tokens, decode_wall_ms, decode_ms, decode_tok_s) in measured_runs {
+        println!(
+            "measured_run {run}: prefill={prefill_ms:.3} ms \
+             decode_tokens={decode_tokens} decode_wall={decode_wall_ms:.3} ms \
+             decode={decode_ms:.3} ms/token throughput={decode_tok_s:.2} tok/s"
+        );
+    }
+    if !decode_throughputs.is_empty() {
+        println!(
+            "measured_median: prefill={:.3} ms decode={:.3} ms/token \
+             throughput={:.2} tok/s (runs={} warmups={})",
+            median(&mut prefills_ms),
+            median(&mut decode_ms_per_token),
+            median(&mut decode_throughputs),
+            args.runs,
+            args.warmups
+        );
+    }
 
     let per_token_us = (elapsed.as_secs_f64() * 1_000_000.0) / total_tokens.max(1) as f64;
     let tok_per_s = total_tokens as f64 / elapsed.as_secs_f64();
