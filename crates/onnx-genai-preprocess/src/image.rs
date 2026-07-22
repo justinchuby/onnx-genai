@@ -2,7 +2,7 @@
 
 pub mod packed;
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::Context;
 use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
@@ -380,6 +380,8 @@ struct TilingMetadata {
 #[derive(Debug, Deserialize)]
 struct ImageTransformMetadata {
     op: String,
+    inputs: Option<Vec<String>>,
+    outputs: Option<Vec<String>>,
     size: Option<ImageSize>,
     mode: Option<String>,
     interpolation: Option<String>,
@@ -410,6 +412,7 @@ struct ImageTransformMetadata {
 
 #[derive(Debug, Deserialize)]
 struct ImageOutputMetadata {
+    source: Option<String>,
     name: String,
     content: String,
     dtype: String,
@@ -531,6 +534,8 @@ impl ImagePreprocessor {
     fn image_transform_metadata(transform: &ImageTransform) -> ImageTransformMetadata {
         ImageTransformMetadata {
             op: transform.op.clone(),
+            inputs: transform.inputs.clone(),
+            outputs: transform.outputs.clone(),
             size: transform.size.as_ref().map(|size| match size {
                 ImageSizeSpec::Square(edge) => ImageSize::Square(*edge),
                 ImageSizeSpec::Dimensions { width, height } => ImageSize::Dimensions {
@@ -568,6 +573,7 @@ impl ImagePreprocessor {
 
     fn image_output_metadata(output: &ImageOutputBinding) -> ImageOutputMetadata {
         ImageOutputMetadata {
+            source: output.source.clone(),
             name: output.name.clone(),
             content: output.content.clone(),
             dtype: output.dtype.clone(),
@@ -834,6 +840,7 @@ fn typed_program_from_metadata(
             "preprocessing.image cannot mix legacy resize/tiling/normalize fields with typed transforms"
         );
     }
+    validate_program_dataflow(&metadata.transforms, &metadata.outputs)?;
 
     let mut resize = None;
     let mut tiling = None;
@@ -844,15 +851,21 @@ fn typed_program_from_metadata(
     let mut dynamic_resize = None;
     let mut dynamic_hd = None;
     let mut decoded = false;
+    let mut flattened = false;
     let mut patchified = false;
     let mut padded = false;
     for transform in metadata.transforms {
         match transform.op.as_str() {
-            "decode_rgb" => {
+            "decode" | "decode_rgb" => {
                 if decoded || resize.is_some() || !value_ops.is_empty() || patchified || padded {
                     anyhow::bail!("decode_rgb must be the first image transform");
                 }
                 decoded = true;
+            }
+            "convert_rgb" => {
+                if !decoded || resize.is_some() || !value_ops.is_empty() || patchified || padded {
+                    anyhow::bail!("convert_rgb must follow decode and precede image transforms");
+                }
             }
             "resize" => {
                 if resize.is_some()
@@ -977,10 +990,8 @@ fn typed_program_from_metadata(
                 value_ops.push(ValueOp::Normalize { mean, std });
             }
             "tile" => {
-                if tiling.is_some() || !value_ops.is_empty() || patchified || padded {
-                    anyhow::bail!(
-                        "tile must occur once and before rescale, normalize, patchify, or pad"
-                    );
+                if tiling.is_some() || patchified || padded {
+                    anyhow::bail!("tile must occur once and before patchify or pad");
                 }
                 let tile_size = transform
                     .tile_size
@@ -1051,11 +1062,7 @@ fn typed_program_from_metadata(
                 if patchified || padded {
                     anyhow::bail!("patchify must occur once and before pad");
                 }
-                if transform.flatten == Some(false) {
-                    anyhow::bail!(
-                        "image patchify flatten=false is not supported; declare flatten=true for packed patch outputs"
-                    );
-                }
+                flattened = transform.flatten.unwrap_or(true);
                 let size = transform
                     .patch_size
                     .context("image patchify transform requires patch_size metadata")?;
@@ -1096,6 +1103,19 @@ fn typed_program_from_metadata(
                 });
                 patchified = true;
             }
+            "flatten" => {
+                if !patchified || flattened || padded {
+                    anyhow::bail!(
+                        "flatten must follow one unflattened patchify transform and precede pad"
+                    );
+                }
+                flattened = true;
+            }
+            "emit_original_size"
+            | "emit_transformed_size"
+            | "emit_validity_mask"
+            | "emit_patch_coordinates"
+            | "emit_grid_coordinates" => {}
             "pad" => {
                 if !patchified {
                     anyhow::bail!("image pad transform requires a preceding patchify transform");
@@ -1116,9 +1136,14 @@ fn typed_program_from_metadata(
                 padded = true;
             }
             other => anyhow::bail!(
-                "unsupported required image transform '{other}'; supported operations are decode_rgb, resize, rescale, normalize, tile, patchify, and pad"
+                "unsupported required image transform '{other}'; supported operations are decode, decode_rgb, convert_rgb, resize, rescale, normalize, tile, patchify, flatten, emit_original_size, emit_transformed_size, emit_validity_mask, emit_patch_coordinates, emit_grid_coordinates, and pad"
             ),
         }
+    }
+    if patchified && !flattened {
+        anyhow::bail!(
+            "image patchify flatten=false requires a following flatten transform before packed output"
+        );
     }
 
     let (width, height, resize_mode, interpolation) = match resize {
@@ -1135,15 +1160,8 @@ fn typed_program_from_metadata(
     };
     validate_image_dimensions(width, height, "image resize")?;
     let tiling = match tiling {
-        Some(tiling) => {
-            if tiling.tile_size != width || tiling.tile_size != height {
-                anyhow::bail!(
-                    "image tile_size {} must match resized dimensions {width}x{height}",
-                    tiling.tile_size
-                );
-            }
-            tiling
-        }
+        Some(tiling) => tiling,
+
         None => ImageTilingConfig {
             mode: TilingMode::None,
             tile_size: width,
@@ -1189,6 +1207,234 @@ fn typed_program_from_metadata(
             outputs,
         },
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgramValueKind {
+    Raster,
+    Tiles,
+    Patches,
+    FlatPatches,
+    PaddedPatches,
+    Coordinates,
+    PaddedCoordinates,
+    Grid,
+    OriginalSize,
+    TransformedSize,
+    ValidityMask,
+}
+
+fn validate_program_dataflow(
+    transforms: &[ImageTransformMetadata],
+    outputs: &[ImageOutputMetadata],
+) -> anyhow::Result<()> {
+    let explicit = transforms
+        .iter()
+        .any(|transform| transform.inputs.is_some() || transform.outputs.is_some())
+        || outputs.iter().any(|output| output.source.is_some());
+    if !explicit {
+        return Ok(());
+    }
+
+    let mut values = BTreeMap::<String, ProgramValueKind>::new();
+    let mut previous = Vec::<String>::new();
+    for (index, transform) in transforms.iter().enumerate() {
+        let inputs = match &transform.inputs {
+            Some(inputs) => inputs.clone(),
+            None if previous.len() == 1 => previous.clone(),
+            None if matches!(transform.op.as_str(), "decode" | "decode_rgb") => Vec::new(),
+            None => anyhow::bail!(
+                "image transform {index} ('{}') must declare inputs because the preceding transform produced {} values",
+                transform.op,
+                previous.len()
+            ),
+        };
+        let input_kinds = inputs
+            .iter()
+            .map(|input| {
+                values.get(input).copied().with_context(|| {
+                    format!(
+                        "image transform {index} ('{}') consumes unknown value '{input}'; declare a preceding transform output with that name",
+                        transform.op
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let output_kinds = descriptor_output_kinds(index, transform, &input_kinds)?;
+        let names = transform.outputs.as_ref().with_context(|| {
+            format!(
+                "image transform {index} ('{}') must declare outputs in an explicitly named preprocessing program",
+                transform.op
+            )
+        })?;
+        if names.len() != output_kinds.len() {
+            anyhow::bail!(
+                "image transform {index} ('{}') declares {} outputs, but this operation produces {}; fix preprocessing.image.transforms[{index}].outputs",
+                transform.op,
+                names.len(),
+                output_kinds.len()
+            );
+        }
+        previous.clear();
+        for (name, kind) in names.iter().zip(output_kinds) {
+            if name.is_empty() {
+                anyhow::bail!("image transform {index} declares an empty output name");
+            }
+            if values.insert(name.clone(), kind).is_some() {
+                anyhow::bail!(
+                    "image transform {index} ('{}') redefines value '{name}'; transform output names must be unique",
+                    transform.op
+                );
+            }
+            previous.push(name.clone());
+        }
+    }
+
+    let has_patchify = transforms
+        .iter()
+        .any(|transform| transform.op == "patchify");
+    let has_pad = transforms.iter().any(|transform| transform.op == "pad");
+    for output in outputs {
+        let Some(source) = output.source.as_deref() else {
+            anyhow::bail!(
+                "image output '{}' must declare source in an explicitly named preprocessing program",
+                output.name
+            );
+        };
+        let kind = values.get(source).with_context(|| {
+            format!(
+                "image output '{}' selects unknown source '{source}'; choose a declared transform output",
+                output.name
+            )
+        })?;
+        if !content_accepts_kind(&output.content, *kind, has_patchify, has_pad) {
+            anyhow::bail!(
+                "image output '{}' declares content '{}' but source '{source}' carries {kind:?}; bind the output to a compatible transform value",
+                output.name,
+                output.content
+            );
+        }
+    }
+    Ok(())
+}
+
+fn descriptor_output_kinds(
+    index: usize,
+    transform: &ImageTransformMetadata,
+    inputs: &[ProgramValueKind],
+) -> anyhow::Result<Vec<ProgramValueKind>> {
+    let require = |expected: &[ProgramValueKind]| -> anyhow::Result<ProgramValueKind> {
+        let [actual] = inputs else {
+            anyhow::bail!(
+                "image transform {index} ('{}') expects one input, got {}",
+                transform.op,
+                inputs.len()
+            );
+        };
+        if !expected.contains(actual) {
+            anyhow::bail!(
+                "image transform {index} ('{}') received incompatible input {actual:?}",
+                transform.op
+            );
+        }
+        Ok(*actual)
+    };
+    match transform.op.as_str() {
+        "decode" | "decode_rgb" => {
+            if !inputs.is_empty() {
+                anyhow::bail!(
+                    "image transform {index} ('{}') must not declare inputs",
+                    transform.op
+                );
+            }
+            Ok(vec![ProgramValueKind::Raster])
+        }
+        "convert_rgb" | "resize" => {
+            require(&[ProgramValueKind::Raster])?;
+            Ok(vec![ProgramValueKind::Raster])
+        }
+        "rescale" | "normalize" => {
+            let kind = require(&[ProgramValueKind::Raster, ProgramValueKind::Tiles])?;
+            Ok(vec![kind])
+        }
+        "tile" => {
+            require(&[ProgramValueKind::Raster])?;
+            Ok(vec![ProgramValueKind::Tiles])
+        }
+        "patchify" => {
+            require(&[ProgramValueKind::Raster, ProgramValueKind::Tiles])?;
+            Ok(vec![ProgramValueKind::Patches])
+        }
+        "flatten" => {
+            require(&[ProgramValueKind::Patches])?;
+            Ok(vec![ProgramValueKind::FlatPatches])
+        }
+        "emit_original_size" => {
+            require(&[ProgramValueKind::Raster])?;
+            Ok(vec![ProgramValueKind::OriginalSize])
+        }
+        "emit_transformed_size" => {
+            require(&[ProgramValueKind::Raster, ProgramValueKind::Tiles])?;
+            Ok(vec![ProgramValueKind::TransformedSize])
+        }
+        "emit_validity_mask" => {
+            require(&[ProgramValueKind::Tiles])?;
+            Ok(vec![ProgramValueKind::ValidityMask])
+        }
+        "emit_patch_coordinates" => {
+            require(&[ProgramValueKind::Patches, ProgramValueKind::FlatPatches])?;
+            Ok(vec![ProgramValueKind::Coordinates])
+        }
+        "emit_grid_coordinates" => {
+            require(&[ProgramValueKind::Patches, ProgramValueKind::FlatPatches])?;
+            Ok(vec![ProgramValueKind::Grid])
+        }
+        "pad" => {
+            if inputs.is_empty() {
+                anyhow::bail!("image transform {index} ('pad') expects at least one input");
+            }
+            inputs
+                .iter()
+                .map(|kind| match kind {
+                    ProgramValueKind::Patches | ProgramValueKind::FlatPatches => {
+                        Ok(ProgramValueKind::PaddedPatches)
+                    }
+                    ProgramValueKind::Coordinates => Ok(ProgramValueKind::PaddedCoordinates),
+                    other => anyhow::bail!(
+                        "image transform {index} ('pad') cannot pad input {other:?}; expected patches or coordinates"
+                    ),
+                })
+                .collect()
+        }
+        other => anyhow::bail!(
+            "unsupported required image transform '{other}' at preprocessing.image.transforms[{index}]"
+        ),
+    }
+}
+
+fn content_accepts_kind(
+    content: &str,
+    kind: ProgramValueKind,
+    has_patchify: bool,
+    has_pad: bool,
+) -> bool {
+    match content {
+        "pixels" if has_pad => kind == ProgramValueKind::PaddedPatches,
+        "pixels" if has_patchify => {
+            matches!(
+                kind,
+                ProgramValueKind::Patches | ProgramValueKind::FlatPatches
+            )
+        }
+        "pixels" => matches!(kind, ProgramValueKind::Raster | ProgramValueKind::Tiles),
+        "patch_coordinates" if has_pad => kind == ProgramValueKind::PaddedCoordinates,
+        "patch_coordinates" => kind == ProgramValueKind::Coordinates,
+        "grid_dimensions" => kind == ProgramValueKind::Grid,
+        "original_size" => kind == ProgramValueKind::OriginalSize,
+        "transformed_size" => kind == ProgramValueKind::TransformedSize,
+        "validity_mask" => kind == ProgramValueKind::ValidityMask,
+        _ => false,
+    }
 }
 
 fn parse_interpolation(value: Option<&str>) -> anyhow::Result<Interpolation> {
@@ -2784,6 +3030,137 @@ preprocessing:
             DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 2, Rgb([255, 0, 0]))),
             DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([0, 0, 255]))),
         ]
+    }
+
+    #[test]
+    fn named_operation_descriptors_select_declared_output_sources() {
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode
+        outputs: [decoded]
+      - op: convert_rgb
+        inputs: [decoded]
+        outputs: [rgb]
+      - op: resize
+        inputs: [rgb]
+        outputs: [resized]
+        size: 4
+        mode: stretch
+      - op: rescale
+        inputs: [resized]
+        outputs: [scaled]
+        scale: 0.00392156862745098
+      - op: patchify
+        inputs: [scaled]
+        outputs: [patches]
+        patch_size: 2
+        flatten: false
+      - op: flatten
+        inputs: [patches]
+        outputs: [flat_patches]
+      - op: emit_patch_coordinates
+        inputs: [patches]
+        outputs: [coordinates]
+      - op: emit_grid_coordinates
+        inputs: [patches]
+        outputs: [grid]
+      - op: emit_original_size
+        inputs: [rgb]
+        outputs: [original_size]
+      - op: pad
+        inputs: [flat_patches, coordinates]
+        outputs: [padded_patches, padded_coordinates]
+        target_length: 5
+        pad_value: 0
+    outputs:
+      - source: padded_patches
+        name: arbitrary_pixels
+        content: pixels
+        dtype: fp32
+      - source: padded_coordinates
+        name: arbitrary_coordinates
+        content: patch_coordinates
+        dtype: int64
+        pad_value: -1
+      - source: grid
+        name: arbitrary_grid
+        content: grid_dimensions
+        dtype: int32
+      - source: original_size
+        name: arbitrary_size
+        content: original_size
+        dtype: int64
+"#;
+        let preprocessor = typed_preprocessor(&[1, 5, 12], PROGRAM);
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(3, 2, Rgb([255, 0, 0])));
+        let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+        assert_eq!(bundle.tensor("arbitrary_pixels").unwrap().shape, [1, 5, 12]);
+        assert_eq!(
+            bundle.tensor("arbitrary_coordinates").unwrap().shape,
+            [1, 5, 2]
+        );
+        assert_eq!(
+            bundle.tensor("arbitrary_grid").unwrap().data,
+            ImageTensorData::Int32(vec![1, 2, 2])
+        );
+        assert_eq!(
+            bundle.tensor("arbitrary_size").unwrap().data,
+            ImageTensorData::Int64(vec![2, 3])
+        );
+    }
+
+    #[test]
+    fn named_operation_descriptors_reject_unknown_output_source() {
+        const PROGRAM: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - op: decode
+        outputs: [decoded]
+    outputs:
+      - source: missing
+        name: pixels
+        content: pixels
+        dtype: fp32
+"#;
+        let document = serde_yaml::from_str::<MetadataDocument>(PROGRAM).unwrap();
+        let error =
+            ImagePreprocessor::from_metadata_document(&[1, 3, 2, 2], Some(document)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selects unknown source 'missing'")
+        );
+    }
+
+    #[test]
+    fn checked_in_wp0_named_program_executes_without_identity_dispatch() {
+        let document = serde_yaml::from_str::<MetadataDocument>(include_str!(
+            "../../onnx-genai-metadata/tests/fixtures/vlm_packed_valid.yaml"
+        ))
+        .unwrap();
+        let preprocessor =
+            ImagePreprocessor::from_metadata_document(&[1, 4096, 588], Some(document)).unwrap();
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(32, 16, Rgb([64, 128, 255])));
+        let bundle = preprocessor.preprocess(&[image]).unwrap();
+
+        assert_eq!(
+            bundle.tensor("vision_encoder.pixel_values").unwrap().shape,
+            [1, 4096, 588]
+        );
+        assert_eq!(
+            bundle
+                .tensor("vision_encoder.pixel_position_ids")
+                .unwrap()
+                .shape,
+            [1, 4096, 2]
+        );
+        assert_eq!(bundle.images.len(), 1);
+        assert!(bundle.images[0].expansion_count > 0);
+        assert_eq!(bundle.images[0].tensor_length, 4096);
     }
 
     const PADDED_PROGRAM: &str = r#"
