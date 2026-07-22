@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_genai_ort::PipelineModelDirectory;
 use onnx_std::Model;
-use onnx_std::ir::{DataType, Graph, Node, NodeId};
+use onnx_std::ir::{DataType, Graph, Node, NodeId, TensorData, WeightRef};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -134,6 +134,48 @@ fn write_single_node_model(
     graph.add_output(output_id);
     let model = Model::new(graph);
     model.to_proto()?;
+    onnx_std::save_model(&model, path)?;
+    Ok(())
+}
+
+fn write_initializer_backed_input_model(path: &Path) -> TestResult {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let shape = vec![0.into(), 8.into()];
+    let features = graph.create_named_value("features", DataType::Float16, shape.clone());
+    graph.add_input(features);
+    graph.set_initializer(
+        features,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float16,
+            vec![0, 8],
+            Vec::new(),
+        )),
+    );
+    let output = graph.create_named_value("output", DataType::Float16, shape);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(features)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let model = Model::new(graph);
+    let proto = model.to_proto()?;
+    let proto_graph = proto.graph.as_ref().expect("model must contain a graph");
+    assert!(
+        proto_graph
+            .input
+            .iter()
+            .any(|input| input.name == "features")
+    );
+    assert!(
+        proto_graph
+            .initializer
+            .iter()
+            .any(|initializer| initializer.name == "features")
+    );
     onnx_std::save_model(&model, path)?;
     Ok(())
 }
@@ -768,6 +810,62 @@ pipeline:
         .expect("I/O contract")
         .optional_inputs["audio_features"];
     assert_eq!(optional.presence, "audio");
+    Ok(())
+}
+
+#[test]
+fn admission_accepts_initializer_backed_raw_optional_graph_input() -> TestResult {
+    let fixture = FixtureDir::new("optional-initializer-backed-input")?;
+    let model_path = fixture.0.join("consumer.onnx");
+    write_initializer_backed_input_model(&model_path)?;
+
+    let loaded = onnx_std::load_model(&model_path)?;
+    assert!(
+        loaded
+            .graph
+            .inputs
+            .iter()
+            .all(|input| { loaded.graph.value(*input).name.as_deref() != Some("features") }),
+        "loader IR projection must omit initializer-backed graph inputs"
+    );
+    let retained = loaded.to_proto()?;
+    assert!(
+        retained
+            .graph
+            .as_ref()
+            .expect("model must contain a graph")
+            .input
+            .iter()
+            .any(|input| input.name == "features"),
+        "retained raw protobuf must preserve the graph input"
+    );
+
+    write_metadata(
+        &fixture.0,
+        r#"
+pipeline:
+  models:
+    consumer:
+      filename: consumer.onnx
+      type: encoder
+      io:
+        optional_inputs:
+          features:
+            presence: audio
+            absent:
+              kind: zeros
+              shape: [0, 8]
+  dataflow: []
+  strategy:
+    kind: single_pass
+    model: consumer
+  phases:
+    consumer:
+      run_on: prompt_only
+"#,
+    )?;
+
+    PipelineModelDirectory::load(&fixture.0)?;
     Ok(())
 }
 

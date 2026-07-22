@@ -221,20 +221,34 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         )));
     }
 
-    let graph = &model.graph;
     let mut signature = ComponentSignature::default();
+    let initializer_names = source_graph
+        .initializer
+        .iter()
+        .map(|initializer| initializer.name.as_str())
+        .collect::<BTreeSet<_>>();
 
-    for input in &graph.inputs {
-        let value = graph.value(*input);
-        let name = value
-            .name
-            .clone()
-            .expect("validated GraphProto input names survive loader projection");
-        if graph.initializers.contains_key(input) {
-            signature.defaulted_inputs.insert(name.clone());
+    for input in &source_graph.input {
+        let value = model
+            .graph
+            .values
+            .values()
+            .find(|value| value.name.as_deref() == Some(input.name.as_str()))
+            .ok_or_else(|| {
+                component_inspection_error(
+                    component,
+                    path,
+                    format!(
+                        "raw ONNX graph input '{}' has no corresponding loaded value",
+                        input.name
+                    ),
+                )
+            })?;
+        if initializer_names.contains(input.name.as_str()) {
+            signature.defaulted_inputs.insert(input.name.clone());
         }
         signature.inputs.insert(
-            name,
+            input.name.clone(),
             PortSignature {
                 dtype: value.dtype,
                 shape: value.shape.clone(),
@@ -242,8 +256,8 @@ fn inspect_component_signature(component: &str, path: &Path) -> Result<Component
         );
     }
 
-    for output in &graph.outputs {
-        let value = graph.value(*output);
+    for output in &model.graph.outputs {
+        let value = model.graph.value(*output);
         let name = value
             .name
             .clone()
