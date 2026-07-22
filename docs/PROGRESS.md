@@ -8,6 +8,14 @@ _Last updated: 2026-07-22T08:20Z — H200 multi-model decode roofline bench land
 
 **Current `origin/main` implementation HEAD:** `791e276` (code); `ba86625` (docs).
 
+## 2026-07-22 — VLM WP6 strict-compat pipeline loader merged
+
+- **Executable genai_config compatibility fallback ✅ (`bbe5607`):** Sapper made `smart_resize`/`temporal_patch` required-or-rejected, validates synthesized preprocessing through the real `ImagePreprocessor`, canonicalizes per-layer KV dtype checks, and exercises the real `PipelineModelDirectory::load_if_declared` server path with an e2e server-pipeline test. Native metadata precedence is retained; architecture-neutral per RULES §2/§2.1 (declared components + ONNX graph inventory, never `model.type`). (Luv 🟢; all 5 original findings fixed.)
+
+## 2026-07-22 — Gemma4 CUDA-graph aux-output guard (F1+F2) merged
+
+- **Structural aux-output capture guard ✅ (`794f9cf`):** Leon refined the friendly-decline path with `unit_symbols` / unresolved-symbolic-axis decline-to-eager plus `cuda_auxiliary_bind_declines()` and 4 tests on top of Batty's aux-output binding fix. H200-validated with no Qwen regression. (Chew 🟢)
+
 ## 2026-07-22 — H200 multi-model decode roofline bench: native beats ORT on Qwen0.5B; coverage seams identified
 
 - **Qwen2.5-0.5B native beats ORT GenAI ✅** on the identical int4 block-32 ONNX (H200, device KV, CUDA graph, 3-run median): **815.78 tok/s @128 vs ORT 725.72 (+12.4%)**, **783.84 tok/s @1024 vs ORT 663.35 (+18.2%)** — 2.1× the cited RTX-4060 380 tok/s baseline, coherent output, 0 capture fallbacks. Still only **~9% of the 8,598 tok/s HBM roofline**: capture removes host-launch overhead but does not fuse the ~227 device kernels/token. Next lever is layer-level persistent fusion (fold norm/residual/MLP epilogues around the Q4 GEMVs + GQA), not another isolated kernel tweak.
