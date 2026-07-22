@@ -383,17 +383,18 @@ fn gqa_decode_growing_cache_extends_present_to_logical_total() {
 }
 
 #[test]
-fn dynamic_slice_shape_propagates_through_unsqueeze_comparison_and_transpose() {
+fn dynamic_slice_shape_propagates_through_movement_and_broadcast_chain() {
     let mut g = Graph::new();
     g.opset_imports.insert(String::new(), 17);
 
     let data = input(&mut g, "data", DataType::Float32, &[4]);
     let one = i64_init(&mut g, "one", &[1], &[1]);
+    let two = i64_init(&mut g, "two", &[1], &[2]);
     let starts = i64_init(&mut g, "starts", &[1], &[0]);
     let slice_axes = i64_init(&mut g, "slice_axes", &[1], &[0]);
     let steps = i64_init(&mut g, "steps", &[1], &[1]);
     let unsqueeze_axes = i64_init(&mut g, "unsqueeze_axes", &[1], &[-1]);
-    let thresholds = f32_init(&mut g, "thresholds", &[2, 1], &[1.5, 2.5]);
+    let thresholds = f32_init(&mut g, "thresholds", &[1, 2], &[1.5, 2.5]);
     let dynamic_extent = g.intern_symbol("dynamic_extent");
 
     let data_shape = g.create_value(DataType::Int64, static_shape([1]));
@@ -410,6 +411,17 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_comparison_and_transpose() {
         vec![Some(data_shape), Some(one)],
         vec![end],
     ));
+    let expand_shape = g.create_value(DataType::Int64, static_shape([2]));
+    let mut concat_shape = Node::new(
+        NodeId(0),
+        "Concat",
+        vec![Some(end), Some(two)],
+        vec![expand_shape],
+    );
+    concat_shape
+        .attributes
+        .insert("axis".into(), Attribute::Int(0));
+    g.insert_node(concat_shape);
 
     let sliced = g.create_value(DataType::Float32, vec![Dim::Symbolic(dynamic_extent)]);
     g.mark_value_shape_unknown(sliced);
@@ -438,30 +450,63 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_comparison_and_transpose() {
         vec![unsqueezed],
     ));
 
-    let transposed = g.create_value(
+    let expanded = g.create_value(
         DataType::Float32,
-        vec![Dim::Static(1), Dim::Symbolic(dynamic_extent)],
+        vec![Dim::Symbolic(dynamic_extent), Dim::Static(2)],
     );
-    g.mark_value_shape_unknown(transposed);
-    let mut transpose = Node::new(
+    g.mark_value_shape_unknown(expanded);
+    g.insert_node(Node::new(
         NodeId(0),
-        "Transpose",
-        vec![Some(unsqueezed)],
-        vec![transposed],
+        "Expand",
+        vec![Some(unsqueezed), Some(expand_shape)],
+        vec![expanded],
+    ));
+
+    let reshape_shape = g.create_value(DataType::Int64, static_shape([2]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Shape",
+        vec![Some(expanded)],
+        vec![reshape_shape],
+    ));
+    let reshaped = g.create_value(
+        DataType::Float32,
+        vec![Dim::Symbolic(dynamic_extent), Dim::Static(2)],
     );
-    transpose
+    g.mark_value_shape_unknown(reshaped);
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Reshape",
+        vec![Some(expanded), Some(reshape_shape)],
+        vec![reshaped],
+    ));
+
+    let concatenated_extent = g.intern_symbol("concatenated_extent");
+    let concatenated = g.create_value(
+        DataType::Float32,
+        vec![Dim::Symbolic(concatenated_extent), Dim::Static(2)],
+    );
+    g.mark_value_shape_unknown(concatenated);
+    let mut concat_data = Node::new(
+        NodeId(0),
+        "Concat",
+        vec![Some(expanded), Some(reshaped)],
+        vec![concatenated],
+    );
+    concat_data
         .attributes
-        .insert("perm".into(), Attribute::Ints(vec![1, 0]));
-    g.insert_node(transpose);
+        .insert("axis".into(), Attribute::Int(0));
+    g.insert_node(concat_data);
+
     let compared = g.create_value(
         DataType::Bool,
-        vec![Dim::Static(2), Dim::Symbolic(dynamic_extent)],
+        vec![Dim::Symbolic(concatenated_extent), Dim::Static(2)],
     );
     g.mark_value_shape_unknown(compared);
     g.insert_node(Node::new(
         NodeId(0),
         "Less",
-        vec![Some(transposed), Some(thresholds)],
+        vec![Some(concatenated), Some(thresholds)],
         vec![compared],
     ));
     g.add_output(compared);
@@ -470,9 +515,9 @@ fn dynamic_slice_shape_propagates_through_unsqueeze_comparison_and_transpose() {
     let data = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let outputs = session.run(&[("data", &data)]).expect("run dynamic chain");
 
-    assert_eq!(outputs[0].shape, vec![2, 3]);
+    assert_eq!(outputs[0].shape, vec![6, 2]);
     assert_eq!(outputs[0].dtype, DataType::Bool);
-    assert_eq!(outputs[0].as_bytes(), &[1, 0, 0, 1, 1, 0]);
+    assert_eq!(outputs[0].as_bytes(), &[1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 0]);
 }
 
 #[test]
