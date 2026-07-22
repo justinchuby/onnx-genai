@@ -15,6 +15,17 @@ pipeline:
       filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
+      io:
+        sequence_source: token_ids
+        token_input: input_ids
+        inputs_embeds_input: inputs_embeds
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
   dataflow:
     - from: embedding.inputs_embeds
       to: decoder.inputs_embeds

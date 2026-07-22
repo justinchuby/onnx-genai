@@ -2,7 +2,7 @@
 
 use crate::decode::{
     DecodeState, clone_value, extract_next_token_logits_with_io, is_present_output,
-    is_token_input_name, run_decode_step_with_extra,
+    run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -520,8 +520,8 @@ impl PipelineEngine {
         })
     }
 
-    /// Drive a **dual, hierarchically-nested autoregressive** pipeline — the
-    /// multi-decoder TTS (Qwen3-TTS-style) shape (DESIGN.md §20.3).
+    /// Drive a **dual, hierarchically-nested autoregressive** pipeline for the
+    /// multi-decoder TTS shape in DESIGN.md §20.3.
     ///
     /// The **outer** decoder (talker) runs up to `max_frames` frames; each outer
     /// step (one audio frame) produces a `last_hidden_state` that seeds the
@@ -905,8 +905,8 @@ impl PipelineEngine {
 
             // Pre-embedder mode: remember this frame's code tuple for the next
             // frame's `frame_codes`: the talker's own code as group 0 and the
-            // inner residuals for groups 1..G-1 (matching the real Qwen3-TTS
-            // layout where code_0 comes from the talker, not the code predictor).
+            // inner residuals for groups 1..G-1, where code_0 comes from the
+            // talker rather than the code predictor.
             if pre_embed.is_some() {
                 let mut tuple = Vec::with_capacity(plan.num_code_groups);
                 tuple.push(outer_token);
@@ -1862,10 +1862,8 @@ impl PipelineEngine {
     /// component that consumes a token input (`input_ids`) which is neither
     /// supplied by the caller nor routed by a dataflow edge.
     ///
-    /// A Gemma4-style VLM fuses image features into text-token embeddings via a
-    /// prompt-phase `embedding` component whose `input_ids` come from the prompt
-    /// itself (not from another model). Without this seam that component would
-    /// fail with a `missing pipeline input 'embedding.input_ids'` error.
+    /// The token port is taken only from explicit component `io.token_input`
+    /// metadata. Components without that declaration are not implicitly seeded.
     fn seed_prompt_token_inputs(
         &self,
         components: &[String],
@@ -1873,23 +1871,25 @@ impl PipelineEngine {
         tensors: &mut PipelineTensors,
     ) -> anyhow::Result<()> {
         for component in components {
-            let session = self
+            let Some(token_input) = self
                 .models
-                .session(component)
-                .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
-            for info in session.inputs() {
-                if !is_token_input_name(&info.name.to_ascii_lowercase()) {
-                    continue;
-                }
-                let endpoint = format!("{component}.{}", info.name);
-                let routed = self.plan.dataflow().iter().any(|edge| edge.to == endpoint);
-                if routed || tensors.contains_key(&endpoint) {
-                    continue;
-                }
-                let ids: Vec<i64> = prompt_tokens.iter().map(|&t| i64::from(t)).collect();
-                let value = Value::from_slice_i64(&ids, &[1, ids.len() as i64])?;
-                tensors.insert(endpoint, value);
+                .directory
+                .spec
+                .models
+                .get(component)
+                .and_then(|model| model.io.as_ref())
+                .and_then(|io| io.token_input.as_deref())
+            else {
+                continue;
+            };
+            let endpoint = format!("{component}.{token_input}");
+            let routed = self.plan.dataflow().iter().any(|edge| edge.to == endpoint);
+            if routed || tensors.contains_key(&endpoint) {
+                continue;
             }
+            let ids: Vec<i64> = prompt_tokens.iter().map(|&t| i64::from(t)).collect();
+            let value = Value::from_slice_i64(&ids, &[1, ids.len() as i64])?;
+            tensors.insert(endpoint, value);
         }
         Ok(())
     }
@@ -2388,8 +2388,8 @@ struct AutoregressivePlan {
     presence_conditions: HashMap<String, String>,
 }
 
-/// Dual, hierarchically-nested autoregressive pipeline — the multi-decoder TTS
-/// (Qwen3-TTS-style) shape (DESIGN.md §20.3).
+/// Dual, hierarchically-nested autoregressive pipeline for the multi-decoder TTS
+/// shape in DESIGN.md §20.3.
 ///
 /// An **outer** AR loop (talker) runs up to `max_frames` frames; each outer step
 /// is one audio frame and produces a per-frame `last_hidden_state`. That hidden
@@ -2412,10 +2412,9 @@ struct AutoregressivePlan {
 /// set, the talker is instead driven by `inputs_embeds` materialized each frame
 /// from the PREVIOUS frame's codes `[outer_code_0, inner_code_1, ...,
 /// inner_code_{num_code_groups-1}]` through a codec-sum pre-embedder component
-/// (`frame_codes [+ text_embed] -> inputs_embeds`), matching the real Qwen3-TTS
-/// talker. This keeps the engine generic: the codec-sum construction lives in an
-/// ONNX component, not in Rust. See [`PreEmbedderBinding`]. The inner loop is
-/// unchanged in both modes.
+/// (`frame_codes [+ text_embed] -> inputs_embeds`). This keeps the engine generic:
+/// the codec-sum construction lives in an ONNX component, not in Rust. See
+/// [`PreEmbedderBinding`]. The inner loop is unchanged in both modes.
 #[derive(Debug, Clone)]
 struct NestedAutoregressivePlan {
     /// Outer decoder component (talker); one outer step == one audio frame.
@@ -2460,14 +2459,14 @@ struct NestedAutoregressivePlan {
 /// Wiring for a pre-embedder that drives the outer talker's per-step
 /// `inputs_embeds` in a [`NestedAutoregressivePlan`].
 ///
-/// The real Qwen3-TTS talker consumes `inputs_embeds` (not `input_ids`), built
-/// each step from the previous frame's codes as `codec_sum(+ text_embed)`. On the
-/// Mobius side that construction is materialized into an ONNX component with
-/// inputs `frame_codes [batch, num_code_groups]` int64 (`[+ text_embed [batch, 1,
-/// hidden]]`) → output `inputs_embeds [batch, 1, hidden]`. This binding records
-/// the component name and the outer decoder input port fed by it; the exact
-/// pre-embedder input names are resolved from its loaded session at drive time
-/// (sessions are not available at plan-build time).
+/// The talker consumes `inputs_embeds` (not `input_ids`), built each step from
+/// the previous frame's codes as `codec_sum(+ text_embed)`. That construction is
+/// materialized into an ONNX component with inputs `frame_codes [batch,
+/// num_code_groups]` int64 (`[+ text_embed [batch, 1, hidden]]`) → output
+/// `inputs_embeds [batch, 1, hidden]`. This binding records the component name
+/// and the outer decoder input port fed by it; the exact pre-embedder input names
+/// are resolved from its loaded session at drive time (sessions are not
+/// available at plan-build time).
 #[derive(Debug, Clone)]
 struct PreEmbedderBinding {
     /// Pre-embedder component name (a declared model).

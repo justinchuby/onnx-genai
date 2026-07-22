@@ -348,6 +348,16 @@ pipeline:
       filename: decoder.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
+      io:
+        sequence_source: inputs_embeds
+        inputs_embeds_input: inputs_embeds
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
   dataflow:
     - from: vision_encoder.image_features
       to: embedding.image_features
