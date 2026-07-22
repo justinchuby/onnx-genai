@@ -399,26 +399,95 @@ fn run_f16_case_with_bits(
     n: usize,
     bits: usize,
 ) -> onnx_runtime_ep_api::Result<Vec<f16>> {
+    run_f16_case_with_bits_and_shape(
+        ep,
+        &[1, k],
+        activations,
+        packed,
+        F16TestScales::F16(scales),
+        zero_points,
+        k,
+        n,
+        bits,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum F16TestScales<'a> {
+    F16(&'a [f16]),
+    F32(&'a [f32]),
+}
+
+impl F16TestScales<'_> {
+    fn dtype(self) -> DataType {
+        match self {
+            Self::F16(_) => DataType::Float16,
+            Self::F32(_) => DataType::Float32,
+        }
+    }
+
+    fn tensor(self, shape: &[usize]) -> HostTensor {
+        match self {
+            Self::F16(values) => tensor(DataType::Float16, shape, values),
+            Self::F32(values) => tensor(DataType::Float32, shape, values),
+        }
+    }
+
+    fn value(self, index: usize) -> f64 {
+        match self {
+            Self::F16(values) => f64::from(values[index].to_f32()),
+            Self::F32(values) => f64::from(values[index]),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_f16_case_with_bits_and_shape(
+    ep: &CudaExecutionProvider,
+    a_shape: &[usize],
+    activations: &[f16],
+    packed: &[u8],
+    scales: F16TestScales<'_>,
+    zero_points: Option<&[u8]>,
+    k: usize,
+    n: usize,
+    bits: usize,
+) -> onnx_runtime_ep_api::Result<Vec<f16>> {
     let block_size = 32usize;
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size * bits / 8;
+    let zp_row_bytes = (blocks * bits).div_ceil(8);
+    let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
     let mut graph = Graph::new();
     graph.opset_imports.insert("com.microsoft".into(), 1);
-    let a = graph.create_named_value("A", DataType::Float16, static_shape([1, k]));
+    let a = graph.create_named_value(
+        "A",
+        DataType::Float16,
+        static_shape(a_shape.iter().copied()),
+    );
     let b = graph.create_named_value("B", DataType::Uint8, static_shape([n, blocks, blob_size]));
     let scales_value =
-        graph.create_named_value("scales", DataType::Float16, static_shape([n, blocks]));
+        graph.create_named_value("scales", scales.dtype(), static_shape([n, blocks]));
     for value in [a, b, scales_value] {
         graph.add_input(value);
     }
     let mut node_inputs = vec![Some(a), Some(b), Some(scales_value)];
     if zero_points.is_some() {
-        let zp =
-            graph.create_named_value("zero_points", DataType::Uint8, static_shape([n, blocks]));
+        let zp = graph.create_named_value(
+            "zero_points",
+            DataType::Uint8,
+            static_shape([n, zp_row_bytes]),
+        );
         graph.add_input(zp);
         node_inputs.push(Some(zp));
     }
-    let output = graph.create_named_value("Y", DataType::Float16, static_shape([1, n]));
+    let mut output_shape = a_shape[..a_shape.len() - 1].to_vec();
+    output_shape.push(n);
+    let output = graph.create_named_value(
+        "Y",
+        DataType::Float16,
+        static_shape(output_shape.iter().copied()),
+    );
     let mut node = Node::new(NodeId(0), "MatMulNBits", node_inputs, vec![output]);
     node.domain = "com.microsoft".into();
     node.attributes.insert("K".into(), Attribute::Int(k as i64));
@@ -436,12 +505,12 @@ fn run_f16_case_with_bits(
     assert!(!kernel.cuda_graph_compatible());
 
     let mut inputs = vec![
-        tensor(DataType::Float16, &[1, k], activations),
+        tensor(DataType::Float16, a_shape, activations),
         tensor(DataType::Uint8, &[n, blocks, blob_size], packed),
-        tensor(DataType::Float16, &[n, blocks], scales),
+        scales.tensor(&[n, blocks]),
     ];
     if let Some(zero_points) = zero_points {
-        inputs.push(tensor(DataType::Uint8, &[n, blocks], zero_points));
+        inputs.push(tensor(DataType::Uint8, &[n, zp_row_bytes], zero_points));
     }
     let runtime = ep.runtime();
     let device = ep.device_id();
@@ -470,8 +539,8 @@ fn run_f16_case_with_bits(
             )
         })
         .collect();
-    let mut output_buffer = ep.allocate(n * 2, 256)?;
-    let output_shape = [1, n];
+    let output_len = m * n;
+    let mut output_buffer = ep.allocate(output_len * 2, 256)?;
     let output_strides = compute_contiguous_strides(&output_shape);
     kernel.execute(
         &input_views,
@@ -483,10 +552,10 @@ fn run_f16_case_with_bits(
             device,
         )],
     )?;
-    assert!(kernel.cuda_graph_compatible());
-    if bits == 8 {
-        let mut eager = vec![0u8; n * 2];
-        // SAFETY: output allocation contains `n` fp16 values.
+    assert_eq!(kernel.cuda_graph_compatible(), m == 1);
+    if bits == 8 && m == 1 {
+        let mut eager = vec![0u8; output_len * 2];
+        // SAFETY: output allocation contains `output_len` fp16 values.
         unsafe { runtime.dtoh(&mut eager, cuptr(output_buffer.as_ptr()))? };
         let allocation_counts = runtime.allocation_counts();
         runtime.begin_graph_capture(&[kernel.as_ref()])?;
@@ -502,8 +571,8 @@ fn run_f16_case_with_bits(
         )?;
         runtime.end_graph_capture()?;
         runtime.replay_graph()?;
-        let mut replayed = vec![0u8; n * 2];
-        // SAFETY: output allocation contains `n` fp16 values.
+        let mut replayed = vec![0u8; output_len * 2];
+        // SAFETY: output allocation contains `output_len` fp16 values.
         unsafe { runtime.dtoh(&mut replayed, cuptr(output_buffer.as_ptr()))? };
         assert_eq!(
             replayed, eager,
@@ -513,8 +582,8 @@ fn run_f16_case_with_bits(
         assert!(runtime.reset_graph()?);
     }
 
-    let mut bytes = vec![0u8; n * 2];
-    // SAFETY: output allocation contains `n` fp16 values.
+    let mut bytes = vec![0u8; output_len * 2];
+    // SAFETY: output allocation contains `output_len` fp16 values.
     unsafe { runtime.dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))? };
     drop(input_views);
     for buffer in input_buffers {
@@ -1429,6 +1498,179 @@ fn f16_int8_reference_column(
         }
     }
     value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn f16_prefill_reference(
+    activations: &[f16],
+    packed: &[u8],
+    scales: F16TestScales<'_>,
+    zero_points: Option<&[u8]>,
+    m: usize,
+    k: usize,
+    n: usize,
+    bits: usize,
+) -> Vec<f32> {
+    let blocks = k.div_ceil(32);
+    let blob_size = 32 * bits / 8;
+    let zp_row_bytes = (blocks * bits).div_ceil(8);
+    let mut output = vec![0.0f32; m * n];
+    for row in 0..m {
+        for column in 0..n {
+            let mut accumulator = 0.0f64;
+            for depth in 0..k {
+                let block = depth / 32;
+                let within = depth % 32;
+                let byte = packed[(column * blocks + block) * blob_size + within * bits / 8];
+                let quantized = if bits == 8 {
+                    byte
+                } else if within.is_multiple_of(2) {
+                    byte & 15
+                } else {
+                    byte >> 4
+                };
+                let zero_point = zero_points.map_or(1 << (bits - 1), |points| {
+                    if bits == 8 {
+                        usize::from(points[column * zp_row_bytes + block])
+                    } else {
+                        let byte = points[column * zp_row_bytes + block / 2];
+                        usize::from(if block.is_multiple_of(2) {
+                            byte & 15
+                        } else {
+                            byte >> 4
+                        })
+                    }
+                });
+                accumulator += f64::from(activations[row * k + depth].to_f32())
+                    * (f64::from(quantized) - zero_point as f64)
+                    * scales.value(column * blocks + block);
+            }
+            output[row * n + column] = accumulator as f32;
+        }
+    }
+    output
+}
+
+fn run_fp16_prefill_parity(bits: usize) {
+    let Some(ep) = gpu() else { return };
+    let (k, n) = (77usize, 35usize);
+    let blocks = k.div_ceil(32);
+    let blob_size = 32 * bits / 8;
+    let packed: Vec<u8> = (0..n * blocks * blob_size)
+        .map(|index| ((index * 37 + index / 11 + 19) & 255) as u8)
+        .collect();
+    let scales_f16: Vec<f16> = (0..n * blocks)
+        .map(|index| f16::from_f32(0.001 + (index * 17 % 31) as f32 * 0.0002))
+        .collect();
+    let scales_f32: Vec<f32> = (0..n * blocks)
+        .map(|index| 0.001 + (index * 17 % 31) as f32 * 0.0002)
+        .collect();
+
+    for m in [5usize, 17] {
+        let activations: Vec<f16> = (0..m * k)
+            .map(|index| f16::from_f32(((index * 29 % 257) as f32 - 128.0) / 97.0))
+            .collect();
+        let scales = if m == 5 {
+            F16TestScales::F16(&scales_f16)
+        } else {
+            F16TestScales::F32(&scales_f32)
+        };
+        for explicit_zero_points in [false, true] {
+            let zero_points = explicit_zero_points.then(|| {
+                if bits == 8 {
+                    (0..n * blocks)
+                        .map(|index| ((index * 13 + 97) & 255) as u8)
+                        .collect::<Vec<_>>()
+                } else {
+                    let zp_row_bytes = blocks.div_ceil(2);
+                    let mut points = vec![0u8; n * zp_row_bytes];
+                    for column in 0..n {
+                        for block in 0..blocks {
+                            let point = ((column * 5 + block * 3 + 2) % 16) as u8;
+                            points[column * zp_row_bytes + block / 2] |= point << (4 * (block % 2));
+                        }
+                    }
+                    points
+                }
+            });
+            let actual = run_f16_case_with_bits_and_shape(
+                &ep,
+                &[m, k],
+                &activations,
+                &packed,
+                scales,
+                zero_points.as_deref(),
+                k,
+                n,
+                bits,
+            )
+            .unwrap();
+            let expected = f16_prefill_reference(
+                &activations,
+                &packed,
+                scales,
+                zero_points.as_deref(),
+                m,
+                k,
+                n,
+                bits,
+            );
+            let mut max_abs = 0.0f32;
+            for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+                let expected_f16 = f16::from_f32(want).to_f32();
+                let difference = (got.to_f32() - expected_f16).abs();
+                max_abs = max_abs.max(difference);
+                let tolerance = 0.02f32.max(expected_f16.abs() * 2e-3);
+                assert!(
+                    difference <= tolerance,
+                    "bits={bits} M={m} explicit_zp={explicit_zero_points} index={index}: \
+                     got={} expected={expected_f16} tolerance={tolerance}",
+                    got.to_f32()
+                );
+            }
+            eprintln!(
+                "fp16 MatMulNBits prefill bits={bits} M={m} explicit_zp={explicit_zero_points} \
+                 scales={:?} max_abs_diff={max_abs:e}",
+                scales.dtype()
+            );
+
+            if m == 5 && (bits == 8 || !explicit_zero_points) {
+                let decode = run_f16_case_with_bits_and_shape(
+                    &ep,
+                    &[1, k],
+                    &activations[..k],
+                    &packed,
+                    scales,
+                    zero_points.as_deref(),
+                    k,
+                    n,
+                    bits,
+                )
+                .unwrap();
+                for column in 0..n {
+                    let prefill_value = actual[column].to_f32();
+                    let decode_value = decode[column].to_f32();
+                    let tolerance = 0.02f32.max(decode_value.abs() * 2e-3);
+                    assert!(
+                        (prefill_value - decode_value).abs() <= tolerance,
+                        "bits={bits} explicit_zp={explicit_zero_points} column={column}: \
+                         prefill first row={prefill_value} decode={decode_value} \
+                         tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matmul_nbits_gpu_int4_fp16_prefill_matches_f64_reference() {
+    run_fp16_prefill_parity(4);
+}
+
+#[test]
+fn matmul_nbits_gpu_int8_fp16_prefill_matches_f64_reference() {
+    run_fp16_prefill_parity(8);
 }
 
 #[test]

@@ -29,8 +29,10 @@ const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
 const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
+const GEMM_F16_ENTRY: &str = "matmul_nbits_gemm_f16";
 const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
 const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
+const GEMM_F16_TILE: usize = 16;
 const GEMV_F16_SMALL_THREADS: u32 = 64;
 const GEMV_F16_LARGE_THREADS: u32 = 256;
 const GEMV_F16_SMALL_N_MAX: usize = 1152;
@@ -467,6 +469,97 @@ extern "C" __global__ void matmul_nbits_gemv_int8_f16(
     value = warp_sum(value);
     if (lane == 0 && column < n) {
         output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// Portable CUDA-core prefill GEMM. A 16x16 CTA cooperatively stages one
+// block-32 activation/weight tile, so each packed weight is reused by up to 16
+// prompt rows and each activation by up to 16 output columns. It deliberately
+// uses only ordinary shared memory, fp32 arithmetic, and __half conversion:
+// no tensor-core, async-copy, or architecture-specific PTX requirement.
+extern "C" __global__ void matmul_nbits_gemm_f16(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int m,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int bits,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    __shared__ float activation_tile[16][32];
+    __shared__ float weight_tile[32][16];
+    const int tid = (int)threadIdx.y * 16 + (int)threadIdx.x;
+    const int row = (int)blockIdx.y * 16 + (int)threadIdx.y;
+    const int column = (int)blockIdx.x * 16 + (int)threadIdx.x;
+    float value = 0.0f;
+
+    for (int block = 0; block < k_blocks; ++block) {
+#pragma unroll
+        for (int load = tid; load < 16 * 32; load += 16 * 16) {
+            const int tile_row = load >> 5;
+            const int within = load & 31;
+            const int depth = block * 32 + within;
+            const int global_row = (int)blockIdx.y * 16 + tile_row;
+            activation_tile[tile_row][within] =
+                global_row < m && depth < k
+                    ? __half2float(activation[(long)global_row * k + depth])
+                    : 0.0f;
+        }
+#pragma unroll
+        for (int load = tid; load < 32 * 16; load += 16 * 16) {
+            const int tile_column = load >> 5;
+            const int within = load & 31;
+            const int global_column = (int)blockIdx.x * 16 + tile_column;
+            const int depth = block * 32 + within;
+            float weight = 0.0f;
+            if (global_column < n && depth < k) {
+                const long scale_index = (long)global_column * k_blocks + block;
+                const float scale = scales_fp16
+                    ? __half2float(
+                        reinterpret_cast<const __half*>(scales_raw)[scale_index])
+                    : reinterpret_cast<const float*>(scales_raw)[scale_index];
+                int quantized;
+                int zero_point;
+                if (bits == 8) {
+                    quantized = (int)packed[scale_index * 32 + within];
+                    zero_point = zero_points ? (int)zero_points[scale_index] : 128;
+                } else {
+                    const unsigned char byte =
+                        packed[scale_index * 16 + (within >> 1)];
+                    quantized = (within & 1) ? (byte >> 4) : (byte & 15);
+                    zero_point = 8;
+                    if (zero_points) {
+                        const int zp_row_bytes = (k_blocks + 1) >> 1;
+                        const unsigned char zp =
+                            zero_points[(long)global_column * zp_row_bytes + (block >> 1)];
+                        zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+                    }
+                }
+                weight = ((float)quantized - (float)zero_point) * scale;
+            }
+            weight_tile[within][tile_column] = weight;
+        }
+        __syncthreads();
+
+        if (row < m && column < n) {
+#pragma unroll
+            for (int within = 0; within < 32; ++within) {
+                value += activation_tile[threadIdx.y][within]
+                    * weight_tile[within][threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < m && column < n) {
+        output[(long)row * n + column] =
+            fold_bias_f16(value, bias, column, bias_post_round);
     }
 }
 
@@ -1488,10 +1581,9 @@ impl MatMulNBitsKernel {
         result.and(free_workspace).and(free_weight)
     }
 
-    /// Direct fp16-activation x int4/int8-weight decode path. Scales may be
-    /// fp16 or f32. Both block-32 GEMVs dequantize weights on the fly without
-    /// allocations or host synchronization; int8 additionally supports explicit
-    /// unpacked uint8 zero points.
+    /// Direct fp16-activation x int4/int8-weight path. Scales may be fp16 or
+    /// f32. M=1 uses the capture-safe decode GEMVs; M>1 uses a portable tiled
+    /// CUDA-core GEMM with fp32 accumulation and fp16 output.
     fn run_f16(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         require_dtype("A", inputs[0].dtype, DataType::Float16)?;
         require_dtype("B", inputs[1].dtype, DataType::Uint8)?;
@@ -1558,12 +1650,50 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
-        if m != 1 || self.block_size != 32 || group_indices.is_some() {
+        if self.block_size != 32 {
+            return Err(error(format!(
+                "MatMulNBits CUDA fp16 activations received block_size={}. Why: the native fp16 \
+                 decode and prefill kernels implement the block-32 packed layout. How to fix: \
+                 export block_size=32, provide f32 activations, or select another execution provider",
+                self.block_size
+            )));
+        }
+        if group_indices.is_some() {
             return Err(error(
-                "MatMulNBits CUDA fp16 activations require block_size=32, M=1, and no g_idx. \
-                 Why: only the capture-safe decode GEMVs implement fp16 activations. How to fix: \
-                 use a block-32 decode shape without g_idx, or provide f32 activations",
+                "MatMulNBits CUDA fp16 activations do not support g_idx. Why: the block-32 fp16 \
+                 kernels map each K block directly to its scale and zero point and do not implement \
+                 group remapping. How to fix: omit g_idx, provide f32 activations, or select another \
+                 execution provider",
             ));
+        }
+
+        if m > 1 {
+            // SAFETY: the tiled prefill kernel itself has fixed pointers and no
+            // allocation or host synchronization. We nevertheless keep the
+            // advertised capture contract conservative: variable-M prefill is
+            // outside the persistent M=1 decode graph and has no replay coverage.
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gemm_f16_tiled",
+                "M={} prefill: fp16 activation, bits={}, block_size=32, zero_points={}, \
+                 scales={} → portable 16x16 CUDA-core tiled GEMM with fp32 accumulation; \
+                 not advertised as CUDA-graph capture-safe",
+                m,
+                self.bits,
+                zero_points.is_some(),
+                if scales_fp16 { "fp16" } else { "fp32" }
+            );
+            return self.launch_f16_gemm(
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                scales_fp16,
+                zero_points,
+                bias,
+                &mut outputs[0],
+                m,
+                k_blocks,
+            );
         }
 
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
@@ -1604,6 +1734,76 @@ impl MatMulNBitsKernel {
             k_blocks,
             blob_size,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_f16_gemm(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+        k_blocks: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits fp16 prefill GEMM")?;
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, GEMM_F16_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let m_i32 = as_i32("M", m)?;
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let bits = as_i32("bits", self.bits)?;
+        let scales_fp16_flag = scales_fp16 as i32;
+        let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+        let grid_x = u32::try_from(self.n.div_ceil(GEMM_F16_TILE))
+            .map_err(|_| error(format!("N={} exceeds CUDA prefill grid limits", self.n)))?;
+        let grid_y = u32::try_from(m.div_ceil(GEMM_F16_TILE))
+            .map_err(|_| error(format!("M={m} exceeds CUDA prefill grid limits")))?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&m_i32)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks)
+            .arg(&bits)
+            .arg(&scales_fp16_flag)
+            .arg(&bias_post_round_flag);
+        // SAFETY: dense block-32 tensors and all dimensions were validated
+        // above. The 16x16 CTA uses 4 KiB of statically sized shared memory,
+        // ordinary fp32 CUDA-core arithmetic, and fp16 conversions only. It has
+        // no tensor-core/PTX/cp.async dependency, so the same path is the
+        // portable fallback on every CUDA SM supported by this crate.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (GEMM_F16_TILE as u32, GEMM_F16_TILE as u32, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits fp16 prefill GEMM", err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2292,13 +2492,15 @@ impl Kernel for MatMulNBitsKernel {
         // shape-fixed persistent accuracy-4 activation workspace; it performs no
         // per-call allocation, D2H, or synchronization. The direct fp16 GEMV is
         // likewise capture-safe: fixed grid/block geometry from the shape
-        // signature and register/launch-time-shared scratch. Prefill GEMM and
-        // g_idx validation retain their non-capturable behavior.
+        // signature and register/launch-time-shared scratch. The allocation-free
+        // fp16 prefill GEMM remains conservatively unadvertised because variable-M
+        // prefill is outside the persistent decode graph and lacks replay coverage;
+        // f32 prefill scratch and g_idx validation are also non-capturable.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires M==1 decode GEMV without group_indices; prefill allocates scratch and group_indices validation reads D2H",
+                "requires M==1 decode GEMV without group_indices; prefill is outside the advertised capture contract and group_indices validation reads D2H",
             )
         }
     }
