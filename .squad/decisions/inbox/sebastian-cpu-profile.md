@@ -75,3 +75,55 @@ Thirty-two threads is the clear operating point for this 7B model on this dual-s
 3. **GQA/attention (6.4% here, increasing with context)** — reduce remaining per-layer attention setup/copies and reuse scratch/static KV views. Halving this bucket yields about 3.2% at this short context, with larger upside at long context.
 
 RMSNorm is the next target at 3.9%, preferably as part of residual-plus-normalization fusion. Sampling and generic loop orchestration are not priority work.
+
+## Follow-up: decode-to-decode runtime comparison
+
+All three runtimes used the same model directory, bare 8-token prompt, greedy decoding, and one warmup. The ORT wrapper explicitly used 32 intra-op threads. Native used 32 decode threads. OGA 0.14.1 does not expose the ORT intra-op setting through its Python configuration surface, so its model-default CPU threading remained in effect.
+
+### Comparable 24-token end-to-end request
+
+These numbers include per-request setup and prompt prefill, but exclude model loading and prompt tokenization:
+
+| runtime | ms/generated token | tok/s | native-relative |
+|---|---:|---:|---:|
+| Native nxrt CPU | 116.662 | 8.57 | 1.00x |
+| ORT wrapper, 32 threads | 45.633 | **21.91** | **2.56x** |
+| onnxruntime-genai | 53.179 | **18.80** | **2.19x** |
+
+The repository `oga_bench.py` originally reported 21.04 tok/s at 24 tokens because its timer begins **after** `Generator.append_tokens`, excluding OGA's prompt prefill. A separate timer around generator setup, append, and decode gives the comparable 18.80 tok/s above. OGA spent about 1.1 ms in generator setup and 101.8 ms in prompt append/prefill per request.
+
+### Clean 128-token steady decode
+
+Each runtime generated 128 tokens and the steady window excluded the first eight emitted tokens. Native and ORT produced the same continuation; OGA produced a different greedy continuation despite the same raw prompt/model, so its number is a throughput comparison at identical lengths rather than token-identical execution.
+
+| runtime | steady window | ms/M=1 token | tok/s | native-relative |
+|---|---:|---:|---:|---:|
+| Native nxrt CPU, 32 threads | tokens 9-128 | 91.447 | 10.94 | 1.00x |
+| ORT wrapper, 32 threads | tokens 9-128 | 37.145 | **26.92** | **2.46x** |
+| onnxruntime-genai | tokens 9-128 | 48.101 | **20.79** | **1.90x** |
+
+The earlier native 12.59 tok/s value covered only a short 24-token request. Extending all runtimes to the same 128-token context lowers native to 10.94 tok/s; the clean decode gap is therefore 2.46x to the ORT wrapper and 1.90x to OGA. ORT's full 128-token request measured 26.43 tok/s including prefill and one final logits materialization.
+
+## Follow-up: decomposing native prefill versus reset
+
+A prefill-only native run (`--tokens 1 --warmups 1 --runs 3`, node profiling enabled) directly separates graph execution from everything outside executor nodes:
+
+| component per request | time | share |
+|---|---:|---:|
+| M=8 executor-node compute, mean | 748.617 ms | 99.2% |
+| Reset, input/output allocation, sampling, detokenization, and profiler bookkeeping combined | at most 5.880 ms | at most 0.8% |
+| Total mean wall time | 754.497 ms | 100% |
+
+The three measured M=8 node times were 1079.810, 583.353, and 582.688 ms, demonstrating substantial host/cache noise but consistently dwarfing reset overhead. Mean M=8 compute attribution was:
+
+| prefill operator | mean ms | compute share |
+|---|---:|---:|
+| `MatMulNBits` | 607.858 | **81.2%** |
+| GQA/attention | 45.686 | 6.1% |
+| `Silu` | 45.236 | 6.0% |
+| RMSNorm/LayerNorm | 28.302 | 3.8% |
+| `Add` + `Mul` and remaining nodes | 21.535 | 2.9% |
+
+This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 model compute, not benchmark reset/allocation. The native M=8 prefill is roughly 0.58-1.08 seconds versus 63.5 ms for the 32-thread ORT wrapper first forward and about 102 ms for OGA prompt append/prefill. Lowering `NXRT_SQNBIT_PREFILL_MIN` to route M=8 through MLAS did not improve end-to-end throughput (8.43 versus 8.57 tok/s).
+
+**Decision:** assign dedicated CPU prefill optimization work if TTFT or short-request throughput matters. It will not improve steady M=1 decode, but the measured M=8 compute is a real product bottleneck and is overwhelmingly `MatMulNBits`, not harness overhead.
