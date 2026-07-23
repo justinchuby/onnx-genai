@@ -171,10 +171,10 @@ and practical sparse MoE emission remain separate work.
    Llama-style ops, and already runs on native CUDA with zero fallbacks.
 2. **Use DeepSeek-R1-Distill-Qwen-1.5B as the reasoning-model smoke
    target (done).** Its Qwen2 graph captures as one segment with zero fallbacks.
-3. **Implement quantization-aware GLM-4 preprocessing in Mobius, then emit the
-   downloaded GPTQ checkpoint (3-5 days).** Graph support and a packed int4
-   checkpoint are available; the remaining blocker is checkpoint-name mapping
-   plus fused packed-QKV splitting/repacking.
+3. **Implement quantization-aware GLM-4 preprocessing in Mobius and emit the
+   downloaded GPTQ checkpoint (done, pending Mobius PR #424).** The importer now
+   remaps the legacy encoder hierarchy, preserves fused packed gate/up, and
+   splits fused packed QKV into separate MatMulNBits projections.
 4. **Run a real DeepSeek-V2-Lite/V3 MLA float or per-expert-int4 structural
    parity export (3-5 days).** This validates MLA shapes and partial RoPE while
    explicitly accepting that unrolled MoE is not performant.
@@ -186,8 +186,8 @@ and practical sparse MoE emission remain separate work.
    state/indexer-cache orchestration.
 
 The truly blocked items are practical MoE packing and V4/GLM-5.2 sparse+MTP
-orchestration. Dense DeepSeek-Coder and R1-Distill run now; dense GLM-4 graph
-execution is tractable but export is blocked on quantized-weight preprocessing.
+orchestration. Dense DeepSeek-Coder, R1-Distill, and GLM-4-9B now run on the
+native CUDA EP.
 
 ## Weight generation progress 2026-07-23
 
@@ -231,7 +231,7 @@ The greedy output was grammatical but degenerated into repeated
 Thus execution/capture is proven, but this plain-prompt greedy smoke is not a
 quality validation.
 
-### GLM-4-9B: exporter weight mapping blocked
+### GLM-4-9B: exporter weight mapping resolved
 
 The ORT GenAI builder does recognize `zai-org/GLM-4-9B` as `ChatGLMModel` and
 selects GQA/int4 CUDA. It downloaded the ten-file checkpoint, then failed while
@@ -275,10 +275,51 @@ Check if the preprocess_weights logic is correct.
 
 The source checkpoint uses names such as
 `transformer.encoder.layers.0.self_attention.query_key_value.qweight` and a
-fused interleaved QKV projection. Mobius's current ChatGLM preprocessing only
+fused concatenated QKV projection. Mobius's previous ChatGLM preprocessing only
 renames `self_attention` and MLP projection names; it does not remap the
 `transformer.encoder` hierarchy and split/repack the fused quantized QKV into
-the graph's `q_proj`/`k_proj`/`v_proj` initializers. No runnable GLM-4 artifact
-was emitted. The concrete next implementation is a quantization-aware GLM-4
-weight preprocessor in Mobius, plus `.bin` support or use of the downloaded
-GPTQ safetensors checkpoint.
+the graph's `q_proj`/`k_proj`/`v_proj` initializers.
+
+Mobius PR [onnxruntime/mobius#424](https://github.com/onnxruntime/mobius/pull/424)
+implements that preprocessing. It also normalizes legacy ChatGLM configuration
+fields (`num_layers`, `multi_query_group_num`, `kv_channels`, `seq_length`,
+projection bias flags), selects the fused gate/up MLP, and preserves partial
+interleaved RoPE (`0.5`).
+
+The previously downloaded GPTQ safetensors checkpoint now emits successfully:
+
+```bash
+/home/justinchu/mobius/.venv/bin/mobius build \
+  --model ModelCloud/glm-4-9b-gptq-4bit --trust-remote-code \
+  --dtype f16 --ep cuda --runtime onnx-genai \
+  --optimize=group_query_attention,skip_norm \
+  /home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda
+```
+
+The 6.3 GB graph contains 240 symmetric block-128 `MatMulNBits`, 40 GQA,
+80 skip-RMSNorm, and 40 activation `Split` nodes. Model checksums:
+
+```text
+8901dba568ae59b8caca0186f391350d4657af99c3c2656495fc83bc48d33033  model.onnx
+8169705cdb528915bec69e82442123fbd40c4ea8eee9ef1558264bfb736d394b  model.onnx.data
+54323f454c7eddebf2e46a5296d9df2fef6fde609d5e8185ef1d3aa418e8272a  inference_metadata.yaml
+```
+
+Native CUDA on GPU 4 generated a coherent response:
+
+```text
+" I'm a bot. I'm trying to help you with your question.
+, but I'm not sure what you're asking. Can you please clarify your question"
+```
+
+Steady decode was 91.51 tok/s (10.928 ms/token). Capture diagnostics reported
+41 captured segments and 40 eager seams, one per fused-MLP activation `Split`.
+The measured run reported `captures=1 replays=29 fallbacks=0`, so GLM-4 dense
+execution is unblocked. The seams are a performance issue, not an execution
+fallback.
+
+One packaging caveat remains: the original GPTQ repository exposes only a
+custom slow tiktoken tokenizer, so Mobius cannot derive `tokenizer.json`
+automatically. The smoke package uses the compatible fast tokenizer from
+`THUDM/glm-4-9b-chat-hf`. This does not block graph execution, but tokenizer
+fallback/source selection should be automated before distributing the package.
