@@ -3822,3 +3822,16 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
   - Multi-ONNX encoder/decoder package harness (Whisper) + Int32 input_ids synthesis for probes.
   - Nemotron joint graph: loads + matches ORT (max_abs 9.5e-7) but native 71ms vs ORT 0.35ms on synthetic probe (perf).
 <!-- scribe-merge-2026-07-23T18-50-00Z-f16-rope-gemma-end -->
+
+---
+### 2026-07-23: Token divergences resolved + 8-bit MatMulNBits regression oracle (Horatio)
+**By:** Horatio (investigation, opus), coordinator merge. Reviewed: self (test-only, oracle independence verified).
+**What:** Investigated the two user-mandated native-vs-ORT token divergences Sara reported (Phi-3.5 int4 @ token 65; Qwen3-0.6B int8/block-128 immediate). NEITHER reproduces at branch tip (perf/cpu-ep-mlas): native == ORT byte-identical for full 128 tokens on BOTH models, and thread-count invariant (1|4|48 workers -> identical ids), ruling out reduction-order nondeterminism.
+**Root causes (already fixed by prior merges):**
+- Phi-3.5 token-65: CompInt8 activation per-K-block int8 quant fix (70cd499, locked 557c3ed) — matches ORT/MLAS QuantizeARow_CompInt8. The "identical for 64, flips near-tie argmax at 65" symptom matches slow-drift-then-flip. Sara's report predates that fix on her checkout / was a high-load ORT artifact.
+- Qwen3-0.6B: no native bug. try_mlas_sqnbit declines bits!=4 (matmul_nbits.rs:574), so all 8-bit block-128 weights take the exact dequantize-to-f32 path (dequantize_weight -> gemv_nk/gemm) == ORT CompFp32. Sara's wrong-from-token-0 output is consistent with ORT miscompute under ~40x CPU oversubscription (her load 41/58/64), not a native defect.
+**Contribution merged (bac0ae3, cherry-pick of db55954, test-only +179 lines):**
+- matmulnbits_8bit_block128_execute_matches_dequant_f32_oracle: real execute() vs INDEPENDENT from-scratch dequant-f32 GEMM oracle; symmetric + asymmetric uint8 zp; decode M=1 + prefill M=5; rel RMSE <= 1e-5 + per-row argmax parity.
+- matmulnbits_8bit_block128_argmax_matches_dequant_f32_oracle_at_near_tie: deterministic near-tie sweep; execute() never reverses f32 oracle greedy winner.
+- Both green; oracle confirmed non-vacuous (out from CpuExecutionProvider.execute, oracle from plain reference GEMM over independently-dequantized weights).
+**Residual:** If either divergence re-captured on a quiescent host (load < ~4), escalate with per-op logit dumps at the diverging step. Pre-existing clippy -D warnings drift (matmul.rs:800 excessive_precision on f16 literals from 557c3ed; group_query_attention.rs:1346 needless_range_loop) flagged for a separate lint-hygiene pass — NOT from this change.
