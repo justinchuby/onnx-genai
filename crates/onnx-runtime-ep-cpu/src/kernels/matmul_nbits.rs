@@ -871,6 +871,10 @@ fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDecodePools> 
     }
 }
 
+#[cfg(test)]
+static SPMD_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Fan a projection's output rows out across the decode workers.
 ///
 /// With `numa-split` active, the rows are sharded across the per-node sub-pools
@@ -888,6 +892,8 @@ where
         return;
     }
     if let Some(spmd) = spmd_decode_active() {
+        #[cfg(test)]
+        SPMD_TEST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         spmd.dispatch_output_rows(result, k, &compute);
         return;
     }
@@ -1035,6 +1041,9 @@ impl Drop for DecodeResidencyGuard {
 /// Callers should enter this scope only for the M=1 CPU decode case; prefill
 /// (M>1) and non-CPU paths must keep using the global pool.
 pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    let both_requested = crate::decode_spmd::enabled()
+        && std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
+            .is_ok_and(|value| value.trim() == "numa-split");
     // `numa-split`: run the forward on the dispatcher pool and let each M=1
     // projection fan its output rows out across the per-node sub-pools. The
     // decode-residency flag is set too, so the inner `with_decode_pool` calls
@@ -1042,6 +1051,14 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     // single-node pool); the numa-scope flag makes `parallel_output_rows`
     // choose the two-level per-node dispatch.
     if let Some(numa) = numa_pools() {
+        if both_requested {
+            report_decode_strategy_precedence(
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and \
+                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 are mutually exclusive; \
+                 numa-split is active because it has precedence and its two-level \
+                 NUMA layout was built successfully",
+            );
+        }
         return numa.install_scope(move || {
             let _numa_guard = NumaScopeGuard::enter();
             let _decode_guard = DecodeResidencyGuard::enter();
@@ -1055,9 +1072,25 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     // re-install the flat pool); the SPMD-scope flag routes `parallel_output_rows`
     // through the persistent pool.
     if crate::decode_spmd::pools().is_some() {
+        if both_requested {
+            report_decode_strategy_precedence(
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and \
+                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 are mutually exclusive; \
+                 persistent SPMD is active because the higher-precedence numa-split \
+                 layout was unavailable",
+            );
+        }
         let _spmd_guard = SpmdScopeGuard::enter();
         let _decode_guard = DecodeResidencyGuard::enter();
         return f();
+    }
+    if both_requested {
+        report_decode_strategy_precedence(
+            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and \
+             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 are mutually exclusive; \
+             neither strategy is active because no bounded decode worker count or \
+             usable numa-split layout is available",
+        );
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => pool.install(move || {
@@ -1065,6 +1098,13 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
             f()
         }),
         _ => f(),
+    }
+}
+
+fn report_decode_strategy_precedence(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        eprintln!("onnx-genai: decode strategy selection: {message}");
     }
 }
 
@@ -2994,6 +3034,122 @@ mod tests {
     fn backend_env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    const SPMD_PARITY_CHILD_ENV: &str = "NXRT_SPMD_PARITY_CHILD";
+    const SPMD_PARITY_MARKER: &str = "NXRT_SPMD_PARITY_BYTES=";
+
+    fn real_int4_decode_fixture_bytes() -> Vec<u8> {
+        let (n, k, block_size) = (1024usize, 1024usize, 32usize);
+        let blocks = k / block_size;
+        let packed = PackedInt4Weight {
+            values: (0..n * blocks * (block_size / 2))
+                .map(|index| {
+                    let low = ((index * 13 + 3) & 0xf) as u8;
+                    let high = ((index * 7 + 11) & 0xf) as u8;
+                    low | (high << 4)
+                })
+                .collect(),
+            scales: (0..n * blocks)
+                .map(|index| 0.000_5 + (index % 29) as f32 * 0.000_031_25)
+                .collect(),
+        };
+        let mut activation: Vec<f32> = (0..k)
+            .map(|index| ((index * 37 % 257) as f32 - 128.0) * 0.007_812_5)
+            .collect();
+        let dot_kernel = selected_dot_kernel();
+        let mut bytes = Vec::with_capacity(6 * n * std::mem::size_of::<f32>());
+
+        with_decode_pool_scope(|| {
+            for op in 0..6usize {
+                let mut output = vec![0.0f32; n];
+                int4_matmul_m1(&activation, &packed, &mut output, k, n, dot_kernel);
+                for value in &output {
+                    bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+                for (index, value) in activation.iter_mut().enumerate() {
+                    *value = output[index] * 0.125
+                        + ((op * 17 + index * 5) % 31) as f32 * 0.000_976_562_5;
+                }
+            }
+        });
+        bytes
+    }
+
+    fn parity_child_output(persistent: bool) -> Vec<u8> {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::spmd_real_int4_parity_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(SPMD_PARITY_CHILD_ENV, if persistent { "on" } else { "off" })
+            .env(DECODE_THREADS_ENV, "31")
+            .env("RAYON_NUM_THREADS", "31")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if persistent {
+            command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
+        } else {
+            command.env_remove(crate::decode_spmd::PERSISTENT_POOL_ENV);
+        }
+        let output = command.output().expect("run SPMD parity child process");
+        assert!(
+            output.status.success(),
+            "SPMD parity child failed (persistent={persistent}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("child output is UTF-8");
+        let encoded = stdout
+            .lines()
+            .find_map(|line| {
+                line.find(SPMD_PARITY_MARKER)
+                    .map(|index| &line[index + SPMD_PARITY_MARKER.len()..])
+            })
+            .expect("child emitted parity bytes");
+        assert_eq!(encoded.len() % 2, 0);
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spmd_real_int4_parity_subprocess() {
+        let Ok(mode) = std::env::var(SPMD_PARITY_CHILD_ENV) else {
+            return;
+        };
+        let persistent = mode == "on";
+        assert_eq!(
+            crate::decode_spmd::pools().is_some(),
+            persistent,
+            "the ON child must build the persistent pool and the OFF child must not"
+        );
+        SPMD_TEST_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let bytes = real_int4_decode_fixture_bytes();
+        if persistent {
+            assert!(
+                SPMD_TEST_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed) >= 6,
+                "persistent parity child did not route every real int4 op through SPMD"
+            );
+        }
+        let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        println!("{SPMD_PARITY_MARKER}{encoded}");
+    }
+
+    #[test]
+    fn spmd_real_multi_op_int4_is_bit_identical_at_odd_worker_count() {
+        let baseline = parity_child_output(false);
+        let persistent = parity_child_output(true);
+        assert_eq!(
+            persistent, baseline,
+            "31-worker persistent SPMD output must be byte-identical to flag-OFF \
+             across every sequential packed-int4 MatMulNBits op"
+        );
     }
 
     /// M-based hybrid routing gate: with an otherwise-eligible int4 case

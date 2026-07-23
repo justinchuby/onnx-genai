@@ -105,13 +105,23 @@ node-local placement and exact reduction order):
 
 Bit-parity: output rows are sharded, and each output row is an independent
 full-K dot product, so any row partition is exactly associative -- greedy token
-ids are byte-identical with the flag ON vs OFF (verified over 64 tokens).
+ids are byte-identical with the flag ON vs OFF. The regression test runs several
+sequential real packed-int4 M=1 MatMulNBits kernels in fresh subprocesses, compares
+every output byte, asserts that the persistent pool actually dispatched the ON
+case, and uses 31 workers to cover uneven node/row sharding.
 
 Generality / fallback (Rule 2, Rule 5): default OFF; on a single-node host,
-non-Linux, or when pinning is refused (cgroup) it degrades to the existing
-bounded pool behavior. The barrier primitive itself is portable `std` atomics +
-`thread::park`; only the optional CPU pinning is Linux-specific and is a
-best-effort no-op elsewhere.
+non-Linux, or when pinning is refused (cgroup) it degrades to a single unpinned
+SPMD worker group; it does not switch back to the bounded Rayon pool. The barrier
+primitive itself is portable `std` atomics + `thread::park`; only optional CPU
+pinning is platform-specific and best-effort.
+
+Decode strategy precedence is explicit: when both
+`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split` and
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` are set, the strategies are mutually
+exclusive and `numa-split` wins if its two-level topology can be built. The
+runtime reports that choice once. If `numa-split` cannot build, the persistent
+SPMD pool remains eligible and that fallback choice is also reported once.
 
 Measured (Sapphire Rapids Xeon 8480C, 2x48 cores, 2 NUMA nodes,
 Qwen2.5-Coder-7B int4, 32 decode threads, steady M=1, 96 tokens, interleaved

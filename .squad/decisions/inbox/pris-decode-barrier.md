@@ -115,7 +115,7 @@ addressed by this lever.
   `pris-decode-profile.md`); pinning failures report a clear fallback message,
   not a panic.
 - **Rule 2 (EP/topology-agnostic):** default OFF; single-node host, non-Linux,
-  or cgroup-refused pinning all degrade to the existing bounded-pool behavior.
+  or cgroup-refused pinning all degrade to a single unpinned SPMD group.
   Barrier primitive is portable `std` atomics + `thread::park`; only optional CPU
   pinning is Linux-specific (best-effort no-op elsewhere). No x86-only or
   2-node-only assumptions — worker count / node split derive from runtime

@@ -18,7 +18,9 @@
 //! bump publishes the op, workers observe it, run their pre-assigned output-row
 //! shard, and decrement a per-node completion counter; the dispatcher spins on
 //! those counters. No per-op allocation, no deque, no epoch GC -- just a handful
-//! of atomics per projection.
+//! of atomics per projection. An unwind-only completion guard still decrements
+//! the counter if a worker panics, poisons the pool, and makes the dispatcher
+//! report an actionable panic instead of hanging.
 //!
 //! # Two-level, NUMA-aware (mirrors `numa-split`)
 //!
@@ -39,7 +41,10 @@
 //! unpinned worker group -- it still replaces the per-op Rayon barrier with the
 //! lightweight one, and stays correct. The whole layout is opt-in behind
 //! `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` (rule 5); when unset the decode path
-//! is byte-for-byte unchanged.
+//! is byte-for-byte unchanged. If `ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`
+//! is also requested, `numa-split` takes precedence when its two-level layout can
+//! be built; the mutually-exclusive selection is reported once. If that layout
+//! is unavailable, the persistent pool remains eligible.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -68,10 +73,13 @@ const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 struct Padded<T>(T);
 
 /// A type-erased decode job: run the shard for the given global worker index.
-/// The pointer is only dereferenced by workers between a [`SharedState::publish`]
-/// and the matching dispatcher wait, both of which live entirely inside one
-/// blocking `dispatch` call, so the borrow it erases always outlives its use.
-type JobPtr = *const (dyn Fn(usize) + Sync);
+/// The data pointer is only dereferenced between [`SharedState::publish`] and the
+/// matching dispatcher wait, so the borrowed closure always outlives its use.
+#[derive(Clone, Copy)]
+struct Job {
+    data: *const (),
+    call: unsafe fn(*const (), usize),
+}
 
 /// State shared between the dispatcher (the engine thread running the forward)
 /// and the persistent worker threads.
@@ -80,7 +88,7 @@ struct SharedState {
     sequence: Padded<AtomicUsize>,
     /// The current op, published before `sequence` bumps and read after the
     /// bump is observed (release/acquire pairing on `sequence`).
-    job: UnsafeCell<Option<JobPtr>>,
+    job: UnsafeCell<Option<Job>>,
     /// Outstanding worker acknowledgements for the current op, one counter per
     /// node so the dispatcher only reads each node's own (mostly node-local)
     /// line instead of an N-way shared barrier.
@@ -96,6 +104,10 @@ struct SharedState {
     /// race a not-yet-started worker (which would miss the op and hang the
     /// barrier).
     ready: AtomicUsize,
+    /// Nonzero after a worker panics while running an op (`worker_index + 1`).
+    /// A poisoned pool rejects this and every later dispatch instead of hanging
+    /// forever waiting for a worker that has unwound.
+    poisoned_worker: AtomicUsize,
     shutdown: AtomicBool,
 }
 
@@ -108,7 +120,7 @@ unsafe impl Send for SharedState {}
 impl SharedState {
     /// Publish `job` for `node_pending[node] = counts[node]` workers and wake any
     /// parked worker. Must be paired with [`SharedState::wait`].
-    fn publish(&self, job: JobPtr, counts: &[usize], handles: &[JoinHandle<()>]) {
+    fn publish(&self, job: Job, counts: &[usize], handles: &[JoinHandle<()>]) {
         // Publish the job pointer, then the per-node counts, before the sequence
         // bump makes them visible to workers.
         unsafe {
@@ -149,6 +161,18 @@ impl SharedState {
             if spins >= SPIN_BEFORE_YIELD {
                 thread::yield_now();
             }
+        }
+    }
+
+    fn panic_if_poisoned(&self) {
+        let poisoned = self.poisoned_worker.load(Ordering::Acquire);
+        if poisoned != 0 {
+            let worker = poisoned - 1;
+            panic!(
+                "persistent SPMD decode worker {worker} panicked while executing a decode op; \
+                 the pool is poisoned and cannot continue. Disable \
+                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL or restart the process"
+            );
         }
     }
 }
@@ -195,6 +219,7 @@ impl SpmdDecodePools {
                 .collect(),
             worker_node,
             ready: AtomicUsize::new(0),
+            poisoned_worker: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
         });
 
@@ -250,16 +275,28 @@ impl SpmdDecodePools {
     /// `job(global_worker_index)` runs the shard owned by that worker. The
     /// dispatcher (this thread) does not compute; it only publishes and waits,
     /// mirroring an external `pool.install` where the caller blocks.
-    fn dispatch(&self, job: &(dyn Fn(usize) + Sync)) {
-        // SAFETY: erase the borrow's lifetime to store the trait-object pointer.
-        // `dispatch` blocks in `wait()` until every worker has finished reading
-        // and running `job`, so the pointee outlives all worker accesses; the
-        // `Sync` bound makes the shared &-access sound.
-        let job_ptr = job as *const (dyn Fn(usize) + Sync);
-        let job_ptr: JobPtr = unsafe { std::mem::transmute::<_, JobPtr>(job_ptr) };
+    fn dispatch<F>(&self, job: &F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        self.shared.panic_if_poisoned();
+        unsafe fn call<F>(data: *const (), global_index: usize)
+        where
+            F: Fn(usize) + Sync,
+        {
+            // SAFETY: `data` came from a live `&F`; synchronous dispatch keeps
+            // that borrow alive until every worker acknowledges this op.
+            let job = unsafe { &*data.cast::<F>() };
+            job(global_index);
+        }
+        let job = Job {
+            data: std::ptr::from_ref(job).cast(),
+            call: call::<F>,
+        };
         self.shared
-            .publish(job_ptr, &self.node_worker_counts, &self.handles);
+            .publish(job, &self.node_worker_counts, &self.handles);
         self.shared.wait();
+        self.shared.panic_if_poisoned();
     }
 
     /// Split `n` output rows across the node groups proportionally to their
@@ -440,6 +477,42 @@ struct CopyTable<'a, T> {
 // SAFETY: each worker copies only its own disjoint row range.
 unsafe impl<T: Send + Sync> Sync for CopyTable<'_, T> {}
 
+/// Ensures a worker always acknowledges the current op while making the normal
+/// path no more expensive than the existing atomic decrement. `complete`
+/// forgets the guard after decrementing; only unwinding executes `Drop`, which
+/// poisons the pool before decrementing so the dispatcher cannot miss the panic.
+struct WorkerCompletion<'a> {
+    shared: &'a SharedState,
+    node: usize,
+    global_index: usize,
+}
+
+impl WorkerCompletion<'_> {
+    fn complete(self) {
+        self.shared.node_pending[self.node]
+            .0
+            .fetch_sub(1, Ordering::AcqRel);
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WorkerCompletion<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .poisoned_worker
+            .compare_exchange(
+                0,
+                self.global_index + 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .ok();
+        self.shared.node_pending[self.node]
+            .0
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The persistent worker main loop: wait for a published op, run this worker's
 /// shard, acknowledge, repeat until shutdown.
 fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
@@ -492,9 +565,15 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
         // SAFETY: the dispatcher keeps the pointee alive until every node
         // counter reaches zero, i.e. until after this worker acknowledges below.
         let job = unsafe { (*shared.job.get()).expect("published SPMD job") };
-        let job: &(dyn Fn(usize) + Sync) = unsafe { &*job };
-        job(global_index);
-        shared.node_pending[node].0.fetch_sub(1, Ordering::AcqRel);
+        let completion = WorkerCompletion {
+            shared: &shared,
+            node,
+            global_index,
+        };
+        // SAFETY: `dispatch` keeps the closure alive until this worker
+        // acknowledges through `completion`.
+        unsafe { (job.call)(job.data, global_index) };
+        completion.complete();
     }
 }
 
@@ -536,7 +615,7 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
 }
 
 /// True only when the opt-in switch is exactly `1`.
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     std::env::var(PERSISTENT_POOL_ENV)
         .map(|value| value.trim() == "1")
         .unwrap_or(false)
@@ -745,5 +824,26 @@ mod tests {
         let mut got = vec![0.0f32; n];
         pool.dispatch_output_rows(&mut got, 4096, &compute);
         assert_eq!(got, vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn panicking_worker_poison_is_reported_without_hanging() {
+        let pool = single_group_pool(4);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.dispatch(&|worker| {
+                assert_ne!(worker, 2, "intentional SPMD worker panic");
+            });
+        }));
+        let panic = result.expect_err("dispatcher must report a worker panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("persistent SPMD decode worker 2 panicked")
+                && message.contains("pool is poisoned"),
+            "unexpected dispatcher diagnostic: {message}"
+        );
     }
 }
