@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T09:10Z — CUDA perf wave 2 complete: f16/bf16 IndexShare, engine build-fix + MoE fixture, SwiGLU-RMS fusion (7B +23.5%, native beats ORT on all Qwen), Phi cast-fold (eager +25%). Wave 3 in flight: Qwen1.5B native-vs-ORT decode divergence root-cause + Phi captured-path GQA._
+_Last updated: 2026-07-23T10:27Z — Phi asymmetric-int4 zero-point SwiGLU-RMS fusion and post-fusion H200 profile._
 
-**Current `origin/main` implementation HEAD:** `17ac19f` (after the CUDA perf wave 2 batch + Phi cast-fold).
+**Current `origin/main` implementation HEAD:** `2715151` (Phi zero-point SwiGLU-RMS fusion).
+
+## 2026-07-23 — Phi zero-point fusion + post-fusion H200 milestone
+
+- **Phi optimization stack ✅:** fp32-gamma vectorized skip-RMSNorm (`8a0814e`), int8 fp16 GEMV vectorization (`cf65ea7`), block-128 MatMulNBits (`c04a622`), graph seams reduced to 3 segments (`4372f1b`), and asymmetric-int4 zero-point SwiGLU-RMS fusion (`2715151`). Phi now reaches **166.12 tok/s**, **+21.71%** versus the clean 136.49 tok/s pre-fusion baseline; its ORT gap is **-27.65%**, down from **-59.86%** at session start. Fusion ON/OFF on current main is 166.12/156.24 tok/s (**+6.32%**).
+- **Qwen control rerun:** 0.5B **816.15 tok/s (+10.02% vs ORT)** and 1.5B **535.87 (+10.00%)** beat ORT, although the known 1.5B repetitive-output divergence remains. The 7B control repeatedly measured **~253 tok/s (-5.33%)**, below both its 288.64 pre-fusion result and ORT; this reproducible regression needs follow-up rather than being reported as a win.
+- **New Phi profile:** captured-decode `nsys --cuda-graph-trace=node` attributes 28.0% to int8 GEMV, 24.7% to fused gate-up/SwiGLU/RMSNorm, 19.8% to int4 GEMV, 15.0% to standalone skip-RMSNorm, and 11.7% to GQA. The qkv/down **int8-fused path is in progress** and targets the combined 43.0% int8-GEMV + standalone-norm cost.
+- **Model expansion:** GLM, DeepSeek, and Qwen3 performance validation remains blocked on availability of the corresponding `cuda-gpu` weights.
 
 ### ⚠️ Open correctness finding (2026-07-23): Qwen2.5-1.5B native decode diverges from ORT
 
@@ -14,7 +21,7 @@ Native CUDA greedy decode of Qwen2.5-1.5B (int4) emits degenerate repetition ("T
 
 ## 2026-07-23 — CUDA perf wave 2 (SwiGLU-RMS fusion flips 7B positive; native beats ORT on 0.5B/1.5B/7B)
 
-Standing native vs onnxruntime-genai-cuda 0.14.1 (8×H200, foundry cuda-gpu int4, greedy, 3-run median @128) after this wave: **Qwen0.5B ~792 vs 742 (+6.9%), 1.5B 514 vs 487 (+5.5%), 7B ~285 vs 267 (+6.8% — now AHEAD, pending Marsten re-verify)**; Phi-4-mini 92 vs 230 (−60%, sole remaining gap — now known to be captured-path GroupQueryAttention, not Cast overhead).
+Historical wave-2 native vs onnxruntime-genai-cuda 0.14.1 results (8×H200, foundry cuda-gpu int4, greedy, 3-run median @128) were **Qwen0.5B ~792 vs 742 (+6.9%), 1.5B 514 vs 487 (+5.5%), and 7B ~285 vs 267 (+6.8%)**; Phi-4-mini was 92 vs 230 (−60%). The authoritative `2715151` rebench above supersedes these standing numbers and did not reproduce the 7B win.
 
 - **f16/bf16 IndexShare storage ✅ (`69ee4e4`, Keaton; Chew 🟢):** homogeneous f32/f16/bf16 K/V storage for the device IndexShare kernel (was f32-only), fp32 accumulation retained; module bumped to `index_share_f32_f16_bf16_v3`. Parity vs exact-rounded CPU oracle max Δ 4.88e-5 (f16) / 1.03e-3 (bf16); present-KV bit-exact; captured f16 replay byte-identical to eager, latch preserved. 13 GPU tests.
 - **Engine `cuda` build-fix + native_engine MoE fixture ✅ (`64238b5`, Irmgard; Gaff 🟢):** wave-1 `d2582df` left `onnx-genai-engine` referencing the undeclared `onnx_runtime_ep_api` crate → `profile_native` (bench-native,cuda) failed to compile, blocking ALL native benchmarking. Fix: new inherent `CudaExecutionProvider::initialized(ordinal)` (does `new()`+`initialize(&EpConfig::default())` internally) so the engine no longer names the api crate. Also repaired the stale `ModelCapabilities`/`mixture_of_experts` test fixtures (native_engine 7/7; fixtures now assert real decode+fallback, stronger than the prior error-string checks).

@@ -9,16 +9,66 @@ have added host-side noise.
 | Model | Native tok/s (median of 3) | ORT 0.14.1 tok/s | Delta | Coherent? | Segments / fallbacks |
 |---|---:|---:|---:|:---:|---:|
 | Qwen2.5-0.5B int4 | 821.35 | 741.83 | **+10.72%** | Yes | 1 / 0 |
-| Qwen2.5-1.5B int4 | 586.82 | 487.14 | **+20.46%** | Yes | 1 / 0 |
+| Qwen2.5-1.5B int4 | 586.82 | 487.14 | **+20.46%** | Deterministic; repetitive | 1 / 0 |
 | Qwen2.5-7B int4 | 288.64 | 267.23 | **+8.01%** | Yes | 1 / 0 |
 | Phi-4-mini int4/int8 | 136.49 | 229.62 | **-40.56%** | Yes | 3 / 0 |
 
 Native samples (tok/s) were 823.18/821.35/814.49, 575.13/586.82/586.88,
 288.27/288.81/288.64, and 137.19/134.65/136.49 respectively; no sample was
 discarded as an obvious outlier. Each diagnostic run reported one measured
-capture, 30 replays, zero fallbacks, and coherent greedy text. The ORT values
-are the existing authoritative 0.14.1 medians in the post-fusion table below.
+capture, 30 replays, and zero fallbacks. Streams were token-identical; the
+known 1.5B repetitive-output divergence was present. The ORT values are the
+existing authoritative 0.14.1 medians in the post-fusion table below.
 Deltas are `(native - ORT) / ORT * 100`.
+
+## Post-fusion @ 2715151 — 2026-07-23
+
+This rerun measures the asymmetric-int4 zero-point SwiGLU-RMS fusion firing on
+Phi at `2715151`, again on physical GPU 5 (NVIDIA H200).
+
+| Model | Native tok/s (median of 3) | ORT 0.14.1 tok/s | Delta | Coherent? | Segments / fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| Qwen2.5-0.5B int4 | 816.15 | 741.83 | **+10.02%** | Yes | 1 / 0 |
+| Qwen2.5-1.5B int4 | 535.87 | 487.14 | **+10.00%** | Deterministic; repetitive | 1 / 0 |
+| Qwen2.5-7B int4 | 253.00 | 267.23 | **-5.33%** | Yes | 1 / 0 |
+| Phi-4-mini int4/int8 | 166.12 | 229.62 | **-27.65%** | Yes | 3 / 0 |
+
+Native samples (tok/s) were 816.15/817.15/799.00,
+535.92/535.87/507.35, 252.93/253.00/253.03, and
+164.04/168.99/166.12 respectively. The low 1.5B third sample is a likely
+host-noise outlier; its exclusion would not change the reported median.
+Repeated 7B sets remained near 253 tok/s, so its regression from the
+pre-fusion 288.64 tok/s baseline is reproducible rather than an isolated
+sample. A concurrent CPU-benchmark team may have added host-side noise.
+Diagnostic runs remained token-identical and reported one measured capture,
+30 replays, and zero fallbacks. The known Qwen 1.5B native greedy divergence
+remains: its stream is deterministic but falls into repetitive prose.
+
+### Phi fusion A/B
+
+On the same `2715151` binary, fusion ON reached **166.12 tok/s** versus
+**156.24 tok/s** with `ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION=1`, an exact
+**+6.32%** fusion gain. Against the `4372f1b` pre-fusion baseline
+(136.49 tok/s), the complete post-fusion stack is **+21.71%** faster.
+
+### Nsight Systems captured-decode profile
+
+`nsys profile --cuda-graph-trace=node` over a 64-token Phi run (one warmup,
+one measured generation) exposed the graph-node kernels. The captured decode
+kernel-time breakdown was:
+
+| Kernel | GPU kernel time |
+|---|---:|
+| `matmul_nbits_gemv_int8_f16` | **28.0%** |
+| `matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm` | **24.7%** |
+| `matmul_nbits_gemv_f16_scales_f16` | **19.8%** |
+| `skip_rmsnorm_f16_warp_half4` | **15.0%** |
+| GQA attention + prep + merge | **11.7%** |
+
+The next largest removable seam is therefore the standalone RMSNorm feeding
+the qkv/down int8 GEMVs: int8 GEMV plus standalone RMSNorm account for
+**43.0%** of GPU kernel time. This supports prioritizing the in-progress
+int8-fused path; GQA is materially smaller.
 
 ## f0af865 baseline
 
