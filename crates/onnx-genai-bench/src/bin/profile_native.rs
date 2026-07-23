@@ -249,6 +249,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
     }
+    onnx_runtime_session::print_exec_phase_profile();
     Ok(())
 }
 
