@@ -107,3 +107,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
+## 2026-07-23T22-29-16Z — DeepSeek dtod stream-ordering race learned
+- Root-cause correction: the DeepSeek MLA garbage decode was not RoPE/attention math; it was `CudaRuntime::dtod` copying on the legacy default stream before EP non-blocking-stream producers finished.
+- Durable lesson: when a CUDA copy bridges graph movement (`copy_reshape`) and EP kernels, verify stream ordering before localizing numerical bugs to model-specific kernels.
