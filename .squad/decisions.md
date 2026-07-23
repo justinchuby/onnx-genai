@@ -3873,3 +3873,13 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Also fixed latent UB in ALREADY-MERGED code:** Warrick's LinearAttention direct-state path did copy_from_slice(past_state)-then-mutate = copy_nonoverlapping UB if present aliases past_state. Now guarded.
 **Vartann verification:** byte_ranges_overlap correct on half-open ranges (exact/nested/partial detected, adjacent=non-overlap, saturating_add, no off-by-one); guard itself not UB (usize compare, no deref, &mut only after disjointness+exact-count proven); ALL direct-write sites gated; fallback byte-identical (copies past state before mutation, retrieved buffer fill(0.0) before use); length==1 CausalConv fast path algebraically identical. Vartann added an independent forced-alias test (output->q) that reproduces disjoint result exactly. Exact 32-token qwen3.5 ORT greedy parity.
 **Tests:** 815 ep-cpu lib green (+3 forced-alias regression tests: present<->past_state, y<->x, output<->v) + 10 integration; clippy clean. 🟡 nit (optional, not reachable today): CausalConv doesn't guard its two OUTPUTS (y vs present_state) against each other — LinearAttention already stricter. Per protocol Doc+Wendy both locked out; any hardening needs a third agent.
+
+### 2026-07-23: Clean load-gated native-vs-ORT CPU EP scoreboard (Langston)
+**By:** Langston (benchmark) — recorded by Coordinator
+**What:** Load-gated (1-min load<5) A/B, same genai loop, only --backend swapped:
+- Qwen2.5-0.5B int4: native 158.4 vs ORT 63.1 tok/s → **2.51x WIN** (@512 1.61x), parity OK.
+- Qwen2.5-coder-7B int4: native 36.0 vs ORT 16.4 → **2.19x WIN**, parity OK.
+- Phi-3.5-mini int4 (block-32 acc-level-4): native 13.6 vs ORT 21.9 → **0.62x (ORT 1.61x faster)**, soft near-tie drift @~62 (native numerics verified correct by Horatio's f32 oracle).
+- qwen3-0.6b int4 (generic-cpu-4): native 5.41 vs ORT 111.8 → **0.048x (ORT 20.7x faster)** AND parity FAIL from token 0 → native slow/broken fallback path. HIGH-PRIORITY.
+- qwen3.5-2b-text hybrid SSM: LOAD FAIL in BOTH backends (conv_state/recurrent_state vs io.kv_inputs mismatch) — genai-loop generality gap, not perf.
+**Why:** Confirms we beat ORT on the Qwen2.5 int4 family (no regression) but exposes two native gaps to close per user mandate (all parts beat ORT, cross-model): qwen3-0.6b native bug (#1) and Phi-3.5 acc-level-4 perf gap (#2). Dispatched Ridley (qwen3-0.6b) and Palmer (Phi-3.5) to fix. qwen3.5-2b hybrid-KV loading is a separate generality track.
