@@ -433,23 +433,41 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_half4(
     }
     inv_std = __shfl_sync(0xffffffffu, inv_std, 0);
 
+    const float* gamma_f = (const float*)gamma;
     for (int item = 0; item < chunks_per_lane; ++item) {
         const int chunk = lane + item * 32;
         SkipHalf4 residual;
-        SkipHalf4 scale;
         SkipHalf4 output;
         residual.raw = y4[chunk];
-        scale.raw = gamma4[chunk];
         const float2 value0 = __half22float2(residual.pair[0]);
         const float2 value1 = __half22float2(residual.pair[1]);
-        const float2 scale0 = __half22float2(scale.pair[0]);
-        const float2 scale1 = __half22float2(scale.pair[1]);
+        // gamma is only ever a final multiplicand (never part of the fp32
+        // variance accumulation), so an fp32 gamma is loaded at full precision
+        // while an fp16 gamma keeps the wide half4 load. This lets decoders that
+        // export gamma in fp32 (e.g. Phi) still take the vectorized warp path.
+        float scale0x, scale0y, scale1x, scale1y;
+        if (gamma_is_half) {
+            SkipHalf4 scale;
+            scale.raw = gamma4[chunk];
+            const float2 scale0 = __half22float2(scale.pair[0]);
+            const float2 scale1 = __half22float2(scale.pair[1]);
+            scale0x = scale0.x;
+            scale0y = scale0.y;
+            scale1x = scale1.x;
+            scale1y = scale1.y;
+        } else {
+            const int j = chunk << 2;
+            scale0x = gamma_f[j];
+            scale0y = gamma_f[j + 1];
+            scale1x = gamma_f[j + 2];
+            scale1y = gamma_f[j + 3];
+        }
         output.pair[0] = __floats2half2_rn(
-            value0.x * inv_std * scale0.x,
-            value0.y * inv_std * scale0.y);
+            value0.x * inv_std * scale0x,
+            value0.y * inv_std * scale0y);
         output.pair[1] = __floats2half2_rn(
-            value1.x * inv_std * scale1.x,
-            value1.y * inv_std * scale1.y);
+            value1.x * inv_std * scale1x,
+            value1.y * inv_std * scale1y);
         y4[chunk] = output.raw;
     }
 }
@@ -666,7 +684,7 @@ extern "C" __global__ void skip_layernorm_f32(
 
 const LAYERNORM_MODULE: &str = "layernorm_f16_v1";
 const RMSNORM_MODULE: &str = "rmsnorm_f16_v1";
-const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v4";
+const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v5";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
@@ -687,6 +705,17 @@ struct SkipRmsnormSelection {
     reason: &'static str,
 }
 
+/// Environment opt-out for the fp32-gamma warp-half4 path, mirroring the other
+/// CUDA A/B switches. Any value other than unset/empty/`0` forces an fp16
+/// activation norm with an fp32 gamma back onto the generic warp kernel (for
+/// A/B measurement or rollback); an fp16 gamma is unaffected.
+const FP32_GAMMA_WARP_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_FP32_GAMMA_WARP_NORM";
+
+fn fp32_gamma_warp_disabled() -> bool {
+    std::env::var_os(FP32_GAMMA_WARP_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 /// Select the one-warp half4 path by its actual data-layout capabilities, never
 /// by a model-specific hidden dimension.
 fn select_skip_rmsnorm_variant(
@@ -696,23 +725,32 @@ fn select_skip_rmsnorm_variant(
     has_bias: bool,
     gamma_is_half: bool,
 ) -> SkipRmsnormSelection {
+    // gamma is only a final multiplicand (never part of the fp32 variance
+    // accumulation), so the vectorized warp path serves an fp32 gamma at full
+    // precision too. The A/B switch keeps the pre-existing fp16-gamma-only gate.
+    let gamma_ok = gamma_is_half || !fp32_gamma_warp_disabled();
     if is_half
         && dense_skip
         && norm_size.is_multiple_of(SKIP_RMSNORM_WARP_HALF4_MULTIPLE)
         && !has_bias
-        && gamma_is_half
+        && gamma_ok
     {
         SkipRmsnormSelection {
             variant: SkipRmsnormVariant::F16WarpHalf4,
             entry: "skip_rmsnorm_f16_warp_half4",
-            reason: "variant=warp_half4;dtype=fp16;dense_skip;bias=none;gamma=fp16;\
-                     hidden%128==0;one_warp",
+            reason: if gamma_is_half {
+                "variant=warp_half4;dtype=fp16;dense_skip;bias=none;gamma=fp16;\
+                 hidden%128==0;one_warp"
+            } else {
+                "variant=warp_half4;dtype=fp16;dense_skip;bias=none;gamma=fp32;\
+                 hidden%128==0;one_warp"
+            },
         }
     } else if is_half {
         SkipRmsnormSelection {
             variant: SkipRmsnormVariant::F16Generic,
             entry: "skip_rmsnorm_f16",
-            reason: "variant=generic;dtype=fp16;not(dense_skip & bias=none & gamma=fp16 & \
+            reason: "variant=generic;dtype=fp16;not(dense_skip & bias=none & \
                      hidden%128==0)",
         }
     } else {
@@ -2171,6 +2209,223 @@ mod tests {
         ep.deallocate(gamma_buffer).unwrap();
         ep.deallocate(output_buffer).unwrap();
         (output, residual, gamma)
+    }
+
+    fn f32_bytes(values: &[f32]) -> &[u8] {
+        // SAFETY: f32 is plain-old-data; reinterpreting as bytes is sound.
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+    }
+
+    /// Run `SkipSimplifiedLayerNormalization` on the GPU with fp16 activations
+    /// but an **fp32 gamma** (the shape Phi's cast-fold leaves behind), returning
+    /// `(output, residual, gamma_f32)`.
+    fn run_skip_rmsnorm_gpu_f32_gamma(
+        ep: &CudaExecutionProvider,
+        hidden: usize,
+    ) -> (Vec<f16>, Vec<f16>, Vec<f32>) {
+        let shape = [1, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let gamma_shape = [hidden];
+        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let input = (0..hidden)
+            .map(|index| f16::from_f32(((index * 37 % 101) as f32 - 50.0) / 31.0))
+            .collect::<Vec<_>>();
+        let skip = (0..hidden)
+            .map(|index| f16::from_f32(((index * 17 % 67) as f32 - 33.0) / 47.0))
+            .collect::<Vec<_>>();
+        // fp32 gamma with sub-fp16 precision, so the full-precision multiply is
+        // observable and an fp16 gamma round-trip would perturb the result.
+        let gamma = (0..hidden)
+            .map(|index| 0.7501 + (index % 41) as f32 * 0.012_345)
+            .collect::<Vec<f32>>();
+        let residual = input
+            .iter()
+            .zip(&skip)
+            .map(|(input, skip)| f16::from_f32(input.to_f32() + skip.to_f32()))
+            .collect::<Vec<_>>();
+
+        let input_buffer = ep.allocate(hidden * std::mem::size_of::<f16>(), 256).unwrap();
+        let skip_buffer = ep.allocate(hidden * std::mem::size_of::<f16>(), 256).unwrap();
+        let gamma_buffer = ep.allocate(hidden * std::mem::size_of::<f32>(), 256).unwrap();
+        let mut output_buffer = ep.allocate(hidden * std::mem::size_of::<f16>(), 256).unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(f16_bytes(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f16_bytes(&skip), cuptr(skip_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f32_bytes(&gamma), cuptr(gamma_buffer.as_ptr()))
+                .unwrap();
+        }
+        {
+            let inputs = [
+                TensorView::new(
+                    DevicePtr(input_buffer.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(skip_buffer.as_ptr()),
+                    DataType::Float16,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(gamma_buffer.as_ptr()),
+                    DataType::Float32,
+                    &gamma_shape,
+                    &gamma_strides,
+                    ep.device_id(),
+                ),
+            ];
+            let output = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float16,
+                &shape,
+                &strides,
+                ep.device_id(),
+            );
+            let kernel = SkipSimplifiedLayerNormKernel {
+                epsilon: 1e-5,
+                runtime: runtime.clone(),
+                metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            kernel.run(&inputs, &mut [output]).unwrap();
+        }
+        let mut output_bytes = vec![0u8; hidden * std::mem::size_of::<f16>()];
+        unsafe {
+            runtime
+                .dtoh(&mut output_bytes, cuptr(output_buffer.as_ptr()))
+                .unwrap();
+        }
+        let output = output_bytes
+            .chunks_exact(2)
+            .map(|raw| f16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+        ep.deallocate(input_buffer).unwrap();
+        ep.deallocate(skip_buffer).unwrap();
+        ep.deallocate(gamma_buffer).unwrap();
+        ep.deallocate(output_buffer).unwrap();
+        (output, residual, gamma)
+    }
+
+    /// warp_half4 reduction order (fp32, four accumulators) with an fp32 gamma
+    /// applied at full precision, matching the widened kernel.
+    fn half4_warp_skip_rmsnorm_f32_gamma(residual: &[f16], gamma: &[f32]) -> Vec<f16> {
+        let mut lanes = [0.0f32; 32];
+        let chunks_per_lane = residual.len() / SKIP_RMSNORM_WARP_HALF4_MULTIPLE;
+        for (lane, sum) in lanes.iter_mut().enumerate() {
+            let (mut ss0, mut ss1, mut ss2, mut ss3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for item in 0..chunks_per_lane {
+                let base = (lane + item * 32) * 4;
+                let v0 = residual[base].to_f32();
+                let v1 = residual[base + 1].to_f32();
+                let v2 = residual[base + 2].to_f32();
+                let v3 = residual[base + 3].to_f32();
+                ss0 += v0 * v0;
+                ss1 += v1 * v1;
+                ss2 += v2 * v2;
+                ss3 += v3 * v3;
+            }
+            *sum = (ss0 + ss1) + (ss2 + ss3);
+        }
+        let mut offset = 16;
+        while offset > 0 {
+            let previous = lanes;
+            for lane in 0..(32 - offset) {
+                lanes[lane] += previous[lane + offset];
+            }
+            offset /= 2;
+        }
+        let inv_std = 1.0 / (lanes[0] / residual.len() as f32 + 1e-5).sqrt();
+        residual
+            .iter()
+            .zip(gamma)
+            .map(|(r, g)| f16::from_f32(r.to_f32() * inv_std * g))
+            .collect()
+    }
+
+    /// Same reduction but accumulating the sum-of-squares in fp16 (the broken
+    /// contract). Used only as a mutation guard: the real kernel must diverge
+    /// from this.
+    fn f16_accumulation_skip_rmsnorm_f32_gamma(residual: &[f16], gamma: &[f32]) -> Vec<f16> {
+        let mut ss = f16::from_f32(0.0);
+        for r in residual {
+            ss = f16::from_f32(ss.to_f32() + (r.to_f32() * r.to_f32()));
+        }
+        let inv_std = 1.0 / (ss.to_f32() / residual.len() as f32 + 1e-5).sqrt();
+        residual
+            .iter()
+            .zip(gamma)
+            .map(|(r, g)| f16::from_f32(r.to_f32() * inv_std * g))
+            .collect()
+    }
+
+    #[test]
+    fn f32_gamma_warp_selection_is_structural_and_gated() {
+        // fp32 gamma now qualifies for the vectorized warp path (default on).
+        for hidden in [128usize, 3072, 4096] {
+            let sel = select_skip_rmsnorm_variant(true, true, hidden, false, false);
+            assert_eq!(
+                sel.variant,
+                SkipRmsnormVariant::F16WarpHalf4,
+                "hidden={hidden} fp32-gamma should take warp_half4"
+            );
+            assert!(sel.reason.contains("gamma=fp32"));
+        }
+        // fp16 gamma is unchanged.
+        let half = select_skip_rmsnorm_variant(true, true, 3072, false, true);
+        assert_eq!(half.variant, SkipRmsnormVariant::F16WarpHalf4);
+        assert!(half.reason.contains("gamma=fp16"));
+    }
+
+    #[test]
+    fn fp32_gamma_gpu_skip_rmsnorm_matches_warp_reference_at_phi_and_qwen_dims() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        // 128 = Qwen-class small warp; 3072 = Phi-4-mini hidden (both %128==0).
+        for hidden in [128usize, 3072] {
+            let (output, residual, gamma) = run_skip_rmsnorm_gpu_f32_gamma(&ep, hidden);
+            let reference = half4_warp_skip_rmsnorm_f32_gamma(&residual, &gamma);
+            let max_error = output
+                .iter()
+                .zip(&reference)
+                .map(|(got, want)| (got.to_f32() - want.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            // fp32-accum + fp32-gamma path is ULP-tight to the reference.
+            let parity_tol = 1.0e-3f32;
+            assert!(
+                max_error <= parity_tol,
+                "hidden={hidden} fp32-gamma warp GPU max error {max_error}"
+            );
+
+            // Mutation guard: a kernel that accumulated the sum-of-squares in
+            // fp16 would exceed the parity bound above, so this test would catch
+            // a broken accumulation dtype (proving the fp32 contract is real).
+            let broken = f16_accumulation_skip_rmsnorm_f32_gamma(&residual, &gamma);
+            let broken_error = reference
+                .iter()
+                .zip(&broken)
+                .map(|(want, bad)| (want.to_f32() - bad.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                broken_error > parity_tol,
+                "hidden={hidden} fp16-accumulation guard too weak ({broken_error}); \
+                 test cannot detect a broken accumulation dtype"
+            );
+        }
     }
 
     #[test]
