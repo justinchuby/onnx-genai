@@ -73,6 +73,34 @@ Optimizing its zero-point int4 dequantization/GEMV is therefore the highest
 impact next lever; the remaining standalone int8 down-projection is a smaller
 13.3% follow-up, approximately tied with aggregate GQA.
 
+## GLM-4-9B + DeepSeek-R1-Distill-1.5B @ ad49bf3 — 2026-07-23
+
+| Model | Native tok/s (median of 3) | ORT 0.14.1 tok/s | Delta | Coherent? | Segments / fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| DeepSeek-R1-Distill-Qwen-1.5B int4 | 576.41 | 489.19 | **+17.83%** | Yes; repetitive | 1 / 0 |
+| GLM-4-9B GPTQ int4 | 110.34 | **Cannot load** | N/A | Yes | 41 / 0 |
+
+DeepSeek-R1 samples were 576.40/576.49/576.41 tok/s natively and
+491.86/488.29/489.19 tok/s under ORT GenAI 0.14.1 with CUDA graph enabled.
+Its greedy continuation is readable but exhibits the same benign fp16
+knife-edge repetition caveat as other 1.5B-family measurements.
+
+GLM-4 native samples were 110.34/109.96/110.36 tok/s. The Mobius native
+package intentionally contains `inference_metadata.yaml` rather than an ORT
+`genai_config.json`; after supplying an equivalent scratch configuration,
+ORT GenAI 0.14.1 still rejects the model because its bundled GQA schema does
+not recognize the required partial-RoPE `rotary_embedding_dim` attribute.
+ORT therefore never reaches CUDA graph capture, so there is no meaningful ORT
+throughput or segment count. The native EP runs coherent GLM-4 output where
+ORT 0.14.1 cannot load the graph.
+
+Native GLM-4 capture installs **41 segments** around **40 eager `Split`
+seams**, one per layer's partial-RoPE path, with zero fallbacks. Despite that
+fragmentation, graph capture raises throughput from **85.51 to 110.34 tok/s**
+(**+29.04%**) versus forced eager execution. Eliminating the host-reading,
+stream-synchronizing `Split` seams is the open GLM-4 performance lever; Batty
+is analyzing capture defragmentation.
+
 ## f0af865 baseline
 
 | Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 | Smoothness |
