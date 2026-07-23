@@ -142,8 +142,44 @@ impl Kernel for CausalConvWithStateKernel {
             None
         };
 
-        let mut out = vec![0.0f32; batch * channels * length];
-        let mut present = vec![0.0f32; batch * channels * pad];
+        let (primary_output, present_outputs) = outputs.split_at_mut(1);
+        let out_len = batch * channels * length;
+        let direct_out = primary_output[0].dtype == onnx_runtime_ir::DataType::Float32
+            && primary_output[0].is_contiguous()
+            && primary_output[0].device.is_host_accessible();
+        let mut owned_out;
+        let out: &mut [f32] = if direct_out {
+            // SAFETY: the executor owns an exclusive contiguous output buffer
+            // whose validated shape contains exactly `out_len` f32 values.
+            unsafe {
+                std::slice::from_raw_parts_mut(primary_output[0].data_ptr_mut::<f32>(), out_len)
+            }
+        } else {
+            owned_out = vec![0.0f32; out_len];
+            &mut owned_out
+        };
+
+        let present_len = batch * channels * pad;
+        let direct_present = present_outputs.first().is_some_and(|present| {
+            present.dtype == onnx_runtime_ir::DataType::Float32
+                && present.is_contiguous()
+                && present.device.is_host_accessible()
+        });
+        let mut owned_present;
+        let mut present = if let Some(output) = present_outputs.first_mut() {
+            if direct_present {
+                // SAFETY: same output-buffer contract as `out`, with
+                // `present_len` validated by the shape checks above.
+                Some(unsafe {
+                    std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), present_len)
+                })
+            } else {
+                owned_present = vec![0.0f32; present_len];
+                Some(owned_present.as_mut_slice())
+            }
+        } else {
+            None
+        };
 
         // Depthwise: every (batch, channel) is fully independent. `window`
         // slides over `[state | x]`; the accumulation order matches ORT's inner
@@ -159,49 +195,71 @@ impl Kernel for CausalConvWithStateKernel {
 
                 let out_row =
                     &mut out[(b * channels + c) * length..(b * channels + c) * length + length];
-                for (t, out_t) in out_row.iter_mut().enumerate() {
+                if length == 1 {
                     let mut acc = bias_c;
-                    for (k, &w) in w_row.iter().enumerate() {
-                        // Position `t + k` in the virtual `[state(pad) | x(L)]`
-                        // sequence: the first `pad` slots come from state.
-                        let pos = t + k;
-                        let val = if pos < pad {
-                            state_row.map_or(0.0, |s| s[pos])
-                        } else {
-                            x_row[pos - pad]
-                        };
-                        acc += w * val;
+                    for (k, &w) in w_row[..pad].iter().enumerate() {
+                        acc += w * state_row.map_or(0.0, |s| s[k]);
                     }
-                    *out_t = acc;
+                    acc += w_row[pad] * x_row[0];
+                    out_row[0] = acc;
+                } else {
+                    for (t, out_t) in out_row.iter_mut().enumerate() {
+                        let mut acc = bias_c;
+                        for (k, &w) in w_row.iter().enumerate() {
+                            // Position `t + k` in the virtual `[state(pad) | x(L)]`
+                            // sequence: the first `pad` slots come from state.
+                            let pos = t + k;
+                            let val = if pos < pad {
+                                state_row.map_or(0.0, |s| s[pos])
+                            } else {
+                                x_row[pos - pad]
+                            };
+                            acc += w * val;
+                        }
+                        *out_t = acc;
+                    }
                 }
 
                 // present_state = last `pad` frames of `[state | x]`.
-                let present_row =
-                    &mut present[(b * channels + c) * pad..(b * channels + c) * pad + pad];
-                for (p, slot) in present_row.iter_mut().enumerate() {
-                    // Global index into the virtual sequence of the p-th tail
-                    // frame: (pad + L) - pad + p = L + p.
-                    let pos = length + p;
-                    *slot = if pos < pad {
-                        state_row.map_or(0.0, |s| s[pos])
+                if let Some(present) = present.as_deref_mut() {
+                    let present_row =
+                        &mut present[(b * channels + c) * pad..(b * channels + c) * pad + pad];
+                    if length == 1 && pad > 0 {
+                        for (slot, source) in present_row[..pad - 1].iter_mut().zip(1..pad) {
+                            *slot = state_row.map_or(0.0, |s| s[source]);
+                        }
+                        present_row[pad - 1] = x_row[0];
                     } else {
-                        x_row[pos - pad]
-                    };
+                        for (p, slot) in present_row.iter_mut().enumerate() {
+                            // Global index into the virtual sequence of the p-th tail
+                            // frame: (pad + L) - pad + p = L + p.
+                            let pos = length + p;
+                            *slot = if pos < pad {
+                                state_row.map_or(0.0, |s| s[pos])
+                            } else {
+                                x_row[pos - pad]
+                            };
+                        }
+                    }
                 }
             }
         }
 
         if self.activation == ConvActivation::Silu {
-            // In-place SiLU over the dense output (MLAS logistic where available,
+            // SiLU over the dense output (MLAS logistic where available,
             // matching ORT's activation numerics).
             let mut activated = vec![0.0f32; out.len()];
-            silu_f32_slice(&out, &mut activated);
-            out = activated;
+            silu_f32_slice(out, &mut activated);
+            out.copy_from_slice(&activated);
         }
 
-        write_dense_f32_narrow("CausalConvWithState", &mut outputs[0], &out)?;
-        if outputs.len() >= 2 {
-            write_dense_f32_narrow("CausalConvWithState", &mut outputs[1], &present)?;
+        if !direct_out {
+            write_dense_f32_narrow("CausalConvWithState", &mut primary_output[0], out)?;
+        }
+        if !direct_present
+            && let (Some(output), Some(present)) = (present_outputs.first_mut(), present.as_deref())
+        {
+            write_dense_f32_narrow("CausalConvWithState", output, present)?;
         }
         Ok(())
     }
