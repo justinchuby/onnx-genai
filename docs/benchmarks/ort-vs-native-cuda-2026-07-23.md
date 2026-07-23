@@ -85,21 +85,21 @@ DeepSeek-R1 samples were 576.40/576.49/576.41 tok/s natively and
 Its greedy continuation is readable but exhibits the same benign fp16
 knife-edge repetition caveat as other 1.5B-family measurements.
 
-GLM-4 native samples were 110.34/109.96/110.36 tok/s. The Mobius native
-package intentionally contains `inference_metadata.yaml` rather than an ORT
-`genai_config.json`; after supplying an equivalent scratch configuration,
-ORT GenAI 0.14.1 still rejects the model because its bundled GQA schema does
-not recognize the required partial-RoPE `rotary_embedding_dim` attribute.
+GLM-4 native samples were 110.34/109.96/110.36 tok/s. The Mobius output lacks
+an ORT `genai_config.json`; after supplying an equivalent scratch
+configuration, ORT GenAI 0.14.1 still rejects the model because its bundled
+GQA schema does not recognize the required partial-RoPE
+`rotary_embedding_dim` attribute.
 ORT therefore never reaches CUDA graph capture, so there is no meaningful ORT
 throughput or segment count. The native EP runs coherent GLM-4 output where
 ORT 0.14.1 cannot load the graph.
 
-Native GLM-4 capture installs **41 segments** around **40 eager `Split`
-seams**, one per layer's partial-RoPE path, with zero fallbacks. Despite that
-fragmentation, graph capture raises throughput from **85.51 to 110.34 tok/s**
-(**+29.04%**) versus forced eager execution. Eliminating the host-reading,
-stream-synchronizing `Split` seams is the open GLM-4 performance lever; Batty
-is analyzing capture defragmentation.
+Native GLM-4 capture installs **41 segments** around **40 eager fused-MLP
+gate/up activation `Split` seams (one per layer)**, with zero fallbacks.
+Despite that fragmentation, graph capture raises throughput from **85.51 to
+110.34 tok/s** (**+29.04%**) versus forced eager execution. Eliminating the
+host-reading, stream-synchronizing `Split` seams is the open GLM-4 performance
+lever; Batty is analyzing capture defragmentation.
 
 ## f0af865 baseline
 
