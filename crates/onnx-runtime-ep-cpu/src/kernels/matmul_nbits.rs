@@ -710,17 +710,75 @@ fn configured_decode_threads() -> Option<usize> {
     resolve_decode_threads(value.as_deref(), available)
 }
 
-/// The resolved bounded decode-worker count, exposed so the persistent SPMD
-/// pool ([`crate::decode_spmd`]) sizes itself exactly like the flat pool and
-/// honors `ONNX_GENAI_CPU_DECODE_THREADS`.
+/// The resolved bounded decode-worker count, exposed so callers can size a
+/// worker set exactly like the flat pool and honor `ONNX_GENAI_CPU_DECODE_THREADS`.
 pub fn configured_decode_threads_public() -> Option<usize> {
     configured_decode_threads()
+}
+
+/// The worker count for the persistent SPMD decode pool ([`crate::decode_spmd`]).
+///
+/// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
+/// the variable is unset it uses a *different, higher* default than the flat
+/// pool: [`default_persistent_threads`] (about half the logical CPUs) instead of
+/// the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
+/// because its per-op fork/join regresses beyond that; the persistent pool
+/// replaces that fork/join with one hot broadcast barrier, so it keeps scaling
+/// with cores until it hits the memory-bandwidth knee (measured plateau ~half
+/// the logical CPUs on a 2-socket Xeon 8480C). Sizing it from the flat default
+/// would leave the out-of-box path at the flat pool's throughput and defeat the
+/// point of making it the default.
+pub fn configured_persistent_decode_threads() -> Option<usize> {
+    let value = std::env::var(DECODE_THREADS_ENV).ok();
+    let available = available_parallelism();
+    resolve_persistent_decode_threads(value.as_deref(), available)
+}
+
+/// Default persistent-pool worker count for `available` logical CPUs: half of
+/// them (at least one), derived purely from topology (Rule 2).
+///
+/// Half leaves a full set of hardware threads free for the dispatcher (which
+/// runs the forward inline and spins on the completion counters), the prefill
+/// global Rayon pool, and co-tenants on a shared box. Because the SPMD workers
+/// *spin* before parking, a fully-subscribed pool starves the dispatcher and
+/// collapses throughput (measured 1.4 tok/s at 96 workers vs 28.7 at 48 on a
+/// 96-logical-CPU host); half sits at the measured plateau while avoiding that
+/// cliff, and on SMT hosts it maps to roughly the physical-core count.
+fn default_persistent_threads(available: usize) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    Some((available / 2).max(1))
+}
+
+/// Resolve the persistent-pool worker count from the raw `ONNX_GENAI_CPU_DECODE_THREADS`
+/// value and the host's logical CPU count. `Some("0")` opts out (`None`); an
+/// explicit positive count is honored (clamped to `available`); an unset or
+/// unparseable value falls back to [`default_persistent_threads`].
+fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    let default = default_persistent_threads(available)?;
+    let threads = match raw {
+        Some("0") => return None,
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|threads| *threads > 0)
+            .unwrap_or(default),
+        None => default,
+    };
+    Some(threads.min(available))
 }
 
 fn available_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1)
+}
+
+/// The host's logical CPU count, exposed so the persistent SPMD pool can apply
+/// its safe auto-enable gate ([`crate::decode_spmd`]) without duplicating the
+/// `available_parallelism` fallback logic.
+pub fn available_parallelism_public() -> usize {
+    available_parallelism()
 }
 
 /// Choose a bounded decode pool from the host's logical CPU count.
@@ -1102,6 +1160,11 @@ impl Drop for DecodeResidencyGuard {
 /// Callers should enter this scope only for the M=1 CPU decode case; prefill
 /// (M>1) and non-CPU paths must keep using the global pool.
 pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    // The persistent SPMD pool is default-on (opt out with
+    // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0`), so it is "requested" whenever it
+    // is not explicitly disabled. `numa-split` is an explicit opt-in that outranks
+    // it (precedence: explicit numa-split env > persistent SPMD default > flat +
+    // auto-compact). We only log the mutual-exclusion note when both are in play.
     let both_requested = crate::decode_spmd::enabled()
         && std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
             .is_ok_and(|value| value.trim() == "numa-split");
@@ -1114,10 +1177,10 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if let Some(numa) = numa_pools() {
         if both_requested {
             report_decode_strategy_precedence(
-                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and \
-                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 are mutually exclusive; \
-                 numa-split is active because it has precedence and its two-level \
-                 NUMA layout was built successfully",
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the default-on persistent \
+                 SPMD decode pool are mutually exclusive; numa-split is active because it \
+                 has precedence and its two-level NUMA layout was built successfully. Set \
+                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0 to silence this if intentional",
             );
         }
         return numa.install_scope(move || {
@@ -1135,10 +1198,9 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if crate::decode_spmd::pools().is_some() {
         if both_requested {
             report_decode_strategy_precedence(
-                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and \
-                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 are mutually exclusive; \
-                 persistent SPMD is active because the higher-precedence numa-split \
-                 layout was unavailable",
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the default-on persistent \
+                 SPMD decode pool are mutually exclusive; persistent SPMD is active because \
+                 the higher-precedence numa-split layout was unavailable",
             );
         }
         let _spmd_guard = SpmdScopeGuard::enter();
@@ -1147,10 +1209,9 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     }
     if both_requested {
         report_decode_strategy_precedence(
-            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and \
-             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 are mutually exclusive; \
-             neither strategy is active because no bounded decode worker count or \
-             usable numa-split layout is available",
+            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the default-on persistent SPMD \
+             decode pool are mutually exclusive; neither strategy is active because no \
+             bounded decode worker count or usable numa-split layout is available",
         );
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
@@ -2357,6 +2418,38 @@ mod tests {
     }
 
     #[test]
+    fn persistent_decode_thread_default_is_half_the_logical_cpus() {
+        // The persistent pool scales past the flat pool's 8-worker ceiling: unset
+        // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
+        assert_eq!(default_persistent_threads(96), Some(48));
+        assert_eq!(default_persistent_threads(8), Some(4));
+        assert_eq!(default_persistent_threads(4), Some(2));
+        assert_eq!(default_persistent_threads(2), Some(1));
+        assert_eq!(default_persistent_threads(1), Some(1));
+        assert_eq!(default_persistent_threads(0), None);
+        // Distinct from the flat default on a big host (48 vs 8) -- proving the
+        // persistent path does not inherit the fork/join-bound cap.
+        assert_ne!(default_persistent_threads(96), default_decode_threads(96));
+    }
+
+    #[test]
+    fn persistent_decode_threads_honor_env_and_opt_out() {
+        // Unset -> the persistent default (half cores), not the flat cap.
+        assert_eq!(resolve_persistent_decode_threads(None, 96), Some(48));
+        assert_eq!(resolve_persistent_decode_threads(Some(""), 96), Some(48));
+        // Explicit `0` opts out of the bounded pool (flat legacy path).
+        assert_eq!(resolve_persistent_decode_threads(Some("0"), 96), None);
+        // An explicit positive count is honored and clamped to the host.
+        assert_eq!(resolve_persistent_decode_threads(Some("32"), 96), Some(32));
+        assert_eq!(resolve_persistent_decode_threads(Some("1"), 96), Some(1));
+        assert_eq!(resolve_persistent_decode_threads(Some("1000"), 96), Some(96));
+        // Unparseable/negative values fall back to the persistent default.
+        assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
+        assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
+        assert_eq!(resolve_persistent_decode_threads(Some("8"), 0), None);
+    }
+
+    #[test]
     fn decode_thread_pool_supports_global_pool_opt_out() {
         assert!(build_decode_pool(None).unwrap().is_none());
         let pool = build_decode_pool(Some(3)).unwrap().unwrap();
@@ -3185,7 +3278,9 @@ mod tests {
         if persistent {
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
         } else {
-            command.env_remove(crate::decode_spmd::PERSISTENT_POOL_ENV);
+            // Default-on: the OFF child must explicitly opt out (`=0`) to exercise
+            // the flat legacy path; simply unsetting the var now auto-enables.
+            command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "0");
         }
         let output = command.output().expect("run SPMD parity child process");
         assert!(

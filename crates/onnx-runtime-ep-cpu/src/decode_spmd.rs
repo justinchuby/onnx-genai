@@ -39,11 +39,23 @@
 //! Topology is queried at runtime, never hardcoded. On a single-node host, a
 //! non-NUMA machine, or a platform without CPU pinning, the pool degrades to one
 //! unpinned worker group -- it still replaces the per-op Rayon barrier with the
-//! lightweight one, and stays correct. The whole layout is opt-in behind
-//! `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` (rule 5); when unset the decode path
-//! is byte-for-byte unchanged. If `ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`
+//! lightweight one, and stays correct.
+//!
+//! # Default-on with opt-out (rule 5)
+//!
+//! The pool is the **default** decode path: when `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL`
+//! is unset it auto-enables, `=0` opts out (the flat Rayon + auto-`compact` legacy
+//! path), and `=1` forces it on even on hosts the auto policy would decline. The
+//! one-time activation is logged. Auto-enable is conservative: it only fires when
+//! the host is large enough that a spinning worker set is safe (>= 4 logical CPUs,
+//! see [`AUTO_MIN_LOGICAL_CPUS`]); tiny hosts fall back to the flat path, and a
+//! `THREADS=0` opt-out still leaves the decode path unchanged. The unset worker
+//! count is [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`]
+//! (about half the logical CPUs), not the flat pool's eight-worker ceiling, so the
+//! out-of-box path actually scales. If `ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`
 //! is also requested, `numa-split` takes precedence when its two-level layout can
-//! be built; the mutually-exclusive selection is reported once. If that layout
+//! be built (precedence: explicit numa-split env > persistent SPMD default > flat +
+//! auto-compact); the mutually-exclusive selection is reported once. If that layout
 //! is unavailable, the persistent pool remains eligible.
 
 use std::cell::UnsafeCell;
@@ -54,9 +66,17 @@ use std::thread::{self, JoinHandle};
 use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len;
 
-/// Environment switch that opts a run into the persistent SPMD decode pool.
-/// Default OFF: only the exact value `1` enables it (rule 5).
+/// Environment switch for the persistent SPMD decode pool. **Default-on**: unset
+/// auto-enables (subject to the safe-host gate), `0` opts out (flat legacy path),
+/// and `1` forces it on regardless of the auto gate (rule 5).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
+
+/// Minimum logical CPU count for the persistent pool to *auto*-enable when
+/// `PERSISTENT_POOL_ENV` is unset. Below this, an auto-enabled spinning worker
+/// set risks starving the dispatcher on a tiny host, so decode stays on the flat
+/// legacy path. An explicit `=1` bypasses this gate. Derived from topology, not a
+/// model/vendor constant (rule 2).
+const AUTO_MIN_LOGICAL_CPUS: usize = 4;
 
 /// Spin iterations a worker or the dispatcher busy-waits before yielding /
 /// parking. Sized so back-to-back decode projections (microseconds apart) are
@@ -640,27 +660,63 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     }
 }
 
-/// The lazily built persistent SPMD layout, or `None` when the mode is not
-/// requested (its default). Built once and reused for the whole process.
+/// The lazily built persistent SPMD layout, or `None` when the mode is opted out
+/// or the safe auto-enable gate declines. Built once and reused for the whole
+/// process.
 pub fn pools() -> Option<&'static SpmdDecodePools> {
     static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
     POOLS.get_or_init(|| build_from_env(default_threads())).as_ref()
 }
 
-/// Resolve the configured decode thread count the same way the flat pool does,
-/// so the persistent pool honors `ONNX_GENAI_CPU_DECODE_THREADS`.
+/// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
+/// when set (`0` opts out); when unset it uses the persistent-specific default
+/// (about half the logical CPUs), *not* the flat pool's eight-worker ceiling --
+/// see [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
 fn default_threads() -> Option<usize> {
-    crate::kernels::matmul_nbits::configured_decode_threads_public()
+    crate::kernels::matmul_nbits::configured_persistent_decode_threads()
 }
 
-/// Build the persistent SPMD layout when `PERSISTENT_POOL_ENV=1` and a worker
-/// count is available; otherwise `None` (the decode path stays unchanged).
+/// How the persistent pool was selected, parsed from `PERSISTENT_POOL_ENV`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersistenceMode {
+    /// `=0`: explicit opt-out; the decode path stays on the flat legacy pool.
+    Off,
+    /// Unset (or an unrecognized value): default-on, subject to the safe-host gate.
+    Auto,
+    /// `=1`: forced on, bypassing the safe-host gate (operator override).
+    Forced,
+}
+
+/// Parse the persistence mode from the raw env value (`None` = unset). Only the
+/// exact string `0` opts out and only `1` forces; unset or any other value is
+/// treated as the default-on `Auto` so the pool is on out of the box (rule 5).
+pub(crate) fn persistence_mode_from_raw(raw: Option<&str>) -> PersistenceMode {
+    match raw.map(str::trim) {
+        Some("0") => PersistenceMode::Off,
+        Some("1") => PersistenceMode::Forced,
+        _ => PersistenceMode::Auto,
+    }
+}
+
+fn persistence_mode() -> PersistenceMode {
+    persistence_mode_from_raw(std::env::var(PERSISTENT_POOL_ENV).ok().as_deref())
+}
+
+/// Whether the host is large enough to *auto*-enable the spinning worker set.
+fn auto_enable_suitable(available: usize) -> bool {
+    available >= AUTO_MIN_LOGICAL_CPUS
+}
+
+/// Build the persistent SPMD layout unless it is opted out (`=0`), the worker
+/// count is unavailable (`THREADS=0`), or the safe auto-enable gate declines on a
+/// tiny host. Otherwise `Some(layout)` (the decode path uses the persistent pool).
 ///
 /// Two or more usable NUMA nodes yield the two-level node-pinned layout; a
 /// single-node host, a non-NUMA machine, or a platform without pinning yields a
 /// single unpinned worker group (still the lightweight barrier, still correct).
 pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
-    if !enabled() {
+    let mode = persistence_mode();
+    if matches!(mode, PersistenceMode::Off) {
         return None;
     }
     let Some(total) = threads else {
@@ -673,15 +729,31 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     if total == 0 {
         return None;
     }
+    // Safe auto-enable gate (rule 2 conservatism): on a tiny host an auto-enabled
+    // spinning pool can starve the dispatcher, so decline and stay on the flat
+    // legacy path. An explicit `=1` (Forced) bypasses this.
+    if matches!(mode, PersistenceMode::Auto)
+        && !auto_enable_suitable(crate::kernels::matmul_nbits::available_parallelism_public())
+    {
+        report_spmd_fallback(
+            "persistent SPMD decode pool auto-enable declined: fewer than 4 logical CPUs, \
+             where a spinning worker set risks starving the dispatcher -- staying on the flat \
+             decode path. Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to force it on",
+        );
+        return None;
+    }
+    if matches!(mode, PersistenceMode::Auto) {
+        report_default_on();
+    }
     let shards = node_shards(total);
     Some(SpmdDecodePools::build(&shards))
 }
 
-/// True only when the opt-in switch is exactly `1`.
+/// True unless the persistent pool is explicitly opted out (`=0`). Default-on:
+/// unset auto-enables (subject to the host gate applied in [`build_from_env`])
+/// and `=1` forces on. Callers that need the actual built layout use [`pools`].
 pub(crate) fn enabled() -> bool {
-    std::env::var(PERSISTENT_POOL_ENV)
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
+    !matches!(persistence_mode(), PersistenceMode::Off)
 }
 
 /// Resolve the node shards for `total` workers: the multi-node split when the
@@ -710,6 +782,18 @@ fn report_spmd_fallback(message: &str) {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
         eprintln!("onnx-genai: persistent SPMD decode pool: {message}");
+    }
+}
+
+/// Announce once (rule 5) that the persistent SPMD pool is active by default, so
+/// the behavior is inspectable and the opt-out is discoverable.
+fn report_default_on() {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        eprintln!(
+            "onnx-genai: persistent SPMD decode pool active by default; set \
+             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0 to opt out"
+        );
     }
 }
 
@@ -948,5 +1032,45 @@ mod tests {
                 && message.contains("pool is poisoned"),
             "unexpected dispatcher diagnostic: {message}"
         );
+    }
+
+    #[test]
+    fn persistence_mode_defaults_on_and_only_zero_opts_out() {
+        // Default-on semantics (rule 5): unset -> Auto (on), `0` -> Off, `1` ->
+        // Forced. Whitespace is trimmed, and any unrecognized value is treated as
+        // the default-on Auto rather than silently disabling.
+        assert_eq!(persistence_mode_from_raw(None), PersistenceMode::Auto);
+        assert_eq!(persistence_mode_from_raw(Some("")), PersistenceMode::Auto);
+        assert_eq!(persistence_mode_from_raw(Some("   ")), PersistenceMode::Auto);
+        assert_eq!(persistence_mode_from_raw(Some("0")), PersistenceMode::Off);
+        assert_eq!(persistence_mode_from_raw(Some(" 0 ")), PersistenceMode::Off);
+        assert_eq!(persistence_mode_from_raw(Some("1")), PersistenceMode::Forced);
+        assert_eq!(persistence_mode_from_raw(Some(" 1 ")), PersistenceMode::Forced);
+        // Unknown values stay on (Auto), never a surprise silent opt-out.
+        assert_eq!(persistence_mode_from_raw(Some("true")), PersistenceMode::Auto);
+        assert_eq!(persistence_mode_from_raw(Some("2")), PersistenceMode::Auto);
+
+        // Only `Off` disables the pool for callers checking `enabled()`-style gates.
+        assert!(!matches!(
+            persistence_mode_from_raw(Some("0")),
+            PersistenceMode::Auto | PersistenceMode::Forced
+        ));
+        assert!(matches!(
+            persistence_mode_from_raw(None),
+            PersistenceMode::Auto | PersistenceMode::Forced
+        ));
+    }
+
+    #[test]
+    fn auto_enable_gate_declines_only_on_tiny_hosts() {
+        // Safe auto-enable (rule 2 conservatism): decline below the CPU floor so a
+        // spinning pool never starves the dispatcher on a tiny host; enable at and
+        // above it, where the persistent pool degrades gracefully.
+        assert!(!auto_enable_suitable(1));
+        assert!(!auto_enable_suitable(2));
+        assert!(!auto_enable_suitable(AUTO_MIN_LOGICAL_CPUS - 1));
+        assert!(auto_enable_suitable(AUTO_MIN_LOGICAL_CPUS));
+        assert!(auto_enable_suitable(8));
+        assert!(auto_enable_suitable(96));
     }
 }

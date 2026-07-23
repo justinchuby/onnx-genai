@@ -79,14 +79,16 @@ sub-pools joined by a two-level barrier), which is the remaining lever.
 
 ## Implemented increment: persistent SPMD decode pool (barrier fusion)
 
-`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` replaces the per-op rayon fork-join
-region -- there are ~141 `MatMulNBits` ops per decoded token, each currently a
-separate parallel region whose *join barrier* dominates once the int4 kernel
-itself is L3-resident -- with **one persistent worker set** that stays hot for
-the whole decode loop and is driven by a lightweight reusable barrier instead of
-re-forking rayon tasks. This targets the fork-join/barrier bound directly rather
-than the kernel math (Rule 4: the actual GEMV still runs the existing packed
-int4 / MLAS SQNBit kernels; only the orchestration changes).
+The persistent SPMD pool is the **default** CPU decode path (`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL`
+unset auto-enables it; `=0` opts out to the flat Rayon + auto-`compact` legacy
+path; `=1` forces it on even where the auto policy would decline). It replaces
+the per-op rayon fork-join region -- there are ~141 `MatMulNBits` ops per decoded
+token, each previously a separate parallel region whose *join barrier* dominates
+once the int4 kernel itself is L3-resident -- with **one persistent worker set**
+that stays hot for the whole decode loop and is driven by a lightweight reusable
+barrier instead of re-forking rayon tasks. This targets the fork-join/barrier
+bound directly rather than the kernel math (Rule 4: the actual GEMV still runs the
+existing packed int4 / MLAS SQNBit kernels; only the orchestration changes).
 
 Design (mirrors the `numa-split` two-level structure so it inherits its
 node-local placement and exact reduction order):
@@ -110,29 +112,65 @@ sequential real packed-int4 M=1 MatMulNBits kernels in fresh subprocesses, compa
 every output byte, asserts that the persistent pool actually dispatched the ON
 case, and uses 31 workers to cover uneven node/row sharding.
 
-Generality / fallback (Rule 2, Rule 5): default OFF; on a single-node host,
-non-Linux, or when pinning is refused (cgroup) it degrades to a single unpinned
-SPMD worker group; it does not switch back to the bounded Rayon pool. The barrier
-primitive itself is portable `std` atomics + `thread::park`; only optional CPU
-pinning is platform-specific and best-effort.
+Generality / fallback (Rule 2, Rule 5): **default-on with opt-out**. When
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` is unset the pool auto-enables and logs
+the activation once; `=0` opts out (flat legacy path) and `=1` forces it on. Auto-
+enable is conservative -- it only fires on hosts with >= 4 logical CPUs, where a
+spinning worker set is safe; tiny/single-core hosts and `THREADS=0` fall back to
+the flat path. On a single-node host, non-Linux, or when pinning is refused
+(cgroup) it degrades to a single unpinned SPMD worker group; it does not switch
+back to the bounded Rayon pool. The barrier primitive itself is portable `std`
+atomics + `thread::park`; only optional CPU pinning is platform-specific and
+best-effort.
 
-Decode strategy precedence is explicit: when both
-`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split` and
-`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` are set, the strategies are mutually
-exclusive and `numa-split` wins if its two-level topology can be built. The
-runtime reports that choice once. If `numa-split` cannot build, the persistent
-SPMD pool remains eligible and that fallback choice is also reported once.
+Default worker count (Rule 2, topology-derived): when
+`ONNX_GENAI_CPU_DECODE_THREADS` is unset the persistent pool uses **half the
+logical CPUs** (at least one), *not* the flat pool's eight-worker ceiling. The
+flat pool caps at eight because its per-op fork/join regresses beyond that; the
+persistent pool replaces that fork/join with one hot broadcast barrier, so it
+keeps scaling with cores until the memory-bandwidth knee. Half leaves a full set
+of hardware threads free for the dispatcher (which runs the forward inline and
+spins on the completion counters), prefill's global pool, and co-tenants -- a
+*fully*-subscribed spinning pool starves the dispatcher and collapses (measured
+below). An explicit `ONNX_GENAI_CPU_DECODE_THREADS` is always honored.
+
+Decode strategy precedence is explicit (Rule 5): **explicit `numa-split` env >
+persistent SPMD (default) > flat + auto-`compact`**. When persistent SPMD is
+active it does its own per-node worker pinning, and the flat pool's auto-`compact`
+affinity is never built (the two are mutually exclusive by construction, verified:
+the auto-`compact` log does not appear in the default path). When both
+`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split` and the default-on pool are in play,
+`numa-split` wins if its two-level topology can be built, and the runtime reports
+that choice once; if `numa-split` cannot build, the persistent SPMD pool remains
+eligible and that fallback is also reported once.
 
 Measured (Sapphire Rapids Xeon 8480C, 2x48 cores, 2 NUMA nodes,
-Qwen2.5-Coder-7B int4, 32 decode threads, steady M=1, 96 tokens, interleaved
-A/B, shared/noisy host load avg ~10-37):
+Qwen2.5-Coder-7B int4, steady M=1, 128 tokens, 5-run median, interleaved A/B,
+shared/noisy host):
 
-| Path | steady decode median | best | wins/rounds |
-| --- | --- | --- | --- |
-| `numa-split` (prior best) | 16.42 tok/s | 16.96 | 0/4 |
-| `PERSISTENT_POOL=1` | 17.71 tok/s | 18.37 | 4/4 |
+Out-of-box default flip (nothing set):
 
-~+7.9% median (+8.3% best) over the prior best `numa-split` path, winning every
-interleaved round. Still short of ORT (26.9) / onnxruntime-genai (20.8) -- the
-residual gap is memory-latency bound -- but it is the best native result and is
-shipped OFF by default until enabled explicitly.
+| Path | steady decode median |
+| --- | --- |
+| before (flat + auto-`compact`, 8 workers) | ~11.1 tok/s |
+| after (persistent SPMD default, 48 workers) | **~28.8 tok/s** |
+| `PERSISTENT_POOL=0` (restores legacy) | ~11.1 tok/s |
+
+Beats onnxruntime-genai 0.14.1 (21.30) and raw ORT (~26.9) out of the box.
+
+Persistent-pool worker-count sweep (why half, and why not all cores):
+
+| workers | tok/s |
+| --- | --- |
+| 8 (old flat default) | 12.95 |
+| 16 | 19.78 |
+| 24 | 23.86 |
+| 32 | 26.18 |
+| 40 | 27.90 |
+| 48 (= half of 96, the default) | 28.71 |
+| 64 | 28.67 |
+| 96 (all logical CPUs) | **1.36** (dispatcher starved by spinning workers) |
+
+Throughput plateaus at ~half the logical CPUs and *collapses* at full
+subscription, which is exactly why the default is half-cores (not all cores) and
+why an explicit override is clamped to the host.
