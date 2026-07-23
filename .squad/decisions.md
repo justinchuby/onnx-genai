@@ -3360,3 +3360,16 @@ New 0.5B per-op steady: **MatMulNBits ~82%, GroupQueryAttention ~14%** (was 54%)
 **Sources reconciled:** `pris-f16-widen-parity-test.md` and `gaff-notail-widen-test.md`.
 
 Decision archive gate checked at 2026-07-23T05:00:00Z: the active ledger was 266888 bytes before this entry. No dated ledger entries older than 2026-06-23T05:00:00Z were present, so no archive was created or updated.
+
+<!-- scribe-merge-2026-07-23T06-31-00Z-f16-matmulnbits-shard -->
+## 2026-07-23 — f16 MatMulNBits decode SPMD sharding
+
+**By:** Bryant (implementation, `8598f6a`) and Pris (parity coverage, `08875b1`); Gaff approved threading, and Chew rejected then approved after the added tests. Merged to `perf/cpu-ep-mlas` at `08875b1`.
+
+**What:** For f16-activation (`accuracy_level=0`) int4 M=1 decode, MLAS SQNBit no longer forks the global 96-thread pool from the inline dispatcher while roughly 48 persistent SPMD workers spin-wait. The pre-packed weight is split by output columns and each resident SPMD worker makes one single-threaded MLAS call for its N-shard under one barrier. Without a pool, a single shard retains the old behavior; the generic-cpu f32 `accuracy_level=4` route is untouched. `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` retains the full-width route for A/B comparison.
+
+**Why:** Profiling disproved f16 widen/narrow conversion as the cause (0.1%/0.3%): oversubscribed MLAS GEMV dominated. The fix improved f16 decode from 6.5 to 32.53 tok/s on 0.5B (5×) and 3.58 to 14.40 tok/s on 1.5B (4×), reduced MatMulNBits share from 79% to 10%, and left 7B generic-cpu unchanged. Sharded output is byte-identical to `NO_SHARD`. Pris extended mlas-sys shard/full parity over block sizes 32/64/128 and K=384, and CPU-EP subprocess parity exercises the cached real SPMD route with three workers, N=97, and uneven segments. GQA is now the dominant 0.5B decode operation (~72%).
+
+**Sources reconciled:** `bryant-f16-matmulnbits.md` and `pris-f16-matmulnbits-tests.md`.
+
+Decision archive gate checked at 2026-07-23T06:31:00Z: the active ledger was 268050 bytes before this entry. No dated ledger entries older than 2026-06-23T06:31:00Z were present, so no archive was created or updated.
