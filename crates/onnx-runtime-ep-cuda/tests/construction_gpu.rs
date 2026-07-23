@@ -1,7 +1,8 @@
 //! CUDA conformance tests for movement/construction operators and `Where`.
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut,
+    TensorView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -379,4 +380,132 @@ fn where_broadcasts_all_three_inputs() {
         &[],
     );
     assert_eq!(out[0], raw(&[1_i64, 2, 3, 9, 9, 9]));
+}
+
+/// Build a `Split` kernel for a single data input of `data_shape` producing
+/// `output_shapes`, with an optional runtime split-sizes input. Returns the
+/// kernel so a test can inspect its device-graph capture eligibility. The
+/// resolved input shapes are forwarded to `get_kernel` so the kernel can plan
+/// the static, capturable form at build time exactly as the executor does.
+fn build_split_kernel(
+    ep: &CudaExecutionProvider,
+    data_shape: &[usize],
+    output_shapes: &[Vec<usize>],
+    attrs: &[(&str, Attribute)],
+    runtime_split_shape: Option<&[usize]>,
+) -> Box<dyn Kernel> {
+    let opset = 13;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), opset);
+    let data = graph.create_named_value(
+        "data",
+        DataType::Float32,
+        static_shape(data_shape.iter().copied()),
+    );
+    graph.add_input(data);
+    let mut node_inputs = vec![Some(data)];
+    let mut input_shapes = vec![data_shape.to_vec()];
+    if let Some(split_shape) = runtime_split_shape {
+        let split = graph.create_named_value(
+            "split_sizes",
+            DataType::Int64,
+            static_shape(split_shape.iter().copied()),
+        );
+        graph.add_input(split);
+        node_inputs.push(Some(split));
+        input_shapes.push(split_shape.to_vec());
+    }
+    let outputs = output_shapes
+        .iter()
+        .enumerate()
+        .map(|(i, shape)| {
+            graph.create_named_value(
+                &format!("output_{i}"),
+                DataType::Float32,
+                static_shape(shape.iter().copied()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut node = Node::new(NodeId(0), "Split", node_inputs, outputs.clone());
+    for (name, value) in attrs {
+        node.attributes.insert((*name).into(), value.clone());
+    }
+    let node_id = graph.insert_node(node);
+    for output in outputs {
+        graph.add_output(output);
+    }
+    let model = Model::new(&graph);
+    ep.get_kernel(model.graph.node(node_id), &input_shapes, opset)
+        .unwrap()
+}
+
+#[test]
+fn split_static_even_num_outputs_is_capture_supported() {
+    // The GLM-4 fused-MLP activation split: single data input, num_outputs=2,
+    // axis=-1, statically resolved even halves. This must be capturable.
+    let ep = gpu();
+    let kernel = build_split_kernel(
+        &ep,
+        &[1, 4, 8],
+        &[vec![1, 4, 4], vec![1, 4, 4]],
+        &[("axis", Attribute::Int(-1)), ("num_outputs", Attribute::Int(2))],
+        None,
+    );
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+}
+
+#[test]
+fn split_static_explicit_split_attribute_is_capture_supported() {
+    // Explicit, uneven but statically known split sizes are also capturable.
+    let ep = gpu();
+    let kernel = build_split_kernel(
+        &ep,
+        &[2, 5],
+        &[vec![2, 2], vec![2, 3]],
+        &[("axis", Attribute::Int(1)), ("split", Attribute::Ints(vec![2, 3]))],
+        None,
+    );
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+}
+
+#[test]
+fn split_dynamic_runtime_sizes_is_not_capture_supported() {
+    // A wired runtime split-sizes input keeps the host-read-plus-synchronize
+    // path and must never be admitted to capture.
+    let ep = gpu();
+    let kernel = build_split_kernel(
+        &ep,
+        &[2, 4],
+        &[vec![2, 1], vec![2, 3]],
+        &[("axis", Attribute::Int(-1))],
+        Some(&[2]),
+    );
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+}
+
+#[test]
+fn split_static_even_num_outputs_matches_eager_bytes() {
+    // Capture-path result parity: the static fast path yields identical bytes to
+    // the reference even split.
+    let ep = gpu();
+    let out = run(
+        &ep,
+        "Split",
+        13,
+        &[tensor(
+            DataType::Float32,
+            &[1, 2, 4],
+            &[1_f32, 2., 3., 4., 5., 6., 7., 8.],
+        )],
+        &[
+            (DataType::Float32, vec![1, 2, 2]),
+            (DataType::Float32, vec![1, 2, 2]),
+        ],
+        &[("axis", Attribute::Int(-1)), ("num_outputs", Attribute::Int(2))],
+    );
+    assert_eq!(f32s(&out[0]), vec![1., 2., 5., 6.]);
+    assert_eq!(f32s(&out[1]), vec![3., 4., 7., 8.]);
 }
