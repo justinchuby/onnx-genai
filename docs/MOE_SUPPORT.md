@@ -362,20 +362,24 @@ Empty experts launch no GEMM.
 
 ### 6.2 CPU EP
 
-Integration points:
+Implemented integration points:
 
 - `crates/onnx-runtime-ep-cpu/src/kernels/selection.rs`: TopK reference behavior.
 - `.../gather.rs` and indexing/movement kernels: correctness building blocks.
 - `.../matmul.rs` / `gemm.rs`: dense grouped/batched baseline.
-- a future quantized kernel module: expert-batched int4 `QMoE`, using a conversion
+- `.../moe.rs`: grouped floating-point `MoE` execution.
+- `.../qmoe.rs`: expert-batched integer `QMoE`, including int4, using a conversion
   established by the Phase 1 packing-validation gate rather than assuming that
   Mobius/`MatMulNBits` storage is already identical.
-- `.../mod.rs`: register `com.microsoft::MoE` and `QMoE`.
+- `.../block_quantized_moe.rs`: the `pkg.nxrt::BlockQuantizedMoE` CPU parity kernel.
+- `.../mod.rs`: registrations for `com.microsoft::MoE`, `com.microsoft::QMoE`, and
+  `pkg.nxrt::BlockQuantizedMoE`.
 
-The CPU correctness kernel may initially gather into dense scratch buffers and call
-existing GEMM paths. The performance kernel should avoid dequantizing a whole expert:
-unpack/dequantize blocks inside the dot-product loop and parallelize over active
-experts and token rows without oversubscribing Rayon.
+The implemented kernels route and group the token batch before expert execution.
+`QMoE` dequantizes only active experts, one expert at a time, so the route-first path
+keeps the peak dequantized residency to one expert. Remaining CPU work is performance
+optimization, including packing/prepacking improvements and reducing temporary expert
+materialization while preserving the bounded-residency behavior.
 
 ### 6.3 CUDA EP
 
