@@ -137,3 +137,7 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 ## 2026-07-23T14:55:00Z — Mobius PR #404 DSA review
 
 - Reviewed Leon's PR #404 DSA correctness fixes green: INT64 TopK indices, target-dtype finite mask handling, and indexer schedule length were cleared.
+
+## 2026-07-23T18:30:00Z — Phi on-device select review
+
+- Reviewed Deckard's `CudaOnDeviceConstantSelect` LongRoPE lowering 🟢 APPROVE: true/false branch mapping is preserved, unequal-table zero-padding is guarded by the threshold/extent proof, lowering is conservative, and capture-safe `Where` is determinism-neutral. Re-ran CUDA gate: 201 passed / 0 failed.

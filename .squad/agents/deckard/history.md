@@ -95,3 +95,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - Completed Qwen-7B column-split, true K-slice split-K, and vectorized-load/roofline investigations. All were no-go; the remaining int4 GEMVs are shared-memory/weight-read-efficiency bound, so main stayed clean.
 - Standalone Phi int8-zp split-K remains a validated +2.1% branch result with clean CUDA tests/clippy.
+
+## 2026-07-23T18:30:00Z — On-device LongRoPE select landed
+
+- `97c1a56` landed the shared `CudaOnDeviceConstantSelect` capability and capture-safe scalar `Where`: pure constant-branch `If` nodes can now lower to a live device predicate with conservative unequal-table zero-padding guards.
+- Phi LongRoPE decode collapsed from two captured regions to one. Interleaved idle-GPU performance improved 203.50→322.15 tok/s (+58.3%), with byte-identical 160-token and 4,200-token boundary generation and a 201/0 CUDA gate.

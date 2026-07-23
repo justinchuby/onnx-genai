@@ -215,3 +215,30 @@ The full source notes for this reconciliation are preserved in `2026-07-23T00-00
 **By:** Deckard
 **What:** Removing the staged shared activation path regressed the asymmetric Phi gate/up kernel from about 31.5 to 50.7 µs (+61%). Each of eight warps redundantly recomputed RMS normalization; the prototype also forced a local-memory round-trip.
 **Why:** Shared staging is load-bearing cross-warp reuse, not removable overhead. Further fused gate/up micro-optimization should yield to capture seams or other kernels.
+
+## 2026-07-23 — Phi on-device LongRoPE and real-weight scoreboard
+
+### Complete Phi capture-seam groundwork
+**By:** Deckard
+**What:** Capture-safe scalar `Greater` metadata caching and invariant-`If` memoization reduced Phi LongRoPE decode from three captured regions to two. The predicate remains live, changing-capture branches are never memoized, and branch flips invalidate capture safely; 192 CUDA tests and session control-flow tests passed.
+**Why:** The groundwork removed repeated constant-cache materialization while preserving the shape and control-flow guards required for a subsequent fully on-device select.
+
+### Adopt the on-device constant-select lowering for LongRoPE
+**By:** Deckard; reviewed by Gaff
+**What:** Merged as `97c1a56`, `CudaOnDeviceConstantSelect` lowers a loop-invariant scalar-predicate `If` whose branches are pure constants to capture-safe CUDA `Where` nodes. Equal shapes lower directly; unequal leading dimensions lower only when a scalar integer `Greater`/`GreaterOrEqual` threshold exactly matches the smaller false table, the true table is larger, and trailing dimensions agree. The false table is zero-padded to a fixed large output. Phi reduced two captured regions to one, eliminated eager rejections, and improved 203.50→322.15 tok/s (+58.3%) in idle-GPU interleaving; 160-token and 4,200-token boundary output were byte-identical, with 201/0 CUDA tests.
+**Why:** Keeping selection and the live predicate on device removes the per-token LongRoPE host `If` seam without stale-branch risk. The deliberately narrow unequal-shape guard makes appended zero rows unreachable while the short table is selected.
+
+### Record the post-fix Phi profile and independent benchmark
+**By:** Marsten
+**What:** Before the device-select landing, fixed main at `719d2fe` still spent 1.935 ms/token in the eager LongRoPE `If`, versus 2.948 ms in GPU kernels, making the host branch the primary remaining lever. After `97c1a56`, four accepted nine-run measurements on idle GPU 3 established a 321.98 tok/s Phi median: +40.22% versus canonical ORT and +57.2% versus the session's `origin/main` baseline; two nondeterministic shared-host launches were excluded by the harness.
+**Why:** The profile correctly prioritized de-hosting control flow over GEMV tuning, while the independent result establishes the real-weight score with an explicit shared-host caveat.
+
+### Declare native CUDA faster than ORT on all available real-weight models
+**By:** Marsten and Deckard
+**What:** The authoritative real-weight scoreboard is Qwen2.5 0.5B +62.7%, 1.5B +36.8%, 7B +10.8%, and Phi-4-mini +40.2% versus ORT after LongRoPE de-hosting. The previous Phi reference was 193.89 versus 229.62 tok/s; the on-device select removes that deficit.
+**Why:** The faster-than-ORT mandate is achieved for every available real-weight model, so future optimization work should use this scoreboard rather than the obsolete pre-fix Phi shortfall.
+
+### Bound DeepSeek-V2-Lite full-depth validation honestly
+**By:** Batty
+**What:** No local or Foundry DeepSeek-V2-Lite source checkpoint weights are available. A deterministic synthetic 27-layer artifact at real configuration geometry (`26` QMoE, `27` Attention, FC1 `[64,2816,1024]`, FC2 `[64,2048,704]`) completed strict native CUDA with zero fallbacks at 26.66 tok/s; ORT GenAI rejects the `deepseek_v2` architecture.
+**Why:** This validates full-depth native int4-QMoE wiring and the f16 router fix, but it is structural synthetic-weight evidence, not a real-weight semantic or ORT comparison.
