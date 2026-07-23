@@ -38,7 +38,6 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
 
     for (op_type, opset, dtype, expected_reason) in [
-        ("Attention", 23, DataType::Float16, "Attention: dtype f16"),
         ("Attention", 23, DataType::BFloat16, "Attention: dtype bf16"),
         (
             "RotaryEmbedding",
@@ -83,6 +82,33 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
             );
         }
     }
+
+    let mut graph = Graph::new();
+    let inputs = (0..3)
+        .map(|index| {
+            graph.create_named_value(
+                format!("fp16_attention_input_{index}"),
+                DataType::Float16,
+                static_shape([1, 1, 1, 2]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = graph.create_named_value(
+        "fp16_attention_output",
+        DataType::Float16,
+        static_shape([1, 1, 1, 2]),
+    );
+    let node = Node::new(
+        NodeId(1),
+        "Attention",
+        inputs.into_iter().map(Some).collect(),
+        vec![output],
+    );
+    assert!(
+        ep.supports_op(&node, 23, &[], &[DataType::Float16; 3], &[])
+            .is_supported(),
+        "Attention must claim its fp16 activation path"
+    );
 
     let mut graph = Graph::new();
     let inputs = (0..3)
