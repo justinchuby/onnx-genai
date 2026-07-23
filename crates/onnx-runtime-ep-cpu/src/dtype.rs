@@ -471,6 +471,109 @@ macro_rules! dispatch_float {
     }};
 }
 
+/// F16C-accelerated bulk `f16`⇆`f32` conversion for **contiguous** tensors.
+///
+/// The KV-cache widen (`f16`→`f32`) and narrow (`f32`→`f16`) in the decode hot
+/// path (GroupQueryAttention, per token, over the whole growing cache) is the
+/// single largest cost in native f16 decode — profiling attributes ~92% of GQA
+/// wall time to these two scalar conversions. The `F16C` instruction set
+/// converts 8 lanes per instruction, so the contiguous case is offloaded to it
+/// when the running CPU advertises `f16c` + `avx2`.
+///
+/// ### Numerical equivalence (RULES.md §4 / cross-EP parity)
+/// * `f16`→`f32` is *exact* for every `f16` value, so `_mm256_cvtph_ps` and
+///   [`half::f16::to_f32`] are bit-identical.
+/// * `f32`→`f16` uses IEEE-754 round-to-nearest-even. `_mm256_cvtps_ph` with
+///   `_MM_FROUND_TO_NEAREST_INT` and [`half::f16::from_f32`] both round to
+///   nearest-even, so results are bit-identical (verified in `tests`).
+///
+/// Non-contiguous or non-x86 callers fall back to the scalar `half` path.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod f16c {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    #[inline]
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("f16c") && std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// Widen `src.len()` contiguous `f16` bit patterns into `dst` as `f32`.
+    ///
+    /// # Safety
+    /// The running CPU must support `f16c` + `avx2` (see [`available`]);
+    /// `src.len() == dst.len()`.
+    #[target_feature(enable = "f16c,avx2")]
+    pub unsafe fn widen(src: &[u16], dst: &mut [f32]) {
+        debug_assert_eq!(src.len(), dst.len());
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        unsafe {
+            let mut i = 0;
+            while i + 8 <= n {
+                let h = _mm_loadu_si128(sp.add(i) as *const __m128i);
+                _mm256_storeu_ps(dp.add(i), _mm256_cvtph_ps(h));
+                i += 8;
+            }
+            // Scalar tail via the same round-trip the SIMD lanes use.
+            while i < n {
+                *dp.add(i) = half::f16::from_bits(*sp.add(i)).to_f32();
+                i += 1;
+            }
+        }
+    }
+
+    /// Narrow `src.len()` contiguous `f32` values into `dst` as `f16` bit
+    /// patterns, rounding to nearest-even.
+    ///
+    /// # Safety
+    /// The running CPU must support `f16c` + `avx2` (see [`available`]);
+    /// `src.len() == dst.len()`.
+    #[target_feature(enable = "f16c,avx2")]
+    pub unsafe fn narrow(src: &[f32], dst: &mut [u16]) {
+        debug_assert_eq!(src.len(), dst.len());
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        unsafe {
+            let mut i = 0;
+            while i + 8 <= n {
+                let v = _mm256_loadu_ps(sp.add(i));
+                let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
+                _mm_storeu_si128(dp.add(i) as *mut __m128i, h);
+                i += 8;
+            }
+            while i < n {
+                *dp.add(i) = half::f16::from_f32(*sp.add(i)).to_bits();
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Widen a contiguous `f16` slice (as raw `u16` bit patterns) into an equal-length
+/// `f32` slice, using the [`f16c`] hardware path when available and falling back
+/// to the scalar [`half`] conversion otherwise. `src.len()` must equal `dst.len()`.
+///
+/// Exposed so hot-path kernels (e.g. GroupQueryAttention building its `present`
+/// KV cache) can widen a past-cache head-run *directly into* their destination
+/// buffer, skipping a separate owned widen followed by an `f32`→`f32` copy.
+pub fn widen_f16_slice_into(src: &[u16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if f16c::available() {
+        // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
+        unsafe { f16c::widen(src, dst) };
+        return;
+    }
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = half::f16::from_bits(s).to_f32();
+    }
+}
+
 /// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
 /// supported float view (`f16`/`bf16`/`f64` or strided f32) into dense f32.
 /// Rejects non-float dtypes with a RULE #1 error.
@@ -487,6 +590,23 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
         let data = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
         return Ok(Cow::Borrowed(data));
     }
+    // F16C bulk widen for a contiguous f16 tensor (the KV-cache decode hot path).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if view.dtype == DataType::Float16 && view.is_contiguous() && f16c::available() {
+        view.validate()?;
+        let len = view.numel();
+        if len == 0 {
+            return Ok(Cow::Borrowed(&[]));
+        }
+        // SAFETY: a validated contiguous Float16 view addresses exactly `len`
+        // 2-byte elements; `half::f16` is `repr(transparent)` over `u16`, so the
+        // same storage reads soundly as `u16` bit patterns.
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) };
+        let mut dst = vec![0.0f32; len];
+        // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
+        unsafe { f16c::widen(src, &mut dst) };
+        return Ok(Cow::Owned(dst));
+    }
     dispatch_float!(view.dtype, op, T => {
         let raw = to_dense_float::<T>(view)?;
         Ok(Cow::Owned(
@@ -498,6 +618,28 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
 /// Narrow a dense `Vec<f32>` result into `out`, rounding to `out`'s float dtype
 /// (`f32`/`f16`/`bf16`/`f64`). Counterpart to [`to_dense_f32_widen`].
 pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Result<()> {
+    // F16C bulk narrow for a contiguous f16 output (the KV-cache decode hot path).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if out.dtype == DataType::Float16 && out.is_contiguous() && f16c::available() {
+        out.validate()?;
+        let n = out.numel();
+        if data.len() != n {
+            return Err(EpError::KernelFailed(format!(
+                "output element count {n} does not match produced {}",
+                data.len()
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        // SAFETY: a validated contiguous Float16 output addresses exactly `n`
+        // 2-byte elements; `half::f16` is `repr(transparent)` over `u16`, so the
+        // storage is written soundly as `u16` bit patterns.
+        let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
+        // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
+        unsafe { f16c::narrow(data, dst) };
+        return Ok(());
+    }
     dispatch_float!(out.dtype, op, T => {
         let narrowed: Vec<T> = data.iter().map(|&v| T::from_f32(v)).collect();
         write_dense_float::<T>(out, &narrowed)
@@ -516,6 +658,81 @@ mod tests {
         assert_eq!(h.to_bits(), 0x3C00);
         assert_eq!(NumericElem::to_acc(h), 1.0f32);
         assert_eq!(half::f16::from_acc(1.0f32).to_bits(), 0x3C00);
+    }
+
+    /// The F16C bulk widen/narrow fast paths must produce bit-identical results
+    /// to the scalar `half` crate reference across the full f16 bit space and a
+    /// representative f32 range (RULES.md §4 parity contract). f16→f32 is exact;
+    /// f32→f16 rounds to nearest-even in both, so equality is exact, not
+    /// approximate.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn f16c_widen_narrow_bit_identical_to_scalar() {
+        if !f16c::available() {
+            eprintln!("skipping: host lacks f16c/avx2");
+            return;
+        }
+
+        // Widen: every one of the 65_536 f16 bit patterns, including NaN/inf,
+        // subnormals, and a non-multiple-of-8 tail.
+        let src: Vec<u16> = (0u32..=u16::MAX as u32).map(|b| b as u16).collect();
+        for len in [0usize, 1, 7, 8, 15, 16, 65_533, src.len()] {
+            let s = &src[..len];
+            let mut simd = vec![0.0f32; len];
+            // SAFETY: guarded by f16c::available(); lengths match.
+            unsafe { f16c::widen(s, &mut simd) };
+            for (i, &bits) in s.iter().enumerate() {
+                let want = half::f16::from_bits(bits).to_f32();
+                // NaN compares unequal to itself; compare bit patterns instead.
+                assert_eq!(
+                    simd[i].to_bits(),
+                    want.to_bits(),
+                    "widen mismatch at f16 bits {bits:#06x}"
+                );
+            }
+        }
+
+        // Narrow: a spread of f32 values (exact halves, subnormals, overflow to
+        // inf, negatives, and ties that exercise round-to-nearest-even).
+        let vals: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            2049.0,       // rounds to nearest-even in f16
+            65_504.0,     // f16::MAX
+            65_520.0,     // overflows to +inf
+            -65_520.0,    // overflows to -inf
+            6.1e-5,       // near f16 subnormal boundary
+            1e-8,         // flushes toward zero
+            3.140625,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            std::f32::consts::PI,
+            123456.0,
+        ];
+        for len in [0usize, 1, 7, 8, 15, vals.len()] {
+            let s = &vals[..len.min(vals.len())];
+            let mut simd = vec![0u16; s.len()];
+            // SAFETY: guarded by f16c::available(); lengths match.
+            unsafe { f16c::narrow(s, &mut simd) };
+            for (i, &v) in s.iter().enumerate() {
+                let want = half::f16::from_f32(v).to_bits();
+                let got = simd[i];
+                // Both NaN encodings are acceptable only if both are NaN; assert
+                // exact equality otherwise. f16 NaN canonicalizes identically.
+                if half::f16::from_bits(want).is_nan() {
+                    assert!(
+                        half::f16::from_bits(got).is_nan(),
+                        "narrow NaN mismatch for {v}"
+                    );
+                } else {
+                    assert_eq!(got, want, "narrow mismatch for f32 {v}");
+                }
+            }
+        }
     }
 
     #[test]

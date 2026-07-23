@@ -11,6 +11,10 @@ categories = ["science", "hardware-support"]
 [features]
 # Opt-in vendored MLAS f32 SGEMM. Kept off by default because it builds C++/asm.
 mlas = ["dep:mlas-sys"]
+# Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
+# gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no
+# code to production builds.
+gqa_phase_profile = []
 tracing = ["dep:onnx-runtime-tracer"]
 
 [dependencies]
