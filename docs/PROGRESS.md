@@ -4,9 +4,19 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T04:09Z — CUDA IndexShare (GLM/DeepSeek selected-token attention) + f16 standard Attention._
+_Last updated: 2026-07-23T05:45Z — CUDA perf + smoothness wave 1: GQA scalar seqlens, ORT baseline, IndexShare capture, epilogue fusion (7B +9.5%), bf16 Attention._
 
-**Current `origin/main` implementation HEAD:** `0828abb` (after the CUDA IndexShare + f16 Attention batch).
+**Current `origin/main` implementation HEAD:** `0672400` (after the CUDA perf + smoothness wave 1 batch).
+
+## 2026-07-23 — CUDA perf + smoothness wave 1 (native vs ORT baseline + 4 landings)
+
+Five parallel worktree agents, each independently reviewed before fast-forward merge (main enforces `required_linear_history`). Net vs onnxruntime-genai-cuda 0.14.1 on 8×H200 (foundry cuda-gpu int4, greedy, 3-run median @128): Qwen0.5B **821 vs 732 (native +12%)**, 1.5B 481 vs 483 (parity), 7B 231→**254 vs 280 (−18%→~−9% after fusion)**, Phi-4-mini 93 vs 237 (−58%, top remaining target). Full table: `docs/benchmarks/ort-vs-native-cuda-2026-07-23.md`.
+
+- **Generic GQA scalar `seqlens_k` ✅ (`d2582df`, Irmgard; Chew 🟢):** batch-1 rank-0→`[1]` promotion for `com.microsoft::GroupQueryAttention` on CPU+CUDA (validated int32/contiguous/non-negative/capacity; scalar rejected for batch>1); removed the metadata opt-in policy. Model-agnostic. Unblocks a scalar-seqlens export.
+- **IndexShare CUDA-graph capture ✅ (`3ff0f12`, Keaton; Chew 🟢):** device-resident `validate_index_rows` NVRTC kernel + capture-error latch (`0x200`) replaces the D2H `selected_indices` validation; pooled stable-address scratch; `cuda_graph_compatible()` now true after a warmed eager pass. 10/10 GPU tests (captured replay byte-identical to eager).
+- **Epilogue fusion ✅ (`8dd3072`, Deckard; Luv 🟢 GPU-verified):** `CudaSkipRmsNormMatMulFusion` folds `SkipSimplifiedLayerNormalization` (largest decode kernel, ~24%) into neighbouring `MatMulNBits` GEMVs (residual→preceding bias epilogue, RMS→following prologue). **7B +9.5% (231→254 tok/s), −28 device kernels/token, byte-identical output.** 0.5B −2.7% (structural warp-0 recompute; still beats ORT) → size-floor follow-up. Env toggle `ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION`.
+- **bf16 standard Attention + mask-dtype fix ✅ (`0672400`, Roy→Holden; Gaff 🔴→🟢):** completed the f32/f16/bf16 Attention dtype matrix (fp32 accumulation, mutation-guarded). Gaff rejected v1 for claiming a floating mask whose dtype ≠ Q/K/V; per strict reviewer lockout **Roy was barred and Holden owned the fix** — floating masks must now match Q/K/V dtype (bool/undefined exempt), closing the bf16 defect and the latent f16 gap. `docs/GLM_READINESS_GAPS.md` Attention row now f32/f16/bf16.
+- **Wave 2 in flight:** post-fusion re-bench + smoothness matrix (Marsten), 0.5B size-floor + next epilogue fusion (Deckard), Phi-4-mini CUDA-graph capture / control-flow (Batty), f16/bf16 IndexShare storage (Keaton), native_engine MoE test-fixture fix (Irmgard).
 
 ## 2026-07-23 — CUDA IndexShare (GLM/DeepSeek DSA) + f16 standard Attention
 

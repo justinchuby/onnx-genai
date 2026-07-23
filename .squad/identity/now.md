@@ -1,11 +1,11 @@
-# Now
+# Team Focus — now
 
-**Updated:** 2026-07-23T04:09Z
+**Goal:** (A) run GLM/DeepSeek/Qwen/Gemma4/Phi smoothly on the native stack; (B) native CUDA EP decisively faster than onnxruntime-genai; (C) continuously benchmark foundry-local cuda-gpu models on 8×H200.
 
-Focus: CUDA performance + GLM/DeepSeek native-runtime support.
+**main HEAD:** `0672400` — after CUDA perf + smoothness wave 1.
 
-Just landed to main (13f641f): device-resident CUDA **IndexShare v1** (GLM/DeepSeek selected-token attention, GPU-native, 7 parity tests, capture=false pending device index validation) and **f16 CUDA standard Attention** (was f32-only; fp32 accum retained; bf16 deferred). Both reviewed (Chew/Gaff 🟡→addressed) and re-verified green on merged main.
+**Standing vs ORT (onnxruntime-genai-cuda 0.14.1, @128 greedy):** Qwen0.5B +12% (ahead), 1.5B parity, 7B ~−9% (after epilogue fusion, from −18%), Phi-4-mini −58% (top target — ORT graph-captures, native cannot due to control flow).
 
-Next CUDA/GLM-DeepSeek: IndexShare CUDA-graph capture (device-side index validation), f16/bf16 IndexShare storage, bf16 standard Attention, Mobius fused QMoE/BlockQuantizedMoE emitter, MTP state threading, CSA Phase B perf tuning.
+**Wave 2 in flight (5 worktree agents):** Marsten (post-fusion re-bench + smoothness), Deckard (0.5B fusion size-floor + next epilogue fusion), Batty (Phi-4-mini CUDA-graph capture), Keaton (f16/bf16 IndexShare storage), Irmgard (native_engine MoE test-fixture fix).
 
-Op-note: spawned "Scribe"-flavored agents keep hitting the squad.agent.md canary-refusal loop (even on gpt-5.6-terra); coordinator does the decisions/log merge inline under the local state backend.
+**Next levers:** Phi control-flow capture, per-layer megakernel fusion (~227 kernels/token), int8 SDOT (DP4A), GLM/DeepSeek real-weight E2E (blocked on Mobius fused QMoE emitter), Gemma4 VLM native pipeline.
