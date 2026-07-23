@@ -1760,6 +1760,9 @@ impl CudaOnDeviceConstantSelect {
                     return None;
                 }
                 let threshold = threshold?;
+                // This tie is a RoPE-cache-pattern topological proxy, not a
+                // general proof for arbitrary Ifs: the consumer only indexes
+                // rows below `threshold` while the predicate is false.
                 if i64::try_from(else_lead).ok()? != threshold {
                     return None;
                 }
@@ -3735,6 +3738,11 @@ mod tests {
         (0..rows * cols).flat_map(|_| fill.to_le_bytes()).collect()
     }
 
+    const THEN_COS_SENTINEL: u16 = 0x3C00; // 1.0
+    const THEN_SIN_SENTINEL: u16 = 0x4000; // 2.0
+    const ELSE_COS_SENTINEL: u16 = 0x4200; // 3.0
+    const ELSE_SIN_SENTINEL: u16 = 0x4400; // 4.0
+
     fn constant_branch(outputs: &[(&str, DataType, Vec<usize>, Vec<u8>)]) -> Graph {
         let mut branch = Graph::new();
         for (name, dtype, dims, bytes) in outputs {
@@ -3812,10 +3820,10 @@ mod tests {
         graph.add_output(cos);
         graph.add_output(sin);
 
-        let then_cos = fp16_bytes(then_dims[0], then_dims[1], 0x3C00); // 1.0
-        let then_sin = fp16_bytes(then_dims[0], then_dims[1], 0x4000); // 2.0
-        let else_cos = fp16_bytes(else_dims[0], else_dims[1], 0x4200); // 3.0
-        let else_sin = fp16_bytes(else_dims[0], else_dims[1], 0x4400); // 4.0
+        let then_cos = fp16_bytes(then_dims[0], then_dims[1], THEN_COS_SENTINEL);
+        let then_sin = fp16_bytes(then_dims[0], then_dims[1], THEN_SIN_SENTINEL);
+        let else_cos = fp16_bytes(else_dims[0], else_dims[1], ELSE_COS_SENTINEL);
+        let else_sin = fp16_bytes(else_dims[0], else_dims[1], ELSE_SIN_SENTINEL);
         graph.subgraphs.insert(
             (if_node, "then_branch".into()),
             constant_branch(&[
@@ -3875,13 +3883,24 @@ mod tests {
                 WeightRef::Inline(t) => &t.data,
                 _ => panic!("y must be inline"),
             };
+            let (then_sentinel, else_sentinel) = match node.outputs[0] {
+                output if output == cos => (THEN_COS_SENTINEL, ELSE_COS_SENTINEL),
+                output if output == sin => (THEN_SIN_SENTINEL, ELSE_SIN_SENTINEL),
+                output => panic!("unexpected Where output {output:?}"),
+            };
             assert_eq!(x_bytes.len(), 4 * 2 * 2, "then const is the full long table");
             assert_eq!(y_bytes.len(), 4 * 2 * 2, "else const padded to the long shape");
+            assert_eq!(
+                x_bytes,
+                &fp16_bytes(4, 2, then_sentinel),
+                "x must carry the predicate-true branch values"
+            );
             // First 2 rows preserved from the short table; the appended 2 rows are
             // zeros (provably never indexed when the predicate is false).
-            assert!(
-                y_bytes[..2 * 2 * 2].iter().any(|&b| b != 0),
-                "short-table rows preserved byte-for-byte"
+            assert_eq!(
+                &y_bytes[..2 * 2 * 2],
+                fp16_bytes(2, 2, else_sentinel),
+                "y must carry the predicate-false branch values"
             );
             assert!(
                 y_bytes[2 * 2 * 2..].iter().all(|&b| b == 0),
