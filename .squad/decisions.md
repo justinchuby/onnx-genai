@@ -3731,3 +3731,13 @@ non-row-vector bias rejected, extra-consumer rejected, graph-output rejected).
 Openers byte-identical. ORT f16 baselines obtained via CPU-provider config variants (/tmp/ortcpu-{0.5b,1.5b}, provider_options emptied).
 **Why:** Confirms the user directive — every material CPU-EP decode op now beats/ties ORT AND whole-model decode beats ORT on all three. Landed this segment (all non-author reviewed, byte-identical/tight-tolerance, cross-OS/cross-arch, no hardcoded dims): f32 SiLU MLAS-logistic+robust-extreme (13x), f16/bf16 SiLU reuse (~3.9x), f16 Mul/Sub/Div binary_contiguous (~3.8x), SkipSimplifiedLayerNorm portable 8-lane SIMD + stats-output fast path (~3.3x vs ORT), QKV-bias Add folded into MatMulNBits epilogue (standalone Add eliminated). 730 CPU-EP tests green, clippy -D warnings clean. PR #105.
 <!-- scribe-merge-2026-07-23T11-10-00Z-coordinator-final-cpu-benchmark-end -->
+
+<!-- scribe-merge-2026-07-23T11-25-00Z-pris-parity-gate -->
+<!-- merged from .squad/decisions/inbox/pris-parity-gate.md -->
+### 2026-07-23: Add CPU SIMD-versus-scalar parity regression gate
+**By:** Pris
+**What:** Extended f16 Mul/Sub/Div binary-contiguous raw-bit parity coverage with non-lane-multiple 61- and 53-element inputs. Added cross-dtype (f32/f16/bf16) `SkipSimplifiedLayerNormalization` SIMD-versus-scalar parity coverage across remainder and bulk hidden sizes, with/without bias and requested statistics outputs. Existing SiLU MLAS-versus-scalar boundary coverage and MatMulNBits numeric bias-fusion equivalence were retained without duplication.
+**Why:** Locks the five landed CPU-EP performance improvements against correctness regressions; x86 SIMD-equals-scalar parity serves as the cross-architecture correctness proxy.
+**Validation:** 731 library tests passed; Clippy with warnings denied and rustfmt were clean.
+**Merged:** `1be1bd5`.
+<!-- scribe-merge-2026-07-23T11-25-00Z-pris-parity-gate-end -->
