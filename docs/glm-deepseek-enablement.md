@@ -399,3 +399,38 @@ from removing downstream graph replay calls; GLM additionally pays 40 explicit
 stream synchronizations. Conservatively, removing the seams should move
 91.5 tok/s into roughly the 110-125 tok/s range (20-37%), with the static CUDA
 Split path likely owning the higher end because it preserves one gate/up GEMV.
+
+#### Mobius pre-split result
+
+The packed-weight avenue was implemented on Mobius PR
+[`onnxruntime/mobius#424`](https://github.com/onnxruntime/mobius/pull/424).
+After GPTQ repacking, ChatGLM preprocessing now slices every
+`gate_up_proj.{weight,scales,bias,zero_points}` tensor along output dimension 0
+and emits separate `gate_proj` and `up_proj` MatMulNBits nodes through the
+standard MLP graph. The 13,696-output midpoint is block-aligned
+(`13696 / 128 = 107`); more importantly, MatMulNBits packs along the input
+dimension, so slicing output rows leaves every `[32, 64]` int4 block intact.
+The emitted weights are `[13696, 32, 64]` and scales are `[13696, 32]` for both
+projections.
+
+Fresh artifact:
+`/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda-nosplit`.
+
+| Metric | Fused activation Split | Packed weights pre-split |
+|---|---:|---:|
+| ONNX `Split` nodes | 40 | 0 |
+| `MatMulNBits` nodes | 240 | 280 |
+| Captured segments | 41 | 1 |
+| Eager seams | 40 | 0 |
+| CUDA graph fallbacks | 0 | 0 |
+| Steady decode | 9.059 ms/token | 8.457 ms/token |
+| Throughput | 110.39 tok/s | 118.24 tok/s |
+
+Both measurements used the same release `profile_native`, GPU 4, prompt
+`Hello, who are you?`, one warmup, three runs, and 128 generated tokens. This is
+a 7.1% throughput improvement and 6.6% decode-latency reduction. All 128 greedy
+token IDs matched exactly between artifacts, and both decoded to the same
+coherent response. Prefill moved from 101.224 ms to 108.019 ms because the
+pre-split graph launches an additional projection per layer; the measured
+steady-decode gain confirms that eliminating 40 synchronization seams outweighs
+that cost during generation.
