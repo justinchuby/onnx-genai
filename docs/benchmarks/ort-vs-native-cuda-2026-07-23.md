@@ -41,6 +41,8 @@ Native ladder load averages were 29.66/27.01/30.40 before and
 
 ### 7B fusion isolation
 
+#### Epilogue-only (64238b5)
+
 At 128 tokens, 7B is **252.74 tok/s** with the fusion enabled and **230.60
 tok/s** with `ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION=1`: **+9.60%**. The
 off result agrees with the 230.84 tok/s pre-fusion baseline, independently
@@ -52,6 +54,36 @@ from 168 to 84 and `gemv_f16_general` from 114 to 58, while 28
 streams and decoded continuation are identical. The 0.5B −3.46% regression is
 slightly larger than the reported −2.7%, but it remains 6.86% ahead of ORT;
 the size-floor gate was not present in `64238b5`.
+
+### Post-SwiGLU fusion (main 05e1fd1)
+
+| Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Change vs. epilogue-only | Smoothness |
+|---|---:|---:|---:|---:|---|
+| Qwen2.5-0.5B int4 | 818.75 (1.221) | 741.83 (1.348) | **110.37% BEATS +10.37%** | +3.28% | coherent + deterministic: yes |
+| Qwen2.5-1.5B int4 | 572.20 (1.748) | 487.14 (2.053) | **117.46% BEATS +17.46%** | +11.31% | coherent + deterministic: yes |
+| Qwen2.5-7B int4 | 286.90 (3.486) | 267.23 (3.742) | **107.36% BEATS +7.36%** | +13.52% | coherent + deterministic: yes |
+| Phi-4-mini int4/int8 | 93.92 (10.648) | 229.62 (4.355) | **40.90% TRAILS −59.10%** | +1.89% | coherent + deterministic: yes |
+
+The 7B A/B isolates both RMSNorm fusions: enabled is **286.90 tok/s** and
+`ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION=1` is **230.29 tok/s**, a **+24.58%**
+gain. This confirms the claimed approximately 285 tok/s result and moves
+native 7B ahead of ORT by 7.36%. A 32-token trace contains 453 events enabled,
+down from 537 with the prior epilogue-only fusion and 621 with both fusions
+disabled. The enabled trace has `gate_up_swiglu_rmsnorm_prefill` (28) and
+`gate_up_swiglu_rmsnorm_fused` (56), while the disabled trace has 168
+`skip_rmsnorm_f16_warp_half4` events; its absence confirms the SwiGLU-RMS
+fusion fires. The on/off token IDs and decoded `" Paris..."` text are
+identical.
+
+The 1.5B 514.05→572.20 tok/s gain is from the SwiGLU-RMS fusion now firing:
+its hidden size is 1536, above the 1280 fusion floor, while the preceding
+epilogue-only measurement predated that fusion. In contrast, 0.5B's hidden
+size is 896, below the floor. Its 818.75 tok/s is 3.28% above the preceding
+792.72 measurement, which is run-to-run variance from lower host load
+(13.42/13.61/14.77 before and 10.07/12.79/14.47 after), not a new fusion
+effect. Its 537-event trace retains the unfused `gate_up_swiglu_*` and
+`skip_rmsnorm_f16_warp_half4` variants, confirming the size floor kept the new
+SwiGLU fusion inert.
 
 ## Method and validity checks
 
@@ -92,10 +124,11 @@ and 1,162/1,139 (Phi).
 
 ## Where the native gap is
 
-On post-fusion main, Phi-4-mini remains the worst trailing model: native is
-59.86% behind ORT at 128 tokens. The f0af865 baseline was 60.71% behind at 128
-tokens and 57.76% behind at 1024; 1024 native post-fusion was not rerun. It
-also has the largest native absolute per-token latency, so it was profiled.
+On the epilogue-only `64238b5` measurement, Phi-4-mini was 59.86% behind ORT
+at 128 tokens; current `05e1fd1` is 59.10% behind. The f0af865 baseline was
+60.71% behind at 128 tokens and 57.76% behind at 1024; 1024 native
+post-fusion was not rerun. It also has the largest native absolute per-token
+latency, so it was profiled.
 
 `ONNX_GENAI_PROFILE_OPS=1` on Phi (32-token diagnostic) is intrusive and
 therefore not used for the throughput table. Its warm operator summaries show
