@@ -107,18 +107,19 @@ def check_case(
         if divergence is not None:
             raise AssertionError(f"{key} must be exact; first divergence is {divergence}")
     else:
-        minimum = int(case["minimum_common_prefix"])
-        common_prefix = tokens if divergence is None else divergence
-        if common_prefix < minimum:
+        expected_divergence = int(case["expected_first_divergence"])
+        if divergence != expected_divergence:
             raise AssertionError(
-                f"{key} diverged at {common_prefix}, earlier than locked minimum {minimum}"
+                f"{key} first-divergence regression: expected index "
+                f"{expected_divergence}, got {divergence}"
             )
         oracle_index = int(case["oracle_index"])
         oracle_token = int(case["exact_q4_f32_oracle_token"])
         if actual["native"][oracle_index] != oracle_token:
             raise AssertionError(
-                f"{key} native token {actual['native'][oracle_index]} at {oracle_index} "
-                f"does not match exact-Q4 f32 oracle {oracle_token}"
+                f"{key} oracle-token regression at divergence index {oracle_index}: "
+                f"native produced {actual['native'][oracle_index]}, exact-Q4 f32 "
+                f"oracle requires {oracle_token}"
             )
 
     aligned = sum(a == b for a, b in zip(actual["native"], actual["ort"]))
