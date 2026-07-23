@@ -4,10 +4,10 @@ use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut,
     TensorView,
 };
-use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    compute_contiguous_strides, static_shape, Attribute, DataType, Graph, Node, NodeId,
 };
 use onnx_runtime_loader::Model;
 
@@ -51,7 +51,7 @@ fn run(
         .enumerate()
         .map(|(i, input)| {
             let value = graph.create_named_value(
-                &format!("input_{i}"),
+                format!("input_{i}"),
                 input.dtype,
                 static_shape(input.shape.iter().copied()),
             );
@@ -64,7 +64,7 @@ fn run(
         .enumerate()
         .map(|(i, (dtype, shape))| {
             graph.create_named_value(
-                &format!("output_{i}"),
+                format!("output_{i}"),
                 *dtype,
                 static_shape(shape.iter().copied()),
             )
@@ -420,7 +420,7 @@ fn build_split_kernel(
         .enumerate()
         .map(|(i, shape)| {
             graph.create_named_value(
-                &format!("output_{i}"),
+                format!("output_{i}"),
                 DataType::Float32,
                 static_shape(shape.iter().copied()),
             )
@@ -448,7 +448,10 @@ fn split_static_even_num_outputs_is_capture_supported() {
         &ep,
         &[1, 4, 8],
         &[vec![1, 4, 4], vec![1, 4, 4]],
-        &[("axis", Attribute::Int(-1)), ("num_outputs", Attribute::Int(2))],
+        &[
+            ("axis", Attribute::Int(-1)),
+            ("num_outputs", Attribute::Int(2)),
+        ],
         None,
     );
     assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
@@ -462,7 +465,10 @@ fn split_static_explicit_split_attribute_is_capture_supported() {
         &ep,
         &[2, 5],
         &[vec![2, 2], vec![2, 3]],
-        &[("axis", Attribute::Int(1)), ("split", Attribute::Ints(vec![2, 3]))],
+        &[
+            ("axis", Attribute::Int(1)),
+            ("split", Attribute::Ints(vec![2, 3])),
+        ],
         None,
     );
     assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
@@ -488,24 +494,126 @@ fn split_dynamic_runtime_sizes_is_not_capture_supported() {
 
 #[test]
 fn split_static_even_num_outputs_matches_eager_bytes() {
-    // Capture-path result parity: the static fast path yields identical bytes to
-    // the reference even split.
     let ep = gpu();
-    let out = run(
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let input_shape = [1, 2, 4];
+    let output_shapes = [vec![1, 2, 2], vec![1, 2, 2]];
+    let initial = raw(&[1_f32, 2., 3., 4., 5., 6., 7., 8.]);
+    let mutated = raw(&[9_f32, 10., 11., 12., 13., 14., 15., 16.]);
+    let kernel = build_split_kernel(
         &ep,
-        "Split",
-        13,
-        &[tensor(
-            DataType::Float32,
-            &[1, 2, 4],
-            &[1_f32, 2., 3., 4., 5., 6., 7., 8.],
-        )],
+        &input_shape,
+        &output_shapes,
         &[
-            (DataType::Float32, vec![1, 2, 2]),
-            (DataType::Float32, vec![1, 2, 2]),
+            ("axis", Attribute::Int(-1)),
+            ("num_outputs", Attribute::Int(2)),
         ],
-        &[("axis", Attribute::Int(-1)), ("num_outputs", Attribute::Int(2))],
+        None,
     );
-    assert_eq!(f32s(&out[0]), vec![1., 2., 5., 6.]);
-    assert_eq!(f32s(&out[1]), vec![3., 4., 7., 8.]);
+    assert_eq!(
+        kernel.capture_support(),
+        CaptureSupport::Supported,
+        "concrete input shapes must select the static Split plan"
+    );
+
+    let input_buffer = ep.allocate(initial.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&initial, cuptr(input_buffer.as_ptr()))
+            .unwrap();
+    };
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let input = TensorView::new(
+        DevicePtr(input_buffer.as_ptr()),
+        DataType::Float32,
+        &input_shape,
+        &input_strides,
+        device,
+    );
+    let mut output_buffers = output_shapes
+        .iter()
+        .map(|shape| {
+            ep.allocate(DataType::Float32.storage_bytes(shape.iter().product()), 256)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output_strides = output_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+
+    macro_rules! execute {
+        () => {{
+            let mut outputs = output_buffers
+                .iter_mut()
+                .zip(&output_shapes)
+                .zip(&output_strides)
+                .map(|((buffer, shape), strides)| {
+                    TensorMut::new(
+                        DevicePtrMut(buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        shape,
+                        strides,
+                        device,
+                    )
+                })
+                .collect::<Vec<_>>();
+            kernel.execute(&[input], &mut outputs).unwrap();
+        }};
+    }
+
+    execute!();
+    unsafe {
+        runtime
+            .htod(&mutated, cuptr(input_buffer.as_ptr()))
+            .unwrap();
+    };
+    execute!();
+    let eager = output_buffers
+        .iter()
+        .map(|buffer| {
+            let mut bytes = vec![0; 4 * 4];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(eager[0], raw(&[9_f32, 10., 13., 14.]));
+    assert_eq!(eager[1], raw(&[11_f32, 12., 15., 16.]));
+
+    unsafe {
+        runtime
+            .htod(&initial, cuptr(input_buffer.as_ptr()))
+            .unwrap();
+    };
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute!();
+    runtime.end_graph_capture().unwrap();
+    assert!(runtime.has_graph_executable().unwrap());
+
+    unsafe {
+        runtime
+            .htod(&mutated, cuptr(input_buffer.as_ptr()))
+            .unwrap();
+    };
+    runtime.replay_graph().unwrap();
+    let replayed = output_buffers
+        .iter()
+        .map(|buffer| {
+            let mut bytes = vec![0; 4 * 4];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            };
+            bytes
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replayed, eager);
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(input_buffer).unwrap();
+    for buffer in output_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
 }
