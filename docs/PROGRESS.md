@@ -4,9 +4,20 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T05:45Z — CUDA perf + smoothness wave 1: GQA scalar seqlens, ORT baseline, IndexShare capture, epilogue fusion (7B +9.5%), bf16 Attention._
+_Last updated: 2026-07-23T07:30Z — CUDA perf wave 2: f16/bf16 IndexShare, engine build-fix + MoE fixture, SwiGLU-RMS fusion (7B +23.5%, native now beats ORT on 7B). Phi captured-path GQA track opened._
 
-**Current `origin/main` implementation HEAD:** `0672400` (after the CUDA perf + smoothness wave 1 batch).
+**Current `origin/main` implementation HEAD:** `05e1fd1` (after the CUDA perf wave 2 batch).
+
+## 2026-07-23 — CUDA perf wave 2 (SwiGLU-RMS fusion flips 7B positive; native beats ORT on 0.5B/1.5B/7B)
+
+Standing native vs onnxruntime-genai-cuda 0.14.1 (8×H200, foundry cuda-gpu int4, greedy, 3-run median @128) after this wave: **Qwen0.5B ~792 vs 742 (+6.9%), 1.5B 514 vs 487 (+5.5%), 7B ~285 vs 267 (+6.8% — now AHEAD, pending Marsten re-verify)**; Phi-4-mini 92 vs 230 (−60%, sole remaining gap — now known to be captured-path GroupQueryAttention, not Cast overhead).
+
+- **f16/bf16 IndexShare storage ✅ (`69ee4e4`, Keaton; Chew 🟢):** homogeneous f32/f16/bf16 K/V storage for the device IndexShare kernel (was f32-only), fp32 accumulation retained; module bumped to `index_share_f32_f16_bf16_v3`. Parity vs exact-rounded CPU oracle max Δ 4.88e-5 (f16) / 1.03e-3 (bf16); present-KV bit-exact; captured f16 replay byte-identical to eager, latch preserved. 13 GPU tests.
+- **Engine `cuda` build-fix + native_engine MoE fixture ✅ (`64238b5`, Irmgard; Gaff 🟢):** wave-1 `d2582df` left `onnx-genai-engine` referencing the undeclared `onnx_runtime_ep_api` crate → `profile_native` (bench-native,cuda) failed to compile, blocking ALL native benchmarking. Fix: new inherent `CudaExecutionProvider::initialized(ordinal)` (does `new()`+`initialize(&EpConfig::default())` internally) so the engine no longer names the api crate. Also repaired the stale `ModelCapabilities`/`mixture_of_experts` test fixtures (native_engine 7/7; fixtures now assert real decode+fallback, stronger than the prior error-string checks).
+- **Stale lib-test expectations ✅ (`de831fd`, Irmgard):** two CUDA lib unit tests were red on main (only targeted GPU tests were run in wave-1 review): `covered_ops_have_no_duplicates` hardcoded 87 (now 88 — `pkg.nxrt::IndexShare` from `1304707`) and a GQA seqlens test asserted an outdated error substring. Fixed both → full lib suite **168/0**.
+- **SwiGLU-RMS fusion + size-floor gate ✅ (`05e1fd1`, Deckard; Chew 🟢 bit-exact-verified):** (1) model-agnostic `fusion_benefit_is_positive()` gate — fuse only when `hidden ≥ RMSNORM_FUSION_MIN_HIDDEN` (1280 = 10× warp-half4 reduction stride), so 0.5B (896) stays inert (no more −2.7% regression: 814.9 on vs 816.1 off). (2) New capture-safe kernel `matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm` folds the post-attention `SkipSimplifiedLayerNormalization` into the fan-out-1 `GateUpSwiGlu` GEMV (byte-identical RMS prologue + SwiGLU body), plus a `value_redirects` fix for chained blocks sharing a residual. **7B +23.5% @128 (231→285.4), +23.1% @1024**, all 168 standalone SkipSLN launches removed (~56/forward pass), byte-identical (bit-exact GPU test Δ==0 + token-identical). Full suite 174/0.
+- **Cast-fold (eager-only) — in review (Batty; Luv 🟡):** `CudaDropNormalizationCasts` removes Phi's redundant f16→f32→f16 norm-cast wrappers (765→6 casts), model-agnostic, byte-identical, capture-preserving. Luv's A/B: **+25.6% eager but +0.8% (noise) in the captured path** — the win is eager/hygiene only; Phi's captured-path gap is GQA. Batty rebasing onto Deckard + correcting the claim + adding negative/fixpoint tests.
+- **Wave 3 opened:** Phi captured-path GroupQueryAttention profiling+optimization (Roy) — the true driver of Phi's −60%.
 
 ## 2026-07-23 — CUDA perf + smoothness wave 1 (native vs ORT baseline + 4 landings)
 
