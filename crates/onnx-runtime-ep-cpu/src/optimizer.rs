@@ -45,6 +45,10 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     // the `MatMulNBits` optional bias input, which the kernel adds inside the
     // MLAS GEMV epilogue instead of paying for a standalone element-wise `Add`.
     passes.push(Box::new(MatMulNBitsBiasFusion::new()));
+    // Always-on Conv+BatchNormalization(+Relu) fold: pushes the inference-time BN
+    // affine transform back into the Conv weight/bias and folds a trailing Relu
+    // into the Conv activation epilogue, eliminating standalone BN/Relu kernels.
+    passes.push(Box::new(ConvBatchNormActivationFusion::new()));
     passes
 }
 
@@ -547,6 +551,295 @@ impl GateUpCandidate {
     }
 }
 
+/// Folds `Conv -> BatchNormalization` (and an optional trailing `Relu`) into a
+/// single `Conv` with adjusted weight/bias initializers and a fused activation.
+///
+/// Batch normalization at inference is an affine per-output-channel transform
+/// `y = a[c]*x + b[c]` with `a[c] = scale[c]/sqrt(var[c]+eps)` and
+/// `b[c] = beta[c] - a[c]*mean[c]`. Because a convolution is linear in its
+/// weights and bias, that transform can be pushed back into the Conv:
+/// `W'[c] = a[c]*W[c]` and `B'[c] = a[c]*(B[c]-mean[c]) + beta[c]`. ORT folds BN
+/// this way in its `nchwc_transformer`, eliminating a full-tensor BN kernel per
+/// convolution (which profiling showed dominates ResNet/MobileNet inference on
+/// the native EP). A trailing `Relu` is folded into the Conv's `activation`
+/// attribute, which the MLAS NCHWc epilogue (and the im2col fallback) applies for
+/// free.
+///
+/// The match is purely structural and only fires when BN's scale/B/mean/var (and
+/// the Conv weight/bias) are constant `Float32` initializers, so it is a general
+/// graph rewrite with no model-specific knowledge.
+pub struct ConvBatchNormActivationFusion;
+
+impl ConvBatchNormActivationFusion {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ConvBatchNormActivationFusion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OptimizationPass for ConvBatchNormActivationFusion {
+    fn name(&self) -> &str {
+        "CpuConvBatchNormActivationFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        let bn_nodes: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "BatchNormalization"
+                    && matches!(node.domain.as_str(), "" | "ai.onnx"))
+                .then_some(id)
+            })
+            .collect();
+
+        let mut changed = false;
+        for bn_id in bn_nodes {
+            if let Some(fusion) = ConvBnFusion::match_from_bn(graph, bn_id, ctx) {
+                fusion.apply(graph);
+                changed = true;
+            }
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+struct ConvBnFusion {
+    conv_id: NodeId,
+    bn_id: NodeId,
+    /// The shared value produced by Conv and consumed by BN.
+    conv_output: ValueId,
+    bn_output: ValueId,
+    old_weight: ValueId,
+    old_bias: Option<ValueId>,
+    bn_params: Vec<ValueId>,
+    weight_dims: Vec<usize>,
+    new_weight: Vec<f32>,
+    new_bias: Vec<f32>,
+    /// `(relu_node, relu_output)` when a trailing `Relu` is folded in.
+    relu: Option<(NodeId, ValueId)>,
+}
+
+impl ConvBnFusion {
+    fn match_from_bn(graph: &Graph, bn_id: NodeId, ctx: &PassContext) -> Option<Self> {
+        let bn = graph.try_node(bn_id)?;
+        // Inference BatchNormalization: X, scale, B, mean, var -> Y only. Skip the
+        // training form (which also emits running-stat outputs).
+        if bn.inputs.len() != 5 || bn.outputs.len() != 1 {
+            return None;
+        }
+        let conv_output = bn.inputs[0]?;
+        let bn_output = bn.outputs[0];
+
+        let conv_id = graph.value(conv_output).producer?;
+        let conv = graph.try_node(conv_id)?;
+        if conv.op_type != "Conv"
+            || !matches!(conv.domain.as_str(), "" | "ai.onnx")
+            || conv.outputs.len() != 1
+            || conv.outputs[0] != conv_output
+            || conv.attr("activation").is_some()
+        {
+            return None;
+        }
+        // The Conv result must be private to this BN so it can be rewritten away.
+        if graph.outputs.contains(&conv_output) || graph.consumers(conv_output) != [bn_id] {
+            return None;
+        }
+
+        let weight = conv.inputs.get(1).copied().flatten()?;
+        let weight_ref = graph.initializers.get(&weight)?;
+        if weight_ref.dtype() != DataType::Float32 || weight_ref.dims().len() != 4 {
+            return None;
+        }
+        let weight_dims = weight_ref.dims().to_vec();
+        let out_ch = weight_dims[0];
+        if out_ch == 0 {
+            return None;
+        }
+        let weight_vals = bytes_to_f32(ctx.initializer_bytes(weight_ref)?)?;
+        if !weight_vals.len().is_multiple_of(out_ch) {
+            return None;
+        }
+
+        let old_bias = conv.inputs.get(2).copied().flatten();
+        let bias_vals = match old_bias {
+            Some(bias) => {
+                let bias_ref = graph.initializers.get(&bias)?;
+                if bias_ref.dtype() != DataType::Float32 || bias_ref.dims() != [out_ch] {
+                    return None;
+                }
+                bytes_to_f32(ctx.initializer_bytes(bias_ref)?)?
+            }
+            None => vec![0.0f32; out_ch],
+        };
+
+        // scale, B (beta), mean, var — all per-output-channel constants.
+        let mut bn_params: Vec<ValueId> = Vec::with_capacity(4);
+        let mut params: Vec<Vec<f32>> = Vec::with_capacity(4);
+        for slot in 0..4 {
+            let value = bn.inputs[slot + 1]?;
+            let param_ref = graph.initializers.get(&value)?;
+            if param_ref.dtype() != DataType::Float32 || param_ref.dims() != [out_ch] {
+                return None;
+            }
+            bn_params.push(value);
+            params.push(bytes_to_f32(ctx.initializer_bytes(param_ref)?)?);
+        }
+        let (scale, beta, mean, var) = (&params[0], &params[1], &params[2], &params[3]);
+        let epsilon = bn
+            .attr("epsilon")
+            .and_then(Attribute::as_float)
+            .unwrap_or(1e-5);
+
+        let mut a = vec![0.0f32; out_ch];
+        for c in 0..out_ch {
+            let denom = (var[c] + epsilon).sqrt();
+            if !denom.is_finite() || denom <= 0.0 {
+                return None;
+            }
+            a[c] = scale[c] / denom;
+        }
+
+        let per_filter = weight_vals.len() / out_ch;
+        let mut new_weight = weight_vals;
+        for c in 0..out_ch {
+            let factor = a[c];
+            for value in &mut new_weight[c * per_filter..(c + 1) * per_filter] {
+                *value *= factor;
+            }
+        }
+        let mut new_bias = vec![0.0f32; out_ch];
+        for c in 0..out_ch {
+            new_bias[c] = (bias_vals[c] - mean[c]) * a[c] + beta[c];
+        }
+
+        // Optionally fold a trailing Relu when BN feeds exactly one Relu.
+        let relu = (!graph.outputs.contains(&bn_output))
+            .then(|| {
+                let consumers = graph.consumers(bn_output);
+                let relu_id = *consumers.first()?;
+                if consumers.len() != 1 {
+                    return None;
+                }
+                let relu = graph.try_node(relu_id)?;
+                (relu.op_type == "Relu"
+                    && matches!(relu.domain.as_str(), "" | "ai.onnx")
+                    && relu.inputs.len() == 1
+                    && relu.outputs.len() == 1)
+                    .then_some((relu_id, relu.outputs[0]))
+            })
+            .flatten();
+
+        Some(Self {
+            conv_id,
+            bn_id,
+            conv_output,
+            bn_output,
+            old_weight: weight,
+            old_bias,
+            bn_params,
+            weight_dims,
+            new_weight,
+            new_bias,
+            relu,
+        })
+    }
+
+    fn apply(self, graph: &mut Graph) {
+        let conv_index = self.conv_id.0;
+        let out_ch = self.weight_dims[0];
+
+        let weight_value = graph.create_named_value(
+            format!("__nxrt_convbn_{conv_index}_weight"),
+            DataType::Float32,
+            static_shape(self.weight_dims.iter().copied()),
+        );
+        graph.set_initializer(
+            weight_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                self.weight_dims.clone(),
+                f32_to_bytes(&self.new_weight),
+            )),
+        );
+
+        let bias_value = graph.create_named_value(
+            format!("__nxrt_convbn_{conv_index}_bias"),
+            DataType::Float32,
+            static_shape([out_ch]),
+        );
+        graph.set_initializer(
+            bias_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![out_ch],
+                f32_to_bytes(&self.new_bias),
+            )),
+        );
+
+        let mut conv = graph.node(self.conv_id).clone();
+        if conv.inputs.len() < 3 {
+            conv.inputs.resize(3, None);
+        }
+        conv.inputs[1] = Some(weight_value);
+        conv.inputs[2] = Some(bias_value);
+        if self.relu.is_some() {
+            conv.attributes
+                .insert("activation".into(), Attribute::String(b"Relu".to_vec()));
+        }
+        graph.replace_node(self.conv_id, conv);
+
+        // Route BN's (and any trailing Relu's) consumers back onto the Conv
+        // output, then drop the now-dead BN / Relu nodes.
+        graph.replace_all_uses(self.bn_output, self.conv_output);
+        graph.remove_node(self.bn_id);
+        if let Some((relu_id, relu_output)) = self.relu {
+            graph.replace_all_uses(relu_output, self.conv_output);
+            graph.remove_node(relu_id);
+        }
+
+        // Drop initializers left orphaned by the rewrite.
+        remove_orphan_initializer(graph, self.old_weight);
+        if let Some(bias) = self.old_bias {
+            remove_orphan_initializer(graph, bias);
+        }
+        for param in self.bn_params {
+            remove_orphan_initializer(graph, param);
+        }
+    }
+}
+
+/// Reinterpret a little-endian `Float32` initializer blob as `f32` values.
+fn bytes_to_f32(bytes: &[u8]) -> Option<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+    )
+}
+
+/// Serialize `f32` values into a little-endian byte blob for an initializer.
+fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 fn positive_attr(node: &Node, name: &str) -> Option<usize> {
     usize::try_from(node.attr(name)?.as_int()?)
         .ok()
@@ -757,5 +1050,236 @@ mod tests {
 
         assert_eq!(count(&graph, "Add"), 1);
         assert_eq!(graph.node(mm_id).inputs.len(), 3);
+    }
+
+    use super::{f32_to_bytes, ConvBatchNormActivationFusion};
+    use onnx_runtime_ir::{TensorData, WeightRef};
+
+    fn set_f32_initializer(graph: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId {
+        let value = graph.create_named_value(name, DataType::Float32, static_shape(dims.to_vec()));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                dims.to_vec(),
+                f32_to_bytes(data),
+            )),
+        );
+        value
+    }
+
+    fn read_f32_initializer(graph: &Graph, value: ValueId) -> Vec<f32> {
+        let weight = graph.initializers.get(&value).expect("initializer present");
+        let WeightRef::Inline(tensor) = weight else {
+            panic!("expected inline initializer");
+        };
+        tensor
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// Builds `Conv(x, w[, b]) -> BatchNormalization -> [Relu]` with constant BN
+    /// parameters and returns the graph plus the Conv node id.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_bn_graph(
+        weight: &[f32],
+        weight_dims: &[usize],
+        bias: Option<&[f32]>,
+        scale: &[f32],
+        beta: &[f32],
+        mean: &[f32],
+        var: &[f32],
+        epsilon: f32,
+        with_relu: bool,
+    ) -> (Graph, NodeId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let out_ch = weight_dims[0];
+
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 3, 8, 8]));
+        graph.add_input(x);
+        let w = set_f32_initializer(&mut graph, "w", weight_dims, weight);
+        let mut conv_inputs = vec![Some(x), Some(w)];
+        if let Some(bias) = bias {
+            conv_inputs.push(Some(set_f32_initializer(&mut graph, "b", &[out_ch], bias)));
+        }
+
+        let conv_out = graph.create_named_value(
+            "conv_out",
+            DataType::Float32,
+            static_shape([1, out_ch, 6, 6]),
+        );
+        let conv = Node::new(NodeId(0), "Conv", conv_inputs, vec![conv_out]);
+        let conv_id = graph.insert_node(conv);
+
+        let scale_v = set_f32_initializer(&mut graph, "scale", &[out_ch], scale);
+        let beta_v = set_f32_initializer(&mut graph, "beta", &[out_ch], beta);
+        let mean_v = set_f32_initializer(&mut graph, "mean", &[out_ch], mean);
+        let var_v = set_f32_initializer(&mut graph, "var", &[out_ch], var);
+        let bn_out =
+            graph.create_named_value("bn_out", DataType::Float32, static_shape([1, out_ch, 6, 6]));
+        let mut bn = Node::new(
+            NodeId(0),
+            "BatchNormalization",
+            vec![
+                Some(conv_out),
+                Some(scale_v),
+                Some(beta_v),
+                Some(mean_v),
+                Some(var_v),
+            ],
+            vec![bn_out],
+        );
+        bn.attributes
+            .insert("epsilon".into(), Attribute::Float(epsilon));
+        graph.insert_node(bn);
+
+        let final_out = if with_relu {
+            let relu_out = graph.create_named_value(
+                "relu_out",
+                DataType::Float32,
+                static_shape([1, out_ch, 6, 6]),
+            );
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Relu",
+                vec![Some(bn_out)],
+                vec![relu_out],
+            ));
+            relu_out
+        } else {
+            bn_out
+        };
+        graph.add_output(final_out);
+        (graph, conv_id)
+    }
+
+    fn run_conv_bn_pass(graph: &mut Graph) {
+        ConvBatchNormActivationFusion::new()
+            .run(graph, &PassContext::new())
+            .expect("conv-bn fusion pass");
+    }
+
+    #[test]
+    fn folds_conv_bn_relu_into_conv() {
+        // Two output channels, 3 input channels, 3x3 kernel.
+        let out_ch = 2usize;
+        let per_filter = 3 * 3 * 3;
+        let weight: Vec<f32> = (0..out_ch * per_filter)
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let bias = [0.5f32, -0.25];
+        let scale = [1.5f32, 0.75];
+        let beta = [0.1f32, -0.2];
+        let mean = [0.3f32, 0.6];
+        let var = [4.0f32, 9.0];
+        let epsilon = 1e-5f32;
+
+        let (mut graph, conv_id) = conv_bn_graph(
+            &weight,
+            &[out_ch, 3, 3, 3],
+            Some(&bias),
+            &scale,
+            &beta,
+            &mean,
+            &var,
+            epsilon,
+            true,
+        );
+        run_conv_bn_pass(&mut graph);
+
+        assert_eq!(count(&graph, "BatchNormalization"), 0, "BN folded away");
+        assert_eq!(count(&graph, "Relu"), 0, "Relu folded into activation");
+        assert_eq!(count(&graph, "Conv"), 1);
+
+        let conv = graph.node(conv_id);
+        assert_eq!(
+            conv.attr("activation").and_then(Attribute::as_str),
+            Some("Relu")
+        );
+        let folded_w = read_f32_initializer(&graph, conv.inputs[1].unwrap());
+        let folded_b = read_f32_initializer(&graph, conv.inputs[2].unwrap());
+
+        for c in 0..out_ch {
+            let a = scale[c] / (var[c] + epsilon).sqrt();
+            for j in 0..per_filter {
+                let expected = weight[c * per_filter + j] * a;
+                assert!((folded_w[c * per_filter + j] - expected).abs() < 1e-6);
+            }
+            let expected_b = (bias[c] - mean[c]) * a + beta[c];
+            assert!((folded_b[c] - expected_b).abs() < 1e-6);
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_conv_bn_without_bias_or_relu() {
+        let out_ch = 2usize;
+        let per_filter = 3 * 3 * 3;
+        let weight: Vec<f32> = (0..out_ch * per_filter)
+            .map(|i| (i as f32) * 0.02)
+            .collect();
+        let scale = [2.0f32, 0.5];
+        let beta = [0.0f32, 1.0];
+        let mean = [1.0f32, -1.0];
+        let var = [1.0f32, 4.0];
+        let epsilon = 1e-5f32;
+
+        let (mut graph, conv_id) = conv_bn_graph(
+            &weight,
+            &[out_ch, 3, 3, 3],
+            None,
+            &scale,
+            &beta,
+            &mean,
+            &var,
+            epsilon,
+            false,
+        );
+        run_conv_bn_pass(&mut graph);
+
+        assert_eq!(count(&graph, "BatchNormalization"), 0);
+        let conv = graph.node(conv_id);
+        assert!(conv.attr("activation").is_none(), "no Relu to fold");
+        let folded_b = read_f32_initializer(&graph, conv.inputs[2].unwrap());
+        for c in 0..out_ch {
+            let a = scale[c] / (var[c] + epsilon).sqrt();
+            let expected_b = (0.0 - mean[c]) * a + beta[c];
+            assert!((folded_b[c] - expected_b).abs() < 1e-6);
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn skips_fusion_when_conv_output_is_shared() {
+        let out_ch = 2usize;
+        let per_filter = 3 * 3 * 3;
+        let weight = vec![0.01f32; out_ch * per_filter];
+        let (mut graph, conv_id) = conv_bn_graph(
+            &weight,
+            &[out_ch, 3, 3, 3],
+            None,
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            &[1.0, 1.0],
+            1e-5,
+            false,
+        );
+        // Expose the Conv output as a graph output so folding would drop an
+        // observable value.
+        let conv_out = graph.node(conv_id).outputs[0];
+        let mut outputs = graph.outputs.clone();
+        outputs.push(conv_out);
+        graph.set_outputs(outputs);
+
+        run_conv_bn_pass(&mut graph);
+        assert_eq!(
+            count(&graph, "BatchNormalization"),
+            1,
+            "shared Conv output blocks the fold"
+        );
     }
 }

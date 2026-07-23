@@ -42,7 +42,9 @@ pub mod weight_offload;
 
 pub use backend::CpuBackend;
 pub use kernels::qmoe::WeightOffloadHostCache;
-pub use optimizer::{MatMulNBitsBiasFusion, ProjectionFusion, cpu_optimization_passes};
+pub use optimizer::{
+    ConvBatchNormActivationFusion, MatMulNBitsBiasFusion, ProjectionFusion, cpu_optimization_passes,
+};
 pub use provider::CpuExecutionProvider;
 pub use weight_offload::placement::{
     ArbitrationAction, GpuLayersOverrideReport, HostFallbackReason, IqFormat, KvAdmissionDecision,
