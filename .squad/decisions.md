@@ -3658,3 +3658,64 @@ Decision archive gate checked at 2026-07-23T10:30:00Z: the active ledger was 271
 **What:** The contiguous f32 `SkipSimplifiedLayerNormalization` path now also handles requested mean/inv-std outputs directly, fuses residual/bias assembly with an eight-lane f32 square reduction, and uses a fixed-lane normalize/scale loop with scalar remainders. The broadcast and widened f16/bf16 fallback remains dtype- and shape-generic.
 **Why:** The real 7B graph requested statistics, so the previous direct-output path was bypassed and every one of 56 decode calls allocated buffers and performed per-element broadcast index unraveling. On the mandated profile, average decode op time/share fell from 2.885 ms / 9.15% to 0.594 ms / 1.99%; this is about 3.3x faster than the audit's approximately 1.94 ms ORT result inferred from the reported 1.49x baseline gap. The rewrite contains no target-specific intrinsics or model constants, preserves the exact 16-token opener, and passed 719 unit tests plus 10 integration tests, warnings-denied Clippy, and formatting checks.
 <!-- scribe-merge-2026-07-23T10-35-00Z-deckard-skiplayernorm-simd-end -->
+
+<!-- scribe-merge-2026-07-23T11-00-00Z-roy-f16-silu -->
+<!-- merged from .squad/decisions/inbox/roy-f16-silu.md -->
+### 2026-07-23: Route widened low-precision SiLU through the shared MLAS path
+**By:** Roy
+**What:** f16/bf16 (and other non-f32, non-f64 floating) SiLU now widens to f32 and calls `silu_f32_slice` before narrowing, instead of applying scalar SiLU element by element.
+**Why:** This reuses the portable MLAS logistic SIMD routine and its existing finite/extreme correction pass, eliminating the low-precision scalar activation bottleneck without model- or architecture-specific behavior. On the Qwen2.5-0.5B f16 profile, SiLU fell from about 1.08 ms to about 0.275 ms per 24 calls (~3.9x faster); the host was loaded above 6, so the relative per-op result is the meaningful measure.
+
+**Review:** Chew APPROVE. **Merged:** `d14cc83`.
+<!-- scribe-merge-2026-07-23T11-00-00Z-roy-f16-silu-end -->
+
+<!-- scribe-merge-2026-07-23T11-00-00Z-bryant-qkv-bias-add -->
+<!-- merged from .squad/decisions/inbox/bryant-qkv-bias-add.md -->
+### 2026-07-23: Fold QKV-bias `Add` into `MatMulNBits` (CPU EP)
+**By:** Bryant (CPU-EP kernels)
+**Branch:** perf/qkv-bias-add (off main 316113e)
+
+**What:** Added an always-on, EP-internal graph fusion pass
+`CpuMatMulNBitsBiasFusion` in `crates/onnx-runtime-ep-cpu/src/optimizer.rs`
+that recognizes the generic pattern `Add(MatMulNBits(A, ...), [N]-bias)` and
+rewrites it to `MatMulNBits(A, ..., bias)` using the contrib op's optional bias
+input (index 5). The `MatMulNBits` kernel already adds that bias inside the MLAS
+GEMV epilogue, so the standalone element-wise `Add` disappears.
+
+**Why:** The per-op audit flagged the QKV-bias `Add` as a spot where ORT is
+faster because ORT fuses the bias into the projection GEMM. On the 7B
+generic-cpu graph it was **28 Adds/step (1 per decoder layer), ~1.87 ms/step,
+~6.5% of node execution** — a combined QKV `MatMulNBits` feeding one rank-1
+`[q+k+v]` bias `Add` feeding GQA. Folding the bias into the GEMV epilogue reuses
+memory the kernel already touches, so the bias add is effectively free.
+
+**Profile (7B qwen2.5-coder generic-cpu-4, --steady --decode-skip 8 --tokens 128
+--runs 3; shared box, trust SHARE not absolute ms):**
+- Before: `Add` = 28 calls, ~1.82–1.88 ms/step, **6.5% share**; `MatMulNBits`
+  67.3%; node execution ~28.2 ms.
+- After: **`Add` gone (0 standalone Adds)**; `MatMulNBits` 73.3% (absorbs bias,
+  its own ms unchanged ~19.0 ms); node execution ~26.1 ms.
+
+**Correctness / generality (RULE 2 / 2.1):**
+- Byte-identical: MLAS and the standalone `Add` both perform a single f32 add of
+  the same bias per column over the same GEMM result.
+- Opener stays byte-identical:
+  `[48298,271,9707,0,2585,646,358,7789,498,3351,30,151645,198,151643,151644,198]`.
+- Pattern-only match — no model names, no hardcoded dims. Guards: producer is a
+  bias-free `MatMulNBits` (com.microsoft) whose sole consumer is the `Add` and
+  whose output is not a graph output; bias is a rank-1 `[N]` float tensor over
+  the output's last (`N`) dim. Falls back cleanly (no rewrite) otherwise.
+- Runs unconditionally (unlike the env-gated gate/up `ProjectionFusion`) because
+  it is a pure, safe, byte-identical convenience fold with a clean fallback.
+
+**Validation:** `cargo test -p onnx-runtime-ep-cpu --features mlas` → 728 passed
+/ 0 failed (incl. 5 new fusion tests: positive fold, operand-order symmetry,
+non-row-vector bias rejected, extra-consumer rejected, graph-output rejected).
+`cargo clippy -p onnx-runtime-ep-cpu --features mlas -- -D warnings` clean.
+`rustfmt` clean on changed files.
+
+**Scope:** No change to `main`, no push/merge. Touches only
+`crates/onnx-runtime-ep-cpu/src/{optimizer.rs,lib.rs}`.
+
+**Review:** Gaff APPROVE. **Merged:** `28adcd9`.
+<!-- scribe-merge-2026-07-23T11-00-00Z-bryant-qkv-bias-add-end -->
