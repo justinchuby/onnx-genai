@@ -66,6 +66,7 @@ const GEMV_F16_DOWN_MAX_SMEM_BYTES: usize = 48 * 1024;
 const GEMV_F16_DOWN_THREADS: u32 = 256;
 const GEMV_F16_DOWN_COLUMNS_PER_BLOCK: usize = 8;
 const GATE_UP_SWIGLU_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu";
+const GATE_UP_SWIGLU_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -1323,6 +1324,176 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu(
     }
 }
 
+// Paired gate/up projection + SwiGLU with a fused RMS-normalization prologue.
+// This is `matmul_nbits_gemv_f16_gate_up_swiglu` preceded by the exact prologue
+// of `matmul_nbits_gemv_f16_scales_f16_rmsnorm`: the block reduces the shared
+// activation (the residual sum the preceding GEMV epilogue already produced)
+// once, stages the normalized activation into shared memory with the same
+// rounding, and then both the gate and up GEMVs read that single staged,
+// normalized activation. Doing the reduction once — rather than once per
+// following GEMV — is the whole point of routing the fan-out-2 post-attention
+// `SkipSimplifiedLayerNormalization` through the paired kernel. Every arithmetic
+// step mirrors the standalone norm followed by the two-op gate/up SwiGLU, so
+// greedy tokens stay bit-for-bit identical.
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const __half* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const float epsilon)
+{
+    extern __shared__ __align__(16) __half staged_activation[];
+    __shared__ float shared_inv_std;
+
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // --- RMS reduction, byte-identical to `skip_rmsnorm_f16_warp_half4`. ---
+    if (warp == 0) {
+        const int chunks_per_lane = k / (32 * 4);
+        const unsigned long long* activation4 =
+            reinterpret_cast<const unsigned long long*>(activation);
+        float ss0 = 0.0f;
+        float ss1 = 0.0f;
+        float ss2 = 0.0f;
+        float ss3 = 0.0f;
+        for (int item = 0; item < chunks_per_lane; ++item) {
+            const int chunk = lane + item * 32;
+            MatMulNBitsSkipHalf4 residual;
+            residual.raw = activation4[chunk];
+            const float2 rounded0 = __half22float2(residual.pair[0]);
+            const float2 rounded1 = __half22float2(residual.pair[1]);
+            ss0 += rounded0.x * rounded0.x;
+            ss1 += rounded0.y * rounded0.y;
+            ss2 += rounded1.x * rounded1.x;
+            ss3 += rounded1.y * rounded1.y;
+        }
+        float ss = (ss0 + ss1) + (ss2 + ss3);
+        for (int off = 16; off > 0; off >>= 1) {
+            ss += __shfl_down_sync(0xffffffffu, ss, off);
+        }
+        if (lane == 0) {
+            shared_inv_std = 1.0f / sqrtf(ss / (float)k + epsilon);
+        }
+    }
+    __syncthreads();
+    const float inv_std = shared_inv_std;
+
+    // --- Normalized activation, matching the norm kernel's rounded output. ---
+    for (int j = tid; j < k; j += (int)blockDim.x) {
+        const float residual = __half2float(activation[j]);
+        const float scale = __half2float(gamma[j]);
+        staged_activation[j] = __float2half((residual * inv_std) * scale);
+    }
+    __syncthreads();
+
+    // --- Paired gate/up int4 dot over the staged, normalized activation. ---
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    __half2 g0 = __float2half2_rn(0.0f);
+    __half2 g1 = __float2half2_rn(0.0f);
+    __half2 g2 = __float2half2_rn(0.0f);
+    __half2 g3 = __float2half2_rn(0.0f);
+    __half2 u0 = __float2half2_rn(0.0f);
+    __half2 u1 = __float2half2_rn(0.0f);
+    __half2 u2 = __float2half2_rn(0.0f);
+    __half2 u3 = __float2half2_rn(0.0f);
+    float gate_tail = 0.0f;
+    float up_tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        const __half* activation_ptr = staged_activation + lane_depth;
+        const unsigned char* packed_gate_ptr =
+            packed_gate + (long)column * k_blocks * blob_size + lane * 4;
+        const unsigned char* packed_up_ptr =
+            packed_up + (long)column * k_blocks * blob_size + lane * 4;
+        const __half* scale_gate_ptr =
+            scales_gate + (long)column * k_blocks + (lane >> 2);
+        const __half* scale_up_ptr =
+            scales_up + (long)column * k_blocks + (lane >> 2);
+        int depth_base = 0;
+        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+            const uint4 permuted = permute_activation_f16x8(activation_ptr);
+            const unsigned int gate_word =
+                *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
+            accumulate_int4x8_f16_permuted(
+                gate_word, permuted, *scale_gate_ptr, g0, g1, g2, g3);
+            const unsigned int up_word =
+                *reinterpret_cast<const unsigned int*>(packed_up_ptr);
+            accumulate_int4x8_f16_permuted(
+                up_word, permuted, *scale_up_ptr, u0, u1, u2, u3);
+            activation_ptr += 256;
+            packed_gate_ptr += 128;
+            packed_up_ptr += 128;
+            scale_gate_ptr += 8;
+            scale_up_ptr += 8;
+        }
+        const int tail_depth = depth_base + lane_depth;
+        if (tail_depth < k) {
+            const unsigned int gate_word =
+                *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
+            const unsigned int up_word =
+                *reinterpret_cast<const unsigned int*>(packed_up_ptr);
+            const float gate_scale = __half2float(*scale_gate_ptr);
+            const float up_scale = __half2float(*scale_up_ptr);
+            const int valid = min(8, k - tail_depth);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < valid) {
+                    const float a = __half2float(activation_ptr[i]);
+                    const int qg = (int)((gate_word >> (i * 4)) & 15u) - 8;
+                    const int qu = (int)((up_word >> (i * 4)) & 15u) - 8;
+                    gate_tail += (float)qg * a * gate_scale;
+                    up_tail += (float)qu * a * up_scale;
+                }
+            }
+        }
+    }
+    const float2 g04 = __half22float2(g0);
+    const float2 g15 = __half22float2(g1);
+    const float2 g26 = __half22float2(g2);
+    const float2 g37 = __half22float2(g3);
+    float gate_value = gate_tail + g04.x;
+    gate_value += g15.x;
+    gate_value += g26.x;
+    gate_value += g37.x;
+    gate_value += g04.y;
+    gate_value += g15.y;
+    gate_value += g26.y;
+    gate_value += g37.y;
+    gate_value = warp_sum(gate_value);
+
+    const float2 u04 = __half22float2(u0);
+    const float2 u15 = __half22float2(u1);
+    const float2 u26 = __half22float2(u2);
+    const float2 u37 = __half22float2(u3);
+    float up_value = up_tail + u04.x;
+    up_value += u15.x;
+    up_value += u26.x;
+    up_value += u37.x;
+    up_value += u04.y;
+    up_value += u15.y;
+    up_value += u26.y;
+    up_value += u37.y;
+    up_value = warp_sum(up_value);
+
+    if (lane == 0 && column < n) {
+        const float gate_h = __half2float(__float2half(gate_value));
+        const float up_h = __half2float(__float2half(up_value));
+        output[column] =
+            __float2half_rn(__fmul_rn(gate_up_silu_f32(gate_h), up_h));
+    }
+}
+
 // Down projection specialization: a 256-thread CTA computes eight columns and
 // parallelizes over block-32 K tiles. The activation is staged once in the
 // permuted half2 layout, then reused by all eight columns.
@@ -2334,10 +2505,12 @@ impl MatMulNBitsKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
     ) -> Result<()> {
-        if inputs.len() != 5 || outputs.len() != 1 {
+        let expected_inputs = if self.rmsnorm_prologue { 6 } else { 5 };
+        if inputs.len() != expected_inputs || outputs.len() != 1 {
             return Err(error(format!(
-                "gate/up SwiGLU fusion expects 5 inputs [x, W_gate, scales_gate, W_up, \
-                 scales_up] and 1 output, got {} inputs and {} outputs",
+                "gate/up SwiGLU fusion expects {expected_inputs} inputs [x, W_gate, \
+                 scales_gate, W_up, scales_up{}] and 1 output, got {} inputs and {} outputs",
+                if self.rmsnorm_prologue { ", gamma" } else { "" },
                 inputs.len(),
                 outputs.len()
             )));
@@ -2348,6 +2521,18 @@ impl MatMulNBitsKernel {
         require_dtype("W_up", inputs[3].dtype, DataType::Uint8)?;
         require_dtype("scales_up", inputs[4].dtype, DataType::Float16)?;
         require_dtype("Y", outputs[0].dtype, DataType::Float16)?;
+        let gamma = if self.rmsnorm_prologue {
+            require_dtype("gamma", inputs[5].dtype, DataType::Float16)?;
+            require_shape("gamma", inputs[5].shape, &[self.k])?;
+            if !inputs[5].is_contiguous() {
+                return Err(error(
+                    "gamma must be contiguous on the CUDA execution provider".to_string(),
+                ));
+            }
+            Some(&inputs[5])
+        } else {
+            None
+        };
 
         let a_shape = inputs[0].shape;
         if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
@@ -2405,6 +2590,26 @@ impl MatMulNBitsKernel {
         }
         if m > 1 {
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            if let Some(gamma) = gamma {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gate_up_swiglu_rmsnorm_prefill",
+                    "M={} prefill: RMS-normalization prologue into scratch, then two portable \
+                     block-32 int4 fp16 tiled GEMMs with fp32 accumulation, followed by fp16 \
+                     SiluMul; not advertised as CUDA-graph capture-safe",
+                    m
+                );
+                return self.launch_gate_up_swiglu_rmsnorm_prefill(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    &inputs[3],
+                    &inputs[4],
+                    gamma,
+                    &mut outputs[0],
+                    m,
+                    k_blocks,
+                );
+            }
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gate_up_swiglu_prefill",
                 "M={} prefill: two portable block-32 int4 fp16 tiled GEMMs with fp32 \
@@ -2421,6 +2626,28 @@ impl MatMulNBitsKernel {
                 &mut outputs[0],
                 m,
                 k_blocks,
+            );
+        }
+
+        if let Some(gamma) = gamma {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gate_up_swiglu_rmsnorm_fused",
+                "fp16 block-32 M==1 decode: fused RMS-normalization prologue + paired gate/up \
+                 int4 GEMV + SwiGLU (silu(gate)*up) in one capture-safe kernel; the RMS \
+                 reduction runs once for both projections and reproduces the standalone norm \
+                 plus two-op fp16 rounding for byte-identical greedy tokens"
+            );
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            return self.launch_gate_up_swiglu_rmsnorm(
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                &inputs[3],
+                &inputs[4],
+                gamma,
+                &mut outputs[0],
+                k_blocks,
+                blob_size,
             );
         }
 
@@ -2555,6 +2782,132 @@ impl MatMulNBitsKernel {
         }
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMulNBits fp16 gate/up SwiGLU GEMV", err))
+    }
+
+    /// Decode (M==1) paired gate/up SwiGLU with a fused RMS-normalization
+    /// prologue. The block reduces the shared activation once and stages the
+    /// normalized activation in launch-time dynamic shared memory (`K *
+    /// sizeof(f16)`, bounded by the fusion's `K % 128 == 0` predicate), then
+    /// both projections read that single staged copy. Fixing the reduction to a
+    /// single pass is what recovers the double-recompute cost the fan-out-2
+    /// post-attention norm otherwise pays.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_swiglu_rmsnorm(
+        &self,
+        activation: &TensorView,
+        packed_gate: &TensorView,
+        scales_gate: &TensorView,
+        packed_up: &TensorView,
+        scales_up: &TensorView,
+        gamma: &TensorView,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU RMS-norm GEMV")?;
+        let function = self.runtime.nvrtc_function(
+            GEMV_F16_MODULE,
+            GEMV_F16_SRC,
+            GATE_UP_SWIGLU_RMSNORM_ENTRY,
+        )?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_gate_ptr = cuptr(packed_gate.data_ptr::<u8>() as *const c_void);
+        let scales_gate_ptr = cuptr(scales_gate.data_ptr::<u8>() as *const c_void);
+        let packed_up_ptr = cuptr(packed_up.data_ptr::<u8>() as *const c_void);
+        let scales_up_ptr = cuptr(scales_up.data_ptr::<u8>() as *const c_void);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let blob_size = as_i32("block blob size", blob_size)?;
+        let epsilon = self.rmsnorm_epsilon;
+        let threads = GATE_UP_SWIGLU_THREADS;
+        let columns_per_block = (threads / 32) as usize;
+        let shared_mem_bytes = (self.k * std::mem::size_of::<half::f16>()) as u32;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_gate_ptr)
+            .arg(&scales_gate_ptr)
+            .arg(&packed_up_ptr)
+            .arg(&scales_up_ptr)
+            .arg(&gamma_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks)
+            .arg(&blob_size)
+            .arg(&epsilon);
+        // SAFETY: restricted to fp16 block-32 M=1 inputs validated above; the
+        // weight/scale/gamma sets and the output are fixed device pointers, the
+        // scalar ABI matches the paired RMS-norm entry point, and the kernel
+        // stages the normalized activation in launch-time dynamic shared memory
+        // (`K * sizeof(f16)`, bounded by the fusion's `K % 128 == 0` predicate)
+        // using only registers, warp shuffles, and `__syncthreads` — no per-call
+        // allocation or host sync — so it is legal to record into and replay
+        // from a CUDA graph.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits fp16 gate/up SwiGLU RMS-norm GEMV", err))
+    }
+
+    /// Prefill (M>1) gate/up SwiGLU with an RMS-normalization prologue.
+    /// Normalizes each token row into scratch (byte-identical to
+    /// `skip_rmsnorm_f16_warp_half4`), then runs the standard paired gate/up
+    /// SwiGLU prefill over the normalized activation. Prefill is outside the
+    /// persistent decode graph, so the scratch allocation is not on any captured
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_swiglu_rmsnorm_prefill(
+        &self,
+        activation: &TensorView,
+        packed_gate: &TensorView,
+        scales_gate: &TensorView,
+        packed_up: &TensorView,
+        scales_up: &TensorView,
+        gamma: &TensorView,
+        output: &mut TensorMut,
+        m: usize,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let scratch = self
+            .runtime
+            .alloc_raw(m * self.k * std::mem::size_of::<half::f16>())?;
+        let scratch_shape = [m, self.k];
+        let scratch_strides = [self.k as i64, 1];
+        let normalized = TensorView::new(
+            DevicePtr(raw_ptr(scratch) as *const c_void),
+            DataType::Float16,
+            &scratch_shape,
+            &scratch_strides,
+            activation.device,
+        );
+        let result = self
+            .launch_rmsnorm_prefill(activation, gamma, scratch, m)
+            .and_then(|()| {
+                self.launch_gate_up_swiglu_prefill(
+                    &normalized,
+                    packed_gate,
+                    scales_gate,
+                    packed_up,
+                    scales_up,
+                    output,
+                    m,
+                    k_blocks,
+                )
+            });
+        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly
+        // once; `cuMemFree` waits for the preceding norm + GEMM stream work.
+        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
+        result.and(free_scratch)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4345,6 +4698,283 @@ extern "C" __global__ void ref_silu_mul_f16(
                     reference[index].to_bits(),
                     "paired gate/up SwiGLU diverged at M={m}, K={k}, N={n}, row={}, column={}: \
                      fused={:?} reference={:?}",
+                    index / n,
+                    index % n,
+                    fused[index],
+                    reference[index]
+                );
+            }
+        }
+    }
+
+    /// Byte-for-byte parity of the fused gate/up SwiGLU kernel *with an RMS
+    /// prologue* against the standalone two-step sequence
+    /// (`RMS-normalize the activation` → `paired gate/up SwiGLU`). The reference
+    /// normalizes with the production prefill norm kernel
+    /// (`matmul_nbits_rmsnorm_f16_warp_half4`) and then runs the already-proven
+    /// non-prologue paired kernel, so any divergence isolates the fused
+    /// prologue. Exercising M==1 (the single fused decode kernel) and M>1 (the
+    /// normalize-into-scratch prefill path) keeps both dispatches honest.
+    #[test]
+    fn fused_gate_up_swiglu_rmsnorm_is_bit_exact_to_two_step_path() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping gate/up SwiGLU RMS-norm parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!(
+                "skipping gate/up SwiGLU RMS-norm parity test: fp16 NVRTC headers unavailable"
+            );
+            return;
+        }
+
+        let epsilon = 1e-5f32;
+        // (M, K=hidden, N=intermediate); hidden % 128 == 0 for the warp_half4
+        // reduction. Decode is the capture-safe fused kernel; M=5 prefill routes
+        // through the normalize-into-scratch path.
+        for (m, k, n) in [(1usize, 896usize, 2432usize), (1, 3584, 4864), (5, 896, 2432)] {
+            let block_size = 32usize;
+            let k_blocks = k / block_size;
+            let blob_size = block_size / 2;
+
+            let mut state = 0xf00d_1ceb_00da_5555u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            let pack = |next: &mut dyn FnMut() -> f32| -> Vec<u8> {
+                let mut quant = vec![0u8; n * k];
+                for value in quant.iter_mut() {
+                    *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                }
+                let mut packed = vec![0u8; n * k_blocks * blob_size];
+                for col in 0..n {
+                    for block in 0..k_blocks {
+                        for pair in 0..blob_size {
+                            let low = quant[col * k + block * block_size + pair * 2] & 15;
+                            let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                            packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                        }
+                    }
+                }
+                packed
+            };
+
+            let activation: Vec<f16> = (0..m * k).map(|_| f16::from_f32(next())).collect();
+            let packed_gate = pack(&mut next);
+            let scales_gate: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            let packed_up = pack(&mut next);
+            let scales_up: Vec<f16> = (0..n * k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            let gamma: Vec<f16> = (0..k)
+                .map(|_| f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5)))
+                .collect();
+
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+            let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+            let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+            let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+            let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+            let normalized_dev = runtime.alloc_raw(m * k * 2).unwrap();
+            let output_elements = m * n;
+            let ref_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+            let fused_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
+            // SAFETY: device buffers exactly cover their source slices.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&scales_gate), scales_gate_dev)
+                    .unwrap();
+                runtime.htod(&packed_up, packed_up_dev).unwrap();
+                runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+                runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+            }
+
+            let device = DeviceId::cuda(0);
+            let a_shape = [m, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let scales_shape = [n, k_blocks];
+            let scales_strides = [k_blocks as i64, 1];
+            let gamma_shape = [k];
+            let gamma_strides = [1i64];
+            let y_shape = [m, n];
+            let y_strides = [n as i64, 1];
+
+            let activation_view = TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            );
+            let normalized_view = TensorView::new(
+                device_ptr(normalized_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            );
+            let packed_gate_view = TensorView::new(
+                device_ptr(packed_gate_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_gate_view = TensorView::new(
+                device_ptr(scales_gate_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let packed_up_view = TensorView::new(
+                device_ptr(packed_up_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            );
+            let scales_up_view = TensorView::new(
+                device_ptr(scales_up_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            );
+            let gamma_view = TensorView::new(
+                device_ptr(gamma_dev),
+                DataType::Float16,
+                &gamma_shape,
+                &gamma_strides,
+                device,
+            );
+            let ref_out = TensorMut::new(
+                device_ptr_mut(ref_out_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+            let fused_out = TensorMut::new(
+                device_ptr_mut(fused_out_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            );
+
+            let plain_swiglu = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: true,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: epsilon,
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            let fused_swiglu = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: false,
+                gate_up_swiglu: true,
+                rmsnorm_prologue: true,
+                rmsnorm_epsilon: epsilon,
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+
+            // Reference: normalize the activation (production prefill norm
+            // kernel), then run the proven non-prologue paired gate/up SwiGLU.
+            plain_swiglu
+                .launch_rmsnorm_prefill(&activation_view, &gamma_view, cuptr(device_ptr(normalized_dev).0), m)
+                .unwrap();
+            {
+                let mut ref_outputs = [ref_out];
+                let ref_inputs = [
+                    normalized_view,
+                    packed_gate_view,
+                    scales_gate_view,
+                    packed_up_view,
+                    scales_up_view,
+                ];
+                plain_swiglu
+                    .run_f16_gate_up_swiglu(&ref_inputs, &mut ref_outputs)
+                    .unwrap();
+            }
+
+            // Subject: the fused prologue kernel over the raw (residual sum)
+            // activation with gamma at slot 5.
+            {
+                let mut fused_outputs = [fused_out];
+                let fused_inputs = [
+                    activation_view,
+                    packed_gate_view,
+                    scales_gate_view,
+                    packed_up_view,
+                    scales_up_view,
+                    gamma_view,
+                ];
+                fused_swiglu
+                    .run_f16_gate_up_swiglu(&fused_inputs, &mut fused_outputs)
+                    .unwrap();
+            }
+            assert_eq!(
+                fused_swiglu.last_call_capture_safe.load(Ordering::Relaxed),
+                m == 1,
+                "only M=1 decode may be advertised capture-safe"
+            );
+            runtime.synchronize().unwrap();
+
+            let mut reference = vec![f16::ZERO; output_elements];
+            let mut fused = vec![f16::ZERO; output_elements];
+            // SAFETY: both output allocations hold `output_elements` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut reference), ref_out_dev)
+                    .unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut fused), fused_out_dev)
+                    .unwrap();
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(packed_gate_dev).unwrap();
+                runtime.free_raw(scales_gate_dev).unwrap();
+                runtime.free_raw(packed_up_dev).unwrap();
+                runtime.free_raw(scales_up_dev).unwrap();
+                runtime.free_raw(gamma_dev).unwrap();
+                runtime.free_raw(normalized_dev).unwrap();
+                runtime.free_raw(ref_out_dev).unwrap();
+                runtime.free_raw(fused_out_dev).unwrap();
+            }
+
+            for index in 0..output_elements {
+                assert_eq!(
+                    fused[index].to_bits(),
+                    reference[index].to_bits(),
+                    "fused gate/up SwiGLU RMS prologue diverged at M={m}, K={k}, N={n}, \
+                     row={}, column={}: fused={:?} reference={:?}",
                     index / n,
                     index % n,
                     fused[index],

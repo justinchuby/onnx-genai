@@ -469,6 +469,54 @@ fn rmsnorm_fusion_disabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+/// Minimum hidden width (`norm_size`) at which folding the standalone
+/// `SkipSimplifiedLayerNormalization` into its following GEMV(s) is projected to
+/// be a net win. Below this floor the fusion keeps the standalone norm. See
+/// [`fusion_benefit_is_positive`] for the derivation and calibration.
+///
+/// Expressed as ten [`RMSNORM_FUSION_WARP_HALF4_MULTIPLE`]-wide reduction chunks
+/// (`10 * 128 == 1280`): the measured throughput crossover sits between a hidden
+/// of seven chunks (896, which regresses) and twelve chunks (1536, which wins),
+/// so the floor is the granularity-aligned midpoint. It is a property of the
+/// kernel's 128-lane reduction, never of any model.
+const RMSNORM_FUSION_MIN_HIDDEN: usize = 10 * RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
+/// Optional environment override for [`RMSNORM_FUSION_MIN_HIDDEN`], used only to
+/// calibrate the floor against measured throughput.
+const RMSNORM_FUSION_MIN_HIDDEN_ENV: &str = "ONNX_GENAI_RMSNORM_MIN_HIDDEN";
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Decide whether folding a `SkipSimplifiedLayerNormalization` into its following
+/// GEMV(s) is projected to be a net win, purely from the kernel's own cost model
+/// (no model identity, no per-model constants).
+///
+/// The fused prologue reproduces `skip_rmsnorm_f16_warp_half4`: a **single warp**
+/// reduces the whole hidden vector (`norm_size / 128` half4 chunks) while the
+/// block's other warps idle at a `__syncthreads`, and then the standard int4 dot
+/// runs. Folding therefore trades one fully parallel, CUDA-graph-captured (so
+/// ~free-to-launch) standalone reduction for a serialized single-warp reduction
+/// that is **re-executed once per following GEMV** — the normalized activation is
+/// never materialized to be shared, so a fan-out re-runs the reduction in every
+/// branch.
+///
+/// The benefit (the eliminated standalone kernel) grows with the hidden width and
+/// with how memory bound the model is, while on a tiny decoder the standalone
+/// norm is already almost free under decode graph capture and the added serial
+/// prologue latency dominates. Measured throughput bears this out: the fusion
+/// regresses at a hidden of 896 but wins from 1536 upward, so the gate keeps the
+/// standalone norm whenever `norm_size` is below [`RMSNORM_FUSION_MIN_HIDDEN`].
+/// The `fanout`/`following_min_n` signals are accepted for completeness but the
+/// hidden floor is the decisive, measurement-calibrated term.
+fn fusion_benefit_is_positive(norm_size: usize, _fanout: usize, _following_min_n: usize) -> bool {
+    let floor = env_usize(RMSNORM_FUSION_MIN_HIDDEN_ENV, RMSNORM_FUSION_MIN_HIDDEN);
+    norm_size >= floor
+}
+
 /// Fold a `SkipSimplifiedLayerNormalization` (the standalone `skip_rmsnorm`
 /// kernel — the single largest consumer of decode GPU time) into its two
 /// neighbouring `MatMulNBits` GEMVs, deleting the separate normalization launch.
@@ -543,23 +591,53 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
         }
 
         let changed = !plans.is_empty();
+        // Chained decoder blocks share values across plans: one block's norm
+        // residual sum (`sum_out`) is the *next* block's norm residual (`skip`)
+        // input. Applying a plan rewires and garbage-collects that `sum_out`, so
+        // a later plan that captured it as its `residual` would reference a
+        // deleted value. Track every rewiring here and resolve each plan's
+        // residual through it at apply time, following redirect chains.
+        let mut value_redirects: std::collections::HashMap<ValueId, ValueId> =
+            std::collections::HashMap::new();
+        let resolve = |redirects: &std::collections::HashMap<ValueId, ValueId>,
+                       mut value: ValueId| {
+            while let Some(&next) = redirects.get(&value) {
+                if next == value {
+                    break;
+                }
+                value = next;
+            }
+            value
+        };
         for plan in plans {
+            let residual = resolve(&value_redirects, plan.residual);
+
             // 1. Rewire the norm's outputs onto the preceding GEMV output, which
             //    the residual epilogue now makes hold the byte-identical residual
             //    sum. The following GEMVs then normalize it in their prologue.
             graph.replace_all_uses(plan.normalized_out, plan.preceding_out);
+            value_redirects.insert(plan.normalized_out, plan.preceding_out);
             if let Some(sum_out) = plan.sum_out {
                 graph.replace_all_uses(sum_out, plan.preceding_out);
+                value_redirects.insert(sum_out, plan.preceding_out);
             }
 
             // 2. Rebuild each following GEMV: its activation input is now the
-            //    residual sum; attach gamma at slot 6 and the prologue markers.
+            //    residual sum; attach gamma and the prologue markers. A paired
+            //    gate/up SwiGLU node has exactly five inputs, so gamma lands at
+            //    slot 5; a plain MatMulNBits reserves slot 5 for an optional
+            //    bias, so its gamma lands at slot 6.
             for following_id in &plan.following_ids {
                 let mut fused = graph.node(*following_id).clone();
-                while fused.inputs.len() < 7 {
+                let gamma_slot = if fused.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some() {
+                    5
+                } else {
+                    6
+                };
+                while fused.inputs.len() <= gamma_slot {
                     fused.inputs.push(None);
                 }
-                fused.inputs[6] = Some(plan.gamma);
+                fused.inputs[gamma_slot] = Some(plan.gamma);
                 fused
                     .attributes
                     .insert(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR.into(), Attribute::Int(1));
@@ -579,7 +657,7 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
                 Some(plan.preceding_inputs[2]),
                 None,
                 None,
-                Some(plan.residual),
+                Some(residual),
             ];
             preceding
                 .attributes
@@ -690,6 +768,18 @@ impl CudaSkipRmsNormMatMulFusion {
             return None;
         }
 
+        // Size-floor gate: skip the fusion (keep the standalone norm) when the
+        // projected benefit is negative — see [`fusion_benefit_is_positive`].
+        let following_min_n = following_ids
+            .iter()
+            .filter_map(|id| graph.node(*id).attr("N").and_then(Attribute::as_int))
+            .min()
+            .unwrap_or(0)
+            .max(0) as usize;
+        if !fusion_benefit_is_positive(norm_size, following_ids.len(), following_min_n) {
+            return None;
+        }
+
         let epsilon = skip
             .attr("epsilon")
             .and_then(Attribute::as_float)
@@ -750,17 +840,8 @@ impl CudaSkipRmsNormMatMulFusion {
         if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
             return false;
         }
-        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some()
-            || node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some()
-        {
-            return false;
-        }
-        // No zero-points (slot 3), no group index (slot 4), no pre-existing
-        // gamma (slot 6). An optional bias (slot 5) is allowed.
-        if node.inputs.get(3).copied().flatten().is_some()
-            || node.inputs.get(4).copied().flatten().is_some()
-            || node.inputs.get(6).copied().flatten().is_some()
-        {
+        // A node that already carries the RMS prologue cannot take a second one.
+        if node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some() {
             return false;
         }
         if !self.is_int4_fp16_matmul(graph, node) {
@@ -772,6 +853,22 @@ impl CudaSkipRmsNormMatMulFusion {
         ) else {
             return false;
         };
+        // A paired gate/up SwiGLU node (from CudaGateUpSwiGluFusion) folds the
+        // fan-out-2 post-attention norm into a single kernel that reduces once
+        // for both projections. Its inputs are exactly [x, W_gate, scales_gate,
+        // W_up, scales_up]; the up scales at slot 4 are legitimate, so the plain
+        // zero-point/group-index slot checks below do not apply.
+        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some() {
+            return node.input_values().count() == 5 && k <= n;
+        }
+        // No zero-points (slot 3), no group index (slot 4), no pre-existing
+        // gamma (slot 6). An optional bias (slot 5) is allowed.
+        if node.inputs.get(3).copied().flatten().is_some()
+            || node.inputs.get(4).copied().flatten().is_some()
+            || node.inputs.get(6).copied().flatten().is_some()
+        {
+            return false;
+        }
         // Keep the general scales_f16 entry: the down variant is chosen when
         // K > N, and it has no normalization prologue.
         k <= n
@@ -2010,8 +2107,8 @@ mod tests {
 
     #[test]
     fn folds_skip_rmsnorm_into_neighbouring_gemvs() {
-        // norm_size % 128 == 0, following K(256) <= N(512): general variant.
-        let mut graph = skip_rms_graph(256, 512);
+        // Hidden at the size floor, following K(1280) <= N(1536): general variant.
+        let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
         let pre_out = value_id_by_name(&graph, "pre_out");
         let residual = value_id_by_name(&graph, "residual");
         let gamma = value_id_by_name(&graph, "gamma");
@@ -2074,8 +2171,9 @@ mod tests {
 
     #[test]
     fn leaves_skip_rmsnorm_when_hidden_not_multiple_of_128() {
-        // 200 % 128 != 0 → warp_half4 byte-identity does not hold, so no fusion.
-        let mut graph = skip_rms_graph(200, 400);
+        // 1288 % 128 != 0 → warp_half4 byte-identity does not hold, so no fusion.
+        // Kept above the size floor so the `% 128` check is the sole reason.
+        let mut graph = skip_rms_graph(1288, RMSNORM_FUSION_MIN_HIDDEN + 256);
         CudaSkipRmsNormMatMulFusion
             .run(&mut graph, &PassContext::new())
             .unwrap();
@@ -2090,8 +2188,9 @@ mod tests {
 
     #[test]
     fn leaves_skip_rmsnorm_when_following_is_down_variant() {
-        // Following K(256) > N(128): the tall-skinny down variant has no prologue.
-        let mut graph = skip_rms_graph(256, 128);
+        // Following K(1280) > N(1152): the tall-skinny down variant has no
+        // prologue. Hidden is at the floor so the down variant is the sole reason.
+        let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN - 128);
         CudaSkipRmsNormMatMulFusion
             .run(&mut graph, &PassContext::new())
             .unwrap();
@@ -2106,15 +2205,17 @@ mod tests {
 
     #[test]
     fn leaves_skip_rmsnorm_with_norm_bias() {
-        // A norm bias (4th input) breaks the no-bias warp_half4 contract.
-        let mut graph = skip_rms_graph(256, 512);
-        let bias = vec1d(&mut graph, "norm_bias", DataType::Float16, 256);
+        // A norm bias (4th input) breaks the no-bias warp_half4 contract. Hidden
+        // is at the floor so the bias is the sole reason the fusion declines.
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN;
+        let mut graph = skip_rms_graph(hidden, hidden + 256);
+        let bias = vec1d(&mut graph, "norm_bias", DataType::Float16, hidden);
         graph.set_initializer(
             bias,
             WeightRef::Inline(TensorData::from_raw(
                 DataType::Float16,
-                vec![256],
-                vec![0u8; 512],
+                vec![hidden],
+                vec![0u8; hidden * 2],
             )),
         );
         let skip_id = graph
@@ -2144,9 +2245,10 @@ mod tests {
     fn leaves_skip_rmsnorm_when_preceding_gemv_shared() {
         // A second consumer of the preceding GEMV output means the residual
         // epilogue would drop an observable value; the fusion must decline.
-        let mut graph = skip_rms_graph(256, 512);
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN;
+        let mut graph = skip_rms_graph(hidden, hidden + 256);
         let pre_out = value_id_by_name(&graph, "pre_out");
-        let sink = value(&mut graph, "pre_sink", DataType::Float16, 256);
+        let sink = value(&mut graph, "pre_sink", DataType::Float16, hidden);
         graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(pre_out)], vec![sink]));
         graph.add_output(sink);
 
@@ -2165,7 +2267,8 @@ mod tests {
     #[test]
     fn leaves_skip_rmsnorm_when_broadcast_skip() {
         // A broadcast (non-dense) skip term is not covered by warp_half4.
-        let mut graph = skip_rms_graph(256, 512);
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN;
+        let mut graph = skip_rms_graph(hidden, hidden + 256);
         let residual = value_id_by_name(&graph, "residual");
         graph.value_mut(residual).shape = vec![Dim::Static(1), Dim::Static(1)];
 
@@ -2187,13 +2290,13 @@ mod tests {
         // ([batch, sequence, hidden]); only the hidden dim is static. The fusion
         // must still fire — an earlier version required the whole shape static
         // and silently never matched in production.
-        let mut graph = skip_rms_graph(256, 512);
+        let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
         let batch = graph.create_symbol(Some("batch".into()));
         let sequence = graph.create_symbol(Some("sequence".into()));
         let symbolic = vec![
             Dim::Symbolic(batch),
             Dim::Symbolic(sequence),
-            Dim::Static(256),
+            Dim::Static(RMSNORM_FUSION_MIN_HIDDEN),
         ];
         // Retype every hidden-width activation edge to the symbolic 3-D shape.
         for name in ["pre_out", "residual", "normalized", "sum"] {
@@ -2227,7 +2330,7 @@ mod tests {
     fn skip_rmsnorm_fires_through_full_cuda_pass_list() {
         // End-to-end through the registered CUDA passes: the fusion is the last
         // pass and must fire on the eligible chain.
-        let mut graph = skip_rms_graph(256, 512);
+        let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
         for pass in cuda_optimization_passes() {
             pass.run(&mut graph, &PassContext::new()).unwrap();
         }
@@ -2239,5 +2342,312 @@ mod tests {
             "the fusion must fire through the full pass list"
         );
         assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn gate_leaves_skip_rmsnorm_below_hidden_floor() {
+        // One reduction chunk (128) below the size floor: an otherwise fully
+        // fusable chain, blocked solely because the projected benefit is negative
+        // for such a small hidden (the serial prologue recompute dominates the
+        // ~free graph-captured standalone launch it would remove).
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN - RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
+        let mut graph = skip_rms_graph(hidden, hidden + 256);
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "a hidden below the size floor must keep the standalone norm"
+        );
+    }
+
+    #[test]
+    fn gate_folds_skip_rmsnorm_at_hidden_floor() {
+        // Exactly at the floor the same chain fuses, proving the boundary is the
+        // only thing the smaller case tripped (not any structural mismatch).
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN;
+        let mut graph = skip_rms_graph(hidden, hidden + 256);
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "a hidden at the size floor must fuse"
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    /// Build the post-attention decode chain the fan-out-2 fold targets:
+    /// `o_proj MatMulNBits (N == hidden)` → `SkipSimplifiedLayerNormalization`
+    /// → gate + up `MatMulNBits` → `Silu(gate)` → `Mul(silu, up)`. Running the
+    /// full CUDA pass list first collapses gate+up into one SwiGLU node, then the
+    /// skip-rmsnorm fold must route its RMS prologue through that single node.
+    fn post_attention_swiglu_graph(hidden: usize, intermediate: usize) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let pre_x = value(&mut graph, "pre_x", DataType::Float16, hidden + 128);
+        graph.add_input(pre_x);
+        let pre_out = projection(&mut graph, "pre", pre_x, hidden + 128, hidden);
+
+        let residual = value(&mut graph, "residual", DataType::Float16, hidden);
+        graph.add_input(residual);
+
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float16, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![hidden],
+                vec![0u8; hidden * 2],
+            )),
+        );
+
+        let normalized = value(&mut graph, "normalized", DataType::Float16, hidden);
+        let stat_mean = graph.create_value(DataType::Float32, Vec::new());
+        let stat_inv_std = graph.create_value(DataType::Float32, Vec::new());
+        let sum = value(&mut graph, "sum", DataType::Float16, hidden);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(pre_out), Some(residual), Some(gamma)],
+            vec![normalized, stat_mean, stat_inv_std, sum],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        skip.attributes
+            .insert("epsilon".into(), Attribute::Float(9.999_999e-7));
+        graph.insert_node(skip);
+
+        // Fan-out 2: the normalized output feeds both the gate and up projection.
+        let gate_out = projection(&mut graph, "gate", normalized, hidden, intermediate);
+        let up_out = projection(&mut graph, "up", normalized, hidden, intermediate);
+        let silu_out = value(&mut graph, "silu", DataType::Float16, intermediate);
+        let out = value(&mut graph, "output", DataType::Float16, intermediate);
+        let mut silu = Node::new(NodeId(0), "Silu", vec![Some(gate_out)], vec![silu_out]);
+        silu.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(silu);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(silu_out), Some(up_out)],
+            vec![out],
+        ));
+        graph.add_output(out);
+
+        let sum_sink = value(&mut graph, "sum_sink", DataType::Float16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(sum)],
+            vec![sum_sink],
+        ));
+        graph.add_output(sum_sink);
+
+        graph
+    }
+
+    #[test]
+    fn folds_skip_rmsnorm_into_gate_up_swiglu_node() {
+        // Hidden at the size floor, intermediate > hidden so the paired gate/up
+        // node keeps the general scales_f16 entry (K <= N).
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN;
+        let intermediate = hidden * 2;
+        let mut graph = post_attention_swiglu_graph(hidden, intermediate);
+
+        for pass in cuda_optimization_passes() {
+            pass.run(&mut graph, &PassContext::new()).unwrap();
+        }
+
+        // Norm is gone and gate/up are collapsed into one SwiGLU node.
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "the standalone norm must be folded away"
+        );
+        let swiglu = graph
+            .nodes
+            .values()
+            .find(|node| node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some())
+            .expect("a fused gate/up SwiGLU node must exist");
+
+        let pre_out = value_id_by_name(&graph, "pre_out");
+        let gamma = value_id_by_name(&graph, "gamma");
+        // The SwiGLU node now carries the RMS prologue: activation is the
+        // residual sum, gamma lands at slot 5 (after [x, W_gate, Sg, W_up, Su]),
+        // and the prologue markers are set. A single reduction now serves both
+        // projections.
+        assert_eq!(
+            swiglu.inputs[0],
+            Some(pre_out),
+            "activation is the preceding residual sum"
+        );
+        assert_eq!(swiglu.inputs.len(), 6, "gamma appended at slot 5");
+        assert_eq!(swiglu.inputs.get(5).copied().flatten(), Some(gamma));
+        assert_eq!(
+            swiglu
+                .attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            swiglu
+                .attr(MATMUL_NBITS_RMSNORM_EPSILON_ATTR)
+                .and_then(Attribute::as_float),
+            Some(9.999_999e-7)
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn gate_up_swiglu_node_stays_unfused_below_hidden_floor() {
+        // The same fan-out-2 chain, one reduction chunk below the floor: the
+        // SwiGLU node must keep the standalone norm (benefit is negative for a
+        // tiny hidden even though a single fused reduction would serve both).
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN - RMSNORM_FUSION_WARP_HALF4_MULTIPLE;
+        let intermediate = hidden * 2;
+        let mut graph = post_attention_swiglu_graph(hidden, intermediate);
+
+        for pass in cuda_optimization_passes() {
+            pass.run(&mut graph, &PassContext::new()).unwrap();
+        }
+
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "below the floor the standalone norm must survive"
+        );
+        let swiglu = graph
+            .nodes
+            .values()
+            .find(|node| node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some())
+            .expect("the gate/up pair still fuses on its own");
+        assert!(
+            swiglu.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_none(),
+            "the SwiGLU node must not carry an RMS prologue below the floor"
+        );
+    }
+
+    #[test]
+    fn folds_chained_blocks_sharing_residual_sum() {
+        // Two chained decoder blocks: block 0's norm residual sum feeds block 1's
+        // norm as its skip/residual. Both norms are independently fusable, and
+        // applying block 0's fold rewires+GCs the shared sum value — so block 1's
+        // fold must resolve its (now-redirected) residual instead of referencing
+        // the deleted value. This is the graph shape that dangled before the
+        // redirect map. Every value stays live and both norms fold.
+        let hidden = RMSNORM_FUSION_MIN_HIDDEN;
+        let following_n = hidden + 256;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        // The residual stream entering block 0.
+        let res_in = value(&mut graph, "res_in", DataType::Float16, hidden);
+        graph.add_input(res_in);
+
+        let gamma0 = vec1d(&mut graph, "gamma0", DataType::Float16, hidden);
+        let gamma1 = vec1d(&mut graph, "gamma1", DataType::Float16, hidden);
+        for g in [gamma0, gamma1] {
+            graph.set_initializer(
+                g,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float16,
+                    vec![hidden],
+                    vec![0u8; hidden * 2],
+                )),
+            );
+        }
+
+        // Block 0: preceding GEMV → SkipSLN(input, skip=res_in) → following GEMV.
+        let x0 = value(&mut graph, "x0", DataType::Float16, hidden + 128);
+        graph.add_input(x0);
+        let pre0 = projection(&mut graph, "pre0", x0, hidden + 128, hidden);
+        let norm0 = value(&mut graph, "norm0", DataType::Float16, hidden);
+        let mean0 = graph.create_value(DataType::Float32, Vec::new());
+        let inv0 = graph.create_value(DataType::Float32, Vec::new());
+        let sum0 = value(&mut graph, "sum0", DataType::Float16, hidden);
+        let mut skip0 = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(pre0), Some(res_in), Some(gamma0)],
+            vec![norm0, mean0, inv0, sum0],
+        );
+        skip0.domain = MICROSOFT_DOMAIN.into();
+        skip0
+            .attributes
+            .insert("epsilon".into(), Attribute::Float(1e-6));
+        graph.insert_node(skip0);
+        let post0 = projection(&mut graph, "post0", norm0, hidden, following_n);
+        graph.add_output(post0);
+
+        // Block 1: preceding GEMV → SkipSLN(input, skip=sum0) → following GEMV.
+        // Block 1's preceding consumes its own activation so block 0's normalized
+        // output keeps fan-out 1; only the residual sum (sum0) is shared.
+        let x1 = value(&mut graph, "x1", DataType::Float16, hidden + 128);
+        graph.add_input(x1);
+        let pre1 = projection(&mut graph, "pre1", x1, hidden + 128, hidden);
+        let norm1 = value(&mut graph, "norm1", DataType::Float16, hidden);
+        let mean1 = graph.create_value(DataType::Float32, Vec::new());
+        let inv1 = graph.create_value(DataType::Float32, Vec::new());
+        let sum1 = value(&mut graph, "sum1", DataType::Float16, hidden);
+        let mut skip1 = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(pre1), Some(sum0), Some(gamma1)],
+            vec![norm1, mean1, inv1, sum1],
+        );
+        skip1.domain = MICROSOFT_DOMAIN.into();
+        skip1
+            .attributes
+            .insert("epsilon".into(), Attribute::Float(1e-6));
+        graph.insert_node(skip1);
+        let post1 = projection(&mut graph, "post1", norm1, hidden, following_n);
+        graph.add_output(post1);
+        // Keep block 1's residual sum live via an Identity sink (not a graph
+        // output, which the fusion intentionally refuses to fold).
+        let sum1_sink = value(&mut graph, "sum1_sink", DataType::Float16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(sum1)],
+            vec![sum1_sink],
+        ));
+        graph.add_output(sum1_sink);
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Both norms fold and the graph stays structurally valid.
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "both chained norms must fold"
+        );
+        assert!(graph.validate().is_ok(), "no dangling shared residual value");
+
+        // Block 1's preceding GEMV folds the *redirected* residual: sum0 became
+        // block 0's preceding output (pre0_out), so pre1 must fold pre0_out.
+        let pre0_out = value_id_by_name(&graph, "pre0_out");
+        let pre1_out = value_id_by_name(&graph, "pre1_out");
+        let pre1_node = node_producing(&graph, pre1_out);
+        assert_eq!(
+            pre1_node.inputs.get(5).copied().flatten(),
+            Some(pre0_out),
+            "block 1 folds the redirected residual (block 0's preceding output)"
+        );
     }
 }
