@@ -692,6 +692,27 @@ mod tests {
     }
 
     #[test]
+    fn keeps_add_when_matmul_nbits_already_has_bias() {
+        let (mut graph, mm_id, add_bias) = matmul_bias_graph(&static_shape([N]), false);
+        let existing_bias =
+            graph.create_named_value("existing_bias", DataType::Float32, static_shape([N]));
+        graph.add_input(existing_bias);
+        graph.node_mut(mm_id).inputs.resize(6, None);
+        graph.replace_input(mm_id, 5, Some(existing_bias));
+
+        run_pass(&mut graph);
+
+        assert_eq!(
+            count(&graph, "Add"),
+            1,
+            "already-biased MatMulNBits must not fold"
+        );
+        assert_eq!(graph.node(mm_id).inputs[5], Some(existing_bias));
+        assert_ne!(graph.node(mm_id).inputs[5], Some(add_bias));
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
     fn keeps_add_when_bias_is_not_a_row_vector() {
         // A rank-2 [1, N] bias is not the `[N]` shape the kernel accepts.
         let (mut graph, mm_id, _) = matmul_bias_graph(&static_shape([1, N]), false);
