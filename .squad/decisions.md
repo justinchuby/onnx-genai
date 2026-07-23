@@ -5,6 +5,111 @@
 
 > Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
 
+<!-- scribe-merge-2026-07-23T02-50-00Z-persistent-default-shipped -->
+## 2026-07-23 — Persistent SPMD is the default CPU decode path
+
+**By:** Leon (implementation) + Deckard (affinity-defer revision); reviewed by Gaff (concurrency, APPROVE) and Chew (cross-platform, REJECT → APPROVE after revision)
+
+**What:** Persistent SPMD is now the default-on CPU decode pool (`b820a87`, merged on `perf/cpu-ep-mlas`, PR #105). `decode_spmd::persistence_mode()` is `Off`/`Auto`/`Forced`: an unset `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` selects Auto, `=0` opts out to the legacy flat path, and `=1` forces SPMD. Auto activates only on at least four logical CPUs and uses `configured_persistent_decode_threads` (half the logical CPUs) to avoid dispatcher starvation (96 workers: 1.36 tok/s; 48: 28.7 tok/s). In Auto, an explicit non-`numa-split` `ONNX_GENAI_CPU_DECODE_AFFINITY` (`off`, `compact`, `node:n`, or malformed) defers to the flat path via `auto_defers_to_flat`, preserving `plan_decode_affinity` handling and validation; `numa-split` remains highest precedence, while Forced keeps SPMD regardless.
+
+**Why:** With nothing configured, 7B int4 decode improved from 11.1 to 28.5 tok/s—above onnxruntime-genai's 21.30 tok/s (+34%) and comparable to raw ORT at about 26.9 tok/s. The prior default-off switch meant ordinary users missed this win. Bit parity holds across configurations; 707+10 tests and warnings-denied Clippy passed. The topology-based gate degrades safely on single-node, non-NUMA, macOS, and low-core systems.
+
+**Process learning:** Per-agent-worktree inbox notes are gitignored and must be merged into the ledger before `git worktree remove --force`; Leon's and Deckard's original inbox notes were lost when their worktree was removed.
+
+Decision archive gate checked at 2026-07-23T02:50:00Z: the active ledger was 257088 bytes before this entry. No entries older than 2026-06-23T02:50:00Z were present, so no archive was created or updated.
+
+<!-- scribe-merge-2026-07-23T01-55-00Z-persistent-default -->
+## 2026-07-23 — CPU decode pool and f16 LayerNorm reviews
+
+Decision archive gate checked at 2026-07-23T01:55:00Z: active ledger was 250894 bytes; the existing archive is `.squad/decisions/archive/decisions-archive-2026-07.md`. No dated ledger entries older than 2026-06-23T01:55:00Z were present to archive.
+
+<!-- merged from .squad/decisions/inbox/gaff-gqa-pool-review.md -->
+# Concurrency Review — GQA on shared decode pool (commit e4dca5d)
+
+Reviewer: Gaff (concurrency). Author: Rick (not reviewer). Branch: perf/decode-dispatch-overhead. Base: 8df07d9. Date: 2026-07-23T01:20:00Z.
+
+## VERDICT: APPROVE-WITH-NONBLOCKING(1 nit)
+
+Change routes GroupQueryAttention decode row-parallelism through the active decode
+pool via new `SpmdDecodePools::dispatch_output_row_blocks` + generic
+`decode_parallel_output_row_blocks`, instead of a bare `par_chunks_mut` that fell to
+the global 96-thread Rayon pool and contended with the 32 pinned spinning SPMD workers.
+
+## Focus findings
+
+1. DATA-RACE FREEDOM — ✅
+   - `worker_row_segments(num_rows)` is a true partition: `node_row_lengths` sums to
+     `num_rows` (last node absorbs remainder), and within a node `base = len/workers`,
+     `remainder = len%workers` distributes `base + (worker<remainder)` — sum == node_len,
+     contiguous, non-overlapping (decode_spmd.rs:306-340). Holds for num_rows < total_workers
+     (base=0, only first `remainder` workers get 1 row, rest get len=0 → no iterations) and
+     for non-divisible num_rows. Verified by `worker_row_segments_are_disjoint_and_cover_every_row`
+     (n=37) and `node_row_lengths_split_proportionally...` (n=1→[0,1], n=0→[0,0]).
+   - Each worker's job iterates only `start..start+len` and writes
+     `from_raw_parts_mut(base.add(row*row_len), row_len)`. Disjoint row ranges ⇒ no two
+     workers alias the same row slice (decode_spmd.rs:391-411). `unsafe impl Sync for
+     RowBlockTable` (decode_spmd.rs:530) is sound: shared `*mut f32` base but each global
+     index touches only its own rows. `segments` is a stack `Vec` borrowed by `&`;
+     `dispatch` is synchronous (publish→wait) so the borrow outlives all workers.
+
+2. BARRIER / HANDSHAKE / PANIC — ✅
+   - `dispatch_output_row_blocks` reuses `self.dispatch(&job)` — identical publish/counter
+     barrier as the GEMV path (decode_spmd.rs:278-300).
+   - No reentrancy: GQA runs inline on the engine/dispatcher thread within `with_decode_pool_scope`'s
+     `f()`, sequentially between MatMulNBits dispatches — never nested inside another dispatch,
+     and the `compute_row` closure performs no pool dispatch of its own.
+   - Panic-safety intact: `WorkerCompletion` Drop still poisons + decrements on unwind
+     (decode_spmd.rs:562-577); `dispatch` calls `panic_if_poisoned` after `wait`, so a
+     panicking `compute` propagates without hanging the barrier.
+
+3. FALLBACK CORRECTNESS — ✅
+   - Persistent SPMD: `SpmdScopeGuard` sets IN_SPMD_SCOPE, forward runs inline on engine
+     thread ⇒ `spmd_decode_active()` = Some ⇒ routes to SPMD pool (the fix). Previously
+     `par_chunks_mut` hit the global pool here — the reproduced contention.
+   - numa-split: `numa.install_scope` installs a bounded pool; IN_SPMD_SCOPE unset ⇒
+     helper falls to `par_chunks_mut`, which runs on that bounded pool (matmul_nbits.rs:1114-1128).
+     Identical to pre-change behavior for GQA (no global contention).
+   - flat: `DECODE_POOL.install(f)` bounded pool, IN_SPMD_SCOPE unset ⇒ `par_chunks_mut`
+     on the flat pool (matmul_nbits.rs:1156-1162). Unchanged.
+   - default (no persistent/numa/bounded pool): `_ => f()`, no install ⇒ `par_chunks_mut`
+     hits global pool — but this is PRE-EXISTING behavior (GQA already did so). No regression.
+
+4. THRESHOLD PATH — ✅
+   `attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK` guard and the serial
+   `else` loop are unchanged (group_query_attention.rs:809-840). Small-work stays serial. Row
+   index decomposition in the parallel closure is the exact inverse of the serial
+   `(b*num_heads+qh)*seq+qs` mapping. `y_bhsd.len() == attention_rows * v.dim` matches the
+   helper's `debug_assert_eq!(result.len(), row_len*num_rows)`.
+
+5. GENERALITY (RULES.md §2) — ✅
+   Routing keys solely off the active decode scope (`spmd_decode_active()`), never off op or
+   model identity. `row_len`/`num_rows` derive from tensor dims (`v.dim`, `attention_rows`);
+   no hardcoding.
+
+6. BUILD / VERIFY — ✅
+   - `cargo test -p onnx-runtime-ep-cpu --features mlas`: 698 passed / 0 failed / 3 ignored,
+     plus 10 passed (integration) — matches expected 698+10.
+   - `cargo clippy ... -- -D warnings`: clean.
+   - New `dispatch_output_row_blocks_matches_flat_computation` passes under default and
+     `--test-threads=1` (bit-for-bit vs serial reference; cases (28,128),(1,64),(5,3),(37,1),(0,8)).
+   - All `group_query_attention` parity tests pass.
+
+## Non-blocking nit
+- The new row-block test does not include an explicit `num_rows < total_workers` case that
+  forces zero-length worker segments in the row-block dispatch (the zero-len path is only
+  covered indirectly via `node_row_lengths(1)`). Consider adding e.g. `(3, 128)` to the test
+  matrix to exercise a worker receiving `len == 0` through `dispatch_output_row_blocks` directly.
+  Not a correctness blocker — the logic is proven and the partition is separately tested.
+
+No data races, no deadlock/hang, no reentrancy, no regression. Approved.
+
+<!-- merged from .squad/decisions/inbox/roy-f16-layernorm-review.md -->
+### 2026-07-22: Approve f16 SkipSimplifiedLayerNormalization widening
+**By:** Roy
+**What:** Reviewed f9f7572 against cee3c20 and approved the f16 widening/narrowing change with non-blocking test-coverage nits.
+**Why:** All float inputs are safely widened to f32, outputs are narrowed through the dtype helper, and non-float tensors receive the helper's structured unsupported-dtype error. The targeted unit tests and warnings-denied Clippy pass; adding bf16/bias/stat-output coverage would further protect the generalized path.
+<!-- scribe-merge-2026-07-23T01-55-00Z-persistent-default-end -->
+
 <!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation -->
 ## 2026-07-22 — VLM WP1/WP2/WP3 reconciliation and ORT CUDA attention review
 
