@@ -85,3 +85,46 @@ D=/home/justinchu/ds-e2e-artifacts/deepseek-v2-lite-real-int4-blk32
 ./target/release/dump_intermediates $D/model.onnx "549,6077,280,7239,317" logits   # native garbage, pos4=245
 # ORT reference (coherent, pos4=8913): .rachael-diag/ortvenv + ort_allres.py
 ```
+
+---
+
+# UPDATE — CONFIRMED ROOT CAUSE + FIX (VERIFIED)
+
+**Status: FIXED.** Branch `fix/deepseek-mla-attention-prefill` (commit `1fe314f`, off clean origin/main `569507c`), pushed, NOT merged (awaiting fresh reviewer).
+
+## Root cause (corrects the (c)/(d) speculation above)
+
+RoPE and `attention_row` are **both correct** — exonerated. The real defect is a **device-stream ordering race**, not an attention-math bug.
+
+- Kernels run on the EP's **dedicated non-default (non-blocking) stream**, but `CudaRuntime::dtod` issues `cuMemcpyDtoD` on the **legacy default stream**. Non-blocking streams are **not implicitly ordered** against the default stream, so the synchronous D2D copy can run **before a producer kernel finishes writing its source buffer**.
+- This is hit by `copy_reshape` (Reshape/Squeeze, `movement.rs:271`), which materializes `Reshape_39`(K) / `Reshape_30`(V) feeding MLA attention. The fast **k_rope** columns are always ready; the slower **kv_b_proj → Reshape_28 → Split_29 → Concat_37 → Reshape_39** path producing **k_nope + V** is frequently read **stale (zero)** → attention garbage. DeepSeek's MLA assembles K/V through a tight `Concat→Reshape→Attention` chain that reliably exposes the race; dense models (Phi/Qwen) happened to hide it. `dtoh` already synchronizes for this exact reason; `dtod` did not.
+
+### Proof it is a race (not compute)
+- Same binary, no instrumentation: identical runs gave **different** logits (run1/2 pos0 argmax=207 garbage, run3 pos0=1022 correct).
+- `CUDA_LAUNCH_BLOCKING=1` (serializes launches) → **deterministic and exactly matches ORT**: pos0=1022, pos1=280, pos2=254, pos3=317, **pos4=8913 (' Paris', 25.0)**.
+- Kernel pointer dump showed `present_key`/`present_value` do **not** alias `k_cur`/`v_cur` → ruled out in-place aliasing, leaving stream ordering.
+
+## Fix (one line, general, DRY)
+
+`crates/onnx-runtime-ep-cuda/src/runtime.rs` — `CudaRuntime::dtod` now calls `self.synchronize()?` before `memcpy_dtod_sync`, draining the EP stream so the copy always sees fully-produced bytes (mirrors `dtoh`). General: covers every `dtod` caller (movement `copy_reshape`, provider `copy`, CSA checkpoint). Capture-safe: `cuMemcpyDtoD` is illegal during stream capture, so `dtod` is never on the capture path (Qwen cuda-graph decode confirmed unaffected). **Owner: ENGINE / runtime** (not matmul_nbits/Deckard, not qmoe).
+
+## Verification (native CUDA, GPU3)
+
+Before → `"Grants. Links Choir SAC Candle CSP..."` (blk128) / `"to成33333333..."` (blk32) — garbage.
+
+After (deterministic, 4/4 runs match ORT):
+- **block-32** `deepseek-v2-lite-real-int4-blk32`: `" Paris.\nThe capital of France is Paris.\nThe capital of France is Paris. ..."`
+- **block-128** `deepseek-v2-lite-real-int4`: `" Paris.\n\nThe Eiffel Tower is in Paris.\n\nThe Eiffel Tower is in Paris. ..."`
+- Per-position prefill argmax == ORT-on-our-ONNX: pos0=1022, pos1=280, pos2=254, pos3=317, **pos4=8913 (' Paris')**.
+
+## Regression test
+
+`crates/onnx-runtime-ep-cuda/src/runtime.rs` → `runtime::tests::dtod_waits_for_pending_stream_writes`: enqueues a slow (clock-spin) producer kernel on the EP stream, then `dtod` without an explicit sync, and asserts the copy sees the sentinel (not the pre-launch poison). **Verified FAIL without the fix** (`got -999`), **PASS with it**. General (guards the stream-ordering invariant for all `dtod` users; not DeepSeek-specific).
+
+## Gate (source .cudaenv.sh; CUDA_VISIBLE_DEVICES=3; clean worktree off origin/main)
+
+- `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` → **202 passed / 0 failed** (201 baseline + new test).
+- `cargo clippy -p onnx-runtime-ep-cuda --features cuda --lib -- -D warnings` → clean.
+- Qwen2.5-0.5b native decode → coherent (`" Paris. It is the largest city in the country ..."`), cuda_graph enabled captures=1 replays=21 fallbacks=0 → **no dense-model regression**.
+
+Branch: `fix/deepseek-mla-attention-prefill` @ `1fe314f`. Do NOT merge — reviewer to verify.
