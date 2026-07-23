@@ -3650,3 +3650,11 @@ No behavioral change; only tests strengthened (below).
 
 Decision archive gate checked at 2026-07-23T10:30:00Z: the active ledger was 271720 bytes before this merge and exceeded 51200 bytes. No dated ledger entries older than 2026-07-16T10:30:00Z were present, so no archive was created or updated.
 <!-- scribe-merge-2026-07-23T10-30-00Z-perop-audit-silu-robustness-end -->
+
+<!-- scribe-merge-2026-07-23T10-35-00Z-deckard-skiplayernorm-simd -->
+<!-- merged from .squad/decisions/inbox/deckard-skiplayernorm-simd.md -->
+### 2026-07-23: Make CPU SkipSimplifiedLayerNormalization allocation-free and vectorizable
+**By:** Deckard
+**What:** The contiguous f32 `SkipSimplifiedLayerNormalization` path now also handles requested mean/inv-std outputs directly, fuses residual/bias assembly with an eight-lane f32 square reduction, and uses a fixed-lane normalize/scale loop with scalar remainders. The broadcast and widened f16/bf16 fallback remains dtype- and shape-generic.
+**Why:** The real 7B graph requested statistics, so the previous direct-output path was bypassed and every one of 56 decode calls allocated buffers and performed per-element broadcast index unraveling. On the mandated profile, average decode op time/share fell from 2.885 ms / 9.15% to 0.594 ms / 1.99%; this is about 3.3x faster than the audit's approximately 1.94 ms ORT result inferred from the reported 1.49x baseline gap. The rewrite contains no target-specific intrinsics or model constants, preserves the exact 16-token opener, and passed 719 unit tests plus 10 integration tests, warnings-denied Clippy, and formatting checks.
+<!-- scribe-merge-2026-07-23T10-35-00Z-deckard-skiplayernorm-simd-end -->
