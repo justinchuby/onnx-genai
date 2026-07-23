@@ -141,3 +141,7 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 ## 2026-07-23T18:30:00Z — Phi on-device select review
 
 - Reviewed Deckard's `CudaOnDeviceConstantSelect` LongRoPE lowering 🟢 APPROVE: true/false branch mapping is preserved, unequal-table zero-padding is guarded by the threshold/extent proof, lowering is conservative, and capture-safe `Where` is determinism-neutral. Re-ran CUDA gate: 201 passed / 0 failed.
+
+## 2026-07-23T20:30:00Z — Native/ORT parity harness review
+- 🟡 Approved Roy's harness: deployed Qwen artifacts meet its symmetric block-32 Q4 dequantization contract, and fixed-fixture goldens/oracle checks are sound.
+- Future artifact expansion must guard or generalize the block size, zero-point, `g_idx`, and initializer-shape assumptions.

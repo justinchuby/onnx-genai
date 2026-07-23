@@ -30,3 +30,7 @@ Audited `docs/NATIVE_CUDA_DECODE.md`: 14 central claims verified, including conc
 
 ### 2026-07-23T15:45:00Z — DeepSeek QMoE structural smoke verification
 Verified the random-weight DeepSeek native int4-QMoE smoke on idle GPU5: exact QMoE/Attention/GQA/MatMulNBits graph and ABI contract, zero strict-CUDA fallbacks, and 32 finite tokens at 341.54 tok/s. This is structural validation only; it does not establish semantic correctness.
+
+### 2026-07-23T20:30:00Z — Native/ORT parity reasoning
+- Reviewed Roy's parity claims and required an independent exact-Q4 f32 oracle before characterizing the observed Qwen divergences.
+- The merged harness supports bounded fixed-fixture conclusions; ORT-CPU remains corroboration rather than unconditional ground truth.

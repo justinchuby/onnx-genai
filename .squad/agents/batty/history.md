@@ -57,3 +57,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - Extended `glm5.2-moe-export` with int4 QMoE emitter/packer at `751645b`: expert-major FC1/FC2 packing, swiglu gate/up interleave, asymmetric zp inputs 11/12, and GGUF requant-on-zp-mismatch. Chew approved with a Ruff syntax caveat under fix.
 
 - 2026-07-23T15:45:00Z: Corrected DeepSeek low-precision routing in Mobius PR #404 (`bd88fa8`): `_router_logits()` widens both hidden states and gate weights to f32. Strict f16 CUDA smoke had zero fallbacks, 32 finite tokens, and 2.534 ms/token; f16/bf16 graph contracts cover mask, RoPE, and router dtypes.
+
+## 2026-07-23T20:30:00Z — Real DeepSeek-V2-Lite artifact
+- Exported a structurally valid full-depth real f16/int4 QMoE artifact: 27 layers, 26 QMoE nodes, 189 MatMulNBits nodes, asymmetric block-128 quantization, and MLA K/V widths 192/128.
+- Native semantic execution awaits the in-flight block-32 re-export or native block-128 dense MatMulNBits support.

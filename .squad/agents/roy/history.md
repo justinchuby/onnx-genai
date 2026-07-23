@@ -130,3 +130,7 @@ Authored CUDA Gather, Shape, and Constant kernels; coverage reached 65.
 CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
 ### 2026-07-23T11:40Z
 Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path was independently approved by Buster and merged to main as 0a2422d; Iran also recorded PROGRESS.md follow-up a933ffe.
+
+### 2026-07-23T20:30:00Z — Native/ORT decode parity
+- `569507c` added four real-model parity fixtures. Phi and Qwen-0.5B are exact for 128 tokens; Qwen-1.5B/7B native split tokens match an independent exact-deployed-Q4 f32 oracle.
+- Keep the result scoped to the recorded artifacts, prompt, and divergence positions; it is not a blanket numerical-equivalence claim.
