@@ -716,6 +716,15 @@ pub(crate) struct Executor {
     /// for (a shape-varying loop body — rare).
     subgraph_execs: HashMap<(NodeId, String), ChildExecutor>,
     control_flow_stats: ControlFlowStats,
+    /// Per-`If` memo of the last observed branch predicate. During steady decode
+    /// a loop-invariant `If` (e.g. the LongRoPE cos/sin cache selector) keeps the
+    /// same predicate every step, so its branch outputs are already resident in
+    /// their persistent buffers. The predicate is still read each step (the
+    /// correctness guard); only the redundant branch re-execution — here two
+    /// `Constant` materializations plus their host→device cache copies — is
+    /// skipped. A predicate flip re-runs the branch (and, on an output-shape
+    /// change, retires the captured graph via the existing seam invalidation).
+    if_last_predicate: HashMap<NodeId, bool>,
     device_graph_signature: Option<Vec<DeviceBindingSignature>>,
     /// The captured-segment schedule from the most recent successful capture,
     /// reused to interleave segment replays with eager seam nodes on each
@@ -1854,6 +1863,7 @@ impl Executor {
             name_index,
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
+            if_last_predicate: HashMap::new(),
             device_graph_signature: None,
             capture_schedule: None,
             capture_segmentation: Vec::new(),
@@ -2638,6 +2648,12 @@ impl Executor {
                 self.run_plan_eager(&mut resolved, outer_scope, external)?;
             }
             RunMode::Capture => {
+                // A fresh capture may have resized/reallocated the `If` output
+                // buffers, so force every `If` to actually execute its branch
+                // this run (repopulating those buffers) rather than trusting the
+                // steady-decode memo. Cleared before segmentation so the branch
+                // runs as a normal eager seam during the capture pass.
+                self.if_last_predicate.clear();
                 // Partition the claimed subgraph into maximal capturable segments
                 // separated by non-capturable seam nodes. Only a graph-level hard
                 // decline (e.g. no persistent output binding, or nothing
@@ -5047,7 +5063,31 @@ impl Executor {
             ),
         })?;
 
+        // Capture-safe loop-invariant control-flow specialization. The predicate
+        // is read every step (above) so a genuine branch flip is never missed.
+        // When it matches the last observed value AND that value was recorded
+        // only for a branch with *no outer captures* (so its outputs depend on
+        // nothing but its own constants/initializers and are therefore invariant
+        // across decode steps) AND those outputs are still resident in their
+        // persistent buffers, re-running the branch is pure waste — skip it. The
+        // downstream captured segment reads the unchanged buffers correctly. A
+        // branch that reads loop-varying outer values is never memoized, so a
+        // stale output is impossible.
+        if self.if_last_predicate.get(&node.id) == Some(&cond)
+            && node.outputs.iter().all(|v| resolved.contains_key(v))
+        {
+            return Ok(());
+        }
+
         let attr_key = if cond { "then_branch" } else { "else_branch" };
+        // A branch with outer captures may depend on values that change between
+        // steps, so its output is not loop-invariant and must never be memoized.
+        let taken_branch_is_invariant = self
+            .graph
+            .subgraphs
+            .get(&(node.id, attr_key.to_string()))
+            .map(|body| required_outer_names(body).is_empty())
+            .unwrap_or(false);
         let prepared = self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?;
         let outs = self.run_subgraph(&prepared, &[])?;
 
@@ -5060,6 +5100,13 @@ impl Executor {
         }
         for (vid, t) in node.outputs.iter().zip(outs.iter()) {
             self.store_output_tensor(*vid, t, resolved)?;
+        }
+        // Only enable future skips when the taken branch is loop-invariant.
+        // Otherwise drop any stale memo so this `If` always re-runs.
+        if taken_branch_is_invariant {
+            self.if_last_predicate.insert(node.id, cond);
+        } else {
+            self.if_last_predicate.remove(&node.id);
         }
         Ok(())
     }

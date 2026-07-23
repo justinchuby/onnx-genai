@@ -31,14 +31,17 @@
 //! PyTorch-pointwise shaped).
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use super::elementwise::{broadcast_metadata, u64_bytes};
+use super::elementwise::{
+    BroadcastMetadataCache, BroadcastMetadataKey, is_fixed_decode_shape,
+    require_matching_capture_signature,
+};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -621,6 +624,8 @@ impl KernelFactory for CmpFactory {
             src: CMP_SRC,
             kind: BinaryKind::Compare(self.op),
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -640,6 +645,8 @@ impl KernelFactory for LogicalFactory {
             src: LOGICAL_SRC,
             kind: BinaryKind::LogicalBool,
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -656,10 +663,30 @@ pub struct BinaryPredKernel {
     src: &'static str,
     kind: BinaryKind,
     runtime: Arc<CudaRuntime>,
+    /// Persistent broadcast metadata so a captured launch performs no per-step
+    /// host allocation/upload/free/synchronize (the seam Marsten identified).
+    metadata: Mutex<BroadcastMetadataCache>,
+    /// The exact dtype/shape signature recorded by the most recent successful
+    /// fixed-decode call. `Some` iff the op is currently capture-safe.
+    last_capture_safe_signature: Mutex<Option<PredCaptureSignature>>,
+}
+
+/// The dtype + operand/broadcast shapes a captured predicate launch is pinned
+/// to. Capture is admitted only while the live call matches this exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PredCaptureSignature {
+    dtype: DataType,
+    shapes: BroadcastMetadataKey,
 }
 
 impl BinaryPredKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep binary predicate capture signature lock was poisoned".into(),
+            )
+        })?;
+        let warmed_signature = last_signature.take();
         let op = self.op_name;
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -707,14 +734,36 @@ impl BinaryPredKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
+        // Pin capture eligibility to a shape whose broadcast metadata is stable
+        // across steady decode. A predicate that drives control flow (e.g. the
+        // LongRoPE `Greater(total_seq_len, threshold)` feeding an `If`) is a
+        // rank-0 scalar or single-element tensor whose metadata is trivially
+        // constant; a fixed-decode one-row output likewise qualifies. Only such
+        // a signature, matching the warmed launch, may enter capture (mirroring
+        // the elementwise binary kernel). The `If` consumer's branch flip is
+        // separately guarded by the executor's control-flow seam invalidation.
+        let capture_eligible =
+            out_shape.iter().product::<usize>() == 1 || is_fixed_decode_shape(&out_shape);
+        let current_signature = capture_eligible.then(|| PredCaptureSignature {
+            dtype: a.dtype,
+            shapes: BroadcastMetadataKey {
+                a_shape: a.shape.to_vec(),
+                b_shape: b.shape.to_vec(),
+                out_shape: out_shape.clone(),
+            },
+        });
+        require_matching_capture_signature(
+            &self.runtime,
+            op,
+            warmed_signature.as_ref(),
+            current_signature.as_ref(),
+        )?;
+
         let func = self.runtime.nvrtc_function(self.module, self.src, entry)?;
-        let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len())?;
-        if let Err(error) = unsafe { self.runtime.htod(metadata_bytes, metadata_ptr) } {
-            let _ = unsafe { self.runtime.free_raw(metadata_ptr) };
-            return Err(error);
-        }
+        let mut metadata = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep binary predicate metadata lock was poisoned".into())
+        })?;
+        let metadata_ptr = metadata.prepare(a.shape, b.shape, &out_shape)?;
         let rank = i32::try_from(out_shape.len())
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: rank exceeds i32")))?;
         let cfg = LaunchConfig {
@@ -734,12 +783,11 @@ impl BinaryPredKernel {
         // SAFETY: `func` is the compiled predicate entry; its argument list is
         // (const T*, const T*, unsigned char*, metadata, rank, count), where T
         // matches the validated same-type operands. All pointers cover their
-        // respective allocations, with matching rank/count and indexing.
-        let launch =
-            unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free = unsafe { self.runtime.free_raw(metadata_ptr) };
-        sync.and(free)
+        // respective allocations, with matching rank/count and indexing. The
+        // metadata pointer is the persistent cache buffer, valid across replays.
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        *last_signature = current_signature;
+        Ok(())
     }
 }
 
@@ -753,9 +801,20 @@ impl Kernel for BinaryPredKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "binary predicate allocates/uploads/frees per-call broadcast metadata and synchronizes the stream",
-        )
+        // Only the exact fixed-row signature recorded by the most recent
+        // successful call may enter capture; the persistent metadata cache means
+        // the launch itself performs no per-step host alloc/upload/free/sync.
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} broadcast shape/dtype signature does not match the warmed capture signature",
+                self.op_name
+            )),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
+                "{} capture signature is unavailable because its state lock was poisoned",
+                self.op_name
+            )),
+        }
     }
 }
 

@@ -579,10 +579,10 @@ pub struct BinaryKernel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BroadcastMetadataKey {
-    a_shape: Vec<usize>,
-    b_shape: Vec<usize>,
-    out_shape: Vec<usize>,
+pub(crate) struct BroadcastMetadataKey {
+    pub(crate) a_shape: Vec<usize>,
+    pub(crate) b_shape: Vec<usize>,
+    pub(crate) out_shape: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -591,15 +591,20 @@ struct BinaryCaptureSignature {
     shapes: BroadcastMetadataKey,
 }
 
+/// A persistent device buffer holding the right-aligned broadcast stride/shape
+/// metadata for a binary op. Reused across decode steps whenever the operand
+/// shapes are unchanged, so a captured kernel launch performs **no** per-step
+/// host allocation, upload, free, or synchronize — the prerequisite for the op
+/// to advertise [`CaptureSupport::Supported`].
 #[derive(Debug)]
-struct BroadcastMetadataCache {
+pub(crate) struct BroadcastMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<BroadcastMetadataKey>,
     ptr: CUdeviceptr,
 }
 
 impl BroadcastMetadataCache {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
+    pub(crate) fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
             key: None,
@@ -607,7 +612,7 @@ impl BroadcastMetadataCache {
         }
     }
 
-    fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         a_shape: &[usize],
         b_shape: &[usize],
@@ -913,7 +918,7 @@ impl Kernel for SiluMulKernel {
     }
 }
 
-fn require_matching_capture_signature<T: PartialEq>(
+pub(crate) fn require_matching_capture_signature<T: PartialEq>(
     runtime: &CudaRuntime,
     op: &str,
     warmed: Option<&T>,
@@ -927,7 +932,7 @@ fn require_matching_capture_signature<T: PartialEq>(
     Ok(())
 }
 
-fn is_fixed_decode_shape(shape: &[usize]) -> bool {
+pub(crate) fn is_fixed_decode_shape(shape: &[usize]) -> bool {
     !shape.is_empty() && shape[..shape.len() - 1].iter().product::<usize>() == 1
 }
 

@@ -173,6 +173,104 @@ fn if_executes_selected_branch_with_capture_and_inline_initializer() {
     }
 }
 
+/// A loop-invariant `If` branch body: `out = a + zero` where both operands are
+/// inline initializers. It captures **no** outer values, so its output depends
+/// only on its own constants and is identical every time the branch is taken —
+/// the shape the LongRoPE cos/sin cache selector has (two `Constant`s).
+fn invariant_if_branch(value: f32) -> Graph {
+    let mut b = Graph::new();
+    let a = init(
+        &mut b,
+        "a",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[value, value]),
+    );
+    let zero = init(&mut b, "zero", DataType::Float32, &[2], f32_bytes(&[0.0, 0.0]));
+    let out = op(
+        &mut b,
+        "Add",
+        &[a, zero],
+        Some("branch_out"),
+        DataType::Float32,
+        &[2],
+        &[],
+    );
+    b.add_output(out);
+    b
+}
+
+/// The loop-invariant control-flow specialization skips re-running an `If` whose
+/// (capture-free) branch was already taken with the same predicate, but still
+/// re-runs — with the correct output — the moment the predicate flips.
+#[test]
+fn if_memoizes_invariant_branch_but_reruns_on_predicate_flip() {
+    let mut g = new_parent();
+    let cond = input(&mut g, "cond", DataType::Bool, &[1]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+    register(&mut g, node, "then_branch", invariant_if_branch(10.0));
+    register(&mut g, node, "else_branch", invariant_if_branch(20.0));
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    // (cond, expected output, expected cumulative subgraph_runs). Repeats of the
+    // same predicate must be served from the resident buffer (runs unchanged);
+    // every flip must re-run the branch.
+    let steps = [
+        (true, [10.0f32, 10.0], 1u64),
+        (true, [10.0, 10.0], 1),
+        (false, [20.0, 20.0], 2),
+        (false, [20.0, 20.0], 2),
+        (true, [10.0, 10.0], 3),
+    ];
+    for (cond_val, expected, expected_runs) in steps {
+        let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[cond_val as u8]).unwrap();
+        let outs = session.run(&[("cond", &cond_t)]).expect("run");
+        assert_eq!(outs[0].to_vec_f32(), expected.to_vec(), "cond={cond_val}");
+        assert_eq!(
+            session.control_flow_stats().subgraph_runs,
+            expected_runs,
+            "memoized invariant branch should skip only on repeated predicate (cond={cond_val})"
+        );
+    }
+}
+
+/// A branch that captures a loop-varying outer value must **never** be memoized:
+/// even when the predicate repeats, a changed capture has to re-run the branch
+/// so the output is never stale.
+#[test]
+fn if_never_memoizes_branch_that_reads_changing_captures() {
+    let mut g = new_parent();
+    let cond = input(&mut g, "cond", DataType::Bool, &[1]);
+    let _x = input(&mut g, "X", DataType::Float32, &[2]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+    register(&mut g, node, "then_branch", if_branch("Add"));
+    register(&mut g, node, "else_branch", if_branch("Sub"));
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    // Predicate is held constant (true) while the captured X changes: the branch
+    // reads X, so it must re-run every step and reflect the latest X.
+    let steps = [
+        ([2.0f32, 3.0], [3.0f32, 4.0]),
+        ([5.0, 6.0], [6.0, 7.0]),
+        ([9.0, 1.0], [10.0, 2.0]),
+    ];
+    for (run, (x_vals, expected)) in steps.into_iter().enumerate() {
+        let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[1u8]).unwrap();
+        let x_t = Tensor::from_f32(&[2], &x_vals).unwrap();
+        let outs = session.run(&[("cond", &cond_t), ("X", &x_t)]).expect("run");
+        assert_eq!(outs[0].to_vec_f32(), expected.to_vec(), "run={run}");
+        assert_eq!(
+            session.control_flow_stats().subgraph_runs,
+            (run + 1) as u64,
+            "capturing branch must re-run every step (run={run})"
+        );
+    }
+}
+
 #[test]
 fn if_rejects_mismatched_branch_output_counts_before_running_selected_branch() {
     let mut g = new_parent();
