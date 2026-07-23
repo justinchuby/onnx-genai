@@ -588,6 +588,170 @@ mod tests {
     }
 
     #[test]
+    fn skip_simplified_layer_norm_simd_matches_scalar_across_dtypes() {
+        // The f32 four-output form takes the SIMD sum-square reduction. Compare
+        // it with the scalar reference for both its remainder and bulk paths.
+        for (hidden, with_bias) in [(13, false), (257, true)] {
+            let shape = [2, hidden];
+            let input_data = (0..2 * hidden)
+                .map(|i| (i % 37) as f32 * 0.046875 - 0.75)
+                .collect::<Vec<_>>();
+            let skip_data = (0..2 * hidden)
+                .map(|i| (i % 23) as f32 * -0.03125 + 0.3125)
+                .collect::<Vec<_>>();
+            let gamma_data = (0..hidden)
+                .map(|i| 0.625 + (i % 13) as f32 * 0.0390625)
+                .collect::<Vec<_>>();
+            let bias_data = (0..hidden)
+                .map(|i| (i % 9) as f32 * 0.015625 - 0.0625)
+                .collect::<Vec<_>>();
+            let bias = with_bias.then_some(bias_data.as_slice());
+            let (want, want_sum) = reference(&input_data, &skip_data, &gamma_data, bias, 1e-5);
+
+            let input = Owned::f32(&shape, &input_data);
+            let skip = Owned::f32(&shape, &skip_data);
+            let gamma = Owned::f32(&[hidden], &gamma_data);
+            let bias = Owned::f32(&[hidden], &bias_data);
+            let mut output = Owned::zeros_f32(&shape);
+            let mut mean = Owned::zeros_f32(&[2, 1]);
+            let mut inv_std = Owned::zeros_f32(&[2, 1]);
+            let mut sum = Owned::zeros_f32(&shape);
+            let inputs = if with_bias {
+                vec![input.view(), skip.view(), gamma.view(), bias.view()]
+            } else {
+                vec![input.view(), skip.view(), gamma.view()]
+            };
+            SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                .execute(
+                    &inputs,
+                    &mut [
+                        output.view_mut(),
+                        mean.view_mut(),
+                        inv_std.view_mut(),
+                        sum.view_mut(),
+                    ],
+                )
+                .unwrap();
+
+            assert_eq!(sum.to_f32(), want_sum, "hidden={hidden}");
+            assert_eq!(mean.to_f32(), vec![0.0; 2], "hidden={hidden}");
+            assert_close(&output.to_f32(), &want);
+            let want_inv_std = want_sum
+                .chunks_exact(hidden)
+                .map(|row| {
+                    1.0 / (row.iter().map(|x| x * x).sum::<f32>() / hidden as f32 + 1e-5).sqrt()
+                })
+                .collect::<Vec<_>>();
+            assert_close(&inv_std.to_f32(), &want_inv_std);
+        }
+
+        // Reduced-precision tensors use the scalar widened path. Verify that
+        // its narrowing agrees with the same scalar oracle for both dtypes.
+        for (dtype, hidden, with_bias) in [
+            (DataType::Float16, 13, false),
+            (DataType::BFloat16, 257, true),
+        ] {
+            let shape = [2, hidden];
+            let values = (0..2 * hidden)
+                .map(|i| (i % 29) as f32 * 0.0625 - 0.875)
+                .collect::<Vec<_>>();
+            let skip_values = (0..2 * hidden)
+                .map(|i| (i % 19) as f32 * -0.03125 + 0.25)
+                .collect::<Vec<_>>();
+            let gamma_values = (0..hidden)
+                .map(|i| 0.75 + (i % 7) as f32 * 0.0625)
+                .collect::<Vec<_>>();
+            let bias_values = (0..hidden)
+                .map(|i| (i % 5) as f32 * 0.03125 - 0.0625)
+                .collect::<Vec<_>>();
+            let (input, skip, gamma, bias) = match dtype {
+                DataType::Float16 => (
+                    Owned::f16(&shape, &values),
+                    Owned::f16(&shape, &skip_values),
+                    Owned::f16(&[hidden], &gamma_values),
+                    Owned::f16(&[hidden], &bias_values),
+                ),
+                DataType::BFloat16 => (
+                    Owned::bf16(&shape, &values),
+                    Owned::bf16(&shape, &skip_values),
+                    Owned::bf16(&[hidden], &gamma_values),
+                    Owned::bf16(&[hidden], &bias_values),
+                ),
+                _ => unreachable!(),
+            };
+            let widen = |tensor: &Owned| match dtype {
+                DataType::Float16 => tensor.to_f16_as_f32(),
+                DataType::BFloat16 => tensor.to_bf16_as_f32(),
+                _ => unreachable!(),
+            };
+            let input_values = widen(&input);
+            let skip_values = widen(&skip);
+            let gamma_values = widen(&gamma);
+            let bias_values = widen(&bias);
+            let (want, want_sum) = reference(
+                &input_values,
+                &skip_values,
+                &gamma_values,
+                with_bias.then_some(bias_values.as_slice()),
+                1e-5,
+            );
+            let mut output = Owned::zeros(dtype, &shape);
+            let mut mean = Owned::zeros(dtype, &[2, 1]);
+            let mut inv_std = Owned::zeros(dtype, &[2, 1]);
+            let mut sum = Owned::zeros(dtype, &shape);
+            let inputs = if with_bias {
+                vec![input.view(), skip.view(), gamma.view(), bias.view()]
+            } else {
+                vec![input.view(), skip.view(), gamma.view()]
+            };
+            SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                .execute(
+                    &inputs,
+                    &mut [
+                        output.view_mut(),
+                        mean.view_mut(),
+                        inv_std.view_mut(),
+                        sum.view_mut(),
+                    ],
+                )
+                .unwrap();
+            let got = widen(&output);
+            let got_sum = widen(&sum);
+            let got_inv_std = widen(&inv_std);
+            let narrow = |values: &[f32]| match dtype {
+                DataType::Float16 => Owned::f16(&[values.len()], values).to_f16_as_f32(),
+                DataType::BFloat16 => Owned::bf16(&[values.len()], values).to_bf16_as_f32(),
+                _ => unreachable!(),
+            };
+            assert_eq!(got_sum, narrow(&want_sum), "{dtype:?} sum");
+            assert_eq!(widen(&mean), vec![0.0; 2], "{dtype:?} mean");
+            let tolerance = if dtype == DataType::Float16 {
+                1e-3
+            } else {
+                1e-2
+            };
+            for (got, want) in got.iter().zip(narrow(&want)) {
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{dtype:?}: {got} != {want}"
+                );
+            }
+            let want_inv_std = want_sum
+                .chunks_exact(hidden)
+                .map(|row| {
+                    1.0 / (row.iter().map(|x| x * x).sum::<f32>() / hidden as f32 + 1e-5).sqrt()
+                })
+                .collect::<Vec<_>>();
+            for (got, want) in got_inv_std.iter().zip(narrow(&want_inv_std)) {
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{dtype:?}: {got} != {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn skip_simplified_layer_norm_f16_widens_and_narrows() {
         let input = Owned::f16(&[1, 1, 4], &[1., 2., 3., 4.]);
         let skip = Owned::f16(&[1, 1, 4], &[0.5, -1., 1., 0.]);

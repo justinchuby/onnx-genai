@@ -964,11 +964,12 @@ mod tests {
         // which must be byte-identical to the general broadcast_apply path (same
         // to_acc/from_acc f16->f32->f16 rounding). Values with non-trivial f16
         // rounding exercise the round-trip.
-        let lhs: Vec<f32> = (0..64).map(|i| (i as f32) * 0.3 - 5.0).collect();
-        let rhs: Vec<f32> = (0..64).map(|i| 1.0 / (i as f32 + 1.7)).collect();
-        let a = Owned::f16(&[64], &lhs);
-        let b = Owned::f16(&[64], &rhs);
-        let mut fast = Owned::zeros(DataType::Float16, &[64]);
+        // 61 deliberately leaves a remainder for any common SIMD lane width.
+        let lhs: Vec<f32> = (0..61).map(|i| (i as f32) * 0.3 - 5.0).collect();
+        let rhs: Vec<f32> = (0..61).map(|i| 1.0 / (i as f32 + 1.7)).collect();
+        let a = Owned::f16(&[61], &lhs);
+        let b = Owned::f16(&[61], &rhs);
+        let mut fast = Owned::zeros(DataType::Float16, &[61]);
         BinaryKernel { op: BinOp::Mul }
             .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
             .unwrap();
@@ -986,12 +987,12 @@ mod tests {
         assert_eq!(fast.to_f16_as_f32(), want);
 
         // Force the general broadcast fallback by reshaping one operand so the
-        // contiguous fast path is bypassed (shape [64,1] x [1,1] broadcasts a
+        // contiguous fast path is bypassed (shape [61,1] x [1,1] broadcasts a
         // scalar over the column). The fast path and broadcast path must agree
         // bit-for-bit on the equal-shape region, so compare RAW f16 bits.
-        let a_col = Owned::f16(&[64, 1], &lhs);
+        let a_col = Owned::f16(&[61, 1], &lhs);
         let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
-        let mut broadcast = Owned::zeros(DataType::Float16, &[64, 1]);
+        let mut broadcast = Owned::zeros(DataType::Float16, &[61, 1]);
         BinaryKernel { op: BinOp::Mul }
             .execute(
                 &[a_col.view(), b_scalar.view()],
@@ -999,11 +1000,11 @@ mod tests {
             )
             .unwrap();
         // Recompute the fast path with the same scalar multiplier as a full
-        // [64] contiguous op, then compare raw bits against the broadcast result.
-        let rhs_scalar = vec![rhs[0]; 64];
-        let a_flat = Owned::f16(&[64], &lhs);
-        let b_flat = Owned::f16(&[64], &rhs_scalar);
-        let mut fast_scalar = Owned::zeros(DataType::Float16, &[64]);
+        // [61] contiguous op, then compare raw bits against the broadcast result.
+        let rhs_scalar = vec![rhs[0]; 61];
+        let a_flat = Owned::f16(&[61], &lhs);
+        let b_flat = Owned::f16(&[61], &rhs_scalar);
+        let mut fast_scalar = Owned::zeros(DataType::Float16, &[61]);
         BinaryKernel { op: BinOp::Mul }
             .execute(
                 &[a_flat.view(), b_flat.view()],
@@ -1021,30 +1022,31 @@ mod tests {
     fn sub_div_f16_contiguous_matches_broadcast_path() {
         // Cover the generalized contiguous fast path for Sub and Div in f16,
         // asserting bit-identity with the broadcast fallback (Gaff nit).
-        let lhs: Vec<f32> = (0..48).map(|i| (i as f32) * 0.25 - 6.0).collect();
-        let rhs: Vec<f32> = (0..48).map(|i| (i as f32) * 0.1 + 1.3).collect();
+        // 53 exercises the contiguous loop's remainder path.
+        let lhs: Vec<f32> = (0..53).map(|i| (i as f32) * 0.25 - 6.0).collect();
+        let rhs: Vec<f32> = (0..53).map(|i| (i as f32) * 0.1 + 1.3).collect();
         for op in [BinOp::Sub, BinOp::Div] {
-            let a = Owned::f16(&[48], &lhs);
-            let b = Owned::f16(&[48], &rhs);
-            let mut fast = Owned::zeros(DataType::Float16, &[48]);
+            let a = Owned::f16(&[53], &lhs);
+            let b = Owned::f16(&[53], &rhs);
+            let mut fast = Owned::zeros(DataType::Float16, &[53]);
             BinaryKernel { op }
                 .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
                 .unwrap();
 
-            // Broadcast fallback over [48,1] x [1,1] with the first rhs value.
-            let a_col = Owned::f16(&[48, 1], &lhs);
+            // Broadcast fallback over [53,1] x [1,1] with the first rhs value.
+            let a_col = Owned::f16(&[53, 1], &lhs);
             let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
-            let mut broadcast = Owned::zeros(DataType::Float16, &[48, 1]);
+            let mut broadcast = Owned::zeros(DataType::Float16, &[53, 1]);
             BinaryKernel { op }
                 .execute(
                     &[a_col.view(), b_scalar.view()],
                     &mut [broadcast.view_mut()],
                 )
                 .unwrap();
-            let rhs_scalar = vec![rhs[0]; 48];
-            let b_flat = Owned::f16(&[48], &rhs_scalar);
-            let a_flat = Owned::f16(&[48], &lhs);
-            let mut fast_scalar = Owned::zeros(DataType::Float16, &[48]);
+            let rhs_scalar = vec![rhs[0]; 53];
+            let b_flat = Owned::f16(&[53], &rhs_scalar);
+            let a_flat = Owned::f16(&[53], &lhs);
+            let mut fast_scalar = Owned::zeros(DataType::Float16, &[53]);
             BinaryKernel { op }
                 .execute(
                     &[a_flat.view(), b_flat.view()],
