@@ -52,11 +52,32 @@
 //! `THREADS=0` opt-out still leaves the decode path unchanged. The unset worker
 //! count is [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`]
 //! (about half the logical CPUs), not the flat pool's eight-worker ceiling, so the
-//! out-of-box path actually scales. If `ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`
-//! is also requested, `numa-split` takes precedence when its two-level layout can
-//! be built (precedence: explicit numa-split env > persistent SPMD default > flat +
-//! auto-compact); the mutually-exclusive selection is reported once. If that layout
-//! is unavailable, the persistent pool remains eligible.
+//! out-of-box path actually scales.
+//!
+//! # Precedence vs the affinity control (`ONNX_GENAI_CPU_DECODE_AFFINITY`)
+//!
+//! The decode strategy is chosen by this precedence, highest first:
+//!
+//! 1. **`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`** -- the explicit multi-node
+//!    split wins when its two-level layout can be built (the mutually-exclusive
+//!    selection is reported once when the persistent pool was *forced*).
+//! 2. **An explicit non-`numa-split` affinity request in Auto mode** -- when the
+//!    persistence mode is Auto (the default, `PERSISTENT_POOL` unset) *and* the
+//!    user explicitly set `ONNX_GENAI_CPU_DECODE_AFFINITY` to `off`, `compact`,
+//!    `node:<n>`, or a malformed value, the persistent default **defers to the
+//!    flat path** so [`crate::decode_affinity::plan_decode_affinity`] honors and
+//!    validates the request exactly as before (`off` = unpinned, `compact`,
+//!    `node:<n>`, and malformed values still error). An explicit affinity request
+//!    thus opts the user out of the SPMD default (see [`auto_defers_to_flat`]).
+//!    `=1` (Forced) overrides this: the persistent pool wins regardless of the
+//!    affinity env (its own per-node pinning applies).
+//! 3. **Persistent SPMD default** -- with no affinity env set (the true
+//!    out-of-box case), or when `=1` forces it, the persistent pool is used.
+//! 4. **Flat Rayon + auto-`compact`** legacy path -- `=0` (Off), a `THREADS=0`
+//!    opt-out, or a host that fails the auto-enable gate.
+//!
+//! The mutually-exclusive selection between `numa-split` and a *forced*
+//! persistent pool is reported once.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -702,6 +723,38 @@ fn persistence_mode() -> PersistenceMode {
     persistence_mode_from_raw(std::env::var(PERSISTENT_POOL_ENV).ok().as_deref())
 }
 
+/// Whether an explicit affinity request should defer the Auto default to the flat
+/// decode path (single source of truth for Fix (Chew #1)).
+///
+/// Returns `true` only when the persistence mode is **Auto** (the default,
+/// `PERSISTENT_POOL` unset) *and* the user has explicitly set
+/// `ONNX_GENAI_CPU_DECODE_AFFINITY` to a non-`numa-split` value
+/// (`off`/`compact`/`node:<n>`/anything malformed). In that case the user is
+/// asking the flat path's [`crate::decode_affinity::plan_decode_affinity`] to
+/// honor/validate the request, so the persistent SPMD default steps aside.
+///
+/// It returns `false` for `numa-split` (which keeps its own higher precedence),
+/// an unset or empty value (the true out-of-box case that keeps the SPMD
+/// default), and for Off/Forced modes (Forced explicitly demanded the pool, so an
+/// affinity request does not opt it out).
+pub(crate) fn auto_defers_to_flat(mode: PersistenceMode, affinity_raw: Option<&str>) -> bool {
+    if !matches!(mode, PersistenceMode::Auto) {
+        return false;
+    }
+    match affinity_raw.map(str::trim) {
+        None | Some("") => false,
+        Some("numa-split") => false,
+        Some(_) => true,
+    }
+}
+
+/// Whether the persistent pool was **explicitly forced** on (`PERSISTENT_POOL=1`).
+/// Used to keep the `numa-split` mutual-exclusion diagnostic scoped to users who
+/// actually asked for the persistent pool, not the Auto default (Gaff cleanup #2).
+pub(crate) fn is_forced() -> bool {
+    matches!(persistence_mode(), PersistenceMode::Forced)
+}
+
 /// Whether the host is large enough to *auto*-enable the spinning worker set.
 fn auto_enable_suitable(available: usize) -> bool {
     available >= AUTO_MIN_LOGICAL_CPUS
@@ -717,6 +770,21 @@ fn auto_enable_suitable(available: usize) -> bool {
 pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     let mode = persistence_mode();
     if matches!(mode, PersistenceMode::Off) {
+        return None;
+    }
+    // Fix (Chew #1): an explicit non-`numa-split` affinity request opts the Auto
+    // default out of the persistent pool and defers to the flat path, so
+    // `plan_decode_affinity` honors and validates it exactly as before (an
+    // explicit `off`/`compact`/`node:<n>`/malformed value must not be silently
+    // ignored). `numa-split` keeps its own higher precedence, and `=1` (Forced)
+    // overrides this defer entirely.
+    if auto_defers_to_flat(
+        mode,
+        std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        report_affinity_defer();
         return None;
     }
     let Some(total) = threads else {
@@ -747,13 +815,6 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     }
     let shards = node_shards(total);
     Some(SpmdDecodePools::build(&shards))
-}
-
-/// True unless the persistent pool is explicitly opted out (`=0`). Default-on:
-/// unset auto-enables (subject to the host gate applied in [`build_from_env`])
-/// and `=1` forces on. Callers that need the actual built layout use [`pools`].
-pub(crate) fn enabled() -> bool {
-    !matches!(persistence_mode(), PersistenceMode::Off)
 }
 
 /// Resolve the node shards for `total` workers: the multi-node split when the
@@ -793,6 +854,20 @@ fn report_default_on() {
         eprintln!(
             "onnx-genai: persistent SPMD decode pool active by default; set \
              ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0 to opt out"
+        );
+    }
+}
+
+/// Announce once (rule 5) that an explicit affinity request deferred the Auto
+/// default to the flat decode path, so the routing change is inspectable.
+fn report_affinity_defer() {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        eprintln!(
+            "onnx-genai: persistent SPMD decode pool: an explicit \
+             ONNX_GENAI_CPU_DECODE_AFFINITY request was set, so the default-on pool defers to \
+             the flat decode path which honors that affinity control. Set \
+             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to force the persistent pool regardless"
         );
     }
 }
@@ -1050,7 +1125,7 @@ mod tests {
         assert_eq!(persistence_mode_from_raw(Some("true")), PersistenceMode::Auto);
         assert_eq!(persistence_mode_from_raw(Some("2")), PersistenceMode::Auto);
 
-        // Only `Off` disables the pool for callers checking `enabled()`-style gates.
+        // Only `Off` disables the pool for callers checking mode-based gates.
         assert!(!matches!(
             persistence_mode_from_raw(Some("0")),
             PersistenceMode::Auto | PersistenceMode::Forced
@@ -1072,5 +1147,35 @@ mod tests {
         assert!(auto_enable_suitable(AUTO_MIN_LOGICAL_CPUS));
         assert!(auto_enable_suitable(8));
         assert!(auto_enable_suitable(96));
+    }
+
+    #[test]
+    fn auto_defers_to_flat_only_for_explicit_non_numa_affinity_in_auto_mode() {
+        use PersistenceMode::{Auto, Forced, Off};
+
+        // Auto default (PERSISTENT_POOL unset) + an explicit non-numa-split
+        // affinity request defers to the flat path so plan_decode_affinity honors
+        // it (Chew #1). `off`, `compact`, `node:<n>`, and malformed all defer.
+        assert!(auto_defers_to_flat(Auto, Some("off")));
+        assert!(auto_defers_to_flat(Auto, Some("compact")));
+        assert!(auto_defers_to_flat(Auto, Some("node:0")));
+        assert!(auto_defers_to_flat(Auto, Some(" node:3 ")));
+        assert!(auto_defers_to_flat(Auto, Some("bogus-mode")));
+
+        // The true out-of-box case (no affinity env, or an empty/whitespace value)
+        // keeps the SPMD default -- it must NOT defer.
+        assert!(!auto_defers_to_flat(Auto, None));
+        assert!(!auto_defers_to_flat(Auto, Some("")));
+        assert!(!auto_defers_to_flat(Auto, Some("   ")));
+
+        // numa-split keeps its own higher precedence, so it does not "defer" here.
+        assert!(!auto_defers_to_flat(Auto, Some("numa-split")));
+        assert!(!auto_defers_to_flat(Auto, Some(" numa-split ")));
+
+        // Forced (`=1`) explicitly demanded the persistent pool, so an affinity
+        // request never opts it out; Off already returns early upstream.
+        assert!(!auto_defers_to_flat(Forced, Some("off")));
+        assert!(!auto_defers_to_flat(Forced, Some("compact")));
+        assert!(!auto_defers_to_flat(Off, Some("off")));
     }
 }

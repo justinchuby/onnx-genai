@@ -117,11 +117,18 @@ Generality / fallback (Rule 2, Rule 5): **default-on with opt-out**. When
 the activation once; `=0` opts out (flat legacy path) and `=1` forces it on. Auto-
 enable is conservative -- it only fires on hosts with >= 4 logical CPUs, where a
 spinning worker set is safe; tiny/single-core hosts and `THREADS=0` fall back to
-the flat path. On a single-node host, non-Linux, or when pinning is refused
-(cgroup) it degrades to a single unpinned SPMD worker group; it does not switch
-back to the bounded Rayon pool. The barrier primitive itself is portable `std`
-atomics + `thread::park`; only optional CPU pinning is platform-specific and
-best-effort.
+the flat path. On a single-node host, a non-NUMA machine, or when NUMA topology
+is undiscoverable, the pool collapses to a single worker group instead of the
+two-level node split; it does not switch back to the bounded Rayon pool. That
+single group is **not** unconditionally unpinned: `node_shards` passes the
+process's allowed CPU set (`allowed_cpus()`, i.e. the cpuset/taskset mask) into
+the fallback shard, and `SpmdDecodePools::build` **best-effort pins** every
+worker to those CPUs on platforms that support pinning (Linux, Windows). Only
+when the allowed set is unknown, or on a platform without pinning support
+(macOS / unsupported OS), or when the OS refuses the request (a restricted
+cgroup, logged once) do the workers run truly unpinned. The barrier primitive
+itself is portable `std` atomics + `thread::park`; only the optional CPU pinning
+is platform-specific and best-effort.
 
 Default worker count (Rule 2, topology-derived): when
 `ONNX_GENAI_CPU_DECODE_THREADS` is unset the persistent pool uses **half the
@@ -135,14 +142,31 @@ spins on the completion counters), prefill's global pool, and co-tenants -- a
 below). An explicit `ONNX_GENAI_CPU_DECODE_THREADS` is always honored.
 
 Decode strategy precedence is explicit (Rule 5): **explicit `numa-split` env >
-persistent SPMD (default) > flat + auto-`compact`**. When persistent SPMD is
-active it does its own per-node worker pinning, and the flat pool's auto-`compact`
-affinity is never built (the two are mutually exclusive by construction, verified:
-the auto-`compact` log does not appear in the default path). When both
-`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split` and the default-on pool are in play,
-`numa-split` wins if its two-level topology can be built, and the runtime reports
-that choice once; if `numa-split` cannot build, the persistent SPMD pool remains
-eligible and that fallback is also reported once.
+persistent SPMD (default, unless an explicit non-`numa-split` affinity defers it)
+> flat + auto-`compact`**. When persistent SPMD is active it does its own per-node
+worker pinning, and the flat pool's auto-`compact` affinity is never built (the
+two are mutually exclusive by construction, verified: the auto-`compact` log does
+not appear in the default path). When both
+`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split` and a *forced*
+(`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`) pool are in play, `numa-split` wins if
+its two-level topology can be built, and the runtime reports that choice once; if
+`numa-split` cannot build, the persistent SPMD pool remains eligible and that
+fallback is also reported once.
+
+Explicit-affinity defer (Rule 5, Rule 2): because the persistent pool is now the
+Auto default, an explicit `ONNX_GENAI_CPU_DECODE_AFFINITY` request would otherwise
+be silently ignored (the flat pool that honors it is never built). To preserve
+that user control, when the mode is **Auto** (`PERSISTENT_POOL` unset) *and* the
+user explicitly set `ONNX_GENAI_CPU_DECODE_AFFINITY` to a non-`numa-split` value
+(`off`, `compact`, `node:<n>`, or a malformed value), the persistent default
+**defers to the flat path** so `plan_decode_affinity` honors and validates the
+request exactly as before (`off` = unpinned, `compact`, `node:<n>`, malformed
+still errors). An explicit affinity request thus opts the user out of the SPMD
+default, and the defer is logged once. `=1` (Forced) overrides this: the
+persistent pool wins regardless of the affinity env and applies its own per-node
+pinning. With no affinity env set at all (the true out-of-box case) the SPMD
+default is used unchanged. The decision lives in one place,
+`decode_spmd::auto_defers_to_flat` (consumed by `build_from_env`/`pools`).
 
 Measured (Sapphire Rapids Xeon 8480C, 2x48 cores, 2 NUMA nodes,
 Qwen2.5-Coder-7B int4, steady M=1, 128 tokens, 5-run median, interleaved A/B,

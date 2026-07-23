@@ -710,12 +710,6 @@ fn configured_decode_threads() -> Option<usize> {
     resolve_decode_threads(value.as_deref(), available)
 }
 
-/// The resolved bounded decode-worker count, exposed so callers can size a
-/// worker set exactly like the flat pool and honor `ONNX_GENAI_CPU_DECODE_THREADS`.
-pub fn configured_decode_threads_public() -> Option<usize> {
-    configured_decode_threads()
-}
-
 /// The worker count for the persistent SPMD decode pool ([`crate::decode_spmd`]).
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
@@ -1161,11 +1155,15 @@ impl Drop for DecodeResidencyGuard {
 /// (M>1) and non-CPU paths must keep using the global pool.
 pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     // The persistent SPMD pool is default-on (opt out with
-    // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0`), so it is "requested" whenever it
-    // is not explicitly disabled. `numa-split` is an explicit opt-in that outranks
-    // it (precedence: explicit numa-split env > persistent SPMD default > flat +
-    // auto-compact). We only log the mutual-exclusion note when both are in play.
-    let both_requested = crate::decode_spmd::enabled()
+    // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0`). Precedence: explicit numa-split
+    // env > (Auto default, unless an explicit non-numa-split affinity defers it to
+    // the flat path -- see `decode_spmd::auto_defers_to_flat`) persistent SPMD >
+    // flat + auto-compact. The "mutually exclusive" diagnostic below is scoped to
+    // users who *explicitly* forced the persistent pool (`PERSISTENT_POOL=1`);
+    // under the Auto default the user never asked for it, and an explicit
+    // non-numa-split affinity already defers the pool anyway, so logging a
+    // conflict there would be noise.
+    let both_requested = crate::decode_spmd::is_forced()
         && std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
             .is_ok_and(|value| value.trim() == "numa-split");
     // `numa-split`: run the forward on the dispatcher pool and let each M=1
@@ -1177,10 +1175,11 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if let Some(numa) = numa_pools() {
         if both_requested {
             report_decode_strategy_precedence(
-                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the default-on persistent \
-                 SPMD decode pool are mutually exclusive; numa-split is active because it \
-                 has precedence and its two-level NUMA layout was built successfully. Set \
-                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0 to silence this if intentional",
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the forced persistent \
+                 SPMD decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1) are mutually \
+                 exclusive; numa-split is active because it has precedence and its two-level \
+                 NUMA layout was built successfully. Unset \
+                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL to silence this if intentional",
             );
         }
         return numa.install_scope(move || {
@@ -1198,9 +1197,10 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     if crate::decode_spmd::pools().is_some() {
         if both_requested {
             report_decode_strategy_precedence(
-                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the default-on persistent \
-                 SPMD decode pool are mutually exclusive; persistent SPMD is active because \
-                 the higher-precedence numa-split layout was unavailable",
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the forced persistent \
+                 SPMD decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1) are mutually \
+                 exclusive; persistent SPMD is active because the higher-precedence \
+                 numa-split layout was unavailable",
             );
         }
         let _spmd_guard = SpmdScopeGuard::enter();
@@ -1209,9 +1209,10 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     }
     if both_requested {
         report_decode_strategy_precedence(
-            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the default-on persistent SPMD \
-             decode pool are mutually exclusive; neither strategy is active because no \
-             bounded decode worker count or usable numa-split layout is available",
+            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the forced persistent SPMD \
+             decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1) are mutually exclusive; \
+             neither strategy is active because no bounded decode worker count or usable \
+             numa-split layout is available",
         );
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
@@ -3340,6 +3341,108 @@ mod tests {
             "31-worker persistent SPMD output must be byte-identical to flag-OFF \
              across every sequential packed-int4 MatMulNBits op"
         );
+    }
+
+    const AFFINITY_DEFER_CHILD_ENV: &str = "NXRT_AFFINITY_DEFER_CHILD";
+    const AFFINITY_DEFER_MARKER: &str = "NXRT_AFFINITY_DEFER=";
+
+    /// Child process for the affinity-defer routing tests (Chew #1). Dispatches on
+    /// the scenario in `AFFINITY_DEFER_CHILD_ENV`; a plain run (var unset) is a
+    /// no-op so the test is inert in the normal suite. Env is set by the parent
+    /// *before* the process starts, so `pools()`/`plan_decode_affinity` observe it
+    /// on their first (and only) evaluation.
+    #[test]
+    fn affinity_defer_routing_child() {
+        let Ok(scenario) = std::env::var(AFFINITY_DEFER_CHILD_ENV) else {
+            return;
+        };
+        match scenario.as_str() {
+            // (a) Auto default + explicit non-numa-split affinity -> defer to the
+            // flat path: the persistent SPMD pool must NOT be built.
+            "auto_off" | "auto_node" | "auto_compact" => {
+                assert!(
+                    crate::decode_spmd::pools().is_none(),
+                    "Auto default + explicit affinity ({scenario}) must defer to the flat \
+                     path and build no persistent SPMD pool"
+                );
+            }
+            // (b) Forced (`=1`) + affinity set -> SPMD still wins.
+            "forced_off" => {
+                assert!(
+                    crate::decode_spmd::pools().is_some(),
+                    "Forced persistent pool must ignore the affinity defer and build SPMD"
+                );
+            }
+            // (c) Auto + malformed affinity -> deferred to flat AND the flat path
+            // still surfaces the malformed-value error.
+            "auto_malformed" => {
+                assert!(
+                    crate::decode_spmd::pools().is_none(),
+                    "Auto default + malformed affinity must defer to the flat path"
+                );
+                assert!(
+                    crate::decode_affinity::plan_decode_affinity(4).is_err(),
+                    "malformed affinity must still surface an error on the deferred flat path"
+                );
+            }
+            other => panic!("unknown affinity-defer scenario `{other}`"),
+        }
+        println!("{AFFINITY_DEFER_MARKER}ok");
+    }
+
+    fn run_affinity_defer_child(scenario: &str, affinity: &str, forced: bool) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::affinity_defer_routing_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(AFFINITY_DEFER_CHILD_ENV, scenario)
+            .env(crate::decode_affinity::DECODE_AFFINITY_ENV, affinity)
+            .env(DECODE_THREADS_ENV, "8")
+            .env("RAYON_NUM_THREADS", "8");
+        if forced {
+            command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
+        } else {
+            // Auto: the persistence env must be unset so the default-on Auto mode
+            // is what routes (or defers), not an explicit `=0`/`=1`.
+            command.env_remove(crate::decode_spmd::PERSISTENT_POOL_ENV);
+        }
+        let output = command.output().expect("run affinity-defer child process");
+        assert!(
+            output.status.success(),
+            "affinity-defer child failed (scenario={scenario}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("child output is UTF-8");
+        assert!(
+            stdout.contains(&format!("{AFFINITY_DEFER_MARKER}ok")),
+            "affinity-defer child did not confirm scenario {scenario}:\n{stdout}"
+        );
+    }
+
+    /// (a) Auto default (`PERSISTENT_POOL` unset) with an explicit non-numa-split
+    /// affinity defers to the flat path and builds no persistent SPMD pool.
+    #[test]
+    fn auto_default_with_explicit_affinity_defers_to_flat() {
+        run_affinity_defer_child("auto_off", "off", false);
+        run_affinity_defer_child("auto_node", "node:0", false);
+        run_affinity_defer_child("auto_compact", "compact", false);
+    }
+
+    /// (b) Forced (`=1`) keeps the persistent SPMD pool even when an explicit
+    /// affinity is set -- the affinity defer must not apply.
+    #[test]
+    fn forced_persistent_pool_ignores_explicit_affinity() {
+        run_affinity_defer_child("forced_off", "off", true);
+    }
+
+    /// (c) A malformed affinity value in the Auto-defer path still errors (the flat
+    /// path's `plan_decode_affinity` validates it exactly as before).
+    #[test]
+    fn auto_default_malformed_affinity_still_errors_on_flat_path() {
+        run_affinity_defer_child("auto_malformed", "not-a-real-mode", false);
     }
 
     /// M-based hybrid routing gate: with an otherwise-eligible int4 case
