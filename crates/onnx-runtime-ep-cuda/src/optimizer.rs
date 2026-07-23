@@ -799,6 +799,7 @@ struct SkipRmsNormPlan {
     skip_id: NodeId,
     preceding_id: NodeId,
     preceding_inputs: [ValueId; 3],
+    preceding_zero_points: Option<ValueId>,
     preceding_out: ValueId,
     residual: ValueId,
     gamma: ValueId,
@@ -905,13 +906,14 @@ impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
             }
 
             // 3. Rebuild the preceding GEMV with the residual folded into its
-            //    bias slot (post-round semantics), then drop the norm node.
+            //    bias slot (post-round semantics), preserving any asymmetric
+            //    zero point at slot 3, then drop the norm node.
             let mut preceding = graph.node(plan.preceding_id).clone();
             preceding.inputs = vec![
                 Some(plan.preceding_inputs[0]),
                 Some(plan.preceding_inputs[1]),
                 Some(plan.preceding_inputs[2]),
-                None,
+                plan.preceding_zero_points,
                 None,
                 Some(residual),
             ];
@@ -1014,6 +1016,10 @@ impl CudaSkipRmsNormMatMulFusion {
             preceding.inputs[1]?,
             preceding.inputs[2]?,
         ];
+        // Preserve an optional asymmetric zero point (slot 3) so the residual
+        // fold below does not silently drop it (Phi-4-mini's o_proj is int4 with
+        // an explicit zero point).
+        let preceding_zero_points = preceding.inputs.get(3).copied().flatten();
 
         // The normalized output must feed at least one, and only, prologue-capable
         // following GEMV(s).
@@ -1052,6 +1058,7 @@ impl CudaSkipRmsNormMatMulFusion {
             skip_id,
             preceding_id,
             preceding_inputs,
+            preceding_zero_points,
             preceding_out,
             residual,
             gamma,
@@ -1062,10 +1069,10 @@ impl CudaSkipRmsNormMatMulFusion {
         })
     }
 
-    /// A preceding GEMV is fusable when it is a plain int4/fp16 `MatMulNBits`
-    /// (no zero-points, group index or existing bias), its only consumer is the
-    /// norm, it is not a graph output, and its output width equals the hidden
-    /// size (so the residual add is well-shaped).
+    /// A preceding GEMV is fusable when it is an int4/fp16 `MatMulNBits` with an
+    /// optional asymmetric zero point (no group index or existing bias), its
+    /// only consumer is the norm, it is not a graph output, and its output width
+    /// equals the hidden size (so the residual add is well-shaped).
     fn preceding_gemv(&self, graph: &Graph, value: ValueId, norm_size: usize) -> Option<NodeId> {
         let producer = graph.try_value(value)?.producer?;
         let node = graph.try_node(producer)?;
@@ -1077,8 +1084,19 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return None;
         }
-        // Plain A/B/scales form only: no zero-points, group index, or bias.
-        if node.input_values().count() != 3 || node.inputs.iter().skip(3).any(Option::is_some) {
+        // A/B/scales with an optional asymmetric zero point (slot 3); no group
+        // index (slot 4) or pre-existing bias (slot 5), which the residual fold
+        // reuses.
+        let value_count = node.input_values().count();
+        if !(value_count == 3 || value_count == 4)
+            || node.inputs.iter().skip(4).any(Option::is_some)
+        {
+            return None;
+        }
+        // A present zero point (slot 3) must be uint8.
+        if let Some(zero_points) = node.inputs.get(3).copied().flatten()
+            && graph.try_value(zero_points).map(|value| value.dtype) != Some(DataType::Uint8)
+        {
             return None;
         }
         if !self.is_int4_fp16_matmul(graph, node) {
@@ -1118,11 +1136,14 @@ impl CudaSkipRmsNormMatMulFusion {
         };
         // A paired gate/up SwiGLU node (from CudaGateUpSwiGluFusion) folds the
         // fan-out-2 post-attention norm into a single kernel that reduces once
-        // for both projections. Its inputs are exactly [x, W_gate, scales_gate,
-        // W_up, scales_up]; the up scales at slot 4 are legitimate, so the plain
-        // zero-point/group-index slot checks below do not apply.
+        // for both projections. Its inputs are [x, W_gate, scales_gate, W_up,
+        // scales_up] for symmetric weights, or those five plus a reserved gamma
+        // slot and both projections' zero points for asymmetric weights; the up
+        // scales at slot 4 are legitimate, so the plain zero-point/group-index
+        // slot checks below do not apply.
         if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some() {
-            return node.input_values().count() == 5 && k <= n;
+            let value_count = node.input_values().count();
+            return (value_count == 5 || value_count == 7) && k <= n;
         }
         // No zero-points (slot 3), no group index (slot 4), no pre-existing
         // gamma (slot 6). An optional bias (slot 5) is allowed.
@@ -1249,14 +1270,17 @@ impl OptimizationPass for CudaSwiGluFusion {
 ///
 /// Runs *after* [`CudaSwiGluFusion`], so the trailing multiply is already the
 /// tagged two-input `Mul[_cuda_silu_mul](gate, up)`. When `gate` and `up` are
-/// each produced by a plain three-input `MatMulNBits` sharing the *same*
+/// each produced by a three- or four-input `MatMulNBits` sharing the *same*
 /// activation, structurally paired (`gate.N == up.N`, `gate.K == up.K`), and
 /// compatible with the paired kernel (block-32, 4-bit, fp16 activation/scales/
 /// output, persistent weights), the three ops collapse into a single node
 /// marked [`GATE_UP_SWIGLU_FUSION_ATTR`] whose inputs are
-/// `[x, W_gate, scales_gate, W_up, scales_up]`. The paired kernel reads the
-/// activation once, runs both GEMVs, and writes `silu(gate)*up` directly —
-/// reproducing the two-op fp16 rounding so greedy tokens stay byte-identical.
+/// `[x, W_gate, scales_gate, W_up, scales_up]` for symmetric weights, or those
+/// five plus a reserved gamma slot and both projections' asymmetric zero points
+/// (`[.., None, zp_gate, zp_up]`) for asymmetric weights. The paired kernel
+/// reads the activation once, runs both GEMVs (dequantizing `(code - zp) *
+/// scale`), and writes `silu(gate)*up` directly — reproducing the two-op fp16
+/// rounding so greedy tokens stay byte-identical.
 ///
 /// The gate is purely structural + capability: it detects the op/topology
 /// pattern and checks dtype/shape *compatibility*, never a specific model's
@@ -1273,8 +1297,10 @@ struct GateUpSwiGluPlan {
     activation: ValueId,
     gate_weight: ValueId,
     gate_scales: ValueId,
+    gate_zero_points: Option<ValueId>,
     up_weight: ValueId,
     up_scales: ValueId,
+    up_zero_points: Option<ValueId>,
     gate_out: ValueId,
     up_out: ValueId,
 }
@@ -1321,6 +1347,18 @@ impl OptimizationPass for CudaGateUpSwiGluFusion {
                 Some(plan.up_weight),
                 Some(plan.up_scales),
             ];
+            // Asymmetric weights carry per-projection zero points at slots 6/7.
+            // Slot 5 is reserved for the RMS-norm gamma that
+            // `CudaSkipRmsNormMatMulFusion` folds in later, so leave it empty
+            // (None) here; symmetric weights add no trailing slots at all and
+            // stay byte-identical to the pre-zero-point contract.
+            if let (Some(gate_zp), Some(up_zp)) =
+                (plan.gate_zero_points, plan.up_zero_points)
+            {
+                fused.inputs.push(None);
+                fused.inputs.push(Some(gate_zp));
+                fused.inputs.push(Some(up_zp));
+            }
             fused.outputs = graph.node(plan.mul_id).outputs.clone();
             fused
                 .attributes
@@ -1374,6 +1412,11 @@ impl CudaGateUpSwiGluFusion {
         if gate.activation != up.activation || gate.n != up.n || gate.k != up.k {
             return None;
         }
+        // Either both projections carry an asymmetric zero point or neither
+        // does: the fused kernel takes both zero-point tensors together.
+        if gate.zero_points.is_some() != up.zero_points.is_some() {
+            return None;
+        }
 
         Some(GateUpSwiGluPlan {
             mul_id,
@@ -1382,8 +1425,10 @@ impl CudaGateUpSwiGluFusion {
             activation: gate.activation,
             gate_weight: gate.weight,
             gate_scales: gate.scales,
+            gate_zero_points: gate.zero_points,
             up_weight: up.weight,
             up_scales: up.scales,
+            up_zero_points: up.zero_points,
             gate_out,
             up_out,
         })
@@ -1391,14 +1436,22 @@ impl CudaGateUpSwiGluFusion {
 
     /// Validate one projection `MatMulNBits` against the paired kernel's
     /// **capability** contract (not any model's dimensions) and return its
-    /// `[x, W, scales]` value ids plus its `N`/`K` for structural pairing.
+    /// `[x, W, scales, (zero_points?)]` value ids plus its `N`/`K` for
+    /// structural pairing.
     fn eligible_projection(&self, graph: &Graph, matmul_id: NodeId) -> Option<Projection> {
         let matmul = graph.try_node(matmul_id)?;
-        // Plain A/B/scales form only: no zero-points, group index, or bias.
+        // A/B/scales with an optional asymmetric zero-point (slot 3). The paired
+        // kernel dequantizes `(code - zp) * scale` per block, so a 4-input
+        // MatMulNBits (Phi-4-mini) fuses just like the 3-input symmetric form
+        // (Qwen); a symmetric weight simply omits the zero point. Reject group
+        // index (slot 4) and bias (slot 5), which the kernel does not model.
         let present: Vec<ValueId> = matmul.input_values().collect();
-        if present.len() != 3 || matmul.inputs.iter().skip(3).any(Option::is_some) {
+        if !(present.len() == 3 || present.len() == 4)
+            || matmul.inputs.iter().skip(4).any(Option::is_some)
+        {
             return None;
         }
+        let zero_points = matmul.inputs.get(3).copied().flatten();
 
         let n = matmul.attr("N").and_then(Attribute::as_int)? as usize;
         let k = matmul.attr("K").and_then(Attribute::as_int)? as usize;
@@ -1431,11 +1484,20 @@ impl CudaGateUpSwiGluFusion {
         if !graph.initializers.contains_key(&weight) || !graph.initializers.contains_key(&scales) {
             return None;
         }
+        // A persistent zero point (uint8 initializer) is required when present so
+        // the fused kernel's fixed device signature stays capture-safe.
+        if let Some(zero_points) = zero_points
+            && (graph.value(zero_points).dtype != DataType::Uint8
+                || !graph.initializers.contains_key(&zero_points))
+        {
+            return None;
+        }
 
         Some(Projection {
             activation,
             weight,
             scales,
+            zero_points,
             n,
             k,
         })
@@ -1452,6 +1514,7 @@ struct Projection {
     activation: ValueId,
     weight: ValueId,
     scales: ValueId,
+    zero_points: Option<ValueId>,
     n: usize,
     k: usize,
 }
