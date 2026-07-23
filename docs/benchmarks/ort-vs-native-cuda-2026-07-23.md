@@ -134,6 +134,67 @@ DeepSeek-Coder-1.3B measured **728.53 tok/s**; both retained one captured
 segment, coherent deterministic output, and zero fallbacks. Host load samples
 were 6.47--6.49, and physical GPU 5 remained exclusive.
 
+## Phi split-K + GQA stacked @ d8dd707 — 2026-07-23
+
+This milestone stacks asymmetric-zero-point split-K int4 GEMV (`caaf85a`) and
+occupancy-aware fp16 GQA decode (`d8dd707`) on the complete Phi fusion stack.
+Measurements used physical GPU 5 (NVIDIA H200), one warmup, 120-token steady
+windows after skipping the first eight emitted tokens, and CUDA graph/device-KV
+enabled.
+
+| Model | Native tok/s (median of 3–5) | ORT 0.14.1 tok/s | Delta | Coherent? | Segments / fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| Qwen2.5-0.5B int4 | 903.05 | 741.83 | **+21.73%** | Yes | 1 / 0 |
+| Qwen2.5-1.5B int4 | 622.20 | 487.14 | **+27.73%** | Deterministic; repetitive | 1 / 0 |
+| Qwen2.5-7B int4 | 295.32 | 267.23 | **+10.51%** | Yes | 1 / 0 |
+| DeepSeek-Coder-1.3B int4 | 792.85 | 646.88 | **+22.57%** | Yes; coherent code | 1 / 0 |
+| GLM-4-9B GPTQ int4 | 118.85 | **Cannot load** | N/A | Yes | 1 / 0 |
+| Phi-4-mini int4/int8 | **184.27** | 229.62 | **-19.75%** | Yes | 3 / 0 |
+
+Phi samples were 178.23/184.27/184.38/184.00/184.49 tok/s. The first run was
+an obvious low warm-state outlier, but the five-run median is unaffected. The
+new result is **+7.66%** over the prior 171.16 tok/s milestone and compresses
+the ORT gap from -25.46% to **-19.75%**. Phi retains three captured segments
+around its `Greater` and `If` seams, with zero fallbacks.
+
+Qwen samples were 903.13/902.71/903.05, 622.32/621.95/622.20, and
+295.32/295.47/294.97 tok/s. DeepSeek-Coder samples were
+790.55/792.91/792.85 tok/s. The current GLM-4 regression guard measured
+120.93/120.94/120.96 tok/s (median 120.94), consistent with its authoritative
+118.85 tok/s row. Every guard retained one captured segment and zero
+fallbacks. Host load averages ranged from 0.88 to 3.44, and physical GPU 5
+remained exclusive.
+
+### Phi full-fusion A/B
+
+Fusion ON is **184.27 tok/s** versus **167.64 tok/s** with
+`ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION=1`, an exact **+9.92%** current-stack
+gain. Both paths produced coherent greedy output.
+
+### Nsight Systems captured-decode profile
+
+`nsys profile --cuda-graph-trace=node` over a 128-token Phi run exposed the
+captured graph-node kernels. Percentages below use only kernels with a CUDA
+graph node ID, excluding prefill:
+
+| Kernel | Captured-decode GPU kernel time |
+|---|---:|
+| fused gate-up/SwiGLU/RMSNorm zero-point int4 GEMV | **33.3%** |
+| fused int8 GEMV + RMSNorm | **19.4%** |
+| remaining standalone int8 GEMV | **13.9%** |
+| split-K zero-point int4 GEMV | **12.1%** |
+| GQA attention + merge + prep | **13.1%** |
+| zero-point int4 GEMV + RMSNorm | **7.4%** |
+| miscellaneous captured kernels | **0.7%** |
+
+The split-K kernel averages **8.11 us**. The occupancy-aware GQA attention core
+averages **5.89 us**, but merge (**4.63 us**) and prep (**2.65 us**) leave the
+aggregate GQA share at 13.1%. The fused gate-up/SwiGLU/RMSNorm kernel is now
+the clear single-kernel leader at 33.3%; all int4 variants total **52.8%**.
+Because that gate-up grid is not occupancy-starved, the next lever should
+target its dequantization/GEMV efficiency rather than applying split-K
+mechanically. Fusing or reducing GQA prep+merge is a secondary, bounded lever.
+
 ## f0af865 baseline
 
 | Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 | Smoothness |
