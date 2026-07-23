@@ -233,6 +233,11 @@ The full source notes for this reconciliation are preserved in `2026-07-23T00-00
 **What:** Before the device-select landing, fixed main at `719d2fe` still spent 1.935 ms/token in the eager LongRoPE `If`, versus 2.948 ms in GPU kernels, making the host branch the primary remaining lever. After `97c1a56`, four accepted nine-run measurements on idle GPU 3 established a 321.98 tok/s Phi median: +40.22% versus canonical ORT and +57.2% versus the session's `origin/main` baseline; two nondeterministic shared-host launches were excluded by the harness.
 **Why:** The profile correctly prioritized de-hosting control flow over GEMV tuning, while the independent result establishes the real-weight score with an explicit shared-host caveat.
 
+### Retain the pre-de-hosting cumulative Phi frontier as historical context
+**By:** Marsten
+**What:** At `4e774ee`, after fused gate/up int4 prefetch and standalone int8 zero-point split-K, Phi reached a 193.32 tok/s seven-run median with a 121.21–194.67 tok/s shared-host spread and zero fallbacks. Qwen2.5-1.5B and DeepSeek-R1-Distill-Qwen-1.5B remained within noise at 617.90 and 622.66 tok/s.
+**Why:** The result records the validated GEMV frontier and its contention caveat; it must not be confused with the subsequent, much larger LongRoPE seam elimination.
+
 ### Declare native CUDA faster than ORT on all available real-weight models
 **By:** Marsten and Deckard
 **What:** The authoritative real-weight scoreboard is Qwen2.5 0.5B +62.7%, 1.5B +36.8%, 7B +10.8%, and Phi-4-mini +40.2% versus ORT after LongRoPE de-hosting. The previous Phi reference was 193.89 versus 229.62 tok/s; the on-device select removes that deficit.
