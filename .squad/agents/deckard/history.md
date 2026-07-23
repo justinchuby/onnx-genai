@@ -88,3 +88,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default classification but was superseded by Sapper's v3 raw signature fix.
+
+- 2026-07-23: Authored Phi int8 fused norm work (`c644b0f`, +13% Phi) and root-caused/fixed the real Qwen int4 fused-GEMV regression with `12efc92` (`HasZp` specialization), merged to main.

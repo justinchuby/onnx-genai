@@ -109,3 +109,5 @@ Recorded the integration rejection and subsequent approval after dependency meta
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Chew's rejection of loader-IR shape authority directly informed the final Sapper WP-B3 v3 fix.
+
+- 2026-07-23: Reviewed Qwen int4 regression fix `12efc92` 🟢; verified 190/0 CUDA lib tests and clean clippy with correct symmetric/asymmetric `HasZp` routing.
