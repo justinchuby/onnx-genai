@@ -460,9 +460,37 @@ pub fn sqnbit_gemm(
     c: &mut [f32],
     multithread: bool,
 ) {
+    let n = packed.n;
+    assert_eq!(c.len(), m * n, "C must be m*n");
+    // Contiguous output: leading dimension equals the packed weight's N.
+    // SAFETY: `c` is `m * n` contiguous f32s, so writing `m` rows of `n`
+    // columns at stride `n` stays in bounds.
+    unsafe { sqnbit_gemm_into(packed, m, a, bias, c.as_mut_ptr(), n, multithread) };
+}
+
+/// Compute one N-shard of `C = A * dequant(packed) + bias` into a caller-owned
+/// output whose leading dimension is `ldc` (columns per row), writing this
+/// shard's `packed.n` columns starting at `c` for each of the `m` rows. This
+/// lets a weight partitioned along N (e.g. one shard per decode worker) write
+/// its columns into a shared `[m, ldc]` output without a scatter copy; for a
+/// single full-width shard `ldc == packed.n` and it matches [`sqnbit_gemm`].
+///
+/// # Safety
+/// `c` must point at a valid f32 region covering `(m - 1) * ldc + packed.n`
+/// elements (the last row needs `packed.n` columns), `ldc >= packed.n`, and no
+/// other thread may write the same `[row, col]` cells concurrently.
+pub unsafe fn sqnbit_gemm_into(
+    packed: &SQNBitPackedB,
+    m: usize,
+    a: &[f32],
+    bias: Option<&[f32]>,
+    c: *mut f32,
+    ldc: usize,
+    multithread: bool,
+) {
     let (k, n) = (packed.k, packed.n);
     assert_eq!(a.len(), m * k, "A must be m*k");
-    assert_eq!(c.len(), m * n, "C must be m*n");
+    assert!(ldc >= n, "ldc must be >= packed N");
     if let Some(bias) = bias {
         assert_eq!(bias.len(), n, "bias must be length n");
     }
@@ -510,8 +538,8 @@ pub fn sqnbit_gemm(
             packed.has_zp as c_int,
             zp_ptr,
             bias_ptr,
-            c.as_mut_ptr(),
-            n,
+            c,
+            ldc,
             ws_ptr,
             multithread as c_int,
         );
@@ -958,6 +986,113 @@ mod tests {
             }
         }
         check_sqnbit(SQNBitComputeType::Fp32, 4, 128, 512, 32, false, true);
+    }
+
+    /// N-sharding parity: splitting the weight into contiguous output-column
+    /// shards and running each through [`sqnbit_gemm_into`] (writing its columns
+    /// into a shared `[m, n]` output at stride `n`) reproduces the full-width
+    /// [`sqnbit_gemm`] result. Each output column is a GEMV over K independent of
+    /// the other columns, so partitioning N cannot change the arithmetic
+    /// *modulo* MLAS's own SIMD column-tiling: the fp32 kernel processes columns
+    /// in fixed-width tiles, so a shard boundary that falls mid-tile can reorder
+    /// a block-sum reduction and shift a result by ~1 ULP. The tolerance is a few
+    /// ULP (much tighter than the `2e-2` dequant-reference tolerance), which is
+    /// the invariant the ep-cpu decode path relies on when it fans a projection's
+    /// N-shards across the persistent decode workers (verified byte-identical
+    /// end-to-end over 128 greedy tokens on Qwen2.5-0.5B).
+    #[test]
+    fn sqnbit_int4_n_shards_match_full() {
+        let (n, k, block_size) = (96usize, 256usize, 32usize);
+        for &m in &[1usize, 5] {
+            for &asym in &[false, true] {
+                for &with_bias in &[false, true] {
+                    let weights: Vec<f32> =
+                        (0..n * k).map(|i| (i as f32 * 0.017 + 0.3).sin()).collect();
+                    let (packed_b, scales, zps, _) =
+                        quantize_int4(&weights, n, k, block_size, asym);
+                    let a: Vec<f32> = (0..m * k)
+                        .map(|i| ((i as f32 * 0.011 + 0.7).cos()) * 0.5)
+                        .collect();
+                    let bias: Option<Vec<f32>> =
+                        with_bias.then(|| (0..n).map(|i| (i as f32 * 0.03).sin()).collect());
+
+                    let full = match SQNBitPackedB::new(
+                        n,
+                        k,
+                        4,
+                        block_size,
+                        SQNBitComputeType::Fp32,
+                        &packed_b,
+                        &scales,
+                        zps.as_deref(),
+                    ) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("SQNBit blk={block_size} unavailable; skipping");
+                            return;
+                        }
+                    };
+                    let mut c_full = vec![0.0f32; m * n];
+                    sqnbit_gemm(&full, m, &a, bias.as_deref(), &mut c_full, true);
+
+                    let blocks = k.div_ceil(block_size);
+                    let blob = block_size / 2;
+                    let zp_row = blocks.div_ceil(2);
+                    // Deliberately uneven contiguous shards, like the decode
+                    // pool's per-worker segments.
+                    let shards: &[(usize, usize)] = &[(0, 17), (17, 30), (47, 1), (48, 48)];
+                    // multithread=false mirrors the per-worker SPMD dispatch;
+                    // multithread=true mirrors the prefill shard loop.
+                    for &mt in &[false, true] {
+                        let mut c_shard = vec![0.0f32; m * n];
+                        for &(start, len) in shards {
+                            let pb =
+                                &packed_b[start * blocks * blob..(start + len) * blocks * blob];
+                            let sc = &scales[start * blocks..(start + len) * blocks];
+                            let zp = zps
+                                .as_deref()
+                                .map(|z| &z[start * zp_row..(start + len) * zp_row]);
+                            let packed = SQNBitPackedB::new(
+                                len,
+                                k,
+                                4,
+                                block_size,
+                                SQNBitComputeType::Fp32,
+                                pb,
+                                sc,
+                                zp,
+                            )
+                            .expect("shard packs when the full weight packs");
+                            let bias_shard = bias.as_deref().map(|b| &b[start..start + len]);
+                            // SAFETY: shards own disjoint contiguous column ranges
+                            // of the [m, n] output; `start + len <= n`.
+                            unsafe {
+                                sqnbit_gemm_into(
+                                    &packed,
+                                    m,
+                                    &a,
+                                    bias_shard,
+                                    c_shard.as_mut_ptr().add(start),
+                                    n,
+                                    mt,
+                                );
+                            }
+                        }
+                        // A few ULP at magnitude ~60 is ~2.5e-4; 1e-3 covers the
+                        // worst-case tiling reorder with margin while still being
+                        // ~20x tighter than the dequant-reference tolerance.
+                        assert_close(
+                            &c_shard,
+                            &c_full,
+                            1e-3,
+                            &format!(
+                                "N-sharded (multithread={mt}) vs full: m{m} asym{asym} bias{with_bias}"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

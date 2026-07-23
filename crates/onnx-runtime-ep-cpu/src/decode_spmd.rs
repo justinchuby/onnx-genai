@@ -400,6 +400,47 @@ impl SpmdDecodePools {
         self.dispatch_rows_across_workers(result, &compute);
     }
 
+    /// Public view of the contiguous `(start, len)` output-column segment each
+    /// global worker owns when a length-`n` GEMV output is sharded across the
+    /// pool. Callers that pre-partition a weight along N (e.g. one MLAS SQNBit
+    /// packed shard per worker) use this to build shards that line up exactly
+    /// with [`Self::dispatch_output_rows_indexed`].
+    pub fn output_column_segments(&self, n: usize) -> Vec<(usize, usize)> {
+        self.worker_row_segments(n)
+    }
+
+    /// Like [`Self::dispatch_output_rows`], but hands each worker its global
+    /// index alongside its output slice and always dispatches across the pool
+    /// (no serial-threshold short-circuit), so a caller can select the matching
+    /// pre-partitioned weight shard (`compute(global_index, output_start,
+    /// outputs)`). `result.len()` must equal `n` passed to
+    /// [`Self::output_column_segments`]; each worker writes only its own segment,
+    /// so the concatenated result is bit-identical to the single-worker path.
+    pub fn dispatch_output_rows_indexed<F>(&self, result: &mut [f32], compute: &F)
+    where
+        F: Fn(usize, usize, &mut [f32]) + Sync,
+    {
+        let n = result.len();
+        let segments = self.worker_row_segments(n);
+        let table = RowTable {
+            base: result.as_mut_ptr(),
+            segments: &segments,
+        };
+        let table = &table;
+        let job = move |global_index: usize| {
+            let (start, len) = table.segments[global_index];
+            if len == 0 {
+                return;
+            }
+            // SAFETY: `worker_row_segments` produces disjoint, in-bounds column
+            // ranges covering `0..n` exactly once, so each worker's slice never
+            // aliases another's.
+            let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+            compute(global_index, start, outputs);
+        };
+        self.dispatch(&job);
+    }
+
     /// Shard `result`'s `num_rows` fixed-width rows (each `row_len` elements)
     /// across the resident workers and run `compute(row_index, row_slice)` on
     /// each whole row under one lightweight barrier.

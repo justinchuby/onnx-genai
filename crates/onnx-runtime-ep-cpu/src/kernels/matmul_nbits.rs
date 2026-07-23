@@ -24,6 +24,76 @@ use super::{check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
+/// Temporary, opt-in per-phase timers for the f16-activation MatMulNBits decode
+/// path, gated by `ONNX_GENAI_PROFILE_MM=1`. Zero-cost when unset (one cached
+/// bool load, no `Instant::now`). Splits a MatMulNBits call into: activation
+/// widen (f16->f32), the MLAS SQNBit GEMV, and output narrow (f32->f16), so the
+/// int4 GEMV cost can be separated from the per-op activation conversion.
+mod mm_profile {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    static WIDEN_NS: AtomicU64 = AtomicU64::new(0);
+    static GEMV_NS: AtomicU64 = AtomicU64::new(0);
+    static NARROW_NS: AtomicU64 = AtomicU64::new(0);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ONNX_GENAI_PROFILE_MM").is_ok_and(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+        })
+    }
+
+    /// Time `f`, adding the elapsed nanoseconds to `bucket` when profiling is on.
+    #[inline]
+    fn timed<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let start = Instant::now();
+        let out = f();
+        bucket.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        out
+    }
+
+    pub fn time_widen<T>(f: impl FnOnce() -> T) -> T {
+        timed(&WIDEN_NS, f)
+    }
+    pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
+        timed(&GEMV_NS, f)
+    }
+    pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
+        timed(&NARROW_NS, f)
+    }
+
+    /// Record one MatMulNBits call and, every 512 calls, emit the running split
+    /// to stderr so the harness can tail the final line.
+    pub fn tick() {
+        if !enabled() {
+            return;
+        }
+        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls.is_multiple_of(512) {
+            let widen = WIDEN_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            let gemv = GEMV_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            let narrow = NARROW_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            let total = widen + gemv + narrow;
+            eprintln!(
+                "[mm_profile] calls={calls} total={total:.1}ms widen={widen:.1}ms \
+                 ({wp:.1}%) gemv={gemv:.1}ms ({gp:.1}%) narrow={narrow:.1}ms ({np:.1}%)",
+                wp = 100.0 * widen / total,
+                gp = 100.0 * gemv / total,
+                np = 100.0 * narrow / total,
+            );
+        }
+    }
+}
+
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
@@ -66,6 +136,24 @@ const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 #[cfg(feature = "mlas")]
 static SQNBIT_DECODE_MIN: OnceLock<usize> = OnceLock::new();
 
+/// Escape hatch: set `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` to force the MLAS
+/// SQNBit decode GEMV back to a single full-width `multithread=true` call
+/// instead of the per-N-shard, per-worker decode-pool dispatch. MLAS's SIMD
+/// column-tiling is not bit-stable across N-partition boundaries (results can
+/// differ by ~1 ULP), so this restores byte-for-byte the pre-sharding output
+/// for A/B parity checks. Off by default (the sharded path is far faster under
+/// the persistent decode pool). Parsed once.
+#[cfg(feature = "mlas")]
+fn mlas_no_shard() -> bool {
+    static NO_SHARD: OnceLock<bool> = OnceLock::new();
+    *NO_SHARD.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
 /// Smallest `m` (batch·seq row count) that routes int4 MatMulNBits to MLAS
 /// SQNBit; smaller `m` uses the hand int4/int8 decode path. Parsed once from
 /// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`default_sqnbit_decode_min`].
@@ -99,7 +187,17 @@ pub struct MatMulNBitsKernel {
     int8_weight: OnceLock<Int8Weight>,
     packed_int4_weight: OnceLock<PackedInt4Weight>,
     #[cfg(feature = "mlas")]
-    mlas_packed: OnceLock<Option<mlas_sys::SQNBitPackedB>>,
+    mlas_shards: OnceLock<Option<Vec<Option<MlasShard>>>>,
+}
+
+/// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
+/// `start .. start + len` of the `[m, N]` output, prepacked so a single decode
+/// worker can compute them independently of the other shards.
+#[cfg(feature = "mlas")]
+struct MlasShard {
+    start: usize,
+    len: usize,
+    packed: mlas_sys::SQNBitPackedB,
 }
 
 struct Int8Weight {
@@ -156,7 +254,7 @@ impl KernelFactory for MatMulNBitsFactory {
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
-            mlas_packed: OnceLock::new(),
+            mlas_shards: OnceLock::new(),
         }))
     }
 }
@@ -226,7 +324,7 @@ impl Kernel for MatMulNBitsKernel {
             && self.constant_inputs[2]
             && zero_points.is_none_or(|_| self.constant_inputs[3])
             && group_indices.is_none_or(|_| self.constant_inputs[4]);
-        let activations = to_dense_compute_f32(&inputs[0])?;
+        let activations = mm_profile::time_widen(|| to_dense_compute_f32(&inputs[0]))?;
         let m = numel(&a_shape[..a_shape.len() - 1]);
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
@@ -253,7 +351,9 @@ impl Kernel for MatMulNBitsKernel {
                 bias.as_deref(),
                 &mut result,
             )? {
-                return write_compute_f32(&mut outputs[0], &result);
+                let out = mm_profile::time_narrow(|| write_compute_f32(&mut outputs[0], &result));
+                mm_profile::tick();
+                return out;
             }
         }
         if self.bits == 4
@@ -468,29 +568,168 @@ impl MatMulNBitsKernel {
             mlas_sys::SQNBitComputeType::Fp32
         };
 
-        let owned;
-        let packed_ref: Option<&mlas_sys::SQNBitPackedB> = if can_prepack {
-            if let Some(cached) = self.mlas_packed.get() {
-                cached.as_ref()
+        // Constant weights (the decode hot path) are packed once into per-N-shard
+        // MLAS weights and cached. This lets each M=1 decode projection fan its
+        // output columns across the *persistent SPMD decode workers* (each worker
+        // runs its shard's GEMV serially), instead of one `multithread=true` call
+        // that forks MLAS across the global Rayon pool -- which, under the
+        // default persistent decode pool, oversubscribes the machine against the
+        // pool's resident spinning workers and collapses f16 decode (measured
+        // 6->28 tok/s on Qwen2.5-0.5B, Xeon 8480C). Non-constant weights keep the
+        // single owned `multithread=true` path (they are never the decode hot
+        // path and re-sharding per call is not worth it). The `NO_SHARD` escape
+        // hatch forces that single full-width call too: MLAS's SIMD column-tiling
+        // is not bit-stable across N-partition boundaries (it can differ by ~1
+        // ULP), so this hatch restores byte-for-byte the pre-sharding output for
+        // A/B parity checks or a host where the reordering ever matters.
+        if can_prepack && !mlas_no_shard() {
+            let shards = if let Some(shards) = self.mlas_shards.get() {
+                shards
             } else {
-                let built = self.build_mlas_packed(packed, scales, zero_points, comp)?;
-                let _ = self.mlas_packed.set(built);
-                self.mlas_packed
+                let built = self.build_mlas_shards(packed, scales, zero_points, comp)?;
+                let _ = self.mlas_shards.set(built);
+                self.mlas_shards
                     .get()
-                    .expect("constant MatMulNBits MLAS weight was just initialized")
-                    .as_ref()
-            }
-        } else {
-            owned = self.build_mlas_packed(packed, scales, zero_points, comp)?;
-            owned.as_ref()
-        };
+                    .expect("constant MatMulNBits MLAS shards were just initialized")
+            };
+            let Some(shards) = shards.as_ref() else {
+                return Ok(None);
+            };
+            mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
+            return Ok(Some(()));
+        }
 
-        let Some(packed_weight) = packed_ref else {
+        let owned = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+        let Some(packed_weight) = owned.as_ref() else {
             return Ok(None);
         };
-
-        mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true);
+        mm_profile::time_gemv(|| {
+            mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
+        });
         Ok(Some(()))
+    }
+
+    /// Run a pre-partitioned MLAS SQNBit GEMV (`self.n` split into contiguous
+    /// output-column shards, one per decode worker).
+    ///
+    /// * `m == 1` under an active persistent SPMD decode scope: broadcast the
+    ///   shards to the resident workers under one barrier -- each worker runs its
+    ///   own shard's GEMV serially (`multithread=false`), so the whole projection
+    ///   stays on the hot decode pool with no global-Rayon fork.
+    /// * Otherwise (prefill `m > 1`, or decode with no SPMD scope): run each shard
+    ///   with MLAS's own tile parallelism (`multithread=true`) writing its columns
+    ///   into the shared `[m, n]` output at stride `self.n`. With a single
+    ///   full-width shard (no SPMD pool) this is exactly the previous one-call
+    ///   `multithread=true` behaviour.
+    ///
+    /// Row-major N-partitioning computes each output column independently of the
+    /// others, so the concatenated result is bit-identical to a single full-width
+    /// GEMV regardless of how N is split or how many workers run it.
+    #[cfg(feature = "mlas")]
+    fn run_mlas_shards(
+        &self,
+        shards: &[Option<MlasShard>],
+        activations: &[f32],
+        m: usize,
+        bias: Option<&[f32]>,
+        result: &mut [f32],
+    ) {
+        if let Some(spmd) = (m == 1).then(spmd_decode_active).flatten() {
+            spmd.dispatch_output_rows_indexed(result, &|global_index, start, outputs| {
+                let Some(shard) = shards.get(global_index).and_then(Option::as_ref) else {
+                    return;
+                };
+                debug_assert_eq!(shard.start, start);
+                debug_assert_eq!(shard.len, outputs.len());
+                let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
+                // m == 1: `outputs` is this shard's contiguous output row.
+                mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
+            });
+            return;
+        }
+        // Prefill or no active decode scope: each shard writes its columns into
+        // the shared [m, n] output at leading dimension `self.n`, using MLAS's
+        // own tile parallelism.
+        let base = result.as_mut_ptr();
+        for shard in shards.iter().flatten() {
+            let bias = bias.map(|bias| &bias[shard.start..shard.start + shard.len]);
+            // SAFETY: shards own disjoint contiguous column ranges of a single
+            // [m, self.n] row-major output; `base.add(shard.start)` is the first
+            // element of this shard's columns and `(m - 1) * self.n + shard.len`
+            // stays within `result` (shard.start + shard.len <= self.n).
+            unsafe {
+                mlas_sys::sqnbit_gemm_into(
+                    &shard.packed,
+                    m,
+                    activations,
+                    bias,
+                    base.add(shard.start),
+                    self.n,
+                    true,
+                );
+            }
+        }
+    }
+
+    /// The contiguous output-column shards `self.n` is split into for the MLAS
+    /// SQNBit decode path: one per persistent SPMD decode worker (so decode can
+    /// dispatch a shard to each resident worker), or a single full-width shard
+    /// when no persistent pool exists (preserving the one-call behaviour).
+    #[cfg(feature = "mlas")]
+    fn mlas_shard_segments(&self) -> Vec<(usize, usize)> {
+        match crate::decode_spmd::pools() {
+            Some(spmd) => spmd.output_column_segments(self.n),
+            None => vec![(0, self.n)],
+        }
+    }
+
+    /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
+    /// [`Self::mlas_shard_segments`]. Returns `Ok(None)` when MLAS has no kernel
+    /// for this `(bits, block_size, compute_type)` on the host (any shard failing
+    /// to pack), so the caller falls back to a hand path. Empty segments (when
+    /// `N` is smaller than the worker count) map to `None` entries.
+    #[cfg(feature = "mlas")]
+    fn build_mlas_shards(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        comp: mlas_sys::SQNBitComputeType,
+    ) -> Result<Option<Vec<Option<MlasShard>>>> {
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_compute_f32(scales)?;
+        let zero_points = zero_points.map(to_dense_bytes).transpose()?;
+
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size * self.bits / 8;
+        let zp_blob_size = (k_blocks * self.bits).div_ceil(8);
+
+        let mut shards = Vec::new();
+        for (start, len) in self.mlas_shard_segments() {
+            if len == 0 {
+                shards.push(None);
+                continue;
+            }
+            let packed_shard = &packed[start * k_blocks * blob_size..(start + len) * k_blocks * blob_size];
+            let scales_shard = &scales[start * k_blocks..(start + len) * k_blocks];
+            let zero_points_shard = zero_points
+                .as_ref()
+                .map(|zp| &zp[start * zp_blob_size..(start + len) * zp_blob_size]);
+            match mlas_sys::SQNBitPackedB::new(
+                len,
+                self.k,
+                self.bits,
+                self.block_size,
+                comp,
+                packed_shard,
+                scales_shard,
+                zero_points_shard,
+            ) {
+                Some(packed) => shards.push(Some(MlasShard { start, len, packed })),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(shards))
     }
 
     /// Pack the constant int4 weight into MLAS's SQNBit layout, or `None` when
@@ -1844,7 +2083,7 @@ mod tests {
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
-            mlas_packed: OnceLock::new(),
+            mlas_shards: OnceLock::new(),
         }
     }
 
@@ -1857,7 +2096,7 @@ mod tests {
 
     /// Address of whichever prepack reuse cache the routed path populated, or
     /// `None` if none is populated yet. Which cache is filled depends on the
-    /// route: MLAS SQNBit (`mlas_packed`) for `accuracy_level != 4` when the MLAS
+    /// route: MLAS SQNBit (`mlas_shards`) for `accuracy_level != 4` when the MLAS
     /// kernel is available, otherwise the hand GEMV/int8 caches. Returning a raw
     /// address lets tests assert the cache is *reused* (stable) across calls, not
     /// merely populated. The address is stable because every cache is a
@@ -1873,7 +2112,7 @@ mod tests {
             return Some(w as *const _ as *const ());
         }
         #[cfg(feature = "mlas")]
-        if let Some(w) = kernel.mlas_packed.get() {
+        if let Some(w) = kernel.mlas_shards.get() {
             return Some(w as *const _ as *const ());
         }
         None
