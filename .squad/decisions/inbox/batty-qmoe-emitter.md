@@ -1,33 +1,28 @@
 # Batty: expert-major int4 QMoE emitter
 
-**Status:** Implemented on Mobius PR [#424](https://github.com/onnxruntime/mobius/pull/424), commit `7e82326`.
+**Status:** Implemented on Mobius PR [#404](https://github.com/onnxruntime/mobius/pull/404), commit `751645b`.
 
 ## Design and ABI packing
 
-- Mobius now emits one `com.microsoft::QMoE` for GPTQ/AWQ int4 routed MoE layers whose gate exposes full routing scores (`mobius/components/_moe.py:244-359`).
-- FC1 is the checkpoint's chunked `gate_up_proj`, packed expert-major as `[E, 2I, H/2]`; `swiglu_fusion=2` tells the native kernel that gate rows precede up rows.
-- FC2 is packed expert-major as `[E, H, I/2]`.
-- Scales are float32 `[E, out, in/block_size]`; asymmetric zero-points are uint8 `[E, out, ceil(blocks/2)]`. Mobius preserves scale dtype through model casting because native CUDA requires float32 scales and routing tensors (`qmoe.rs:836,959,1076-1077`).
-- GPTQ/AWQ preprocessing now preserves the leading expert axis and flattens MatMulNBits `[blocks, blob]` into QMoE's packed input dimension (`mobius/_weight_utils.py:557-628`).
-- The explicit router remains in ONNX. DeepSeek passes selection scores separately from aggregation scores through QMoE input 14; routed scaling is applied after QMoE (`mobius/models/deepseek.py:80-130`).
-- DeepSeek's two shared experts remain outside QMoE as an always-on dense gated int4 MLP (`mobius/models/deepseek.py:271-312`).
+- `FusedQuantizedMoE` emits one `com.microsoft::QMoE` per routed MoE layer.
+- The packer accepts fused 3-D GPTQ/AWQ checkpoint tensors and already-repacked per-expert GGUF/MatMulNBits tensors.
+- FC1 is expert-major `[E, 2I, packed_H]`; chunked checkpoint gate/up rows are converted to interleaved `[g0,u0,g1,u1,...]` for `swiglu_fusion=1`.
+- FC2 is expert-major `[E, H, packed_I]`.
+- Scales are `[E, out, blocks]` and cast to float32 at the QMoE boundary.
+- Asymmetric quantization is supported: packed FC1/FC2 zero-points are declared and wired through QMoE inputs 11/12. Symmetric quantization uses the implicit midpoint.
+- The explicit router and input-14 aggregation weights are preserved. Shared experts remain separate dense quantized gated MLPs.
 
-## Structural result
+## GGUF correction
 
-DeepSeek-V2-Lite with an injected GPTQ int4/block-128 config:
+The per-expert direct-repack path now verifies that the repacked tensor's zero-point presence matches the target symmetric/asymmetric graph. A mismatch forces dequantization and requantization, preventing missing or semantically incompatible zero-point initializers.
 
-- Before: 5,208 `MatMul` nodes in the weightless float graph, including 192 routed-expert MatMuls per MoE layer.
-- After: 26 `QMoE`, 27 standard `Attention`, 0 `GroupQueryAttention`, 27 plain `MatMul` (routers/final projection), and 189 `MatMulNBits`.
-- Every one of the 26 MoE layers has exactly one QMoE and three shared-expert `MatMulNBits`; no `.moe.experts.*` per-expert expansion remains (`_group_query_attention_test.py:240-295`).
+## Validation
 
-## Differential and regression validation
-
-- Synthetic 64-expert/top-6 GPTQ pack-and-compute differential matches the existing static loop-over-experts reference at `atol=rtol=1e-5` (`components/_moe_test.py:165-236`).
-- Expert-major GPTQ preprocessing shape coverage: 64 experts, including packed zero-points (`_weight_utils_test.py:513-550`).
-- Targeted Mobius suite: **150 passed**.
-- Full GQA rewrite suite: **24 passed**, preserving Qwen/Phi/GLM behavior.
-- Ruff and `git diff --check`: clean.
+- DeepSeek-V2-Lite weightless int4 graph: 26 `QMoE`, 27 standard `Attention`, 0 `GroupQueryAttention`, 27 plain `MatMul`, and 189 `MatMulNBits`.
+- Synthetic 64-expert/top-6 differential matches the static per-expert reference at `atol=rtol=1e-5`.
+- Fused GPTQ layout, asymmetric zero-point wiring, shared-expert retention, and GGUF zero-point mismatch tests pass.
+- Targeted Mobius suite: **46 passed**; Ruff and `git diff --check` clean.
 
 ## Remaining follow-up
 
-Run a full weighted DeepSeek-V2-Lite int4 export and native-CUDA generation smoke. This change validates the graph and packing contract structurally and differentially; it intentionally does not download or generate the production-size artifact.
+Run a full weighted DeepSeek-V2-Lite int4 export and native-CUDA generation smoke.
