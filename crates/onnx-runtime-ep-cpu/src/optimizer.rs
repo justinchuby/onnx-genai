@@ -49,6 +49,11 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     // affine transform back into the Conv weight/bias and folds a trailing Relu
     // into the Conv activation epilogue, eliminating standalone BN/Relu kernels.
     passes.push(Box::new(ConvBatchNormActivationFusion::new()));
+    // Always-on NCHWc layout propagation: keeps CNN backbones in the MLAS
+    // channels-blocked layout end-to-end so per-Conv NCHW<->NCHWc reorders are
+    // eliminated (mirrors ORT's NchwcTransformer). Runs after BN/Relu folding so
+    // interior activations are already fused where possible.
+    passes.push(Box::new(crate::nchwc_layout::NchwcLayoutPropagation::new()));
     passes
 }
 

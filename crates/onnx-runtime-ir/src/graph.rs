@@ -728,7 +728,10 @@ impl Graph {
 
     /// Delete `value` if it has no producer, no consumers, and is not part of
     /// the graph's I/O or initializers.
-    fn gc_value_if_orphan(&mut self, value: ValueId) {
+    ///
+    /// Clears the value's entries in the unknown-type/shape sets so a later
+    /// arena slot reuse does not inherit stale "unknown" flags.
+    pub fn gc_value_if_orphan(&mut self, value: ValueId) {
         let orphan = match self.values.get(value) {
             Some(v) => {
                 v.producer.is_none()
