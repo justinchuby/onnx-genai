@@ -428,6 +428,30 @@ fn run_gpu_with_prefill_min_tokens(
             ep.device_id(),
         )],
     )?;
+    assert!(
+        kernel.capture_support().is_supported(),
+        "successful eager QMoE execution must warm its capture workspace"
+    );
+    runtime.begin_graph_capture(&[kernel.as_ref()])?;
+    if let Err(error) = kernel.execute(
+        &views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            dtype,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )],
+    ) {
+        let _ = runtime.abort_graph_capture();
+        return Err(error);
+    }
+    runtime.end_graph_capture()?;
+    // SAFETY: the output allocation is exactly `output_bytes` bytes.
+    unsafe { runtime.htod(&vec![0u8; output_bytes], cuptr(output_buffer.as_ptr()))? };
+    runtime.replay_graph()?;
+    runtime.synchronize()?;
+    runtime.reset_graph()?;
     let mut bytes = vec![0u8; output_bytes];
     // SAFETY: output allocation contains exactly the requested output tensor.
     unsafe { runtime.dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))? };
