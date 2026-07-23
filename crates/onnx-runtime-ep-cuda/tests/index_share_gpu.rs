@@ -507,6 +507,40 @@ fn int32_indices_and_broadcast_bias_match_cpu() {
     eprintln!("int32_broadcast_bias: Y max|Δ|={delta}");
 }
 
+/// Rank-0 (scalar) `attention_bias`: the CPU oracle accepts it (broadcasts the
+/// single value everywhere), so the CUDA kernel must too. Guards against the
+/// claim-then-fail divergence where the gate (delegating to the CPU oracle)
+/// claims a scalar-bias node but the kernel rejects rank 0 at execution.
+#[test]
+fn scalar_bias_broadcasts_and_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    let case = Case {
+        q_heads: 2,
+        kv_heads: 2,
+        q_seq: 1,
+        head_size: 3,
+        total_seq: 5,
+        scale: 0.4,
+    };
+    let q = HostTensor::f32(&[1, 2, 1, 3], &sequence(6, -0.25));
+    let k = HostTensor::f32(&[1, 2, 5, 3], &sequence(30, 0.125));
+    let v = HostTensor::f32(&[1, 2, 5, 3], &sequence(30, -1.0));
+    let indices = HostTensor::i64(&[1, 2, 1, 4], &[0, 2, 4, -1, 1, 3, -1, -1]);
+    // Rank-0 scalar bias: broadcasts across every [B, N, S_q, total] position.
+    let bias = HostTensor::f32(&[], &[0.5]);
+    let inputs = [
+        Some(q),
+        Some(k),
+        Some(v),
+        None,
+        None,
+        Some(indices),
+        Some(bias),
+    ];
+    let (_, delta) = assert_parity(&ep, &inputs, case, 1);
+    eprintln!("scalar_bias: Y max|Δ|={delta}");
+}
+
 /// prefill → decode → decode, threading present_key/present_value into the next
 /// step's past_key/past_value. Every step is checked against the CPU oracle.
 #[test]

@@ -616,9 +616,9 @@ impl IndexShareKernel {
         match optional_input(inputs, 6) {
             Some(view) => {
                 let rank = view.shape.len();
-                if rank == 0 || rank > 4 {
+                if rank > 4 {
                     return Err(error(format!(
-                        "attention_bias rank {rank} unsupported; expected 1..=4"
+                        "attention_bias rank {rank} exceeds 4"
                     )));
                 }
                 let expected = view.numel();
@@ -836,9 +836,9 @@ fn validate_indices(indices: &[i64], dims: Dims) -> Result<()> {
 }
 
 fn validate_bias_shape(shape: &[usize], target: [usize; 4]) -> Result<()> {
-    if shape.is_empty() || shape.len() > 4 {
+    if shape.len() > 4 {
         return Err(error(format!(
-            "attention_bias rank {} unsupported; expected 1..=4",
+            "attention_bias rank {} exceeds 4",
             shape.len()
         )));
     }
