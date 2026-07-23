@@ -68,9 +68,9 @@
 //!
 //! ## Supported vs. unimplemented
 //!
-//! * dtype: **f32 and f16** Q/K/V, cache, additive mask, and outputs. Device
-//!   f16 loads and stores are converted around fp32 score, softmax, and value
-//!   accumulators. bf16 remains a follow-up.
+//! * dtype: **f32, f16, and bf16** Q/K/V, cache, additive mask, and outputs.
+//!   Device f16/bf16 loads and stores are converted around fp32 score, softmax,
+//!   and value accumulators. Mixed dtypes across Q/K/V/cache are still rejected.
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
 
@@ -89,24 +89,32 @@ use crate::runtime::{CudaRuntime, cuptr};
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
 const ROW_THREADS: u32 = 128;
-const ATTENTION_MODULE: &str = "standard_attention_f32_f16_v2";
+const ATTENTION_MODULE: &str = "standard_attention_f32_f16_bf16_v3";
 const ATTENTION_SOURCE: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #define NEG_INF __int_as_float(0xff800000)
 
-// dtype is 0 for f32 and 1 for f16. Keep all computation in fp32; only the
-// externally visible activations and cache use the requested storage type.
+// dtype is 0 for f32, 1 for f16, and 2 for bf16. Keep all computation in fp32;
+// only the externally visible activations and cache use the requested storage
+// type.
 __device__ __forceinline__ float load_float(const void* data, unsigned long long index, int dtype) {
-  return dtype == 0
-      ? ((const float*)data)[index]
-      : __half2float(((const __half*)data)[index]);
+  if (dtype == 0) {
+    return ((const float*)data)[index];
+  }
+  if (dtype == 1) {
+    return __half2float(((const __half*)data)[index]);
+  }
+  return __bfloat162float(((const __nv_bfloat16*)data)[index]);
 }
 
 __device__ __forceinline__ void store_float(void* data, unsigned long long index, float value, int dtype) {
   if (dtype == 0) {
     ((float*)data)[index] = value;
-  } else {
+  } else if (dtype == 1) {
     ((__half*)data)[index] = __float2half_rn(value);
+  } else {
+    ((__nv_bfloat16*)data)[index] = __float2bfloat16_rn(value);
   }
 }
 
@@ -175,6 +183,9 @@ __device__ __forceinline__ float mask_bias(
   }
   if (mask_kind == 3) {
     return __half2float(((const __half*)mask)[off]);
+  }
+  if (mask_kind == 4) {
+    return __bfloat162float(((const __nv_bfloat16*)mask)[off]);
   }
   // Bool mask: nonzero keeps (bias 0), zero masks (-inf).
   return ((const unsigned char*)mask)[off] != 0 ? 0.0f : NEG_INF;
@@ -351,13 +362,16 @@ pub(crate) fn unsupported_reason(
             other => format!("{other:?}"),
         };
         Cow::Owned(format!(
-            "Attention: dtype {dtype} not supported on CUDA (supported: f32, f16; bf16 follow-up)"
+            "Attention: dtype {dtype} not supported on CUDA (supported: f32, f16, bf16)"
         ))
     };
 
     for index in 0..3 {
         let dtype = dtype_at(index);
-        if !matches!(dtype, DataType::Float32 | DataType::Float16) {
+        if !matches!(
+            dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return Some(floating_denial(dtype));
         }
     }
@@ -370,17 +384,26 @@ pub(crate) fn unsupported_reason(
     let mask_dtype = dtype_at(3);
     if !matches!(
         mask_dtype,
-        DataType::Undefined | DataType::Bool | DataType::Float32 | DataType::Float16
+        DataType::Undefined
+            | DataType::Bool
+            | DataType::Float32
+            | DataType::Float16
+            | DataType::BFloat16
     ) {
         return Some(Cow::Owned(format!(
-            "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool, f32, or f16 when provided)"
+            "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool, f32, f16, or bf16 when provided)"
         )));
     }
 
     let past_key_dtype = dtype_at(4);
     let past_value_dtype = dtype_at(5);
     for dtype in [past_key_dtype, past_value_dtype] {
-        if dtype != DataType::Undefined && !matches!(dtype, DataType::Float32 | DataType::Float16) {
+        if dtype != DataType::Undefined
+            && !matches!(
+                dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            )
+        {
             return Some(floating_denial(dtype));
         }
         if dtype != DataType::Undefined && dtype != dtype_at(0) {
@@ -418,7 +441,7 @@ pub(crate) fn unsupported_reason(
     None
 }
 
-/// f32/f16 standard-`Attention` kernel carrying the resolved attributes.
+/// f32/f16/bf16 standard-`Attention` kernel carrying the resolved attributes.
 pub struct StandardAttentionKernel {
     runtime: Arc<CudaRuntime>,
     /// Explicit score scale; `None` → default `1/sqrt(head_size)`.
@@ -520,9 +543,12 @@ fn resolve_bhsd(view: &TensorView, name: &str, num_heads: Option<usize>) -> Resu
             "Attention: non-contiguous inputs are not supported".into(),
         ));
     }
-    if !matches!(view.dtype, DataType::Float32 | DataType::Float16) {
+    if !matches!(
+        view.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
         return Err(EpError::KernelFailed(format!(
-            "Attention: expected f32 or f16 input, got {:?}",
+            "Attention: expected f32, f16, or bf16 input, got {:?}",
             view.dtype
         )));
     }
@@ -694,7 +720,11 @@ impl Kernel for StandardAttentionKernel {
                 "Attention: Q, K, and V must use the same floating dtype on CUDA".into(),
             ));
         }
-        let dtype_code = if dtype == DataType::Float32 { 0 } else { 1 };
+        let dtype_code = match dtype {
+            DataType::Float32 => 0,
+            DataType::Float16 => 1,
+            _ => 2,
+        };
         let element_bytes = dtype.storage_bytes(1);
 
         // Optional past KV cache (inputs 4 and 5). They must be used together.
@@ -850,9 +880,10 @@ impl Kernel for StandardAttentionKernel {
                 DataType::Bool => 2,
                 DataType::Float32 => 1,
                 DataType::Float16 => 3,
+                DataType::BFloat16 => 4,
                 other => {
                     return Err(EpError::KernelFailed(format!(
-                        "Attention: attn_mask dtype {other:?} not supported (expected bool, f32, or f16)"
+                        "Attention: attn_mask dtype {other:?} not supported (expected bool, f32, f16, or bf16)"
                     )));
                 }
             };
