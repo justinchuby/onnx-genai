@@ -31,6 +31,24 @@ const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
 const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
+/// Split-K specialization of [`GEMV_INT8_F16_ENTRY`]. ncu showed the single-warp
+/// standalone int8 GEMV grid-starved on Phi's int8 down projection (grid 384,
+/// ~0.48 waves/SM, ~35% occupancy, 28µs) — unlike the fused RMSNorm-prologue int8
+/// kernel, it has no serial prologue, so partitioning the K reduction across
+/// [`GEMV_INT8_F16_SPLITK`] cooperating warps per output column multiplies the
+/// grid to fill the SMs and directly attacks the memory-latency bound. The K-slice
+/// partials are summed in fp32 (a new block-sum association vs the single-warp
+/// kernel), so this path is near-equal — not byte-identical — to the plain entry;
+/// asymmetric-zp parity is validated against a dequant reference to tolerance. Only
+/// launched when `K % 256 == 0` (whole 256-wide steps, no divergent tail) and the
+/// weights carry zero points; symmetric int8 keeps the byte-identical single-warp
+/// kernel.
+const GEMV_INT8_F16_SPLITK_ENTRY: &str = "matmul_nbits_gemv_int8_f16_splitk";
+/// Warps cooperating per output column in the split-K standalone int8 GEMV. Must
+/// match `K_SPLIT` in `matmul_nbits_gemv_int8_f16_splitk`. A block keeps its
+/// `blockDim.x / 32` warps but now covers `warps / K_SPLIT` columns, so the launch
+/// grid grows by this factor.
+const GEMV_INT8_F16_SPLITK: usize = 2;
 const GEMM_F16_ENTRY: &str = "matmul_nbits_gemm_f16";
 /// Model-agnostic fp16 int4 decode GEMV for any power-of-two `block_size` (16,
 /// 64, 128, 256, ...). The tuned [`GEMV_F16_ENTRY`]/[`GEMV_F16_SCALES_F16_ENTRY`]
@@ -578,7 +596,105 @@ extern "C" __global__ void matmul_nbits_gemv_int8_f16(
     }
 }
 
-// Portable CUDA-core prefill GEMM. A 16x16 CTA cooperatively stages one
+// Split-K standalone int8 GEMV: K_SPLIT warps cooperate on one output column,
+// each reducing a strided subset of the 8-block (256-wide) K steps, then summing
+// their fp32 partials through shared memory. The launch grid is K_SPLIT x larger
+// than the single-warp kernel, which fills the SMs on the grid-starved
+// (~0.48 waves/SM) Phi int8 down-projection decode GEMV. This kernel has no
+// serial prologue, so the added grid parallelism directly hides the
+// Long-Scoreboard latency (unlike the fused RMSNorm-prologue int8 kernel, whose
+// serial full-vector prologue caps any split-K benefit). The fp32 partial sum is
+// a new block-sum association, so results are near-equal (not byte-identical) to
+// the single-warp kernel; asymmetric-zp parity is validated against a dequant
+// reference to tolerance. Requires K % 256 == 0 (whole steps, no divergent tail)
+// — the launch only routes here in that case.
+extern "C" __global__ void matmul_nbits_gemv_int8_f16_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    constexpr int K_SPLIT = 2;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    float value = 0.0f;
+    if (column < n) {
+        const int quarter = lane & 3;
+        for (int block_base = ks * 8; block_base < k_blocks;
+             block_base += K_SPLIT * 8) {
+            const int block = block_base + (lane >> 2);
+            float block_partial = 0.0f;
+            if (block < k_blocks) {
+                const int zero_point =
+                    zero_points ? (int)zero_points[(long)column * k_blocks + block] : 128;
+                const int depth = block * 32 + quarter * 8;
+                const long packed_start =
+                    ((long)column * k_blocks + block) * 32 + quarter * 8;
+                if (depth + 8 <= k) {
+                    const uint2 packed_word =
+                        *reinterpret_cast<const uint2*>(packed + packed_start);
+                    const unsigned char* bytes =
+                        reinterpret_cast<const unsigned char*>(&packed_word);
+                    const uint4 act = *reinterpret_cast<const uint4*>(activation + depth);
+                    const __half* acth = reinterpret_cast<const __half*>(&act);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        block_partial += ((float)(int)bytes[i] - (float)zero_point)
+                            * __half2float(acth[i]);
+                    }
+                } else if (depth < k) {
+                    const int valid = min(8, k - depth);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid) {
+                            const int quantized = (int)packed[packed_start + i];
+                            block_partial += ((float)quantized - (float)zero_point)
+                                * __half2float(activation[depth + i]);
+                        }
+                    }
+                }
+            }
+            block_partial += __shfl_down_sync(0xffffffffu, block_partial, 2, 4);
+            block_partial += __shfl_down_sync(0xffffffffu, block_partial, 1, 4);
+            if (quarter == 0 && block < k_blocks) {
+                const float scale = scales_fp16
+                    ? __half2float(reinterpret_cast<const __half*>(scales_raw)
+                        [(long)column * k_blocks + block])
+                    : reinterpret_cast<const float*>(scales_raw)
+                        [(long)column * k_blocks + block];
+                value += block_partial * scale;
+            }
+        }
+    }
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+    }
+}
 // block-32 activation/weight tile, so each packed weight is reused by up to 16
 // prompt rows and each activation by up to 16 output columns. It deliberately
 // uses only ordinary shared memory, fp32 arithmetic, and __half conversion:
@@ -3446,9 +3562,25 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits int8 fp16 GEMV")?;
-        let function =
-            self.runtime
-                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, GEMV_INT8_F16_ENTRY)?;
+        // Grid-starved standalone int8-zp GEMV (e.g. Phi's int8 down projection,
+        // grid 384 / ~0.48 waves/SM): when K is a whole multiple of the 256-wide
+        // step and the shape uses the 256-thread large path, take the split-K
+        // entry (K_SPLIT warps/column, K_SPLIT x larger grid) to fill the SMs.
+        // This kernel has no serial prologue, so the extra grid parallelism pays
+        // off directly. Symmetric int8 (no zero points) keeps its byte-identical
+        // single-warp kernel; the small-shape (64-thread) path lacks the warps to
+        // cooperate.
+        let use_splitk = zero_points.is_some()
+            && self.k.is_multiple_of(256)
+            && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX);
+        let entry = if use_splitk {
+            GEMV_INT8_F16_SPLITK_ENTRY
+        } else {
+            GEMV_INT8_F16_ENTRY
+        };
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -3469,7 +3601,11 @@ impl MatMulNBitsKernel {
         } else {
             GEMV_F16_LARGE_THREADS
         };
-        let columns_per_block = (threads / 32) as usize;
+        let columns_per_block = if use_splitk {
+            (threads / 32) as usize / GEMV_INT8_F16_SPLITK
+        } else {
+            (threads / 32) as usize
+        };
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&activation_ptr)
@@ -5972,6 +6108,7 @@ mod tests {
             (8192, 3072, true, false, false),           // Phi down projection int8
             (3072, 5120, true, true, false),            // QKV with folded bias
             (3072, 5120, true, false, true),            // explicit per-block zero points
+            (8192, 3072, true, false, true),            // down-proj zp: exercises split-K at K=8192
             (3072, 5121, true, false, false),           // ragged N tail (not warp-tile aligned)
             (8192, 3072, false, false, false),          // fp32 scales
         ];
@@ -7495,16 +7632,48 @@ extern "C" __global__ void ref_silu_mul_f16(
                     index % hidden
                 );
             }
-            // The fused projection is bit-identical to the three-op sequence.
-            for index in 0..m * post_n {
-                assert_eq!(
-                    y_fused_host[index].to_bits(),
-                    y_ref_host[index].to_bits(),
-                    "fused norm prologue diverged from skip_rmsnorm + GEMV at M={m}, \
-                     following_bias={following_bias}, token={}, column={}",
-                    index / post_n,
-                    index % post_n
+            // The fused projection matches the three-op sequence. It is normally
+            // bit-identical, EXCEPT the asymmetric int8-zp M=1 case: the three-op
+            // reference's standalone int8 GEMV now routes to the split-K entry
+            // (K % 256 == 0, grid-starved), which reorders the fp32 block-sum
+            // association across K_SPLIT cooperating warps (fp reassociation),
+            // while the fused following kernel keeps the single-warp association.
+            // Both are near-equal valid computations, so that path is validated to
+            // a tight magnitude-relative tolerance instead of byte-identity.
+            let splitk_path = bits == 8 && explicit_zp && m == 1;
+            if splitk_path {
+                let mut max_abs = 0.0f32;
+                let mut worst = 0.0f32;
+                for index in 0..m * post_n {
+                    let fused = y_fused_host[index].to_f32();
+                    let reference = y_ref_host[index].to_f32();
+                    assert!(
+                        fused.is_finite(),
+                        "split-K int8-zp GEMV produced a non-finite output at M={m}, \
+                         following_bias={following_bias}, column={}",
+                        index % post_n
+                    );
+                    max_abs = max_abs.max(reference.abs());
+                    worst = worst.max((fused - reference).abs());
+                }
+                let bound = (max_abs * 2e-3).max(1e-3);
+                assert!(
+                    worst < bound,
+                    "fused norm prologue diverged from split-K skip_rmsnorm + GEMV at \
+                     M={m}, following_bias={following_bias}: \
+                     max_abs_diff={worst:.3e} bound={bound:.3e}"
                 );
+            } else {
+                for index in 0..m * post_n {
+                    assert_eq!(
+                        y_fused_host[index].to_bits(),
+                        y_ref_host[index].to_bits(),
+                        "fused norm prologue diverged from skip_rmsnorm + GEMV at M={m}, \
+                         following_bias={following_bias}, token={}, column={}",
+                        index / post_n,
+                        index % post_n
+                    );
+                }
             }
         }
     }
