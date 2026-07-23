@@ -79,6 +79,8 @@ fn main() {
         "quantize.cpp",
         "dequantize.cpp",
         "convolve.cpp",
+        "snchwc.cpp",
+        "reorder.cpp",
         "pooling.cpp",
         "sconv_nchw_depthwise_multiplier_1.cpp",
         "sconv_nchw_depthwise_multiplier_greater_than_1.cpp",

@@ -98,6 +98,36 @@ unsafe extern "C" {
         output: *mut f32,
     );
     fn mlas_conv_plan_destroy(plan: *mut c_void);
+
+    // ---- NCHWc blocked convolution ----
+    fn mlas_nchwc_block_size() -> usize;
+    fn mlas_nchwc_reorder_input_nchw(
+        source: *const f32,
+        dest: *mut f32,
+        channels: usize,
+        input_size: usize,
+    );
+    fn mlas_nchwc_reorder_output_nchw(output_shape: *const i64, source: *const f32, dest: *mut f32);
+    fn mlas_nchwc_reorder_filter_bibo(filter_shape: *const i64, source: *const f32, dest: *mut f32);
+    fn mlas_nchwc_reorder_filter_bo(filter_shape: *const i64, source: *const f32, dest: *mut f32);
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_nchwc_conv(
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        dilation_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        group_count: usize,
+        input: *const f32,
+        filter: *const f32,
+        bias: *const f32,
+        output: *mut f32,
+        activation_kind: c_int,
+        activation_value0: f32,
+        activation_value1: f32,
+        zero_mode: c_int,
+    );
     fn mlas_pool(
         kind: c_int,
         dimensions: usize,
@@ -389,6 +419,135 @@ impl ConvPlan {
 impl Drop for ConvPlan {
     fn drop(&mut self) {
         unsafe { mlas_conv_plan_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// MLAS activation applied inside (or immediately after) a convolution.
+///
+/// Mirrors `MLAS_ACTIVATION_KIND`; the two `values` carry the kind-specific
+/// parameters (`Clip` min/max, `LeakyRelu`/`HardSigmoid` alpha/beta).
+#[derive(Clone, Copy, Debug)]
+pub struct NchwcActivation {
+    /// Raw `MLAS_ACTIVATION_KIND` discriminant (0 = identity, 1 = relu, 5 = clip).
+    pub kind: i32,
+    /// Kind-specific parameters, laid over the `Parameters.Values[2]` union.
+    pub values: [f32; 2],
+}
+
+impl NchwcActivation {
+    /// No activation (`MlasIdentityActivation`).
+    pub const IDENTITY: Self = Self {
+        kind: 0,
+        values: [0.0, 0.0],
+    };
+    /// ReLU (`MlasReluActivation`).
+    pub const RELU: Self = Self {
+        kind: 1,
+        values: [0.0, 0.0],
+    };
+
+    /// Clip activation (`MlasClipActivation`) with the given bounds.
+    pub fn clip(minimum: f32, maximum: f32) -> Self {
+        Self {
+            kind: 5,
+            values: [minimum, maximum],
+        }
+    }
+}
+
+/// SIMD channel-block width used by the MLAS NCHWc kernels (8 for AVX2, 16 for
+/// AVX-512). A value `<= 1` means the host has no blocked-convolution kernel and
+/// callers must use the plain [`ConvPlan`] path instead.
+pub fn nchwc_block_size() -> usize {
+    unsafe { mlas_nchwc_block_size() }
+}
+
+/// Reorder an `OIHW` filter into the `OIHWBiBo` layout (both input and output
+/// channels blocked), padding partial blocks with zeros. `dest` must hold
+/// `round_up(O, block) * round_up(I, block) * H * W` elements.
+pub fn nchwc_reorder_filter_bibo(filter_shape: &[i64; 4], source: &[f32], dest: &mut [f32]) {
+    unsafe {
+        mlas_nchwc_reorder_filter_bibo(filter_shape.as_ptr(), source.as_ptr(), dest.as_mut_ptr())
+    };
+}
+
+/// Reorder an `OIHW` filter into the `OIHWBo` layout (only output channels
+/// blocked), padding partial output blocks with zeros. Used for the NCHW-input
+/// (first-layer) and depthwise algorithms. `dest` must hold
+/// `round_up(O, block) * I * H * W` elements.
+pub fn nchwc_reorder_filter_bo(filter_shape: &[i64; 4], source: &[f32], dest: &mut [f32]) {
+    unsafe {
+        mlas_nchwc_reorder_filter_bo(filter_shape.as_ptr(), source.as_ptr(), dest.as_mut_ptr())
+    };
+}
+
+/// Reorder an NCHW activation plane set into NCHWc. `channels` must be a
+/// multiple of 4; `dest` must hold `round_up(channels, block) * input_size`
+/// elements (partial trailing block is zero padded).
+pub fn nchwc_reorder_input_nchw(
+    source: &[f32],
+    dest: &mut [f32],
+    channels: usize,
+    input_size: usize,
+) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_reorder_input_nchw(source.as_ptr(), dest.as_mut_ptr(), channels, input_size)
+    };
+}
+
+/// Reorder an NCHWc output buffer back to dense NCHW, keeping only
+/// `output_shape[1]` channels.
+pub fn nchwc_reorder_output_nchw(output_shape: &[i64; 4], source: &[f32], dest: &mut [f32]) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_reorder_output_nchw(output_shape.as_ptr(), source.as_ptr(), dest.as_mut_ptr())
+    };
+}
+
+/// Execute an NCHWc blocked 2-D convolution.
+///
+/// `input`/`output` are in NCHWc block layout except for the NCHW-input
+/// (first-layer) algorithm, where `input` stays plain NCHW. `filter` must be
+/// pre-reordered (`OIHWBiBo` or `OIHWBo`) to match the algorithm MLAS selects
+/// from the shape. `bias`, when present, must be padded to
+/// `round_up(output_channels, block)` elements. `zero_mode` false accumulates
+/// into `output` (Conv/Sum fusion); true overwrites it.
+#[allow(clippy::too_many_arguments)]
+pub fn nchwc_conv(
+    input_shape: &[i64; 4],
+    kernel_shape: &[i64; 2],
+    dilation_shape: &[i64; 2],
+    padding: &[i64; 4],
+    stride_shape: &[i64; 2],
+    output_shape: &[i64; 4],
+    group_count: usize,
+    input: &[f32],
+    filter: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+    activation: NchwcActivation,
+    zero_mode: bool,
+) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_conv(
+            input_shape.as_ptr(),
+            kernel_shape.as_ptr(),
+            dilation_shape.as_ptr(),
+            padding.as_ptr(),
+            stride_shape.as_ptr(),
+            output_shape.as_ptr(),
+            group_count,
+            input.as_ptr(),
+            filter.as_ptr(),
+            bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            output.as_mut_ptr(),
+            activation.kind,
+            activation.values[0],
+            activation.values[1],
+            i32::from(zero_mode),
+        );
     }
 }
 
@@ -1406,5 +1565,427 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn round_up(value: usize, multiple: usize) -> usize {
+        value.div_ceil(multiple) * multiple
+    }
+
+    /// Naive NCHW convolution reference (group=1) with optional bias.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_conv_nchw(
+        input: &[f32],
+        filter: &[f32],
+        bias: Option<&[f32]>,
+        n: usize,
+        cin: usize,
+        hin: usize,
+        win: usize,
+        cout: usize,
+        kh: usize,
+        kw: usize,
+        pad: [usize; 4],
+        stride: [usize; 2],
+        group: usize,
+    ) -> (Vec<f32>, usize, usize) {
+        let hout = (hin + pad[0] + pad[2] - kh) / stride[0] + 1;
+        let wout = (win + pad[1] + pad[3] - kw) / stride[1] + 1;
+        let cin_g = cin / group;
+        let cout_g = cout / group;
+        let mut out = vec![0.0f32; n * cout * hout * wout];
+        for ni in 0..n {
+            for oc in 0..cout {
+                let g = oc / cout_g;
+                for oy in 0..hout {
+                    for ox in 0..wout {
+                        let mut acc = bias.map_or(0.0, |b| b[oc]);
+                        for icg in 0..cin_g {
+                            let ic = g * cin_g + icg;
+                            for ky in 0..kh {
+                                let iy = oy * stride[0] + ky;
+                                if iy < pad[0] || iy - pad[0] >= hin {
+                                    continue;
+                                }
+                                let iy = iy - pad[0];
+                                for kx in 0..kw {
+                                    let ix = ox * stride[1] + kx;
+                                    if ix < pad[1] || ix - pad[1] >= win {
+                                        continue;
+                                    }
+                                    let ix = ix - pad[1];
+                                    let iv = input[((ni * cin + ic) * hin + iy) * win + ix];
+                                    let fv = filter[(((oc * cin_g) + icg) * kh + ky) * kw + kx];
+                                    acc += iv * fv;
+                                }
+                            }
+                        }
+                        out[((ni * cout + oc) * hout + oy) * wout + ox] = acc;
+                    }
+                }
+            }
+        }
+        (out, hout, wout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_nchwc_group1(
+        input: &[f32],
+        filter: &[f32],
+        bias: Option<&[f32]>,
+        n: usize,
+        cin: usize,
+        hin: usize,
+        win: usize,
+        cout: usize,
+        kh: usize,
+        kw: usize,
+        pad: [usize; 4],
+        stride: [usize; 2],
+    ) -> Vec<f32> {
+        let block = nchwc_block_size();
+        let hout = (hin + pad[0] + pad[2] - kh) / stride[0] + 1;
+        let wout = (win + pad[1] + pad[3] - kw) / stride[1] + 1;
+        let nchwc_cout = round_up(cout, block);
+        let filter_shape = [cout as i64, cin as i64, kh as i64, kw as i64];
+
+        let reorder_input = cin >= block;
+        let (packed_filter, conv_input, in_channels_for_shape) = if reorder_input {
+            let nchwc_cin = round_up(cin, block);
+            let mut pf = vec![0.0f32; nchwc_cout * nchwc_cin * kh * kw];
+            nchwc_reorder_filter_bibo(&filter_shape, filter, &mut pf);
+            let mut blocked = vec![0.0f32; n * nchwc_cin * hin * win];
+            for ni in 0..n {
+                nchwc_reorder_input_nchw(
+                    &input[ni * cin * hin * win..(ni + 1) * cin * hin * win],
+                    &mut blocked[ni * nchwc_cin * hin * win..(ni + 1) * nchwc_cin * hin * win],
+                    cin,
+                    hin * win,
+                );
+            }
+            (pf, blocked, nchwc_cin)
+        } else {
+            let mut pf = vec![0.0f32; nchwc_cout * cin * kh * kw];
+            nchwc_reorder_filter_bo(&filter_shape, filter, &mut pf);
+            (pf, input.to_vec(), cin)
+        };
+
+        let padded_bias = bias.map(|b| {
+            let mut pb = vec![0.0f32; nchwc_cout];
+            pb[..cout].copy_from_slice(b);
+            pb
+        });
+
+        let mut blocked_out = vec![0.0f32; n * nchwc_cout * hout * wout];
+        nchwc_conv(
+            &[
+                n as i64,
+                in_channels_for_shape as i64,
+                hin as i64,
+                win as i64,
+            ],
+            &[kh as i64, kw as i64],
+            &[1, 1],
+            &[pad[0] as i64, pad[1] as i64, pad[2] as i64, pad[3] as i64],
+            &[stride[0] as i64, stride[1] as i64],
+            &[n as i64, nchwc_cout as i64, hout as i64, wout as i64],
+            1,
+            &conv_input,
+            &packed_filter,
+            padded_bias.as_deref(),
+            &mut blocked_out,
+            NchwcActivation::IDENTITY,
+            true,
+        );
+
+        let mut out = vec![0.0f32; n * cout * hout * wout];
+        nchwc_reorder_output_nchw(
+            &[n as i64, cout as i64, hout as i64, wout as i64],
+            &blocked_out,
+            &mut out,
+        );
+        out
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    #[test]
+    fn nchwc_block_size_is_supported() {
+        // On x86_64 the vendored build always has an NCHWc kernel (8 or 16).
+        assert!(nchwc_block_size() >= 8, "block size {}", nchwc_block_size());
+    }
+
+    #[test]
+    fn nchwc_conv_pointwise_matches_reference() {
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, 2 * block, 7, 7, 3 * block);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let bias: Vec<f32> = (0..cout).map(|i| (i as f32) * 0.01).collect();
+        let (want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            1,
+            1,
+            [0; 4],
+            [1, 1],
+            1,
+        );
+        let got = run_nchwc_group1(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            1,
+            1,
+            [0; 4],
+            [1, 1],
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_3x3_blocked_matches_reference() {
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, block, 9, 9, block);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin * 9)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+            .collect();
+        let (want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            None,
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [1, 1],
+            1,
+        );
+        let got = run_nchwc_group1(
+            &input,
+            &filter,
+            None,
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [1, 1],
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_first_layer_nchw_input_matches_reference() {
+        // Input channels < block: the NCHW-input (first-layer) algorithm.
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, 3, 16, 16, block + block / 2);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.04)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin * 9)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
+            .collect();
+        let bias: Vec<f32> = (0..cout).map(|i| (i as f32) * 0.02 - 0.3).collect();
+        let (want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [2, 2],
+            1,
+        );
+        let got = run_nchwc_group1(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [2, 2],
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_depthwise_matches_reference() {
+        // Depthwise: group == channels, one input & output channel per group.
+        let block = nchwc_block_size();
+        let channels = 2 * block; // must be a multiple of 4
+        let (n, hin, win) = (1, 8, 8);
+        let input: Vec<f32> = (0..n * channels * hin * win)
+            .map(|i| ((i % 15) as f32 - 7.0) * 0.06)
+            .collect();
+        // Filter shape [channels, 1, 3, 3].
+        let filter: Vec<f32> = (0..channels * 9)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let bias: Vec<f32> = (0..channels).map(|i| (i as f32) * 0.01).collect();
+        let (want, hout, wout) = ref_conv_nchw(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            channels,
+            hin,
+            win,
+            channels,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [1, 1],
+            channels,
+        );
+
+        let nchwc_ch = round_up(channels, block);
+        let mut pf = vec![0.0f32; nchwc_ch * 9];
+        nchwc_reorder_filter_bo(&[channels as i64, 1, 3, 3], &filter, &mut pf);
+        let mut blocked_in = vec![0.0f32; n * nchwc_ch * hin * win];
+        nchwc_reorder_input_nchw(&input, &mut blocked_in, channels, hin * win);
+        let mut padded_bias = vec![0.0f32; nchwc_ch];
+        padded_bias[..channels].copy_from_slice(&bias);
+        let mut blocked_out = vec![0.0f32; n * nchwc_ch * hout * wout];
+        nchwc_conv(
+            &[n as i64, nchwc_ch as i64, hin as i64, win as i64],
+            &[3, 3],
+            &[1, 1],
+            &[1, 1, 1, 1],
+            &[1, 1],
+            &[n as i64, nchwc_ch as i64, hout as i64, wout as i64],
+            nchwc_ch, // group count == blocked channel count for depthwise
+            &blocked_in,
+            &pf,
+            Some(&padded_bias),
+            &mut blocked_out,
+            NchwcActivation::IDENTITY,
+            true,
+        );
+        let mut got = vec![0.0f32; n * channels * hout * wout];
+        nchwc_reorder_output_nchw(
+            &[n as i64, channels as i64, hout as i64, wout as i64],
+            &blocked_out,
+            &mut got,
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_relu_activation_matches_reference() {
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, block, 5, 5, block);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.2)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.1)
+            .collect();
+        let (mut want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            None,
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            1,
+            1,
+            [0; 4],
+            [1, 1],
+            1,
+        );
+        for v in &mut want {
+            *v = v.max(0.0);
+        }
+        // Reuse pointwise path but apply ReLU.
+        let nchwc_cout = round_up(cout, block);
+        let nchwc_cin = round_up(cin, block);
+        let mut pf = vec![0.0f32; nchwc_cout * nchwc_cin];
+        nchwc_reorder_filter_bibo(&[cout as i64, cin as i64, 1, 1], &filter, &mut pf);
+        let mut blocked_in = vec![0.0f32; n * nchwc_cin * hin * win];
+        nchwc_reorder_input_nchw(&input, &mut blocked_in, cin, hin * win);
+        let mut blocked_out = vec![0.0f32; n * nchwc_cout * hin * win];
+        nchwc_conv(
+            &[n as i64, nchwc_cin as i64, hin as i64, win as i64],
+            &[1, 1],
+            &[1, 1],
+            &[0; 4],
+            &[1, 1],
+            &[n as i64, nchwc_cout as i64, hin as i64, win as i64],
+            1,
+            &blocked_in,
+            &pf,
+            None,
+            &mut blocked_out,
+            NchwcActivation::RELU,
+            true,
+        );
+        let mut got = vec![0.0f32; n * cout * hin * win];
+        nchwc_reorder_output_nchw(
+            &[n as i64, cout as i64, hin as i64, win as i64],
+            &blocked_out,
+            &mut got,
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
     }
 }
