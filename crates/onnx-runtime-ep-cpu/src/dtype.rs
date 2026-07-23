@@ -646,6 +646,68 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
     })
 }
 
+/// Half-open byte range `[start, end)` spanned by a slice's elements.
+///
+/// The unit of the in-place-aliasing guard ([`output_direct_write_eligible`]):
+/// a widened kernel input (`to_dense_f32_widen`) is either a `Cow::Owned` fresh
+/// heap buffer — whose range never overlaps an executor output — or a
+/// `Cow::Borrowed` view straight into the tensor storage a persistent
+/// `DeviceIoBinding` may share with the output. Pure pointer arithmetic; no
+/// element is dereferenced.
+#[inline]
+pub fn slice_byte_range<T>(slice: &[T]) -> core::ops::Range<usize> {
+    let start = slice.as_ptr() as usize;
+    start..start.saturating_add(std::mem::size_of_val(slice))
+}
+
+/// Whether two byte ranges overlap.
+#[inline]
+pub fn byte_ranges_overlap(a: &core::ops::Range<usize>, b: &core::ops::Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// General in-place-aliasing guard for kernels that write their result straight
+/// into an executor output buffer (the zero-copy "direct write" fast path).
+///
+/// Returns `true` only when it is sound to form a `&mut [f32]` of exactly `len`
+/// elements over `output`'s backing store and write into it while the kernel
+/// still reads the slices covered by `read_ranges`. All of the following must
+/// hold:
+///
+/// * `output` is `Float32`, contiguous row-major, and host-accessible;
+/// * its element count equals `len` (the computed result length); and
+/// * its `len`-element byte range is disjoint from every range in `read_ranges`.
+///
+/// Persistent `DeviceIoBinding`s explicitly permit binding an input buffer onto
+/// an output buffer (`onnx-runtime-session`'s device-binding path), so a kernel
+/// that reads an input *after* it begins writing its output can silently corrupt
+/// that input — or hit copy-`nonoverlapping` UB — when the two alias. Callers
+/// pass the byte ranges of the widened input slices they still read
+/// ([`slice_byte_range`]); on overlap this returns `false` and the caller must
+/// compute into an owned buffer and finish with [`write_dense_f32_narrow`]. The
+/// check is `O(read_ranges)` pointer comparisons with no data movement, so the
+/// common disjoint case keeps the direct-write speed. `len` is used verbatim by
+/// the caller's `unsafe` slice, so the element-count match here is what makes
+/// that slice in-bounds. No hardcoded dimensions — usable by any kernel.
+pub fn output_direct_write_eligible(
+    output: &mut TensorMut,
+    len: usize,
+    read_ranges: &[core::ops::Range<usize>],
+) -> bool {
+    if output.dtype != DataType::Float32
+        || !output.is_contiguous()
+        || !output.device.is_host_accessible()
+        || output.numel() != len
+    {
+        return false;
+    }
+    let start = output.data_ptr_mut::<f32>() as usize;
+    let out_range = start..start.saturating_add(len * std::mem::size_of::<f32>());
+    read_ranges
+        .iter()
+        .all(|r| !byte_ranges_overlap(&out_range, r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,5 +824,41 @@ mod tests {
         assert!(s.contains("WHAT"));
         assert!(s.contains("WHY"));
         assert!(s.contains("HOW"));
+    }
+
+    #[test]
+    fn direct_write_guard_detects_overlap_and_shape() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
+
+        let mut buf = vec![0.0f32; 8];
+        let base = buf.as_ptr() as usize;
+        let shape = [2usize, 4];
+        let strides = compute_contiguous_strides(&shape);
+        let mut out = TensorMut::new(
+            DevicePtrMut(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+
+        // Disjoint input range -> eligible for the direct path.
+        let disjoint = (base + 8 * 4)..(base + 8 * 4 + 16);
+        assert!(output_direct_write_eligible(&mut out, 8, &[disjoint]));
+
+        // Overlapping input range -> must reject (fall back to owned buffer).
+        let overlap = (base + 4)..(base + 4 + 16);
+        assert!(!output_direct_write_eligible(&mut out, 8, &[overlap]));
+
+        // Wrong element count -> reject even with no aliasing input.
+        assert!(!output_direct_write_eligible(&mut out, 7, &[]));
+
+        // Range helpers.
+        let s = [0.0f32; 4];
+        let r = slice_byte_range(&s);
+        assert_eq!(r.end - r.start, 16);
+        assert!(byte_ranges_overlap(&(0..10), &(5..15)));
+        assert!(!byte_ranges_overlap(&(0..10), &(10..20)));
     }
 }
