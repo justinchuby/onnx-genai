@@ -323,3 +323,79 @@ custom slow tiktoken tokenizer, so Mobius cannot derive `tokenizer.json`
 automatically. The smoke package uses the compatible fast tokenizer from
 `THUDM/glm-4-9b-chat-hf`. This does not block graph execution, but tokenizer
 fallback/source selection should be automated before distributing the package.
+
+### GLM-4 capture fragmentation
+
+The 40 seams are one fused-MLP activation split per decoder layer; they are not
+QKV or partial-RoPE splits. For example, layer 0 contains:
+
+```text
+MatMulNBits gate_up_proj: [batch, sequence_len, 27392]
+  -> Split(axis=-1, num_outputs=2)
+     -> gate: [batch, sequence_len, 13696] -> Sigmoid -> Mul
+     -> up:   [batch, sequence_len, 13696] ------------> Mul
+  -> MatMulNBits down_proj
+```
+
+The node is `model/layers.0/mlp/Split_node_24`; layers 1 through 39 repeat the
+same pattern, ending at `model/layers.39/mlp/Split_node_726`. Each Split has one
+data input, no runtime split-size tensor, `axis=-1`, and `num_outputs=2`.
+Mobius emits it in `FusedGateUpMLP.forward`
+(`src/mobius/components/_mlp.py:138-144`).
+
+The shapes are already resolved. Capture diagnostics classify every Split as
+`KernelCaptureUnsupported`, not `UnresolvedInputShape`:
+
+```text
+Split reads runtime split sizes on the host and performs a trailing stream synchronization
+```
+
+The CUDA Split kernel launches one copy kernel per output and then calls
+`runtime.synchronize()` (`movement.rs:923-1018`). Its `capture_support()`
+therefore rejects capture unconditionally. The executor merely partitions
+around that kernel (`executor.rs:2785-2907`); the earlier Phi shape seeding is
+not applicable. Phi had unresolved shapes downstream of a control-flow `If`;
+GLM's Split input and both output shapes are concrete before capture planning.
+
+Measured on GPU 4:
+
+- captured, 41 segments: 10.928 ms/token, 91.51 tok/s;
+- graph disabled: 22.272 ms/token, 44.90 tok/s;
+- an instrumented captured decode charged the 40 eager Splits 3.037 ms total
+  (about 76 microseconds each), before accounting for the extra graph replay
+  calls. The profiler perturbs absolute timing, so this is directional.
+
+Two implementation avenues:
+
+1. **Mobius-side packed gate/up split (recommended first, 0.5-1 day).**
+   Split `gate_up_proj.{weight,scales,bias}` along the already-repacked output
+   dimension during ChatGLM checkpoint preprocessing, emit separate
+   `gate_proj` and `up_proj` MatMulNBits nodes, and use the standard MLP graph.
+   This removes all 40 runtime Splits and should produce one captured segment.
+   The transformation is layer-count-independent and analogous to the proven
+   packed-QKV output split. It should be bit-exact because output columns are
+   independent. Cost: 40 additional captured MatMulNBits launches. The existing
+   paired gate/up SwiGLU CUDA fusion only accepts block-32, so it will not fuse
+   this checkpoint's block-128 projections.
+
+   Replacing Split with Slice is not useful today: CUDA Slice also reads bounds
+   on the host, allocates metadata, synchronizes, and rejects capture
+   (`movement.rs:588-713`).
+
+2. **CUDA Split static capture path (1-2 days, broader but riskier).**
+   This is a kernel change, not executor shape seeding. Teach `SplitFactory` to
+   recognize the one-input static/even-split form, precompute the axis sizes,
+   omit the trailing synchronization, and return capture support only for that
+   validated form. Keep two-input/data-dependent Split unsupported. This also
+   collapses GLM to one segment while retaining the single fused gate/up GEMV,
+   and benefits other static-Split graphs. It needs capture/eager parity,
+   prefill/decode shape, dynamic-split rejection, and token-exact tests because
+   it changes stream-lifetime behavior in the CUDA movement kernel.
+
+The Mobius change gives the same expected 41-to-1 segment collapse with a
+smaller correctness blast radius, so it should be prototyped first on the
+existing GLM import PR. The prior Phi 35-to-3 collapse measured only about 2.3%
+from removing downstream graph replay calls; GLM additionally pays 40 explicit
+stream synchronizations. Conservatively, removing the seams should move
+91.5 tok/s into roughly the 110-125 tok/s range (20-37%), with the static CUDA
+Split path likely owning the higher end because it preserves one gate/up GEMV.
