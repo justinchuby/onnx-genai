@@ -128,6 +128,11 @@ impl<K: ArenaKey, T> Arena<K, T> {
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(Option::as_ref)
     }
+
+    /// Iterate over `&mut value` for all live entries.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.slots.iter_mut().filter_map(Option::as_mut)
+    }
 }
 
 #[cfg(test)]

@@ -59,6 +59,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use onnx_runtime_ir::is_default_domain;
+
 use crate::LoaderError;
 use crate::proto::onnx::{
     AttributeProto, FunctionProto, GraphProto, ModelProto, NodeProto, OperatorSetIdProto,
@@ -132,13 +134,6 @@ pub fn inline_functions(model: &ModelProto) -> Result<Cow<'_, ModelProto>, Loade
 /// no default-domain opset import at all — a valid ONNX model that, e.g., only
 /// called custom-domain functions. Any version ≥ 1 satisfies loader validation.
 const DEFAULT_ONNX_OPSET_VERSION: i64 = 17;
-
-/// The ONNX default operator-set domain has two equivalent spellings: the empty
-/// string `""` and the explicit `"ai.onnx"`. They denote the SAME domain, so any
-/// opset-import comparison/dedup must treat them as one.
-fn is_default_domain(domain: &str) -> bool {
-    domain.is_empty() || domain == "ai.onnx"
-}
 
 /// Canonical map key for an opset-import domain: every spelling of the default
 /// domain collapses to a single key so duplicates cannot survive merging.

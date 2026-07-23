@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use onnx_runtime_ir::{DataType, Dim, Node, SymbolId, ValueId};
+use onnx_runtime_ir::{DataType, Dim, Node, SymbolId, ValueId, normalize_domain};
 
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
@@ -263,17 +263,12 @@ impl<'a> InferenceContext<'a> {
     }
 
     /// The imported opset version for `domain` (the default `""`/`ai.onnx`
-    /// domain falls back to the highest imported ai.onnx version, else `1`).
+    /// domain resolves to the canonical `""` key, else `1`).
     pub fn opset(&self, domain: &str) -> u64 {
-        if domain.is_empty() || domain == "ai.onnx" {
-            self.opset_imports
-                .get("")
-                .or_else(|| self.opset_imports.get("ai.onnx"))
-                .copied()
-                .unwrap_or(1)
-        } else {
-            self.opset_imports.get(domain).copied().unwrap_or(1)
-        }
+        self.opset_imports
+            .get(normalize_domain(domain))
+            .copied()
+            .unwrap_or(1)
     }
 
     /// Mint a fresh opaque dimension.

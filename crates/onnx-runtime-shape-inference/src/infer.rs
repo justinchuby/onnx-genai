@@ -212,7 +212,7 @@ impl InferenceRegistry {
 }
 
 fn is_standard_if(node: &Node) -> bool {
-    node.op_type == "If" && (node.domain.is_empty() || node.domain == "ai.onnx")
+    node.op_type == "If" && node.is_default_domain()
 }
 
 fn infer_if_outputs(

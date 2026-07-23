@@ -617,13 +617,11 @@ fn display_domain(domain: &str) -> String {
 pub fn validate_no_control_flow(graph: &Graph) -> Result<(), LoaderError> {
     use onnx_runtime_ir::Attribute;
 
-    fn is_default_domain(domain: &str) -> bool {
-        domain.is_empty() || domain == "ai.onnx"
-    }
-
     /// The standard subgraph-bearing ops the CPU executor can run recursively.
+    ///
+    /// Operates on loaded IR, where the default domain is canonically `""`.
     fn is_implemented_control_flow(op_type: &str, domain: &str) -> bool {
-        is_default_domain(domain) && matches!(op_type, "If" | "Loop" | "Scan")
+        domain.is_empty() && matches!(op_type, "If" | "Loop" | "Scan")
     }
 
     fn check_graph(graph: &Graph) -> Result<(), LoaderError> {
@@ -745,10 +743,11 @@ pub fn validate_no_initializer_producer(graph: &Graph) -> Result<(), LoaderError
 /// ONNX treats `""` and `"ai.onnx"` as equivalent spellings of the default
 /// domain. Model-level imports also govern nodes nested in subgraphs.
 pub fn validate_opset_imports(graph: &Graph) -> Result<(), LoaderError> {
+    // Loaded IR is canonical: the default domain is `""` for both node domains
+    // and opset-import keys, so a direct lookup suffices (no dual-spelling
+    // fallback needed — see `onnx_runtime_ir::normalize_domain`).
     fn has_import(imports: &std::collections::HashMap<String, u64>, domain: &str) -> bool {
         imports.contains_key(domain)
-            || (domain.is_empty() && imports.contains_key("ai.onnx"))
-            || (domain == "ai.onnx" && imports.contains_key(""))
     }
 
     fn validate_graph(

@@ -1039,23 +1039,13 @@ fn checked_storage_bytes(
 }
 
 /// The effective operator-set version governing `node` — the graph's imported
-/// opset for the node's domain. The default ONNX domain is spelled both `""`
-/// and `"ai.onnx"`; both map to the same import. Loader and programmatic session
-/// entry points validate this invariant before executor construction.
+/// opset for the node's domain. Loaded IR is canonical (the default domain is
+/// `""`, never `"ai.onnx"`; see [`onnx_runtime_ir::normalize_domain`]), so the
+/// node's domain keys directly into the opset-import map.
 fn effective_opset(graph: &Graph, node: &Node) -> u64 {
-    let domain = node.domain.as_str();
     graph
         .opset_imports
-        .get(domain)
-        .or_else(|| {
-            if domain.is_empty() {
-                graph.opset_imports.get("ai.onnx")
-            } else if domain == "ai.onnx" {
-                graph.opset_imports.get("")
-            } else {
-                None
-            }
-        })
+        .get(node.domain.as_str())
         .copied()
         .unwrap_or_else(|| {
             unreachable!(
@@ -1134,7 +1124,7 @@ fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
     // graphs intentionally read Shape at the allocation extent and ReduceSum is
     // unchanged by that suffix; prefix-sensitive transforms such as CumSum must
     // instead see the logical valid length.
-    (node.domain.is_empty() || node.domain == "ai.onnx")
+    node.domain.is_empty()
         && input_index == 0
         && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
 }
@@ -1146,7 +1136,7 @@ fn runtime_elementwise_output_shape(
     node: &Node,
     input_shapes: &[Vec<usize>],
 ) -> Option<std::result::Result<Vec<usize>, onnx_runtime_ir::IrError>> {
-    if !(node.domain.is_empty() || node.domain == "ai.onnx") {
+    if !node.domain.is_empty() {
         return None;
     }
 
@@ -1192,7 +1182,7 @@ fn dynamic_output_shapes(
         // per-axis element count mirrors the `Slice` kernel's clamp semantics
         // exactly (ONNX reference), so the buffer we size here matches what the
         // kernel writes.
-        "Slice" if node.domain.is_empty() || node.domain == "ai.onnx" => {
+        "Slice" if node.domain.is_empty() => {
             let data_shape = input_shapes.first()?;
             let starts = input_values.get(1)?.as_ref()?;
             let ends = input_values.get(2)?.as_ref()?;
@@ -1294,12 +1284,7 @@ fn dynamic_output_shapes(
                 })
                 .collect::<Option<Vec<_>>>()?;
             let mut imports = HashMap::new();
-            let domain = if node.domain == "ai.onnx" {
-                String::new()
-            } else {
-                node.domain.clone()
-            };
-            imports.insert(domain, opset);
+            imports.insert(node.domain.clone(), opset);
             let mut interner = SymbolInterner::new(0x8000_0000);
             static REGISTRY: std::sync::OnceLock<InferenceRegistry> = std::sync::OnceLock::new();
             REGISTRY
@@ -1330,7 +1315,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         .iter()
         .filter_map(|(id, node)| {
             (node.op_type == "Sigmoid"
-                && (node.domain.is_empty() || node.domain == "ai.onnx")
+                && node.domain.is_empty()
                 && node.inputs.len() == 1
                 && node.outputs.len() == 1)
                 .then_some(id)
@@ -1356,7 +1341,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         let mul_id = consumers[0];
         let mul = graph.node(mul_id);
         if mul.op_type != "Mul"
-            || !(mul.domain.is_empty() || mul.domain == "ai.onnx")
+            || !mul.domain.is_empty()
             || mul.inputs.len() != 2
             || mul.outputs.len() != 1
             || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
@@ -4368,7 +4353,7 @@ fn scan_list_attr(node: &Node, name: &str, count: usize, default: i64) -> Result
 /// domain). Kept in lock-step with the loader's `validate_no_control_flow`
 /// allow-list.
 fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
-    (domain.is_empty() || domain == "ai.onnx") && matches!(op_type, "If" | "Loop" | "Scan")
+    domain.is_empty() && matches!(op_type, "If" | "Loop" | "Scan")
 }
 
 /// Whether `(op_type, domain)` is an ONNX **Sequence** op the executor handles
@@ -4378,7 +4363,7 @@ fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
 /// runtime value. Kept as a small self-contained routing predicate (mirroring
 /// [`is_control_flow_op`]) so it never collides with the EP kernel registry.
 fn is_sequence_op(op_type: &str, domain: &str) -> bool {
-    (domain.is_empty() || domain == "ai.onnx")
+    domain.is_empty()
         && matches!(
             op_type,
             "SequenceEmpty"
@@ -4395,7 +4380,7 @@ fn is_sequence_op(op_type: &str, domain: &str) -> bool {
 /// Whether a Sequence op yields a *sequence* value (vs. a tensor). Used at build
 /// to mark sequence-typed values so they are excluded from tensor buffer sizing.
 fn produces_sequence_output(op_type: &str, domain: &str) -> bool {
-    (domain.is_empty() || domain == "ai.onnx")
+    domain.is_empty()
         && matches!(
             op_type,
             "SequenceEmpty"
@@ -7316,7 +7301,6 @@ mod tests {
             vec![Some(ValueId(0)), Some(ValueId(1))],
             vec![ValueId(2)],
         );
-        input_axes.domain = "ai.onnx".into();
         assert_eq!(
             dynamic_output_shapes(
                 &input_axes,

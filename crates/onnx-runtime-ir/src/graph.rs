@@ -377,6 +377,29 @@ impl Graph {
 
     // === Mutation API ===
 
+    /// Canonicalize the default ONNX operator domain to `""` throughout this
+    /// graph (nodes, opset-import keys) and recursively in every subgraph.
+    ///
+    /// After this pass the graph satisfies the post-load invariant: the default
+    /// domain is always the empty string; `"ai.onnx"` never appears. The loader
+    /// establishes this at proto-materialization time; this method lets
+    /// programmatic graph builders reach the same canonical form before session
+    /// construction. See [`crate::normalize_domain`].
+    pub fn normalize_domains(&mut self) {
+        for node in self.nodes.values_mut() {
+            if node.domain == crate::AI_ONNX_DOMAIN {
+                node.domain.clear();
+            }
+        }
+        if let Some(version) = self.opset_imports.remove(crate::AI_ONNX_DOMAIN) {
+            let entry = self.opset_imports.entry(String::new()).or_insert(version);
+            *entry = (*entry).max(version);
+        }
+        for subgraph in self.subgraphs.values_mut() {
+            subgraph.normalize_domains();
+        }
+    }
+
     /// Insert a node, wiring its producer/consumer edges. The node's `id`
     /// field is overwritten with the freshly allocated [`NodeId`].
     pub fn insert_node(&mut self, node: Node) -> NodeId {

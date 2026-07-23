@@ -76,6 +76,17 @@ impl Node {
     pub fn attr(&self, name: &str) -> Option<&Attribute> {
         self.attributes.get(name)
     }
+
+    /// Whether this node belongs to the default ONNX operator domain.
+    ///
+    /// Relies on the post-load invariant that the loader canonicalizes the
+    /// default domain to `""` (see [`crate::normalize_domain`]), so this is a
+    /// simple emptiness test — the `"ai.onnx"` spelling never reaches loaded IR.
+    #[inline]
+    #[must_use]
+    pub fn is_default_domain(&self) -> bool {
+        self.domain.is_empty()
+    }
 }
 
 /// An ONNX operator attribute. Covers all attribute value kinds.

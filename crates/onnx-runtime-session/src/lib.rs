@@ -801,6 +801,13 @@ impl InferenceSession {
         model_metadata: ModelMetadata,
         ep: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
     ) -> Result<Self> {
+        // Establish the canonical-domain invariant for programmatically built
+        // graphs (the loader already normalizes at proto-materialization time):
+        // the default ONNX domain is `""`, never `"ai.onnx"`. The executor and
+        // validators rely on this, comparing `domain.is_empty()` directly.
+        let mut graph = graph;
+        graph.normalize_domains();
+
         onnx_runtime_loader::validate_model(&graph)?;
 
         let inputs = io_meta(&graph, &graph.inputs);
