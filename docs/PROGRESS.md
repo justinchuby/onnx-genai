@@ -4,9 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T09:10Z — CUDA perf wave 2 complete: f16/bf16 IndexShare, engine build-fix + MoE fixture, SwiGLU-RMS fusion (7B +23.5%, native beats ORT on all Qwen), Phi cast-fold (eager +25%). Wave 3 in flight: Qwen1.5B native-vs-ORT decode divergence root-cause + Phi captured-path GQA._
+_Last updated: 2026-07-23T11:28Z — Phi int8 RMSNorm-GEMV fusion milestone and five-model H200 ladder._
 
-**Current `origin/main` implementation HEAD:** `17ac19f` (after the CUDA perf wave 2 batch + Phi cast-fold).
+**Current `origin/main` implementation HEAD:** `c34f813` (Phi int8 RMSNorm-GEMV fusion).
+
+## 2026-07-23 — Post-int8-fused native CUDA milestone
+
+- **Five-model H200 ladder:** native beats ORT GenAI 0.14.1 on every Qwen control — 0.5B **819.42 vs 741.83 (+10.46%)**, 1.5B **584.45 vs 487.14 (+19.98%)**, and 7B **287.03 vs 267.23 (+7.41%)** — with the prior symmetric-int4 occupancy regression fixed. DeepSeek-Coder-1.3B reaches **728.26 vs 646.88 (+12.58%)**, the first non-Qwen-family model proven to beat ORT on the native CUDA EP.
+- **Phi gap compression:** Phi-4-mini reaches **171.16 tok/s**, reducing its ORT gap from **-59.86%** at session start to **-25.46%**. The landed sequence is fp32-gamma norm vectorization (`8a0814e`), int8 GEMV vectorization (`cf65ea7`), block-128 MatMulNBits (`c04a622`), three-segment graph capture (`4372f1b`), asymmetric-int4 zero-point SwiGLU-RMS fusion (`2715151`), symmetric-int4 specialization (`12efc92`), and int8 RMSNorm-GEMV fusion (`c34f813`). Full fusion ON/OFF is 171.16/162.78 tok/s (**+5.15%**).
+- **New bottleneck:** captured-decode Nsight profiling shows zero-point int4 GEMV variants at **54.7%** combined, dominated by the fused gate-up/SwiGLU/RMSNorm kernel at **31.9%**. The old standalone skip-RMSNorm hotspot is gone; remaining standalone int8 GEMV is 13.3% and aggregate GQA is 12.7%.
+- **GLM/DeepSeek enablement:** dense Llama-style DeepSeek-Coder is runnable with one captured segment and zero fallbacks. GLM and dense DeepSeek-V2/V3 plumbing is available, while MoE execution remains blocked on the QMoE/BlockQuantizedMoE packer. Current main tracks the underlying operator gaps in `docs/GLM_READINESS_GAPS.md`; the requested consolidated `docs/glm-deepseek-enablement.md` is not present at `c34f813`.
 
 ### ⚠️ Open correctness finding (2026-07-23): Qwen2.5-1.5B native decode diverges from ORT
 

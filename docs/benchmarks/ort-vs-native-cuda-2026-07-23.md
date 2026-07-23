@@ -20,6 +20,59 @@ capture, 30 replays, zero fallbacks, and coherent greedy text. The ORT values
 are the existing authoritative 0.14.1 medians in the post-fusion table below.
 Deltas are `(native - ORT) / ORT * 100`.
 
+## Post-int8-fused @ c34f813 — 2026-07-23
+
+This milestone adds the Phi int8 qkv/down RMSNorm-GEMV fusion on top of the
+zero-point-aware SwiGLU-RMS fusion. Measurements used physical GPU 5
+(NVIDIA H200), one warmup, three 120-token steady windows after skipping the
+first eight emitted tokens, and CUDA graph/device-KV enabled.
+
+| Model | Native tok/s (median of 3) | ORT 0.14.1 tok/s | Delta | Coherent? | Segments / fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| Qwen2.5-0.5B int4 | 819.42 | 741.83 | **+10.46%** | Yes | 1 / 0 |
+| Qwen2.5-1.5B int4 | 584.45 | 487.14 | **+19.98%** | Deterministic; repetitive | 1 / 0 |
+| Qwen2.5-7B int4 | 287.03 | 267.23 | **+7.41%** | Yes | 1 / 0 |
+| DeepSeek-Coder-1.3B int4 | 728.26 | 646.88 | **+12.58%** | Yes; coherent code | 1 / 0 |
+| Phi-4-mini int4/int8 | 171.16 | 229.62 | **-25.46%** | Yes | 3 / 0 |
+
+The DeepSeek-Coder value is the dedicated native/ORT CUDA-graph comparison;
+a `c34f813` regression guard measured 730.20/729.41/729.39 tok/s (median
+729.41), confirming it remains intact. Native samples for the other rows were
+819.39/819.48/819.42, 584.45/584.54/584.07,
+287.06/286.47/287.03, and 170.31/174.57/171.16 respectively. No sample was
+discarded as an obvious outlier. Diagnostics reported one measured capture,
+zero fallbacks, and zero KV transfers for every model; Phi retains three
+captured segments around its two control-flow seams. Sampled host load averages
+ranged from 1.62 to 2.38, and physical GPU 5 remained exclusive.
+
+### Phi full-fusion A/B
+
+On `c34f813`, Phi fusion ON is **171.16 tok/s** versus **162.78 tok/s** with
+`ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION=1`, an exact **+5.15%** full-fusion
+gain. The complete optimization stack is **+25.40%** versus the clean
+`4372f1b` pre-fusion baseline of 136.49 tok/s.
+
+### Nsight Systems captured-decode profile
+
+`nsys profile --cuda-graph-trace=node` over a 64-token Phi run exposed the
+captured graph-node kernels. GPU kernel time is now:
+
+| Kernel | GPU kernel time |
+|---|---:|
+| zero-point fused gate-up/SwiGLU/RMSNorm int4 GEMV | **31.9%** |
+| zero-point fused int8 GEMV + RMSNorm | **18.5%** |
+| zero-point int4 GEMV | **15.7%** |
+| remaining standalone int8 GEMV | **13.3%** |
+| GQA attention + prep + merge | **12.7%** |
+| zero-point int4 GEMV + RMSNorm | **7.1%** |
+
+The former standalone `skip_rmsnorm_f16_warp_half4` hotspot is absent from
+captured decode, confirming the int8 fusion landed. Int4 GEMV variants now
+consume **54.7%** in aggregate, led by the 31.9% fused gate-up kernel.
+Optimizing its zero-point int4 dequantization/GEMV is therefore the highest
+impact next lever; the remaining standalone int8 down-projection is a smaller
+13.3% follow-up, approximately tied with aggregate GQA.
+
 ## f0af865 baseline
 
 | Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 | Smoothness |
