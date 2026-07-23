@@ -30,6 +30,7 @@ const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
 const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
+const GEMV_F16_FLEX_BLOCK_ENTRY: &str = "matmul_nbits_gemv_f16_flex_block";
 const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
 const GEMM_F16_ENTRY: &str = "matmul_nbits_gemm_f16";
 const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
@@ -490,6 +491,9 @@ extern "C" __global__ void matmul_nbits_gemm_f16(
     const int k,
     const int n,
     const int k_blocks,
+    const int block_size,
+    const int blob_size,
+    const int zp_row_bytes,
     const int bits,
     const int scales_fp16,
     const int bias_post_round)
@@ -501,12 +505,13 @@ extern "C" __global__ void matmul_nbits_gemm_f16(
     const int column = (int)blockIdx.x * 16 + (int)threadIdx.x;
     float value = 0.0f;
 
-    for (int block = 0; block < k_blocks; ++block) {
+    const int k_tiles = (k + 31) / 32;
+    for (int tile = 0; tile < k_tiles; ++tile) {
 #pragma unroll
         for (int load = tid; load < 16 * 32; load += 16 * 16) {
             const int tile_row = load >> 5;
             const int within = load & 31;
-            const int depth = block * 32 + within;
+            const int depth = tile * 32 + within;
             const int global_row = (int)blockIdx.y * 16 + tile_row;
             activation_tile[tile_row][within] =
                 global_row < m && depth < k
@@ -518,9 +523,11 @@ extern "C" __global__ void matmul_nbits_gemm_f16(
             const int tile_column = load >> 5;
             const int within = load & 31;
             const int global_column = (int)blockIdx.x * 16 + tile_column;
-            const int depth = block * 32 + within;
+            const int depth = tile * 32 + within;
             float weight = 0.0f;
             if (global_column < n && depth < k) {
+                const int block = depth / block_size;
+                const int block_within = depth - block * block_size;
                 const long scale_index = (long)global_column * k_blocks + block;
                 const float scale = scales_fp16
                     ? __half2float(
@@ -529,15 +536,14 @@ extern "C" __global__ void matmul_nbits_gemm_f16(
                 int quantized;
                 int zero_point;
                 if (bits == 8) {
-                    quantized = (int)packed[scale_index * 32 + within];
+                    quantized = (int)packed[scale_index * blob_size + block_within];
                     zero_point = zero_points ? (int)zero_points[scale_index] : 128;
                 } else {
                     const unsigned char byte =
-                        packed[scale_index * 16 + (within >> 1)];
-                    quantized = (within & 1) ? (byte >> 4) : (byte & 15);
+                        packed[scale_index * blob_size + (block_within >> 1)];
+                    quantized = (block_within & 1) ? (byte >> 4) : (byte & 15);
                     zero_point = 8;
                     if (zero_points) {
-                        const int zp_row_bytes = (k_blocks + 1) >> 1;
                         const unsigned char zp =
                             zero_points[(long)global_column * zp_row_bytes + (block >> 1)];
                         zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
@@ -854,6 +860,59 @@ extern "C" __global__ void matmul_nbits_gemv_f16(
         }
     }
 
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// Correctness fallback for packed-int4 block sizes other than 32. One warp
+// computes an output column and indexes scales/zero-points by depth/block_size.
+// This keeps the block-32 vectorized kernels unchanged while supporting common
+// GPTQ/AWQ block-128 exports without allocations or host synchronization.
+extern "C" __global__ void matmul_nbits_gemv_f16_flex_block(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    float value = 0.0f;
+    if (column < n) {
+        for (int depth = lane; depth < k; depth += 32) {
+            const int block = depth / block_size;
+            const int within = depth - block * block_size;
+            const unsigned char byte =
+                packed[((long)column * k_blocks + block) * blob_size + within / 2];
+            const int quantized = (within & 1) ? (byte >> 4) : (byte & 15);
+            int zero_point = 8;
+            if (zero_points) {
+                const unsigned char zp =
+                    zero_points[(long)column * zp_row_bytes + block / 2];
+                zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+            }
+            const long scale_index = (long)column * k_blocks + block;
+            const float scale = scales_fp16
+                ? __half2float(reinterpret_cast<const __half*>(scales)[scale_index])
+                : reinterpret_cast<const float*>(scales)[scale_index];
+            value += __half2float(activation[depth])
+                * ((float)quantized - (float)zero_point) * scale;
+        }
+    }
     value = warp_sum(value);
     if (lane == 0 && column < n) {
         output[column] = fold_bias_f16(value, bias, column, bias_post_round);
@@ -1183,6 +1242,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum F16GemvVariant {
     General,
+    FlexibleBlock,
     DownProjection,
 }
 
@@ -1222,6 +1282,12 @@ fn select_f16_gemv_variant(
     scales_fp16: bool,
     has_zero_points: bool,
 ) -> F16GemvSelection {
+    if block_size != GEMV_F16_DOWN_BLOCK_SIZE {
+        return F16GemvSelection {
+            variant: F16GemvVariant::FlexibleBlock,
+            reason: "variant=flexible_block;packed-int4 scale indexing follows depth/block_size",
+        };
+    }
     let staged_smem = k * std::mem::size_of::<half::f16>() + GEMV_F16_DOWN_STATIC_SMEM_BYTES;
     let down_eligible = !has_zero_points
         && scales_fp16
@@ -1686,11 +1752,11 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
-        if self.block_size != 32 {
+        if self.bits == 8 && self.block_size != 32 {
             return Err(error(format!(
-                "MatMulNBits CUDA fp16 activations received block_size={}. Why: the native fp16 \
-                 decode and prefill kernels implement the block-32 packed layout. How to fix: \
-                 export block_size=32, provide f32 activations, or select another execution provider",
+                "MatMulNBits CUDA fp16 int8 activations received block_size={}. Why: the native \
+                 int8 decode kernel implements the block-32 packed layout. How to fix: export \
+                 int8 block_size=32, use int4, provide f32 activations, or select another execution provider",
                 self.block_size
             )));
         }
@@ -1711,11 +1777,12 @@ impl MatMulNBitsKernel {
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemm_f16_tiled",
-                "M={} prefill: fp16 activation, bits={}, block_size=32, zero_points={}, \
+                "M={} prefill: fp16 activation, bits={}, block_size={}, zero_points={}, \
                  scales={} → portable 16x16 CUDA-core tiled GEMM with fp32 accumulation; \
                  not advertised as CUDA-graph capture-safe",
                 m,
                 self.bits,
+                self.block_size,
                 zero_points.is_some(),
                 if scales_fp16 { "fp16" } else { "fp32" }
             );
@@ -1797,6 +1864,12 @@ impl MatMulNBitsKernel {
         let k = as_i32("K", self.k)?;
         let n = as_i32("N", self.n)?;
         let k_blocks = as_i32("K block count", k_blocks)?;
+        let block_size = as_i32("block_size", self.block_size)?;
+        let blob_size = as_i32("block blob size", self.block_size * self.bits / 8)?;
+        let zp_row_bytes = as_i32(
+            "zero-point row byte count",
+            (k_blocks as usize * self.bits).div_ceil(8),
+        )?;
         let bits = as_i32("bits", self.bits)?;
         let scales_fp16_flag = scales_fp16 as i32;
         let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
@@ -1816,10 +1889,13 @@ impl MatMulNBitsKernel {
             .arg(&k)
             .arg(&n)
             .arg(&k_blocks)
+            .arg(&block_size)
+            .arg(&blob_size)
+            .arg(&zp_row_bytes)
             .arg(&bits)
             .arg(&scales_fp16_flag)
             .arg(&bias_post_round_flag);
-        // SAFETY: dense block-32 tensors and all dimensions were validated
+        // SAFETY: dense block-quantized tensors and all dimensions were validated
         // above. The 16x16 CTA uses 4 KiB of statically sized shared memory,
         // ordinary fp32 CUDA-core arithmetic, and fp16 conversions only. It has
         // no tensor-core/PTX/cp.async dependency, so the same path is the
@@ -2156,6 +2232,7 @@ impl MatMulNBitsKernel {
         );
         let variant_name = match selection.variant {
             F16GemvVariant::DownProjection => "gemv_f16_down_projection",
+            F16GemvVariant::FlexibleBlock => "gemv_f16_flexible_block",
             F16GemvVariant::General => "gemv_f16_general",
         };
         onnx_runtime_ep_api::record_kernel_variant!(
@@ -2214,6 +2291,7 @@ impl MatMulNBitsKernel {
             .require_nvrtc_half_headers("MatMulNBits fp16 GEMV")?;
         let entry = match selection.variant {
             F16GemvVariant::DownProjection => GEMV_F16_DOWN_ENTRY,
+            F16GemvVariant::FlexibleBlock => GEMV_F16_FLEX_BLOCK_ENTRY,
             F16GemvVariant::General if scales_fp16 && zero_points.is_none() => {
                 GEMV_F16_SCALES_F16_ENTRY
             }
@@ -2246,7 +2324,7 @@ impl MatMulNBitsKernel {
                 GEMV_F16_DOWN_COLUMNS_PER_BLOCK,
                 (self.k * std::mem::size_of::<half::f16>()) as u32,
             ),
-            F16GemvVariant::General => {
+            F16GemvVariant::FlexibleBlock | F16GemvVariant::General => {
                 let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
                     GEMV_F16_SMALL_THREADS
                 } else {
@@ -2271,7 +2349,7 @@ impl MatMulNBitsKernel {
             .arg(&zp_row_bytes)
             .arg(&scales_fp16_flag)
             .arg(&bias_post_round_flag);
-        // SAFETY: this path is restricted to block-32 M=1 fp16 inputs; all tensors
+        // SAFETY: this path is restricted to packed-int4 M=1 fp16 inputs; all tensors
         // were dtype/shape/contiguity validated above, including the optional
         // packed per-block zero-point rows. The scalar ABI matches the selected
         // fp16 GEMV entry point. Both variants use only registers and launch-time
@@ -2764,7 +2842,7 @@ mod tests {
     /// f32-) rounded scales, so the residual covers only the kernel's documented
     /// accumulation precision and fp16 output rounding — not input quantization,
     /// which both sides share.
-    fn run_parity(scales_fp16: bool, with_bias: bool) -> (f32, f32, f32, bool) {
+    fn run_parity(block_size: usize, scales_fp16: bool, with_bias: bool) -> (f32, f32, f32, bool) {
         let Some(runtime) = runtime() else {
             eprintln!("skipping MatMulNBits fp16 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
@@ -2777,11 +2855,10 @@ mod tests {
             return (0.0, 0.0, 0.0, true);
         }
 
-        // K spans 128 block-32 groups (contraction depth 4096, near the model's
-        // widest hidden path), N covers several 8-column CTAs plus a ragged tail.
+        // K=4096 is representative of a wide hidden path and is divisible by
+        // both supported test block sizes. N covers several CTAs plus a tail.
         let k = 4096usize;
         let n = 70usize;
-        let block_size = 32usize;
         let k_blocks = k / block_size;
         let blob_size = block_size / 2;
 
@@ -2805,7 +2882,7 @@ mod tests {
         }
 
         // int4 quant codes (0..15), packed two nibbles per byte in the exact
-        // symmetric block-32 layout the kernel unpacks.
+        // symmetric low-nibble-first layout the kernel unpacks.
         let mut quant = vec![0u8; n * k];
         for value in quant.iter_mut() {
             *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
@@ -3204,14 +3281,14 @@ mod tests {
         }
 
         // Wide (N>=K) projections, oversized-K (activation exceeds the 48 KiB
-        // smem budget), non-multiple-of-32 K, and non-block-32 all fall back.
+        // smem budget), and non-multiple-of-32 K fall back to the block-32
+        // general kernel. Other block sizes use the flexible-block kernel.
         let general_cases = [
             (896, 4864, 32, true),    // gate/up: N > K
             (896, 896, 32, true),     // square: K == N is not tall-skinny
             (896, 151_936, 32, true), // lm_head: N >> K
             (32_768, 4096, 32, true), // K*2 = 64 KiB > 48 KiB budget
             (4880, 896, 32, true),    // 4880 % 32 != 0
-            (4864, 896, 64, true),    // block_size != 32
         ];
         for (k, n, block_size, scales_fp16) in general_cases {
             let selection = select_f16_gemv_variant(k, n, block_size, scales_fp16, false);
@@ -3221,6 +3298,8 @@ mod tests {
                 "K={k}, N={n}, block_size={block_size} must retain the general GEMV"
             );
         }
+        let flexible = select_f16_gemv_variant(4864, 896, 128, true, false);
+        assert_eq!(flexible.variant, F16GemvVariant::FlexibleBlock);
 
         // fp32 scales are never down-eligible even for a tall-skinny shape.
         assert_eq!(
@@ -3241,12 +3320,13 @@ mod tests {
         let (mut worst_abs, mut worst_rel, mut max_out, mut all_finite) =
             (0.0f32, 0.0f32, 0.0f32, true);
         for (scales_fp16, with_bias) in [(false, false), (true, false), (true, true)] {
-            let (abs, rel, out, finite) = run_parity(scales_fp16, with_bias);
+            let (abs, rel, out, finite) = run_parity(32, scales_fp16, with_bias);
             worst_abs = worst_abs.max(abs);
             worst_rel = worst_rel.max(rel);
             max_out = max_out.max(out);
             all_finite &= finite;
         }
+
         // fp16 output ULP is 2^-11 (~4.9e-4) of a value's magnitude, so the
         // absolute error floor scales with the largest output component. Bound
         // the observed abs error against that magnitude with 2x headroom for the
@@ -3267,6 +3347,34 @@ mod tests {
         assert!(
             worst_rel < 5e-2,
             "fp16 GEMV diverged from dequant reference: max_rel={worst_rel:.3e}"
+        );
+    }
+
+    #[test]
+    fn fp16_block128_gemv_matches_dequant_reference() {
+        let mut worst_abs = 0.0f32;
+        let mut worst_rel = 0.0f32;
+        let mut max_out = 0.0f32;
+        let mut all_finite = true;
+        for (scales_fp16, with_bias) in [(false, false), (true, false), (true, true)] {
+            let (abs, rel, out, finite) = run_parity(128, scales_fp16, with_bias);
+            worst_abs = worst_abs.max(abs);
+            worst_rel = worst_rel.max(rel);
+            max_out = max_out.max(out);
+            all_finite &= finite;
+        }
+        let abs_bound = (max_out * 1e-3).max(1e-3);
+        assert!(
+            all_finite,
+            "block-128 fp16 GEMV produced a non-finite output"
+        );
+        assert!(
+            worst_abs < abs_bound,
+            "block-128 fp16 GEMV diverged: max_abs={worst_abs:.3e} bound={abs_bound:.3e}"
+        );
+        assert!(
+            worst_rel < 5e-2,
+            "block-128 fp16 GEMV diverged: max_rel={worst_rel:.3e}"
         );
     }
 
