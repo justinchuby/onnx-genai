@@ -169,6 +169,8 @@ DEFINE_SILU_MUL(float, f32)
 DEFINE_BINARY_I64(add, a[ai] + b[bi])
 DEFINE_BINARY_I64(sub, a[ai] - b[bi])
 DEFINE_BINARY_I64(mul, a[ai] * b[bi])
+DEFINE_BINARY_I64(min, a[ai] < b[bi] ? a[ai] : b[bi])
+DEFINE_BINARY_I64(max, a[ai] > b[bi] ? a[ai] : b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
@@ -682,8 +684,10 @@ impl BinaryKernel {
         let a = &inputs[0];
         let b = &inputs[1];
         let float_dtype = if a.dtype == DataType::Int64
-            && matches!(self.op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
-        {
+            && matches!(
+                self.op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Min | BinaryOp::Max
+            ) {
             None
         } else {
             Some(FloatDtype::from_onnx(op, "A", a.dtype)?)
@@ -1013,6 +1017,12 @@ mod tests {
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(float, f32)"));
         assert!(POINTWISE_SRC.contains("silu_mul_f16("));
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(__nv_bfloat16, bf16)"));
+        for op in ["add", "sub", "mul", "min", "max"] {
+            assert!(
+                POINTWISE_SRC.contains(&format!("DEFINE_BINARY_I64({op},")),
+                "missing int64 NVRTC generator for {op}"
+            );
+        }
     }
 
     #[test]

@@ -1129,6 +1129,16 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
         && matches!(input_index, 3 | 4)
 }
 
+fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
+    // Persistent decode masks have a zero-filled suffix. Capacity-oriented
+    // graphs intentionally read Shape at the allocation extent and ReduceSum is
+    // unchanged by that suffix; prefix-sensitive transforms such as CumSum must
+    // instead see the logical valid length.
+    (node.domain.is_empty() || node.domain == "ai.onnx")
+        && input_index == 0
+        && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
+}
+
 /// Recompute the output shape of standard elementwise broadcasting ops from
 /// their concrete runtime inputs. Loader inference is only a prior: a
 /// data-dependent upstream value may acquire a different live shape.
@@ -2062,11 +2072,13 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
-        let expose_logical_input_shape = output_name.is_some()
-            && self
-                .input_index
-                .get(&input_name)
-                .is_none_or(|&vid| !self.binding_consumers_use_physical_capacity(vid));
+        let expose_logical_input_shape = self.input_index.get(&input_name).is_none_or(|&vid| {
+            if output_name.is_some() {
+                !self.binding_consumers_use_physical_capacity(vid)
+            } else {
+                !self.binding_consumers_use_padded_capacity(vid)
+            }
+        });
         DeviceIoBinding::allocate(
             self.ep.clone(),
             input_name,
@@ -2107,6 +2119,22 @@ impl Executor {
                 }
                 found = true;
                 if !kernel_input_uses_physical_capacity(self.graph.node(plan.node_id), slot) {
+                    return false;
+                }
+            }
+        }
+        found
+    }
+
+    fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
+        let mut found = false;
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                found = true;
+                if !kernel_input_uses_padded_capacity(self.graph.node(plan.node_id), slot) {
                     return false;
                 }
             }
@@ -6212,6 +6240,20 @@ mod tests {
         assert!(kernel_input_uses_physical_capacity(&gqa, 4));
         assert!(!kernel_input_uses_physical_capacity(&gqa, 0));
         assert!(!kernel_input_uses_physical_capacity(&attention, 4));
+    }
+
+    #[test]
+    fn only_capacity_aware_inputs_keep_physical_capacity() {
+        let shape = Node::new(NodeId(0), "Shape", vec![], vec![]);
+        let reduce_sum = Node::new(NodeId(1), "ReduceSum", vec![], vec![]);
+        let cumsum = Node::new(NodeId(2), "CumSum", vec![], vec![]);
+        let unsqueeze = Node::new(NodeId(3), "Unsqueeze", vec![], vec![]);
+
+        assert!(kernel_input_uses_padded_capacity(&shape, 0));
+        assert!(kernel_input_uses_padded_capacity(&reduce_sum, 0));
+        assert!(!kernel_input_uses_padded_capacity(&cumsum, 0));
+        assert!(!kernel_input_uses_padded_capacity(&unsqueeze, 0));
+        assert!(!kernel_input_uses_padded_capacity(&shape, 1));
     }
 
     struct WeightDeliveryKernel {

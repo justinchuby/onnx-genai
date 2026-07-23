@@ -1914,6 +1914,13 @@ impl DecodeCudaState {
             vec![2],
         )?;
 
+        // A graph records launch geometry, so replay is unsafe when a persistent
+        // binding exposes a growing logical prefix instead of fixed capacity.
+        let graph_enabled = graph_enabled
+            && !bindings
+                .iter()
+                .any(|binding| binding.has_dynamic_logical_input_shape());
+
         Ok(Self {
             logical_len: 0,
             max_len,
