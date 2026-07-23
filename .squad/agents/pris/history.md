@@ -122,3 +122,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
+
+- 2026-07-22T23:20:00Z — Authored the persistent SPMD decode-pool profile/implementation; the default-off lever advanced native M=1 int4 decode to about 17.3 tok/s with bit parity, then entered review and revision.

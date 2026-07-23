@@ -109,3 +109,5 @@ Recorded the integration rejection and subsequent approval after dependency meta
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Chew's rejection of loader-IR shape authority directly informed the final Sapper WP-B3 v3 fix.
+
+2026-07-22T22:15:00Z — Approved Zhora’s `f8848c9` MatMulNBits f16/bf16 and topology tuning with non-blocking parity/regression follow-ups.

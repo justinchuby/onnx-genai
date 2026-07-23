@@ -3158,3 +3158,15 @@ A test-only `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1` override was added to `has
 **Validation:** 694 ep-cpu tests pass, clippy clean (linux + windows-gnu + darwin type-check). Bench: auto-enable engages on 2-node host, bit-identical tokens auto-vs-off, +21% by default (14.58 vs 12.02 tok/s).
 **Why:** User directive — CPU EP must be cross-OS AND cross-processor, and the NUMA win must ship by default. Closes gaps #1 (auto-enable), #2 (hardcoded tuning), #3 (f16 rejected), #5 (GQA tests non-portable), #7 (cgroup cpuset) from Rachael's audit.
 **Owed follow-ups:** f16 for SkipSimplifiedLayerNormalization + other decode ops (full cuda-gpu f16 model); MLAS-routed f16 parity test; cross-target Windows/macOS CI runners; >64-CPU multigroup Windows validation.
+
+<!-- scribe-merge-2026-07-22T23-20-00Z-spmd-lever -->
+## 2026-07-22 — Persistent SPMD CPU decode pool landed
+
+**By:** Pris; revised by Sebastian after Chew rejection; re-reviewed by Chew and Gaff
+**What:** Landed `cee3c20` on `perf/cpu-ep-mlas`: an opt-in, default-off persistent SPMD worker pool for native CPU packed-int4 M=1 decode, enabled only with `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`. The pool reuses existing MLAS/packed-int4 GEMV math while replacing repeated per-op fork/join dispatch; `numa-split` retains explicit precedence when both modes are available and the runtime logs the selected mode once.
+
+**Why:** Profiling found roughly 141 `MatMulNBits` fork/join regions per decoded token and identified barrier/dispatch plus memory latency—not GEMV arithmetic—as the limiting costs. Interleaved noisy-host measurements put persistent SPMD at about 17.3–18.0 tok/s median versus about 16.2–16.4 for `numa-split` (roughly 7% gain); generated IDs and per-op f32 output remained byte-identical.
+
+**Safety and validation:** Sebastian's locked-out revision added a real subprocess ON/OFF parity regression using six sequential packed-int4 M=1 operations and 31 workers, asserts all ON operations dispatch through SPMD, documents precedence/fallback behavior, replaces the erased-job `transmute` with a pointer/trampoline, and makes worker panics poison the pool while releasing the pending barrier rather than hanging. CPU EP validation reported 698 unit tests plus 10 numeric regressions, clean MLAS clippy, 30/30 SPMD stress runs, and a 64-token native ON/OFF ID check. Chew approved the revised blocking requirements; Gaff approved with only non-blocking concurrency follow-up notes.
+
+**Sources reconciled:** `pris-decode-profile.md`, `pris-decode-barrier.md`, `sebastian-spmd-revision.md`, and `chew-spmd-rereview.md`. The earlier tracked Bryant NUMA, Holden portable-GQA, and Zhora dtype/topology notes were already present verbatim in this ledger and were deduplicated.
