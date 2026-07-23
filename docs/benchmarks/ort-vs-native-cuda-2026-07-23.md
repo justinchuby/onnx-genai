@@ -250,8 +250,35 @@ the authoritative five-run Phi samples were
 186.53/189.75/186.35/190.52/188.54 tok/s (median 188.54). Physical GPU 5
 remained exclusive throughout.
 
-*Phi may gain a further increment from an in-flight fused-int8 split-K
-(Deckard) — to be appended.*
+## Phi stacked prefetch + standalone int8 split-K @ 4e774ee — 2026-07-23
+
+This re-benchmark stacks both cumulative Phi levers: fused gate-up asymmetric
+int4 weight software-prefetch (`76e35b2`) and standalone grid-starved int8-zp
+split-K (`4e774ee`). Native CUDA used physical GPU 5, two warmups, and seven
+120-token steady windows after the eight-token exclusion.
+
+| Model | Native tok/s | ORT GenAI 0.14.1 tok/s | Delta | Coherent? | Fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| Phi-4-mini int4/int8 | **193.32** | 229.62 | **-15.81%** | Yes | **0** |
+
+Phi samples were
+194.67/191.62/194.36/193.32/189.46/194.30/121.21 tok/s: median **193.32**
+over seven runs, full spread **121.21--194.67**. The final sample overlapped
+host contention and was retained rather than discarded; the median is
+**+2.54%** over the prior 188.54 tok/s prefetch-only milestone. A separate
+diagnostic generation reported one measured capture, 125 replays, zero
+fallbacks, zero KV transfers, and coherent output beginning `" Paris."`.
+
+The in-tree ORT profiler does not expose the same steady-decode callback window,
+so this section retains the documented canonical Phi ORT 0.14.1 reference of
+229.62 tok/s rather than presenting a non-comparable re-measurement.
+
+Quick native regression guards remained within noise of the comprehensive
+refresh: Qwen2.5-1.5B measured **617.90 tok/s** (617.35--617.93, median of 3)
+versus approximately 622, and DeepSeek-R1-Distill-Qwen-1.5B measured
+**622.66 tok/s** (622.58--623.12, median of 3) versus approximately 622.
+The host is shared with CPU benchmark jobs, so the wide Phi range is reported
+as contention variance, not attributed to a kernel regression.
 
 ## f0af865 baseline
 

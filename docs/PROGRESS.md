@@ -4,15 +4,15 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T13:21Z — comprehensive CUDA matrix and GLM-5.2 QMoE E2E._
+_Last updated: 2026-07-23T14:45Z — Phi stacked prefetch + standalone int8 split-K re-benchmark._
 
-**Current `origin/main` implementation HEAD:** `bd05b75` (GLM-5.2 logical-mask correctness after graph-capturable QMoE).
+**Current `origin/main` implementation HEAD:** `4e774ee` (standalone Phi int8-zp split-K on the cumulative CUDA stack).
 
 ## 2026-07-23 — Post-int8-fused native CUDA milestone
 
 - **Comprehensive H200 ladder:** native beats fresh ORT GenAI 0.14.1 medians on Qwen2.5-0.5B **(+22.48%)**, 1.5B **(+28.04%)**, and 7B **(+4.03%)**; DeepSeek-Coder-1.3B **(+21.27%)**; and DeepSeek-R1-Distill-Qwen-1.5B **(+27.56%)**. All native runs use zero fallbacks.
-- **Phi gap compression:** Phi-4-mini reaches **188.54 tok/s**, reducing its ORT gap from **-59.86%** at session start to **-17.89%**. The landed sequence is fp32-gamma norm vectorization (`8a0814e`), int8 GEMV vectorization (`cf65ea7`), block-128 MatMulNBits (`c04a622`), three-segment graph capture (`4372f1b`), asymmetric-int4 zero-point SwiGLU-RMS fusion (`2715151`), symmetric-int4 specialization (`12efc92`), int8 RMSNorm-GEMV fusion (`c34f813`), asymmetric-zero-point split-K int4 GEMV (`caaf85a`), occupancy-aware GQA decode (`d8dd707`), and fused gate-up software prefetch (`76e35b2`).
-- **Current Phi bottleneck:** the latest captured-decode profile predates the software prefetch but identifies fused gate-up/SwiGLU/RMSNorm zero-point int4 as the leading kernel at 33.3%. An in-flight fused-int8 split-K is the next expected increment.
+- **Phi gap compression:** Phi-4-mini reaches **193.32 tok/s** (seven-run median, 121.21--194.67 spread under shared-host contention), reducing its ORT gap from **-59.86%** at session start to **-15.81%**. The landed sequence is fp32-gamma norm vectorization (`8a0814e`), int8 GEMV vectorization (`cf65ea7`), block-128 MatMulNBits (`c04a622`), three-segment graph capture (`4372f1b`), asymmetric-int4 zero-point SwiGLU-RMS fusion (`2715151`), symmetric-int4 specialization (`12efc92`), int8 RMSNorm-GEMV fusion (`c34f813`), asymmetric-zero-point split-K int4 GEMV (`caaf85a`), occupancy-aware GQA decode (`d8dd707`), fused gate-up software prefetch (`76e35b2`), and standalone int8-zp split-K (`4e774ee`). The last two levers are cumulative; the stacked result is **+2.54%** over the 188.54 tok/s prefetch-only milestone, with zero fallbacks and coherent output.
+- **Current Phi bottleneck:** the latest captured-decode allocation predates the two final kernel levers; refresh profiling before selecting the next optimization target.
 - **GLM/DeepSeek model support:** GLM-4-9B runs coherently at **120.80 tok/s**, one captured segment, zero fallbacks; ORT GenAI 0.14.1 cannot load its partial-RoPE GQA schema. GLM-5.2 tiny dense (**70.63 tok/s**), q4 (**148.58 tok/s**), and fused QMoE (**174.41 tok/s**) now execute DSA indexing and decode end-to-end on native CUDA with zero fallbacks. QMoE is graph-capturable, while whole-model capture is safely auto-disabled for these exports because of their growing logical-prefix bindings. This is a synthetic capability milestone, not a real-checkpoint quality or ORT-performance claim. Real-scale DeepSeek-V2/V3 packing/export remains follow-up work. Full status: `docs/glm-deepseek-enablement.md`.
 
 ### ⚠️ Open correctness finding (2026-07-23): Qwen2.5-1.5B native decode diverges from ORT
