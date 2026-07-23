@@ -1,5 +1,25 @@
 # Native CUDA vs. ORT GenAI CUDA — 2026-07-23
 
+## Pre-fusion baseline @ 4372f1b — 2026-07-23
+
+This is the clean pre-SwiGLU-RMS zero-point-fusion baseline from `4372f1b`,
+measured on physical GPU 5 (NVIDIA H200). A concurrent CPU-benchmark team may
+have added host-side noise.
+
+| Model | Native tok/s (median of 3) | ORT 0.14.1 tok/s | Delta | Coherent? | Segments / fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| Qwen2.5-0.5B int4 | 821.35 | 741.83 | **+10.72%** | Yes | 1 / 0 |
+| Qwen2.5-1.5B int4 | 586.82 | 487.14 | **+20.46%** | Yes | 1 / 0 |
+| Qwen2.5-7B int4 | 288.64 | 267.23 | **+8.01%** | Yes | 1 / 0 |
+| Phi-4-mini int4/int8 | 136.49 | 229.62 | **-40.56%** | Yes | 3 / 0 |
+
+Native samples (tok/s) were 823.18/821.35/814.49, 575.13/586.82/586.88,
+288.27/288.81/288.64, and 137.19/134.65/136.49 respectively; no sample was
+discarded as an obvious outlier. Each diagnostic run reported one measured
+capture, 30 replays, zero fallbacks, and coherent greedy text. The ORT values
+are the existing authoritative 0.14.1 medians in the post-fusion table below.
+Deltas are `(native - ORT) / ORT * 100`.
+
 ## f0af865 baseline
 
 | Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 | Smoothness |
