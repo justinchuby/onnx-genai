@@ -118,3 +118,50 @@ The full source notes for this reconciliation are preserved in `2026-07-23T00-00
 **By:** Sebastian
 **What:** The static even-Split integration test now supplies concrete shapes, executes the static kernel, captures and replays with changed input, and byte-compares replay output with eager output.
 **Why:** The generic helper provides empty shapes and only exercises dynamic Split; capture/replay verifies the static no-synchronization path.
+
+## 2026-07-23 — QMoE, GLM-5.2, and Phi decode follow-up
+
+### Make QMoE CUDA graph capture safe after eager warmup
+**By:** Batty
+**What:** QMoE reuses pooled scratch, avoids synchronization while capturing, and advertises capture only after fixed-shape eager warmup; all 21 GPU cases capture, replay, and retain CPU parity.
+**Why:** Per-call allocation/free and synchronization previously split MoE decode out of CUDA graphs; stable storage and precompiled modules make fixed-shape replay viable.
+
+### Serialize QMoE capture tests and prove routing stays live
+**By:** Sebastian
+**What:** QMoE GPU integration tests now serialize each test with a process-wide GPU mutex and replay changed `router_probs` against an uncaptured eager reference.
+**Why:** Serialization eliminates concurrent-allocation capture invalidation, while changed-routing parity verifies replay recomputes expert selection instead of baking capture-time routes.
+
+### Record QMoE capture review and test-gate resolution
+**By:** Holden
+**What:** Review approved the production fixed-geometry, device-routed QMoE capture design, but initially rejected its flaky parallel test gate because it lacked the repository GPU serial guard; the subsequently landed Sebastian test fix addresses that blocker.
+**Why:** Capture must avoid allocation, synchronization, and host routing reads, and its test gate must be stable under default parallel execution.
+
+### Enable strict native CUDA GLM-5.2 decode with logical-prefix bindings
+**By:** Batty
+**What:** Prefix-sensitive consumers receive logical binding prefixes while capacity-oriented mask consumers keep padded geometry; int64 Min/Max arithmetic is supported and replay is disabled when logical geometry grows. Dense, int4, and QMoE tiny GLM-5.2 decode paths now run with zero fallbacks.
+**Why:** DSA attention indexing requires the logical `[1,4]` mask rather than padded `[1,4096]`; the generalized contract preserves fixed-capacity GLM-4 capture.
+
+### Establish GLM-5.2 QMoE native CUDA capability
+**By:** Marsten
+**What:** At `bd05b75`, tiny GLM-5.2 dense, q4, and fused-QMoE models complete DSA decode on native CUDA at 70.63, 148.58, and 174.41 tok/s respectively, with zero fallbacks.
+**Why:** This validates the architecture and native QMoE execution path, while growing logical prefixes correctly keep whole-model graph replay disabled.
+
+### Verify the comprehensive GLM-5.2 benchmark refresh
+**By:** Fact Checker
+**What:** All six documented deltas recompute within 0.05pp; capability/capture, GLM-4 Split, Phi split-K, and progress claims are supported. A caveat identifies refreshed Qwen 0.5B/1.5B native highs as host-load variance.
+**Why:** The report remains accurate without attributing measurement variance to kernel gains.
+
+### Ship Phi int4 zero-point gate/up weight prefetch
+**By:** Deckard
+**What:** The asymmetric (`HasZp`) fused gate/up SwiGLU-RMSNorm GEMV prefetches only the next packed gate/up weight words; Phi kernel time improves 34.7→31.2µs and decode improves 180.7→184.0 tok/s (+1.8%), with bit-exact output. Symmetric Qwen retains its original loop and stays flat.
+**Why:** The kernel is global-load-latency-bound; weight-only scheduling overlaps loads without the register cost of scale/zero-point prefetch or a TMA staging rewrite.
+
+### Approve Phi gate/up prefetch boundary and identity properties
+**By:** Chew
+**What:** Review confirmed the guarded next-iteration prefetch has no terminal over-read, accumulation order is unchanged, and compile-time isolation leaves the symmetric Qwen PTX path unchanged; CUDA tests and clippy passed.
+**Why:** The optimization is a low-risk scheduling-only improvement under the gate/up kernel's `k >= 256` production geometry.
+
+### Decline fused Phi int8 prefetch and split-K variants
+**By:** Deckard
+**What:** Int8-zp prefetch reduced scoreboard stalls but left the ~20µs kernel and end-to-end decode flat. Split-K increased waves/SM but also washed or regressed because the serial full-vector RMSNorm reduction/staging prologue dominates; both spikes were reverted.
+**Why:** Grid-starvation remedies help pure GEMVs, not this fused kernel's Amdahl-limited prologue; investigate the standalone grid-starved int8 down-projection instead.
