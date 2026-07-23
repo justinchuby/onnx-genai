@@ -7,7 +7,8 @@
 //! prepacked once and reused by a N-parallel GEMV. For symmetric block-32
 //! int4 M=1, `accuracy_level=4` streams the packed weights directly into a VNNI
 //! dot product. Other int4 accuracy-level-4 shapes keep the weights in int8 and
-//! quantize each activation row to int8. The 2-bit correctness path and default
+//! quantize each activation into int8 per K-block (matching ORT/MLAS CompInt8).
+//! The 2-bit correctness path and default
 //! int4 path dequantize to f32; batched shapes then use the shared CPU GEMM,
 //! including its SIMD backend. The 8-bit correctness path uses the same affine
 //! dequantization with one uint8 weight and optional uint8 zero point per block.
@@ -710,7 +711,8 @@ impl MatMulNBitsKernel {
                 shards.push(None);
                 continue;
             }
-            let packed_shard = &packed[start * k_blocks * blob_size..(start + len) * k_blocks * blob_size];
+            let packed_shard =
+                &packed[start * k_blocks * blob_size..(start + len) * k_blocks * blob_size];
             let scales_shard = &scales[start * k_blocks..(start + len) * k_blocks];
             let zero_points_shard = zero_points
                 .as_ref()
@@ -1024,7 +1026,11 @@ pub fn available_parallelism_public() -> usize {
 fn default_decode_threads(available: usize) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let ceil_log2 = usize::BITS as usize - (available - 1).leading_zeros() as usize;
-    Some((ceil_log2 + 1).min(MAX_TOPOLOGY_DECODE_THREADS).min(available))
+    Some(
+        (ceil_log2 + 1)
+            .min(MAX_TOPOLOGY_DECODE_THREADS)
+            .min(available),
+    )
 }
 
 fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
@@ -1062,9 +1068,7 @@ fn build_decode_pool(
                     // rejects the request is logged once, not fatal, so decode
                     // still runs (unpinned) rather than failing outright.
                     let cpu = cpus[worker_index % cpus.len()];
-                    if let Err(message) =
-                        crate::decode_affinity::pin_current_thread_to_cpu(cpu)
-                    {
+                    if let Err(message) = crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
                         report_decode_affinity_failure(&message);
                     }
                 });
@@ -1110,7 +1114,6 @@ fn report_decode_affinity_failure(message: &str) {
         );
     }
 }
-
 
 fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
     // If we are already resident inside a `with_decode_pool_scope` installation
@@ -1497,21 +1500,44 @@ fn selected_dot_kernel() -> DotKernel {
     DotKernel::Scalar
 }
 
-fn quantize_activation_signed(activation: &[f32], padded_k: usize) -> (Vec<i8>, f32) {
-    let max_abs = activation
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0, f32::max);
-    if max_abs == 0.0 {
-        return (vec![0; padded_k], 0.0);
-    }
-    let scale = max_abs / 127.0;
-    let inverse_scale = scale.recip();
+/// Symmetric int8 activation quantization, per K-block, matching ORT/MLAS's
+/// `QuantizeARow_CompInt8`: each `block_size`-wide block gets its own
+/// `scale = max_abs_block / 127` and round-to-nearest int8 codes. A single
+/// per-row scale (the previous scheme) let one outlier block inflate the scale
+/// for the whole row, roughly doubling the CompInt8 error versus ORT; per-block
+/// scaling closes that gap. Returns the padded int8 activations and one scale
+/// per block (`padded_k / block_size` entries).
+fn quantize_activation_signed(
+    activation: &[f32],
+    padded_k: usize,
+    block_size: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    let k_blocks = padded_k / block_size;
     let mut quantized = vec![0i8; padded_k];
-    for (output, &value) in quantized.iter_mut().zip(activation) {
-        *output = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
+    let mut scales = vec![0.0f32; k_blocks];
+    for (block, (out_block, scale)) in quantized
+        .chunks_mut(block_size)
+        .zip(scales.iter_mut())
+        .enumerate()
+    {
+        let start = block * block_size;
+        let real_end = (start + block_size).min(activation.len());
+        if real_end <= start {
+            continue;
+        }
+        let src = &activation[start..real_end];
+        let max_abs = src.iter().map(|value| value.abs()).fold(0.0, f32::max);
+        if max_abs == 0.0 {
+            continue;
+        }
+        // Match MLAS bit-for-bit: scale = max_abs/127, inverse = 127/max_abs.
+        *scale = max_abs / 127.0;
+        let inverse_scale = 127.0 / max_abs;
+        for (out, &value) in out_block.iter_mut().zip(src) {
+            *out = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
+        }
     }
-    (quantized, scale)
+    (quantized, scales)
 }
 
 fn int4_matmul_m1(
@@ -1532,7 +1558,8 @@ fn int4_matmul_m1(
     debug_assert_eq!(weight.scales.len(), n * k_blocks);
     debug_assert_eq!(result.len(), n);
 
-    let (activation, activation_scale) = quantize_activation_signed(activation, padded_k);
+    let (activation, activation_scales) =
+        quantize_activation_signed(activation, padded_k, BLOCK_SIZE);
     let compute = |output_start: usize, outputs: &mut [f32]| {
         for (offset, output) in outputs.iter_mut().enumerate() {
             let output_index = output_start + offset;
@@ -1544,7 +1571,7 @@ fn int4_matmul_m1(
                 &activation,
                 &weight.values[packed_start..packed_end],
                 &weight.scales[scale_start..scale_end],
-                activation_scale,
+                &activation_scales,
                 dot_kernel,
             );
         }
@@ -1557,7 +1584,7 @@ fn int4_dot_row(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
-    activation_scale: f32,
+    activation_scales: &[f32],
     _kernel: DotKernel,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -1566,29 +1593,30 @@ fn int4_dot_row(
             DotKernel::AvxVnni => {
                 // SAFETY: selected_dot_kernel checked AVX2 and AVX-VNNI.
                 return unsafe {
-                    int4_dot_row_avxvnni(activation, packed_weight, scales, activation_scale)
+                    int4_dot_row_avxvnni(activation, packed_weight, scales, activation_scales)
                 };
             }
             DotKernel::Avx512Vnni => {
                 // SAFETY: selected_dot_kernel checked AVX2, AVX512-VNNI, and AVX512VL.
                 return unsafe {
-                    int4_dot_row_avx512vnni(activation, packed_weight, scales, activation_scale)
+                    int4_dot_row_avx512vnni(activation, packed_weight, scales, activation_scales)
                 };
             }
             DotKernel::Scalar => {}
         }
     }
-    int4_dot_row_scalar(activation, packed_weight, scales, activation_scale)
+    int4_dot_row_scalar(activation, packed_weight, scales, activation_scales)
 }
 
 fn int4_dot_row_scalar(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
-    activation_scale: f32,
+    activation_scales: &[f32],
 ) -> f32 {
     debug_assert_eq!(activation.len(), scales.len() * 32);
     debug_assert_eq!(packed_weight.len(), scales.len() * 16);
+    debug_assert_eq!(activation_scales.len(), scales.len());
     let mut value = 0.0f32;
     for (block, &scale) in scales.iter().enumerate() {
         let activation = &activation[block * 32..(block + 1) * 32];
@@ -1598,9 +1626,9 @@ fn int4_dot_row_scalar(
             dot += activation[pair * 2] as i32 * (i32::from(byte & 0x0f) - 8);
             dot += activation[pair * 2 + 1] as i32 * (i32::from(byte >> 4) - 8);
         }
-        value += dot as f32 * scale;
+        value += dot as f32 * (scale * activation_scales[block]);
     }
-    value * activation_scale
+    value
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1609,7 +1637,7 @@ unsafe fn int4_dot_row_avxvnni(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
-    activation_scale: f32,
+    activation_scales: &[f32],
 ) -> f32 {
     use std::arch::x86_64::*;
 
@@ -1631,10 +1659,11 @@ unsafe fn int4_dot_row_avxvnni(
         let signed_activation = _mm256_sign_epi8(activation, weight);
         let dot =
             _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), absolute_weight, signed_activation);
-        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(scale));
+        let block_scale = scale * activation_scales[block];
+        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
         accumulator = _mm256_add_ps(accumulator, scaled);
     }
-    horizontal_sum_f32_256(accumulator) * activation_scale
+    horizontal_sum_f32_256(accumulator)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1643,7 +1672,7 @@ unsafe fn int4_dot_row_avx512vnni(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
-    activation_scale: f32,
+    activation_scales: &[f32],
 ) -> f32 {
     use std::arch::x86_64::*;
 
@@ -1664,10 +1693,11 @@ unsafe fn int4_dot_row_avx512vnni(
         let absolute_weight = _mm256_sign_epi8(weight, weight);
         let signed_activation = _mm256_sign_epi8(activation, weight);
         let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), absolute_weight, signed_activation);
-        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(scale));
+        let block_scale = scale * activation_scales[block];
+        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
         accumulator = _mm256_add_ps(accumulator, scaled);
     }
-    horizontal_sum_f32_256(accumulator) * activation_scale
+    horizontal_sum_f32_256(accumulator)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1677,22 +1707,42 @@ fn horizontal_sum_f32_256(value: std::arch::x86_64::__m256) -> f32 {
     lanes.into_iter().sum()
 }
 
-fn quantize_activation(activation: &[f32], padded_k: usize) -> (Vec<u8>, f32) {
-    let max_abs = activation
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0, f32::max);
-    if max_abs == 0.0 {
-        return (vec![128; padded_k], 0.0);
-    }
-    let scale = max_abs / 127.0;
-    let inverse_scale = scale.recip();
+/// Symmetric int8 activation quantization for the int4→int8 dequantized weight
+/// path, stored offset by 128 (unsigned) so a VNNI `u8×i8` dot can run, with one
+/// `scale = max_abs_block / 127` per K-block (see [`quantize_activation_signed`]
+/// for why per-block scaling matches ORT's CompInt8 accuracy). Returns the
+/// padded u8 activations and one scale per block (`padded_k / block_size`).
+fn quantize_activation(
+    activation: &[f32],
+    padded_k: usize,
+    block_size: usize,
+) -> (Vec<u8>, Vec<f32>) {
+    let k_blocks = padded_k / block_size;
     let mut quantized = vec![128u8; padded_k];
-    for (output, &value) in quantized.iter_mut().zip(activation) {
-        let signed = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
-        *output = (signed as i16 + 128) as u8;
+    let mut scales = vec![0.0f32; k_blocks];
+    for (block, (out_block, scale)) in quantized
+        .chunks_mut(block_size)
+        .zip(scales.iter_mut())
+        .enumerate()
+    {
+        let start = block * block_size;
+        let real_end = (start + block_size).min(activation.len());
+        if real_end <= start {
+            continue;
+        }
+        let src = &activation[start..real_end];
+        let max_abs = src.iter().map(|value| value.abs()).fold(0.0, f32::max);
+        if max_abs == 0.0 {
+            continue;
+        }
+        *scale = max_abs / 127.0;
+        let inverse_scale = 127.0 / max_abs;
+        for (out, &value) in out_block.iter_mut().zip(src) {
+            let signed = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
+            *out = (signed as i16 + 128) as u8;
+        }
     }
-    (quantized, scale)
+    (quantized, scales)
 }
 
 fn int8_matmul(
@@ -1712,10 +1762,11 @@ fn int8_matmul(
     debug_assert_eq!(weight.block_sums.len(), n * k_blocks);
 
     if m == 1 {
-        let (activation, activation_scale) = quantize_activation(activations, padded_k);
+        let (activation, activation_scales) =
+            quantize_activation(activations, padded_k, block_size);
         int8_row(
             &activation,
-            activation_scale,
+            &activation_scales,
             weight,
             result,
             k_blocks,
@@ -1731,10 +1782,11 @@ fn int8_matmul(
             .par_chunks_mut(n)
             .zip(activations.par_chunks_exact(k))
             .for_each(|(output, activation)| {
-                let (activation, activation_scale) = quantize_activation(activation, padded_k);
+                let (activation, activation_scales) =
+                    quantize_activation(activation, padded_k, block_size);
                 int8_row(
                     &activation,
-                    activation_scale,
+                    &activation_scales,
                     weight,
                     output,
                     k_blocks,
@@ -1750,7 +1802,7 @@ fn int8_matmul(
 #[allow(clippy::too_many_arguments)]
 fn int8_row(
     activation: &[u8],
-    activation_scale: f32,
+    activation_scales: &[f32],
     weight: &Int8Weight,
     result: &mut [f32],
     k_blocks: usize,
@@ -1764,15 +1816,17 @@ fn int8_row(
             let output_index = output_start + offset;
             let mut value = 0.0f32;
             let weight_row = &weight.values[output_index * padded_k..(output_index + 1) * padded_k];
-            for block in 0..k_blocks {
+            let block_sums =
+                &weight.block_sums[output_index * k_blocks..(output_index + 1) * k_blocks];
+            let weight_scales =
+                &weight.scales[output_index * k_blocks..(output_index + 1) * k_blocks];
+            for (block, &activation_scale) in activation_scales.iter().enumerate() {
                 let start = block * block_size;
                 let end = start + block_size;
                 let unsigned_dot =
                     dot_u8_i8(&activation[start..end], &weight_row[start..end], dot_kernel);
-                let signed_dot =
-                    unsigned_dot - 128 * weight.block_sums[output_index * k_blocks + block];
-                value += signed_dot as f32
-                    * (activation_scale * weight.scales[output_index * k_blocks + block]);
+                let signed_dot = unsigned_dot - 128 * block_sums[block];
+                value += signed_dot as f32 * (activation_scale * weight_scales[block]);
             }
             *output = value;
         }
@@ -2525,6 +2579,207 @@ mod tests {
         }
     }
 
+    fn rmse(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        let sum: f32 = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, e)| (a - e) * (a - e))
+            .sum();
+        (sum / actual.len() as f32).sqrt()
+    }
+
+    /// Fake-quantize `activations` to int8 the way the CompInt8 path does, then
+    /// dequantize, so the resulting matmul against the f32-dequantized weights
+    /// isolates the *activation* quantization error. `per_block == false`
+    /// reproduces the old single-per-row scale (one outlier inflates the whole
+    /// row); `per_block == true` is the ORT/MLAS scheme this fix adopts.
+    fn activation_quant_oracle(
+        activations: &[f32],
+        dequantized: &[f32],
+        k: usize,
+        n: usize,
+        block_size: usize,
+        per_block: bool,
+    ) -> Vec<f32> {
+        let mut hat = activations.to_vec();
+        if per_block {
+            for block in 0..k.div_ceil(block_size) {
+                let start = block * block_size;
+                let end = (start + block_size).min(k);
+                let max_abs = activations[start..end]
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0, f32::max);
+                if max_abs == 0.0 {
+                    continue;
+                }
+                let scale = max_abs / 127.0;
+                for i in start..end {
+                    hat[i] = (activations[i] / scale).round().clamp(-127.0, 127.0) * scale;
+                }
+            }
+        } else {
+            let max_abs = activations.iter().map(|v| v.abs()).fold(0.0, f32::max);
+            let scale = max_abs / 127.0;
+            for value in hat.iter_mut() {
+                *value = (*value / scale).round().clamp(-127.0, 127.0) * scale;
+            }
+        }
+        reference(&hat, dequantized, 1, k, n)
+    }
+
+    /// Root-cause regression: cross-K-block magnitude spread is exactly what
+    /// broke the old single-scale (per-row) CompInt8 quant -- the largest block
+    /// set one row scale that crushed every smaller block's int8 codes, leaving
+    /// native ~2.6x less accurate than ORT. Per-block activation scaling
+    /// (ORT/MLAS `QuantizeARow_CompInt8`) must keep BOTH accuracy-level-4 hand
+    /// paths (int4 GEMV and the int4->int8 GEMM) within ORT-class error of the
+    /// dequantized-f32 oracle, and must be materially better than per-row.
+    #[test]
+    fn matmulnbits_compint8_per_block_activation_tracks_dequant_f32_oracle() {
+        let (k, n, block_size) = (256usize, 8usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+
+        // Anti-correlated magnitudes: block 0 has a large activation amplitude but
+        // tiny weights, while every other block has a small activation amplitude
+        // paired with large weights. A per-row scale is pinned by block 0 and
+        // crushes the small-activation blocks to a handful of int8 levels -- yet
+        // those blocks carry most of the output signal (large weights), so the
+        // per-row error is large. Per-block scaling keeps each block at full
+        // int8 resolution. This mirrors the real Qwen/Phi CompInt8 divergence.
+        let amp_a = |block: usize| if block == 0 { 2.5 } else { 0.06 };
+        let amp_w = |block: usize| if block == 0 { 0.05 } else { 1.5 };
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i as f32 * 0.37).sin()) * amp_a(i / block_size))
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.11).cos()) * amp_w((i % k) / block_size))
+            .collect();
+        let (packed, scales, _, dequantized) = quantize(&weights, n, k, block_size, false);
+        let oracle = reference(&activations, &dequantized, 1, k, n);
+        let oracle_rms = rmse(&oracle, &vec![0.0; n]);
+
+        let packed_weight = PackedInt4Weight {
+            values: packed.clone(),
+            scales: scales.clone(),
+        };
+        let mut int4_out = vec![0.0; n];
+        int4_matmul_m1(
+            &activations,
+            &packed_weight,
+            &mut int4_out,
+            k,
+            n,
+            DotKernel::Scalar,
+        );
+
+        let kernel = accuracy4_kernel(k, n, block_size);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let int8_weight = kernel
+            .prepack_int8_weight(&b.view(), &scales_tensor.view(), None)
+            .unwrap();
+        let mut int8_out = vec![0.0; n];
+        int8_matmul(
+            &activations,
+            &int8_weight,
+            &mut int8_out,
+            1,
+            k,
+            n,
+            block_size,
+            DotKernel::Scalar,
+        );
+
+        // ORT-class accuracy is a small *relative* error vs the f32 oracle.
+        let int4_rel = rmse(&int4_out, &oracle) / oracle_rms;
+        let int8_rel = rmse(&int8_out, &oracle) / oracle_rms;
+        assert!(
+            int4_rel <= 5e-3,
+            "per-block int4 CompInt8 relative RMSE {int4_rel} exceeds ORT-class 5e-3",
+        );
+        assert!(
+            int8_rel <= 5e-3,
+            "per-block int8 CompInt8 relative RMSE {int8_rel} exceeds ORT-class 5e-3",
+        );
+
+        let per_row_rel = rmse(
+            &activation_quant_oracle(&activations, &dequantized, k, n, block_size, false),
+            &oracle,
+        ) / oracle_rms;
+        let per_block_rel = rmse(
+            &activation_quant_oracle(&activations, &dequantized, k, n, block_size, true),
+            &oracle,
+        ) / oracle_rms;
+        assert!(
+            per_block_rel < per_row_rel * 0.25,
+            "per-block activation quant ({per_block_rel}) must be far better than per-row ({per_row_rel})",
+        );
+    }
+
+    /// Fixed-form of the CompInt8 argmax-reversal characterization (the bug seen
+    /// at Qwen2.5-Coder-7B decode index 23 and Phi-3.5-mini index 2): at a near
+    /// tie the native accuracy-level-4 path must pick the SAME greedy winner as
+    /// the dequantized-f32 oracle. Activations carry cross-block magnitude spread
+    /// so the old per-row scale is exercised. The near-tie window is kept
+    /// comfortably above 2x the ORT-class per-output error (measured relative to
+    /// the output magnitude) so a passing argmax is a real accuracy result.
+    #[test]
+    fn matmulnbits_compint8_argmax_matches_dequant_f32_oracle_at_near_tie() {
+        let (k, n, block_size) = (128usize, 2usize, 32usize);
+        let mut checked = 0usize;
+        for seed in 1..=400u32 {
+            let s = seed as f32;
+            let activations: Vec<f32> = (0..k)
+                .map(|i| {
+                    let block = (i / block_size) as f32;
+                    ((i as f32 * 0.017 + s * 0.013).sin()) * (0.05 + 0.45 * block)
+                })
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| (i as f32 * 0.011 + s * 0.019).cos())
+                .collect();
+            let (packed, scales, _, dequantized) = quantize(&weights, n, k, block_size, false);
+            let oracle = reference(&activations, &dequantized, 1, k, n);
+            let oracle_rms = rmse(&oracle, &vec![0.0; n]).max(1e-6);
+            let margin_rel = (oracle[1] - oracle[0]).abs() / oracle_rms;
+            // Genuine relative near-ties only, but wide enough that ORT-class
+            // error (< 0.5% relative) cannot legitimately flip the winner.
+            if !(0.02..=0.08).contains(&margin_rel) {
+                continue;
+            }
+            checked += 1;
+            let packed_weight = PackedInt4Weight {
+                values: packed.clone(),
+                scales: scales.clone(),
+            };
+            let mut native = vec![0.0; n];
+            int4_matmul_m1(
+                &activations,
+                &packed_weight,
+                &mut native,
+                k,
+                n,
+                selected_dot_kernel(),
+            );
+            let case_rel = rmse(&native, &oracle) / oracle_rms;
+            assert!(
+                case_rel <= 5e-3,
+                "seed {seed}: native CompInt8 relative RMSE {case_rel} exceeds ORT-class 5e-3",
+            );
+            assert_eq!(
+                usize::from(native[1] > native[0]),
+                usize::from(oracle[1] > oracle[0]),
+                "seed {seed}: native CompInt8 argmax != f32 oracle (margin_rel {margin_rel}, native {native:?}, oracle {oracle:?})",
+            );
+        }
+        assert!(
+            checked >= 5,
+            "deterministic search must exercise several near-tie cases (got {checked})",
+        );
+    }
+
     #[test]
     fn matmulnbits_direct_int4_parallel_partial_k_matches_serial() {
         let (k, n, block_size) = (77usize, 1025usize, 32usize);
@@ -2682,7 +2937,10 @@ mod tests {
         // An explicit positive count is honored and clamped to the host.
         assert_eq!(resolve_persistent_decode_threads(Some("32"), 96), Some(32));
         assert_eq!(resolve_persistent_decode_threads(Some("1"), 96), Some(1));
-        assert_eq!(resolve_persistent_decode_threads(Some("1000"), 96), Some(96));
+        assert_eq!(
+            resolve_persistent_decode_threads(Some("1000"), 96),
+            Some(96)
+        );
         // Unparseable/negative values fall back to the persistent default.
         assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
         assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
@@ -3910,11 +4168,7 @@ mod tests {
             decode, None,
             "m={below} (< {at}) must fall back to the hand int4 path",
         );
-        assert_eq!(
-            prefill,
-            Some(()),
-            "m={at} must route to MLAS SQNBit",
-        );
+        assert_eq!(prefill, Some(()), "m={at} must route to MLAS SQNBit",);
     }
 
     /// Slow-hand-path decode routing: for `m == 1` with `bits == 4` but
@@ -4121,7 +4375,9 @@ mod tests {
         )
         .is_none()
         {
-            eprintln!("MLAS SQNBit int4 CompFp32 kernel unavailable; skipping acc0-default-backend test");
+            eprintln!(
+                "MLAS SQNBit int4 CompFp32 kernel unavailable; skipping acc0-default-backend test"
+            );
             return;
         }
 
@@ -4178,7 +4434,12 @@ mod tests {
         );
         // CompFp32 dequant is near-exact, so it must match the f32 reference.
         let expected = reference(&a, &dq, 1, k, n);
-        mlas_close(&acc0_result, &expected, 2e-3, "acc0 default-backend CompFp32");
+        mlas_close(
+            &acc0_result,
+            &expected,
+            2e-3,
+            "acc0 default-backend CompFp32",
+        );
 
         assert_eq!(
             acc4_served, None,
@@ -4303,12 +4564,12 @@ mod tests {
         // (K, N, count-per-token) for one Qwen2.5-Coder-7B decode step.
         let layers = 28usize;
         let ops: &[(usize, usize, usize)] = &[
-            (3584, 4608, layers),    // qkv_proj
-            (3584, 3584, layers),    // o_proj
-            (3584, 18944, layers),   // gate_proj
-            (3584, 18944, layers),   // up_proj
-            (18944, 3584, layers),   // down_proj
-            (3584, 152064, 1),       // lm_head
+            (3584, 4608, layers),  // qkv_proj
+            (3584, 3584, layers),  // o_proj
+            (3584, 18944, layers), // gate_proj
+            (3584, 18944, layers), // up_proj
+            (18944, 3584, layers), // down_proj
+            (3584, 152064, 1),     // lm_head
         ];
         let block_size = 32usize;
         let dot_kernel = selected_dot_kernel();
@@ -4334,7 +4595,16 @@ mod tests {
                 let (packed_bytes, scales, _zps, _dq) =
                     quantize(&weights_nk, n, k, block_size, false);
                 let make = |comp| {
-                    mlas_sys::SQNBitPackedB::new(n, k, 4, block_size, comp, &packed_bytes, &scales, None)
+                    mlas_sys::SQNBitPackedB::new(
+                        n,
+                        k,
+                        4,
+                        block_size,
+                        comp,
+                        &packed_bytes,
+                        &scales,
+                        None,
+                    )
                 };
                 let (Some(mlas_int8), Some(mlas_fp32)) = (
                     make(mlas_sys::SQNBitComputeType::Int8),
