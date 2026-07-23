@@ -790,6 +790,23 @@ mod tests {
     }
 
     #[test]
+    fn matmul_f16_preserves_near_tie_argmax_after_f32_accumulation() {
+        // The f32 reference margin (0.01171875) is below one f16 ULP at 20.
+        // Widened accumulation must still retain the correct first-column winner
+        // before the single final f16 narrowing.
+        let a = Owned::f16(&[1, 4], &[1., 1., 1., 1.]);
+        let b = Owned::f16(
+            &[4, 2],
+            &[5.00390625, 5.0, 5.00390625, 5.0, 5.00390625, 5.0, 5.0, 5.0],
+        );
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[1, 2]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f16_as_f32(), vec![20.015625, 20.0]);
+    }
+
+    #[test]
     fn matmul_bf16_batched() {
         let a = Owned::bf16(&[2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let b = Owned::bf16(&[2, 2, 2], &[1., 0., 0., 1., 2., 0., 0., 2.]);
