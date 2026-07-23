@@ -3247,7 +3247,14 @@ impl Executor {
         let opset = effective_opset(graph, node);
         let constant_inputs: Vec<bool> = inputs
             .iter()
-            .map(|input| input.is_some_and(|vid| graph.initializers.contains_key(&vid)))
+            .map(|input| {
+                input.is_some_and(|vid| {
+                    graph.initializers.contains_key(&vid)
+                        || views_meta
+                            .get(&vid)
+                            .is_some_and(|view| graph.initializers.contains_key(&view.source))
+                })
+            })
             .collect();
         let kernel = cache.get_or_create(
             node_id,

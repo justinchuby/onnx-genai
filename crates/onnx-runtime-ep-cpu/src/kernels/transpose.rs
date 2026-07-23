@@ -1,7 +1,9 @@
 //! `Transpose`: permute axes by moving raw fixed-width element bytes. The `perm` attribute gives the axis
 //! order; it defaults to reversing all axes (`docs/ORT2.md` §4.4).
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+};
 use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
@@ -81,6 +83,31 @@ impl Kernel for TransposeKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+
+    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
+        if num_outputs != 1 || inputs.len() != 1 || inputs[0].dtype.byte_size() == 0 {
+            return None;
+        }
+        let input = &inputs[0];
+        let rank = input.shape.len();
+        let perm = self
+            .perm
+            .clone()
+            .unwrap_or_else(|| (0..rank).rev().collect());
+        if perm.len() != rank || perm.iter().any(|&axis| axis >= rank) || {
+            let mut sorted = perm.clone();
+            sorted.sort_unstable();
+            sorted != (0..rank).collect::<Vec<_>>()
+        } {
+            return None;
+        }
+        Some(vec![ViewOutput {
+            input_index: 0,
+            shape: perm.iter().map(|&axis| input.shape[axis]).collect(),
+            strides: perm.iter().map(|&axis| input.strides[axis]).collect(),
+            byte_offset: input.byte_offset,
+        }])
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +146,21 @@ mod tests {
         run(Some(vec![0, 2, 1]), &a, &mut out);
         // rows [1,2,3],[4,5,6] transposed -> [1,4],[2,5],[3,6]
         assert_eq!(out.to_f32(), vec![1., 4., 2., 5., 3., 6.]);
+    }
+
+    #[test]
+    fn transpose_is_a_zero_copy_strided_view() {
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let view = TransposeKernel {
+            perm: Some(vec![1, 0]),
+        }
+        .view_outputs(&[a.view()], 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert_eq!(view.shape, [3, 2]);
+        assert_eq!(view.strides, [1, 3]);
+        assert_eq!(view.byte_offset, 0);
     }
     #[test]
     fn transpose_bf16_preserves_element_bits() {

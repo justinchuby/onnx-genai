@@ -282,8 +282,7 @@ impl Kernel for LinearAttentionKernel {
 
         let state_per_head = d_k * d_v;
         let total_state = batch * kv_num_heads * state_per_head;
-        // Initialize present state from past (or zeros); it is updated in place.
-        let mut state = if let Some(view) = past_state {
+        let state_init = if let Some(view) = past_state {
             let s = view.shape;
             if s.len() != 4 || s[0] != batch || s[1] != kv_num_heads || s[2] != d_k || s[3] != d_v {
                 return Err(EpError::KernelFailed(format!(
@@ -291,13 +290,41 @@ impl Kernel for LinearAttentionKernel {
                      d_k={d_k}, d_v={d_v}], got {s:?}"
                 )));
             }
-            to_dense_f32_widen("LinearAttention", view)?.into_owned()
+            Some(to_dense_f32_widen("LinearAttention", view)?)
         } else {
-            vec![0.0f32; total_state]
+            None
         };
 
         let output_hidden = q_num_heads.max(kv_num_heads) * d_v;
         let mut output = vec![0.0f32; batch * seq * output_hidden];
+        let (primary_output, present_outputs) = outputs.split_at_mut(1);
+
+        // The recurrent state is a large decode-hot tensor. When the present
+        // output is native contiguous f32, use its executor-owned buffer as the
+        // working state and copy the past state into it once. This avoids a
+        // per-layer 1 MiB allocation plus a second full-state copy on Qwen3.5.
+        let direct_state = present_outputs.first_mut().filter(|present| {
+            present.dtype == onnx_runtime_ir::DataType::Float32
+                && present.is_contiguous()
+                && present.device.is_host_accessible()
+        });
+        let mut owned_state;
+        let (state, state_is_direct): (&mut [f32], bool) = if let Some(present) = direct_state {
+            let state = unsafe {
+                std::slice::from_raw_parts_mut(present.data_ptr_mut::<f32>(), total_state)
+            };
+            if let Some(initial) = state_init.as_deref() {
+                state.copy_from_slice(initial);
+            } else {
+                state.fill(0.0);
+            }
+            (state, true)
+        } else {
+            owned_state = state_init
+                .map(|initial| initial.into_owned())
+                .unwrap_or_else(|| vec![0.0f32; total_state]);
+            (&mut owned_state, false)
+        };
 
         let params = HeadParams {
             seq,
@@ -315,8 +342,6 @@ impl Kernel for LinearAttentionKernel {
             beta_per_head,
         };
 
-        // Each (batch, kv_head) pair is fully independent: the recurrent state
-        // is disjoint per head and the sequential dependency is within a head.
         for b in 0..batch {
             for h_kv in 0..kv_num_heads {
                 let h_k = h_kv / kv_per_k_head;
@@ -337,9 +362,9 @@ impl Kernel for LinearAttentionKernel {
             }
         }
 
-        write_dense_f32_narrow("LinearAttention", &mut outputs[0], &output)?;
-        if outputs.len() >= 2 {
-            write_dense_f32_narrow("LinearAttention", &mut outputs[1], &state)?;
+        write_dense_f32_narrow("LinearAttention", &mut primary_output[0], &output)?;
+        if !state_is_direct && let Some(present) = present_outputs.first_mut() {
+            write_dense_f32_narrow("LinearAttention", present, state)?;
         }
         Ok(())
     }
@@ -411,12 +436,12 @@ fn process_head(
 
         if p.needs_delta {
             // ---- Step 2: retrieval r = Sᵀ k_t (over d_k) ----
-            for (j, r) in retrieved.iter_mut().enumerate() {
-                let mut acc = 0.0f32;
-                for i in 0..d_k {
-                    acc += state[i * d_v + j] * kt[i];
+            retrieved.fill(0.0);
+            for (i, &ki) in kt.iter().enumerate() {
+                let s_row = &state[i * d_v..(i + 1) * d_v];
+                for (r, &s) in retrieved.iter_mut().zip(s_row) {
+                    *r += s * ki;
                 }
-                *r = acc;
             }
             // ---- Step 3: delta update  S += k_t ⊗ (beta·(v_t − r)) ----
             let bt = if p.beta_per_head {
@@ -476,12 +501,15 @@ fn readout(
     let out_head = if p.heads_per_group > 0 { h_q } else { h_kv };
     let qt = &q[row * (p.q_num_heads * d_k) + h_q * d_k..][..d_k];
     let ot = &mut output[row * p.output_hidden + out_head * d_v..][..d_v];
-    for (j, o) in ot.iter_mut().enumerate() {
-        let mut acc = 0.0f32;
-        for i in 0..d_k {
-            acc += qt[i] * state[i * d_v + j];
+    ot.fill(0.0);
+    for (i, &qi) in qt.iter().enumerate() {
+        let s_row = &state[i * d_v..(i + 1) * d_v];
+        for (o, &s) in ot.iter_mut().zip(s_row) {
+            *o += qi * s;
         }
-        *o = p.scale * acc;
+    }
+    for o in ot {
+        *o *= p.scale;
     }
 }
 
