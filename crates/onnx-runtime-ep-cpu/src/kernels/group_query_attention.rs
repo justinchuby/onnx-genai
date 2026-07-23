@@ -348,15 +348,17 @@ fn rotate(
     cos: &[f32],
     sin: &[f32],
     cache_rows: usize,
+    rotary_dim: usize,
     positions: &[usize],
     interleaved: bool,
 ) -> Result<()> {
-    if !tensor.dim.is_multiple_of(2) {
-        return Err(EpError::KernelFailed(
-            "GroupQueryAttention: do_rotary requires an even head_size".into(),
-        ));
+    if rotary_dim == 0 || rotary_dim > tensor.dim || !rotary_dim.is_multiple_of(2) {
+        return Err(EpError::KernelFailed(format!(
+            "GroupQueryAttention: rotary dimension {rotary_dim} must be positive, even, and no larger than head_size {}",
+            tensor.dim
+        )));
     }
-    let half = tensor.dim / 2;
+    let half = rotary_dim / 2;
     if cos.len() != cache_rows * half || sin.len() != cache_rows * half {
         return Err(EpError::KernelFailed(format!(
             "GroupQueryAttention: cos_cache/sin_cache must have shape [max_sequence_length,{half}]"
@@ -777,10 +779,16 @@ impl Kernel for GroupQueryAttentionKernel {
                         .into(),
                 ));
             }
-            if cos_view.shape[1] != q.dim / 2 {
+            let rotary_half = cos_view.shape[1];
+            let rotary_dim = rotary_half.checked_mul(2).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "GroupQueryAttention: rotary cache dimension is too large".into(),
+                )
+            })?;
+            if rotary_half == 0 || rotary_dim > q.dim {
                 return Err(EpError::KernelFailed(format!(
-                    "GroupQueryAttention: cos_cache/sin_cache second dimension must be head_size/2 ({})",
-                    q.dim / 2
+                    "GroupQueryAttention: rotary cache dimension {rotary_half} implies rotary dimension {rotary_dim}, which must be positive and no larger than head_size {}",
+                    q.dim
                 )));
             }
             let explicit_position_ids = inputs.get(9).filter(|v| !v.is_absent());
@@ -821,7 +829,6 @@ impl Kernel for GroupQueryAttentionKernel {
                 ids
             };
             let cache_rows = cos_view.shape[0];
-            let half = q.dim / 2;
             // Only positions up to the live context length are indexed; widening
             // the whole (often 32k-row) cache every call was the dominant GQA
             // decode cost. Bound the widen to the addressed row prefix.
@@ -837,13 +844,16 @@ impl Kernel for GroupQueryAttentionKernel {
                 )));
             }
             let rows_needed = max_position + 1;
-            let cos = widen_rotary_prefix("GroupQueryAttention", cos_view, rows_needed, half)?;
-            let sin = widen_rotary_prefix("GroupQueryAttention", sin_view, rows_needed, half)?;
+            let cos =
+                widen_rotary_prefix("GroupQueryAttention", cos_view, rows_needed, rotary_half)?;
+            let sin =
+                widen_rotary_prefix("GroupQueryAttention", sin_view, rows_needed, rotary_half)?;
             rotate(
                 &mut q,
                 &cos,
                 &sin,
                 rows_needed,
+                rotary_dim,
                 &query_positions,
                 self.rotary_interleaved,
             )?;
@@ -852,6 +862,7 @@ impl Kernel for GroupQueryAttentionKernel {
                 &cos,
                 &sin,
                 rows_needed,
+                rotary_dim,
                 &key_positions,
                 self.rotary_interleaved,
             )?;
@@ -1320,6 +1331,50 @@ mod tests {
         output
     }
 
+    fn reference_rope_bsh_geometry(
+        input: &[f32],
+        seq: usize,
+        heads: usize,
+        head_width: usize,
+        rotary_dim: usize,
+        positions: &[usize],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Vec<f32> {
+        let half = rotary_dim / 2;
+        let mut output = input.to_vec();
+        for s in 0..seq {
+            for h in 0..heads {
+                let base = (s * heads + h) * head_width;
+                for k in 0..half {
+                    let x0 = input[base + k];
+                    let x1 = input[base + half + k];
+                    let cache = positions[s] * half + k;
+                    output[base + k] = cos[cache] * x0 - sin[cache] * x1;
+                    output[base + half + k] = sin[cache] * x0 + cos[cache] * x1;
+                }
+            }
+        }
+        output
+    }
+
+    fn bsh_to_bnsh_geometry(
+        input: &[f32],
+        seq: usize,
+        heads: usize,
+        head_width: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0; input.len()];
+        for s in 0..seq {
+            for h in 0..heads {
+                let src = (s * heads + h) * head_width;
+                let dst = (h * seq + s) * head_width;
+                output[dst..dst + head_width].copy_from_slice(&input[src..src + head_width]);
+            }
+        }
+        output
+    }
+
     #[test]
     fn prefill_gqa_grouping_and_causal_match_reference() {
         let q = vec![
@@ -1528,6 +1583,144 @@ mod tests {
         close(&out.to_f32(), &reference(&q, &all_k, &all_v, 1, 3, 2));
     }
 
+    fn run_nonstandard_head_width_decode(head_width: usize, rotary_dim: usize) {
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const PAST_SEQUENCE_LENGTH: usize = 2;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        let half = rotary_dim / 2;
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * head_width)
+            .map(|i| mixed_scale_value(i, 0x4811))
+            .collect();
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * head_width)
+            .map(|i| mixed_scale_value(i, 0x4822))
+            .collect();
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * head_width)
+            .map(|i| mixed_scale_value(i, 0x4833))
+            .collect();
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * head_width)
+            .map(|i| mixed_scale_value(i, 0x4844))
+            .collect();
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * head_width)
+            .map(|i| mixed_scale_value(i, 0x4855))
+            .collect();
+        let cos: Vec<f32> = (0..TOTAL_SEQUENCE_LENGTH * half)
+            .map(|i| (i as f32 * 0.013).cos())
+            .collect();
+        let sin: Vec<f32> = (0..TOTAL_SEQUENCE_LENGTH * half)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
+
+        let query_rotated = reference_rope_bsh_geometry(
+            &query,
+            1,
+            QUERY_HEAD_COUNT,
+            head_width,
+            rotary_dim,
+            &[PAST_SEQUENCE_LENGTH],
+            &cos,
+            &sin,
+        );
+        let current_key_rotated_bsh = reference_rope_bsh_geometry(
+            &current_key,
+            1,
+            KEY_VALUE_HEAD_COUNT,
+            head_width,
+            rotary_dim,
+            &[PAST_SEQUENCE_LENGTH],
+            &cos,
+            &sin,
+        );
+        let current_key_rotated = bsh_to_bnsh_geometry(
+            &current_key_rotated_bsh,
+            1,
+            KEY_VALUE_HEAD_COUNT,
+            head_width,
+        );
+        let current_value_bnsh =
+            bsh_to_bnsh_geometry(&current_value, 1, KEY_VALUE_HEAD_COUNT, head_width);
+
+        let mut expected_key = vec![0.0; KEY_VALUE_HEAD_COUNT * TOTAL_SEQUENCE_LENGTH * head_width];
+        let mut expected_value = expected_key.clone();
+        for h in 0..KEY_VALUE_HEAD_COUNT {
+            let past_src = h * PAST_SEQUENCE_LENGTH * head_width;
+            let present_dst = h * TOTAL_SEQUENCE_LENGTH * head_width;
+            let past_len = PAST_SEQUENCE_LENGTH * head_width;
+            expected_key[present_dst..present_dst + past_len]
+                .copy_from_slice(&past_key[past_src..past_src + past_len]);
+            expected_value[present_dst..present_dst + past_len]
+                .copy_from_slice(&past_value[past_src..past_src + past_len]);
+            expected_key[present_dst + past_len..present_dst + past_len + head_width]
+                .copy_from_slice(&current_key_rotated[h * head_width..(h + 1) * head_width]);
+            expected_value[present_dst + past_len..present_dst + past_len + head_width]
+                .copy_from_slice(&current_value_bnsh[h * head_width..(h + 1) * head_width]);
+        }
+        let expected_output = reference_with_geometry(
+            &query_rotated,
+            &expected_key,
+            &expected_value,
+            1,
+            TOTAL_SEQUENCE_LENGTH,
+            PAST_SEQUENCE_LENGTH,
+            QUERY_HEAD_COUNT,
+            KEY_VALUE_HEAD_COUNT,
+            head_width,
+        );
+
+        let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * head_width]);
+        let mut present_key =
+            Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, head_width]);
+        let mut present_value =
+            Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, head_width]);
+        gqa_kernel_with_heads(
+            QUERY_HEAD_COUNT as i64,
+            KEY_VALUE_HEAD_COUNT as i64,
+            &[("do_rotary", Attribute::Int(1))],
+        )
+        .execute(
+            &[
+                Owned::f32(&[1, 1, QUERY_HEAD_COUNT * head_width], &query).view(),
+                Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * head_width], &current_key).view(),
+                Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * head_width], &current_value).view(),
+                Owned::f32(
+                    &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, head_width],
+                    &past_key,
+                )
+                .view(),
+                Owned::f32(
+                    &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, head_width],
+                    &past_value,
+                )
+                .view(),
+                Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
+                Owned::f32(&[TOTAL_SEQUENCE_LENGTH, half], &cos).view(),
+                Owned::f32(&[TOTAL_SEQUENCE_LENGTH, half], &sin).view(),
+            ],
+            &mut [
+                output.view_mut(),
+                present_key.view_mut(),
+                present_value.view_mut(),
+            ],
+        )
+        .unwrap();
+
+        close(&present_key.to_f32(), &expected_key);
+        close(&present_value.to_f32(), &expected_value);
+        close(&output.to_f32(), &expected_output);
+    }
+
+    #[test]
+    fn decode_head_dim_48_with_rotary_matches_reference_and_kv_cache() {
+        run_nonstandard_head_width_decode(48, 48);
+    }
+
+    #[test]
+    fn decode_head_dim_80_with_partial_rotary_matches_reference_and_kv_cache() {
+        run_nonstandard_head_width_decode(80, 32);
+    }
+
     #[test]
     fn decode_widens_f16_past_cache_before_materializing_present_cache() {
         let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
@@ -1613,7 +1806,13 @@ mod tests {
             let mut full = rotary_tensor(batch, heads, seq, half * 2, seed);
             let mut bounded = rotary_tensor(batch, heads, seq, half * 2, seed);
             rotate(
-                &mut full, &full_cos, &full_sin, cache_rows, positions, false,
+                &mut full,
+                &full_cos,
+                &full_sin,
+                cache_rows,
+                half * 2,
+                positions,
+                false,
             )
             .unwrap();
             rotate(
@@ -1621,6 +1820,7 @@ mod tests {
                 &bounded_cos,
                 &bounded_sin,
                 rows_needed,
+                half * 2,
                 positions,
                 false,
             )
@@ -1712,6 +1912,7 @@ mod tests {
             &fast_cos,
             &fast_sin,
             rows_needed,
+            half * 2,
             &positions,
             false,
         )
@@ -1721,6 +1922,7 @@ mod tests {
             &fallback_cos,
             &fallback_sin,
             rows_needed,
+            half * 2,
             &positions,
             false,
         )

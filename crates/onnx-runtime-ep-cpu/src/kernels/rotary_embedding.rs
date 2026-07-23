@@ -135,6 +135,24 @@ impl Kernel for RotaryEmbeddingKernel {
             return write_dense_f32(&mut outputs[0], &[]);
         }
 
+        let expected_cache_shape = if position_ids.is_some() {
+            if inputs[1].shape.len() != 2 {
+                return Err(EpError::KernelFailed(format!(
+                    "RotaryEmbedding: with position_ids, cos_cache/sin_cache must be rank 2 [max_position,{half}], got {:?}",
+                    inputs[1].shape
+                )));
+            }
+            inputs[1].shape[1] == half
+        } else {
+            inputs[1].shape == [batch, seq, half]
+        };
+        if inputs[2].shape != inputs[1].shape || !expected_cache_shape {
+            return Err(EpError::KernelFailed(format!(
+                "RotaryEmbedding: cos_cache/sin_cache shapes must match the resolved rotary dimension {rotary_dim}; got cos={:?}, sin={:?}",
+                inputs[1].shape, inputs[2].shape
+            )));
+        }
+
         // With `position_ids` present, validate its shape matches [batch, seq].
         if let Some(pos) = &position_ids {
             let pos_shape = inputs[3].shape;
@@ -366,6 +384,58 @@ mod tests {
         .unwrap();
         // half=1: x1=d0=1, x2=d1=2; cos=0,sin=1 → real=-2, imag=1. Tail [3,4] unchanged.
         assert_eq!(out.to_f32(), vec![-2., 1., 3., 4.]);
+    }
+
+    fn run_nonstandard_head_size(head_size: usize, rotary_dim: usize) {
+        let half = rotary_dim / 2;
+        let x: Vec<f32> = (0..2 * head_size)
+            .map(|i| i as f32 * 0.03125 - 1.5)
+            .collect();
+        let cos: Vec<f32> = (0..2 * half).map(|i| (i as f32 * 0.017).cos()).collect();
+        let sin: Vec<f32> = (0..2 * half).map(|i| (i as f32 * 0.017).sin()).collect();
+        let mut expected = x.clone();
+        for s in 0..2 {
+            for k in 0..half {
+                let base = s * head_size;
+                let cache = s * half + k;
+                let x0 = x[base + k];
+                let x1 = x[base + half + k];
+                expected[base + k] = cos[cache] * x0 - sin[cache] * x1;
+                expected[base + half + k] = sin[cache] * x0 + cos[cache] * x1;
+            }
+        }
+
+        let input = Owned::f32(&[1, 1, 2, head_size], &x);
+        let cos_cache = Owned::f32(&[1, 2, half], &cos);
+        let sin_cache = Owned::f32(&[1, 2, half], &sin);
+        let mut output = Owned::zeros_f32(&[1, 1, 2, head_size]);
+        RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 0,
+            rotary_embedding_dim: rotary_dim,
+        }
+        .execute(
+            &[input.view(), cos_cache.view(), sin_cache.view()],
+            &mut [output.view_mut()],
+        )
+        .unwrap();
+
+        for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "{index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn rope_head_dim_48_matches_reference() {
+        run_nonstandard_head_size(48, 48);
+    }
+
+    #[test]
+    fn rope_head_dim_80_partial_rotary_matches_reference() {
+        run_nonstandard_head_size(80, 32);
     }
 
     #[test]
