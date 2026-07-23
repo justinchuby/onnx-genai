@@ -337,7 +337,19 @@ impl Kernel for MatMulNBitsKernel {
             }
             flops
         });
-        let mut result = vec![0.0f32; m * self.n];
+        let result_len = m * self.n;
+        let direct_result = outputs[0].dtype == DataType::Float32
+            && outputs[0].is_contiguous()
+            && outputs[0].device.is_host_accessible();
+        let mut owned_result;
+        let result: &mut [f32] = if direct_result {
+            // SAFETY: the executor provides an exclusive, in-bounds contiguous
+            // output buffer whose validated shape contains `result_len` f32s.
+            unsafe { std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), result_len) }
+        } else {
+            owned_result = vec![0.0f32; result_len];
+            &mut owned_result
+        };
         let dot_kernel = selected_dot_kernel();
         #[cfg(feature = "mlas")]
         {
@@ -350,9 +362,13 @@ impl Kernel for MatMulNBitsKernel {
                 &activations,
                 m,
                 bias.as_deref(),
-                &mut result,
+                result,
             )? {
-                let out = mm_profile::time_narrow(|| write_compute_f32(&mut outputs[0], &result));
+                let out = if direct_result {
+                    Ok(())
+                } else {
+                    mm_profile::time_narrow(|| write_compute_f32(&mut outputs[0], result))
+                };
                 mm_profile::tick();
                 return out;
             }
@@ -392,7 +408,7 @@ impl Kernel for MatMulNBitsKernel {
                 int4_matmul_m1(
                     &activations,
                     packed_weight,
-                    &mut result,
+                    result,
                     self.k,
                     self.n,
                     dot_kernel,
@@ -420,7 +436,7 @@ impl Kernel for MatMulNBitsKernel {
                 int8_matmul(
                     &activations,
                     int8_weight,
-                    &mut result,
+                    result,
                     m,
                     self.k,
                     self.n,
@@ -464,7 +480,7 @@ impl Kernel for MatMulNBitsKernel {
                 &owned_weight
             };
             with_decode_pool(|| {
-                gemv_nk(&activations, weight_nk, &mut result, self.k, self.n);
+                gemv_nk(&activations, weight_nk, result, self.k, self.n);
             })?;
         } else {
             let weight_kn = self.dequantize_weight(
@@ -474,7 +490,7 @@ impl Kernel for MatMulNBitsKernel {
                 group_indices,
                 WeightLayout::Kn,
             )?;
-            gemm(&activations, &weight_kn, &mut result, m, self.k, self.n)?;
+            gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
         }
         if let Some(bias) = bias {
             for row in result.chunks_exact_mut(self.n) {
@@ -483,7 +499,11 @@ impl Kernel for MatMulNBitsKernel {
                 }
             }
         }
-        write_compute_f32(&mut outputs[0], &result)
+        if direct_result {
+            Ok(())
+        } else {
+            write_compute_f32(&mut outputs[0], result)
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
