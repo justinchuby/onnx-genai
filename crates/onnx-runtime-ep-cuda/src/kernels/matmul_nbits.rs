@@ -3168,13 +3168,21 @@ impl MatMulNBitsKernel {
             scales_fp16,
             zero_points.is_some(),
         );
-        let variant_name = match selection.variant {
-            F16GemvVariant::DownProjection => "gemv_f16_down_projection",
-            F16GemvVariant::General => "gemv_f16_general",
+        // Non-block-32 layouts are served by the model-agnostic general_bs
+        // kernel; tag them distinctly so nsys/trace timelines can tell the
+        // block-size-general decode GEMV apart from a tuned block-32 general one.
+        let variant_name = if self.block_size != 32 {
+            "gemv_f16_general_bs"
+        } else {
+            match selection.variant {
+                F16GemvVariant::DownProjection => "gemv_f16_down_projection",
+                F16GemvVariant::General => "gemv_f16_general",
+            }
         };
         onnx_runtime_ep_api::record_kernel_variant!(
             variant_name,
-            "fp16-activation x int4 M==1 decode GEMV: zero_points={}; {}",
+            "fp16-activation x int4 M==1 decode GEMV: block_size={}; zero_points={}; {}",
+            self.block_size,
             zero_points.is_some(),
             selection.reason
         );
@@ -3294,12 +3302,14 @@ impl MatMulNBitsKernel {
             .arg(&zp_row_bytes)
             .arg(&scales_fp16_flag)
             .arg(&bias_post_round_flag);
-        // SAFETY: this path is restricted to block-32 M=1 fp16 inputs; all tensors
-        // were dtype/shape/contiguity validated above, including the optional
-        // packed per-block zero-point rows. The scalar ABI matches the selected
-        // fp16 GEMV entry point. Both variants use only registers and launch-time
-        // shared memory (no per-call alloc or sync), so the launch is legal to
-        // record into and replay from a CUDA graph.
+        // SAFETY: M=1 fp16 inputs; all tensors were dtype/shape/contiguity
+        // validated above, including the optional packed per-block zero-point
+        // rows. Block-32 layouts use the tuned entries; any other (power-of-two,
+        // >=16) block size routes to the general_bs entry, which derives the
+        // scale/zero-point block index from `block_size`. The scalar ABI is
+        // shared by all these entries. Every variant uses only registers and
+        // launch-time shared memory (no per-call alloc or sync), so the launch
+        // is legal to record into and replay from a CUDA graph.
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
@@ -3897,7 +3907,7 @@ mod tests {
         scales_fp16: bool,
         with_bias: bool,
     ) -> (f32, f32, f32, bool) {
-        run_parity_dims_block(k, n, 32, scales_fp16, with_bias)
+        run_parity_dims_block(k, n, 32, scales_fp16, with_bias, false)
     }
 
     /// Parametrized fp16 GEMV parity harness with an explicit `block_size`. The
@@ -3905,13 +3915,17 @@ mod tests {
     /// share this oracle; passing `block_size != 32` exercises the general
     /// decode GEMV (`matmul_nbits_gemv_f16_general_bs`) against the same f64
     /// dequant-and-matmul reference. `block_size` must be a power of two >= 16
-    /// and must divide `k`.
+    /// and must divide `k`. `explicit_zp` supplies a non-uniform per-block int4
+    /// zero-point tensor (packed two block-nibbles per byte) instead of the
+    /// symmetric zp=8 default, so a zero-point indexing regression in the
+    /// general kernel's dequant path is caught.
     fn run_parity_dims_block(
         k: usize,
         n: usize,
         block_size: usize,
         scales_fp16: bool,
         with_bias: bool,
+        explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
         let Some(runtime) = runtime() else {
             eprintln!("skipping MatMulNBits fp16 GEMV parity test: CUDA runtime unavailable");
@@ -3927,6 +3941,7 @@ mod tests {
 
         let k_blocks = k / block_size;
         let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
 
         // Deterministic LCG so the test is reproducible without extra crates.
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -3964,6 +3979,29 @@ mod tests {
             }
         }
 
+        // Explicit asymmetric int4 zero points: a non-uniform per-(col, block)
+        // code in 0..15, packed two block-nibbles per byte exactly as the kernel
+        // unpacks (`zp[col*zp_row_bytes + block/2]`, low nibble for even blocks).
+        // The symmetric default (zp=8) is used when `explicit_zp` is false.
+        let mut zp_codes = vec![8i32; n * k_blocks];
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        if explicit_zp {
+            for i in 0..n * k_blocks {
+                zp_codes[i] = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
+            }
+            for col in 0..n {
+                for block in 0..k_blocks {
+                    let code = (zp_codes[col * k_blocks + block] & 15) as u8;
+                    let byte = &mut zp_packed[col * zp_row_bytes + block / 2];
+                    if block & 1 == 0 {
+                        *byte = (*byte & 0xf0) | code;
+                    } else {
+                        *byte = (*byte & 0x0f) | (code << 4);
+                    }
+                }
+            }
+        }
+
         // Per (col, block) scales, rounded to the storage dtype so both paths use
         // the same scale value.
         let mut scale_ref = vec![0.0f32; n * k_blocks];
@@ -3997,9 +4035,10 @@ mod tests {
             let mut acc = 0.0f64;
             for block in 0..k_blocks {
                 let scale = scale_ref[col * k_blocks + block] as f64;
+                let zero_point = zp_codes[col * k_blocks + block];
                 for within in 0..block_size {
                     let depth = block * block_size + within;
-                    let q = quant[col * k + depth] as i32 - 8;
+                    let q = quant[col * k + depth] as i32 - zero_point;
                     acc += activation_ref[depth] as f64 * q as f64 * scale;
                 }
             }
@@ -4014,6 +4053,7 @@ mod tests {
         let scales_dev = runtime
             .alloc_raw(n * k_blocks * if scales_fp16 { 2 } else { 4 })
             .unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len().max(1)).unwrap();
         let bias_dev = runtime.alloc_raw(n * 2).unwrap();
         let output_dev = runtime.alloc_raw(n * 2).unwrap();
 
@@ -4027,6 +4067,9 @@ mod tests {
                 runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
             } else {
                 runtime.htod(as_bytes(&scale_f32), scales_dev).unwrap();
+            }
+            if explicit_zp {
+                runtime.htod(&zp_packed, zp_dev).unwrap();
             }
             if with_bias {
                 runtime.htod(as_bytes(&bias_f16), bias_dev).unwrap();
@@ -4073,8 +4116,23 @@ mod tests {
                 device,
             ),
         ];
-        if with_bias {
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let zp_view = TensorView::new(
+            device_ptr(zp_dev),
+            DataType::Uint8,
+            &zp_shape,
+            &zp_strides,
+            device,
+        );
+        // Slots: 3 = zero_points, 4 = g_idx, 5 = bias. Fill only up to the last
+        // present optional input so the kernel's `optional_input` indexing holds.
+        if explicit_zp {
+            inputs.push(zp_view);
+        } else if with_bias {
             inputs.push(TensorView::absent(DataType::Uint8));
+        }
+        if with_bias {
             inputs.push(TensorView::absent(DataType::Int32));
             inputs.push(TensorView::new(
                 device_ptr(bias_dev),
@@ -4128,6 +4186,7 @@ mod tests {
             runtime.free_raw(activation_dev).unwrap();
             runtime.free_raw(packed_dev).unwrap();
             runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
             runtime.free_raw(bias_dev).unwrap();
             runtime.free_raw(output_dev).unwrap();
         }
@@ -4746,8 +4805,11 @@ mod tests {
     /// foundry package's layout that previously failed to load — across the
     /// exact q/k/v/o/gate/up/down projection dims (K=896, and the wide MLP
     /// K=4864), a ragged-N tail, and both fp16/fp32 scales with and without a
-    /// folded bias. A regression in the general block-index math (scale/zp
-    /// stride, K-stepping, or nibble unpack) would diverge here.
+    /// folded bias. It also drives an explicit **asymmetric** per-block int4
+    /// zero-point tensor so a zero-point indexing regression in the general
+    /// kernel's dequant path is caught (plausible for zp-bearing non-32-block
+    /// models). A regression in the general block-index math (scale/zp stride,
+    /// K-stepping, or nibble unpack) would diverge here.
     #[test]
     fn fp16_gemv_matches_dequant_reference_block128() {
         // (block_size, k, n): block-128 covers the Qwen2.5-0.5B bs128 attention
@@ -4771,9 +4833,17 @@ mod tests {
             );
             let (mut worst_abs, mut worst_rel, mut max_out, mut all_finite) =
                 (0.0f32, 0.0f32, 0.0f32, true);
-            for (scales_fp16, with_bias) in [(false, false), (true, false), (true, true)] {
+            // (scales_fp16, with_bias, explicit_zp): the last two rows exercise
+            // the general kernel's asymmetric int4 zero-point dequant path.
+            for (scales_fp16, with_bias, explicit_zp) in [
+                (false, false, false),
+                (true, false, false),
+                (true, true, false),
+                (false, false, true),
+                (true, true, true),
+            ] {
                 let (abs, rel, out, finite) =
-                    run_parity_dims_block(k, n, block_size, scales_fp16, with_bias);
+                    run_parity_dims_block(k, n, block_size, scales_fp16, with_bias, explicit_zp);
                 worst_abs = worst_abs.max(abs);
                 worst_rel = worst_rel.max(rel);
                 max_out = max_out.max(out);
