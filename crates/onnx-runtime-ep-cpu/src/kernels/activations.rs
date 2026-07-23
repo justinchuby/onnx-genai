@@ -317,7 +317,7 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
 /// vectorized routine ORT's activations use), turning the hot MLP activation
 /// into two vectorized passes instead of a scalar `expf`/`exp` loop that LLVM
 /// cannot autovectorize. Without `mlas` we keep the scalar reference.
-fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
+pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "mlas")]
     {
         // MLAS's SIMD logistic clamps its input to [-18, 18] internally, so for

@@ -36,6 +36,7 @@ pub mod block_dequant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
 pub mod cast;
+pub mod causal_conv;
 pub mod center_crop_pad;
 pub mod col2im;
 pub mod compress;
@@ -65,6 +66,7 @@ pub mod index_share;
 pub mod indexing;
 pub mod is_inf;
 pub mod layernorm;
+pub mod linear_attention;
 pub mod log_softmax;
 pub mod logical;
 pub mod lp_normalization;
@@ -99,6 +101,9 @@ pub mod unique;
 pub mod unsqueeze;
 pub mod where_op;
 pub mod window;
+
+#[cfg(test)]
+mod qwen35_goldens;
 
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
@@ -309,6 +314,17 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory),
+    );
+    // `com.microsoft::CausalConvWithState` and `com.microsoft::LinearAttention`:
+    // the hybrid linear-attention (Gated DeltaNet) primitives used by Qwen3.5 /
+    // Qwen3-Next. Shape-driven and gate-configurable (no model-specific dims).
+    reg.register(
+        OpKey::new("CausalConvWithState", "com.microsoft", 1),
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
+    reg.register(
+        OpKey::new("LinearAttention", "com.microsoft", 1),
+        Box::new(linear_attention::LinearAttentionFactory),
     );
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
@@ -1531,8 +1547,10 @@ mod tests {
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
+        // `CausalConvWithState` and `LinearAttention` (Qwen3.5 hybrid
+        // linear-attention primitives) add two more contrib entries.
         let mlas_registrations = usize::from(cfg!(feature = "mlas"));
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 85 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 87 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1575,6 +1593,11 @@ mod tests {
             reg.lookup("GroupQueryAttention", "com.microsoft", 1)
                 .is_some()
         );
+        assert!(
+            reg.lookup("CausalConvWithState", "com.microsoft", 1)
+                .is_some()
+        );
+        assert!(reg.lookup("LinearAttention", "com.microsoft", 1).is_some());
         assert!(reg.lookup("SimplifiedLayerNormalization", "", 21).is_some());
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.
