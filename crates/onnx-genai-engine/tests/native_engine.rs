@@ -4,7 +4,7 @@ use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
     SpeculativeMode,
 };
-use onnx_genai_ort::{ep_selection, SessionOptions};
+use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
 
 #[test]
@@ -105,9 +105,12 @@ fn native_backend_rejects_unsupported_session_device() {
     )
     .err()
     .expect("native backend must reject unsupported session options");
-    assert!(error
-        .to_string()
-        .contains("does not support execution provider WebGpu"));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("does not support execution provider")
+            && message.contains("WebGpuExecutionProvider"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -147,56 +150,48 @@ fn native_backend_rejects_cuda_without_cuda_feature() {
     )
     .err()
     .expect("native CUDA must require the CUDA feature");
-    assert!(error.to_string().contains(
-        "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
-    ));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(
+            "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
+        ),
+        "{message}"
+    );
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-fn native_sub4_cuda_fails_fast_at_load() -> anyhow::Result<()> {
+fn native_sub4_cuda_fallback_generates_coherent_decode() -> anyhow::Result<()> {
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
-        eprintln!("skipping native sub-4-bit CUDA fail-fast test; CUDA is unavailable: {error}");
+        eprintln!("skipping native sub-4-bit CUDA fallback test; CUDA is unavailable: {error}");
         return Ok(());
     }
 
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
-    let explicit_error = Engine::from_dir(
+    let mut explicit = Engine::from_dir(
         &fixture,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
             native_device: Some(NativeDecodeDevice::Cuda { index: Some(0) }),
             ..EngineConfig::default()
         },
-    )
-    .err()
-    .expect("CUDA-only load must fail before generation");
-    let routed_error = Engine::from_dir_with_session_options(
+    )?;
+    let mut routed = Engine::from_dir_with_session_options(
         &fixture,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
             ..EngineConfig::default()
         },
         SessionOptions::with_execution_provider(ep_selection("cuda")),
-    )
-    .err()
-    .expect("ONNX_GENAI_EP-style CUDA routing must fail before generation");
+    )?;
 
-    for error in [explicit_error, routed_error] {
-        let message = error.to_string();
-        assert!(
-            message.contains("Heterogeneous CPU+CUDA placement is required"),
-            "{message}"
-        );
-        assert!(message.contains("not yet available"), "{message}");
-        assert!(message.contains("BlockQuantizedMatMul"), "{message}");
-        assert!(message.contains("M>1 or symbolic prefill"), "{message}");
-        assert!(message.contains("Transpose"), "{message}");
-        assert!(
-            message.contains("use native CPU or the ORT backend"),
-            "{message}"
-        );
+    for engine in [&mut explicit, &mut routed] {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0, 0]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        assert_eq!(engine.generate(request)?.token_ids, vec![1, 1, 1]);
     }
     Ok(())
 }
