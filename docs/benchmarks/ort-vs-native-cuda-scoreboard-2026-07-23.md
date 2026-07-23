@@ -54,4 +54,24 @@ with 0 MiB allocated immediately before and after the timed run, but CPU
 scheduling and system-level contention remain a caveat. Do not interpret
 the difference from a reserved-host result as a kernel regression.
 
+## Post-fix Phi decode diagnostic
+
+An Nsight Systems node-trace over two 128-token generations confirms **two**
+captured graph regions: four `cuStreamBeginCapture` calls and 508
+`cuGraphLaunch` calls, or two launches per each of the 254 decode forwards.
+It records 60,414 kernel instances, **236.0 kernels/decode-forward**, taking
+**2.948 ms/token**. The uninstrumented native run measured **5.150
+ms/token**, leaving about **2.20 ms/token** outside GPU kernels (the Nsight
+wall time itself is not used because instrumentation increases it).
+
+The remaining dominant host cost is the still-eager LongRoPE `If`: the native
+op trace reports a **1.935 ms** median per decode-forward. The replayed
+`Greater` kernel is only about **1.28 us/token**, and GQA is inside the
+captured regions (its GPU prep/attention/merge total is about **0.406
+ms/token**), so neither an eager Greater read nor GQA dispatch is the current
+first target. The 236 kernels are already submitted through two graph
+launches, not individually. **Next lever:** make the LongRoPE branch select
+fully on-device; its ~1.94 ms/token budget is roughly 88% of the remaining
+non-GPU time (a 5.15 to ~3.2 ms/token theoretical ceiling).
+
 No model failed to load on either backend.
