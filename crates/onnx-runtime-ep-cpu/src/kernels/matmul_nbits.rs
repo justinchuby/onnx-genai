@@ -187,6 +187,7 @@ pub struct MatMulNBitsKernel {
     weight_nk: OnceLock<Vec<f32>>,
     int8_weight: OnceLock<Int8Weight>,
     packed_int4_weight: OnceLock<PackedInt4Weight>,
+    packed_u8_weight: OnceLock<PackedU8Weight>,
     #[cfg(feature = "mlas")]
     mlas_shards: OnceLock<Option<Vec<Option<MlasShard>>>>,
 }
@@ -210,6 +211,20 @@ struct Int8Weight {
 struct PackedInt4Weight {
     values: Vec<u8>,
     scales: Vec<f32>,
+}
+
+/// Dense `u8` weight for the 8-bit `MatMulNBits` decode (`m == 1`) path.
+///
+/// Unlike [`weight_nk`](MatMulNBitsKernel::weight_nk) — which fully expands each
+/// weight to `f32` (4 bytes/elem) — this keeps the quantized weight at one byte
+/// per element and dequantizes on the fly inside the GEMV, cutting the weight
+/// memory traffic (which dominates decode) ~4x while keeping the activations in
+/// `f32` so the result stays full-precision. Rows are `[N, K]` (`values`), with
+/// one `scale` and one pre-scaled zero point (`scale * zero_point`) per K block.
+struct PackedU8Weight {
+    values: Vec<u8>,
+    scales: Vec<f32>,
+    scaled_zero_points: Vec<f32>,
 }
 
 pub struct MatMulNBitsFactory;
@@ -254,6 +269,7 @@ impl KernelFactory for MatMulNBitsFactory {
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
+            packed_u8_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
         }))
@@ -449,6 +465,42 @@ impl Kernel for MatMulNBitsKernel {
             } else {
                 matmul();
             }
+        } else if self.bits == 8 && m == 1 && group_indices.is_none() {
+            // 8-bit decode GEMV: keep the weight at one byte per element and
+            // dequantize on the fly against f32 activations, instead of
+            // pre-expanding it to f32 (4x the memory traffic) as the generic
+            // `weight_nk` path below does. Activations stay f32 so the result is
+            // full-precision (unlike int8-activation kernels).
+            let owned_weight;
+            let weight_u8 = if can_prepack {
+                if let Some(weight) = self.packed_u8_weight.get() {
+                    weight
+                } else {
+                    let weight =
+                        self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
+                    let weight = numa_place_u8(weight, self.n);
+                    let _ = self.packed_u8_weight.set(weight);
+                    self.packed_u8_weight
+                        .get()
+                        .expect("constant MatMulNBits u8 prepack was just initialized")
+                }
+            } else {
+                let built = self.prepack_u8_weight(&inputs[1], &inputs[2], zero_points)?;
+                owned_weight = numa_place_u8(built, self.n);
+                &owned_weight
+            };
+            with_decode_pool(|| {
+                    gemv_nk_u8(
+                        &activations,
+                        &weight_u8.values,
+                        &weight_u8.scales,
+                        &weight_u8.scaled_zero_points,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                    );
+            })?;
         } else if m == 1 {
             let owned_weight;
             let weight_nk = if can_prepack {
@@ -832,6 +884,50 @@ impl MatMulNBitsKernel {
             values,
             scales,
             block_sums,
+        })
+    }
+
+    /// Prepack an 8-bit `MatMulNBits` weight into a dense `[N, K]` `u8` buffer
+    /// with per-block `scale` and pre-scaled zero point (`scale * zero_point`),
+    /// for the on-the-fly-dequant decode GEMV ([`gemv_nk_u8`]).
+    ///
+    /// Keeps one byte per weight (vs. 4 for a fully dequantized `f32` weight),
+    /// which is the memory that dominates 8-bit CPU decode.
+    fn prepack_u8_weight(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+    ) -> Result<PackedU8Weight> {
+        debug_assert_eq!(self.bits, 8);
+        let packed = to_dense_bytes(packed)?;
+        let scales = to_dense_compute_f32(scales)?;
+        let packed_zero_points = zero_points.map(to_dense_bytes).transpose()?;
+        let k_blocks = self.k.div_ceil(self.block_size);
+        // 8-bit blob is one byte per weight; zero points are one byte per block.
+        let blob_size = self.block_size;
+        let zp_row_bytes = k_blocks;
+        let mut values = vec![0u8; self.n * self.k];
+        let mut scaled_zero_points = vec![0.0f32; self.n * k_blocks];
+        for output in 0..self.n {
+            for block in 0..k_blocks {
+                let zero_point = packed_zero_points
+                    .as_ref()
+                    .map_or(128u8, |points| points[output * zp_row_bytes + block]);
+                let scale = scales[output * k_blocks + block];
+                scaled_zero_points[output * k_blocks + block] = scale * zero_point as f32;
+                let block_start = block * self.block_size;
+                let valid = self.k.saturating_sub(block_start).min(self.block_size);
+                let packed_start = (output * k_blocks + block) * blob_size;
+                let values_start = output * self.k + block_start;
+                values[values_start..values_start + valid]
+                    .copy_from_slice(&packed[packed_start..packed_start + valid]);
+            }
+        }
+        Ok(PackedU8Weight {
+            values,
+            scales,
+            scaled_zero_points,
         })
     }
 
@@ -1317,6 +1413,26 @@ fn numa_place_int8(weight: Int8Weight, n: usize) -> Int8Weight {
             values: spmd.place_rows(&weight.values, n),
             scales: spmd.place_rows(&weight.scales, n),
             block_sums: spmd.place_rows(&weight.block_sums, n),
+        };
+    }
+    weight
+}
+
+/// Node-local first-touch for the prepacked 8-bit `u8` weight (see
+/// [`numa_place_int4`]).
+fn numa_place_u8(weight: PackedU8Weight, n: usize) -> PackedU8Weight {
+    if let Some(numa) = numa_decode_active() {
+        return PackedU8Weight {
+            values: numa.place_rows(&weight.values, n),
+            scales: numa.place_rows(&weight.scales, n),
+            scaled_zero_points: numa.place_rows(&weight.scaled_zero_points, n),
+        };
+    }
+    if let Some(spmd) = spmd_decode_active() {
+        return PackedU8Weight {
+            values: spmd.place_rows(&weight.values, n),
+            scales: spmd.place_rows(&weight.scales, n),
+            scaled_zero_points: spmd.place_rows(&weight.scaled_zero_points, n),
         };
     }
     weight
@@ -1954,6 +2070,89 @@ fn gemv_nk(activation: &[f32], weight_nk: &[f32], result: &mut [f32], k: usize, 
     }
 }
 
+/// Multiply-accumulate a `u8` weight slice against an `f32` activation slice.
+///
+/// Uses sixteen independent accumulators so LLVM can vectorize the widening
+/// `u8 -> f32` FMA (a plain `iter().map().sum()` keeps a single serial `f32`
+/// reduction chain and stays scalar, which dominates 8-bit decode).
+#[inline]
+fn dot_u8_f32(weight: &[u8], activation: &[f32]) -> f32 {
+    debug_assert_eq!(weight.len(), activation.len());
+    const LANES: usize = 16;
+    let mut acc = [0.0f32; LANES];
+    let mut weight_chunks = weight.chunks_exact(LANES);
+    let mut activation_chunks = activation.chunks_exact(LANES);
+    for (w, a) in weight_chunks.by_ref().zip(activation_chunks.by_ref()) {
+        for lane in 0..LANES {
+            acc[lane] += w[lane] as f32 * a[lane];
+        }
+    }
+    let mut tail = 0.0f32;
+    for (w, a) in weight_chunks
+        .remainder()
+        .iter()
+        .zip(activation_chunks.remainder())
+    {
+        tail += *w as f32 * *a;
+    }
+    tail + acc.iter().sum::<f32>()
+}
+
+/// 8-bit decode GEMV that dequantizes a dense `u8` `[N, K]` weight on the fly.
+///
+/// Computes, for each output row, `sum_block scale * (w . a) - (scale*zp) *
+/// sum(a)`, which is algebraically the dequantized `sum((w - zp) * scale * a)`
+/// but keeps the weight at one byte per element (4x less memory traffic than a
+/// fully expanded `f32` weight) and the activations in `f32` (full precision).
+#[allow(clippy::too_many_arguments)]
+fn gemv_nk_u8(
+    activation: &[f32],
+    values: &[u8],
+    scales: &[f32],
+    scaled_zero_points: &[f32],
+    result: &mut [f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    debug_assert_eq!(activation.len(), k);
+    debug_assert_eq!(values.len(), n * k);
+    debug_assert_eq!(result.len(), n);
+    let k_blocks = k.div_ceil(block_size);
+    debug_assert_eq!(scales.len(), n * k_blocks);
+    debug_assert_eq!(scaled_zero_points.len(), n * k_blocks);
+    // Per-block activation sums are shared across every output row, so compute
+    // them once rather than N times inside the row loop.
+    let mut block_activation_sums = vec![0.0f32; k_blocks];
+    for (block, sum) in block_activation_sums.iter_mut().enumerate() {
+        let start = block * block_size;
+        let end = (start + block_size).min(k);
+        *sum = activation[start..end].iter().sum();
+    }
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        for (index, output) in outputs.iter_mut().enumerate() {
+            let row = output_start + index;
+            let weights = &values[row * k..row * k + k];
+            let scale_row = &scales[row * k_blocks..row * k_blocks + k_blocks];
+            let zp_row = &scaled_zero_points[row * k_blocks..row * k_blocks + k_blocks];
+            let mut acc = 0.0f32;
+            for block in 0..k_blocks {
+                let start = block * block_size;
+                let end = (start + block_size).min(k);
+                let dot = dot_u8_f32(&weights[start..end], &activation[start..end]);
+                acc += scale_row[block] * dot
+                    - zp_row[block] * block_activation_sums[block];
+            }
+            *output = acc;
+        }
+    };
+    let chunk = output_chunk_len(n, k);
+    if chunk < n {
+        parallel_output_rows(result, k, compute);
+    } else {
+        compute(0, result);
+    }
+}
 const MIN_PARALLEL_DOT_PRODUCTS_PER_TASK: usize = 32 * 1024;
 const MIN_PARALLEL_DOT_PRODUCTS_PER_THREAD: usize = 8 * 1024;
 const MANY_THREAD_DOT_PRODUCTS_PER_THREAD: usize = 64 * 1024;
@@ -2155,6 +2354,7 @@ mod tests {
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
             int8_weight: OnceLock::new(),
+            packed_u8_weight: OnceLock::new(),
             packed_int4_weight: OnceLock::new(),
             #[cfg(feature = "mlas")]
             mlas_shards: OnceLock::new(),
@@ -2977,6 +3177,81 @@ mod tests {
             checked >= 5,
             "deterministic search must exercise several 8-bit near-tie cases (got {checked})",
         );
+    }
+
+    /// `dot_u8_f32` (the vectorized `u8`-weight x `f32`-activation multiply-add
+    /// that backs the 8-bit decode GEMV) must equal a plain serial `f32`
+    /// reduction, including a non-multiple-of-16 tail.
+    #[test]
+    fn dot_u8_f32_matches_serial_reference() {
+        for len in [0usize, 1, 7, 16, 17, 31, 128, 129] {
+            let weight: Vec<u8> = (0..len).map(|i| ((i * 37 + 5) % 256) as u8).collect();
+            let activation: Vec<f32> =
+                (0..len).map(|i| (i as f32 * 0.031 - 0.4).sin() * 1.7).collect();
+            let expected: f32 = weight
+                .iter()
+                .zip(&activation)
+                .map(|(&w, &a)| w as f32 * a)
+                .sum();
+            let got = dot_u8_f32(&weight, &activation);
+            assert!(
+                (got - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+                "len={len}: dot_u8_f32={got} != serial reference {expected}",
+            );
+        }
+    }
+
+    /// The 8-bit decode GEMV ([`gemv_nk_u8`]) must reconstruct the same result as
+    /// a from-scratch dequantize-to-f32 GEMV for both symmetric and asymmetric
+    /// zero points and for a partial trailing K block. This pins the on-the-fly
+    /// u8 dequant path independently of the `execute` dispatch harness.
+    #[test]
+    fn gemv_nk_u8_matches_dequant_f32_reference() {
+        let (n, k, block_size) = (40usize, 200usize, 128usize);
+        let k_blocks = k.div_ceil(block_size);
+        let weights_nk: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.017).sin() * 1.1 + (i as f32 * 0.0009).cos() * 0.5)
+            .collect();
+        let activation: Vec<f32> =
+            (0..k).map(|i| (i as f32 * 0.023 + 0.2).cos() * 0.8).collect();
+        for &asymmetric in &[false, true] {
+            let (packed, scales, zps, dequantized) =
+                quantize_8bit(&weights_nk, n, k, block_size, asymmetric);
+            // Prepack into the dense [N, K] u8 layout gemv_nk_u8 consumes.
+            let mut values = vec![0u8; n * k];
+            let mut scaled_zero_points = vec![0.0f32; n * k_blocks];
+            for output in 0..n {
+                for block in 0..k_blocks {
+                    let start = block * block_size;
+                    let valid = k.saturating_sub(start).min(block_size);
+                    let zp = zps.as_ref().map_or(128u8, |z| z[output * k_blocks + block]);
+                    scaled_zero_points[output * k_blocks + block] =
+                        scales[output * k_blocks + block] * zp as f32;
+                    for offset in 0..valid {
+                        values[output * k + start + offset] =
+                            packed[(output * k_blocks + block) * block_size + offset];
+                    }
+                }
+            }
+            let mut out = vec![0.0f32; n];
+            gemv_nk_u8(
+                &activation,
+                &values,
+                &scales,
+                &scaled_zero_points,
+                &mut out,
+                k,
+                n,
+                block_size,
+            );
+            let oracle = reference(&activation, &dequantized, 1, k, n);
+            let oracle_rms = rmse(&oracle, &vec![0.0; n]).max(1e-6);
+            let rel = rmse(&out, &oracle) / oracle_rms;
+            assert!(
+                rel <= 1e-5,
+                "asymmetric={asymmetric}: gemv_nk_u8 relative RMSE {rel} exceeds 1e-5",
+            );
+        }
     }
 
     #[test]
