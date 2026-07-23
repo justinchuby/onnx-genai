@@ -678,7 +678,7 @@ mod tests {
         let q = Owned::f32(&[1, 1, 4], &[1.0, 2.0, 3.0, 4.0]);
         let k = Owned::f32(&[1, 1, 4], &[0.1, 0.2, 0.3, 0.4]);
         let v = Owned::f32(&[1, 1, 2], &[1.0, -1.0]);
-        let st = Owned::f32(&[1, 1, 4, 2], &vec![0.0; 8]);
+        let st = Owned::f32(&[1, 1, 4, 2], &[0.0; 8]);
         let gd = Owned::f32(&[1, 1, 1], &[-0.1]);
         let bd = Owned::f32(&[1, 1, 1], &[0.5]);
         let mut o0 = Owned::zeros_f32(&[1, 1, 2]);

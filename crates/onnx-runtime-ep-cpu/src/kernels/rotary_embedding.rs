@@ -40,6 +40,10 @@ pub struct RotaryEmbeddingKernel {
     interleaved: bool,
     num_heads: usize,
     rotary_embedding_dim: usize,
+    /// `com.microsoft::RotaryEmbedding` orders inputs as
+    /// `(X, position_ids, cos_cache, sin_cache)`; the standard `ai.onnx` op uses
+    /// `(X, cos_cache, sin_cache, position_ids?)`. The rotation math is identical.
+    contrib: bool,
 }
 
 /// Factory reading `interleaved` (0), `num_heads` (0), `rotary_embedding_dim` (0).
@@ -47,39 +51,68 @@ pub struct RotaryEmbeddingFactory;
 
 impl KernelFactory for RotaryEmbeddingFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let interleaved = node
-            .attr("interleaved")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            != 0;
-        let num_heads = node
-            .attr("num_heads")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            .max(0) as usize;
-        let rotary_embedding_dim = node
-            .attr("rotary_embedding_dim")
-            .and_then(|a| a.as_int())
-            .unwrap_or(0)
-            .max(0) as usize;
-        Ok(Box::new(RotaryEmbeddingKernel {
-            interleaved,
-            num_heads,
-            rotary_embedding_dim,
-        }))
+        rotary_kernel_from_node(node, false)
     }
+}
+
+/// Factory for the `com.microsoft::RotaryEmbedding` contrib op, which orders its
+/// inputs as `(X, position_ids, cos_cache, sin_cache)`.
+pub struct RotaryEmbeddingContribFactory;
+
+impl KernelFactory for RotaryEmbeddingContribFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        rotary_kernel_from_node(node, true)
+    }
+}
+
+fn rotary_kernel_from_node(node: &Node, contrib: bool) -> Result<Box<dyn Kernel>> {
+    let interleaved = node
+        .attr("interleaved")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        != 0;
+    let num_heads = node
+        .attr("num_heads")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        .max(0) as usize;
+    let rotary_embedding_dim = node
+        .attr("rotary_embedding_dim")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        .max(0) as usize;
+    Ok(Box::new(RotaryEmbeddingKernel {
+        interleaved,
+        num_heads,
+        rotary_embedding_dim,
+        contrib,
+    }))
 }
 
 impl Kernel for RotaryEmbeddingKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("RotaryEmbedding", inputs, outputs, 3, 4, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let cos_cache = to_dense_f32(&inputs[1])?;
-        let sin_cache = to_dense_f32(&inputs[2])?;
-        let position_ids = if inputs.len() == 4 {
-            Some(to_dense_i64(&inputs[3])?)
+        // Input order differs between the standard and contrib ops.
+        let (cos_i, sin_i, pos_i) = if self.contrib {
+            // com.microsoft: (X, position_ids, cos_cache, sin_cache).
+            if inputs.len() < 4 {
+                return Err(EpError::KernelFailed(
+                    "RotaryEmbedding (com.microsoft): expected 4 inputs \
+                     (X, position_ids, cos_cache, sin_cache)"
+                        .into(),
+                ));
+            }
+            (2, 3, Some(1))
         } else {
-            None
+            // ai.onnx: (X, cos_cache, sin_cache, position_ids?).
+            (1, 2, if inputs.len() == 4 { Some(3) } else { None })
+        };
+        let x = to_dense_f32(&inputs[0])?;
+        let cos_cache = to_dense_f32(&inputs[cos_i])?;
+        let sin_cache = to_dense_f32(&inputs[sin_i])?;
+        let position_ids = match pos_i {
+            Some(i) => Some(to_dense_i64(&inputs[i])?),
+            None => None,
         };
 
         let x_shape = inputs[0].shape;
@@ -136,26 +169,26 @@ impl Kernel for RotaryEmbeddingKernel {
         }
 
         let expected_cache_shape = if position_ids.is_some() {
-            if inputs[1].shape.len() != 2 {
+            if inputs[cos_i].shape.len() != 2 {
                 return Err(EpError::KernelFailed(format!(
                     "RotaryEmbedding: with position_ids, cos_cache/sin_cache must be rank 2 [max_position,{half}], got {:?}",
-                    inputs[1].shape
+                    inputs[cos_i].shape
                 )));
             }
-            inputs[1].shape[1] == half
+            inputs[cos_i].shape[1] == half
         } else {
-            inputs[1].shape == [batch, seq, half]
+            inputs[cos_i].shape == [batch, seq, half]
         };
-        if inputs[2].shape != inputs[1].shape || !expected_cache_shape {
+        if inputs[sin_i].shape != inputs[cos_i].shape || !expected_cache_shape {
             return Err(EpError::KernelFailed(format!(
                 "RotaryEmbedding: cos_cache/sin_cache shapes must match the resolved rotary dimension {rotary_dim}; got cos={:?}, sin={:?}",
-                inputs[1].shape, inputs[2].shape
+                inputs[cos_i].shape, inputs[sin_i].shape
             )));
         }
 
         // With `position_ids` present, validate its shape matches [batch, seq].
         if let Some(pos) = &position_ids {
-            let pos_shape = inputs[3].shape;
+            let pos_shape = inputs[pos_i.expect("pos index present")].shape;
             let expected = batch * seq;
             if pos.len() != expected {
                 return Err(EpError::KernelFailed(format!(
@@ -277,6 +310,7 @@ mod tests {
             interleaved: false,
             num_heads: 0,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(&[x.view(), cos.view(), sin.view()], &mut [out.view_mut()])
         .unwrap();
@@ -307,6 +341,7 @@ mod tests {
             interleaved: true,
             num_heads: 0,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(&[x.view(), cos.view(), sin.view()], &mut [out.view_mut()])
         .unwrap();
@@ -328,11 +363,12 @@ mod tests {
         let x = Owned::f32(&[1, 2, 1, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
         let cos = Owned::f32(&[1, 1, 2], &[1., 1.]);
         let sin = Owned::f32(&[1, 1, 2], &[0., 0.]);
-        let mut out = Owned::zeros_f32(&[1, 2, 1, 4]);
+        let mut out = Owned::zeros_f32(&[1, 1, 2, 4]);
         RotaryEmbeddingKernel {
             interleaved: false,
             num_heads: 0,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(&[x.view(), cos.view(), sin.view()], &mut [out.view_mut()])
         .unwrap();
@@ -352,6 +388,7 @@ mod tests {
             interleaved: false,
             num_heads: 2,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(
             &[x.view(), cos.view(), sin.view(), pos.view()],
@@ -379,6 +416,7 @@ mod tests {
             interleaved: false,
             num_heads: 0,
             rotary_embedding_dim: 2,
+            contrib: false,
         }
         .execute(&[x.view(), cos.view(), sin.view()], &mut [out.view_mut()])
         .unwrap();
@@ -413,6 +451,7 @@ mod tests {
             interleaved: false,
             num_heads: 0,
             rotary_embedding_dim: rotary_dim,
+            contrib: false,
         }
         .execute(
             &[input.view(), cos_cache.view(), sin_cache.view()],
@@ -449,6 +488,7 @@ mod tests {
             interleaved: false,
             num_heads: 0,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(&[x.view(), cos.view(), sin.view()], &mut [out.view_mut()])
         .unwrap();
@@ -468,6 +508,7 @@ mod tests {
             interleaved: false,
             num_heads: 2,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(
             &[x.view(), cos.view(), sin.view(), pos.view()],
@@ -489,6 +530,7 @@ mod tests {
             interleaved: false,
             num_heads: 2,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(
             &[x.view(), cos.view(), sin.view(), pos.view()],
@@ -508,6 +550,7 @@ mod tests {
             interleaved: false,
             num_heads: 2,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(
             &[x.view(), cos.view(), sin.view(), pos.view()],
@@ -528,11 +571,54 @@ mod tests {
             interleaved: false,
             num_heads: 2,
             rotary_embedding_dim: 0,
+            contrib: false,
         }
         .execute(
             &[x.view(), cos.view(), sin.view(), pos.view()],
             &mut [out.view_mut()],
         );
         assert!(err.is_err(), "malformed position_ids must return an error");
+    }
+
+    #[test]
+    fn contrib_input_order_matches_standard() {
+        // The com.microsoft op orders inputs (X, position_ids, cos, sin); the
+        // standard op uses (X, cos, sin, position_ids). Both must produce the
+        // same rotation. Use position_ids to gather from a 2D cache.
+        let x = Owned::f32(&[1, 1, 2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        // cache [max_pos=2, half=2].
+        let cos = Owned::f32(&[2, 2], &[0.5, 0.8, 0.6, 0.9]);
+        let sin = Owned::f32(&[2, 2], &[0.6, 0.5, 0.7, 0.4]);
+        let pos = Owned::i64(&[1, 2], &[0, 1]);
+
+        let mut out_std = Owned::zeros_f32(&[1, 1, 2, 4]);
+        RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 0,
+            rotary_embedding_dim: 0,
+            contrib: false,
+        }
+        .execute(
+            &[x.view(), cos.view(), sin.view(), pos.view()],
+            &mut [out_std.view_mut()],
+        )
+        .unwrap();
+
+        let mut out_contrib = Owned::zeros_f32(&[1, 1, 2, 4]);
+        RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 0,
+            rotary_embedding_dim: 0,
+            contrib: true,
+        }
+        .execute(
+            &[x.view(), pos.view(), cos.view(), sin.view()],
+            &mut [out_contrib.view_mut()],
+        )
+        .unwrap();
+
+        for (a, b) in out_std.to_f32().iter().zip(out_contrib.to_f32().iter()) {
+            assert!((a - b).abs() < 1e-6, "contrib {b} != standard {a}");
+        }
     }
 }

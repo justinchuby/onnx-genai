@@ -1946,15 +1946,27 @@ impl NativeDecodeSession {
             } else if self.hidden_output.as_deref() == Some(metadata.name.as_str()) {
                 hidden = Some(tensor);
             } else if let Some(past) = self.present_to_past.get(&metadata.name) {
-                let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
-                    format!("native present tensor '{}' rank is below 2", metadata.name)
-                })?;
-                if tensor.shape[seq_axis] != total_len {
-                    bail!(
-                        "native present tensor '{}' sequence length {} does not match {total_len}",
-                        metadata.name,
-                        tensor.shape[seq_axis]
-                    );
+                // Fixed-size recurrent states (conv_state / recurrent_state) are
+                // replaced wholesale each step and carry a static feature dim on
+                // the penultimate axis, so the growable-KV sequence-length check
+                // does not apply to them.
+                let recurrent = self
+                    .session
+                    .inputs()
+                    .iter()
+                    .find(|meta| &meta.name == past)
+                    .is_some_and(|meta| is_recurrent_state_shape(&meta.shape));
+                if !recurrent {
+                    let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
+                        format!("native present tensor '{}' rank is below 2", metadata.name)
+                    })?;
+                    if tensor.shape[seq_axis] != total_len {
+                        bail!(
+                            "native present tensor '{}' sequence length {} does not match {total_len}",
+                            metadata.name,
+                            tensor.shape[seq_axis]
+                        );
+                    }
                 }
                 next_past.insert(past.clone(), tensor);
             }
@@ -2088,7 +2100,20 @@ impl DecodeBackend for NativeDecodeSession {
             self.last_hidden = None;
             return Ok(());
         }
+        let recurrent_names: HashSet<String> = self
+            .session
+            .inputs()
+            .iter()
+            .filter(|meta| is_recurrent_state_shape(&meta.shape))
+            .map(|meta| meta.name.clone())
+            .collect();
         for (name, tensor) in &mut self.past {
+            // Recurrent states are destructive rolling caches with no per-step
+            // history to slice; leave them intact (greedy decode never rewinds,
+            // and speculative rewind of a recurrent state is unsupported).
+            if recurrent_names.contains(name) {
+                continue;
+            }
             let axis = tensor
                 .shape
                 .len()
@@ -2469,6 +2494,17 @@ fn tensor_from_f32_as(dtype: DataType, shape: &[usize], values: &[f32]) -> anyho
     }
 }
 
+/// A native "past" input is a fixed-size recurrent state (e.g. the hybrid
+/// linear-attention `conv_state` / `recurrent_state`) rather than a growable
+/// key/value cache when its sequence axis — the penultimate axis, where the
+/// decoder grows KV — is statically sized. Growable KV caches carry a symbolic
+/// `past_sequence_length` on that axis and are concatenated each step; recurrent
+/// states carry a concrete feature dimension there and are replaced wholesale.
+/// This is a purely structural signal (RULES.md §2) — never a model-name gate.
+fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
+    shape.len() >= 2 && shape[shape.len() - 2].is_static()
+}
+
 fn make_empty_input_tensor(session: &InferenceSession, name: &str) -> anyhow::Result<Tensor> {
     let meta = session
         .inputs()
@@ -2487,7 +2523,14 @@ fn make_empty_input_tensor(session: &InferenceSession, name: &str) -> anyhow::Re
         let value = if axis == 0 {
             1
         } else if axis == seq_axis {
-            0
+            // Growable KV caches start with an empty sequence axis; fixed-size
+            // recurrent states (hybrid linear-attention conv_state /
+            // recurrent_state) carry a static feature dim here and must be seeded
+            // at full extent so the first forward sees a zero-filled state.
+            match dim {
+                Dim::Static(value) => value,
+                Dim::Symbolic(_) => 0,
+            }
         } else if let Dim::Static(value) = dim {
             value
         } else {

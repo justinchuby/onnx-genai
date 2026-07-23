@@ -56,6 +56,7 @@ pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
 pub mod gather;
+pub mod gather_block_quantized;
 pub mod gelu;
 pub mod gemm;
 pub mod grid_sample;
@@ -326,6 +327,13 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory),
     );
+    // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
+    // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
+    // dequantizes on the fly to the graph's activation dtype.
+    reg.register(
+        OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
+        Box::new(gather_block_quantized::GatherBlockQuantizedFactory),
+    );
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
     // softcap, and up to four outputs. Distinct from the contrib
@@ -433,6 +441,12 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("RotaryEmbedding", "", 23),
         Box::new(rotary_embedding::RotaryEmbeddingFactory),
+    );
+    // `com.microsoft::RotaryEmbedding` contrib op: same rotation math, but the
+    // inputs are ordered `(X, position_ids, cos_cache, sin_cache)`.
+    reg.register(
+        OpKey::new("RotaryEmbedding", "com.microsoft", 1),
+        Box::new(rotary_embedding::RotaryEmbeddingContribFactory),
     );
     // `ai.onnx::Swish` added at opset 24: y = x·sigmoid(alpha·x).
     reg.register(
@@ -1548,9 +1562,11 @@ mod tests {
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
         // `CausalConvWithState` and `LinearAttention` (Qwen3.5 hybrid
-        // linear-attention primitives) add two more contrib entries.
+        // linear-attention primitives) add two more contrib entries,
+        // `GatherBlockQuantized` (block-quantized embedding gather) adds one,
+        // and the `com.microsoft::RotaryEmbedding` contrib alias adds one.
         let mlas_registrations = usize::from(cfg!(feature = "mlas"));
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 87 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 89 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1598,6 +1614,10 @@ mod tests {
                 .is_some()
         );
         assert!(reg.lookup("LinearAttention", "com.microsoft", 1).is_some());
+        assert!(
+            reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
+                .is_some()
+        );
         assert!(reg.lookup("SimplifiedLayerNormalization", "", 21).is_some());
         // The fused contrib-domain LayerNormalization resolves to the same
         // kernel as the standard default-domain op.
@@ -1652,6 +1672,7 @@ mod tests {
         assert!(reg.lookup("ThresholdedRelu", "", 10).is_some());
         assert!(reg.lookup("ThresholdedRelu", "", 9).is_none());
         assert!(reg.lookup("RotaryEmbedding", "", 23).is_some());
+        assert!(reg.lookup("RotaryEmbedding", "com.microsoft", 1).is_some());
         assert!(reg.lookup("RotaryEmbedding", "", 22).is_none());
         assert!(reg.lookup("Swish", "", 24).is_some());
         assert!(reg.lookup("Swish", "", 23).is_none());
