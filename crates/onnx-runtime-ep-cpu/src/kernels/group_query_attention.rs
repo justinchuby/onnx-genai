@@ -1678,6 +1678,192 @@ mod tests {
         }
     }
 
+    /// Independently verifies the `!has_tail` (uninitialized `Vec::set_len`)
+    /// present fast path with a NONZERO past — the case Chew flagged as
+    /// unverified in `lazy_widen_bit_identical_to_full_widen_multistep` (whose
+    /// only no-tail iteration is step zero, where the past is empty and both
+    /// sides share the production present-construction).
+    ///
+    /// Every batch has `past_len(3) + current(1) == present_sequence_length(4)
+    /// == total`, so `has_tail == false` and `present_k`/`present_v` are built
+    /// via `Vec::with_capacity` + `set_len` with NO zero-fill, then the past
+    /// prefix is materialized by `widen_run` into never-pre-initialized memory
+    /// AND `past_len > 0`. `head_dim == 7` is not a multiple of 8, so the F16C
+    /// widen tail path runs; `q_heads(4) > kv_heads(2)` exercises GQA group
+    /// broadcast.
+    ///
+    /// The expected present is assembled BY HAND from the known past f16 bits +
+    /// the current-step K/V in BNSH order — it does NOT route through the
+    /// production present-construction path, so it cannot share an offset,
+    /// skipped-row, or read-before-write bug with the fast path. A wrong
+    /// destination offset, a missing row, or an uninitialized element in the
+    /// `set_len` fast path makes the bit-exact assertion FAIL rather than being
+    /// masked (both sides corrupting identically), which is exactly the gap the
+    /// full-widen parity test could not close.
+    #[test]
+    fn no_tail_with_past_present_independently_bit_exact() {
+        const BATCH: usize = 2;
+        const QUERY_HEAD_COUNT: usize = 4; // GQA group broadcast: q_heads > kv_heads
+        const KEY_VALUE_HEAD_COUNT: usize = 2; // multiple kv-heads
+        const HEAD_WIDTH: usize = 7; // NOT a multiple of 8 -> F16C widen tail path
+        const PAST_LEN: usize = 3; // nonzero past K/V
+        const CURRENT_LEN: usize = 1; // decode step
+        const PRESENT_LEN: usize = PAST_LEN + CURRENT_LEN; // == total for every batch
+
+        let kernel =
+            gqa_kernel_with_heads(QUERY_HEAD_COUNT as i64, KEY_VALUE_HEAD_COUNT as i64, &[]);
+
+        // Past cache as raw f16 bit patterns (valid halves via from_f32).
+        let past_key_bits: Vec<u16> = (0..BATCH * KEY_VALUE_HEAD_COUNT * PAST_LEN * HEAD_WIDTH)
+            .map(|index| half::f16::from_f32(mixed_scale_value(index, 0xA1A1)).to_bits())
+            .collect();
+        let past_value_bits: Vec<u16> = (0..BATCH * KEY_VALUE_HEAD_COUNT * PAST_LEN * HEAD_WIDTH)
+            .map(|index| half::f16::from_f32(mixed_scale_value(index, 0xB2B2)).to_bits())
+            .collect();
+
+        let query: Vec<f32> = (0..BATCH * QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xC3C3))
+            .collect();
+        let current_key: Vec<f32> = (0..BATCH * KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xD4D4))
+            .collect();
+        let current_value: Vec<f32> = (0..BATCH * KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xE5E5))
+            .collect();
+
+        // seqlens_k = total - 1. With current seq == 1, total == past_len + 1,
+        // so seqlens_k == past_len; total_sequence_length == max(seqlens_k) + 1
+        // == PRESENT_LEN for every batch => has_tail == false.
+        let seqlens_k = [PAST_LEN as i32; BATCH];
+        let total_sequence_length = PRESENT_LEN as i32;
+
+        let past_shape = [BATCH, KEY_VALUE_HEAD_COUNT, PAST_LEN, HEAD_WIDTH];
+        let present_shape = [BATCH, KEY_VALUE_HEAD_COUNT, PRESENT_LEN, HEAD_WIDTH];
+
+        let mut lazy_output =
+            Owned::zeros_f32(&[BATCH, CURRENT_LEN, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+        let mut lazy_present_key = Owned::zeros(DataType::Float16, &present_shape);
+        let mut lazy_present_value = Owned::zeros(DataType::Float16, &present_shape);
+
+        kernel
+            .execute(
+                &[
+                    Owned::f32(&[BATCH, CURRENT_LEN, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                    Owned::f32(
+                        &[BATCH, CURRENT_LEN, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                        &current_key,
+                    )
+                    .view(),
+                    Owned::f32(
+                        &[BATCH, CURRENT_LEN, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                        &current_value,
+                    )
+                    .view(),
+                    Owned::f16_bits(&past_shape, &past_key_bits).view(),
+                    Owned::f16_bits(&past_shape, &past_value_bits).view(),
+                    Owned::i32(&[BATCH], &seqlens_k).view(),
+                    Owned::i32(&[], &[total_sequence_length]).view(),
+                ],
+                &mut [
+                    lazy_output.view_mut(),
+                    lazy_present_key.view_mut(),
+                    lazy_present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        // ── Independently assemble the expected present in BNSH order ──
+        // For each (batch, kv_head): rows [0, PAST_LEN) are the past f16 bits
+        // verbatim (widen f16->f32 then narrow f32->f16 is lossless), and row
+        // PAST_LEN is the current-step value narrowed to f16. This mirror is
+        // written WITHOUT the production fast path, so it cannot share an
+        // offset/skip/read-before-write bug with the code under test.
+        let build_expected_present = |past_bits: &[u16], current: &[f32]| -> Vec<u16> {
+            let mut expected = vec![0u16; BATCH * KEY_VALUE_HEAD_COUNT * PRESENT_LEN * HEAD_WIDTH];
+            for batch_index in 0..BATCH {
+                for kv_head_index in 0..KEY_VALUE_HEAD_COUNT {
+                    let head = batch_index * KEY_VALUE_HEAD_COUNT + kv_head_index;
+                    // Past prefix rows, copied bit-for-bit.
+                    for sequence_index in 0..PAST_LEN {
+                        for dimension_index in 0..HEAD_WIDTH {
+                            let destination =
+                                (head * PRESENT_LEN + sequence_index) * HEAD_WIDTH + dimension_index;
+                            let source =
+                                (head * PAST_LEN + sequence_index) * HEAD_WIDTH + dimension_index;
+                            expected[destination] = past_bits[source];
+                        }
+                    }
+                    // Current decode row, narrowed to f16.
+                    for dimension_index in 0..HEAD_WIDTH {
+                        let destination =
+                            (head * PRESENT_LEN + PAST_LEN) * HEAD_WIDTH + dimension_index;
+                        let source = head * HEAD_WIDTH + dimension_index;
+                        expected[destination] = half::f16::from_f32(current[source]).to_bits();
+                    }
+                }
+            }
+            expected
+        };
+        let expected_present_key = build_expected_present(&past_key_bits, &current_key);
+        let expected_present_value = build_expected_present(&past_value_bits, &current_value);
+
+        // Bit-exact: guards the uninitialized `set_len` fast path against
+        // read-before-write / wrong-offset bugs (Chew's reject on 8638ec6).
+        assert_eq!(
+            lazy_present_key.to_u16_bits(),
+            expected_present_key,
+            "no-tail present key must match the hand-assembled BNSH cache"
+        );
+        assert_eq!(
+            lazy_present_value.to_u16_bits(),
+            expected_present_value,
+            "no-tail present value must match the hand-assembled BNSH cache"
+        );
+
+        // ── Attention output vs the old full-widen reference (kept per Chew) ──
+        // Feeding the already-widened f16 past as dense f32 gives the pre-eedbf93
+        // decode path; attention inputs are bit-identical, so the output must be
+        // bit-identical too.
+        let full_key = old_full_widen_f16(&past_key_bits);
+        let full_value = old_full_widen_f16(&past_value_bits);
+        let mut full_output =
+            Owned::zeros_f32(&[BATCH, CURRENT_LEN, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+        let mut full_present_key = Owned::zeros(DataType::Float16, &present_shape);
+        let mut full_present_value = Owned::zeros(DataType::Float16, &present_shape);
+        kernel
+            .execute(
+                &[
+                    Owned::f32(&[BATCH, CURRENT_LEN, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                    Owned::f32(
+                        &[BATCH, CURRENT_LEN, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                        &current_key,
+                    )
+                    .view(),
+                    Owned::f32(
+                        &[BATCH, CURRENT_LEN, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                        &current_value,
+                    )
+                    .view(),
+                    Owned::f32(&past_shape, &full_key).view(),
+                    Owned::f32(&past_shape, &full_value).view(),
+                    Owned::i32(&[BATCH], &seqlens_k).view(),
+                    Owned::i32(&[], &[total_sequence_length]).view(),
+                ],
+                &mut [
+                    full_output.view_mut(),
+                    full_present_key.view_mut(),
+                    full_present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        assert_f32_bits_eq(
+            &lazy_output.to_f32(),
+            &full_output.to_f32(),
+            "no-tail attention output",
+        );
+    }
+
     #[test]
     fn decode_batch_ragged_past_lengths_materialize_independently() {
         let q = vec![
