@@ -1079,9 +1079,17 @@ mod tests {
     }
 
     fn gqa_kernel(extra: &[(&str, Attribute)]) -> Box<dyn Kernel> {
+        gqa_kernel_with_heads(4, 2, extra)
+    }
+
+    fn gqa_kernel_with_heads(
+        num_heads: i64,
+        kv_num_heads: i64,
+        extra: &[(&str, Attribute)],
+    ) -> Box<dyn Kernel> {
         let mut attrs = vec![
-            ("num_heads", Attribute::Int(4)),
-            ("kv_num_heads", Attribute::Int(2)),
+            ("num_heads", Attribute::Int(num_heads)),
+            ("kv_num_heads", Attribute::Int(kv_num_heads)),
         ];
         attrs.extend_from_slice(extra);
         kernel(&attrs)
@@ -1216,84 +1224,10 @@ mod tests {
         2.0 * gamma * absolute_product_sum + 2.0 * f32::MIN_POSITIVE
     }
 
-    /// Attention reference that mirrors the production kernel's *exact*
-    /// arithmetic — score = `dot(q,k) * (1/sqrt(head_width))` (the reciprocal
-    /// `scale` the kernel multiplies by, not a `/sqrt` divide), the `f64`-exp
-    /// softmax, and ascending-key accumulation. Because it differs from the
-    /// kernel only in *how the KV cache is widened* (this takes an already-dense
-    /// f32 cache; the kernel widens f16 incrementally), it isolates the widen
-    /// path: any output difference is a widen bug, not a softmax-ordering
-    /// artifact. `key`/`value` are BNSH `[kv_heads, total, head_width]`.
-    fn kernel_exact_reference(
-        query: &[f32],
-        key: &[f32],
-        value: &[f32],
-        total_sequence_length: usize,
-        past_sequence_length: usize,
-        query_head_count: usize,
-        key_value_head_count: usize,
-        head_width: usize,
-    ) -> Vec<f32> {
-        let scale = 1.0f32 / (head_width as f32).sqrt();
-        let group = query_head_count / key_value_head_count;
-        let mut output = vec![0.0f32; query_head_count * head_width];
-        for query_head in 0..query_head_count {
-            let kv_head = query_head / group;
-            let attended = past_sequence_length + 1;
-            let query_base = query_head * head_width;
-            let mut scores = vec![0.0f32; attended];
-            for (key_index, score) in scores.iter_mut().enumerate() {
-                let key_base = (kv_head * total_sequence_length + key_index) * head_width;
-                *score = query[query_base..query_base + head_width]
-                    .iter()
-                    .zip(&key[key_base..key_base + head_width])
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>()
-                    * scale;
-            }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for score in &mut scores {
-                *score = ((*score - max) as f64).exp() as f32;
-                sum += *score;
-            }
-            if sum > 0.0 {
-                for score in &mut scores {
-                    *score /= sum;
-                }
-            }
-            let output_base = query_head * head_width;
-            for (key_index, &prob) in scores.iter().enumerate() {
-                let value_base = (kv_head * total_sequence_length + key_index) * head_width;
-                for dimension in 0..head_width {
-                    output[output_base + dimension] += prob * value[value_base + dimension];
-                }
-            }
-        }
-        output
-    }
-
     fn close(got: &[f32], want: &[f32]) {
         assert_eq!(got.len(), want.len());
         for (i, (a, b)) in got.iter().zip(want).enumerate() {
             assert!((a - b).abs() < 1e-5, "{i}: {a} != {b}");
-        }
-    }
-
-    /// Relative-tolerance comparison for kernel-vs-scalar-reference attention
-    /// output. The scalar reference divides the score by `sqrt(head_width)`
-    /// while the kernel multiplies by the reciprocal `scale`; those differ in
-    /// the last bit and softmax amplifies the difference, so an absolute 1e-5
-    /// bound is too tight (see also `gqa_decode_long_context_matches_reference`).
-    fn close_relative(got: &[f32], want: &[f32]) {
-        assert_eq!(got.len(), want.len());
-        for (i, (a, b)) in got.iter().zip(want).enumerate() {
-            let tolerance = 2.0e-5 + 2.0e-5 * b.abs();
-            assert!(
-                (a - b).abs() <= tolerance,
-                "{i}: {a} != {b} (difference {}, tolerance {tolerance})",
-                (a - b).abs()
-            );
         }
     }
 
@@ -1570,130 +1504,177 @@ mod tests {
         );
     }
 
-    /// Locks the incremental `PastCache::widen_run` path (which widens each
-    /// past-cache head-run directly into `present`) against a full-widen
-    /// reference across a *multi-step* decode: every step chains the previous
-    /// step's f16 `present` KV back in as `past`, exactly as the engine's
-    /// owned-KV loop does. The kernel's f32 attention output at each step must
-    /// equal `reference_with_geometry` computed over the fully accumulated
-    /// (f16-rounded past + raw-f32 current) cache. This guards the optimization
-    /// against silent drift and proves the resident/incremental widen equals
-    /// the original whole-cache widen for a real decode sequence.
+    /// Materialize an f16 cache as the pre-`eedbf93` decode path did before
+    /// copying its dense f32 result into `present`.
+    fn old_full_widen_f16(bits: &[u16]) -> Vec<f32> {
+        bits.iter()
+            .map(|&bits| half::f16::from_bits(bits).to_f32())
+            .collect()
+    }
+
+    fn assert_f32_bits_eq(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{label}[{index}]: {actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    /// Compares lazy per-head f16 widening with the old eager whole-cache
+    /// widen, using the production kernel for attention on both sides.
     #[test]
-    fn decode_multistep_incremental_widen_matches_full_widen_reference() {
+    fn lazy_widen_bit_identical_to_full_widen_multistep() {
+        const BATCH: usize = 2;
         const QUERY_HEAD_COUNT: usize = 4;
         const KEY_VALUE_HEAD_COUNT: usize = 2;
-        const HEAD_WIDTH: usize = 2;
-        const STEPS: usize = 12;
+        // Deliberately not a vector width: this exercises scalar/vector tails.
+        const HEAD_WIDTH: usize = 7;
+        const STEPS: usize = 6;
 
-        // Accumulated f16-rounded past rows per kv-head, grown one row per step
-        // by carrying forward the kernel's own f16 `present` (as the engine does).
-        let mut past_key_rows: Vec<Vec<f32>> = vec![Vec::new(); KEY_VALUE_HEAD_COUNT];
-        let mut past_value_rows: Vec<Vec<f32>> = vec![Vec::new(); KEY_VALUE_HEAD_COUNT];
+        let kernel =
+            gqa_kernel_with_heads(QUERY_HEAD_COUNT as i64, KEY_VALUE_HEAD_COUNT as i64, &[]);
+        let mut past_key_bits = Vec::new();
+        let mut past_value_bits = Vec::new();
 
         for step in 0..STEPS {
             let past_sequence_length = step;
-            let total_sequence_length = past_sequence_length + 1;
-
-            let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            // Step zero has no tail and takes the uninitialized-present fast
+            // path. Later steps make batch 1 one token shorter than batch 0,
+            // forcing the zero-filled tail path while the shared cache grows.
+            let past_lengths = [step as i32, step.saturating_sub(1) as i32];
+            let present_sequence_length = step + 1;
+            let query: Vec<f32> = (0..BATCH * QUERY_HEAD_COUNT * HEAD_WIDTH)
                 .map(|index| mixed_scale_value(index + step * 97, 0x1111))
                 .collect();
-            let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            let current_key: Vec<f32> = (0..BATCH * KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
                 .map(|index| mixed_scale_value(index + step * 31, 0x2222))
                 .collect();
-            let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            let current_value: Vec<f32> = (0..BATCH * KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
                 .map(|index| mixed_scale_value(index + step * 57, 0x3333))
                 .collect();
 
-            // BNSH f16 past tensors from the accumulated rows.
-            let mut past_key_flat = vec![0.0f32; KEY_VALUE_HEAD_COUNT * past_sequence_length * HEAD_WIDTH];
-            let mut past_value_flat =
-                vec![0.0f32; KEY_VALUE_HEAD_COUNT * past_sequence_length * HEAD_WIDTH];
-            for head in 0..KEY_VALUE_HEAD_COUNT {
-                let run = past_sequence_length * HEAD_WIDTH;
-                past_key_flat[head * run..(head + 1) * run].copy_from_slice(&past_key_rows[head]);
-                past_value_flat[head * run..(head + 1) * run]
-                    .copy_from_slice(&past_value_rows[head]);
-            }
-
-            // Full-widen reference cache: f16-rounded past rows ++ raw-f32 current.
-            let mut full_key = vec![0.0f32; KEY_VALUE_HEAD_COUNT * total_sequence_length * HEAD_WIDTH];
-            let mut full_value =
-                vec![0.0f32; KEY_VALUE_HEAD_COUNT * total_sequence_length * HEAD_WIDTH];
-            for head in 0..KEY_VALUE_HEAD_COUNT {
-                let full_base = head * total_sequence_length * HEAD_WIDTH;
-                let past_run = past_sequence_length * HEAD_WIDTH;
-                full_key[full_base..full_base + past_run].copy_from_slice(&past_key_rows[head]);
-                full_value[full_base..full_base + past_run].copy_from_slice(&past_value_rows[head]);
-                for dimension in 0..HEAD_WIDTH {
-                    full_key[full_base + past_run + dimension] = current_key[head * HEAD_WIDTH + dimension];
-                    full_value[full_base + past_run + dimension] =
-                        current_value[head * HEAD_WIDTH + dimension];
-                }
-            }
-            let expected = kernel_exact_reference(
-                &query,
-                &full_key,
-                &full_value,
-                total_sequence_length,
-                past_sequence_length,
-                QUERY_HEAD_COUNT,
+            let past_shape = [
+                BATCH,
                 KEY_VALUE_HEAD_COUNT,
+                past_sequence_length,
                 HEAD_WIDTH,
+            ];
+            let past_key = Owned::f16_bits(&past_shape, &past_key_bits);
+            let past_value = Owned::f16_bits(&past_shape, &past_value_bits);
+            let full_key = old_full_widen_f16(&past_key_bits);
+            let full_value = old_full_widen_f16(&past_value_bits);
+            let mut lazy_output = Owned::zeros_f32(&[BATCH, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut lazy_present_key = Owned::zeros(
+                DataType::Float16,
+                &[
+                    BATCH,
+                    KEY_VALUE_HEAD_COUNT,
+                    present_sequence_length,
+                    HEAD_WIDTH,
+                ],
             );
-
-            let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
-            let mut present_key =
-                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, total_sequence_length, HEAD_WIDTH]);
-            let mut present_value =
-                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, total_sequence_length, HEAD_WIDTH]);
-            gqa_kernel(&[])
+            let mut lazy_present_value = Owned::zeros(
+                DataType::Float16,
+                &[
+                    BATCH,
+                    KEY_VALUE_HEAD_COUNT,
+                    present_sequence_length,
+                    HEAD_WIDTH,
+                ],
+            );
+            kernel
                 .execute(
                     &[
-                        Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
-                        Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key).view(),
-                        Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_value).view(),
-                        Owned::f16(
-                            &[1, KEY_VALUE_HEAD_COUNT, past_sequence_length, HEAD_WIDTH],
-                            &past_key_flat,
+                        Owned::f32(&[BATCH, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                        Owned::f32(&[BATCH, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key)
+                            .view(),
+                        Owned::f32(
+                            &[BATCH, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                            &current_value,
                         )
                         .view(),
-                        Owned::f16(
-                            &[1, KEY_VALUE_HEAD_COUNT, past_sequence_length, HEAD_WIDTH],
-                            &past_value_flat,
-                        )
-                        .view(),
-                        Owned::i32(&[1], &[past_sequence_length as i32]).view(),
-                        Owned::i32(&[], &[total_sequence_length as i32]).view(),
+                        past_key.view(),
+                        past_value.view(),
+                        Owned::i32(&[BATCH], &past_lengths).view(),
+                        Owned::i32(&[], &[present_sequence_length as i32]).view(),
                     ],
                     &mut [
-                        output.view_mut(),
-                        present_key.view_mut(),
-                        present_value.view_mut(),
+                        lazy_output.view_mut(),
+                        lazy_present_key.view_mut(),
+                        lazy_present_value.view_mut(),
                     ],
                 )
                 .unwrap();
 
-            close_relative(&output.to_f32(), &expected);
+            let mut full_output = Owned::zeros_f32(&[BATCH, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut full_present_key = Owned::zeros(
+                DataType::Float16,
+                &[
+                    BATCH,
+                    KEY_VALUE_HEAD_COUNT,
+                    present_sequence_length,
+                    HEAD_WIDTH,
+                ],
+            );
+            let mut full_present_value = Owned::zeros(
+                DataType::Float16,
+                &[
+                    BATCH,
+                    KEY_VALUE_HEAD_COUNT,
+                    present_sequence_length,
+                    HEAD_WIDTH,
+                ],
+            );
+            // This is the old path: materialize every f16 cache element before
+            // calling the same production attention implementation.
+            kernel
+                .execute(
+                    &[
+                        Owned::f32(&[BATCH, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                        Owned::f32(&[BATCH, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key)
+                            .view(),
+                        Owned::f32(
+                            &[BATCH, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                            &current_value,
+                        )
+                        .view(),
+                        Owned::f32(&past_shape, &full_key).view(),
+                        Owned::f32(&past_shape, &full_value).view(),
+                        Owned::i32(&[BATCH], &past_lengths).view(),
+                        Owned::i32(&[], &[present_sequence_length as i32]).view(),
+                    ],
+                    &mut [
+                        full_output.view_mut(),
+                        full_present_key.view_mut(),
+                        full_present_value.view_mut(),
+                    ],
+                )
+                .unwrap();
 
-            // Chain: the f16 `present` becomes the next step's `past`. The kernel
-            // wrote `present` as f32 here (test convenience), but the engine's KV
-            // cache is f16, so round each carried-forward value to f16 exactly as
-            // the next-step widen will re-read it.
-            let present_key_f32 = present_key.to_f32();
-            let present_value_f32 = present_value.to_f32();
-            let to_f16 = |x: f32| half::f16::from_f32(x).to_f32();
-            for head in 0..KEY_VALUE_HEAD_COUNT {
-                let run = total_sequence_length * HEAD_WIDTH;
-                past_key_rows[head] = present_key_f32[head * run..(head + 1) * run]
-                    .iter()
-                    .map(|&x| to_f16(x))
-                    .collect();
-                past_value_rows[head] = present_value_f32[head * run..(head + 1) * run]
-                    .iter()
-                    .map(|&x| to_f16(x))
-                    .collect();
-            }
+            assert_f32_bits_eq(
+                &lazy_output.to_f32(),
+                &full_output.to_f32(),
+                "attention output",
+            );
+            assert_eq!(
+                lazy_present_key.to_u16_bits(),
+                full_present_key.to_u16_bits(),
+                "present key"
+            );
+            assert_eq!(
+                lazy_present_value.to_u16_bits(),
+                full_present_value.to_u16_bits(),
+                "present value"
+            );
+
+            // Carry the production f16 cache forward. Exact equality above makes
+            // an omitted write in the !has_tail uninitialized-buffer path fail
+            // before it can be hidden by a later f16 round-trip.
+            past_key_bits = lazy_present_key.to_u16_bits();
+            past_value_bits = lazy_present_value.to_u16_bits();
         }
     }
 
