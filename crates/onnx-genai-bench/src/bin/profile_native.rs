@@ -24,6 +24,27 @@ enum ExecutionProvider {
 enum DecodeBackend {
     Native,
     Ort,
+    Auto,
+}
+
+impl DecodeBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Ort => "ort",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl From<DecodeBackend> for EngineDecodeBackend {
+    fn from(value: DecodeBackend) -> Self {
+        match value {
+            DecodeBackend::Native => Self::Native,
+            DecodeBackend::Ort => Self::Ort,
+            DecodeBackend::Auto => Self::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -55,7 +76,6 @@ struct Args {
     decode_skip: usize,
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
     ep: ExecutionProvider,
-    /// Decoder implementation driven through the same engine generation loop.
     #[arg(long, value_enum, default_value_t = DecodeBackend::Native)]
     backend: DecodeBackend,
     #[arg(long, default_value = "Hello")]
@@ -130,18 +150,35 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         bail!("--tokens must be greater than --decode-skip");
     }
 
+    if !matches!(args.backend, DecodeBackend::Native) {
+        let requested_provider = match args.ep {
+            ExecutionProvider::Cpu => "cpu",
+            ExecutionProvider::Cuda => "cuda",
+        };
+        // This single-threaded CLI sets provider selection before the process-wide
+        // runtime configuration is first read while constructing the ORT session.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_EP", requested_provider);
+        }
+    }
     let mut config = EngineConfig {
-        decode_backend: match args.backend {
-            DecodeBackend::Native => EngineDecodeBackend::Native,
-            DecodeBackend::Ort => EngineDecodeBackend::Ort,
-        },
+        decode_backend: args.backend.into(),
         ..EngineConfig::default()
     };
-    if matches!(args.backend, DecodeBackend::Native) {
-        config.native_device = Some(device);
-    }
-    let mut engine = Engine::from_dir(model_dir, config)
-        .with_context(|| format!("load native engine {}", model_dir.display()))?;
+    config.native_device = Some(device);
+    let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
+        format!(
+            "load {} engine {}",
+            args.backend.as_str(),
+            model_dir.display()
+        )
+    })?;
+    println!(
+        "profile_native: model={} ep={:?} backend={}",
+        model_dir.display(),
+        args.ep,
+        args.backend.as_str()
+    );
 
     for _ in 0..args.warmups {
         std::hint::black_box(
@@ -150,7 +187,6 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
                 .context("steady warmup generation")?,
         );
     }
-    profile::reset();
 
     let mut prefills_ms = Vec::with_capacity(args.runs);
     let mut decode_ms_per_token = Vec::with_capacity(args.runs);
@@ -175,7 +211,10 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         }
         if let Some(reference) = &reference_tokens {
             if reference != &result.token_ids {
-                bail!("native greedy decode was not deterministic across measured runs");
+                bail!(
+                    "{} greedy decode was not deterministic across measured runs",
+                    args.backend.as_str()
+                );
             }
         } else {
             reference_tokens = Some(result.token_ids.clone());
@@ -197,9 +236,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
 
     println!(
-        "steady_median: backend={:?} prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
+        "steady_median: backend={} prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
          (runs={} warmups={} decode_skip={})",
-        args.backend,
+        args.backend.as_str(),
         median(&mut prefills_ms),
         median(&mut decode_ms_per_token),
         median(&mut throughputs),
@@ -209,9 +248,6 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     );
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
-    }
-    if profile::enabled() {
-        println!("{}", profile::report((args.tokens * args.runs) as u64));
     }
     Ok(())
 }

@@ -2879,7 +2879,7 @@ mod tests {
             cross_kv_outputs: None,
             kv_update: None,
             state_pairs: None,
-            optional_inputs: BTreeMap::new(),
+            optional_inputs: std::collections::BTreeMap::new(),
         }
     }
 
