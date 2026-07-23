@@ -65,6 +65,12 @@ struct Args {
     dump_logprobs: Option<PathBuf>,
     #[arg(long, default_value_t = 40)]
     logprobs_k: usize,
+    /// Override the text prompt with an explicit JSON array of token ids (e.g.
+    /// "[9707, 12824, 13]"). Enables exact teacher-forced logit comparison
+    /// against ORT without tokenizer round-trip drift. Only honored with
+    /// --dump-logprobs.
+    #[arg(long)]
+    prompt_ids: Option<PathBuf>,
 }
 
 fn model_file(path: &Path) -> PathBuf {
@@ -442,6 +448,19 @@ fn main() -> Result<()> {
         args.runs
     );
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
+        let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+            let raw = std::fs::read_to_string(ids_path)
+                .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+            let ids: Vec<u32> = serde_json::from_str(raw.trim())
+                .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?;
+            if ids.is_empty() {
+                bail!("--prompt-ids must contain at least one token id");
+            }
+            println!("dump_prompt_ids: {ids:?}");
+            ids
+        } else {
+            prompt_tokens.clone()
+        };
         let options = GenerateOptions {
             max_new_tokens: 1,
             temperature: 0.0,
@@ -451,7 +470,7 @@ fn main() -> Result<()> {
             ..GenerateOptions::default()
         };
         let result =
-            session.generate(&prompt_tokens, &options, &ProcessorChain::new(), &tokenizer)?;
+            session.generate(&dump_prompt_tokens, &options, &ProcessorChain::new(), &tokenizer)?;
         let logprobs = result
             .logprobs
             .and_then(|entries| entries.into_iter().next())
@@ -462,7 +481,7 @@ fn main() -> Result<()> {
             .map(|(id, lp)| serde_json::json!([*id, *lp]))
             .collect();
         let payload = serde_json::json!({
-            "n_prompt_tokens": prompt_tokens.len(),
+            "n_prompt_tokens": dump_prompt_tokens.len(),
             "selected_token": logprobs.token_id,
             "selected_logprob": logprobs.logprob,
             "top": top,
