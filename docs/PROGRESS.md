@@ -4,9 +4,13 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T07:30Z — CUDA perf wave 2: f16/bf16 IndexShare, engine build-fix + MoE fixture, SwiGLU-RMS fusion (7B +23.5%, native now beats ORT on 7B). Phi captured-path GQA track opened._
+_Last updated: 2026-07-23T09:10Z — CUDA perf wave 2 complete: f16/bf16 IndexShare, engine build-fix + MoE fixture, SwiGLU-RMS fusion (7B +23.5%, native beats ORT on all Qwen), Phi cast-fold (eager +25%). Wave 3 in flight: Qwen1.5B native-vs-ORT decode divergence root-cause + Phi captured-path GQA._
 
-**Current `origin/main` implementation HEAD:** `05e1fd1` (after the CUDA perf wave 2 batch).
+**Current `origin/main` implementation HEAD:** `17ac19f` (after the CUDA perf wave 2 batch + Phi cast-fold).
+
+### ⚠️ Open correctness finding (2026-07-23): Qwen2.5-1.5B native decode diverges from ORT
+
+Native CUDA greedy decode of Qwen2.5-1.5B (int4) emits degenerate repetition ("The capital of France is in the country of France…" loops) while onnxruntime-genai-cuda 0.14.1 is coherent on the same model+settings. Proven **NOT** the SwiGLU-RMS fusion: fusion ON vs OFF is byte-identical native output. This is a **pre-existing native numerical/logit divergence** (gate/up MatMulNBits K=1536, N=8960, 4-bit block-32); 0.5B/7B appear coherent. Under root-cause on `fix/qwen15b-native-divergence` (Deckard). Perf numbers for 1.5B are provisional until output quality is fixed.
 
 ## 2026-07-23 — CUDA perf wave 2 (SwiGLU-RMS fusion flips 7B positive; native beats ORT on 0.5B/1.5B/7B)
 
@@ -16,8 +20,8 @@ Standing native vs onnxruntime-genai-cuda 0.14.1 (8×H200, foundry cuda-gpu int4
 - **Engine `cuda` build-fix + native_engine MoE fixture ✅ (`64238b5`, Irmgard; Gaff 🟢):** wave-1 `d2582df` left `onnx-genai-engine` referencing the undeclared `onnx_runtime_ep_api` crate → `profile_native` (bench-native,cuda) failed to compile, blocking ALL native benchmarking. Fix: new inherent `CudaExecutionProvider::initialized(ordinal)` (does `new()`+`initialize(&EpConfig::default())` internally) so the engine no longer names the api crate. Also repaired the stale `ModelCapabilities`/`mixture_of_experts` test fixtures (native_engine 7/7; fixtures now assert real decode+fallback, stronger than the prior error-string checks).
 - **Stale lib-test expectations ✅ (`de831fd`, Irmgard):** two CUDA lib unit tests were red on main (only targeted GPU tests were run in wave-1 review): `covered_ops_have_no_duplicates` hardcoded 87 (now 88 — `pkg.nxrt::IndexShare` from `1304707`) and a GQA seqlens test asserted an outdated error substring. Fixed both → full lib suite **168/0**.
 - **SwiGLU-RMS fusion + size-floor gate ✅ (`05e1fd1`, Deckard; Chew 🟢 bit-exact-verified):** (1) model-agnostic `fusion_benefit_is_positive()` gate — fuse only when `hidden ≥ RMSNORM_FUSION_MIN_HIDDEN` (1280 = 10× warp-half4 reduction stride), so 0.5B (896) stays inert (no more −2.7% regression: 814.9 on vs 816.1 off). (2) New capture-safe kernel `matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm` folds the post-attention `SkipSimplifiedLayerNormalization` into the fan-out-1 `GateUpSwiGlu` GEMV (byte-identical RMS prologue + SwiGLU body), plus a `value_redirects` fix for chained blocks sharing a residual. **7B +23.5% @128 (231→285.4), +23.1% @1024**, all 168 standalone SkipSLN launches removed (~56/forward pass), byte-identical (bit-exact GPU test Δ==0 + token-identical). Full suite 174/0.
-- **Cast-fold (eager-only) — in review (Batty; Luv 🟡):** `CudaDropNormalizationCasts` removes Phi's redundant f16→f32→f16 norm-cast wrappers (765→6 casts), model-agnostic, byte-identical, capture-preserving. Luv's A/B: **+25.6% eager but +0.8% (noise) in the captured path** — the win is eager/hygiene only; Phi's captured-path gap is GQA. Batty rebasing onto Deckard + correcting the claim + adding negative/fixpoint tests.
-- **Wave 3 opened:** Phi captured-path GroupQueryAttention profiling+optimization (Roy) — the true driver of Phi's −60%.
+- **Phi norm cast-fold ✅ (`17ac19f`, Batty; Luv 🟡→addressed):** `CudaDropNormalizationCasts` removes Phi's redundant f16→f32→f16 norm-cast wrappers (765→6 casts), model-agnostic, byte-identical, capture-preserving; registered BEFORE the RMS/SwiGLU fusions so they observe fp16-native norms. Honest perf framing: **+25.6% eager** decode, **flat (+0.8%, noise) in the captured path** — Phi already graph-captures so replay amortizes kernel-launch overhead; the win is eager/prefill/graph-hygiene, NOT the lever for Phi's captured-path ORT gap (that's GroupQueryAttention). Added negative-path (fp32 boundary left intact) + fixpoint (shared-residual) safety tests. Full suite **179/0**, clippy clean. Env opt-out `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1`.
+- **Wave 3 in flight:** (a) Qwen1.5B native-vs-ORT decode divergence root-cause (Deckard, see open-finding box above); (b) Phi captured-path GroupQueryAttention profiling+optimization (Roy) — the true driver of Phi's −60%.
 
 ## 2026-07-23 — CUDA perf + smoothness wave 1 (native vs ORT baseline + 4 landings)
 
