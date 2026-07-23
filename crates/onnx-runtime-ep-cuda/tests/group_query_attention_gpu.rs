@@ -5,13 +5,12 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
-    CudaExecutionProvider, CudaExecutionProviderOptions, GQA_CAPTURE_ERROR_PAST_CAPACITY,
-    GQA_CAPTURE_ERROR_PAST_NEGATIVE, GQA_CAPTURE_ERROR_POSITION, GQA_CAPTURE_ERROR_QUERY_NEGATIVE,
-    GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GqaSequenceLengthsPolicy, GroupQueryAttentionBackend,
-    GroupQueryAttentionKernel, gqa_capture_error_description,
+    gqa_capture_error_description, CudaExecutionProvider, GroupQueryAttentionBackend,
+    GroupQueryAttentionKernel, GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE,
+    GQA_CAPTURE_ERROR_POSITION, GQA_CAPTURE_ERROR_QUERY_NEGATIVE, GQA_CAPTURE_ERROR_TOTAL_OVERFLOW,
 };
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    compute_contiguous_strides, static_shape, Attribute, DataType, Graph, Node, NodeId,
 };
 use onnx_runtime_loader::Model;
 use std::time::Instant;
@@ -106,21 +105,6 @@ fn quantize(values: &[f32], dtype: DataType) -> Vec<f32> {
 
 fn gpu() -> Option<CudaExecutionProvider> {
     match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
-        Err(error) => {
-            eprintln!("skip: no CUDA GPU available ({error})");
-            None
-        }
-    }
-}
-
-fn gpu_allow_unit_batch_scalar() -> Option<CudaExecutionProvider> {
-    match CudaExecutionProvider::new_with_options(
-        0,
-        CudaExecutionProviderOptions {
-            gqa_sequence_lengths_policy: GqaSequenceLengthsPolicy::AllowUnitBatchScalar,
-        },
-    ) {
         Ok(ep) => Some(ep),
         Err(error) => {
             eprintln!("skip: no CUDA GPU available ({error})");
@@ -1051,11 +1035,10 @@ fn parity_fixture(
     assert_eq!(case.totals.len(), case.batch);
     assert!(case.totals.iter().all(|&total| total >= case.k_seq));
     assert!(case.totals.iter().all(|&total| total >= case.q_seq));
-    assert!(
-        case.totals
-            .iter()
-            .all(|&total| total - case.k_seq <= case.past_capacity)
-    );
+    assert!(case
+        .totals
+        .iter()
+        .all(|&total| total - case.k_seq <= case.past_capacity));
     let scale_values = |mut values: Vec<f32>| {
         for value in &mut values {
             *value *= case.magnitude;
@@ -1701,7 +1684,7 @@ fn gqa_gpu_head_sharing_matches_manual_repeat_kv_reference() {
 }
 
 #[test]
-fn gqa_gpu_strict_policy_rejects_scalar_seqlens_with_actionable_metadata_key() {
+fn gqa_gpu_scalar_seqlens_requires_unit_batch_and_valid_value() {
     let Some(ep) = gpu() else { return };
     let mut inputs = base_inputs(
         &[1, 1, 8],
@@ -1715,21 +1698,41 @@ fn gqa_gpu_strict_policy_rejects_scalar_seqlens_with_actionable_metadata_key() {
         1,
     );
     inputs[5].as_mut().unwrap().shape.clear();
-    let error = run_available(run(
+    let scalar = run_available(run(
         &ep,
         &attrs(&[]),
         &inputs,
         &[vec![1, 1, 8], vec![1, 2, 1, 2], vec![1, 2, 1, 2]],
     ))
-    .expect_err("strict policy must reject scalar seqlens_k");
-    let message = format!("{error}");
-    assert!(message.contains("scalar seqlens_k is not enabled"));
-    assert!(message.contains("model.attention.key_sequence_lengths.scalar_broadcast: unit_batch"));
+    .expect("unit-batch scalar seqlens_k must be promoted");
+    assert_eq!(scalar[0], vec![1., 2., 1., 2., 10., 20., 10., 20.]);
+
+    let mut negative = inputs.clone();
+    negative[5].as_mut().unwrap().bytes = typed_bytes(&[-1_i32]);
+    let error = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &negative,
+        &[vec![1, 1, 8], vec![1, 2, 1, 2], vec![1, 2, 1, 2]],
+    ))
+    .expect_err("negative scalar must fail");
+    assert!(format!("{error}").contains("non-negative"));
+
+    let mut out_of_range = inputs;
+    out_of_range[5].as_mut().unwrap().bytes = typed_bytes(&[1_i32]);
+    let error = run_available(run(
+        &ep,
+        &attrs(&[]),
+        &out_of_range,
+        &[vec![1, 1, 8], vec![1, 2, 1, 2], vec![1, 2, 1, 2]],
+    ))
+    .expect_err("scalar exceeding total sequence length must fail");
+    assert!(format!("{error}").contains("exceeds physical total_sequence_length"));
 }
 
 #[test]
-fn gqa_gpu_declared_unit_batch_scalar_matches_cpu_oracle_and_cuda_vector() {
-    let Some(ep) = gpu_allow_unit_batch_scalar() else {
+fn gqa_gpu_unit_batch_scalar_matches_cpu_oracle_and_cuda_vector() {
+    let Some(ep) = gpu() else {
         return;
     };
     let q = [1., 0., 1., 0., 0., 1., 0., 1.];
@@ -1839,14 +1842,14 @@ fn gqa_gpu_rejects_noncanonical_seqlens_singleton_shapes_actionably() {
         let error = run_available(run(&ep, &attrs, &invalid_inputs, &output_shapes))
             .expect_err("noncanonical seqlens_k singleton shape must fail");
         let message = format!("{error}");
-        assert!(message.contains("[batch_size] or [batch_size, 1]"));
+        assert!(message.contains("[batch_size], [batch_size, 1]"));
         assert!(message.contains(&format!("got shape {shape:?}")));
     }
 }
 
 #[test]
-fn gqa_gpu_declared_scalar_still_rejects_multi_batch() {
-    let Some(ep) = gpu_allow_unit_batch_scalar() else {
+fn gqa_gpu_scalar_rejects_multi_batch() {
+    let Some(ep) = gpu() else {
         return;
     };
     let mut inputs = base_inputs(
@@ -1871,13 +1874,13 @@ fn gqa_gpu_declared_scalar_still_rejects_multi_batch() {
     ))
     .expect_err("scalar cannot encode multiple batch rows");
     let message = format!("{error}");
-    assert!(message.contains("cannot represent batch 2"));
+    assert!(message.contains("only be promoted to [1] when batch_size is 1"));
     assert!(message.contains("contiguous int32 [batch_size] or [batch_size, 1]"));
 }
 
 #[test]
-fn gqa_gpu_scalar_permission_preserves_dtype_layout_value_and_shape_validation() {
-    let Some(ep) = gpu_allow_unit_batch_scalar() else {
+fn gqa_gpu_scalar_preserves_dtype_layout_value_and_shape_validation() {
+    let Some(ep) = gpu() else {
         return;
     };
     let base = || {
@@ -1921,7 +1924,7 @@ fn gqa_gpu_scalar_permission_preserves_dtype_layout_value_and_shape_validation()
     let error = run_available(run(&ep, &attrs(&[]), &non_one_element, &output_shapes))
         .expect_err("non-one-element alternate shape must fail");
     let message = format!("{error}");
-    assert!(message.contains("[batch_size] or [batch_size, 1]"));
+    assert!(message.contains("[batch_size], [batch_size, 1]"));
     assert!(message.contains("got shape [2]"));
 }
 
@@ -1929,13 +1932,10 @@ fn gqa_gpu_scalar_permission_preserves_dtype_layout_value_and_shape_validation()
 fn gqa_gpu_fixed_decode_capture_replays_bit_identically() {
     let Some(ep) = gpu() else { return };
     let runtime = ep.runtime();
-    let kernel = GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0)
-        .unwrap()
-        .with_sequence_lengths_policy(GqaSequenceLengthsPolicy::AllowUnitBatchScalar);
+    let kernel =
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
     let eager_kernel =
-        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0)
-            .unwrap()
-            .with_sequence_lengths_policy(GqaSequenceLengthsPolicy::AllowUnitBatchScalar);
+        GroupQueryAttentionKernel::new(runtime.clone(), 4, 2, None, true, false, -1, 0.0).unwrap();
     assert!(!kernel.cuda_graph_compatible());
 
     let packed_host = f32_tensor(
@@ -2244,11 +2244,9 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
 
     let overflow = capture_invalid(Some(i32::MAX), None);
     assert_ne!(overflow & GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, 0);
-    assert!(
-        gqa_capture_error_description(overflow)
-            .unwrap()
-            .contains("seqlens_k + 1 overflows int32")
-    );
+    assert!(gqa_capture_error_description(overflow)
+        .unwrap()
+        .contains("seqlens_k + 1 overflows int32"));
 
     let negative = capture_invalid(Some(-1), None);
     assert_ne!(negative & GQA_CAPTURE_ERROR_PAST_NEGATIVE, 0);
@@ -2259,19 +2257,15 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
 
     let capacity = capture_invalid(Some(6), None);
     assert_ne!(capacity & GQA_CAPTURE_ERROR_PAST_CAPACITY, 0);
-    assert!(
-        gqa_capture_error_description(capacity)
-            .unwrap()
-            .contains("effective past length exceeds past cache extent")
-    );
+    assert!(gqa_capture_error_description(capacity)
+        .unwrap()
+        .contains("effective past length exceeds past cache extent"));
 
     let position = capture_invalid(None, Some(i64::MAX));
     assert_ne!(position & GQA_CAPTURE_ERROR_POSITION, 0);
-    assert!(
-        gqa_capture_error_description(position)
-            .unwrap()
-            .contains("rotary position exceeds cache rows")
-    );
+    assert!(gqa_capture_error_description(position)
+        .unwrap()
+        .contains("rotary position exceeds cache rows"));
 
     // Leave the latch clean for any later kernel sharing this runtime.
     runtime.reset_capture_error().unwrap();

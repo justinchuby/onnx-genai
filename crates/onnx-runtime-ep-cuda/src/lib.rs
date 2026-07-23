@@ -75,13 +75,13 @@ pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
 pub use kernels::group_query_attention::{
     GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE, GQA_CAPTURE_ERROR_POSITION,
     GQA_CAPTURE_ERROR_PRESENT_CAPACITY, GQA_CAPTURE_ERROR_QUERY_NEGATIVE,
-    GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GqaSequenceLengthsPolicy, GroupQueryAttentionBackend,
+    GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GroupQueryAttentionBackend,
     GroupQueryAttentionKernel, gqa_capture_error_description,
 };
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
-pub use provider::{CudaExecutionProvider, CudaExecutionProviderOptions};
+pub use provider::CudaExecutionProvider;
 
 /// Number of additional u32 words required by the CUDA device argmax result buffer.
 pub fn device_argmax_scratch_words(elements: usize) -> usize {

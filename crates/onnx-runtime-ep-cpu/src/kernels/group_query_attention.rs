@@ -434,12 +434,13 @@ impl Kernel for GroupQueryAttentionKernel {
             ));
         }
 
-        let seqlens = to_dense_i64(&inputs[5])?;
-        if seqlens.len() != q.batch || seqlens.iter().any(|&x| x < 0) {
+        let seqlens = normalized_sequence_lengths(&inputs[5], q.batch)?;
+        if seqlens.iter().any(|&x| x < 0) {
             return Err(EpError::KernelFailed(
                 "GroupQueryAttention: seqlens_k must be non-negative int32 [batch_size]".into(),
             ));
         }
+
         let total_sequence_length = scalar_i64(&inputs[6], "total_sequence_length")?;
         let totals: Vec<usize> = seqlens.iter().map(|&x| x as usize + 1).collect();
         if totals.iter().copied().max().unwrap_or(0) != total_sequence_length {
@@ -703,6 +704,33 @@ impl Kernel for GroupQueryAttentionKernel {
     }
 }
 
+/// Normalize the one exporter layout that is unambiguous: a rank-zero
+/// `seqlens_k` represents the sole row of a unit batch.
+fn normalized_sequence_lengths(view: &TensorView, batch: usize) -> Result<Vec<i64>> {
+    if view.dtype != onnx_runtime_ir::DataType::Int32 {
+        return Err(EpError::KernelFailed(format!(
+            "GroupQueryAttention: seqlens_k must be int32, got {:?}",
+            view.dtype
+        )));
+    }
+    let scalar = view.shape.is_empty() && view.numel() == 1;
+    if scalar {
+        if batch == 1 {
+            return to_dense_i64(view);
+        }
+        return Err(EpError::KernelFailed(format!(
+            "GroupQueryAttention: scalar seqlens_k can only be promoted to [1] when batch_size is 1, got batch_size {batch}; provide int32 [batch_size] values for every row"
+        )));
+    }
+    if view.shape != [batch] && view.shape != [batch, 1] {
+        return Err(EpError::KernelFailed(format!(
+            "GroupQueryAttention: seqlens_k must be int32 [batch_size], [batch_size, 1], or a scalar for batch_size 1; got shape {:?}",
+            view.shape
+        )));
+    }
+    to_dense_i64(view)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +935,19 @@ mod tests {
         };
 
         assert_eq!(run(&[]), run(&[1]));
+    }
+
+    #[test]
+    fn scalar_seqlens_rejects_multi_row_batch_and_wrong_dtype() {
+        let multi_row = Owned::i32(&[], &[0]);
+        let error = normalized_sequence_lengths(&multi_row.view(), 2)
+            .expect_err("a scalar cannot represent two batch rows");
+        assert!(format!("{error}").contains("batch_size 2"));
+
+        let wrong_dtype = Owned::i64(&[], &[0]);
+        let error = normalized_sequence_lengths(&wrong_dtype.view(), 1)
+            .expect_err("seqlens_k must be int32");
+        assert!(format!("{error}").contains("must be int32"));
     }
 
     #[test]
