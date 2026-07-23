@@ -73,6 +73,13 @@ impl CudaExecutionProvider {
         })
     }
 
+    /// Construct and initialize a CUDA execution provider with default settings.
+    pub fn initialized(ordinal: u32) -> Result<Self> {
+        let mut provider = Self::new(ordinal)?;
+        <Self as ExecutionProvider>::initialize(&mut provider, &EpConfig::default())?;
+        Ok(provider)
+    }
+
     /// Construct a CUDA EP on the default device (`CUDA:0`).
     pub fn new_default() -> Result<Self> {
         Self::new(0)

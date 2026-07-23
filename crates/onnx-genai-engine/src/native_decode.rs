@@ -613,13 +613,8 @@ impl NativeDecodeSession {
         }
         #[cfg(feature = "cuda")]
         if let NativeDecodeDevice::Cuda { index } = device {
-            let mut ep = onnx_runtime_ep_cuda::CudaExecutionProvider::new(index.unwrap_or(0))
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index.unwrap_or(0))
                 .context("initialize native CUDA execution provider")?;
-            onnx_runtime_ep_api::ExecutionProvider::initialize(
-                &mut ep,
-                &onnx_runtime_ep_api::EpConfig::default(),
-            )
-            .context("initialize native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
