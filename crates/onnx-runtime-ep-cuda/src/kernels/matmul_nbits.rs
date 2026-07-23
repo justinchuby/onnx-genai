@@ -1019,6 +1019,22 @@ union MatMulNBitsSkipHalf4 {
     __half2 pair[2];
 };
 
+// Scalar RMS-norm gamma load matching `skip_rmsnorm_f16_warp_half4`: gamma is
+// only ever a final multiplicand (never part of the fp32 variance
+// accumulation), so an fp32 gamma is read at full precision while an fp16 gamma
+// keeps the half round-trip. This lets decoders that export gamma in fp32 (e.g.
+// Phi-4-mini) take the fused RMS-norm-prologue GEMV path bit-identically to the
+// standalone norm + GEMV pair.
+__device__ __forceinline__ float load_rmsnorm_gamma(
+    const void* __restrict__ gamma,
+    const int gamma_is_half,
+    const int index)
+{
+    return gamma_is_half
+        ? __half2float(reinterpret_cast<const __half*>(gamma)[index])
+        : reinterpret_cast<const float*>(gamma)[index];
+}
+
 // General fp16/fp16-scales GEMV with a fused RMS-normalization prologue. The
 // preceding GEMV's residual epilogue already produced the byte-identical
 // residual sum that `SkipSimplifiedLayerNormalization` would emit as its
@@ -1032,7 +1048,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
     const void* __restrict__ scales_raw,
-    const __half* __restrict__ gamma,
+    const void* __restrict__ gamma,
     const __half* __restrict__ bias,
     __half* __restrict__ output,
     const int k,
@@ -1040,6 +1056,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm(
     const int k_blocks,
     const int blob_size,
     const int bias_post_round,
+    const int gamma_is_half,
     const float epsilon)
 {
     // Normalized activation, staged 16-byte aligned so the dot below can reuse
@@ -1085,7 +1102,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm(
     // --- Normalized activation, matching the norm kernel's rounded output. ---
     for (int j = tid; j < k; j += (int)blockDim.x) {
         const float residual = __half2float(activation[j]);
-        const float scale = __half2float(gamma[j]);
+        const float scale = load_rmsnorm_gamma(gamma, gamma_is_half, j);
         staged_activation[j] = __float2half((residual * inv_std) * scale);
     }
     __syncthreads();
@@ -1170,6 +1187,7 @@ extern "C" __global__ void matmul_nbits_rmsnorm_f16_warp_half4(
     __half* __restrict__ normalized,
     const int norm_size,
     const int num_groups,
+    const int gamma_is_half,
     const float epsilon)
 {
     const int g = (int)blockIdx.x;
@@ -1210,20 +1228,37 @@ extern "C" __global__ void matmul_nbits_rmsnorm_f16_warp_half4(
     for (int item = 0; item < chunks_per_lane; ++item) {
         const int chunk = lane + item * 32;
         MatMulNBitsSkipHalf4 residual;
-        MatMulNBitsSkipHalf4 scale;
         MatMulNBitsSkipHalf4 output;
         residual.raw = activation4[chunk];
-        scale.raw = gamma4[chunk];
         const float2 value0 = __half22float2(residual.pair[0]);
         const float2 value1 = __half22float2(residual.pair[1]);
-        const float2 scale0 = __half22float2(scale.pair[0]);
-        const float2 scale1 = __half22float2(scale.pair[1]);
+        // gamma is only a final multiplicand: an fp16 gamma keeps the wide
+        // half4 load, an fp32 gamma is read at full precision (matching the
+        // standalone `skip_rmsnorm_f16_warp_half4`), so fp32-gamma decoders fuse.
+        float scale0x, scale0y, scale1x, scale1y;
+        if (gamma_is_half) {
+            MatMulNBitsSkipHalf4 scale;
+            scale.raw = gamma4[chunk];
+            const float2 scale0 = __half22float2(scale.pair[0]);
+            const float2 scale1 = __half22float2(scale.pair[1]);
+            scale0x = scale0.x;
+            scale0y = scale0.y;
+            scale1x = scale1.x;
+            scale1y = scale1.y;
+        } else {
+            const int j = chunk << 2;
+            const float* gamma_f = reinterpret_cast<const float*>(gamma);
+            scale0x = gamma_f[j];
+            scale0y = gamma_f[j + 1];
+            scale1x = gamma_f[j + 2];
+            scale1y = gamma_f[j + 3];
+        }
         output.pair[0] = __floats2half2_rn(
-            value0.x * inv_std * scale0.x,
-            value0.y * inv_std * scale0.y);
+            value0.x * inv_std * scale0x,
+            value0.y * inv_std * scale0y);
         output.pair[1] = __floats2half2_rn(
-            value1.x * inv_std * scale1.x,
-            value1.y * inv_std * scale1.y);
+            value1.x * inv_std * scale1x,
+            value1.y * inv_std * scale1y);
         normalized4[chunk] = output.raw;
     }
 }
@@ -1387,12 +1422,13 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm(
     const __half* __restrict__ scales_gate,
     const unsigned char* __restrict__ packed_up,
     const __half* __restrict__ scales_up,
-    const __half* __restrict__ gamma,
+    const void* __restrict__ gamma,
     __half* __restrict__ output,
     const int k,
     const int n,
     const int k_blocks,
     const int blob_size,
+    const int gamma_is_half,
     const float epsilon)
 {
     extern __shared__ __align__(16) __half staged_activation[];
@@ -1436,7 +1472,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm(
     // --- Normalized activation, matching the norm kernel's rounded output. ---
     for (int j = tid; j < k; j += (int)blockDim.x) {
         const float residual = __half2float(activation[j]);
-        const float scale = __half2float(gamma[j]);
+        const float scale = load_rmsnorm_gamma(gamma, gamma_is_half, j);
         staged_activation[j] = __float2half((residual * inv_std) * scale);
     }
     __syncthreads();
@@ -2322,7 +2358,7 @@ impl MatMulNBitsKernel {
             let gamma = gamma.ok_or_else(|| {
                 error("rmsnorm_prologue fusion requires the normalization weight at input 6")
             })?;
-            require_dtype("gamma", gamma.dtype, DataType::Float16)?;
+            require_gamma_dtype(gamma.dtype)?;
             require_shape("gamma", gamma.shape, &[self.k])?;
         }
 
@@ -2640,6 +2676,7 @@ impl MatMulNBitsKernel {
         let normalized_ptr = normalized;
         let norm_size = as_i32("K", self.k)?;
         let num_groups = as_i32("M", m)?;
+        let gamma_is_half: i32 = (gamma.dtype == DataType::Float16) as i32;
         let epsilon = self.rmsnorm_epsilon;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
@@ -2648,6 +2685,7 @@ impl MatMulNBitsKernel {
             .arg(&normalized_ptr)
             .arg(&norm_size)
             .arg(&num_groups)
+            .arg(&gamma_is_half)
             .arg(&epsilon);
         // SAFETY: `activation` and `gamma` are validated contiguous fp16 tensors
         // and `normalized` is a `K * M`-half scratch buffer allocated by the
@@ -2757,7 +2795,7 @@ impl MatMulNBitsKernel {
         require_dtype("scales_up", inputs[4].dtype, DataType::Float16)?;
         require_dtype("Y", outputs[0].dtype, DataType::Float16)?;
         let gamma = if self.rmsnorm_prologue {
-            require_dtype("gamma", inputs[5].dtype, DataType::Float16)?;
+            require_gamma_dtype(inputs[5].dtype)?;
             require_shape("gamma", inputs[5].shape, &[self.k])?;
             if !inputs[5].is_contiguous() {
                 return Err(error(
@@ -3059,6 +3097,7 @@ impl MatMulNBitsKernel {
         let n = as_i32("N", self.n)?;
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
+        let gamma_is_half: i32 = (gamma.dtype == DataType::Float16) as i32;
         let epsilon = self.rmsnorm_epsilon;
         let threads = GATE_UP_SWIGLU_THREADS;
         let columns_per_block = (threads / 32) as usize;
@@ -3076,6 +3115,7 @@ impl MatMulNBitsKernel {
             .arg(&n)
             .arg(&k_blocks)
             .arg(&blob_size)
+            .arg(&gamma_is_half)
             .arg(&epsilon);
         // SAFETY: restricted to fp16 block-32 M=1 inputs validated above; the
         // weight/scale/gamma sets and the output are fixed device pointers, the
@@ -3379,6 +3419,7 @@ impl MatMulNBitsKernel {
         let k_blocks = as_i32("K block count", k_blocks)?;
         let blob_size = as_i32("block blob size", blob_size)?;
         let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+        let gamma_is_half: i32 = (gamma.dtype == DataType::Float16) as i32;
         let epsilon = self.rmsnorm_epsilon;
         let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
             GEMV_F16_SMALL_THREADS
@@ -3400,6 +3441,7 @@ impl MatMulNBitsKernel {
             .arg(&k_blocks)
             .arg(&blob_size)
             .arg(&bias_post_round_flag)
+            .arg(&gamma_is_half)
             .arg(&epsilon);
         // SAFETY: restricted to block-32 M=1 fp16 inputs with fp16 scales and no
         // zero_points, all dtype/shape/contiguity validated above. The kernel
@@ -3798,6 +3840,19 @@ fn require_dtype(name: &str, got: DataType, expected: DataType) -> Result<()> {
     if got != expected {
         return Err(error(format!(
             "{name} must have dtype {expected:?}, got {got:?}"
+        )));
+    }
+    Ok(())
+}
+
+// The RMS-norm prologue accepts an fp16 OR fp32 gamma. Gamma is only a final
+// multiplicand (never in the fp32 variance accumulation), so an fp32 gamma is
+// numerically safe and lets fp32-gamma exports (e.g. Phi-4-mini) fuse. The
+// fused kernels branch on `gamma_is_half` to read gamma at full precision.
+fn require_gamma_dtype(got: DataType) -> Result<()> {
+    if got != DataType::Float16 && got != DataType::Float32 {
+        return Err(error(format!(
+            "gamma must have dtype Float16 or Float, got {got:?}"
         )));
     }
     Ok(())
@@ -5496,6 +5551,18 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// normalize-into-scratch prefill path) keeps both dispatches honest.
     #[test]
     fn fused_gate_up_swiglu_rmsnorm_is_bit_exact_to_two_step_path() {
+        run_fused_gate_up_swiglu_rmsnorm_parity(DataType::Float16);
+    }
+
+    /// Same gate/up SwiGLU RMS-norm fusion parity, but with an fp32 gamma (as
+    /// Phi-4-mini exports it). The fused decode/prefill kernels must read the
+    /// fp32 gamma at full precision and stay bit-identical to the two-step path.
+    #[test]
+    fn fused_gate_up_swiglu_rmsnorm_fp32_gamma_is_bit_exact_to_two_step_path() {
+        run_fused_gate_up_swiglu_rmsnorm_parity(DataType::Float32);
+    }
+
+    fn run_fused_gate_up_swiglu_rmsnorm_parity(gamma_dtype: DataType) {
         let Some(runtime) = runtime() else {
             eprintln!("skipping gate/up SwiGLU RMS-norm parity test: CUDA runtime unavailable");
             return;
@@ -5554,16 +5621,23 @@ extern "C" __global__ void ref_silu_mul_f16(
             let scales_up: Vec<f16> = (0..n * k_blocks)
                 .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
                 .collect();
-            let gamma: Vec<f16> = (0..k)
-                .map(|_| f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5)))
-                .collect();
+            let gamma_is_f32 = gamma_dtype == DataType::Float32;
+            let gamma_f32: Vec<f32> = (0..k).map(|_| 0.5 + 0.5 * (next() * 0.5 + 0.5)).collect();
+            let gamma_bytes: Vec<u8> = if gamma_is_f32 {
+                gamma_f32.iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                gamma_f32
+                    .iter()
+                    .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+                    .collect()
+            };
 
             let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
             let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
             let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
             let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
             let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
-            let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+            let gamma_dev = runtime.alloc_raw(gamma_bytes.len()).unwrap();
             let normalized_dev = runtime.alloc_raw(m * k * 2).unwrap();
             let output_elements = m * n;
             let ref_out_dev = runtime.alloc_raw(output_elements * 2).unwrap();
@@ -5577,7 +5651,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     .unwrap();
                 runtime.htod(&packed_up, packed_up_dev).unwrap();
                 runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
-                runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+                runtime.htod(&gamma_bytes, gamma_dev).unwrap();
             }
 
             let device = DeviceId::cuda(0);
@@ -5636,7 +5710,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             );
             let gamma_view = TensorView::new(
                 device_ptr(gamma_dev),
-                DataType::Float16,
+                gamma_dtype,
                 &gamma_shape,
                 &gamma_strides,
                 device,
@@ -5778,6 +5852,19 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// for decode (M==1) and prefill (M>1), with and without a following bias.
     #[test]
     fn fused_skip_rmsnorm_is_bit_exact_to_three_op_path() {
+        run_fused_skip_rmsnorm_parity(DataType::Float16);
+    }
+
+    /// Phi-4-mini exports its `SkipSimplifiedLayerNormalization` gamma in fp32.
+    /// The fused RMS-norm-prologue GEMV must accept that fp32 gamma and stay
+    /// bit-identical to the standalone (fp32-gamma) norm + GEMV pair, so the
+    /// fusion fires on Phi as well as on Qwen (fp16 gamma).
+    #[test]
+    fn fused_skip_rmsnorm_fp32_gamma_is_bit_exact_to_three_op_path() {
+        run_fused_skip_rmsnorm_parity(DataType::Float32);
+    }
+
+    fn run_fused_skip_rmsnorm_parity(gamma_dtype: DataType) {
         let Some(runtime) = runtime() else {
             eprintln!("skipping fused skip-rmsnorm parity test: CUDA runtime unavailable");
             return;
@@ -5843,9 +5930,20 @@ extern "C" __global__ void ref_silu_mul_f16(
                 .collect();
             // The residual is a plain fp16 activation, one hidden vector per token.
             let residual: Vec<f16> = (0..m * hidden).map(|_| f16::from_f32(next())).collect();
-            let gamma: Vec<f16> = (0..hidden)
-                .map(|_| f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5)))
+            // Gamma values are produced identically regardless of storage dtype;
+            // fp16 keeps the byte-identical Qwen path, fp32 exercises Phi's export.
+            let gamma_is_f32 = gamma_dtype == DataType::Float32;
+            let gamma_f32: Vec<f32> = (0..hidden)
+                .map(|_| 0.5 + 0.5 * (next() * 0.5 + 0.5))
                 .collect();
+            let gamma_bytes: Vec<u8> = if gamma_is_f32 {
+                gamma_f32.iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                gamma_f32
+                    .iter()
+                    .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+                    .collect()
+            };
             let bias_post: Vec<f16> = (0..post_n).map(|_| f16::from_f32(next())).collect();
 
             // Device buffers.
@@ -5855,7 +5953,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             let packed_post_dev = runtime.alloc_raw(packed_post.len()).unwrap();
             let scales_post_dev = runtime.alloc_raw(scales_post.len() * 2).unwrap();
             let residual_dev = runtime.alloc_raw(residual.len() * 2).unwrap();
-            let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+            let gamma_dev = runtime.alloc_raw(gamma_bytes.len()).unwrap();
             let bias_post_dev = runtime.alloc_raw(bias_post.len() * 2).unwrap();
             let matmul_out_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
             let normalized_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
@@ -5876,7 +5974,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     .htod(as_bytes(&scales_post), scales_post_dev)
                     .unwrap();
                 runtime.htod(as_bytes(&residual), residual_dev).unwrap();
-                runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+                runtime.htod(&gamma_bytes, gamma_dev).unwrap();
                 runtime.htod(as_bytes(&bias_post), bias_post_dev).unwrap();
             }
 
@@ -5946,7 +6044,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             );
             let gamma_view = TensorView::new(
                 device_ptr(gamma_dev),
-                DataType::Float16,
+                gamma_dtype,
                 &gamma_shape,
                 &gamma_strides,
                 device,

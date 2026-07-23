@@ -964,13 +964,16 @@ impl CudaSkipRmsNormMatMulFusion {
         }
 
         // Gate on the standalone warp_half4 conditions for byte-identity:
-        // fp16 input/skip/gamma, dense skip (identical shapes), hidden % 128 == 0.
+        // fp16 input/skip, dense skip (identical shapes), hidden % 128 == 0.
+        // Gamma may be fp16 OR fp32 — it is only a final multiplicand (never in
+        // the fp32 variance accumulation), so an fp32 gamma (e.g. Phi-4-mini)
+        // is numerically safe and the fused kernel reads it at full precision.
         let input_meta = graph.value(input_value);
         let skip_meta = graph.value(skip_value);
         let gamma_meta = graph.value(gamma);
         if input_meta.dtype != DataType::Float16
             || skip_meta.dtype != DataType::Float16
-            || gamma_meta.dtype != DataType::Float16
+            || (gamma_meta.dtype != DataType::Float16 && gamma_meta.dtype != DataType::Float32)
         {
             return None;
         }
