@@ -222,6 +222,36 @@ fn case_inputs(case: Case, dtype: DataType) -> Vec<Option<HostTensor>> {
     ]
 }
 
+fn router_with_top_experts(case: Case, first_expert: usize) -> HostTensor {
+    assert!(first_expert + case.top_k <= case.experts);
+    let values: Vec<f32> = (0..case.rows)
+        .flat_map(|_| {
+            (0..case.experts).map(move |expert| {
+                if (first_expert..first_expert + case.top_k).contains(&expert) {
+                    10.0 - (expert - first_expert) as f32
+                } else {
+                    -10.0
+                }
+            })
+        })
+        .collect();
+    HostTensor::f32(&[case.rows, case.experts], &values)
+}
+
+fn router_with_hot_expert(case: Case) -> HostTensor {
+    assert!(case.top_k >= 2);
+    let values: Vec<f32> = (0..case.rows)
+        .flat_map(|_| {
+            (0..case.experts).map(move |expert| match expert {
+                0 => 20.0,
+                expert if expert < case.top_k => 10.0 - expert as f32,
+                _ => -10.0,
+            })
+        })
+        .collect();
+    HostTensor::f32(&[case.rows, case.experts], &values)
+}
+
 fn model_node(
     inputs: &[Option<HostTensor>],
     output_dtype: DataType,
@@ -601,6 +631,30 @@ fn compare(case: Case, dtype: DataType) -> (f32, u32) {
     error_metrics(&actual, &expected)
 }
 
+fn qmoe_64expert_case(rows: usize) -> Case {
+    Case {
+        experts: 64,
+        rows,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 6,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: false,
+        biases: true,
+        normalize: true,
+        router_weights: true,
+    }
+}
+
+fn compare_64expert_decode_and_prefill(dtype: DataType) {
+    for rows in [1, 8] {
+        compare(qmoe_64expert_case(rows), dtype);
+    }
+}
+
 fn compare_gemv_gemm_and_cpu(case: Case) {
     assert_eq!(case.rows, 6);
     assert_eq!(case.experts, 4);
@@ -777,6 +831,29 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
 }
 
 #[test]
+fn qmoe_64experts_top6_fp16_decode_and_prefill_match_cpu() {
+    compare_64expert_decode_and_prefill(DataType::Float16);
+}
+
+#[test]
+fn qmoe_64experts_top6_bf16_decode_and_prefill_match_cpu() {
+    compare_64expert_decode_and_prefill(DataType::BFloat16);
+}
+
+#[test]
+fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
+    let Some(ep) = gpu() else { return };
+    let case = qmoe_64expert_case(16);
+    let mut inputs = case_inputs(case, DataType::Float16);
+    inputs[1] = Some(router_with_hot_expert(case));
+
+    let cpu_inputs = rounded_cpu_inputs(&inputs, DataType::Float16);
+    let expected = run_cpu(case, &cpu_inputs);
+    let actual = run_gpu(&ep, case, &inputs, DataType::Float16).unwrap();
+    assert_conforms(&actual, &expected, case, DataType::Float16);
+}
+
+#[test]
 fn qmoe_capture_replay_reresolves_changed_router_probs() {
     let Some(ep) = gpu() else { return };
     let case = Case {
@@ -832,6 +909,47 @@ fn qmoe_capture_replay_reresolves_changed_router_probs() {
     .unwrap();
 
     assert_conforms(&replay, &eager, case, DataType::Float32);
+}
+
+#[test]
+fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
+    let Some(ep) = gpu() else { return };
+    let case = qmoe_64expert_case(8);
+    let mut capture_inputs = case_inputs(case, DataType::Float16);
+    capture_inputs[1] = Some(router_with_top_experts(case, 0));
+    let replay_router = router_with_top_experts(case, 32);
+
+    let replay = run_gpu_impl(
+        &ep,
+        case,
+        &capture_inputs,
+        DataType::Float16,
+        None,
+        Some(&replay_router),
+        true,
+    )
+    .unwrap();
+    let mut eager_inputs = capture_inputs;
+    eager_inputs[1] = Some(replay_router);
+    let eager = run_gpu_impl(
+        &ep,
+        case,
+        &eager_inputs,
+        DataType::Float16,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let expected = run_cpu(case, &rounded_cpu_inputs(&eager_inputs, DataType::Float16));
+
+    assert_conforms(&replay, &eager, case, DataType::Float16);
+    assert_conforms(&replay, &expected, case, DataType::Float16);
+}
+
+#[test]
+fn qmoe_64experts_top6_worst_case_scratch_sizing_matches_cpu() {
+    compare(qmoe_64expert_case(64), DataType::Float16);
 }
 
 #[test]
