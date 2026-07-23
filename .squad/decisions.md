@@ -3750,3 +3750,16 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Validation:** 757 ep-cpu lib tests + 10 numeric-regression golden tests green (752→771 total incl. new bf16 tests); clippy -D warnings clean. Non-author reviewed by Gaff (opus): attention KV round-trip verified single-narrow (no double-truncation), movement genuinely byte-generic, tests assert independent f32 reference / exact bit equality. Verdict ✅ ship.
 **Merged:** cherry-picked to perf/cpu-ep-mlas as `84b40d9` + `a68b076`, pushed (PR #105).
 <!-- scribe-merge-2026-07-23T14-45-00Z-bf16-coverage-end -->
+
+<!-- scribe-merge-2026-07-23T15-30-00Z-loop-and-divergence-start -->
+## 2026-07-23 — Generation-loop overhead cut + same-loop backend A/B + token-divergence root-cause
+**By:** Bryant (loop), Deckard (A/B + divergence), requested by justinchuby.
+**Loop overhead (Bryant, 2fbc679):** Profiled the shared engine decode loop; removed native greedy path's full-vocab logits materialization (direct argmax from Float32/Float16/BFloat16 tensors), cut default-loop alloc/cloning, skip incremental detokenization when no callback needs it. Native non-model overhead 0.510→0.258 ms/tok (-49%); 0.5B native 139.4→152.7 tok/s (+9.5%), 1.5B +3.5%. Greedy IDs identical. **Proved our loop is NOT slower than ORT's** — residual gap vs external onnxruntime-genai is inside ORT build/session.run (99% of wall), not our loop. Behavior dtype/shape/capability-driven, EP/model agnostic.
+**Same-loop backend A/B (Deckard, 8f55928):** Added `--backend {native,ort,auto}` to profile_native so Native and ORT run through the SAME Engine::generate loop (isolates runtime speed from loop speed). Result: **Native beats ORT 2.24× (0.5B) / 2.38× (1.5B) / 3.06× (7B int4) / 3.49× (7B f16)** — proves our RUNTIME is faster, not just the loop.
+**Token-divergence root-cause (Deckard, 557c3ed):**
+  - 1.5B f16 @36: Native is MORE accurate (matches f32-reference argmax token 4092; ORT tie). KEEP ours. Regression test `matmul.rs::matmul_f16_preserves_near_tie_argmax_after_f32_accumulation`.
+  - 7B int4 @23: REAL native bug — culprit = **CompInt8 activation quantization** in MatMulNBits (Native RMSE 0.005 vs ORT 0.0019 vs dequant-f32 oracle; native picks wrong token 151643 vs correct 151644). CompFp32 fixes it but collapses throughput 27→0.55 tok/s. Characterization test `matmul_nbits.rs::matmulnbits_compint8_argmax_reversal_is_caught_by_fp32_oracle`. → Spun focused fix agent (fix/compint8-accuracy) to make int8 path ORT-accurate at int8 speed (prefer reusing MLAS CompInt8).
+**Generality gaps found (to fix):** Phi-4-mini/Phi-3.5 (phi3, head_dim=48) fail native GQA (kernel assumes 64) → fix/phi3-headdim agent. Qwen3-0.6b lacks GatherBlockQuantized native op → queued.
+**Validation:** ep-cpu 759 tests green (incl. 2 new divergence tests); engine 164 passed / 17 pre-existing textproto-fixture failures (identical set on base — zero regression; separate fix PR opened via fix/textproto-fixture-loading). clippy clean.
+**Merged:** perf/cpu-ep-mlas 2fbc679 + 8f55928 + 557c3ed (cherry-picked; profile_native.rs --backend conflict resolved to Deckard's Auto-capable version, Bryant's native_decode engine opts retained). Pushed to PR #105.
+<!-- scribe-merge-2026-07-23T15-30-00Z-loop-and-divergence-end -->
