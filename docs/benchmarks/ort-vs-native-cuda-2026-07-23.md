@@ -195,6 +195,63 @@ Because that gate-up grid is not occupancy-starved, the next lever should
 target its dequantization/GEMV efficiency rather than applying split-K
 mechanically. Fusing or reducing GQA prep+merge is a secondary, bounded lever.
 
+## Comprehensive refresh @ bd05b75 — 2026-07-23
+
+This refresh covers the complete currently-runnable H200 model matrix after
+the fused int4-zp gate-up software prefetch (`76e35b2`), graph-capturable QMoE
+(`0175a12`), and GLM-5.2 logical-mask repair (`bd05b75`). Native measurements
+used physical GPU 5, greedy decoding, one warmup, and three 120-token steady
+windows after the eight-token exclusion. The synthetic GLM-5.2 models use five
+56-token steady windows.
+
+| Model | Native tok/s | ORT GenAI 0.14.1 tok/s | Delta | Coherent? | Native segments / fallbacks | Native capture |
+|---|---:|---:|---:|:---:|---:|:---:|
+| Qwen2.5-0.5B int4 | 900.78 | 735.47 | **+22.48%** | Yes | 1 / 0 | ON |
+| Qwen2.5-1.5B int4 | 622.60 | 486.26 | **+28.04%** | Deterministic; repetitive | 1 / 0 | ON |
+| Qwen2.5-7B int4 | 295.19 | 283.76 | **+4.03%** | Yes | 1 / 0 | ON |
+| DeepSeek-Coder-1.3B int4 | 793.01 | 653.93 | **+21.27%** | Yes; coherent code | 1 / 0 | ON |
+| DeepSeek-R1-Distill-Qwen-1.5B int4 | 622.69 | 488.17 | **+27.56%** | Yes; repetitive | 1 / 0 | ON |
+| GLM-4-9B GPTQ int4 | 120.80 | **Cannot load** — GQA rejects `rotary_embedding_dim` | N/A | Yes | 1 / 0 | ON |
+| Phi-4-mini int4/int8 | **188.54** | 229.62 | **-17.89%** | Yes | 3 / 0 | ON |
+| GLM-5.2-tiny dense | 70.63 | **Cannot load** — no compatible GLM-5.2/DSA config | N/A | Yes; synthetic token stream | N/A / 0 | OFF (automatic) |
+| GLM-5.2-tiny q4 | 148.58 | **Cannot load** — no compatible GLM-5.2/DSA config | N/A | Yes; synthetic token stream | N/A / 0 | OFF (automatic) |
+| GLM-5.2-tiny QMoE | **174.41** | **Cannot load** — no compatible GLM-5.2/DSA+QMoE config | N/A | Yes; synthetic token stream | N/A / 0 | OFF (automatic) |
+
+Fresh ORT medians use CUDA graph for Qwen and both DeepSeek-family rows.
+The fresh Qwen-7B ORT median is 283.76 tok/s, **+6.19%** above the earlier
+267.23 reference, so this section's native margin is intentionally the more
+conservative +4.03%.
+Phi uses the requested canonical 229.62 tok/s graph-off reference because
+ORT rejects CUDA graph capture for its control-flow graph; a same-session
+graph-off probe measured 239.43 tok/s and was not substituted into the
+canonical comparison. GLM-4 remains an important capability differentiator:
+native runs it coherently in one captured segment at 120.80 tok/s, while ORT
+0.14.1 cannot initialize the graph.
+
+Phi has progressed from **-59.86%** versus ORT at session start to **-17.89%**,
+now reaching 188.54 tok/s. The latest software prefetch adds **+2.32%** over
+the prior 184.27 tok/s stacked split-K/GQA milestone.
+
+GLM-5.2 MoE is now a native-CUDA capability milestone: the tiny dense, q4,
+and fused-QMoE graphs all execute DSA indexing and decode end-to-end with zero
+fallbacks. Their numeric-token output is deterministic and structurally valid;
+these synthetic models are not semantic-quality or beat-ORT claims. The QMoE
+kernel itself is CUDA-graph-capturable, but model-level capture is
+automatically disabled for all three exports because their bindings expose a
+growing logical prefix whose launch geometry cannot safely be replayed.
+
+Host load rose from 3.83 to 9.07 during the matrix. Large-model samples were
+tightly grouped. GLM-5.2 dense run 4 (48.01 vs 70.63 tok/s median) and q4 run
+4 (124.82 vs 148.58 median) were clear contention outliers; neither affects
+the five-run median. A separate `profile_native` job later overlapped an
+additional Phi check and depressed that check to 173.54 tok/s; after it exited,
+the authoritative five-run Phi samples were
+186.53/189.75/186.35/190.52/188.54 tok/s (median 188.54). Physical GPU 5
+remained exclusive throughout.
+
+*Phi may gain a further increment from an in-flight fused-int8 split-K
+(Deckard) — to be appended.*
+
 ## f0af865 baseline
 
 | Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 | Smoothness |
