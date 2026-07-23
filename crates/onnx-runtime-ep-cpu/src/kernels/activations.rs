@@ -264,10 +264,17 @@ impl Kernel for ActivationKernel {
                 .collect::<Vec<_>>();
             return write_dense_float::<f64>(&mut outputs[0], &y);
         }
-        let y = to_dense_f32_widen(self.activation.name(), &inputs[0])?
-            .iter()
-            .map(|x| self.activation.apply(*x))
-            .collect::<Vec<_>>();
+        let input = to_dense_f32_widen(self.activation.name(), &inputs[0])?;
+        let y = if matches!(self.activation, Activation::Silu) {
+            let mut output = vec![0.0; input.len()];
+            silu_f32_slice(&input, &mut output);
+            output
+        } else {
+            input
+                .iter()
+                .map(|x| self.activation.apply(*x))
+                .collect::<Vec<_>>()
+        };
         write_dense_f32_narrow(self.activation.name(), &mut outputs[0], &y)
     }
 
@@ -647,6 +654,72 @@ mod tests {
         assert_eq!(got[0], f32::INFINITY, "SiLU(+Inf) must be +Inf");
         assert_eq!(got[1], 0.0, "SiLU(-Inf) must be 0");
         assert!(got[2].is_nan(), "SiLU(NaN) must be NaN");
+    }
+
+    #[test]
+    fn silu_f16_and_bf16_match_scalar_reference() {
+        // 329 values exercise SIMD remainders and the MLAS clamp boundary.
+        let mut xs = Vec::new();
+        let mut value = -20.0f32;
+        while value <= 20.0 {
+            xs.push(value);
+            value += 0.125;
+        }
+        xs.extend_from_slice(&[
+            -1e4,
+            1e4,
+            -18.5,
+            18.5,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+            -0.0,
+        ]);
+        let kernel = ActivationKernel {
+            activation: Activation::Silu,
+        };
+
+        let f16_input = Owned::f16(&[xs.len()], &xs);
+        let f16_reference_input = f16_input.to_f16_as_f32();
+        let f16_reference_values: Vec<_> = f16_reference_input.into_iter().map(silu).collect();
+        let f16_reference = Owned::f16(&[xs.len()], &f16_reference_values);
+        let mut f16_output = Owned::zeros(DataType::Float16, &[xs.len()]);
+        kernel
+            .execute(&[f16_input.view()], &mut [f16_output.view_mut()])
+            .unwrap();
+        for (got, expected) in f16_output
+            .to_f16_as_f32()
+            .into_iter()
+            .zip(f16_reference.to_f16_as_f32())
+        {
+            assert!(
+                got == expected
+                    || (got - expected).abs() <= 1e-3 * expected.abs().max(1.0)
+                    || (got.is_nan() && expected.is_nan()),
+                "f16 SiLU got {got}, expected {expected}"
+            );
+        }
+
+        let bf16_input = Owned::bf16(&[xs.len()], &xs);
+        let bf16_reference_input = bf16_input.to_bf16_as_f32();
+        let bf16_reference_values: Vec<_> = bf16_reference_input.into_iter().map(silu).collect();
+        let bf16_reference = Owned::bf16(&[xs.len()], &bf16_reference_values);
+        let mut bf16_output = Owned::zeros(DataType::BFloat16, &[xs.len()]);
+        kernel
+            .execute(&[bf16_input.view()], &mut [bf16_output.view_mut()])
+            .unwrap();
+        for (got, expected) in bf16_output
+            .to_bf16_as_f32()
+            .into_iter()
+            .zip(bf16_reference.to_bf16_as_f32())
+        {
+            assert!(
+                got == expected
+                    || (got - expected).abs() <= 1e-3 * expected.abs().max(1.0)
+                    || (got.is_nan() && expected.is_nan()),
+                "bf16 SiLU got {got}, expected {expected}"
+            );
+        }
     }
 
     #[test]
