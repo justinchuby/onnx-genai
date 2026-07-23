@@ -928,6 +928,47 @@ where
     }
 }
 
+/// Fan `num_rows` fixed-width output rows (each `row_len` elements of `result`)
+/// out across the active decode workers, running `compute(row_index, row_slice)`
+/// on each whole row.
+///
+/// This is the row-block analogue of [`parallel_output_rows`] for decode kernels
+/// (e.g. `GroupQueryAttention`) whose parallel unit is a full contiguous row
+/// rather than a GEMV scalar output. It exists so those kernels use the *same*
+/// decode pool as the `MatMulNBits` projections instead of a second thread pool:
+///
+/// * When a persistent SPMD decode scope is active the forward runs on the
+///   engine thread (not a Rayon worker), so a bare `par_chunks_mut` here would
+///   fall to the *global* Rayon pool and contend with the SPMD pool's resident,
+///   pinned, spinning workers. Routing through the SPMD pool removes that
+///   contention (measured to dominate 7B CPU decode).
+/// * The `numa-split` and flat decode scopes install the forward onto a bounded
+///   Rayon pool, so `par_chunks_mut` already runs on that pool (no global-pool
+///   contention); they keep the existing behaviour.
+///
+/// Each row is independent, so sharding it across workers reproduces the
+/// single-threaded result bit-for-bit. Generality: the routing keys off which
+/// decode scope is active, never off op or model identity (RULES.md §2).
+pub fn decode_parallel_output_row_blocks<F>(
+    result: &mut [f32],
+    row_len: usize,
+    num_rows: usize,
+    compute: F,
+) where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_output_row_blocks(result, row_len, num_rows, &compute);
+        return;
+    }
+    // numa-split and flat decode scopes run the forward on a bounded Rayon pool,
+    // so this `par_chunks_mut` uses that pool rather than the global one.
+    result
+        .par_chunks_mut(row_len)
+        .enumerate()
+        .for_each(|(row_index, row)| compute(row_index, row));
+}
+
 /// First-touch each row-major weight component on the NUMA node that will read
 /// it under `numa-split` or the persistent SPMD pool, so each node's workers
 /// stream node-local memory. A no-op (returns the input) when neither node-aware

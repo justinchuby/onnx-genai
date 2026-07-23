@@ -359,6 +359,58 @@ impl SpmdDecodePools {
         self.dispatch_rows_across_workers(result, &compute);
     }
 
+    /// Shard `result`'s `num_rows` fixed-width rows (each `row_len` elements)
+    /// across the resident workers and run `compute(row_index, row_slice)` on
+    /// each whole row under one lightweight barrier.
+    ///
+    /// Unlike [`Self::dispatch_output_rows`] (which shards a GEMV's scalar output
+    /// rows), this keeps every `row_len`-element row intact on a single worker,
+    /// so a caller whose per-row closure needs the full contiguous row (e.g. an
+    /// attention head's output vector) can run on the persistent decode pool
+    /// instead of a second, contending thread pool. Rows are handed out
+    /// contiguously, so concatenating the per-worker slices reproduces the
+    /// single-threaded result bit-for-bit (each row is independent).
+    pub fn dispatch_output_row_blocks<F>(
+        &self,
+        result: &mut [f32],
+        row_len: usize,
+        num_rows: usize,
+        compute: &F,
+    ) where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        debug_assert_eq!(result.len(), row_len.saturating_mul(num_rows));
+        if self.total_workers <= 1 || num_rows <= 1 || row_len == 0 {
+            for row in 0..num_rows {
+                compute(row, &mut result[row * row_len..(row + 1) * row_len]);
+            }
+            return;
+        }
+        let segments = self.worker_row_segments(num_rows);
+        let table = RowBlockTable {
+            base: result.as_mut_ptr(),
+            row_len,
+            segments: &segments,
+        };
+        let table = &table;
+        let job = move |global_index: usize| {
+            let (start, len) = table.segments[global_index];
+            for row in start..start + len {
+                // SAFETY: `worker_row_segments` produces disjoint, in-bounds row
+                // ranges covering `0..num_rows` exactly once, so each worker's
+                // `[row*row_len, (row+1)*row_len)` slice never aliases another's.
+                let slice = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        table.base.add(row * table.row_len),
+                        table.row_len,
+                    )
+                };
+                compute(row, slice);
+            }
+        };
+        self.dispatch(&job);
+    }
+
     /// Broadcast the output-row shards to every worker under one barrier,
     /// unconditionally (no serial-threshold check). The public
     /// [`Self::dispatch_output_rows`] applies the threshold before calling this;
@@ -466,6 +518,17 @@ struct RowTable<'a> {
 }
 // SAFETY: each global worker index reads only its own disjoint row segment.
 unsafe impl Sync for RowTable<'_> {}
+
+/// Output view for fixed-width row-block dispatch: `base` is a `[num_rows,
+/// row_len]` row-major buffer, and each worker owns the disjoint row range
+/// `segments[worker]`.
+struct RowBlockTable<'a> {
+    base: *mut f32,
+    row_len: usize,
+    segments: &'a [(usize, usize)],
+}
+// SAFETY: each global worker index writes only its own disjoint row range.
+unsafe impl Sync for RowBlockTable<'_> {}
 
 /// Source/destination view for node-local weight placement.
 struct CopyTable<'a, T> {
@@ -754,6 +817,46 @@ mod tests {
             reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "row-sharded dispatch must be bit-identical to the serial reference"
         );
+    }
+
+    #[test]
+    fn dispatch_output_row_blocks_matches_flat_computation() {
+        // Fixed-width row blocks (mirrors GroupQueryAttention's per-head output
+        // rows): every `row_len`-element row is computed whole on one worker, so
+        // the sharded result must equal the single-threaded reference row-for-row
+        // and bit-for-bit (rows are independent).
+        for (num_rows, row_len) in [
+            (28usize, 128usize),
+            (3, 128),
+            (1, 64),
+            (5, 3),
+            (37, 1),
+            (0, 8),
+        ] {
+            let pool = two_group_pool();
+            let compute = |row_index: usize, row: &mut [f32]| {
+                for (offset, out) in row.iter_mut().enumerate() {
+                    // Order-sensitive accumulation to catch any row reordering.
+                    let mut acc = 0.0f32;
+                    for step in 0..=offset {
+                        acc += (row_index * 7 + step) as f32 * 0.015_625 - 1.0;
+                    }
+                    *out = acc;
+                }
+            };
+            let mut sharded = vec![0.0f32; num_rows * row_len];
+            pool.dispatch_output_row_blocks(&mut sharded, row_len, num_rows, &compute);
+            let mut reference = vec![0.0f32; num_rows * row_len];
+            for row in 0..num_rows {
+                compute(row, &mut reference[row * row_len..(row + 1) * row_len]);
+            }
+            assert_eq!(
+                sharded.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "row-block dispatch must be bit-identical to the serial reference \
+                 (num_rows={num_rows}, row_len={row_len})"
+            );
+        }
     }
 
     #[test]

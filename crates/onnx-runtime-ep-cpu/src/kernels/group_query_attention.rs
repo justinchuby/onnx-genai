@@ -37,8 +37,6 @@ use std::borrow::Cow;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
-use rayon::prelude::*;
-
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
@@ -809,16 +807,23 @@ impl Kernel for GroupQueryAttentionKernel {
             .saturating_mul(total_sequence_length)
             .saturating_mul(cache_dim);
         if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
-            y_bhsd
-                .par_chunks_mut(v.dim)
-                .enumerate()
-                .for_each(|(row_index, output_row)| {
+            // Route through the active decode pool (the same resident workers the
+            // MatMulNBits projections use). Under the persistent SPMD scope this
+            // avoids falling to the global Rayon pool, which would contend with
+            // the SPMD pool's pinned, spinning workers; under numa-split/flat
+            // scopes it runs on their bounded pool exactly as before.
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                &mut y_bhsd,
+                v.dim,
+                attention_rows,
+                |row_index, output_row| {
                     let b = row_index / (self.num_heads * q.seq);
                     let row_in_batch = row_index % (self.num_heads * q.seq);
                     let qh = row_in_batch / q.seq;
                     let qs = row_in_batch % q.seq;
                     compute_row(b, qh, qs, output_row);
-                });
+                },
+            );
         } else {
             for b in 0..q.batch {
                 for qh in 0..self.num_heads {
