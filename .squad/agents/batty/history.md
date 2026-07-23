@@ -55,3 +55,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-23T14:55:00Z — Mobius PR #404 QMoE emitter
 
 - Extended `glm5.2-moe-export` with int4 QMoE emitter/packer at `751645b`: expert-major FC1/FC2 packing, swiglu gate/up interleave, asymmetric zp inputs 11/12, and GGUF requant-on-zp-mismatch. Chew approved with a Ruff syntax caveat under fix.
+
+- 2026-07-23T15:45:00Z: Corrected DeepSeek low-precision routing in Mobius PR #404 (`bd88fa8`): `_router_logits()` widens both hidden states and gate weights to f32. Strict f16 CUDA smoke had zero fallbacks, 32 finite tokens, and 2.534 ms/token; f16/bf16 graph contracts cover mask, RoPE, and router dtypes.

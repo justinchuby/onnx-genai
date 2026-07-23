@@ -27,3 +27,6 @@ Verified the model-specific claims in `docs/PROJECTION_FUSION.md`: QKV is alread
 
 ### 2026-07-16T00:00:00Z — Native CUDA decode design fact check
 Audited `docs/NATIVE_CUDA_DECODE.md`: 14 central claims verified, including concrete CPU EP wiring, object-safe dynamic EP dispatch, packed-QKV GQA and O(capacity) KV blockers, and cudarc graph APIs. Required M4 corrections—a real non-null stream and serialized ownership of non-Send/Sync CUDA graphs—were incorporated in `33beb8d`; virtual-dispatch cost remains unmeasured.
+
+### 2026-07-23T15:45:00Z — DeepSeek QMoE structural smoke verification
+Verified the random-weight DeepSeek native int4-QMoE smoke on idle GPU5: exact QMoE/Attention/GQA/MatMulNBits graph and ABI contract, zero strict-CUDA fallbacks, and 32 finite tokens at 341.54 tok/s. This is structural validation only; it does not establish semantic correctness.

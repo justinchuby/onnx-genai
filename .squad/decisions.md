@@ -193,3 +193,25 @@ The full source notes for this reconciliation are preserved in `2026-07-23T00-00
 **By:** Deckard
 **What:** The standalone asymmetric int8 GEMV split-K path improved Phi end-to-end throughput about 2.1% while leaving Qwen unchanged by construction; CUDA tests and clippy were clean on the feature branch.
 **Why:** Unlike fused int8 kernels, this standalone GEMV has no serial RMSNorm prologue, so K_SPLIT=2 converts grid fill into useful wall-time.
+
+## 2026-07-23 — DeepSeek QMoE validation and Phi capture priority
+
+### Establish DeepSeek-V2-Lite as the real-scale native CUDA MoE target
+**By:** Batty
+**What:** Mobius PR #404's expert-major int4 emitter produces one QMoE per routed layer with fused/interleaved FC1, FC2, f32 scales, asymmetric zero-points on inputs 11/12, explicit routing/aggregation weights, and separate shared experts. The first DeepSeek MLA export must retain standard Attention when K/V head dimensions differ (192 versus 128), because GQA requires equal widths.
+**Why:** DeepSeek-V2-Lite (64 routed experts, top-6) is the smallest practical target covering MLA and real QMoE breadth. The native QMoE ABI generalizes to that geometry; exporter packing and an MLA-aware capture-safe latent-cache boundary, not a kernel expert-count limit, remain the production work.
+
+### Verify native DeepSeek QMoE structural and f16 execution smoke
+**By:** Fact Checker and Batty
+**What:** A random-weight two-layer 64-expert/top-6 asymmetric-int4 DeepSeek artifact matches the QMoE ABI and graph contract (one QMoE, two standard Attention, no GQA, 16 MatMulNBits) and completed strict-CUDA decode with zero fallbacks and finite output. The f16 root cause was router MatMul mixing f32 hidden states with f16 gate weights, not Attention-mask or RoPE dtypes; shared `_router_logits()` now casts both operands to f32. The corrected f16 smoke completed 32 finite tokens at 2.534 ms/token (394.64 tok/s), with 107 targeted tests and Ruff clean.
+**Why:** This proves emitter-to-native wiring and low-precision router correctness, but random weights make it structural rather than semantic validation. ORT GenAI 0.14.1 rejects `model_type=deepseek_v2`; full-weight export, semantic comparison, and native smoke remain in flight.
+
+### Prioritize fixed-decode Greater/If capture specialization for Phi
+**By:** Marsten
+**What:** At 193.90 tok/s (5.157 ms/token), Phi has only 2.899 ms/token of GPU kernels; 2.258 ms/token (43.8% of wall time) is dispatch/capture-seam overhead. Eager `Greater` metadata handling and host-side `If` control flow split decode into three CUDA graphs. A fixed-predicate, recapture-on-change specialization has an approximately 0.91 ms/token recoverable budget versus ORT.
+**Why:** GEMVs consume 86.02% of GPU time and are already at their established roofline, while capture-safe control flow directly targets the demonstrated wall-time gap.
+
+### Close warp-cooperative Phi gate/up GEMV as a no-go
+**By:** Deckard
+**What:** Removing the staged shared activation path regressed the asymmetric Phi gate/up kernel from about 31.5 to 50.7 µs (+61%). Each of eight warps redundantly recomputed RMS normalization; the prototype also forced a local-memory round-trip.
+**Why:** Shared staging is load-bearing cross-warp reuse, not removable overhead. Further fused gate/up micro-optimization should yield to capture seams or other kernels.
