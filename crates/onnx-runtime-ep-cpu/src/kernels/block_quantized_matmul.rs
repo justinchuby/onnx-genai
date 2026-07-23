@@ -15,7 +15,8 @@ use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
 use super::matmul::gemm;
-use super::{check_arity, to_dense_bytes, to_dense_f32, write_dense_f32};
+use super::{check_arity, to_dense_bytes};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 const OP: &str = "BlockQuantizedMatMul";
@@ -186,9 +187,15 @@ impl Kernel for BlockQuantizedMatMulKernel {
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(OP, inputs, outputs, 2, 3, 1)?;
-        require_dtype("A", inputs[0].dtype, DataType::Float32)?;
+        require_compute_dtype("A", inputs[0].dtype)?;
         require_dtype("packed_B", inputs[1].dtype, DataType::Uint8)?;
-        require_dtype("Y", outputs[0].dtype, DataType::Float32)?;
+        require_compute_dtype("Y", outputs[0].dtype)?;
+        if outputs[0].dtype != inputs[0].dtype {
+            return Err(error(format!(
+                "Y dtype {:?} must match A dtype {:?}",
+                outputs[0].dtype, inputs[0].dtype
+            )));
+        }
 
         let a_shape = inputs[0].shape;
         if a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k {
@@ -208,14 +215,20 @@ impl Kernel for BlockQuantizedMatMulKernel {
         )?;
 
         let bias = if let Some(bias) = inputs.get(2).filter(|input| !input.is_absent()) {
-            require_dtype("bias", bias.dtype, DataType::Float32)?;
+            require_compute_dtype("bias", bias.dtype)?;
+            if bias.dtype != inputs[0].dtype {
+                return Err(error(format!(
+                    "bias dtype {:?} must match A dtype {:?}",
+                    bias.dtype, inputs[0].dtype
+                )));
+            }
             require_shape("bias", bias.shape, &[self.n])?;
-            Some(to_dense_f32(bias)?)
+            Some(to_dense_f32_widen(OP, bias)?.into_owned())
         } else {
             None
         };
 
-        let activations = to_dense_f32(&inputs[0])?;
+        let activations = to_dense_f32_widen(OP, &inputs[0])?;
         let owned_weight;
         let weight_kn = if self.packed_b_constant {
             if let Some(weight) = self.weight_kn.get() {
@@ -245,11 +258,26 @@ impl Kernel for BlockQuantizedMatMulKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &result)
+        write_dense_f32_narrow(OP, &mut outputs[0], &result)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+}
+
+fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
+    if matches!(
+        got,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        Ok(())
+    } else {
+        Err(error(format!(
+            "{name} has unsupported dtype {got:?}; BlockQuantizedMatMul computes floating-point \
+             activations in Float32 and supports Float32, Float16, or BFloat16 storage. Cast \
+             {name} to one of those dtypes before this operator"
+        )))
     }
 }
 
@@ -899,6 +927,71 @@ mod tests {
             .unwrap();
         for (actual, expected) in y.to_f32().iter().zip(expected) {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn mxfp4_bfloat16_decode_and_prefill_match_widened_reference() {
+        let (k, n) = (32, 2);
+        let mut packed = vec![0u8; n * MXFP4_BLOCK_BYTES];
+        for output in 0..n {
+            let start = output * MXFP4_BLOCK_BYTES;
+            packed[start] = 127 + output as u8;
+            for index in 0..16 {
+                let low = ((index + output) % 16) as u8;
+                let high = ((15 + output - index % 2) % 16) as u8;
+                packed[start + 1 + index] = low | (high << 4);
+            }
+        }
+        let packed_weight = Owned::u8(&[n, 1, MXFP4_BLOCK_BYTES], &packed);
+        let kernel = BlockQuantizedMatMulKernel {
+            k,
+            n,
+            format: BlockFormat::Mxfp4,
+            packed_b_constant: false,
+            weight_kn: OnceLock::new(),
+        };
+        let weight = kernel.dequantize_weight_kn(&packed_weight.view()).unwrap();
+
+        for rows in [1, 4] {
+            let activation_values: Vec<f32> = (0..rows * k)
+                .map(|index| ((index * 13 % 31) as f32 - 15.0) * 0.0625)
+                .collect();
+            let activation = Owned::bf16(&[rows, k], &activation_values);
+            let bias = Owned::bf16(&[n], &[0.375, -0.625]);
+            let mut output = Owned::zeros(DataType::BFloat16, &[rows, n]);
+            kernel
+                .execute(
+                    &[activation.view(), packed_weight.view(), bias.view()],
+                    &mut [output.view_mut()],
+                )
+                .unwrap();
+
+            let widened_activation = activation.to_bf16_as_f32();
+            let widened_bias = bias.to_bf16_as_f32();
+            let mut expected = vec![0.0; rows * n];
+            for row in 0..rows {
+                for column in 0..n {
+                    expected[row * n + column] = widened_bias[column]
+                        + (0..k)
+                            .map(|inner| {
+                                widened_activation[row * k + inner] * weight[inner * n + column]
+                            })
+                            .sum::<f32>();
+                }
+            }
+            for (index, (actual, expected)) in output
+                .to_bf16_as_f32()
+                .into_iter()
+                .zip(expected)
+                .enumerate()
+            {
+                let tolerance = 5e-3 + 1e-2 * expected.abs();
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "rows {rows}, element {index}: {actual} != {expected}"
+                );
+            }
         }
     }
 

@@ -365,6 +365,77 @@ mod tests {
     }
 
     #[test]
+    fn rope_bfloat16_decode_and_prefill_match_widened_reference() {
+        let kernel = RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 0,
+            rotary_embedding_dim: 0,
+            contrib: false,
+        };
+        for (batch, sequence) in [(1, 1), (2, 4)] {
+            let heads = 2;
+            let head_size = 8;
+            let half = head_size / 2;
+            let input_values: Vec<f32> = (0..batch * heads * sequence * head_size)
+                .map(|index| ((index * 11 % 37) as f32 - 18.0) * 0.125)
+                .collect();
+            let angle_values: Vec<f32> = (0..batch * sequence * half)
+                .map(|index| index as f32 * 0.03125)
+                .collect();
+            let cosine_values: Vec<f32> = angle_values.iter().map(|angle| angle.cos()).collect();
+            let sine_values: Vec<f32> = angle_values.iter().map(|angle| angle.sin()).collect();
+            let input = Owned::bf16(&[batch, heads, sequence, head_size], &input_values);
+            let cosine = Owned::bf16(&[batch, sequence, half], &cosine_values);
+            let sine = Owned::bf16(&[batch, sequence, half], &sine_values);
+            let mut output = Owned::zeros(
+                onnx_runtime_ir::DataType::BFloat16,
+                &[batch, heads, sequence, head_size],
+            );
+            kernel
+                .execute(
+                    &[input.view(), cosine.view(), sine.view()],
+                    &mut [output.view_mut()],
+                )
+                .unwrap();
+
+            let widened_input = input.to_bf16_as_f32();
+            let widened_cosine = cosine.to_bf16_as_f32();
+            let widened_sine = sine.to_bf16_as_f32();
+            let mut expected = vec![0.0; widened_input.len()];
+            for batch_index in 0..batch {
+                for head_index in 0..heads {
+                    for sequence_index in 0..sequence {
+                        let input_base = ((batch_index * heads + head_index) * sequence
+                            + sequence_index)
+                            * head_size;
+                        let cache_base = (batch_index * sequence + sequence_index) * half;
+                        for channel in 0..half {
+                            let first = widened_input[input_base + channel];
+                            let second = widened_input[input_base + half + channel];
+                            let cosine = widened_cosine[cache_base + channel];
+                            let sine = widened_sine[cache_base + channel];
+                            expected[input_base + channel] = cosine * first - sine * second;
+                            expected[input_base + half + channel] = sine * first + cosine * second;
+                        }
+                    }
+                }
+            }
+            for (index, (actual, expected)) in output
+                .to_bf16_as_f32()
+                .into_iter()
+                .zip(expected)
+                .enumerate()
+            {
+                let tolerance = 2e-3 + 1e-2 * expected.abs();
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "batch {batch}, sequence {sequence}, element {index}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rope_interleaved_hand_computed() {
         // Same values, interleaved: x1=even=[1,3], x2=odd=[2,4].
         let c0 = 0.5f32;
