@@ -539,3 +539,32 @@ extern "C" void mlas_pool(
         output,
         thread_pool);
 }
+
+// NCHWc blocked 2-D pooling. `input_shape`/`output_shape` are blocked NCHWc
+// shapes (channel dimension rounded up to the SIMD block); MLAS pools each
+// channel independently over the blocked buffer, so no NCHW<->NCHWc reorder is
+// needed around it. Mirrors ONNX Runtime's NchwcTransformer pool handling.
+extern "C" void mlas_nchwc_pool(
+    int kind,
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* dilation_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    const float* input,
+    float* output)
+{
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasNchwcPool(
+        static_cast<MLAS_POOLING_KIND>(kind),
+        input_shape,
+        kernel_shape,
+        dilation_shape,
+        padding,
+        stride_shape,
+        output_shape,
+        input,
+        output,
+        thread_pool);
+}

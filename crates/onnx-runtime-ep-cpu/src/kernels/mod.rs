@@ -75,6 +75,7 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod moe;
 pub mod movement_ops;
+pub mod nchwc;
 pub mod norm_ops;
 pub mod onehot;
 pub mod pad;
@@ -256,6 +257,37 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory),
+    );
+    // NCHWc blocked layout ops, emitted only by the CpuNchwcLayoutPropagation
+    // pass (never parsed from a model). They keep the CNN backbone in the MLAS
+    // channels-blocked layout so per-Conv NCHW<->NCHWc reorders are eliminated.
+    reg.register(
+        OpKey::new(nchwc::REORDER_TO_BLOCKED_OP, nchwc::NCHWC_DOMAIN, 1),
+        Box::new(nchwc::NchwcReorderToBlockedFactory),
+    );
+    reg.register(
+        OpKey::new(nchwc::REORDER_TO_NCHW_OP, nchwc::NCHWC_DOMAIN, 1),
+        Box::new(nchwc::NchwcReorderToNchwFactory),
+    );
+    reg.register(
+        OpKey::new(nchwc::NCHWC_CONV_OP, nchwc::NCHWC_DOMAIN, 1),
+        Box::new(nchwc::NchwcConvFactory),
+    );
+    reg.register(
+        OpKey::new(nchwc::NCHWC_MAX_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+        Box::new(nchwc::NchwcPoolFactory::max()),
+    );
+    reg.register(
+        OpKey::new(nchwc::NCHWC_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+        Box::new(nchwc::NchwcPoolFactory::average()),
+    );
+    reg.register(
+        OpKey::new(
+            nchwc::NCHWC_GLOBAL_AVERAGE_POOL_OP,
+            nchwc::NCHWC_DOMAIN,
+            1,
+        ),
+        Box::new(nchwc::NchwcPoolFactory::global_average()),
     );
     reg.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
@@ -1565,8 +1597,11 @@ mod tests {
         // linear-attention primitives) add two more contrib entries,
         // `GatherBlockQuantized` (block-quantized embedding gather) adds one,
         // and the `com.microsoft::RotaryEmbedding` contrib alias adds one.
+        // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
+        // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
+        // NCHWc layout-propagation pass add six more entries.
         let mlas_registrations = usize::from(cfg!(feature = "mlas"));
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 89 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 95 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

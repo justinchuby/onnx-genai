@@ -139,6 +139,18 @@ unsafe extern "C" {
         input: *const f32,
         output: *mut f32,
     );
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_nchwc_pool(
+        kind: c_int,
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        dilation_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        input: *const f32,
+        output: *mut f32,
+    );
 
     // ---- Blocked n-bit quantized GEMM (SQNBitGemm) ----
     fn mlas_qnbit_gemm_available(bits: usize, blk_len: usize, comp_type: c_int) -> c_int;
@@ -594,8 +606,40 @@ pub fn pool(
     }
 }
 
-/// Pre-packed B weight buffer, mirroring how ORT pre-packs constant MatMul
-/// weights once and reuses the packed panel across calls.
+/// Execute an NCHWc blocked 2-D pool using MLAS.
+///
+/// `input_shape` / `output_shape` are the blocked NCHWc shapes
+/// `[N, round_up(C, block), H, W]`; MLAS pools each channel independently on the
+/// blocked buffer, so callers keep the activation in NCHWc across the pool with
+/// no reorder. `input` / `output` are blocked buffers. Mirrors ONNX Runtime's
+/// `NchwcTransformer` handling of pooling.
+#[allow(clippy::too_many_arguments)]
+pub fn nchwc_pool(
+    kind: PoolKind,
+    input_shape: &[i64; 4],
+    kernel_shape: &[i64; 2],
+    dilation_shape: &[i64; 2],
+    padding: &[i64; 4],
+    stride_shape: &[i64; 2],
+    output_shape: &[i64; 4],
+    input: &[f32],
+    output: &mut [f32],
+) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_pool(
+            kind as c_int,
+            input_shape.as_ptr(),
+            kernel_shape.as_ptr(),
+            dilation_shape.as_ptr(),
+            padding.as_ptr(),
+            stride_shape.as_ptr(),
+            output_shape.as_ptr(),
+            input.as_ptr(),
+            output.as_mut_ptr(),
+        );
+    }
+}
 ///
 /// MLAS's packed layout is accessed with aligned AVX-512 loads/stores, so the
 /// backing allocation is 64-byte aligned (a plain `Vec<u8>` is not).
@@ -1987,5 +2031,110 @@ mod tests {
             "diff {}",
             max_abs_diff(&want, &got)
         );
+    }
+
+    #[test]
+    fn nchwc_pool_max_and_average_match_reference() {
+        let block = nchwc_block_size();
+        let channels = block + block / 2; // partial trailing block exercises padding
+        let (n, hin, win) = (1, 8, 8);
+        let (kh, kw) = (2usize, 2usize);
+        let (sh, sw) = (2usize, 2usize);
+        let hout = (hin - kh) / sh + 1;
+        let wout = (win - kw) / sw + 1;
+        let input: Vec<f32> = (0..n * channels * hin * win)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.13)
+            .collect();
+
+        let nchwc_ch = round_up(channels, block);
+        let mut blocked_in = vec![0.0f32; n * nchwc_ch * hin * win];
+        nchwc_reorder_input_nchw(&input, &mut blocked_in, channels, hin * win);
+
+        for kind in [PoolKind::Maximum, PoolKind::AverageIncludePad] {
+            let mut blocked_out = vec![0.0f32; n * nchwc_ch * hout * wout];
+            nchwc_pool(
+                kind,
+                &[n as i64, nchwc_ch as i64, hin as i64, win as i64],
+                &[kh as i64, kw as i64],
+                &[1, 1],
+                &[0, 0, 0, 0],
+                &[sh as i64, sw as i64],
+                &[n as i64, nchwc_ch as i64, hout as i64, wout as i64],
+                &blocked_in,
+                &mut blocked_out,
+            );
+            let mut got = vec![0.0f32; n * channels * hout * wout];
+            nchwc_reorder_output_nchw(
+                &[n as i64, channels as i64, hout as i64, wout as i64],
+                &blocked_out,
+                &mut got,
+            );
+
+            let mut want = vec![0.0f32; n * channels * hout * wout];
+            for c in 0..channels {
+                for oh in 0..hout {
+                    for ow in 0..wout {
+                        let mut acc = if matches!(kind, PoolKind::Maximum) {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        };
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let ih = oh * sh + ky;
+                                let iw = ow * sw + kx;
+                                let v = input[((c * hin) + ih) * win + iw];
+                                if matches!(kind, PoolKind::Maximum) {
+                                    acc = acc.max(v);
+                                } else {
+                                    acc += v;
+                                }
+                            }
+                        }
+                        if !matches!(kind, PoolKind::Maximum) {
+                            acc /= (kh * kw) as f32;
+                        }
+                        want[((c * hout) + oh) * wout + ow] = acc;
+                    }
+                }
+            }
+            assert!(
+                max_abs_diff(&want, &got) < 1e-4,
+                "kind {kind:?} diff {}",
+                max_abs_diff(&want, &got)
+            );
+        }
+    }
+
+    /// NCHW -> NCHWc -> NCHW must reproduce the original activation exactly for
+    /// the kept channels, including when the channel count leaves a partial
+    /// trailing block (padding lanes are added on the way in and dropped on the
+    /// way out). This is the layout round-trip the graph pass relies on at
+    /// region entry/exit boundaries.
+    #[test]
+    fn nchwc_reorder_round_trip_is_identity() {
+        let block = nchwc_block_size();
+        // Exercise both an exact multiple of the block and a partial trailing
+        // block (still a multiple of 4, the reorder's channel-group unit).
+        for &channels in &[block, block + 4] {
+            let (n, h, w) = (1usize, 5usize, 7usize);
+            let plane = h * w;
+            let input: Vec<f32> = (0..n * channels * plane)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.07)
+                .collect();
+
+            let nchwc_ch = round_up(channels, block);
+            let mut blocked = vec![7.0f32; n * nchwc_ch * plane]; // non-zero fill
+            nchwc_reorder_input_nchw(&input, &mut blocked, channels, plane);
+
+            let mut back = vec![0.0f32; n * channels * plane];
+            nchwc_reorder_output_nchw(
+                &[n as i64, channels as i64, h as i64, w as i64],
+                &blocked,
+                &mut back,
+            );
+
+            assert_eq!(back, input, "round-trip mismatch for channels={channels}");
+        }
     }
 }
