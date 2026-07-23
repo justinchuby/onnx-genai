@@ -200,4 +200,16 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("WHY:"));
     }
+    #[test]
+    fn constant_of_shape_bf16_preserves_fill_bits() {
+        let bits = 0x7fc1u16;
+        let k = kernel_with(Some(tensor_value(
+            DataType::BFloat16,
+            bits.to_le_bytes().to_vec(),
+        )));
+        let shape = Owned::i64(&[1], &[3]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[3]);
+        k.execute(&[shape.view()], &mut [out.view_mut()]).unwrap();
+        assert_eq!(out.to_u16_bits(), vec![bits; 3]);
+    }
 }

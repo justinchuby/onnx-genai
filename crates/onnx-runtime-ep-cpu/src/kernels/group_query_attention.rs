@@ -2678,4 +2678,59 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn decode_bf16_kv_state_matches_widened_f32_reference() {
+        let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
+        let past_k = vec![1., 0., 0., 1., 10., 0., 0., 10.];
+        let past_v = vec![1., 2., 3., 4., 10., 20., 30., 40.];
+        let cur_k = vec![1., 1., 10., 10.];
+        let cur_v = vec![5., 6., 50., 60.];
+        let q = Owned::bf16(&[1, 1, 8], &q);
+        let cur_k = Owned::bf16(&[1, 1, 4], &cur_k);
+        let cur_v = Owned::bf16(&[1, 1, 4], &cur_v);
+        let past_k = Owned::bf16(&[1, 2, 2, 2], &past_k);
+        let past_v = Owned::bf16(&[1, 2, 2, 2], &past_v);
+        let mut out = Owned::zeros(DataType::BFloat16, &[1, 1, 8]);
+        let mut present_k = Owned::zeros(DataType::BFloat16, &[1, 2, 3, 2]);
+        let mut present_v = Owned::zeros(DataType::BFloat16, &[1, 2, 3, 2]);
+        gqa_kernel(&[])
+            .execute(
+                &[
+                    q.view(),
+                    cur_k.view(),
+                    cur_v.view(),
+                    past_k.view(),
+                    past_v.view(),
+                    Owned::i32(&[1], &[2]).view(),
+                    Owned::i32(&[], &[3]).view(),
+                ],
+                &mut [out.view_mut(), present_k.view_mut(), present_v.view_mut()],
+            )
+            .unwrap();
+        let expected_k = vec![1., 0., 0., 1., 1., 1., 10., 0., 0., 10., 10., 10.];
+        let expected_v = vec![1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60.];
+        let expected = reference(&q.to_bf16_as_f32(), &expected_k, &expected_v, 1, 3, 2);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        assert_eq!(out.to_bf16_as_f32(), expected);
+        assert_eq!(
+            present_k.to_u16_bits(),
+            expected_k
+                .into_iter()
+                .map(half::bf16::from_f32)
+                .map(half::bf16::to_bits)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            present_v.to_u16_bits(),
+            expected_v
+                .into_iter()
+                .map(half::bf16::from_f32)
+                .map(half::bf16::to_bits)
+                .collect::<Vec<_>>()
+        );
+    }
 }

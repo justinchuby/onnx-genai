@@ -117,4 +117,17 @@ mod tests {
         let mut out = Owned::zeros_f32(&[1]);
         assert!(k.execute(&[], &mut [out.view_mut()]).is_err());
     }
+    #[test]
+    fn constant_tensor_bf16_preserves_raw_bits() {
+        let bits = [0x3f80u16, 0x7fc1, 0x8000];
+        let bytes = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let node = node_with(
+            "value",
+            Attribute::Tensor(TensorData::from_raw(DataType::BFloat16, vec![3], bytes)),
+        );
+        let k = kernel_from(&node);
+        let mut out = Owned::zeros(DataType::BFloat16, &[3]);
+        k.execute(&[], &mut [out.view_mut()]).unwrap();
+        assert_eq!(out.to_u16_bits(), bits);
+    }
 }

@@ -64,4 +64,13 @@ mod tests {
             .unwrap();
         assert_eq!(out.to_u16_bits(), bits);
     }
+    #[test]
+    fn reshape_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[2, 2], &[1., -2., 3., 4.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[4]);
+        ReshapeKernel
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_u16_bits(), x.to_u16_bits());
+    }
 }

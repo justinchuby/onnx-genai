@@ -359,4 +359,15 @@ mod tests {
         assert!(msg.contains("WHY:"));
         assert!(msg.contains("extent 4"));
     }
+    #[test]
+    fn split_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[4], &[1., -2., 3., 4.]);
+        let mut a = Owned::zeros(DataType::BFloat16, &[2]);
+        let mut b = Owned::zeros(DataType::BFloat16, &[2]);
+        kernel(0, None, None)
+            .execute(&[x.view()], &mut [a.view_mut(), b.view_mut()])
+            .unwrap();
+        assert_eq!(a.to_u16_bits(), x.to_u16_bits()[..2]);
+        assert_eq!(b.to_u16_bits(), x.to_u16_bits()[2..]);
+    }
 }

@@ -1,13 +1,13 @@
-//! `Transpose`: permute axes for f32. The `perm` attribute gives the axis
+//! `Transpose`: permute axes by moving raw fixed-width element bytes. The `perm` attribute gives the axis
 //! order; it defaults to reversing all axes (`docs/ORT2.md` §4.4).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
 use crate::strided::{next_index, numel};
 
-/// f32 Transpose kernel carrying the resolved `perm`.
+/// Dtype-generic Transpose kernel carrying the resolved `perm`.
 pub struct TransposeKernel {
     /// Axis permutation; `None` means reverse all axes.
     perm: Option<Vec<usize>>,
@@ -44,11 +44,18 @@ impl Kernel for TransposeKernel {
             None => (0..rank).rev().collect(),
         };
 
-        let din = to_dense_f32(&inputs[0])?;
+        if outputs[0].dtype != inputs[0].dtype {
+            return Err(EpError::KernelFailed(format!(
+                "Transpose: output dtype {:?} must match input dtype {:?}",
+                outputs[0].dtype, inputs[0].dtype
+            )));
+        }
+        let esize = elem_size(inputs[0].dtype)?;
+        let din = to_dense_bytes(&inputs[0])?;
         let in_strides = compute_contiguous_strides(&in_shape);
         // Output axis i corresponds to input axis perm[i].
         let out_shape: Vec<usize> = perm.iter().map(|&p| in_shape[p]).collect();
-        let mut out = vec![0.0f32; numel(&out_shape)];
+        let mut out = vec![0u8; numel(&out_shape) * esize];
 
         if !out.is_empty() {
             let mut oidx = vec![0usize; rank];
@@ -59,14 +66,16 @@ impl Kernel for TransposeKernel {
                 for (i, &p) in perm.iter().enumerate() {
                     in_flat += in_strides[p] * oidx[i] as i64;
                 }
-                out[flat] = din[in_flat as usize];
+                let src = in_flat as usize * esize;
+                let dst = flat * esize;
+                out[dst..dst + esize].copy_from_slice(&din[src..src + esize]);
                 flat += 1;
                 if !next_index(&out_shape, &mut oidx) {
                     break;
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_bytes(&mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -110,5 +119,20 @@ mod tests {
         run(Some(vec![0, 2, 1]), &a, &mut out);
         // rows [1,2,3],[4,5,6] transposed -> [1,4],[2,5],[3,6]
         assert_eq!(out.to_f32(), vec![1., 4., 2., 5., 3., 6.]);
+    }
+    #[test]
+    fn transpose_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[2, 2], &[1., -2., 3., 4.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 2]);
+        run(None, &x, &mut out);
+        assert_eq!(
+            out.to_u16_bits(),
+            vec![
+                x.to_u16_bits()[0],
+                x.to_u16_bits()[2],
+                x.to_u16_bits()[1],
+                x.to_u16_bits()[3]
+            ]
+        );
     }
 }

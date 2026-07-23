@@ -373,4 +373,15 @@ mod tests {
         run(0, &data, &idx, &mut out);
         assert_eq!(out.to_i64(), vec![33]);
     }
+    #[test]
+    fn gather_bf16_preserves_element_bits() {
+        let data = Owned::bf16(&[3], &[1., -2., 3.]);
+        let indices = Owned::i64(&[2], &[2, 0]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2]);
+        run(0, &data, &indices, &mut out);
+        assert_eq!(
+            out.to_u16_bits(),
+            vec![data.to_u16_bits()[2], data.to_u16_bits()[0]]
+        );
+    }
 }

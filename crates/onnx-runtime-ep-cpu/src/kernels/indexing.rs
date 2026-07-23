@@ -499,4 +499,46 @@ mod tests {
             .unwrap();
         assert_eq!(out.to_f32(), vec![1., 0., 0., 1., 0., 1., 1., 0.]);
     }
+    #[test]
+    fn indexed_bf16_movement_preserves_bits() {
+        let x = Owned::bf16(&[2, 2], &[1., -2., 3., 4.]);
+        let indices = Owned::i64(&[2, 1], &[1, 0]);
+        let mut ge = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 1]);
+        GatherElementsKernel { axis: 1 }
+            .execute(&[x.view(), indices.view()], &mut [ge.view_mut()])
+            .unwrap();
+        assert_eq!(
+            ge.to_u16_bits(),
+            vec![x.to_u16_bits()[1], x.to_u16_bits()[2]]
+        );
+        let nd_indices = Owned::i64(&[2, 2], &[0, 1, 1, 0]);
+        let mut nd = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2]);
+        GatherNDKernel { batch_dims: 0 }
+            .execute(&[x.view(), nd_indices.view()], &mut [nd.view_mut()])
+            .unwrap();
+        assert_eq!(
+            nd.to_u16_bits(),
+            vec![x.to_u16_bits()[1], x.to_u16_bits()[2]]
+        );
+        let updates = Owned::bf16(&[2, 1], &[9., -8.]);
+        let mut scatter = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 2]);
+        ScatterElementsKernel {
+            axis: 1,
+            reduction: ScatterReduction::None,
+        }
+        .execute(
+            &[x.view(), indices.view(), updates.view()],
+            &mut [scatter.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(
+            scatter.to_u16_bits(),
+            vec![
+                x.to_u16_bits()[0],
+                updates.to_u16_bits()[0],
+                updates.to_u16_bits()[1],
+                x.to_u16_bits()[3]
+            ]
+        );
+    }
 }

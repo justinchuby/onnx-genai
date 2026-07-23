@@ -177,4 +177,16 @@ mod tests {
         // (1,0) F -> y[1,0]=20; (1,1) T -> x[0,1]=2
         assert_eq!(out.to_f32(), vec![1., 10., 20., 2.]);
     }
+    #[test]
+    fn where_bf16_preserves_selected_bits() {
+        let c = Owned::bool_(&[3], &[true, false, true]);
+        let x = Owned::bf16(&[3], &[1., -2., 3.]);
+        let y = Owned::bf16(&[3], &[4., 5., -6.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[3]);
+        run(&c, &x, &y, &mut out);
+        assert_eq!(
+            out.to_u16_bits(),
+            vec![x.to_u16_bits()[0], y.to_u16_bits()[1], x.to_u16_bits()[2]]
+        );
+    }
 }

@@ -158,4 +158,20 @@ mod tests {
             .unwrap();
         assert_eq!(out.to_f32(), vec![1., 2., 5., 6., 13., 14., 17., 18.]);
     }
+    #[test]
+    fn center_crop_pad_bf16_is_bit_exact() {
+        let bits = [0x7fc1u16, 0x3f80, 0x8000];
+        let input = Owned {
+            bytes: bits.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            shape: vec![3],
+            strides: vec![1],
+            dtype: onnx_runtime_ir::DataType::BFloat16,
+        };
+        let shape = Owned::i64(&[1], &[5]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[5]);
+        kernel(None)
+            .execute(&[input.view(), shape.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_u16_bits(), vec![0, bits[0], bits[1], bits[2], 0]);
+    }
 }

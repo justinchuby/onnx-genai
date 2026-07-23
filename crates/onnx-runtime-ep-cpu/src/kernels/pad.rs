@@ -405,4 +405,17 @@ mod tests {
             .unwrap();
         assert_eq!(out.to_i64(), vec![99, 10, 20]);
     }
+    #[test]
+    fn pad_bf16_preserves_input_element_bits() {
+        let x = Owned::bf16(&[2], &[1., -2.]);
+        let pads = Owned::i64(&[2], &[1, 1]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[4]);
+        constant_kernel(None)
+            .execute(&[x.view(), pads.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_u16_bits(),
+            vec![0, x.to_u16_bits()[0], x.to_u16_bits()[1], 0]
+        );
+    }
 }
