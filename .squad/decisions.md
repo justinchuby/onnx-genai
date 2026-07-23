@@ -3719,3 +3719,15 @@ non-row-vector bias rejected, extra-consumer rejected, graph-output rejected).
 
 **Review:** Gaff APPROVE. **Merged:** `28adcd9`.
 <!-- scribe-merge-2026-07-23T11-00-00Z-bryant-qkv-bias-add-end -->
+
+<!-- scribe-merge-2026-07-23T11-10-00Z-coordinator-final-cpu-benchmark -->
+<!-- merged from .squad/decisions/inbox/coordinator-final-cpu-benchmark.md -->
+### 2026-07-23: CPU EP whole-model decode beats onnxruntime-genai on all 3 models (matched-load A/B)
+**By:** Squad (Coordinator), for justinchuby
+**What:** Final matched-load A/B on the same Xeon 8480C, native onnx-genai CPU vs onnxruntime-genai 0.14.1 CPU, decode tok/s (--steady --decode-skip 8 --tokens 128 --runs 3, median):
+- Qwen2.5-0.5B f16: native 154.9 vs ORT 86.5 = 1.79x
+- Qwen2.5-1.5B f16: native 74.0 vs ORT 40.6 = 1.82x
+- Qwen2.5-coder-7B int4 generic-cpu: native 32.7 vs ORT 21.1 = 1.55x
+Openers byte-identical. ORT f16 baselines obtained via CPU-provider config variants (/tmp/ortcpu-{0.5b,1.5b}, provider_options emptied).
+**Why:** Confirms the user directive — every material CPU-EP decode op now beats/ties ORT AND whole-model decode beats ORT on all three. Landed this segment (all non-author reviewed, byte-identical/tight-tolerance, cross-OS/cross-arch, no hardcoded dims): f32 SiLU MLAS-logistic+robust-extreme (13x), f16/bf16 SiLU reuse (~3.9x), f16 Mul/Sub/Div binary_contiguous (~3.8x), SkipSimplifiedLayerNorm portable 8-lane SIMD + stats-output fast path (~3.3x vs ORT), QKV-bias Add folded into MatMulNBits epilogue (standalone Add eliminated). 730 CPU-EP tests green, clippy -D warnings clean. PR #105.
+<!-- scribe-merge-2026-07-23T11-10-00Z-coordinator-final-cpu-benchmark-end -->
