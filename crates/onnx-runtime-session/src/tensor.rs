@@ -499,6 +499,41 @@ impl Tensor {
         Self::from_raw_in(shared_cpu_ep(), dtype, shape, bytes)
     }
 
+    /// Take ownership of an already-allocated, contiguous `buffer` (allocated by
+    /// `allocator`) and wrap it as a row-major tensor **without copying**. The
+    /// executor uses this to hand a produced output's host buffer straight to
+    /// the caller instead of round-tripping the bytes through
+    /// [`copy_to_host`](ExecutionProvider::copy_to_host) plus a second
+    /// allocate+copy in [`from_raw`]. The bytes are the exact same memory the
+    /// kernel wrote, so this is numerically identical to the copy path.
+    ///
+    /// `buffer` must hold exactly `storage_bytes(numel)` bytes for `dtype` and
+    /// `shape`, must be host-resident, and must be owned (not borrowed) so the
+    /// tensor can free it exactly once on drop.
+    pub(crate) fn from_owned_buffer(
+        allocator: Arc<dyn ExecutionProvider>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        buffer: DeviceBuffer,
+    ) -> Self {
+        debug_assert!(!buffer.is_borrowed(), "from_owned_buffer requires an owned buffer");
+        debug_assert_eq!(
+            buffer.len(),
+            dtype.storage_bytes(shape.iter().product::<usize>()).max(1),
+            "from_owned_buffer size mismatch for shape {shape:?} dtype {dtype:?}",
+        );
+        let device = buffer.device();
+        Self {
+            dtype,
+            shape,
+            layout: TensorLayout::contiguous(),
+            device,
+            buffer: Some(buffer),
+            allocator,
+            import_guard: None,
+        }
+    }
+
     /// Build an `f32` tensor from a dense row-major slice.
     pub fn from_f32(shape: &[usize], data: &[f32]) -> Result<Self> {
         let mut bytes = Vec::with_capacity(data.len() * 4);

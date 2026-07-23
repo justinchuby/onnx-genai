@@ -2827,7 +2827,8 @@ impl Executor {
         });
         let mut results = Vec::with_capacity(self.graph.outputs.len());
         let mut host_output_bytes = 0usize;
-        for &vid in &self.graph.outputs {
+        let output_vids: Vec<ValueId> = self.graph.outputs.clone();
+        for vid in output_vids {
             if external.outputs.contains_key(&vid) {
                 results.push(None);
                 continue;
@@ -2845,6 +2846,16 @@ impl Executor {
 
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
+            // Top-level outputs: hand the produced host buffer to the caller
+            // zero-copy when safe (the KV-cache round-trip the decode hot path
+            // otherwise pays every step). Child (subgraph) outputs are copied
+            // back into the parent scope, so keep them on the copy path.
+            if !nested {
+                if let Some(tensor) = self.try_move_host_output(vid, &shape, dtype)? {
+                    results.push(Some(SessionOutput::Tensor(tensor)));
+                    continue;
+                }
+            }
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
             host_output_bytes += bytes.len();
             results.push(Some(SessionOutput::Tensor(Tensor::from_raw(
@@ -4771,6 +4782,73 @@ impl Executor {
         }
     }
 
+    /// Zero-copy hand-off of a top-level graph output: move the produced host
+    /// buffer straight into the returned tensor instead of copying it to host
+    /// and re-allocating it in [`Tensor::from_raw`]. This eliminates two full
+    /// per-output memcpys on the decode hot path (the growing KV-cache present
+    /// outputs re-materialized every step) while being numerically identical —
+    /// the tensor keeps the exact bytes the kernel wrote.
+    ///
+    /// Returns `None` (caller falls back to the copy path) unless every safety
+    /// precondition holds: the value is an owned, host-resident, exactly-sized
+    /// producer output that is not a view/sequence element, not pinned as a live
+    /// view source, not shared, and not listed as a graph output more than once.
+    /// Moving the buffer out forfeits this value's cross-run allocation reuse, so
+    /// its `buffer_shapes` entry is cleared to force a fresh allocation next run.
+    fn try_move_host_output(
+        &mut self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Result<Option<Tensor>> {
+        // Values the copy path materializes specially (strided gather, shared
+        // sequence element, in-place share, or a pinned live view source) must
+        // not have their backing buffer stolen.
+        if self.views.contains_key(&vid)
+            || self.seq_elem_values.contains_key(&vid)
+            || self.shared_buffers.contains_key(&vid)
+            || self.pinned.contains(&vid)
+        {
+            return Ok(None);
+        }
+        // Only a produced value owns a writable buffer. A producer-less output
+        // (initializer or graph-input passthrough) may alias read-only mmap or
+        // foreign/borrowed memory that a tensor must never free.
+        if self
+            .graph
+            .try_value(vid)
+            .is_none_or(|value| value.producer.is_none())
+        {
+            return Ok(None);
+        }
+        // A value listed as a graph output more than once would be taken twice.
+        if self.graph.outputs.iter().filter(|&&o| o == vid).count() != 1 {
+            return Ok(None);
+        }
+        let value_name = || format!("value#{}", vid.0);
+        let numel = checked_numel(shape, value_name)?;
+        let n = checked_storage_bytes(dtype, numel, value_name, shape)?;
+        let movable = self.buffers.get(&vid).is_some_and(|buf| {
+            buf.device().is_host_accessible() && !buf.is_borrowed() && buf.len() == n
+        });
+        if !movable {
+            return Ok(None);
+        }
+        let buffer = self
+            .buffers
+            .remove(&vid)
+            .expect("buffer presence checked above");
+        // The buffer now belongs to the tensor; force a fresh allocation on the
+        // next run instead of the reuse fast path (which assumes it is present).
+        self.buffer_shapes.remove(&vid);
+        Ok(Some(Tensor::from_owned_buffer(
+            self.ep.clone(),
+            dtype,
+            shape.to_vec(),
+            buffer,
+        )))
+    }
+
     /// Contiguous row-major bytes of `vid` for `shape`/`dtype`, materializing a
     /// view (strided gather over its source buffer) or truncating an owned
     /// buffer to its logical size. This is the single materialization seam used
@@ -6044,6 +6122,83 @@ mod tests {
 
         // Restore the default (disabled) state so other tests stay inert.
         phase_profile::force_enabled(false);
+    }
+
+    // A produced top-level output is handed to the caller by moving its host
+    // buffer out of the executor (zero-copy), while a producer-less output (an
+    // initializer routed straight to a graph output) stays on the copy path so
+    // its borrowed/shared storage is never freed. Repeated runs must keep
+    // producing correct bytes even though the produced buffer was moved out and
+    // its `buffer_shapes` entry cleared (forcing a fresh allocation each run).
+    #[test]
+    fn zero_copy_output_move_reallocates_and_preserves_producer_less_output() {
+        use onnx_runtime_ir::TensorData;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let a = graph.create_named_value("a", DataType::Float32, static_shape([3]));
+        let b = graph.create_named_value("b", DataType::Float32, static_shape([3]));
+        graph.add_input(a);
+        graph.add_input(b);
+
+        // Producer-less graph output: an initializer wired straight to an output.
+        let k = graph.create_named_value("k", DataType::Float32, static_shape([3]));
+        graph.set_initializer(
+            k,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![3],
+                [100.0f32, 200.0, 300.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+
+        // Produced output: Add(a, b). This is the movable, owned, host output.
+        let sum = graph.create_named_value("sum", DataType::Float32, static_shape([3]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![sum],
+        ));
+        graph.add_output(sum);
+        graph.add_output(k);
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let a_val = Tensor::from_f32(&[3], &[1.0, 2.0, 3.0]).unwrap();
+        let b_val = Tensor::from_f32(&[3], &[10.0, 20.0, 30.0]).unwrap();
+
+        // Three runs prove the move-out survives buffer reallocation: run 1 moves
+        // `sum`'s buffer out, so runs 2 and 3 must reallocate it from scratch.
+        for _ in 0..3 {
+            let outputs = executor
+                .run(&[("a", &a_val), ("b", &b_val)])
+                .expect("run must succeed after a prior output buffer was moved out");
+            assert_eq!(outputs[0].to_vec_f32(), vec![11.0, 22.0, 33.0]);
+            assert_eq!(
+                outputs[1].to_vec_f32(),
+                vec![100.0, 200.0, 300.0],
+                "producer-less initializer output must stay intact across runs"
+            );
+            // The produced output was handed off zero-copy: its buffer is gone
+            // from the executor. The initializer stays resident (copy path).
+            assert!(
+                !executor.buffers.contains_key(&sum),
+                "produced output buffer must be moved out, not copied"
+            );
+            assert!(
+                executor.buffers.contains_key(&k),
+                "producer-less output must not have its buffer stolen"
+            );
+        }
     }
 
     struct CaptureDecliningKernel;
