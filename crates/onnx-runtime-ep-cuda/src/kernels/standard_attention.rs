@@ -69,8 +69,9 @@
 //! ## Supported vs. unimplemented
 //!
 //! * dtype: **f32, f16, and bf16** Q/K/V, cache, additive mask, and outputs.
-//!   Device f16/bf16 loads and stores are converted around fp32 score, softmax,
-//!   and value accumulators. Mixed dtypes across Q/K/V/cache are still rejected.
+//!   All floating inputs must use the same dtype; a boolean attention mask is
+//!   exempt. Device f16/bf16 loads and stores are converted around fp32 score,
+//!   softmax, and value accumulators.
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
 
@@ -393,6 +394,11 @@ pub(crate) fn unsupported_reason(
         return Some(Cow::Owned(format!(
             "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool, f32, f16, or bf16 when provided)"
         )));
+    }
+    if !matches!(mask_dtype, DataType::Undefined | DataType::Bool) && mask_dtype != dtype_at(0) {
+        return Some(Cow::Borrowed(
+            "Attention: floating attn_mask must use the same dtype as Q, K, and V on CUDA",
+        ));
     }
 
     let past_key_dtype = dtype_at(4);

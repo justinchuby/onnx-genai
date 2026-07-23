@@ -159,6 +159,89 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
 }
 
 #[test]
+fn standard_attention_claim_requires_homogeneous_floating_input_dtypes() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+
+    let claim = |input_dtypes: &[DataType]| {
+        let mut graph = Graph::new();
+        let inputs = input_dtypes
+            .iter()
+            .enumerate()
+            .map(|(index, dtype)| {
+                graph.create_named_value(
+                    format!("attention_input_{index}"),
+                    *dtype,
+                    static_shape([1, 1, 1, 2]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = graph.create_named_value(
+            "attention_output",
+            input_dtypes[0],
+            static_shape([1, 1, 1, 2]),
+        );
+        let node = Node::new(
+            NodeId(0),
+            "Attention",
+            inputs.into_iter().map(Some).collect(),
+            vec![output],
+        );
+        ep.supports_op(&node, 23, &[], input_dtypes, &[])
+    };
+
+    for input_dtypes in [
+        [
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::Float32,
+        ],
+        [
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::Float16,
+        ],
+        [
+            DataType::Float16,
+            DataType::Float16,
+            DataType::Float16,
+            DataType::Float32,
+        ],
+        [
+            DataType::BFloat16,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::BFloat16,
+        ],
+    ] {
+        assert!(
+            !claim(&input_dtypes).is_supported(),
+            "Attention must reject mixed floating input dtypes: {input_dtypes:?}"
+        );
+    }
+
+    for floating_dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        let homogeneous = [floating_dtype; 4];
+        assert!(
+            claim(&homogeneous).is_supported(),
+            "Attention must accept a homogeneous {floating_dtype:?} additive mask"
+        );
+
+        let boolean_mask = [
+            floating_dtype,
+            floating_dtype,
+            floating_dtype,
+            DataType::Bool,
+        ];
+        assert!(
+            claim(&boolean_mask).is_supported(),
+            "Attention must accept a boolean mask with {floating_dtype:?} Q, K, and V"
+        );
+    }
+}
+
+#[test]
 fn standard_attention_claim_distinguishes_omitted_and_wrong_typed_past_cache() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
     let mut graph = Graph::new();
