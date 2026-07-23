@@ -401,14 +401,18 @@ impl MatMulNBitsKernel {
     /// crossover [`sqnbit_decode_min`]) when the hand path is a *fast*
     /// specialized int4/int8 route (`bits == 4 && accuracy_level == 4`), which
     /// ties MLAS on bandwidth-bound M=1 while avoiding int8 activation rounding;
-    /// backend is not MLAS; `bits != 4` (2-bit is left to the existing
-    /// correctness path); `g_idx` is present (MLAS SQNBit has no per-row group
-    /// indices); or MLAS reports no kernel is available for this shape on the
-    /// host. A small-`m` case whose hand path would instead fall to the slow
-    /// full-f32-dequant GEMV (e.g. `accuracy_level != 4`) is **not** dropped
-    /// here: MLAS SQNBit (CompFp32) beats a dequantize-then-GEMM there. Bias,
-    /// when present, is added by MLAS itself, so the caller's post-loop bias add
-    /// is skipped on this path.
+    /// `accuracy_level == 4` when the resolved [`CpuBackend`] is not MLAS (its
+    /// hand int8 path owns MatMulNBits and matches ORT's CompInt8 numerics);
+    /// `bits != 4` (2-bit is left to the existing correctness path); `g_idx` is
+    /// present (MLAS SQNBit has no per-row group indices); or MLAS reports no
+    /// kernel is available for this shape on the host. A case whose hand path
+    /// would instead fall to the slow full-f32-dequant GEMV (any
+    /// `accuracy_level != 4`, e.g. the `accuracy_level = 0` "implementation's
+    /// choice" that Foundry `cuda-gpu` int4 exports emit) is **not** dropped
+    /// here: MLAS SQNBit (CompFp32) beats a dequantize-then-GEMM there, matching
+    /// how ORT/onnxruntime-genai run those models. Bias, when present, is added
+    /// by MLAS itself, so the caller's post-loop bias add is skipped on this
+    /// path.
     #[cfg(feature = "mlas")]
     #[allow(clippy::too_many_arguments)]
     fn try_mlas_sqnbit(
@@ -435,16 +439,32 @@ impl MatMulNBitsKernel {
             return Ok(None);
         }
 
-        if self.bits != 4
-            || group_indices.is_some()
-            || CpuBackend::auto_detect() != CpuBackend::Mlas
-        {
+        // MLAS SQNBit is a specialized blockwise-quantized kernel, distinct from
+        // the dense-f32 GEMM microkernel that `CpuBackend` selects. For
+        // `accuracy_level == 4` the fast hand int8/int4 paths own MatMulNBits and
+        // match ORT's CompInt8 numerics, so only defer to MLAS (CompInt8) when the
+        // whole GEMM backend was explicitly forced to MLAS. For every other
+        // accuracy level the hand fallback is a slow full-f32-dequant GEMV, so
+        // prefer MLAS SQNBit (CompFp32) whenever MLAS actually has a kernel --
+        // this matches ORT/onnxruntime-genai, which treat `accuracy_level` 0/1 as
+        // CompFp32 rather than dequantizing the whole weight.
+        let backend_is_mlas = CpuBackend::auto_detect() == CpuBackend::Mlas;
+        let use_mlas = backend_is_mlas || self.accuracy_level != 4;
+        if self.bits != 4 || group_indices.is_some() || !use_mlas {
             return Ok(None);
         }
 
         let comp = if self.accuracy_level == 4 {
             mlas_sys::SQNBitComputeType::Int8
         } else {
+            // accuracy_level is a *minimum* compute-precision hint: 0 = kernel's
+            // choice, 1 = fp32, 2 = fp16, 3 = bf16, 4 = int8. We route every
+            // non-int8 level to MLAS SQNBit CompFp32, i.e. the fp16/bf16 levels
+            // (2/3) are deliberately upgraded to fp32 compute -- more accuracy
+            // than requested, never less, and a conservative, bandwidth-bound
+            // choice that MLAS actually implements (it has no fp16/bf16 SQNBit
+            // path here). This matches ORT/onnxruntime-genai, which treat 0/1 as
+            // CompFp32.
             mlas_sys::SQNBitComputeType::Fp32
         };
 
@@ -1732,6 +1752,36 @@ mod tests {
         }
     }
 
+    /// Address of whichever prepack reuse cache the routed path populated, or
+    /// `None` if none is populated yet. Which cache is filled depends on the
+    /// route: MLAS SQNBit (`mlas_packed`) for `accuracy_level != 4` when the MLAS
+    /// kernel is available, otherwise the hand GEMV/int8 caches. Returning a raw
+    /// address lets tests assert the cache is *reused* (stable) across calls, not
+    /// merely populated. The address is stable because every cache is a
+    /// `OnceLock` that stores its value in place.
+    fn prepack_cache_ptr(kernel: &MatMulNBitsKernel) -> Option<*const ()> {
+        if let Some(w) = kernel.weight_nk.get() {
+            return Some(w as *const _ as *const ());
+        }
+        if let Some(w) = kernel.int8_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
+        if let Some(w) = kernel.packed_int4_weight.get() {
+            return Some(w as *const _ as *const ());
+        }
+        #[cfg(feature = "mlas")]
+        if let Some(w) = kernel.mlas_packed.get() {
+            return Some(w as *const _ as *const ());
+        }
+        None
+    }
+
+    /// True when a constant `MatMulNBits` weight has been prepacked into any of
+    /// the reuse caches (see [`prepack_cache_ptr`]).
+    fn prepack_cache_populated(kernel: &MatMulNBitsKernel) -> bool {
+        prepack_cache_ptr(kernel).is_some()
+    }
+
     fn quantize(
         weights_nk: &[f32],
         n: usize,
@@ -2614,17 +2664,21 @@ mod tests {
             .unwrap();
         assert_close(&y1.to_f32(), &reference(&a1_values, &dequantized, 1, k, n));
 
-        let cached_weight = kernel
-            .weight_nk
-            .get()
-            .expect("M=1 constant B must populate the prepacked weight cache")
-            .as_ptr();
+        let cached_ptr = prepack_cache_ptr(&kernel);
+        assert!(
+            cached_ptr.is_some(),
+            "M=1 constant B must populate a prepacked weight cache"
+        );
         let a2 = Owned::f32(&[1, k], &a2_values);
         let mut y2 = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
             .unwrap();
-        assert_eq!(kernel.weight_nk.get().unwrap().as_ptr(), cached_weight);
+        assert_eq!(
+            prepack_cache_ptr(&kernel),
+            cached_ptr,
+            "prepacked weight cache must be reused (stable) across activations"
+        );
         assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
         assert_ne!(y1.to_f32(), y2.to_f32());
     }
@@ -2659,8 +2713,8 @@ mod tests {
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
         assert!(
-            kernel.weight_nk.get().is_some(),
-            "M=1 constant B/scales/zero-points must take the prepacked GEMV path"
+            prepack_cache_populated(&kernel),
+            "M=1 constant B/scales/zero-points must take a prepacked path"
         );
     }
 
@@ -3310,6 +3364,102 @@ mod tests {
         // CompFp32 dequant is near-exact, so it must match the f32 reference.
         let expected = reference(&a, &dq, 1, k, n);
         mlas_close(&result, &expected, 2e-3, "slow-dequant m1 CompFp32");
+    }
+
+    /// Regression for the `accuracy_level = 0` slow-path bug: MLAS SQNBit is a
+    /// specialized quantized kernel independent of the dense-f32 [`CpuBackend`]
+    /// microkernel, so an `accuracy_level != 4` MatMulNBits must route to MLAS
+    /// (CompFp32) even when the resolved backend is *not* MLAS -- the real
+    /// default on an AVX2 host, where [`CpuBackend::auto_detect`] returns
+    /// `SimdX86`. Before the fix the `auto_detect() != Mlas` gate dropped this
+    /// case to the slow full-f32-dequant GEMV. `accuracy_level = 4` must be
+    /// unaffected: its fast hand int8/int4 path stays selected (returns `None`)
+    /// unless the whole backend is explicitly forced to MLAS. Skipped when the
+    /// host lacks the MLAS kernel.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_try_mlas_routes_acclevel0_without_mlas_backend() {
+        let (n, k, block_size) = (32usize, 64usize, 32usize);
+        let k_blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let weights_nk = pseudo(n * k, 0.3);
+        let (packed_bytes, scales, _zps, dq) = quantize(&weights_nk, n, k, block_size, false);
+
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Fp32,
+            &packed_bytes,
+            &scales,
+            None,
+        )
+        .is_none()
+        {
+            eprintln!("MLAS SQNBit int4 CompFp32 kernel unavailable; skipping acc0-default-backend test");
+            return;
+        }
+
+        let b = Owned::u8(&[n, k_blocks, blob], &packed_bytes);
+        let scales_t = Owned::f32(&[n, k_blocks], &scales);
+        let a = pseudo(k, 0.8);
+
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var.
+        // Force a non-MLAS backend to model the real-world default: MLAS SQNBit
+        // routing for accuracy_level != 4 must not depend on the dense-GEMM
+        // backend being MLAS.
+        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "generic") };
+        assert_ne!(
+            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Mlas,
+            "test precondition: backend must not resolve to MLAS",
+        );
+
+        let call = |kernel: &MatMulNBitsKernel| {
+            let mut result = vec![0.0f32; n];
+            let served = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    None,
+                    None,
+                    false,
+                    &a,
+                    1,
+                    None,
+                    &mut result,
+                )
+                .unwrap();
+            (served, result)
+        };
+
+        let (acc0_served, acc0_result) = call(&test_kernel(k, n, block_size));
+        let (acc4_served, _) = call(&accuracy4_kernel(k, n, block_size));
+
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+            }
+        }
+
+        assert_eq!(
+            acc0_served,
+            Some(()),
+            "accuracy_level=0 must route to MLAS SQNBit even when the backend is not MLAS",
+        );
+        // CompFp32 dequant is near-exact, so it must match the f32 reference.
+        let expected = reference(&a, &dq, 1, k, n);
+        mlas_close(&acc0_result, &expected, 2e-3, "acc0 default-backend CompFp32");
+
+        assert_eq!(
+            acc4_served, None,
+            "accuracy_level=4 decode must stay on the fast hand path when the backend is not MLAS",
+        );
     }
 
     /// Before/after perf for int4 MatMulNBits: the existing hand-written VNNI
