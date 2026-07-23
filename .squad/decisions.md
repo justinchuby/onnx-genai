@@ -3805,3 +3805,20 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Did NOT beat ORT yet** (7.7×/4.6× slower). Root cause of residual gap: every Conv reorders NCHW→NCHWc in and back out; ORT converts to NCHWc once at graph entry and stays blocked. **Next: graph-level NCHWc layout-propagation pass** (reorder only at layout boundaries, keep Conv/Pool/Add/Relu blocked) — the path to matching/beating ORT. bf16/f16 Conv = TODO (MLAS NCHWc is f32-centric).
 **Review (Greg/opus):** ✅ SAFE, no 🔴. FFI buffer sizing correct (round_up channels to block), per-node prepack cache no leakage, BN-fold inference/constant-only + Relu sole-consumer guarded. mlas-sys 18 + ep-cpu 792 tests green (3 new fusion tests), clippy clean, real-model parity re-verified. 🟡 nits (queued): add debug_assert! length checks in public nchwc_* wrappers; add a dilation>1 NCHWc unit test.
 <!-- scribe-merge-2026-07-23T17-55-00Z-nchwc-conv-end -->
+
+<!-- scribe-merge-2026-07-23T18-50-00Z-f16-rope-gemma-start -->
+## 2026-07-23 — f16 RotaryEmbedding (enables Gemma-2) + foundry-model breadth + generality gaps — PR #105
+**By:** Sara. Review: Sofia (sol, non-author). Requested by justinchuby.
+**What (merged c38438e):** RotaryEmbedding now accepts f16/bf16 by widening to f32 for compute and narrowing to the output dtype (was f32-only, ERRORed on Gemma-2's opset-24 f16 RoPE). f32 path is zero-copy identity (no regression — Phi-3.5 32-token native/ORT still identical). f16 computes in f32 then rounds once → potentially MORE accurate than ORT stepwise-f16. Parity unit test added. **Enables Gemma-2-2B native E2E with EXACT token parity vs ORT.**
+**Review (Sofia/sol):** ✅ SAFE, no 🔴. 793 ep-cpu tests green (incl. f16 parity + head-dim 48/80), clippy clean, cherry-picks cleanly. 🟡 nit: add bf16 + ORT-golden RoPE coverage later.
+**Foundry-model breadth results (same-loop native-vs-ORT, box heavily loaded ~20-66 so throughput ratios UNRELIABLE; PARITY is load-independent):**
+  - Gemma-2-2B (mobius f16): tokens MATCH ✅ (native slower under load, re-measure clean).
+  - Phi-3.5-mini int4: tokens **diverge at generated token 65** ❌ (separate/deeper than the CompInt8 step-23 fix; first 64 identical) → fix/token-divergence agent (Horatio).
+  - Qwen3-0.6B int8/block-128: tokens **diverge immediately** ❌ + 0.003× (8-bit block-128 MatMulNBits) → Horatio.
+**Generality gaps found (native CPU EP can't load these — QUEUED):**
+  - **rank-3 1-D Conv** (ai.onnx::Conv opset18/21) — MLAS Conv only accepts rank-4 2-D NCHW; blocks Whisper-tiny encoder (X=[1,80,3000],W=[384,80,3]) AND Nemotron ASR encoder (X=[1,1024,7],W=[2048,1024,1]). **HIGHEST-VALUE next op.**
+  - **LSTM opset 21** (Nemotron decoder) — no CPU EP handler.
+  - **If branch rank-mismatch** in native shape inference (Whisper jump-times, Nemotron VAD) — rejects branch outputs of differing rank.
+  - Multi-ONNX encoder/decoder package harness (Whisper) + Int32 input_ids synthesis for probes.
+  - Nemotron joint graph: loads + matches ORT (max_abs 9.5e-7) but native 71ms vs ORT 0.35ms on synthetic probe (perf).
+<!-- scribe-merge-2026-07-23T18-50-00Z-f16-rope-gemma-end -->
