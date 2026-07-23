@@ -139,6 +139,53 @@ fn if_branch(bin_op: &str) -> Graph {
     b
 }
 
+fn if_matmul_nbits_bias_branch(bias: [f32; 2]) -> Graph {
+    let mut b = Graph::new();
+    b.opset_imports.insert("com.microsoft".to_string(), 1);
+    let x = capture(&mut b, "X", DataType::Float32, &[1, 16]);
+    let weight = init(
+        &mut b,
+        "weight",
+        DataType::Uint8,
+        &[2, 1, 8],
+        vec![0x88; 16],
+    );
+    let scales = init(
+        &mut b,
+        "scales",
+        DataType::Float32,
+        &[2, 1],
+        f32_bytes(&[1.0, 1.0]),
+    );
+    let bias = init(&mut b, "bias", DataType::Float32, &[2], f32_bytes(&bias));
+    let mm = b.create_named_value("mm", DataType::Float32, static_shape([1, 2]));
+    let mut matmul = Node::new(
+        NodeId(0),
+        "MatMulNBits",
+        vec![Some(x), Some(weight), Some(scales)],
+        vec![mm],
+    );
+    matmul.domain = "com.microsoft".to_string();
+    matmul.attributes.insert("K".into(), Attribute::Int(16));
+    matmul.attributes.insert("N".into(), Attribute::Int(2));
+    matmul.attributes.insert("bits".into(), Attribute::Int(4));
+    matmul
+        .attributes
+        .insert("block_size".into(), Attribute::Int(16));
+    b.insert_node(matmul);
+    let out = op(
+        &mut b,
+        "Add",
+        &[mm, bias],
+        Some("branch_out"),
+        DataType::Float32,
+        &[1, 2],
+        &[],
+    );
+    b.add_output(out);
+    b
+}
+
 #[test]
 fn if_executes_selected_branch_with_capture_and_inline_initializer() {
     let mut g = new_parent();
@@ -189,12 +236,9 @@ fn if_rejects_mismatched_branch_output_counts_before_running_selected_branch() {
     register(&mut g, node, "else_branch", else_branch);
     g.add_output(y);
 
-    let mut session = InferenceSession::from_graph(g).expect("build session");
-    let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
-    let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
-    let err = session
-        .run(&[("cond", &cond_t), ("X", &x_t)])
-        .expect_err("mismatched branches must fail even when then_branch is selected");
+    let err = InferenceSession::from_graph(g)
+        .err()
+        .expect("mismatched branches must fail before optimization");
     assert!(
         err.to_string().contains(
             "control-flow op If: branches declare different output counts: then_branch has 1, \
@@ -202,7 +246,6 @@ fn if_rejects_mismatched_branch_output_counts_before_running_selected_branch() {
         ),
         "unexpected error: {err}"
     );
-    assert_eq!(session.control_flow_stats().subgraph_runs, 0);
 }
 
 #[test]
@@ -230,12 +273,9 @@ fn if_rejects_mismatched_branch_output_dtypes() {
     register(&mut g, node, "else_branch", else_branch);
     g.add_output(y);
 
-    let mut session = InferenceSession::from_graph(g).expect("build session");
-    let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
-    let x_t = Tensor::from_f32(&[2], &[2.0, 3.0]).unwrap();
-    let err = session
-        .run(&[("cond", &cond_t), ("X", &x_t)])
-        .expect_err("mismatched branch dtypes must fail");
+    let err = InferenceSession::from_graph(g)
+        .err()
+        .expect("mismatched branch dtypes must fail before optimization");
     assert!(
         err.to_string().contains(
             "control-flow op If: branches declare different dtypes for output 0: \
@@ -243,7 +283,42 @@ fn if_rejects_mismatched_branch_output_dtypes() {
         ),
         "unexpected error: {err}"
     );
-    assert_eq!(session.control_flow_stats().subgraph_runs, 0);
+}
+
+#[test]
+fn if_runs_fuseable_matmul_nbits_bias_branches() {
+    let mut g = new_parent();
+    g.opset_imports.insert("com.microsoft".to_string(), 1);
+    let cond = input(&mut g, "cond", DataType::Bool, &[]);
+    let _x = input(&mut g, "X", DataType::Float32, &[1, 16]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([1, 2]));
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+    register(
+        &mut g,
+        node,
+        "then_branch",
+        if_matmul_nbits_bias_branch([1.25, -2.5]),
+    );
+    register(
+        &mut g,
+        node,
+        "else_branch",
+        if_matmul_nbits_bias_branch([-3.0, 4.5]),
+    );
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let x_t = Tensor::from_f32(&[1, 16], &[1.0; 16]).unwrap();
+    for (cond, expected) in [(true, [1.25, -2.5]), (false, [-3.0, 4.5])] {
+        let cond_t = Tensor::from_raw(DataType::Bool, vec![], &[cond as u8]).unwrap();
+        let outputs = session
+            .run(&[("cond", &cond_t), ("X", &x_t)])
+            .expect("run fuseable branch");
+        assert_eq!(outputs[0].to_vec_f32(), expected);
+    }
+    let stats = session.control_flow_stats();
+    assert_eq!(stats.subgraph_builds, 2);
+    assert_eq!(stats.subgraph_runs, 2);
 }
 
 #[test]

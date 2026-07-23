@@ -1537,6 +1537,72 @@ fn run_ep_scoped_passes(
     Ok(())
 }
 
+fn validate_if_branch_outputs(graph: &Graph, node: &Node) -> Result<()> {
+    let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".to_string())) else {
+        return Ok(());
+    };
+    let Some(else_branch) = graph.subgraphs.get(&(node.id, "else_branch".to_string())) else {
+        return Ok(());
+    };
+
+    if then_branch.outputs.len() != else_branch.outputs.len() {
+        return Err(SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "branches declare different output counts: then_branch has {}, \
+                 else_branch has {}",
+                then_branch.outputs.len(),
+                else_branch.outputs.len()
+            ),
+        });
+    }
+    if then_branch.outputs.len() != node.outputs.len() {
+        return Err(SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "node declares {} output(s), but each branch declares {}",
+                node.outputs.len(),
+                then_branch.outputs.len()
+            ),
+        });
+    }
+    for (index, (&then_output, &else_output)) in then_branch
+        .outputs
+        .iter()
+        .zip(&else_branch.outputs)
+        .enumerate()
+    {
+        if then_branch.value_type_is_known(then_output)
+            && else_branch.value_type_is_known(else_output)
+        {
+            let then_dtype = then_branch.value(then_output).dtype;
+            let else_dtype = else_branch.value(else_output).dtype;
+            if then_dtype != else_dtype {
+                return Err(SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: format!(
+                        "branches declare different dtypes for output {index}: \
+                         then_branch is {then_dtype:?}, else_branch is {else_dtype:?}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
+    for (_, node) in graph.nodes.iter() {
+        if node.op_type == "If" && matches!(node.domain.as_str(), "" | "ai.onnx") {
+            validate_if_branch_outputs(graph, node)?;
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        validate_control_flow_signatures(subgraph)?;
+    }
+    Ok(())
+}
+
 fn cuda_fallback_report(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
@@ -1778,6 +1844,11 @@ impl Executor {
         mut ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
     ) -> Result<Self> {
+        // Reject incompatible control-flow signatures before EP optimizers run:
+        // optimizer postconditions recursively validate subgraphs and can
+        // otherwise obscure the actionable If diagnostic with a structural
+        // error from a malformed branch.
+        validate_control_flow_signatures(&graph)?;
         fuse_silu_patterns(&mut graph);
         let graph_before_ep_passes = graph.clone();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
@@ -5106,49 +5177,7 @@ impl Executor {
                     ),
                 });
             }
-            if then_branch.outputs.len() != else_branch.outputs.len() {
-                return Err(SessionError::ControlFlow {
-                    op: "If".to_string(),
-                    reason: format!(
-                        "branches declare different output counts: then_branch has {}, \
-                         else_branch has {}",
-                        then_branch.outputs.len(),
-                        else_branch.outputs.len()
-                    ),
-                });
-            }
-            if then_branch.outputs.len() != node.outputs.len() {
-                return Err(SessionError::ControlFlow {
-                    op: "If".to_string(),
-                    reason: format!(
-                        "node declares {} output(s), but each branch declares {}",
-                        node.outputs.len(),
-                        then_branch.outputs.len()
-                    ),
-                });
-            }
-            for (index, (&then_output, &else_output)) in then_branch
-                .outputs
-                .iter()
-                .zip(&else_branch.outputs)
-                .enumerate()
-            {
-                if then_branch.value_type_is_known(then_output)
-                    && else_branch.value_type_is_known(else_output)
-                {
-                    let then_dtype = then_branch.value(then_output).dtype;
-                    let else_dtype = else_branch.value(else_output).dtype;
-                    if then_dtype != else_dtype {
-                        return Err(SessionError::ControlFlow {
-                            op: "If".to_string(),
-                            reason: format!(
-                                "branches declare different dtypes for output {index}: \
-                                 then_branch is {then_dtype:?}, else_branch is {else_dtype:?}"
-                            ),
-                        });
-                    }
-                }
-            }
+            validate_if_branch_outputs(&self.graph, node)?;
         }
 
         let cond_vid =
