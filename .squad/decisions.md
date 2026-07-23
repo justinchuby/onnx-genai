@@ -86,3 +86,35 @@ The full source notes for this reconciliation are preserved in `2026-07-23T00-00
 **By:** Batty
 **What:** GLM-4's 40 Split seams arise from CUDA Split's trailing stream synchronization despite resolved output shapes. First split packed gate/up weights and nodes during Mobius preprocessing; if that is insufficient, implement a static capture-safe CUDA Split path rather than extending executor shape seeding.
 **Why:** Pre-splitting can collapse 41 capture segments with a smaller runtime blast radius.
+
+## 2026-07-23 — CUDA decode and GLM-4 follow-up
+
+### Keep GLM-4 packed gate/up pre-splitting
+**By:** Batty
+**What:** Import fused GPTQ gate/up tensors as separate Mobius gate_proj and up_proj MatMulNBits weights, eliminating runtime Split nodes; a fresh 9B export has zero Split nodes and one capture segment.
+**Why:** Release A/B improved steady decode 110.39→118.24 tok/s (+7.1%) with identical 128-token greedy output and zero capture fallbacks.
+
+### Decline cp.async for Phi asymmetric int4 zero-point GEMV
+**By:** Deckard
+**What:** The latency-bound `_zp` GEMVs reach only 13–18% DRAM peak; occupancy forcing was a no-op and a two-stage cp.async buffer improved issue activity but added registers and lost occupancy.
+**Why:** The best end-to-end effect was about 1% and within noise, so no kernel change ships; pursue targeted grid-starvation remedies instead.
+
+### Adopt split-K=2 for grid-starved asymmetric int4 zero-point GEMV
+**By:** Deckard
+**What:** Route eligible block-32 fp16-scale asymmetric-zp GEMVs with K divisible by 256 to a separate within-block split-K=2 entry, retaining byte-identical existing symmetric and fallback paths.
+**Why:** It doubles the sparse grid (0.36→0.73 waves/SM), reduces the target kernel 8.5→7.1µs, and improves Phi decode 173.6→176.9 tok/s (+1.9%); tolerance parity, 192 CUDA tests, and clippy pass.
+
+### Record GLM-4 static Split capture as generic EP support
+**By:** Marsten
+**What:** Generic single-input static Split capture removes GLM-4's 40 fused-MLP gate/up activation Split seams (`Split(axis=-1, num_outputs=2)`), giving one capture segment, zero fallbacks, and 110.34→118.85 tok/s (+7.71%).
+**Why:** This fixes a model-agnostic capture barrier without a graph rewrite; ORT's partial-RoPE GQA schema incompatibility is separate and unrelated.
+
+### Prioritize Phi fused gate-up int4 efficiency after split-K and GQA
+**By:** Marsten
+**What:** With split-K and occupancy-aware GQA, Phi-4-mini reaches 184.27 tok/s (19.75% behind ORT); fused gate-up/SwiGLU/RMSNorm zero-point int4 is now 33.3% of captured decode.
+**Why:** Standalone zero-point int4 is down to 12.1% and GQA core is 5.89µs, so next work should improve fused gate-up dequant/GEMV efficiency; GQA prep/merge is secondary.
+
+### Guard static Split capture with concrete-shape replay parity
+**By:** Sebastian
+**What:** The static even-Split integration test now supplies concrete shapes, executes the static kernel, captures and replays with changed input, and byte-compares replay output with eager output.
+**Why:** The generic helper provides empty shapes and only exercises dynamic Split; capture/replay verifies the static no-synchronization path.
