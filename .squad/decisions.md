@@ -3373,3 +3373,18 @@ Decision archive gate checked at 2026-07-23T05:00:00Z: the active ledger was 266
 **Sources reconciled:** `bryant-f16-matmulnbits.md` and `pris-f16-matmulnbits-tests.md`.
 
 Decision archive gate checked at 2026-07-23T06:31:00Z: the active ledger was 268050 bytes before this entry. No dated ledger entries older than 2026-06-23T06:31:00Z were present, so no archive was created or updated.
+
+<!-- scribe-merge-2026-07-23T08-50-00Z-gqa-rotary-widen -->
+## 2026-07-23 — GQA rotary-prefix bounded widen landed
+
+**By:** Roy (implementation, `475fa47`) and Pris (parity tests, `6941a9a`); Gaff approved bound/indexing correctness, and Chew rejected then approved after bit-exact coverage. Both changes are cherry-picked to main.
+
+**What:** GQA f16 decode was spending **95.8%** of execute time widening the entire rotary cos/sin cache (`[~32768, head_dim/2]`) from f16 to f32 for every layer and token, though `rotate()` reads only live-position rows. This was not thread oversubscription: `RAYON_NUM_THREADS=8` was flat and disabling the persistent pool was worse. `widen_rotary_prefix` now bounds contiguous F16C/f32 widening to `max_position + 1` rows, retaining a full-widen-and-truncate fallback for strided/transposed layouts; output remains byte-identical.
+
+**Why:** The original GQA phase percentages normalized to instrumented phases and concealed the cost. A `TOTAL_NS` timer around `execute()` exposed the uninstrumented rotary widening. Always include an execute-total timer rather than inferring totals from phase sums.
+
+**Results and validation:** On merged main, 0.5B improved **34→101.89 tok/s** and 1.5B **14.7→50.51 tok/s**; generic-cpu 7B held at **26.86 tok/s**. GQA share fell **70%→4.4%**. Cumulatively, the f16 workstream reached 0.5B **6.5→101.89 (~15.7×)** and 1.5B **3.58→50.51 (~14×)**. Pris added `.to_bits()`-exact f16/f32 parity against full widen, strided/transposed fallback, and batch-two descending-`position_ids` coverage. **717 tests plus 10 doctests passed.**
+
+**Sources reconciled:** `roy-f16-gqa-decode.md` and `pris-gqa-rotary-tests.md`.
+
+Decision archive gate checked at 2026-07-23T08:50:00Z: the active ledger exceeded 20480 bytes, but no dated entries were older than 2026-06-23T08:50:00Z; no archive was created or updated.
