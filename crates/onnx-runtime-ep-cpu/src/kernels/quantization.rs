@@ -145,6 +145,13 @@ impl Kernel for DequantizeLinearKernel {
 impl Kernel for DynamicQuantizeLinearKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("DynamicQuantizeLinear", inputs, outputs, 1, 1, 3)?;
+        if inputs[0].dtype != DataType::Float32 {
+            return Err(EpError::KernelFailed(format!(
+                "DynamicQuantizeLinear: input dtype must be Float32 per the ONNX schema, got {:?}; \
+                 cast the input to Float32 or use QuantizeLinear with a BFloat16 scale",
+                inputs[0].dtype,
+            )));
+        }
         if outputs[0].dtype != DataType::Uint8
             || outputs[1].dtype != DataType::Float32
             || outputs[2].dtype != DataType::Uint8
@@ -270,9 +277,13 @@ fn read_floats(op: &str, view: &TensorView) -> Result<Vec<f32>> {
             .chunks_exact(2)
             .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
             .collect(),
+        DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes(b.try_into().unwrap()).to_f32())
+            .collect(),
         other => {
             return Err(EpError::KernelFailed(format!(
-                "{op}: only Float32 and Float16 inputs are supported, got {other:?}"
+                "{op}: only Float32, Float16, and BFloat16 inputs are supported, got {other:?}"
             )));
         }
     })
@@ -291,9 +302,14 @@ fn write_floats(out: &mut TensorMut, data: &[f32]) -> Result<()> {
                 bytes.extend_from_slice(&half::f16::from_f32(value).to_le_bytes());
             }
         }
+        DataType::BFloat16 => {
+            for &value in data {
+                bytes.extend_from_slice(&half::bf16::from_f32(value).to_le_bytes());
+            }
+        }
         other => {
             return Err(EpError::KernelFailed(format!(
-                "quantization: floating output must be Float32 or Float16, got {other:?}"
+                "quantization: floating output must be Float32, Float16, or BFloat16, got {other:?}"
             )));
         }
     }
@@ -432,6 +448,66 @@ mod tests {
     }
 
     #[test]
+    fn quantize_bfloat16_decode_and_prefill_match_widened_reference() {
+        for rows in [1, 4] {
+            let values: Vec<f32> = (0..rows * 8)
+                .map(|index| ((index * 7 % 23) as f32 - 11.0) * 0.1875)
+                .collect();
+            let input = Owned::bf16(&[rows, 8], &values);
+            let scale = Owned::bf16(&[], &[0.25]);
+            let zero_point = Owned::u8(&[], &[113]);
+            let mut output = Owned::zeros(DataType::Uint8, &[rows, 8]);
+            QuantizeLinearKernel {
+                axis: 1,
+                block_size: None,
+            }
+            .execute(
+                &[input.view(), scale.view(), zero_point.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+            let scale = scale.to_bf16_as_f32()[0];
+            let expected: Vec<u8> = input
+                .to_bf16_as_f32()
+                .into_iter()
+                .map(|value| ((value / scale).round_ties_even() as i64 + 113).clamp(0, 255) as u8)
+                .collect();
+            assert_eq!(output.to_u8(), expected);
+        }
+    }
+
+    #[test]
+    fn dequantize_bfloat16_decode_and_prefill_match_widened_reference() {
+        for rows in [1, 4] {
+            let quantized: Vec<u8> = (0..rows * 8)
+                .map(|index| 100 + (index * 5 % 29) as u8)
+                .collect();
+            let input = Owned::u8(&[rows, 8], &quantized);
+            let scale = Owned::bf16(&[], &[0.03125]);
+            let zero_point = Owned::u8(&[], &[113]);
+            let mut output = Owned::zeros(DataType::BFloat16, &[rows, 8]);
+            DequantizeLinearKernel {
+                axis: 1,
+                block_size: None,
+            }
+            .execute(
+                &[input.view(), scale.view(), zero_point.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+            let scale = scale.to_bf16_as_f32()[0];
+            let expected: Vec<f32> = quantized
+                .iter()
+                .map(|&value| (i64::from(value) - 113) as f32 * scale)
+                .collect();
+            for (actual, expected) in output.to_bf16_as_f32().into_iter().zip(expected) {
+                let tolerance = 5e-4 + 1e-2 * expected.abs();
+                assert!((actual - expected).abs() <= tolerance);
+            }
+        }
+    }
+
+    #[test]
     fn dynamic_quantize_uses_zero_in_range() {
         let x = Owned::f32(&[3], &[-2.0, 2.0, 6.0]);
         let mut y = Owned::zeros(DataType::Uint8, &[3]);
@@ -446,5 +522,24 @@ mod tests {
         assert_eq!(scale.to_f32(), vec![8.0 / 255.0]);
         assert_eq!(zp.to_u8(), vec![64]);
         assert_eq!(y.to_u8(), vec![0, 128, 255]);
+    }
+
+    #[test]
+    fn dynamic_quantize_rejects_bfloat16_per_schema() {
+        let input = Owned::bf16(&[3], &[-2.0, 2.0, 6.0]);
+        let mut quantized = Owned::zeros(DataType::Uint8, &[3]);
+        let mut scale = Owned::zeros_f32(&[]);
+        let mut zero_point = Owned::zeros(DataType::Uint8, &[]);
+        let error = DynamicQuantizeLinearKernel
+            .execute(
+                &[input.view()],
+                &mut [
+                    quantized.view_mut(),
+                    scale.view_mut(),
+                    zero_point.view_mut(),
+                ],
+            )
+            .unwrap_err();
+        assert!(format!("{error}").contains("Float32 per the ONNX schema"));
     }
 }
