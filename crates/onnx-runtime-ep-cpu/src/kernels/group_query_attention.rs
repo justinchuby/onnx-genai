@@ -1581,6 +1581,176 @@ mod tests {
         }
     }
 
+    fn rotary_tensor(batch: usize, heads: usize, seq: usize, dim: usize, seed: f32) -> Bhsd {
+        Bhsd {
+            data: (0..batch * heads * seq * dim)
+                .map(|index| seed + index as f32 * 0.03125)
+                .collect(),
+            batch,
+            heads,
+            seq,
+            dim,
+        }
+    }
+
+    fn assert_bounded_rotary_matches_full_widen_bitwise(
+        cos_view: TensorView,
+        sin_view: TensorView,
+        positions: &[usize],
+        batch: usize,
+        seq: usize,
+        label: &str,
+    ) {
+        let half = cos_view.shape[1];
+        let cache_rows = cos_view.shape[0];
+        let rows_needed = positions.iter().copied().max().unwrap() + 1;
+        let full_cos = to_dense_f32_widen("test", &cos_view).unwrap().into_owned();
+        let full_sin = to_dense_f32_widen("test", &sin_view).unwrap().into_owned();
+        let bounded_cos = widen_rotary_prefix("test", &cos_view, rows_needed, half).unwrap();
+        let bounded_sin = widen_rotary_prefix("test", &sin_view, rows_needed, half).unwrap();
+
+        for (tensor_label, heads, seed) in [("query", 2, 0.25), ("key", 1, -0.75)] {
+            let mut full = rotary_tensor(batch, heads, seq, half * 2, seed);
+            let mut bounded = rotary_tensor(batch, heads, seq, half * 2, seed);
+            rotate(
+                &mut full, &full_cos, &full_sin, cache_rows, positions, false,
+            )
+            .unwrap();
+            rotate(
+                &mut bounded,
+                &bounded_cos,
+                &bounded_sin,
+                rows_needed,
+                positions,
+                false,
+            )
+            .unwrap();
+            assert_f32_bits_eq(
+                &bounded.data,
+                &full.data,
+                &format!("{label} {tensor_label} bounded rotary"),
+            );
+        }
+    }
+
+    #[test]
+    fn rotary_bounded_widen_is_bit_identical_to_full_cache_for_f16_and_f32() {
+        let cache_rows = 11;
+        let half = 3;
+        let positions = [5, 3, 1];
+        let cos: Vec<f32> = (0..cache_rows * half)
+            .map(|index| (index as f32 * 0.17).cos())
+            .collect();
+        let sin: Vec<f32> = (0..cache_rows * half)
+            .map(|index| (index as f32 * 0.17).sin())
+            .collect();
+        let cos_f16 = Owned::f16(&[cache_rows, half], &cos);
+        let sin_f16 = Owned::f16(&[cache_rows, half], &sin);
+        assert_bounded_rotary_matches_full_widen_bitwise(
+            cos_f16.view(),
+            sin_f16.view(),
+            &positions,
+            1,
+            3,
+            "f16",
+        );
+
+        let cos_f32 = Owned::f32(&[cache_rows, half], &cos);
+        let sin_f32 = Owned::f32(&[cache_rows, half], &sin);
+        assert_bounded_rotary_matches_full_widen_bitwise(
+            cos_f32.view(),
+            sin_f32.view(),
+            &positions,
+            1,
+            3,
+            "f32",
+        );
+    }
+
+    #[test]
+    fn rotary_strided_cache_fallback_matches_contiguous_fast_path_bitwise() {
+        let cache_rows = 8;
+        let half = 3;
+        let rows_needed = 6;
+        let positions = [5, 3, 1];
+        let cos: Vec<f32> = (0..cache_rows * half)
+            .map(|index| (index as f32 * 0.23).cos())
+            .collect();
+        let sin: Vec<f32> = (0..cache_rows * half)
+            .map(|index| (index as f32 * 0.23).sin())
+            .collect();
+        let mut cos_transposed = vec![0.0; cos.len()];
+        let mut sin_transposed = vec![0.0; sin.len()];
+        for row in 0..cache_rows {
+            for column in 0..half {
+                cos_transposed[column * cache_rows + row] = cos[row * half + column];
+                sin_transposed[column * cache_rows + row] = sin[row * half + column];
+            }
+        }
+        let cos_contiguous = Owned::f32(&[cache_rows, half], &cos);
+        let sin_contiguous = Owned::f32(&[cache_rows, half], &sin);
+        let cos_strided = Owned::f32(&[cache_rows, half], &cos_transposed)
+            .with_view(&[cache_rows, half], &[1, cache_rows as i64]);
+        let sin_strided = Owned::f32(&[cache_rows, half], &sin_transposed)
+            .with_view(&[cache_rows, half], &[1, cache_rows as i64]);
+
+        let fast_cos =
+            widen_rotary_prefix("test", &cos_contiguous.view(), rows_needed, half).unwrap();
+        let fast_sin =
+            widen_rotary_prefix("test", &sin_contiguous.view(), rows_needed, half).unwrap();
+        let fallback_cos =
+            widen_rotary_prefix("test", &cos_strided.view(), rows_needed, half).unwrap();
+        let fallback_sin =
+            widen_rotary_prefix("test", &sin_strided.view(), rows_needed, half).unwrap();
+        assert_f32_bits_eq(&fallback_cos, &fast_cos, "strided cos fallback");
+        assert_f32_bits_eq(&fallback_sin, &fast_sin, "strided sin fallback");
+
+        let mut fast = rotary_tensor(1, 2, 3, half * 2, 0.5);
+        let mut fallback = rotary_tensor(1, 2, 3, half * 2, 0.5);
+        rotate(
+            &mut fast,
+            &fast_cos,
+            &fast_sin,
+            rows_needed,
+            &positions,
+            false,
+        )
+        .unwrap();
+        rotate(
+            &mut fallback,
+            &fallback_cos,
+            &fallback_sin,
+            rows_needed,
+            &positions,
+            false,
+        )
+        .unwrap();
+        assert_f32_bits_eq(&fallback.data, &fast.data, "strided rotary fallback");
+    }
+
+    #[test]
+    fn rotary_batch_descending_position_ids_match_full_cache_bitwise() {
+        let cache_rows = 9;
+        let half = 2;
+        let positions = [5, 3, 1, 7, 0, 2];
+        let cos: Vec<f32> = (0..cache_rows * half)
+            .map(|index| (index as f32 * 0.31).cos())
+            .collect();
+        let sin: Vec<f32> = (0..cache_rows * half)
+            .map(|index| (index as f32 * 0.31).sin())
+            .collect();
+        let cos_cache = Owned::f32(&[cache_rows, half], &cos);
+        let sin_cache = Owned::f32(&[cache_rows, half], &sin);
+        assert_bounded_rotary_matches_full_widen_bitwise(
+            cos_cache.view(),
+            sin_cache.view(),
+            &positions,
+            2,
+            3,
+            "batch descending position ids",
+        );
+    }
+
     /// Compares lazy per-head f16 widening with the old eager whole-cache
     /// widen, using the production kernel for attention on both sides.
     #[test]
