@@ -2222,7 +2222,8 @@ impl GroupQueryAttentionKernel {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_fp16_splitk",
                 "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
-                 active split count (1/2/4/8, max {}) chosen on-device from valid length",
+                 active split count (up to {}) chosen on-device from the valid length \
+                 and a host occupancy target that fills the multiprocessors",
                 q_seq,
                 dim,
                 gqa_decode_fp16::MAX_SPLITS
