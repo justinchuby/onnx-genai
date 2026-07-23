@@ -220,7 +220,8 @@ windows after the eight-token exclusion. The synthetic GLM-5.2 models use five
 Fresh ORT medians use CUDA graph for Qwen and both DeepSeek-family rows.
 The fresh Qwen-7B ORT median is 283.76 tok/s, **+6.19%** above the earlier
 267.23 reference, so this section's native margin is intentionally the more
-conservative +4.03%.
+conservative +4.03%. The higher Qwen-0.5B/1.5B native medians (900/622 tok/s
+versus earlier ~819/~584) are host-load variance, not additional kernel gains.
 Phi uses the requested canonical 229.62 tok/s graph-off reference because
 ORT rejects CUDA graph capture for its control-flow graph; a same-session
 graph-off probe measured 239.43 tok/s and was not substituted into the
