@@ -296,8 +296,22 @@ impl Kernel for LinearAttentionKernel {
         };
 
         let output_hidden = q_num_heads.max(kv_num_heads) * d_v;
-        let mut output = vec![0.0f32; batch * seq * output_hidden];
         let (primary_output, present_outputs) = outputs.split_at_mut(1);
+        let output_len = batch * seq * output_hidden;
+        let direct_output = primary_output[0].dtype == onnx_runtime_ir::DataType::Float32
+            && primary_output[0].is_contiguous()
+            && primary_output[0].device.is_host_accessible();
+        let mut owned_output;
+        let output: &mut [f32] = if direct_output {
+            // SAFETY: the executor provides an exclusive contiguous output
+            // buffer whose validated shape contains `output_len` f32 values.
+            unsafe {
+                std::slice::from_raw_parts_mut(primary_output[0].data_ptr_mut::<f32>(), output_len)
+            }
+        } else {
+            owned_output = vec![0.0f32; output_len];
+            &mut owned_output
+        };
 
         // The recurrent state is a large decode-hot tensor. When the present
         // output is native contiguous f32, use its executor-owned buffer as the
@@ -342,6 +356,7 @@ impl Kernel for LinearAttentionKernel {
             beta_per_head,
         };
 
+        let mut retrieved = vec![0.0f32; d_v];
         for b in 0..batch {
             for h_kv in 0..kv_num_heads {
                 let h_k = h_kv / kv_per_k_head;
@@ -353,7 +368,8 @@ impl Kernel for LinearAttentionKernel {
                     &v,
                     decay_data.as_deref(),
                     beta_data.as_deref(),
-                    &mut output,
+                    output,
+                    &mut retrieved,
                     b,
                     h_kv,
                     h_k,
@@ -362,7 +378,9 @@ impl Kernel for LinearAttentionKernel {
             }
         }
 
-        write_dense_f32_narrow("LinearAttention", &mut primary_output[0], &output)?;
+        if !direct_output {
+            write_dense_f32_narrow("LinearAttention", &mut primary_output[0], output)?;
+        }
         if !state_is_direct && let Some(present) = present_outputs.first_mut() {
             write_dense_f32_narrow("LinearAttention", present, state)?;
         }
@@ -400,6 +418,7 @@ fn process_head(
     decay: Option<&[f32]>,
     beta: Option<&[f32]>,
     output: &mut [f32],
+    retrieved: &mut [f32],
     batch_idx: usize,
     h_kv: usize,
     h_k: usize,
@@ -407,7 +426,7 @@ fn process_head(
 ) {
     let d_k = p.d_k;
     let d_v = p.d_v;
-    let mut retrieved = vec![0.0f32; d_v];
+    debug_assert_eq!(retrieved.len(), d_v);
 
     for t in 0..p.seq {
         let row = batch_idx * p.seq + t;
