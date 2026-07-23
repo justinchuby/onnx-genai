@@ -730,6 +730,14 @@ impl CudaRuntime {
     /// Both pointers are live allocations of at least `bytes` bytes.
     pub unsafe fn dtod(&self, src: CUdeviceptr, dst: CUdeviceptr, bytes: usize) -> Result<()> {
         self.bind()?;
+        // Kernels enqueue their writes on the EP's dedicated non-default stream,
+        // but `cuMemcpyDtoD` issues on the legacy default stream. On a
+        // non-blocking compute stream the two are not implicitly ordered, so the
+        // copy can race a producer kernel that is still writing `src` (or a
+        // consumer that already queued a read of `dst`). Drain the EP stream
+        // first so the synchronous copy always sees fully-produced bytes. This
+        // mirrors `dtoh`, which synchronizes for the same reason.
+        self.synchronize()?;
         // SAFETY: bound context; both endpoints cover `bytes` per the contract.
         unsafe { cudarc::driver::result::memcpy_dtod_sync(dst, src, bytes) }
             .map_err(|e| driver_err("cuMemcpyDtoD", e))
@@ -786,6 +794,7 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cudarc::driver::PushKernelArg;
 
     #[test]
     fn derives_ptx_arch_from_compute_capability() {
@@ -870,5 +879,87 @@ mod tests {
                 .iter()
                 .all(|path| Path::new(path).join("cuda_fp16.h").is_file())
         );
+    }
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten()
+    }
+
+    // Regression guard for the DeepSeek-V2-Lite garbage-decode race: kernels run
+    // on the EP's non-default stream, but `cuMemcpyDtoD` issues on the legacy
+    // default stream, which is NOT implicitly ordered against a non-blocking
+    // compute stream. `dtod` must therefore drain the EP stream before copying,
+    // so it never reads bytes a producer kernel is still writing. Without the
+    // synchronize this test observes the pre-launch poison values; with it the
+    // copy always sees the fully-produced sentinel.
+    #[test]
+    fn dtod_waits_for_pending_stream_writes() {
+        const MODULE: &str = "runtime_dtod_race_test";
+        // Each thread spins on the GPU clock (~a few ms) before storing its
+        // sentinel, guaranteeing the store is still in flight when the racing
+        // default-stream copy would otherwise run.
+        const SOURCE: &str = r#"
+extern "C" __global__ void slow_fill(float* out, unsigned long long n, long long spin) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+    out[i] = 1.0f + (float)(i % 7);
+}
+"#;
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping dtod race regression: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "slow_fill").unwrap();
+        let n = 4096usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let src = runtime.alloc_raw(bytes).unwrap();
+        let dst = runtime.alloc_raw(bytes).unwrap();
+
+        // Poison the source so a premature (racing) copy is detectable.
+        let poison = vec![-999.0f32; n];
+        let poison_bytes = unsafe {
+            std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes)
+        };
+        // Run several iterations; a race is probabilistic per launch, but the
+        // fix must make every iteration correct.
+        for _ in 0..8 {
+            unsafe { runtime.htod(poison_bytes, src) }.unwrap();
+            runtime.synchronize().unwrap();
+
+            // Enqueue the slow producer on the EP stream, then immediately copy
+            // WITHOUT an explicit synchronize — `dtod` must order this itself.
+            let spin: i64 = 8_000_000;
+            let mut builder = runtime.stream().launch_builder(&function);
+            let n_u64 = n as u64;
+            builder.arg(&src).arg(&n_u64).arg(&spin);
+            unsafe {
+                builder
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap();
+            }
+            unsafe { runtime.dtod(src, dst, bytes) }.unwrap();
+
+            let mut out = vec![0.0f32; n];
+            let out_bytes = unsafe {
+                std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
+            };
+            unsafe { runtime.dtoh(out_bytes, dst) }.unwrap();
+
+            for (i, value) in out.iter().enumerate() {
+                let expected = 1.0f32 + (i % 7) as f32;
+                assert_eq!(
+                    *value, expected,
+                    "dtod observed unsynchronized/poison data at index {i}: \
+                     got {value}, expected {expected} (stream-ordering race)"
+                );
+            }
+        }
+
+        unsafe { runtime.free_raw(src) }.unwrap();
+        unsafe { runtime.free_raw(dst) }.unwrap();
     }
 }
