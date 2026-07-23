@@ -909,8 +909,11 @@ impl InferenceSession {
     }
 
     /// Replay the installed device graph after the caller has refreshed any
-    /// persistent scalar inputs.
-    pub fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<()> {
+    /// persistent scalar inputs. Returns `true` when the graph is still valid for
+    /// the next step, or `false` when a control-flow branch flip retired it this
+    /// step (the token was produced correctly via eager fallback) and the caller
+    /// should re-warm and re-capture.
+    pub fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
         self.exec.replay_device_graph(bindings)
     }
 

@@ -724,6 +724,23 @@ pub(crate) struct Executor {
     /// Structured segment-boundary reasons from the most recent capture, retained
     /// for diagnostics after `capture_schedule` is taken for replay.
     capture_segmentation: Vec<CaptureDecline>,
+    /// Output value ids of every control-flow (`If`/`Loop`/`Scan`) node. ONNX
+    /// shape inference cannot statically resolve a control-flow output whose
+    /// branches declare different shapes (e.g. LongRoPE's `If` selecting a short
+    /// vs. long RoPE cos/sin cache), so such outputs stay symbolic and any
+    /// downstream capturable kernel that reads one would form a per-consumer
+    /// eager seam. Within a decode generation the selected branch is stable, so
+    /// [`Self::seed_control_flow_capture_shapes`] seeds each output's concrete
+    /// shape from the prior run for capture planning, folding those consumers
+    /// back into captured segments. Computed once at build.
+    control_flow_output_values: HashSet<ValueId>,
+    /// Concrete control-flow output shapes the most recent capture assumed (a
+    /// snapshot of the seeded shapes from [`Self::control_flow_output_values`]).
+    /// On replay the control-flow seam re-executes eagerly; if it now produces a
+    /// different shape (a branch flip, e.g. LongRoPE short↔long at the context
+    /// threshold) the installed graph's baked device pointers are stale, so the
+    /// step falls back to eager and the graph is retired for re-capture.
+    capture_cf_shapes: HashMap<ValueId, Vec<usize>>,
     /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
     /// a strided view aliasing another value's buffer (a layout/movement-op
     /// output such as `Slice`) rather than an owner in [`Self::buffers`]. Built
@@ -1751,6 +1768,19 @@ impl Executor {
             }
         }
 
+        // Output value ids of every control-flow node, used to seed their
+        // concrete (branch-selected) shapes into the capture plan so downstream
+        // capturable consumers do not each form an eager seam.
+        let mut control_flow_output_values: HashSet<ValueId> = HashSet::new();
+        for &nid in &order {
+            let node = graph.node(nid);
+            if is_control_flow_op(&node.op_type, &node.domain) {
+                for &out in &node.outputs {
+                    control_flow_output_values.insert(out);
+                }
+            }
+        }
+
         // 3) Build the structural per-node plan.
         let mut plan = Vec::with_capacity(order.len());
         for &nid in &order {
@@ -1832,6 +1862,8 @@ impl Executor {
             device_graph_signature: None,
             capture_schedule: None,
             capture_segmentation: Vec::new(),
+            control_flow_output_values,
+            capture_cf_shapes: HashMap::new(),
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
@@ -2292,7 +2324,14 @@ impl Executor {
         }
     }
 
-    pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<()> {
+    /// Replay the installed device graph for one decode step. Returns `true` when
+    /// the graph remains installed and valid for the next step, or `false` when a
+    /// control-flow branch flip retired it mid-step (the token was still produced
+    /// correctly via an eager fallback) and the caller must re-warm/re-capture.
+    pub(crate) fn replay_device_graph(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<bool> {
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.device_graph_signature.as_ref() != Some(&signature) {
@@ -2313,10 +2352,12 @@ impl Executor {
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
             self.ep.replay_device_graph()?;
-            return Ok(());
+            return Ok(true);
         }
         match self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay)? {
-            ScopedRunResult::Executed(_) => Ok(()),
+            // `run_scoped_mode` clears `capture_schedule` when a branch flip
+            // retired the graph this step; report that so the caller re-arms.
+            ScopedRunResult::Executed(_) => Ok(self.capture_schedule.is_some()),
             ScopedRunResult::NotCapturable(reason) => {
                 self.reset_device_graph()?;
                 Err(SessionError::Internal(format!(
@@ -2329,6 +2370,7 @@ impl Executor {
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
         self.device_graph_signature = None;
         self.capture_schedule = None;
+        self.capture_cf_shapes.clear();
         Ok(self.ep.reset_device_graph()?)
     }
 
@@ -2543,6 +2585,11 @@ impl Executor {
             // their input/output contracts. Seed only unresolved values:
             // statically/symbolically resolved shapes remain authoritative.
             external.seed_capture_shapes(&mut resolved);
+            // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
+            // shape inference but stable within a generation: seed their concrete
+            // prior-run shape so downstream capturable consumers fold into
+            // captured segments instead of forming per-consumer eager seams.
+            self.seed_control_flow_capture_shapes(&mut resolved);
         }
         let external_values = external
             .inputs
@@ -2596,12 +2643,21 @@ impl Executor {
                     let _ = self.ep.reset_device_graph();
                     self.capture_schedule = None;
                     self.capture_segmentation.clear();
+                    self.capture_cf_shapes.clear();
                     return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
                         CaptureDecline::graph(format!(
                             "segmented CUDA graph capture failed: {error}"
                         )),
                     )));
                 }
+                // Snapshot the concrete control-flow output shapes this capture
+                // assumed so a later replay can detect a branch flip that changes
+                // them and retire the now-stale installed graph.
+                self.capture_cf_shapes = self
+                    .control_flow_output_values
+                    .iter()
+                    .filter_map(|vid| resolved.get(vid).map(|shape| (*vid, shape.clone())))
+                    .collect();
                 self.capture_segmentation = schedule.boundaries.clone();
                 if capture_segmentation_logging_enabled() {
                     log_capture_segmentation(&schedule);
@@ -2618,15 +2674,26 @@ impl Executor {
                         ),
                     )));
                 };
-                let result = self.run_plan_segmented(
+                let still_valid = self.run_plan_segmented(
                     &schedule,
                     RunMode::Replay,
                     &mut resolved,
                     outer_scope,
                     external,
-                );
-                self.capture_schedule = Some(schedule);
-                result?;
+                )?;
+                if still_valid {
+                    self.capture_schedule = Some(schedule);
+                } else {
+                    // A control-flow branch flip changed a seeded output shape:
+                    // the remaining plan already ran eagerly this step (correct
+                    // token), but the installed segments are stale. Retire the
+                    // device graph so the caller re-warms and re-captures for the
+                    // new branch. `capture_schedule` stays `None`.
+                    self.capture_segmentation.clear();
+                    self.capture_cf_shapes.clear();
+                    self.device_graph_signature = None;
+                    self.ep.reset_device_graph()?;
+                }
             }
         }
 
@@ -2665,6 +2732,56 @@ impl Executor {
     /// `None` when it is capturable. Mirrors the per-node predicates the
     /// all-or-nothing audit used, but returns the reason instead of aborting so
     /// the caller can form segments around each non-capturable seam node.
+    /// Seed the concrete shapes of control-flow (`If`/`Loop`/`Scan`) outputs from
+    /// the previous run's buffer allocation so downstream capturable kernels that
+    /// read them (e.g. GroupQueryAttention reading LongRoPE's `If`-selected
+    /// cos/sin caches) resolve their input shapes and fold into captured segments
+    /// instead of each forming an eager seam.
+    ///
+    /// ONNX shape inference cannot statically resolve a control-flow output whose
+    /// branches declare different shapes, so it stays symbolic. Within a decode
+    /// generation the selected branch — and thus the concrete output shape — is
+    /// stable across steps, so the prior run's shape is authoritative for capture
+    /// planning. A branch flip changes the shape and is detected on replay
+    /// ([`Self::control_flow_seam_invalidated`]), which retires the captured graph
+    /// for re-capture, so seeding never risks replaying against a stale shape.
+    ///
+    /// Only genuinely-unresolved outputs are seeded: a statically/symbolically
+    /// resolved shape stays authoritative, matching [`ExternalBindings::seed_capture_shapes`].
+    fn seed_control_flow_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
+        for &vid in &self.control_flow_output_values {
+            if resolved.contains_key(&vid) {
+                continue;
+            }
+            if let Some(shape) = self.buffer_shapes.get(&vid) {
+                resolved.insert(vid, shape.clone());
+            }
+        }
+    }
+
+    /// Whether the control-flow seam node at plan index `pi` produced a different
+    /// output shape than the most recent capture assumed. A change means a branch
+    /// flip (e.g. LongRoPE short↔long at the context threshold) reallocated an
+    /// output buffer a later captured segment reads, so that segment's baked
+    /// device pointer is now stale and the installed graph must be retired.
+    fn control_flow_seam_invalidated(
+        &self,
+        pi: usize,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> bool {
+        let node = self.graph.node(self.plan[pi].node_id);
+        if !is_control_flow_op(&node.op_type, &node.domain) {
+            return false;
+        }
+        self.plan[pi].outputs.iter().any(|out| {
+            match (self.capture_cf_shapes.get(out), resolved.get(out)) {
+                (Some(captured), Some(current)) => captured != current,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        })
+    }
+
     fn node_capture_reason(
         &self,
         plan: &NodePlan,
@@ -2918,9 +3035,28 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ep = Arc::clone(&self.ep);
+        // Set once a control-flow branch flip retires the installed graph mid
+        // replay: every remaining node then runs eagerly (its captured segment's
+        // baked device pointers are stale) so the step still produces a correct
+        // token. Only ever set in `RunMode::Replay`.
+        let mut invalidated = false;
         for seg in &schedule.segments {
+            if invalidated {
+                // Graph retired earlier this step: run this segment's nodes
+                // eagerly instead of replaying a stale installed graph.
+                for pi in seg.start..seg.end {
+                    self.exec_plan_node(
+                        pi,
+                        resolved,
+                        outer_scope,
+                        external,
+                        OpCaptureTrace::Eager,
+                    )?;
+                }
+                continue;
+            }
             if seg.captured {
                 match mode {
                     RunMode::Capture => {
@@ -2974,10 +3110,19 @@ impl Executor {
                         external,
                         OpCaptureTrace::Rejected(reason),
                     )?;
+                    // A control-flow seam (e.g. LongRoPE's `If`) that now selects
+                    // a different-shaped branch than capture assumed reallocated
+                    // an output a later captured segment reads: retire the graph
+                    // and finish this step eagerly.
+                    if mode == RunMode::Replay
+                        && self.control_flow_seam_invalidated(pi, resolved)
+                    {
+                        invalidated = true;
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(!invalidated)
     }
 
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent

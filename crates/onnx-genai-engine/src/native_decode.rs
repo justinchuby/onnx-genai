@@ -2023,8 +2023,15 @@ impl DecodeCudaState {
                 }
             }
             DecodeCudaGraphPhase::Ready => {
-                session.replay_device_graph(&mut self.bindings)?;
+                let still_valid = session.replay_device_graph(&mut self.bindings)?;
                 self.graph_replays += 1;
+                if !still_valid {
+                    // A control-flow branch flip (e.g. LongRoPE short↔long at the
+                    // context threshold) changed a seeded output shape and retired
+                    // the captured graph after producing this token eagerly.
+                    // Re-warm and re-capture for the new branch.
+                    self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+                }
             }
             DecodeCudaGraphPhase::Unsupported => {
                 session.run_with_device_bindings(&[], &mut self.bindings)?;
