@@ -21,7 +21,9 @@
 #include "core/mlas/inc/mlas_qnbit.h"
 
 #include <cstddef>
+#include <cstring>
 #include <functional>
+#include <new>
 
 // ---- Pluggable parallel-for backend (driven from Rust/Rayon) ----------------
 
@@ -315,4 +317,136 @@ extern "C" void mlas_compute_logistic(
     size_t n)
 {
     MlasComputeLogistic(input, output, n);
+}
+
+extern "C" void mlas_eltwise_add(
+    const float* left,
+    const float* right,
+    float* output,
+    size_t n)
+{
+    MlasEltwiseAdd<float>(left, right, output, n);
+}
+
+extern "C" void mlas_compute_activation(
+    int kind,
+    float minimum,
+    float maximum,
+    const float* input,
+    float* output,
+    size_t n)
+{
+    if (input != output) {
+        std::memcpy(output, input, n * sizeof(float));
+    }
+    MLAS_ACTIVATION activation{};
+    activation.ActivationKind = static_cast<MLAS_ACTIVATION_KIND>(kind);
+    activation.Parameters.Clip.minimum = minimum;
+    activation.Parameters.Clip.maximum = maximum;
+    MlasActivation(&activation, output, nullptr, 1, n, n);
+}
+
+// ---- Float convolution -------------------------------------------------------
+
+namespace {
+struct mlas_conv_plan {
+    MLAS_ACTIVATION activation{};
+    MLAS_CONV_PARAMETERS parameters{};
+};
+}  // namespace
+
+extern "C" void* mlas_conv_prepare(
+    size_t dimensions,
+    size_t batch_count,
+    size_t group_count,
+    size_t input_channels_per_group,
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* dilation_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    size_t filter_count_per_group,
+    size_t* working_buffer_elements)
+{
+    mlas_conv_plan* plan = nullptr;
+    try {
+        plan = new mlas_conv_plan();
+        plan->activation.ActivationKind = MlasIdentityActivation;
+        MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+        MlasConvPrepare(
+            &plan->parameters,
+            dimensions,
+            batch_count,
+            group_count,
+            input_channels_per_group,
+            input_shape,
+            kernel_shape,
+            dilation_shape,
+            padding,
+            stride_shape,
+            output_shape,
+            filter_count_per_group,
+            &plan->activation,
+            working_buffer_elements,
+            /*ChannelsLast=*/false,
+            /*Beta=*/0.0f,
+            thread_pool);
+        return plan;
+    } catch (...) {
+        delete plan;
+        return nullptr;
+    }
+}
+
+extern "C" void mlas_conv_run(
+    const void* opaque_plan,
+    const float* input,
+    const float* filter,
+    const float* bias,
+    float* working_buffer,
+    float* output)
+{
+    const auto* plan = static_cast<const mlas_conv_plan*>(opaque_plan);
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasConv(
+        &plan->parameters,
+        input,
+        filter,
+        bias,
+        working_buffer,
+        output,
+        thread_pool);
+}
+
+extern "C" void mlas_conv_plan_destroy(void* opaque_plan)
+{
+    delete static_cast<mlas_conv_plan*>(opaque_plan);
+}
+
+// ---- Float pooling -----------------------------------------------------------
+
+extern "C" void mlas_pool(
+    int kind,
+    size_t dimensions,
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    const float* input,
+    float* output)
+{
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasPool(
+        static_cast<MLAS_POOLING_KIND>(kind),
+        dimensions,
+        input_shape,
+        kernel_shape,
+        padding,
+        stride_shape,
+        output_shape,
+        input,
+        output,
+        thread_pool);
 }

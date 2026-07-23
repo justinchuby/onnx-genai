@@ -7,7 +7,7 @@ use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::check_arity;
 use crate::dispatch_arith;
-use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
+use crate::dtype::{ComputeDomain, NumericElem, to_dense, to_dense_f32_widen, write_dense};
 use crate::strided::{next_index, numel};
 
 /// Stateless broadcasting Add kernel (dtype-generic).
@@ -83,12 +83,49 @@ impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Add", inputs, outputs, 2, 2, 1)?;
         crate::trace::record_kernel_metrics(inputs, outputs, || outputs[0].numel() as u64);
+        #[cfg(feature = "mlas")]
+        if add_contiguous_f32(inputs, &mut outputs[0])? {
+            return Ok(());
+        }
         dispatch_arith!(inputs[0].dtype, "Add", T => add_typed::<T>(inputs, outputs))
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+#[cfg(feature = "mlas")]
+fn add_contiguous_f32(inputs: &[TensorView], output: &mut TensorMut) -> Result<bool> {
+    if inputs[0].dtype != DataType::Float32
+        || inputs[1].dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || inputs[0].shape != inputs[1].shape
+        || inputs[0].shape != output.shape
+        || !inputs[0].is_contiguous()
+        || !inputs[1].is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if inputs.iter().any(|input| {
+        let start = input.data_ptr::<u8>() as usize;
+        let end = start.saturating_add(input.byte_size());
+        output_start < end && start < output_end
+    }) {
+        return Ok(false);
+    }
+    let left = to_dense_f32_widen("Add", &inputs[0])?;
+    let right = to_dense_f32_widen("Add", &inputs[1])?;
+    let output_len = output.numel();
+    // SAFETY: all three views are validated contiguous Float32 tensors with
+    // identical shapes, and the range check proves the output does not alias.
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), output_len) };
+    mlas_sys::eltwise_add(&left, &right, output);
+    Ok(true)
 }
 
 /// Dtype-generic Add: widen both operands to the compute domain, broadcast-add,

@@ -501,14 +501,19 @@ mod tests {
         assert!(ep.supports_op(&mm, 17, &[], &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
         let rejected = ep.supports_op(&conv, 17, &[], &[], &[]);
-        assert!(!rejected.is_supported());
-        let reason = rejected.reason().expect("unsupported reason");
-        assert!(reason.contains("Conv"), "{reason}");
-        assert!(
-            reason.contains("no handler for ai.onnx::Conv at opset 17"),
-            "{reason}"
-        );
-        assert!(reason.contains("add a claim+handler"), "{reason}");
+        #[cfg(feature = "mlas")]
+        assert!(rejected.is_supported());
+        #[cfg(not(feature = "mlas"))]
+        {
+            assert!(!rejected.is_supported());
+            let reason = rejected.reason().expect("unsupported reason");
+            assert!(reason.contains("Conv"), "{reason}");
+            assert!(
+                reason.contains("no handler for ai.onnx::Conv at opset 17"),
+                "{reason}"
+            );
+            assert!(reason.contains("add a claim+handler"), "{reason}");
+        }
     }
 
     #[test]

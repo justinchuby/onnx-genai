@@ -44,6 +44,8 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+#[cfg(feature = "mlas")]
+pub mod conv;
 pub mod conv_transpose;
 pub mod dropout;
 pub mod elementwise;
@@ -526,6 +528,8 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("ConvTranspose", "", 1),
         Box::new(conv_transpose::ConvTransposeFactory),
     );
+    #[cfg(feature = "mlas")]
+    reg.register(OpKey::new("Conv", "", 1), Box::new(conv::ConvFactory));
     reg.register(
         OpKey::new("CenterCropPad", "", 18),
         Box::new(center_crop_pad::CenterCropPadFactory),
@@ -1527,7 +1531,8 @@ mod tests {
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 85);
+        let mlas_registrations = usize::from(cfg!(feature = "mlas"));
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 85 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1543,6 +1548,8 @@ mod tests {
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
+        #[cfg(feature = "mlas")]
+        assert!(reg.lookup("Conv", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
@@ -1563,7 +1570,7 @@ mod tests {
             reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
                 .is_some()
         );
-        assert!(reg.lookup("Conv", "", 21).is_none());
+        assert_eq!(reg.lookup("Conv", "", 21).is_some(), cfg!(feature = "mlas"));
         assert!(
             reg.lookup("GroupQueryAttention", "com.microsoft", 1)
                 .is_some()

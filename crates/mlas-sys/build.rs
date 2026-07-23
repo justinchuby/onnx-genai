@@ -69,6 +69,7 @@ fn main() {
         "rotary_embedding.cpp",
         // Scalar fallback kernels referenced by platform.cpp's dispatch table.
         "compute.cpp",
+        "activate.cpp",
         "erf.cpp",
         "gelu.cpp",
         "silu.cpp",
@@ -77,6 +78,10 @@ fn main() {
         "qladd.cpp",
         "quantize.cpp",
         "dequantize.cpp",
+        "convolve.cpp",
+        "pooling.cpp",
+        "sconv_nchw_depthwise_multiplier_1.cpp",
+        "sconv_nchw_depthwise_multiplier_greater_than_1.cpp",
         "convsym.cpp",
         "eltwise.cpp",
         "qdwconv.cpp",

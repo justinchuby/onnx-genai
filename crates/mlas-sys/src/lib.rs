@@ -11,6 +11,7 @@
 
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::ptr::NonNull;
 use std::sync::Once;
 
 use rayon::prelude::*;
@@ -64,6 +65,50 @@ unsafe extern "C" {
     /// Vectorized logistic (sigmoid) over `n` contiguous f32s: single-threaded
     /// MLAS SIMD sigmoid, used to build SiLU without a scalar `expf` loop.
     fn mlas_compute_logistic(input: *const f32, output: *mut f32, n: usize);
+    fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
+    fn mlas_compute_activation(
+        kind: c_int,
+        minimum: f32,
+        maximum: f32,
+        input: *const f32,
+        output: *mut f32,
+        n: usize,
+    );
+
+    fn mlas_conv_prepare(
+        dimensions: usize,
+        batch_count: usize,
+        group_count: usize,
+        input_channels_per_group: usize,
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        dilation_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        filter_count_per_group: usize,
+        working_buffer_elements: *mut usize,
+    ) -> *mut c_void;
+    fn mlas_conv_run(
+        plan: *const c_void,
+        input: *const f32,
+        filter: *const f32,
+        bias: *const f32,
+        working_buffer: *mut f32,
+        output: *mut f32,
+    );
+    fn mlas_conv_plan_destroy(plan: *mut c_void);
+    fn mlas_pool(
+        kind: c_int,
+        dimensions: usize,
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        input: *const f32,
+        output: *mut f32,
+    );
 
     // ---- Blocked n-bit quantized GEMM (SQNBitGemm) ----
     fn mlas_qnbit_gemm_available(bits: usize, blk_len: usize, comp_type: c_int) -> c_int;
@@ -205,6 +250,189 @@ pub fn compute_logistic(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_logistic(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute contiguous Float32 elementwise addition with MLAS SIMD.
+pub fn eltwise_add(left: &[f32], right: &[f32], output: &mut [f32]) {
+    assert_eq!(left.len(), right.len());
+    assert_eq!(left.len(), output.len());
+    unsafe {
+        mlas_eltwise_add(
+            left.as_ptr(),
+            right.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+}
+
+/// Compute contiguous Float32 ReLU with MLAS SIMD.
+pub fn compute_relu(input: &[f32], output: &mut [f32]) {
+    assert_eq!(input.len(), output.len());
+    unsafe {
+        mlas_compute_activation(
+            1,
+            0.0,
+            0.0,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+}
+
+/// Compute contiguous Float32 clipping with MLAS SIMD.
+pub fn compute_clip(input: &[f32], output: &mut [f32], minimum: f32, maximum: f32) {
+    assert_eq!(input.len(), output.len());
+    unsafe {
+        mlas_compute_activation(
+            5,
+            minimum,
+            maximum,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+}
+
+/// Prepared MLAS Float32 convolution parameters for one concrete NCHW shape.
+pub struct ConvPlan {
+    ptr: NonNull<c_void>,
+    working_buffer_elements: usize,
+}
+
+// SAFETY: MLAS treats prepared convolution parameters as immutable during
+// execution. Each call supplies disjoint input, scratch, and output buffers.
+unsafe impl Send for ConvPlan {}
+unsafe impl Sync for ConvPlan {}
+
+impl ConvPlan {
+    /// Prepare an N-dimensional NCHW convolution and return its scratch size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        batch_count: usize,
+        group_count: usize,
+        input_channels_per_group: usize,
+        input_shape: &[i64],
+        kernel_shape: &[i64],
+        dilation_shape: &[i64],
+        padding: &[i64],
+        stride_shape: &[i64],
+        output_shape: &[i64],
+        filter_count_per_group: usize,
+    ) -> Option<Self> {
+        let dimensions = input_shape.len();
+        assert!((1..=3).contains(&dimensions));
+        assert_eq!(kernel_shape.len(), dimensions);
+        assert_eq!(dilation_shape.len(), dimensions);
+        assert_eq!(padding.len(), dimensions * 2);
+        assert_eq!(stride_shape.len(), dimensions);
+        assert_eq!(output_shape.len(), dimensions);
+        ensure_threading();
+        let mut working_buffer_elements = 0;
+        let ptr = unsafe {
+            mlas_conv_prepare(
+                dimensions,
+                batch_count,
+                group_count,
+                input_channels_per_group,
+                input_shape.as_ptr(),
+                kernel_shape.as_ptr(),
+                dilation_shape.as_ptr(),
+                padding.as_ptr(),
+                stride_shape.as_ptr(),
+                output_shape.as_ptr(),
+                filter_count_per_group,
+                &mut working_buffer_elements,
+            )
+        };
+        Some(Self {
+            ptr: NonNull::new(ptr)?,
+            working_buffer_elements,
+        })
+    }
+
+    /// Number of Float32 scratch elements required by [`Self::run`].
+    pub fn working_buffer_elements(&self) -> usize {
+        self.working_buffer_elements
+    }
+
+    /// Execute the prepared convolution.
+    pub fn run(
+        &self,
+        input: &[f32],
+        filter: &[f32],
+        bias: Option<&[f32]>,
+        working_buffer: &mut [f32],
+        output: &mut [f32],
+    ) {
+        assert!(working_buffer.len() >= self.working_buffer_elements);
+        ensure_threading();
+        unsafe {
+            mlas_conv_run(
+                self.ptr.as_ptr(),
+                input.as_ptr(),
+                filter.as_ptr(),
+                bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                if self.working_buffer_elements == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    working_buffer.as_mut_ptr()
+                },
+                output.as_mut_ptr(),
+            );
+        }
+    }
+}
+
+impl Drop for ConvPlan {
+    fn drop(&mut self) {
+        unsafe { mlas_conv_plan_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// MLAS Float32 pooling mode.
+#[derive(Clone, Copy, Debug)]
+#[repr(i32)]
+pub enum PoolKind {
+    Maximum = 0,
+    AverageExcludePad = 1,
+    AverageIncludePad = 2,
+}
+
+/// Execute an N-dimensional NCHW Float32 pool using MLAS.
+#[allow(clippy::too_many_arguments)]
+pub fn pool(
+    kind: PoolKind,
+    input_shape: &[i64],
+    kernel_shape: &[i64],
+    padding: &[i64],
+    stride_shape: &[i64],
+    output_shape: &[i64],
+    input: &[f32],
+    output: &mut [f32],
+) {
+    let dimensions = input_shape.len().saturating_sub(2);
+    assert!((1..=3).contains(&dimensions));
+    assert_eq!(kernel_shape.len(), dimensions);
+    assert_eq!(padding.len(), dimensions * 2);
+    assert_eq!(stride_shape.len(), dimensions);
+    assert_eq!(output_shape.len(), dimensions + 2);
+    ensure_threading();
+    unsafe {
+        mlas_pool(
+            kind as c_int,
+            dimensions,
+            input_shape.as_ptr(),
+            kernel_shape.as_ptr(),
+            padding.as_ptr(),
+            stride_shape.as_ptr(),
+            output_shape.as_ptr(),
+            input.as_ptr(),
+            output.as_mut_ptr(),
+        );
+    }
 }
 
 /// Pre-packed B weight buffer, mirroring how ORT pre-packs constant MatMul
@@ -1171,7 +1399,9 @@ mod tests {
                             }
                             start.elapsed().as_secs_f64() * 1e6 / iters as f64
                         });
-                        eprintln!("SQNBit int4 {comp:?} K={k} N={n} M={m} {threads}t: {per_us:.1} us/iter");
+                        eprintln!(
+                            "SQNBit int4 {comp:?} K={k} N={n} M={m} {threads}t: {per_us:.1} us/iter"
+                        );
                     }
                 }
             }

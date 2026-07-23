@@ -7,7 +7,7 @@ use onnx_runtime_ir::{DataType, Node};
 use super::add::require_same_dtype;
 use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32};
 use crate::dispatch_arith;
-use crate::dtype::{NumericElem, to_dense, write_dense};
+use crate::dtype::{NumericElem, to_dense, to_dense_f32_widen, write_dense};
 use crate::strided::numel;
 
 pub struct ClipKernel {
@@ -26,6 +26,10 @@ impl KernelFactory for ClipFactory {
 impl Kernel for ClipKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Clip", inputs, outputs, 1, 3, 1)?;
+        #[cfg(feature = "mlas")]
+        if clip_contiguous_f32(self, inputs, &mut outputs[0])? {
+            return Ok(());
+        }
         dispatch_arith!(inputs[0].dtype, "Clip", T => {
             clip_typed::<T>(self, inputs, outputs)
         })
@@ -34,6 +38,54 @@ impl Kernel for ClipKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         true
     }
+}
+
+#[cfg(feature = "mlas")]
+fn clip_contiguous_f32(
+    kernel: &ClipKernel,
+    inputs: &[TensorView],
+    output: &mut TensorMut,
+) -> Result<bool> {
+    if inputs[0].dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || inputs[0].shape != output.shape
+        || !inputs[0].is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let minimum = if inputs.len() > 1 && !inputs[1].is_absent() {
+        require_same_dtype("Clip", &inputs[1], DataType::Float32)?;
+        scalar_typed::<f32>("Clip min", &inputs[1])?
+    } else {
+        kernel.min.unwrap_or(f32::NEG_INFINITY)
+    };
+    let maximum = if inputs.len() > 2 && !inputs[2].is_absent() {
+        require_same_dtype("Clip", &inputs[2], DataType::Float32)?;
+        scalar_typed::<f32>("Clip max", &inputs[2])?
+    } else {
+        kernel.max.unwrap_or(f32::INFINITY)
+    };
+    if minimum > maximum {
+        return Err(EpError::KernelFailed(
+            "Clip: min must not exceed max".into(),
+        ));
+    }
+    let input_start = inputs[0].data_ptr::<u8>() as usize;
+    let input_end = input_start.saturating_add(inputs[0].byte_size());
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if output_start < input_end && input_start < output_end {
+        return Ok(false);
+    }
+    let input = to_dense_f32_widen("Clip", &inputs[0])?;
+    let output_len = output.numel();
+    // SAFETY: equal contiguous Float32 shapes prove the output span, and the
+    // range check proves it does not overlap the borrowed input.
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), output_len) };
+    mlas_sys::compute_clip(&input, output, minimum, maximum);
+    Ok(true)
 }
 
 fn clip_typed<T: NumericElem + PartialOrd>(
