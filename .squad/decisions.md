@@ -3275,3 +3275,77 @@ A test-only `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1` override was added to `has
 **Safety and validation:** Sebastian's locked-out revision added a real subprocess ON/OFF parity regression using six sequential packed-int4 M=1 operations and 31 workers, asserts all ON operations dispatch through SPMD, documents precedence/fallback behavior, replaces the erased-job `transmute` with a pointer/trampoline, and makes worker panics poison the pool while releasing the pending barrier rather than hanging. CPU EP validation reported 698 unit tests plus 10 numeric regressions, clean MLAS clippy, 30/30 SPMD stress runs, and a 64-token native ON/OFF ID check. Chew approved the revised blocking requirements; Gaff approved with only non-blocking concurrency follow-up notes.
 
 **Sources reconciled:** `pris-decode-profile.md`, `pris-decode-barrier.md`, `sebastian-spmd-revision.md`, and `chew-spmd-rereview.md`. The earlier tracked Bryant NUMA, Holden portable-GQA, and Zhora dtype/topology notes were already present verbatim in this ledger and were deduplicated.
+
+<!-- scribe-merge-2026-07-23T04-10-00Z-f16-gqa-and-crossmodel -->
+## 2026-07-23 — f16 GQA decode and cross-model CPU comparison
+
+**What:** Roy's f16 GQA decode optimization shipped in `eedbf93`, with Gaff and Chew approving. It removes the per-token full-KV f16 re-widen bottleneck through F16C bulk conversion and incremental widening into the present cache, improving 0.5B decode from 2.55 to 6.56 tok/s (2.57×) and 1.5B from 1.15 to 3.58 tok/s (3.11×). Sebastian's foundry comparison records Qwen2.5-Coder 7B generic-cpu at 28.62 tok/s native versus 21.00 tok/s ORT GenAI CPU (1.36×); Qwen 3.5 9B is a VLM package, not a comparable text-decoder case for this native checkout.
+
+**Why:** The GQA change removes conversion work—not attention math—as the f16 decode bottleneck, while the comparison makes the native win without overstating cross-model generality.
+
+**Process learning:** Roy's inbox note was copied to the MAIN checkout before worktree removal, avoiding the earlier gitignored-note-loss quirk.
+
+Decision archive gate checked at 2026-07-23T04:10:00Z: the active ledger was 259049 bytes before this entry. No dated ledger entries older than 2026-06-23T04:10:00Z were present, so no archive was created or updated.
+
+<!-- merged from .squad/decisions/inbox/roy-f16-gqa-decode.md -->
+# Decision: f16 GQA decode — kill the per-token KV re-widen (F16C + incremental widen)
+
+**Author:** Roy (principal kernel engineer, CPU-EP)
+**Branch:** perf/f16-gqa-decode (off 536025f)
+**Date:** 2026-07-23
+**Scope:** native CPU decode of f16-activation int4 foundry `cuda-gpu` exports (GroupQueryAttention). Generic-cpu f32 path untouched.
+
+## Problem (profiled first — RULES.md §4)
+Baseline 0.5B qwen2.5 cuda-gpu decode = **2.55 tok/s**. Per-op steady: GroupQueryAttention ~54%, MatMulNBits ~43%.
+Within-GQA phase breakdown (added temporary timers behind `gqa_phase_profile` feature + `ONNX_GENAI_PROFILE_GQA=1`):
+- **widen ~47%** — re-widening the ENTIRE growing f16 past K+V → f32 every token (`to_dense_f32_widen`), O(seq_len) scalar convert per step.
+- **out ~45%** — narrowing the whole present K+V f32→f16 + output, scalar.
+- **attn ~6%** — the real QK·softmax·PV math.
+- **present ~2%**.
+So ~92% of GQA was scalar f16↔f32 conversion of the whole KV cache per token, not attention. Hypothesis confirmed.
+
+## Fix (targeted, general, EP-agnostic)
+1. **F16C-vectorize the bulk conversions** (`dtype.rs`): added an `f16c` module (`_mm256_cvtph_ps` / `_mm256_cvtps_ph` with `_MM_FROUND_TO_NEAREST_INT`) + `widen_f16_slice_into`, wired fast paths into `to_dense_f32_widen` (contiguous f16 in) and `write_dense_f32_narrow` (contiguous f16 out). f16→f32 is exact; f32→f16 rounds to nearest-even exactly like `half::f16::from_f32` → **bit-identical** (locked by test `f16c_widen_narrow_bit_identical_to_scalar` over all 65 536 f16 patterns + representative f32s). Runtime-detected; scalar fallback off-x86 / non-contiguous.
+2. **Eliminate the redundant widen+copy** (`group_query_attention.rs`): `PastCache` no longer eagerly widens the whole cache into an owned `Cow<[f32]>`. New `PastSrc` enum (F32 borrow / F16 raw u16 / Dense fallback) + `widen_run()` widens each per-head run **directly into** the `present` buffer (F16C for f16), removing the intermediate materialize AND the second f32→f32 copy the decode path paid every token. Exotic layouts (strided/bf16/f64) still widen once up front — generality preserved.
+3. **Skip the present zero-fill when there is no tail**: in steady decode every batch's `total == present_sequence_length`, so the per-(b,h) loop overwrites every element. `has_tail = totals.iter().any(|&t| t < present_sequence_length)`; when false, allocate uninit via `with_capacity`+`set_len` (documented SAFETY: every element written before any read).
+
+Design note: kernel dispatch is shape-keyed (new seq length re-instantiates the kernel each token), so a resident f32 shadow cache can't live in the kernel instance cleanly. Chose the **stateless** approach (incremental widen-into-present + F16C) — simpler, correct across cache resets, no identity bookkeeping.
+
+Key files:
+- `crates/onnx-runtime-ep-cpu/src/dtype.rs`: `f16c` mod, `widen_f16_slice_into`, fast paths in `to_dense_f32_widen` / `write_dense_f32_narrow`, test.
+- `crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`: `PastSrc`/`widen_run` (~:283-333), present-build zero-fill skip (~:804-840), widen-into-present (~:855-861), `phase_prof` mod (~:545), multi-step lock test.
+- `crates/onnx-runtime-ep-cpu/Cargo.toml`: `gqa_phase_profile` feature (off by default, zero-cost when disabled).
+
+## Results (tokens 128, runs 3, median; host shared/noisy — checked uptime, no parallel benches)
+| model | before | after | speedup |
+|---|---|---|---|
+| qwen2.5-0.5b cuda-gpu v4 | 2.55 tok/s | **6.56 tok/s** | **2.57×** |
+| qwen2.5-1.5b cuda-gpu v4 | 1.15 tok/s | **3.58 tok/s** | **3.11×** |
+
+New 0.5B per-op steady: **MatMulNBits ~82%, GroupQueryAttention ~14%** (was 54%). GQA is no longer the bottleneck; the int4 MatMulNBits GEMV now dominates (next target).
+
+## Parity (non-negotiable — PASS)
+- 0.5B cuda-gpu greedy opener unchanged, **byte-identical for the full 128-token sequence**: `[271, 40, 1079, 264, 48948, 304, 13027, 323, 358, 1079, 4460, 311, 1855, 264, 4285, 2025, …]`.
+- Conversions are bit-identical to scalar `half` (exact widen, round-to-nearest-even narrow) — verified by dedicated test. f32 accumulation throughout; only the final present/output narrows to f16.
+- Added `decode_multistep_incremental_widen_matches_full_widen_reference`: chains f16 present→past across 12 decode steps and locks the incremental-widen kernel output against a full-widen `kernel_exact_reference` — identical.
+
+## No regression to shipped generic-cpu f32 path (PASS)
+- generic-cpu 7B (qwen2.5-coder-7b) = **29.09 tok/s** (baseline ~28.5, within noise; ran under high host load). f32 caches take `PastSrc::F32` = borrow + verbatim copy, same behavior/numerics as before.
+
+## Validation
+- `cargo test -p onnx-runtime-ep-cpu --features mlas`: **709 passed + 10 golden**, 3 ignored, 0 failed.
+- `cargo clippy -p onnx-runtime-ep-cpu --features mlas -- -D warnings`: clean (also clean with `gqa_phase_profile`).
+
+## Residual risk / follow-ups
+- F16C fast path is x86-only; other ISAs (aarch64) fall back to scalar `half` — correct but not accelerated. A portable-SIMD widen/narrow would generalize the speedup (future work).
+- The `set_len` uninit optimization relies on the full-coverage invariant (no tail). Guarded by `has_tail`; the tail case keeps the safe zero-fill. Covered by existing prefill/padding tests.
+- Bottleneck has shifted to MatMulNBits (int4 GEMV) — that is the next highest-leverage target for further f16-model gains.
+- Kept `gqa_phase_profile` instrumentation behind an off-by-default feature (zero prod cost) for future profiling; strip if undesired.
+
+<!-- merged from .squad/decisions/inbox/sebastian-foundry-cpu-comparison.md -->
+### 2026-07-23
+**By:** Sebastian
+
+**What:** Benchmarked foundry-local CPU decode with persistent SPMD left as the default. Qwen 2.5 Coder 7B generic-cpu ran at 28.62 tok/s native versus 21.00 tok/s ORT GenAI 0.14.1 CPU (1.36x native). Qwen 3.5 9B generic-cpu ran in ORT at 13.63 tok/s but cannot be loaded by this native checkout: direct loading sees multiple ONNX files and compatibility pipeline loading rejects unspecified smart-resize semantics.
+
+**Why:** The available evidence confirms the default native win on one fair generic-cpu model, but does not support a cross-two-model generality claim until the Qwen 3.5 multimodal package has complete native pipeline metadata/support. CUDA-export f16-GQA models were recorded separately as a native CPU follow-up; ORT CPU could not load them because its CUDA interface library was absent.
