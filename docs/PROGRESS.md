@@ -4,16 +4,16 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T11:50Z — GLM-4-9B and DeepSeek-R1-Distill native CUDA validation._
+_Last updated: 2026-07-23T12:14Z — GLM-4 static-Split whole-graph capture._
 
-**Current `origin/main` implementation HEAD:** `ad49bf3` (runnable GLM-4 GPTQ CUDA export documented).
+**Current `origin/main` implementation HEAD:** `bd9b3a7` (static single-input Split CUDA-graph capture).
 
 ## 2026-07-23 — Post-int8-fused native CUDA milestone
 
 - **Five-model H200 ladder:** native beats ORT GenAI 0.14.1 on every Qwen control — 0.5B **819.42 vs 741.83 (+10.46%)**, 1.5B **584.45 vs 487.14 (+19.98%)**, and 7B **287.03 vs 267.23 (+7.41%)** — with the prior symmetric-int4 occupancy regression fixed. DeepSeek-Coder-1.3B reaches **728.26 vs 646.88 (+12.58%)**, the first non-Qwen-family model proven to beat ORT on the native CUDA EP.
 - **Phi gap compression:** Phi-4-mini reaches **171.16 tok/s**, reducing its ORT gap from **-59.86%** at session start to **-25.46%**. The landed sequence is fp32-gamma norm vectorization (`8a0814e`), int8 GEMV vectorization (`cf65ea7`), block-128 MatMulNBits (`c04a622`), three-segment graph capture (`4372f1b`), asymmetric-int4 zero-point SwiGLU-RMS fusion (`2715151`), symmetric-int4 specialization (`12efc92`), and int8 RMSNorm-GEMV fusion (`c34f813`). Full fusion ON/OFF is 171.16/162.78 tok/s (**+5.15%**).
 - **New bottleneck:** captured-decode Nsight profiling shows zero-point int4 GEMV variants at **54.7%** combined, dominated by the fused gate-up/SwiGLU/RMSNorm kernel at **31.9%**. The old standalone skip-RMSNorm hotspot is gone; remaining standalone int8 GEMV is 13.3% and aggregate GQA is 12.7%.
-- **GLM/DeepSeek model support:** GLM-4-9B GPTQ now runs coherently on the native CUDA EP at **110.34 tok/s**, with 41 captured segments around 40 fused-MLP gate/up activation `Split` seams (one per layer) and zero fallbacks. It is the first validated model supported by native while ORT GenAI 0.14.1 cannot load it: Mobius output lacks `genai_config.json`, and after a scratch configuration is supplied, ORT rejects the GQA `rotary_embedding_dim` attribute. DeepSeek-Coder-1.3B beats ORT by **+12.58%**, and DeepSeek-R1-Distill-Qwen-1.5B beats ORT by **+17.83%** (576.41 vs 489.19 tok/s). Dense support is runnable; DeepSeek-V2/V3 MoE remains blocked on the QMoE/BlockQuantizedMoE packer. Full status: `docs/glm-deepseek-enablement.md`.
+- **GLM/DeepSeek model support:** GLM-4-9B GPTQ now runs coherently on the native CUDA EP at **118.85 tok/s** with **one captured segment and zero fallbacks**. Generic EP-side static-Split capture (`bd9b3a7`) eliminated all 40 partial-RoPE Split seams, improving the same export by **+7.71%** from 110.34 tok/s; the capture-defragmentation lever is landed. GLM-4 remains the first validated model supported by native while ORT GenAI 0.14.1 cannot load the graph (`rotary_embedding_dim` is absent from its GQA schema). DeepSeek-Coder-1.3B beats ORT by **+12.58%**, and DeepSeek-R1-Distill-Qwen-1.5B beats ORT by **+17.83%**. Dense support is runnable; DeepSeek-V2/V3 MoE remains blocked on the QMoE/BlockQuantizedMoE packer. Full status: `docs/glm-deepseek-enablement.md`.
 
 ### ⚠️ Open correctness finding (2026-07-23): Qwen2.5-1.5B native decode diverges from ORT
 

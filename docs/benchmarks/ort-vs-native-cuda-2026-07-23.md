@@ -101,6 +101,34 @@ Despite that fragmentation, graph capture raises throughput from **85.51 to
 host-reading, stream-synchronizing `Split` seams is the open GLM-4 performance
 lever; Batty is analyzing capture defragmentation.
 
+## GLM-4 static-Split capture @ bd9b3a7 — 2026-07-23
+
+The EP-side static single-input `Split` capture path collapses the existing
+GLM-4 export from **41 captured segments / 40 eager seams** to **1 captured
+segment / 0 eager seams**, with zero fallbacks. This is a general EP
+improvement: any graph whose split sizes and output shapes are static can
+benefit without requiring a model-specific rewrite.
+
+| Model | Native tok/s (median of 3) | Prior native | Change | Coherent? | Segments / fallbacks |
+|---|---:|---:|---:|:---:|---:|
+| GLM-4-9B GPTQ int4 | **118.85** | 110.34 | **+7.71%** | Yes | **1 / 0** |
+
+The measured samples were 118.85/118.41/118.88 tok/s. The third run had a
+noisy 131.144-ms prefill, but its 118.88 tok/s steady decode was not an
+outlier. ORT GenAI 0.14.1 still cannot load this graph because its bundled GQA
+schema rejects the required partial-RoPE `rotary_embedding_dim` attribute.
+Relative to forced eager execution at 85.51 tok/s, whole-graph capture is now
+**+38.99%**.
+
+The equivalent Mobius-side MLP pre-split in PR #424 (Chew-approved, reported
+**+7.1%**) removes the same structural seam at graph-emission time and remains
+pending Justin's merge.
+
+Regression guards remained stable: Qwen2.5-7B measured **286.95 tok/s** and
+DeepSeek-Coder-1.3B measured **728.53 tok/s**; both retained one captured
+segment, coherent deterministic output, and zero fallbacks. Host load samples
+were 6.47--6.49, and physical GPU 5 remained exclusive.
+
 ## f0af865 baseline
 
 | Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 | Smoothness |
