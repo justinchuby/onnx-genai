@@ -85,6 +85,10 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
         Box::new(CudaSkipRmsNormMatMulFusion),
+        // Lower a capture-unsafe LongRoPE-style `If(Greater, const, const)` cos/sin
+        // cache selector into an on-device `Where`, collapsing the per-token host
+        // cond readback / graph split so decode captures as a single graph.
+        Box::new(CudaOnDeviceConstantSelect),
     ]
 }
 
@@ -1529,6 +1533,349 @@ struct Projection {
     zero_points: Option<ValueId>,
     n: usize,
     k: usize,
+}
+
+/// Lower a capture-unsafe `If` whose branches are pure, side-effect-free
+/// constant selections into an on-device `Where`, so its loop-invariant scalar
+/// predicate is evaluated on the device every step and the decode collapses from
+/// two captured CUDA graphs into one — with **no** per-step host `cond` readback
+/// / graph split.
+///
+/// ## The seam this removes
+///
+/// A decoder's rotary-embedding cache selector exports as
+/// `Greater(seq_len, T) → If → (cos_cache, sin_cache)`, where each `If` branch is
+/// just `Constant`s emitting a full cos/sin table (a short-context table sized to
+/// `T`, and a long-context table sized to the model's max positions). Executing
+/// the `If` reads the predicate to the **host** every decode step to pick a
+/// branch, which splits the captured graph in two around the read. During steady
+/// decode the predicate is loop-invariant, yet the host round-trip and the
+/// mid-step graph boundary cost real wall-clock time.
+///
+/// ## The rewrite (topology + shape driven, never model identity)
+///
+/// The pass fires on any `If` whose two branches contain **only** `Constant`
+/// nodes (so each output depends on nothing but its own constant — pure, no outer
+/// captures, guaranteed loop-invariant) and whose per-output branch tensors are
+/// selectable on-device. For output `i` it emits
+/// `Where(cond, then_const_i, else_const_i)`, keeping both branch tables resident
+/// as constants and evaluating the *device* predicate (`Greater`'s bool output)
+/// every step. The `If` and its subgraphs are deleted; `cond` is rewired to the
+/// `Where`s. `Where`'s capture-safe path (see `kernels::where_op`) then folds
+/// into the single captured graph.
+///
+/// ## Correctness (why the selection stays exact, including at the boundary)
+///
+/// `Where` recomputes the selection from the live predicate every step, so a
+/// genuine branch flip is never missed — unlike a host memo, there is no stale
+/// branch. Two shape cases:
+///
+/// * **Equal-shaped branches** — `then` and `else` tensors have identical shape.
+///   The `Where` is a byte-exact select for either predicate value,
+///   unconditionally correct for any consumer.
+/// * **Differing leading dimension** (the LongRoPE case: `else` short table
+///   `[T, ..]`, `then` long table `[maxpos, ..]`, `maxpos > T`, trailing dims
+///   equal). The predicate must be `Greater`/`GreaterOrEqual(_, T)` and the
+///   short table's leading dim must equal `T`. The short (`else`) table is padded
+///   with zeros up to the long leading dim so both operands share the long
+///   shape. When the predicate is false the short branch is selected: its
+///   original `[0, T)` rows are preserved byte-for-byte, and the appended rows at
+///   indices `>= T` are ones the *original* short table never had — so no
+///   execution that was in-bounds against the original model can ever read them.
+///   When the predicate is true the long branch is selected unchanged. The
+///   selection therefore matches the original `If` for every predicate value and
+///   crosses the `T` boundary exactly.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaOnDeviceConstantSelect;
+
+/// One rewritten `If` output: the surviving `If`-output value (reused as the
+/// `Where` output) plus the materialized constant operands for `Where`.
+struct SelectOutput {
+    value: ValueId,
+    dtype: DataType,
+    out_dims: Vec<usize>,
+    /// `then` (predicate-true) constant, already sized to `out_dims`.
+    x_bytes: Vec<u8>,
+    /// `else` (predicate-false) constant, padded to `out_dims`.
+    y_bytes: Vec<u8>,
+}
+
+struct SelectPlan {
+    if_node: NodeId,
+    then_key: (NodeId, String),
+    else_key: (NodeId, String),
+    cond: ValueId,
+    name: String,
+    outputs: Vec<SelectOutput>,
+}
+
+impl OptimizationPass for CudaOnDeviceConstantSelect {
+    fn name(&self) -> &str {
+        "CudaOnDeviceConstantSelect"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "If" && matches!(node.domain.as_str(), "" | "ai.onnx"))
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<SelectPlan> = Vec::new();
+        for if_node in candidates {
+            if let Some(plan) = self.plan_select(graph, ctx, if_node) {
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // Delete the host `If` first: its output values survive because
+            // downstream consumers still reference them, so they can be reused
+            // as the `Where` outputs (SSA: one producer, now the `Where`).
+            graph.remove_node(plan.if_node);
+            graph.subgraphs.remove(&plan.then_key);
+            graph.subgraphs.remove(&plan.else_key);
+            for (index, out) in plan.outputs.into_iter().enumerate() {
+                if graph.try_value(out.value).is_none() {
+                    continue;
+                }
+                let shape = static_shape(out.out_dims.clone());
+                let x = graph.create_value(out.dtype, shape.clone());
+                graph.set_initializer(
+                    x,
+                    WeightRef::Inline(TensorData::from_raw(
+                        out.dtype,
+                        out.out_dims.clone(),
+                        out.x_bytes,
+                    )),
+                );
+                let y = graph.create_value(out.dtype, shape.clone());
+                graph.set_initializer(
+                    y,
+                    WeightRef::Inline(TensorData::from_raw(
+                        out.dtype,
+                        out.out_dims.clone(),
+                        out.y_bytes,
+                    )),
+                );
+
+                let value = graph.value_mut(out.value);
+                value.dtype = out.dtype;
+                value.shape = shape;
+
+                let mut node = onnx_runtime_ir::Node::new(
+                    NodeId(0),
+                    "Where",
+                    vec![Some(plan.cond), Some(x), Some(y)],
+                    vec![out.value],
+                );
+                node.name = format!("{}/on_device_select_{index}", plan.name);
+                graph.insert_node(node);
+            }
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaOnDeviceConstantSelect {
+    fn plan_select(
+        &self,
+        graph: &Graph,
+        ctx: &PassContext,
+        if_node: NodeId,
+    ) -> Option<SelectPlan> {
+        let node = graph.try_node(if_node)?;
+        let cond = node.inputs.first().copied().flatten()?;
+        let then_key = (if_node, "then_branch".to_string());
+        let else_key = (if_node, "else_branch".to_string());
+        let then_branch = graph.subgraphs.get(&then_key)?;
+        let else_branch = graph.subgraphs.get(&else_key)?;
+
+        // Both branches must be pure constant selections: every node a
+        // `Constant`, zero formal inputs (so no outer captures), and one output
+        // per node — the guarantee that each output is loop-invariant.
+        if !branch_is_pure_constants(then_branch) || !branch_is_pure_constants(else_branch) {
+            return None;
+        }
+        let output_count = node.outputs.len();
+        if output_count == 0
+            || then_branch.outputs.len() != output_count
+            || else_branch.outputs.len() != output_count
+        {
+            return None;
+        }
+
+        // The predicate-false / -true index tie (only needed when a branch is
+        // padded): `cond = Greater/GreaterOrEqual(_, T)` with a scalar-int `T`.
+        let threshold = greater_threshold(graph, ctx, cond);
+
+        let mut outputs = Vec::with_capacity(output_count);
+        for i in 0..output_count {
+            let then_tensor = branch_constant(then_branch, then_branch.outputs[i])?;
+            let else_tensor = branch_constant(else_branch, else_branch.outputs[i])?;
+            if then_tensor.dtype != else_tensor.dtype {
+                return None;
+            }
+            let dtype = then_tensor.dtype;
+            let elem = dtype.byte_size();
+            if elem == 0 || dtype.is_sub_byte() {
+                return None;
+            }
+            let then_dims = then_tensor.dims.clone();
+            let else_dims = else_tensor.dims.clone();
+            let then_bytes: &[u8] = &then_tensor.data;
+            let else_bytes: &[u8] = &else_tensor.data;
+            // Guard against malformed constants before trusting the byte lengths.
+            if then_bytes.len() != dims_bytes(&then_dims, elem)?
+                || else_bytes.len() != dims_bytes(&else_dims, elem)?
+            {
+                return None;
+            }
+
+            let plan = if then_dims == else_dims {
+                // Equal-shaped select: byte-exact for either predicate value.
+                SelectOutput {
+                    value: node.outputs[i],
+                    dtype,
+                    out_dims: then_dims,
+                    x_bytes: then_bytes.to_vec(),
+                    y_bytes: else_bytes.to_vec(),
+                }
+            } else {
+                // Differing leading dim: the predicate-true (`then`) branch must
+                // be the larger table; the predicate-false (`else`) branch is
+                // padded, and its original leading dim must equal the `Greater`
+                // threshold so the appended rows are provably never indexed.
+                let (then_lead, then_trail) = split_leading(&then_dims)?;
+                let (else_lead, else_trail) = split_leading(&else_dims)?;
+                if then_trail != else_trail || then_lead <= else_lead {
+                    return None;
+                }
+                let threshold = threshold?;
+                if i64::try_from(else_lead).ok()? != threshold {
+                    return None;
+                }
+                let row_bytes = else_trail.iter().product::<usize>().checked_mul(elem)?;
+                let mut y_bytes = else_bytes.to_vec();
+                let pad_rows = then_lead.checked_sub(else_lead)?;
+                y_bytes.resize(else_bytes.len() + pad_rows.checked_mul(row_bytes)?, 0);
+                SelectOutput {
+                    value: node.outputs[i],
+                    dtype,
+                    out_dims: then_dims,
+                    x_bytes: then_bytes.to_vec(),
+                    y_bytes,
+                }
+            };
+            outputs.push(plan);
+        }
+
+        Some(SelectPlan {
+            if_node,
+            then_key,
+            else_key,
+            cond,
+            name: node.name.clone(),
+            outputs,
+        })
+    }
+}
+
+/// Whether every node in `branch` is a producer-less `Constant` with no formal
+/// inputs — a pure, side-effect-free constant selection with no outer captures.
+fn branch_is_pure_constants(branch: &Graph) -> bool {
+    if !branch.inputs.is_empty() {
+        return false;
+    }
+    branch.nodes.iter().all(|(_, node)| {
+        node.op_type == "Constant"
+            && matches!(node.domain.as_str(), "" | "ai.onnx")
+            && node.inputs.is_empty()
+            && node.outputs.len() == 1
+            && matches!(node.attr("value"), Some(Attribute::Tensor(_)))
+    })
+}
+
+/// Read the `Constant` tensor backing branch output `out`, or `None` if `out` is
+/// not produced by a default-domain `Constant` with a `value` tensor attribute.
+fn branch_constant(branch: &Graph, out: ValueId) -> Option<&TensorData> {
+    let producer = branch.try_value(out)?.producer?;
+    let node = branch.try_node(producer)?;
+    if node.op_type != "Constant" || !matches!(node.domain.as_str(), "" | "ai.onnx") {
+        return None;
+    }
+    match node.attr("value") {
+        Some(Attribute::Tensor(tensor)) => Some(tensor),
+        _ => None,
+    }
+}
+
+/// The scalar-int threshold `T` of a `cond = Greater/GreaterOrEqual(_, T)`, when
+/// `T` is a producer-less constant int initializer (or a `Constant` node).
+fn greater_threshold(graph: &Graph, ctx: &PassContext, cond: ValueId) -> Option<i64> {
+    let producer = graph.try_value(cond)?.producer?;
+    let node = graph.try_node(producer)?;
+    if !matches!(node.op_type.as_str(), "Greater" | "GreaterOrEqual")
+        || !matches!(node.domain.as_str(), "" | "ai.onnx")
+    {
+        return None;
+    }
+    let threshold_value = node.inputs.get(1).copied().flatten()?;
+    scalar_int(graph, ctx, threshold_value)
+}
+
+/// Read a single-element integer value, whether backed by an initializer or a
+/// `Constant` node. Returns `None` for non-integer or multi-element tensors.
+fn scalar_int(graph: &Graph, ctx: &PassContext, value: ValueId) -> Option<i64> {
+    let tensor_owned;
+    let tensor: &TensorData = if let Some(weight) = graph.initializers.get(&value) {
+        match weight {
+            WeightRef::Inline(tensor) => tensor,
+            WeightRef::External { .. } => {
+                tensor_owned = TensorData::from_raw(
+                    weight.dtype(),
+                    weight.dims().to_vec(),
+                    ctx.initializer_bytes(weight)?.to_vec(),
+                );
+                &tensor_owned
+            }
+        }
+    } else {
+        let producer = graph.try_value(value)?.producer?;
+        match graph.try_node(producer)?.attr("value") {
+            Some(Attribute::Tensor(tensor)) => tensor,
+            _ => return None,
+        }
+    };
+    if tensor.dims.iter().product::<usize>() != 1 {
+        return None;
+    }
+    match tensor.dtype {
+        DataType::Int64 => Some(i64::from_le_bytes(tensor.data.get(..8)?.try_into().ok()?)),
+        DataType::Int32 => Some(i64::from(i32::from_le_bytes(
+            tensor.data.get(..4)?.try_into().ok()?,
+        ))),
+        _ => None,
+    }
+}
+
+/// Split a shape into `(leading, trailing)` where `trailing` is `dims[1..]`.
+fn split_leading(dims: &[usize]) -> Option<(usize, Vec<usize>)> {
+    let (&lead, trail) = dims.split_first()?;
+    Some((lead, trail.to_vec()))
+}
+
+/// Byte length of a dense tensor of `dims` with `elem`-byte elements.
+fn dims_bytes(dims: &[usize], elem: usize) -> Option<usize> {
+    dims.iter().product::<usize>().checked_mul(elem)
 }
 
 #[cfg(test)]
@@ -3380,5 +3727,256 @@ mod tests {
         assert_eq!(graph.value(norm_a).dtype, DataType::Float16);
         assert_eq!(graph.value(norm_b).dtype, DataType::Float16);
         assert!(graph.validate().is_ok());
+    }
+
+    // ---- CudaOnDeviceConstantSelect ----------------------------------------
+
+    fn fp16_bytes(rows: usize, cols: usize, fill: u16) -> Vec<u8> {
+        (0..rows * cols).flat_map(|_| fill.to_le_bytes()).collect()
+    }
+
+    fn constant_branch(outputs: &[(&str, DataType, Vec<usize>, Vec<u8>)]) -> Graph {
+        let mut branch = Graph::new();
+        for (name, dtype, dims, bytes) in outputs {
+            let out = branch.create_named_value(
+                *name,
+                *dtype,
+                dims.iter().map(|&d| Dim::Static(d)).collect::<Vec<_>>(),
+            );
+            branch.add_output(out);
+            let mut node = Node::new(NodeId(0), "Constant", vec![], vec![out]);
+            node.attributes.insert(
+                "value".into(),
+                Attribute::Tensor(TensorData::from_raw(*dtype, dims.clone(), bytes.clone())),
+            );
+            branch.insert_node(node);
+        }
+        branch
+    }
+
+    /// Build `Greater(seq_len, threshold) → If → (cos, sin)` with pure-constant
+    /// branches. `cond_from_greater` toggles whether the predicate is produced by
+    /// a `Greater` (with a scalar-int threshold initializer) or is a plain bool
+    /// graph input (exercising the equal-shape path that needs no threshold tie).
+    fn longrope_if_graph(
+        then_dims: Vec<usize>,
+        else_dims: Vec<usize>,
+        threshold: i64,
+        cond_from_greater: bool,
+    ) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let cond = if cond_from_greater {
+            let seq = graph.create_named_value("seq_len", DataType::Int64, Vec::new());
+            graph.add_input(seq);
+            let thr = graph.create_named_value("threshold", DataType::Int64, Vec::new());
+            graph.set_initializer(
+                thr,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Int64,
+                    Vec::new(),
+                    threshold.to_le_bytes().to_vec(),
+                )),
+            );
+            let cond = graph.create_named_value("cond", DataType::Bool, Vec::new());
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Greater",
+                vec![Some(seq), Some(thr)],
+                vec![cond],
+            ));
+            cond
+        } else {
+            let cond = graph.create_named_value("cond", DataType::Bool, Vec::new());
+            graph.add_input(cond);
+            cond
+        };
+
+        let cos = graph.create_named_value(
+            "cos_cache",
+            DataType::Float16,
+            then_dims.iter().map(|&d| Dim::Static(d)).collect::<Vec<_>>(),
+        );
+        let sin = graph.create_named_value(
+            "sin_cache",
+            DataType::Float16,
+            then_dims.iter().map(|&d| Dim::Static(d)).collect::<Vec<_>>(),
+        );
+        let if_node = graph.insert_node(Node::new(
+            NodeId(0),
+            "If",
+            vec![Some(cond)],
+            vec![cos, sin],
+        ));
+        graph.add_output(cos);
+        graph.add_output(sin);
+
+        let then_cos = fp16_bytes(then_dims[0], then_dims[1], 0x3C00); // 1.0
+        let then_sin = fp16_bytes(then_dims[0], then_dims[1], 0x4000); // 2.0
+        let else_cos = fp16_bytes(else_dims[0], else_dims[1], 0x4200); // 3.0
+        let else_sin = fp16_bytes(else_dims[0], else_dims[1], 0x4400); // 4.0
+        graph.subgraphs.insert(
+            (if_node, "then_branch".into()),
+            constant_branch(&[
+                ("cos_large", DataType::Float16, then_dims.clone(), then_cos),
+                ("sin_large", DataType::Float16, then_dims.clone(), then_sin),
+            ]),
+        );
+        graph.subgraphs.insert(
+            (if_node, "else_branch".into()),
+            constant_branch(&[
+                ("cos_small", DataType::Float16, else_dims.clone(), else_cos),
+                ("sin_small", DataType::Float16, else_dims.clone(), else_sin),
+            ]),
+        );
+        (graph, cos, sin)
+    }
+
+    fn where_nodes(graph: &Graph) -> Vec<NodeId> {
+        graph
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| (n.op_type == "Where").then_some(id))
+            .collect()
+    }
+
+    #[test]
+    fn lowers_differing_shape_longrope_if_to_padded_where() {
+        // then (predicate-true / long) = [4,2], else (false / short) = [2,2],
+        // threshold = 2 == short leading dim.
+        let (mut graph, cos, sin) = longrope_if_graph(vec![4, 2], vec![2, 2], 2, true);
+        CudaOnDeviceConstantSelect
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(
+            graph.nodes.values().all(|n| n.op_type != "If"),
+            "the host If must be gone"
+        );
+        assert!(graph.subgraphs.is_empty(), "If subgraphs must be removed");
+        let wheres = where_nodes(&graph);
+        assert_eq!(wheres.len(), 2, "one Where per If output");
+
+        // Both cache outputs now have the long shape and are Where-produced.
+        assert_eq!(graph.value(cos).shape, static_shape([4, 2]));
+        assert_eq!(graph.value(sin).shape, static_shape([4, 2]));
+
+        for &w in &wheres {
+            let node = graph.node(w);
+            // cond wired to input 0; x/y are constant initializers.
+            let x = node.inputs[1].unwrap();
+            let y = node.inputs[2].unwrap();
+            let x_bytes = match graph.initializers.get(&x).unwrap() {
+                WeightRef::Inline(t) => &t.data,
+                _ => panic!("x must be inline"),
+            };
+            let y_bytes = match graph.initializers.get(&y).unwrap() {
+                WeightRef::Inline(t) => &t.data,
+                _ => panic!("y must be inline"),
+            };
+            assert_eq!(x_bytes.len(), 4 * 2 * 2, "then const is the full long table");
+            assert_eq!(y_bytes.len(), 4 * 2 * 2, "else const padded to the long shape");
+            // First 2 rows preserved from the short table; the appended 2 rows are
+            // zeros (provably never indexed when the predicate is false).
+            assert!(
+                y_bytes[..2 * 2 * 2].iter().any(|&b| b != 0),
+                "short-table rows preserved byte-for-byte"
+            );
+            assert!(
+                y_bytes[2 * 2 * 2..].iter().all(|&b| b == 0),
+                "appended rows are zero padding"
+            );
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn lowers_equal_shape_if_without_threshold() {
+        // Equal-shaped branches: no Greater / threshold tie required.
+        let (mut graph, _cos, _sin) = longrope_if_graph(vec![3, 2], vec![3, 2], 0, false);
+        CudaOnDeviceConstantSelect
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(graph.nodes.values().all(|n| n.op_type != "If"));
+        let wheres = where_nodes(&graph);
+        assert_eq!(wheres.len(), 2);
+        for &w in &wheres {
+            let node = graph.node(w);
+            let y = node.inputs[2].unwrap();
+            let y_bytes = match graph.initializers.get(&y).unwrap() {
+                WeightRef::Inline(t) => &t.data,
+                _ => panic!(),
+            };
+            assert_eq!(y_bytes.len(), 3 * 2 * 2, "no padding for equal shapes");
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn skips_if_with_non_constant_branch() {
+        let (mut graph, _cos, _sin) = longrope_if_graph(vec![4, 2], vec![2, 2], 2, true);
+        // Corrupt the then branch: replace one Constant with an Add so the branch
+        // is no longer a pure constant selection.
+        let key = (
+            graph
+                .nodes
+                .iter()
+                .find_map(|(id, n)| (n.op_type == "If").then_some(id))
+                .unwrap(),
+            "then_branch".to_string(),
+        );
+        let branch = graph.subgraphs.get_mut(&key).unwrap();
+        let victim = branch
+            .nodes
+            .iter()
+            .find_map(|(id, n)| (n.op_type == "Constant").then_some(id))
+            .unwrap();
+        branch.node_mut(victim).op_type = "Add".into();
+
+        CudaOnDeviceConstantSelect
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph.nodes.values().any(|n| n.op_type == "If"),
+            "a non-constant branch must not be rewritten"
+        );
+        assert!(where_nodes(&graph).is_empty());
+    }
+
+    #[test]
+    fn skips_padded_if_when_threshold_mismatches_short_table() {
+        // else leading dim (2) != threshold (3): padded rows are not provably
+        // unread, so the rewrite must not fire.
+        let (mut graph, _cos, _sin) = longrope_if_graph(vec![4, 2], vec![2, 2], 3, true);
+        CudaOnDeviceConstantSelect
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(graph.nodes.values().any(|n| n.op_type == "If"));
+        assert!(where_nodes(&graph).is_empty());
+    }
+
+    #[test]
+    fn skips_padded_if_without_greater_predicate() {
+        // Differing shapes but the predicate is a plain bool input (no threshold
+        // tie available): must not rewrite.
+        let (mut graph, _cos, _sin) = longrope_if_graph(vec![4, 2], vec![2, 2], 2, false);
+        CudaOnDeviceConstantSelect
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(graph.nodes.values().any(|n| n.op_type == "If"));
+        assert!(where_nodes(&graph).is_empty());
+    }
+
+    #[test]
+    fn skips_if_when_true_branch_is_smaller() {
+        // then (predicate-true) smaller than else: selecting the padded true
+        // branch on a long sequence could read appended rows — must not rewrite.
+        let (mut graph, _cos, _sin) = longrope_if_graph(vec![2, 2], vec![4, 2], 2, true);
+        CudaOnDeviceConstantSelect
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(graph.nodes.values().any(|n| n.op_type == "If"));
+        assert!(where_nodes(&graph).is_empty());
     }
 }
