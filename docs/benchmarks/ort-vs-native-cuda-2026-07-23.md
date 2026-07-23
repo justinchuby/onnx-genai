@@ -1,25 +1,13 @@
 # Native CUDA vs. ORT GenAI CUDA baseline — 2026-07-23
 
-## Result: ORT 0.14 CUDA baseline unavailable
+## Results
 
-This is a clean native baseline, but **not an apples-to-apples comparison**:
-the requested ORT GenAI 0.14.x CUDA runtime was unavailable on this host.
-The user-site `onnxruntime_genai==0.14.1` imports, but lacks
-`libonnxruntime-genai-cuda.so`. The `onnx` conda environment instead has
-`0.15.0-dev`; it was deliberately excluded rather than presenting a
-cross-version result as ORT 0.14. Consequently every ORT, ratio, and
-BEATS/TRAILS cell is `N/A`, not zero or an estimate.
-
-| Model | Native @128 tok/s (ms/token) | Native @1024 tok/s (ms/token) | ORT 0.14 @128 | ORT 0.14 @1024 | Native / ORT | Native HBM roofline @128 / @1024 |
-|---|---:|---:|---:|---:|---:|---:|
-| Qwen2.5-0.5B int4 | 821.10 (1.218) | 771.87 (1.296) | N/A | N/A | N/A | 6.94% / 6.65% |
-| Qwen2.5-1.5B int4 | 481.29 (2.078) | 455.56 (2.195) | N/A | N/A | N/A | 12.63% / 12.13% |
-| Qwen2.5-7B int4 | 230.84 (4.332) | 222.95 (4.485) | N/A | N/A | N/A | 27.50% / 26.73% |
-| Phi-4-mini int4/int8 | 92.94 (10.759) | 88.82 (11.259) | N/A | N/A | N/A | 8.00% / 7.80% |
-
-No model can honestly be labelled **BEATS** or **TRAILS** without the
-version-matched ORT CUDA package. Re-run this report after installing a CUDA
-wheel/package in the `onnx` environment specifically for ORT GenAI 0.14.x.
+| Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Native @1024 tok/s (ms/token) | ORT 0.14.1 @1024 tok/s (ms/token) | Native / ORT @1024 | Native HBM roofline @128 / @1024 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B int4 | 821.10 (1.218) | 731.88 (1.366) | **112.19% BEATS +12.19%** | 771.87 (1.296) | 638.76 (1.566) | **120.84% BEATS +20.84%** | 6.94% / 6.65% |
+| Qwen2.5-1.5B int4 | 481.29 (2.078) | 483.15 (2.070) | **99.62% TRAILS -0.38%** | 455.56 (2.195) | 472.09 (2.118) | **96.50% TRAILS -3.50%** | 12.63% / 12.13% |
+| Qwen2.5-7B int4 | 230.84 (4.332) | 280.21 (3.569) | **82.38% TRAILS -17.62%** | 222.95 (4.485) | 276.68 (3.614) | **80.58% TRAILS -19.42%** | 27.50% / 26.73% |
+| Phi-4-mini int4/int8 | 92.94 (10.759) | 236.56 (4.227) | **39.29% TRAILS -60.71%** | 88.82 (11.259) | 210.25 (4.756) | **42.25% TRAILS -57.75%** | 8.00% / 7.80% |
 
 ## Method and validity checks
 
@@ -38,6 +26,18 @@ wheel/package in the `onnx` environment specifically for ORT GenAI 0.14.x.
   diagnostic 32-token runs were coherent (`" Paris..."`), deterministic, graph
   enabled, and reported one measured capture, 29 replays, zero fallbacks, and
   zero KV H2D/D2H calls and bytes.
+- ORT used the separately installed `onnxruntime-genai-cuda==0.14.1` wheel in a
+  fresh venv, greedy with `min_length=max_length=prompt_tokens + output_tokens`
+  to prevent early EOS, one warmup, three measured generations, and the same
+  eight-token steady-window exclusion. It used the CUDA-12 `libcudart`,
+  `libcublas`, and `libcufft` pip-library directories plus CUDA-12-compatible
+  cuDNN on `LD_LIBRARY_PATH`; the wheel otherwise fails to load
+  `libcublasLt.so.12`. ORT CUDA graph capture was enabled for Qwen. Phi has
+  control-flow nodes and ORT 0.14.1 rejects graph capture for it, so its
+  graph-off result is its best runnable ORT configuration. All ORT greedy
+  continuations were coherent and began `" Paris..."`; the three runs per
+  model/length were deterministic. Load averages during ORT samples were
+  8.72--17.26.
 
 The roofline uses the requested 3.35 TB/s and
 `3.35e12 / (streamed initializer bytes + average cached-KV bytes)`. It excludes
@@ -48,10 +48,9 @@ and 1,162/1,139 (Phi).
 
 ## Where the native gap is
 
-There is no ORT result from which to designate a worst *trailing* model.
-The lowest native roofline utilization is Qwen2.5-0.5B, while Phi has the
-largest absolute per-token latency, so Phi was profiled as the practical
-investigation target.
+Phi-4-mini is the worst trailing model: native is 60.71% behind ORT at 128
+tokens and 57.75% behind at 1024. It also has the largest native absolute
+per-token latency, so it was profiled.
 
 `ONNX_GENAI_PROFILE_OPS=1` on Phi (32-token diagnostic) is intrusive and
 therefore not used for the throughput table. Its warm operator summaries show
