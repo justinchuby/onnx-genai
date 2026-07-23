@@ -20,6 +20,7 @@
 //!
 //! Tests skip cleanly when no CUDA device is present.
 
+use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
 };
@@ -50,6 +51,30 @@ impl HostTensor {
             dtype: DataType::Float32,
             shape: shape.to_vec(),
             bytes: values.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+        }
+    }
+
+    fn f16(shape: &[usize], values: &[f32]) -> Self {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        Self {
+            dtype: DataType::Float16,
+            shape: shape.to_vec(),
+            bytes: values
+                .iter()
+                .flat_map(|&value| f16::from_f32(value).to_bits().to_ne_bytes())
+                .collect(),
+        }
+    }
+
+    fn bf16(shape: &[usize], values: &[f32]) -> Self {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        Self {
+            dtype: DataType::BFloat16,
+            shape: shape.to_vec(),
+            bytes: values
+                .iter()
+                .flat_map(|&value| bf16::from_f32(value).to_bits().to_ne_bytes())
+                .collect(),
         }
     }
 
@@ -130,13 +155,14 @@ fn build_node(
     let y_shape = vec![batch, case.q_heads, case.q_seq, case.head_size];
     let mut node_outputs = Vec::new();
     let mut output_specs = Vec::new();
+    let dtype = inputs[0].as_ref().expect("query is required").dtype;
     node_outputs.push(graph.create_named_value(
         "output",
-        DataType::Float32,
+        dtype,
         static_shape(y_shape.iter().copied()),
     ));
     output_specs.push(OutputSpec {
-        dtype: DataType::Float32,
+        dtype,
         shape: y_shape,
     });
     if outputs == 3 {
@@ -144,13 +170,10 @@ fn build_node(
             let shape = vec![batch, case.kv_heads, case.total_seq, case.head_size];
             node_outputs.push(graph.create_named_value(
                 name,
-                DataType::Float32,
+                dtype,
                 static_shape(shape.iter().copied()),
             ));
-            output_specs.push(OutputSpec {
-                dtype: DataType::Float32,
-                shape,
-            });
+            output_specs.push(OutputSpec { dtype, shape });
         }
     }
 
@@ -336,24 +359,47 @@ fn as_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Assert `Y` matches within [`Y_TOLERANCE`]; return the max |Δ| observed.
-fn assert_close(gpu: &[u8], cpu: &[u8], what: &str) -> f32 {
-    let g = as_f32(gpu);
-    let c = as_f32(cpu);
-    assert_eq!(g.len(), c.len(), "{what}: length mismatch");
+fn decode_floating(dtype: DataType, bytes: &[u8]) -> Vec<f32> {
+    match dtype {
+        DataType::Float32 => as_f32(bytes),
+        DataType::Float16 => bytes
+            .chunks_exact(2)
+            .map(|bytes| f16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32())
+            .collect(),
+        DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .map(|bytes| bf16::from_bits(u16::from_ne_bytes(bytes.try_into().unwrap())).to_f32())
+            .collect(),
+        _ => panic!("unsupported floating test dtype {dtype:?}"),
+    }
+}
+
+/// Convert storage values to the exact f32 values visible to the CUDA kernel,
+/// so the frozen f32 CPU oracle is a valid reference for low-precision inputs.
+fn exact_rounded_f32(tensor: &HostTensor) -> HostTensor {
+    HostTensor::f32(&tensor.shape, &decode_floating(tensor.dtype, &tensor.bytes))
+}
+
+fn assert_close_values(gpu: &[f32], cpu: &[f32], tolerance: f32, what: &str) -> f32 {
+    assert_eq!(gpu.len(), cpu.len(), "{what}: length mismatch");
     let mut max_delta = 0.0f32;
-    for (index, (gv, cv)) in g.iter().zip(&c).enumerate() {
-        if gv.to_bits() == cv.to_bits() {
+    for (index, (&gpu, &cpu)) in gpu.iter().zip(cpu).enumerate() {
+        if gpu.to_bits() == cpu.to_bits() {
             continue;
         }
-        let delta = (gv - cv).abs();
+        let delta = (gpu - cpu).abs();
         max_delta = max_delta.max(delta);
         assert!(
-            delta <= Y_TOLERANCE,
-            "{what}: mismatch at {index}: gpu={gv} cpu={cv} (|Δ|={delta} > {Y_TOLERANCE})"
+            delta <= tolerance,
+            "{what}: mismatch at {index}: gpu={gpu} cpu={cpu} (|Δ|={delta} > {tolerance})"
         );
     }
     max_delta
+}
+
+/// Assert `Y` matches within [`Y_TOLERANCE`]; return the max |Δ| observed.
+fn assert_close(gpu: &[u8], cpu: &[u8], what: &str) -> f32 {
+    assert_close_values(&as_f32(gpu), &as_f32(cpu), Y_TOLERANCE, what)
 }
 
 /// Assert a pure-copy output is bit-identical.
@@ -405,6 +451,71 @@ fn selected_subset_and_trailing_padding_match_cpu() {
     let inputs = [Some(q), Some(k), Some(v), None, None, Some(indices)];
     let (_, delta) = assert_parity(&ep, &inputs, case, 3);
     eprintln!("selected_subset: Y max|Δ|={delta}");
+}
+
+/// Runs low-precision storage through CUDA, comparing its decoded result to the
+/// f32 CPU oracle fed the *exact* values obtained by rounding every input to
+/// the requested storage type first.
+fn low_precision_matches_exact_rounded_cpu(dtype: DataType, tolerance: f32) {
+    let Some(ep) = gpu() else { return };
+    let case = Case {
+        q_heads: 2,
+        kv_heads: 2,
+        q_seq: 1,
+        head_size: 3,
+        total_seq: 5,
+        scale: 0.5,
+    };
+    let make = |shape, values: Vec<f32>| match dtype {
+        DataType::Float16 => HostTensor::f16(shape, &values),
+        DataType::BFloat16 => HostTensor::bf16(shape, &values),
+        _ => unreachable!("low precision test only covers f16/bf16"),
+    };
+    let q = make(&[1, 2, 1, 3], sequence(6, -0.25));
+    let k = make(&[1, 2, 5, 3], sequence(30, 0.125));
+    let v = make(&[1, 2, 5, 3], sequence(30, -1.0));
+    let indices = HostTensor::i64(&[1, 2, 1, 4], &[0, 2, 4, -1, 1, 3, -1, -1]);
+    let gpu_inputs = [
+        Some(q.clone()),
+        Some(k.clone()),
+        Some(v.clone()),
+        None,
+        None,
+        Some(indices.clone()),
+    ];
+    let cpu_inputs = [
+        Some(exact_rounded_f32(&q)),
+        Some(exact_rounded_f32(&k)),
+        Some(exact_rounded_f32(&v)),
+        None,
+        None,
+        Some(indices),
+    ];
+    let (cpu_graph, cpu_node, cpu_specs) = build_node(&cpu_inputs, case, 3);
+    let cpu = run_cpu(&cpu_graph, cpu_node, &cpu_inputs, &cpu_specs).expect("CPU f32 oracle");
+    let (gpu_graph, gpu_node, gpu_specs) = build_node(&gpu_inputs, case, 3);
+    let gpu = run_gpu(&ep, &gpu_graph, gpu_node, &gpu_inputs, &gpu_specs)
+        .expect("CUDA low-precision IndexShare");
+
+    let delta = assert_close_values(
+        &decode_floating(dtype, &gpu[0]),
+        &as_f32(&cpu[0]),
+        tolerance,
+        "low-precision output",
+    );
+    assert_bit_exact(&gpu[1], &k.bytes, "present_key low-precision copy");
+    assert_bit_exact(&gpu[2], &v.bytes, "present_value low-precision copy");
+    eprintln!("{dtype:?} exact-rounded CPU parity: Y max|Δ|={delta}");
+}
+
+#[test]
+fn f16_storage_matches_exact_rounded_cpu_oracle() {
+    low_precision_matches_exact_rounded_cpu(DataType::Float16, 1e-3);
+}
+
+#[test]
+fn bf16_storage_matches_exact_rounded_cpu_oracle() {
+    low_precision_matches_exact_rounded_cpu(DataType::BFloat16, 1e-2);
 }
 
 #[test]
@@ -569,8 +680,14 @@ fn prefill_then_two_decodes_thread_present_to_past() {
         scale: 0.4,
     };
     let q = HostTensor::f32(&[1, q_heads, 6, head_size], &make(q_heads * 6 * head_size));
-    let k = HostTensor::f32(&[1, kv_heads, 6, head_size], &make(kv_heads * 6 * head_size));
-    let v = HostTensor::f32(&[1, kv_heads, 6, head_size], &make(kv_heads * 6 * head_size));
+    let k = HostTensor::f32(
+        &[1, kv_heads, 6, head_size],
+        &make(kv_heads * 6 * head_size),
+    );
+    let v = HostTensor::f32(
+        &[1, kv_heads, 6, head_size],
+        &make(kv_heads * 6 * head_size),
+    );
     let mut prefill_indices = Vec::new();
     for qi in 0..6usize {
         let mut row: Vec<i64> = (0..=qi as i64).take(4).collect();
@@ -649,6 +766,42 @@ fn single_output_matches_cpu() {
     let inputs = [Some(q), Some(k), Some(v), None, None, Some(indices)];
     let (_, delta) = assert_parity(&ep, &inputs, case, 1);
     eprintln!("single_output: Y max|Δ|={delta}");
+}
+
+#[test]
+fn captured_f16_replay_is_byte_identical_to_eager_and_preserves_latch() {
+    let Some(ep) = gpu() else { return };
+    let case = Case {
+        q_heads: 2,
+        kv_heads: 2,
+        q_seq: 1,
+        head_size: 3,
+        total_seq: 5,
+        scale: 0.5,
+    };
+    let q = HostTensor::f16(&[1, 2, 1, 3], &sequence(6, -0.25));
+    let k = HostTensor::f16(&[1, 2, 5, 3], &sequence(30, 0.125));
+    let v = HostTensor::f16(&[1, 2, 5, 3], &sequence(30, -1.0));
+    let indices = HostTensor::i64(&[1, 2, 1, 4], &[0, 2, 4, -1, 1, 3, -1, -1]);
+    let inputs = [Some(q), Some(k), Some(v), None, None, Some(indices)];
+    let (graph, node, specs) = build_node(&inputs, case, 3);
+    let eager = run_gpu(&ep, &graph, node, &inputs, &specs).expect("eager f16 IndexShare");
+    let replay = run_gpu_capture_replay(&ep, &graph, node, &inputs, &specs)
+        .expect("captured f16 IndexShare");
+    for (label, (eager, replay)) in ["Y", "present_key", "present_value"]
+        .iter()
+        .zip(eager.iter().zip(&replay))
+    {
+        assert_bit_exact(replay, eager, label);
+    }
+    assert_eq!(
+        ep.runtime()
+            .check_capture_error()
+            .expect("read capture-error latch"),
+        0,
+        "valid f16 capture must not poison the capture-error latch"
+    );
+    eprintln!("captured f16 replay: byte-identical to eager with a clear capture-error latch");
 }
 
 /// Capture one IndexShare `execute` into a CUDA graph and replay it, returning
@@ -769,13 +922,16 @@ fn run_gpu_capture_replay(
     let captured = (|| -> onnx_runtime_ep_api::Result<()> {
         // SAFETY: `stream` is the EP's live compute stream.
         unsafe {
-            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .result()
-                .map_err(|error| {
-                    onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                        "cuStreamBeginCapture_v2: {error:?}"
-                    ))
-                })?;
+            cuStreamBeginCapture_v2(
+                stream,
+                CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .result()
+            .map_err(|error| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                    "cuStreamBeginCapture_v2: {error:?}"
+                ))
+            })?;
         }
         let mut out_views = make_out_views(&mut out_buffers);
         let record = kernel.execute(&input_views, &mut out_views);
@@ -866,8 +1022,14 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
         scale: 0.4,
     };
     let q = HostTensor::f32(&[1, q_heads, 6, head_size], &make(q_heads * 6 * head_size));
-    let k = HostTensor::f32(&[1, kv_heads, 6, head_size], &make(kv_heads * 6 * head_size));
-    let v = HostTensor::f32(&[1, kv_heads, 6, head_size], &make(kv_heads * 6 * head_size));
+    let k = HostTensor::f32(
+        &[1, kv_heads, 6, head_size],
+        &make(kv_heads * 6 * head_size),
+    );
+    let v = HostTensor::f32(
+        &[1, kv_heads, 6, head_size],
+        &make(kv_heads * 6 * head_size),
+    );
     let mut prefill_indices = Vec::new();
     for qi in 0..6usize {
         let mut row: Vec<i64> = (0..=qi as i64).take(4).collect();
@@ -882,8 +1044,8 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
     let (graph, node, specs) = build_node(&inputs, prefill_case, 3);
     let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU prefill oracle");
     let eager = run_gpu(&ep, &graph, node, &inputs, &specs).expect("eager prefill");
-    let replay = run_gpu_capture_replay(&ep, &graph, node, &inputs, &specs)
-        .expect("captured prefill");
+    let replay =
+        run_gpu_capture_replay(&ep, &graph, node, &inputs, &specs).expect("captured prefill");
     for (index, label) in ["Y", "present_key", "present_value"].iter().enumerate() {
         assert_eq!(
             replay[index], eager[index],
@@ -935,8 +1097,8 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
         let (graph, node, specs) = build_node(&inputs, decode_case, 3);
         let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU decode oracle");
         let eager = run_gpu(&ep, &graph, node, &inputs, &specs).expect("eager decode");
-        let replay = run_gpu_capture_replay(&ep, &graph, node, &inputs, &specs)
-            .expect("captured decode");
+        let replay =
+            run_gpu_capture_replay(&ep, &graph, node, &inputs, &specs).expect("captured decode");
         for (index, label) in ["Y", "present_key", "present_value"].iter().enumerate() {
             assert_eq!(
                 replay[index], eager[index],
@@ -948,7 +1110,9 @@ fn captured_prefill_then_two_decodes_match_eager_and_cpu() {
         assert_bit_exact(&eager[2], &cpu[2], "decode present_value (eager vs cpu)");
         // A well-formed captured replay must never poison the capture-error latch.
         assert_eq!(
-            ep.runtime().check_capture_error().expect("read capture-error latch"),
+            ep.runtime()
+                .check_capture_error()
+                .expect("read capture-error latch"),
             0,
             "valid captured decode must not latch a capture error"
         );
@@ -1016,14 +1180,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     let valid = HostTensor::i64(&[1, 2, 1, 4], &[0, 2, 4, -1, 1, 3, -1, -1]);
     // Index 9 is out of range for a cache of length 5 (valid range [0, 5)).
     let invalid = HostTensor::i64(&[1, 2, 1, 4], &[0, 2, 9, -1, 1, 3, -1, -1]);
-    let inputs = [
-        Some(q),
-        Some(k),
-        Some(v),
-        None,
-        None,
-        Some(valid.clone()),
-    ];
+    let inputs = [Some(q), Some(k), Some(v), None, None, Some(valid.clone())];
     let (graph, node, specs) = build_node(&inputs, case, 1);
 
     let model = Model::new(&graph);
@@ -1040,7 +1197,11 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
             Some(tensor) => {
                 let buffer = ep.allocate(tensor.bytes.len().max(1), 256).expect("alloc");
                 // SAFETY: allocation exactly covers the source tensor bytes.
-                unsafe { runtime.htod(&tensor.bytes, cuptr(buffer.as_ptr())).expect("htod") };
+                unsafe {
+                    runtime
+                        .htod(&tensor.bytes, cuptr(buffer.as_ptr()))
+                        .expect("htod")
+                };
                 buffers.push(Some(buffer));
             }
             None => buffers.push(None),
@@ -1084,7 +1245,9 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     // eligible, and (eager) does not poison the latch.
     {
         let mut out = make_out(&mut out_buffer);
-        kernel.execute(&input_views, &mut out).expect("warmup execute");
+        kernel
+            .execute(&input_views, &mut out)
+            .expect("warmup execute");
     }
     runtime.synchronize().expect("sync");
     assert!(kernel.cuda_graph_compatible(), "eligible after warmup");
@@ -1110,11 +1273,14 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     let captured = (|| -> onnx_runtime_ep_api::Result<()> {
         // SAFETY: `stream` is the EP's live compute stream.
         unsafe {
-            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .result()
-                .map_err(|error| {
-                    onnx_runtime_ep_api::EpError::KernelFailed(format!("begin capture: {error:?}"))
-                })?;
+            cuStreamBeginCapture_v2(
+                stream,
+                CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .result()
+            .map_err(|error| {
+                onnx_runtime_ep_api::EpError::KernelFailed(format!("begin capture: {error:?}"))
+            })?;
         }
         let mut out = make_out(&mut out_buffer);
         let record = kernel.execute(&input_views, &mut out);

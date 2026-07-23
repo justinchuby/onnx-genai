@@ -184,7 +184,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         if op.op_type == "IndexShare"
             && op.domain == "pkg.nxrt"
             && let Some(reason) =
-                onnx_runtime_ep_cpu::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
+                crate::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

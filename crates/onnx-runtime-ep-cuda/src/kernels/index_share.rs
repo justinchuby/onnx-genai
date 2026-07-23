@@ -59,19 +59,70 @@
 //! dtype/layout/arity/shape combinations at claim time rather than claiming a
 //! node and falling back inside the kernel.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "IndexShare";
+
+/// Claim-time validation preserving the CPU oracle's structural ABI checks
+/// while extending its f32-only execution oracle to CUDA's f16/bf16 storage
+/// variants. The CPU validation receives an f32 dtype projection after this
+/// method has enforced CUDA's homogeneous floating dtype contract.
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    shapes: &[onnx_runtime_ir::Shape],
+    input_dtypes: &[DataType],
+) -> Option<Cow<'static, str>> {
+    let dtype_at = |index| {
+        input_dtypes
+            .get(index)
+            .copied()
+            .unwrap_or(DataType::Undefined)
+    };
+    let dtype = dtype_at(0);
+    if !matches!(
+        dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        return Some(Cow::Owned(format!(
+            "IndexShare: query dtype {dtype:?} unsupported on CUDA (expected f32, f16, or bf16)"
+        )));
+    }
+    for index in [1, 2, 3, 4, 6] {
+        let candidate = dtype_at(index);
+        if candidate != DataType::Undefined && candidate != dtype {
+            return Some(Cow::Borrowed(
+                "IndexShare: query, key, value, past_key, past_value, and attention_bias must use the same floating dtype on CUDA",
+            ));
+        }
+    }
+    let projected: Vec<_> = input_dtypes
+        .iter()
+        .map(|&candidate| {
+            if matches!(
+                candidate,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
+                DataType::Float32
+            } else {
+                candidate
+            }
+        })
+        .collect();
+    onnx_runtime_ep_cpu::kernels::index_share::unsupported_reason(node, shapes, &projected)
+}
 
 /// Capture-error latch bit raised by [`validate_index_rows`] when a captured
 /// replay observes a `selected_indices` row that fails the deterministic ONNX
@@ -94,16 +145,42 @@ const INPUT_NAMES: [&str; 7] = [
 const BLOCK: u32 = 256;
 /// Threads per block for `index_share_row` (one block services one output row).
 const ROW_THREADS: u32 = 128;
-const MODULE: &str = "index_share_f32_v2";
+const MODULE: &str = "index_share_f32_f16_bf16_v3";
 const SOURCE: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #define NEG_INF __int_as_float(0xff800000)
+
+// dtype is 0 for f32, 1 for f16, and 2 for bf16. Scores and reductions remain
+// fp32; only externally visible tensors and the K/V cache use this storage type.
+__device__ __forceinline__ float load_float(
+    const void* data, unsigned long long index, int dtype) {
+  if (dtype == 0) {
+    return ((const float*)data)[index];
+  }
+  if (dtype == 1) {
+    return __half2float(((const __half*)data)[index]);
+  }
+  return __bfloat162float(((const __nv_bfloat16*)data)[index]);
+}
+
+__device__ __forceinline__ void store_float(
+    void* data, unsigned long long index, float value, int dtype) {
+  if (dtype == 0) {
+    ((float*)data)[index] = value;
+  } else if (dtype == 1) {
+    ((__half*)data)[index] = __float2half_rn(value);
+  } else {
+    ((__nv_bfloat16*)data)[index] = __float2bfloat16_rn(value);
+  }
+}
 
 // Gather a K/V input plus an optional past cache into a contiguous
 // [batch, kv_heads, total_seq, head_size] present buffer (past ++ current along
 // the sequence axis). This is a pure copy, so the present outputs are
 // bit-identical to the CPU reference's concatenation.
 extern "C" __global__ void build_present(
-    const float* past, const float* cur, float* out, int has_past,
+    const void* past, const void* cur, void* out, int dtype, int has_past,
     unsigned long long batch, unsigned long long heads,
     unsigned long long past_seq, unsigned long long cur_seq,
     unsigned long long total_seq, unsigned long long dim,
@@ -118,12 +195,12 @@ extern "C" __global__ void build_present(
     unsigned long long b = rem / heads;
     float val;
     if (has_past && t < past_seq) {
-      val = past[((b * heads + h) * past_seq + t) * dim + d];
+      val = load_float(past, ((b * heads + h) * past_seq + t) * dim + d, dtype);
     } else {
       unsigned long long c = has_past ? (t - past_seq) : t;
-      val = cur[((b * heads + h) * cur_seq + c) * dim + d];
+      val = load_float(cur, ((b * heads + h) * cur_seq + c) * dim + d, dtype);
     }
-    out[idx] = val;
+    store_float(out, idx, val, dtype);
   }
 }
 
@@ -132,7 +209,7 @@ extern "C" __global__ void build_present(
 // Bias::at exactly (size-1 axes broadcast; no -inf padding for a short last
 // dim, which the claim gate already forbids).
 __device__ __forceinline__ float bias_at(
-    const float* bias, int rank,
+    const void* bias, int dtype, int rank,
     unsigned long long bd0, unsigned long long bd1,
     unsigned long long bd2, unsigned long long bd3,
     unsigned long long b, unsigned long long h,
@@ -145,7 +222,7 @@ __device__ __forceinline__ float bias_at(
     unsigned long long index = (dim == 1ULL) ? 0ULL : logical[axis];
     off = off * dim + index;
   }
-  return bias[off];
+  return load_float(bias, off, dtype);
 }
 
 __device__ __forceinline__ long long load_index(
@@ -214,13 +291,13 @@ extern "C" __global__ void validate_index_rows(
 // computes scaled QK scores (+ optional bias), a numerically-stable softmax
 // over the valid selections, and the probability-weighted value sum.
 extern "C" __global__ void index_share_row(
-    const float* q, const float* present_k, const float* present_v,
-    const void* indices, const float* bias, float* scores, float* y,
+    const void* q, const void* present_k, const void* present_v,
+    const void* indices, const void* bias, float* scores, void* y,
     unsigned long long batch, unsigned long long q_heads, unsigned long long kv_heads,
     unsigned long long q_seq, unsigned long long total_seq, unsigned long long head_size,
     unsigned long long index_heads, unsigned long long selected_width,
     unsigned long long group, float sqrt_scale,
-    int index_is_i64, int has_bias, int bias_rank,
+    int dtype, int index_is_i64, int has_bias, int bias_rank,
     unsigned long long bd0, unsigned long long bd1,
     unsigned long long bd2, unsigned long long bd3) {
   const unsigned long long row = blockIdx.x;
@@ -275,10 +352,11 @@ extern "C" __global__ void index_share_row(
     const unsigned long long koff = ((b * kv_heads + kvh) * total_seq + key) * head_size;
     float acc = 0.0f;
     for (unsigned long long d = 0; d < head_size; ++d) {
-      acc += (q[qoff + d] * sqrt_scale) * (present_k[koff + d] * sqrt_scale);
+      acc += (load_float(q, qoff + d, dtype) * sqrt_scale) *
+             (load_float(present_k, koff + d, dtype) * sqrt_scale);
     }
     if (has_bias) {
-      acc += bias_at(bias, bias_rank, bd0, bd1, bd2, bd3, b, qh, qi, key);
+      acc += bias_at(bias, dtype, bias_rank, bd0, bd1, bd2, bd3, b, qh, qi, key);
     }
     scores[score_row + s] = acc;
   }
@@ -312,7 +390,7 @@ extern "C" __global__ void index_share_row(
   const unsigned long long ybase = ((b * q_heads + qh) * q_seq + qi) * head_size;
   if (all_masked_sh) {
     for (unsigned long long d = tid; d < head_size; d += nthreads) {
-      y[ybase + d] = 0.0f;
+      store_float(y, ybase + d, 0.0f, dtype);
     }
     return;
   }
@@ -336,9 +414,9 @@ extern "C" __global__ void index_share_row(
               ? (unsigned long long)raw_key
               : 0ULL;
       const unsigned long long voff = ((b * kv_heads + kvh) * total_seq + key) * head_size + d;
-      acc += scores[score_row + s] * present_v[voff];
+      acc += scores[score_row + s] * load_float(present_v, voff, dtype);
     }
-    y[ybase + d] = acc;
+    store_float(y, ybase + d, acc, dtype);
   }
 }
 "#;
@@ -574,12 +652,21 @@ impl Kernel for IndexShareKernel {
         if has_past_key != has_past_value {
             return Err(error("past_key and past_value must be provided together"));
         }
-        for &index in &[0, 1, 2] {
-            require_dtype(index, &inputs[index], DataType::Float32)?;
+        let dtype = require_floating_dtype(&inputs[0], 0)?;
+        for &index in &[1, 2] {
+            if inputs[index].dtype != dtype {
+                return Err(error(
+                    "query, key, and value must use the same floating dtype",
+                ));
+            }
         }
         for index in [3, 4, 6] {
-            if let Some(input) = optional_input(inputs, index) {
-                require_dtype(index, input, DataType::Float32)?;
+            if let Some(input) = optional_input(inputs, index)
+                && input.dtype != dtype
+            {
+                return Err(error(
+                    "query, key, value, past_key, past_value, and attention_bias must use the same floating dtype",
+                ));
             }
         }
         if !matches!(inputs[5].dtype, DataType::Int32 | DataType::Int64) {
@@ -589,10 +676,10 @@ impl Kernel for IndexShareKernel {
             )));
         }
         for (index, output) in outputs.iter().enumerate() {
-            if output.dtype != DataType::Float32 {
+            if output.dtype != dtype {
                 return Err(error(format!(
-                    "output {index} dtype {:?} unsupported; expected Float32",
-                    output.dtype
+                    "output {index} dtype {:?} must match query dtype {dtype:?}",
+                    output.dtype,
                 )));
             }
         }
@@ -677,22 +764,38 @@ impl Kernel for IndexShareKernel {
             let present_key_ptr = if want_present {
                 present_key_out
             } else {
-                pool.ensure_present_key(&self.runtime, present_elements * 4, capturing)?
+                pool.ensure_present_key(
+                    &self.runtime,
+                    present_elements * dtype.storage_bytes(1),
+                    capturing,
+                )?
             };
             let present_value_ptr = if want_present {
                 present_value_out
             } else {
-                pool.ensure_present_value(&self.runtime, present_elements * 4, capturing)?
+                pool.ensure_present_value(
+                    &self.runtime,
+                    present_elements * dtype.storage_bytes(1),
+                    capturing,
+                )?
             };
             let scores_ptr = pool.ensure_scores(&self.runtime, scores_elements * 4, capturing)?;
 
-            self.build_present(past_key_ptr, key_ptr, present_key_ptr, has_past_key, dims)?;
+            self.build_present(
+                past_key_ptr,
+                key_ptr,
+                present_key_ptr,
+                has_past_key,
+                dims,
+                dtype_code(dtype)?,
+            )?;
             self.build_present(
                 past_value_ptr,
                 value_ptr,
                 present_value_ptr,
                 has_past_value,
                 dims,
+                dtype_code(dtype)?,
             )?;
 
             // On the capturing path record the device-side index validation so a
@@ -711,10 +814,15 @@ impl Kernel for IndexShareKernel {
                 scores_ptr,
                 y_ptr,
                 dims,
+                dtype_code(dtype)?,
                 index_is_i64,
                 output_elements,
             )?;
-            if capturing { Ok(()) } else { self.runtime.synchronize() }
+            if capturing {
+                Ok(())
+            } else {
+                self.runtime.synchronize()
+            }
         })();
 
         if result.is_ok() && !capturing {
@@ -867,9 +975,7 @@ impl IndexShareKernel {
             Some(view) => {
                 let rank = view.shape.len();
                 if rank > 4 {
-                    return Err(error(format!(
-                        "attention_bias rank {rank} exceeds 4"
-                    )));
+                    return Err(error(format!("attention_bias rank {rank} exceeds 4")));
                 }
                 let expected = view.numel();
                 let actual = view.shape.iter().product::<usize>();
@@ -953,6 +1059,7 @@ impl IndexShareKernel {
         out_ptr: CUdeviceptr,
         has_past: bool,
         dims: Dims,
+        dtype: i32,
     ) -> Result<()> {
         let elements = (dims.batch * dims.kv_heads * dims.total_seq * dims.head_size) as u64;
         if elements == 0 {
@@ -973,6 +1080,7 @@ impl IndexShareKernel {
             .arg(&past_ptr)
             .arg(&current_ptr)
             .arg(&out_ptr)
+            .arg(&dtype)
             .arg(&has_past_i)
             .arg(&batch)
             .arg(&heads)
@@ -985,7 +1093,11 @@ impl IndexShareKernel {
         // to live contiguous device allocations validated above.
         unsafe {
             builder.launch(LaunchConfig {
-                grid_dim: (elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32, 1, 1),
+                grid_dim: (
+                    elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
+                    1,
+                    1,
+                ),
                 block_dim: (BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })
@@ -1005,6 +1117,7 @@ impl IndexShareKernel {
         scores_ptr: CUdeviceptr,
         y_ptr: CUdeviceptr,
         dims: Dims,
+        dtype: i32,
         index_is_i64: i32,
         output_elements: usize,
     ) -> Result<()> {
@@ -1050,6 +1163,7 @@ impl IndexShareKernel {
             .arg(&selected_width)
             .arg(&group)
             .arg(&sqrt_scale)
+            .arg(&dtype)
             .arg(&index_is_i64)
             .arg(&has_bias)
             .arg(&bias_rank)
@@ -1087,7 +1201,13 @@ fn validate_indices(indices: &[i64], dims: Dims) -> Result<()> {
                         continue;
                     }
                     if index < -1 {
-                        return Err(index_error(b, h, q, column, format!("invalid sentinel {index}")));
+                        return Err(index_error(
+                            b,
+                            h,
+                            q,
+                            column,
+                            format!("invalid sentinel {index}"),
+                        ));
                     }
                     if padding {
                         return Err(index_error(
@@ -1169,14 +1289,26 @@ fn require_rank(index: usize, shape: &[usize]) -> Result<()> {
     Ok(())
 }
 
-fn require_dtype(index: usize, input: &TensorView, expected: DataType) -> Result<()> {
-    if input.dtype != expected {
+fn require_floating_dtype(input: &TensorView, index: usize) -> Result<DataType> {
+    if !matches!(
+        input.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
         return Err(error(format!(
-            "input {index} ('{}') dtype {:?} unsupported; expected {expected:?}",
+            "input {index} ('{}') dtype {:?} unsupported; expected Float32, Float16, or BFloat16",
             INPUT_NAMES[index], input.dtype
         )));
     }
-    Ok(())
+    Ok(input.dtype)
+}
+
+fn dtype_code(dtype: DataType) -> Result<i32> {
+    match dtype {
+        DataType::Float32 => Ok(0),
+        DataType::Float16 => Ok(1),
+        DataType::BFloat16 => Ok(2),
+        _ => Err(error(format!("unsupported floating dtype {dtype:?}"))),
+    }
 }
 
 fn required_positive_int(node: &Node, name: &str) -> Result<usize> {
