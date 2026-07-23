@@ -61,6 +61,10 @@ unsafe extern "C" {
 
     fn mlas_float_kernel_id() -> c_int;
 
+    /// Vectorized logistic (sigmoid) over `n` contiguous f32s: single-threaded
+    /// MLAS SIMD sigmoid, used to build SiLU without a scalar `expf` loop.
+    fn mlas_compute_logistic(input: *const f32, output: *mut f32, n: usize);
+
     // ---- Blocked n-bit quantized GEMM (SQNBitGemm) ----
     fn mlas_qnbit_gemm_available(bits: usize, blk_len: usize, comp_type: c_int) -> c_int;
     fn mlas_qnbit_gemm_pack_b_size(
@@ -181,6 +185,26 @@ fn ensure_threading() {
 /// 1 = AVX, -1 = other/unknown, 0 = non-x86.
 pub fn selected_float_kernel() -> i32 {
     unsafe { mlas_float_kernel_id() as i32 }
+}
+
+/// Compute the elementwise logistic (sigmoid) `output = 1 / (1 + exp(-input))`
+/// over equal-length contiguous f32 slices using MLAS's SIMD sigmoid. Single
+/// threaded; callers shard across threads themselves when needed.
+///
+/// This is the vectorized primitive behind SiLU (`x * sigmoid(x)`), replacing a
+/// scalar `expf` loop that LLVM cannot autovectorize.
+pub fn compute_logistic(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_logistic input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_logistic(input.as_ptr(), output.as_mut_ptr(), input.len()) };
 }
 
 /// Pre-packed B weight buffer, mirroring how ORT pre-packs constant MatMul

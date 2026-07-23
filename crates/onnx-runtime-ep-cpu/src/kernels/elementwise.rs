@@ -246,7 +246,9 @@ impl Kernel for BinaryKernel {
                 (outputs[0].numel() as u64).saturating_mul(inputs.len().saturating_sub(1) as u64)
             });
         }
-        if op == BinOp::Mul && multiply_contiguous_f32(inputs, &mut outputs[0]) {
+        if matches!(op, BinOp::Sub | BinOp::Mul | BinOp::Div)
+            && binary_contiguous(op, inputs, &mut outputs[0])
+        {
             return Ok(());
         }
         match op {
@@ -267,11 +269,21 @@ impl Kernel for BinaryKernel {
     }
 }
 
-fn multiply_contiguous_f32(inputs: &[TensorView], output: &mut TensorMut) -> bool {
+/// Fast path for strictly-binary `Sub`/`Mul`/`Div` when both operands and the
+/// output share one contiguous shape (no broadcasting) and do not alias. This
+/// is the common decode-time case (SwiGLU `gate * up`, residual `Sub`, etc.) and
+/// runs a single tight per-element loop instead of the general
+/// [`broadcast_apply`] path, which recomputes a multi-axis source index for
+/// every element and allocates an accumulator plus dense staging buffers.
+///
+/// Byte-identical to the general path: each element uses the same
+/// `to_acc`/`from_acc` rounding and the same [`BinOp::apply`] combiner. Covers
+/// every numeric dtype (f16/bf16 previously fell to the slow path since the old
+/// fast path was f32-only).
+fn binary_contiguous(op: BinOp, inputs: &[TensorView], output: &mut TensorMut) -> bool {
     if inputs.len() != 2
-        || inputs[0].dtype != DataType::Float32
-        || inputs[1].dtype != DataType::Float32
-        || output.dtype != DataType::Float32
+        || inputs[0].dtype != output.dtype
+        || inputs[1].dtype != output.dtype
         || inputs[0].shape != output.shape
         || inputs[1].shape != output.shape
         || !inputs[0].is_contiguous()
@@ -282,26 +294,41 @@ fn multiply_contiguous_f32(inputs: &[TensorView], output: &mut TensorMut) -> boo
     }
 
     let n = output.numel();
-    let bytes = n.saturating_mul(std::mem::size_of::<f32>());
-    let output_start = output.data_ptr_mut::<f32>() as usize;
+    let bytes = output.byte_size();
+    let output_start = output.data_ptr_mut::<u8>() as usize;
     let output_end = output_start.saturating_add(bytes);
     if inputs.iter().any(|input| {
-        let input_start = input.data_ptr::<f32>() as usize;
+        let input_start = input.data_ptr::<u8>() as usize;
         let input_end = input_start.saturating_add(bytes);
         output_start < input_end && input_start < output_end
     }) {
         return false;
     }
-    // SAFETY: the executor bounds-checks every view before dispatch. The dtype,
-    // equal shapes, and contiguous layouts above prove each pointer spans n f32s;
-    // the range check proves the mutable output does not alias either input.
-    let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<f32>(), n) };
-    let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<f32>(), n) };
-    let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
-    for ((output, &lhs), &rhs) in output.iter_mut().zip(lhs).zip(rhs) {
-        *output = lhs * rhs;
+
+    match output.dtype {
+        DataType::Float32 => binary_contiguous_typed::<f32>(op, inputs, output, n),
+        DataType::Float64 => binary_contiguous_typed::<f64>(op, inputs, output, n),
+        DataType::Float16 => binary_contiguous_typed::<half::f16>(op, inputs, output, n),
+        DataType::BFloat16 => binary_contiguous_typed::<half::bf16>(op, inputs, output, n),
+        _ => return false,
     }
     true
+}
+
+fn binary_contiguous_typed<T: NumericElem>(
+    op: BinOp,
+    inputs: &[TensorView],
+    output: &mut TensorMut,
+    n: usize,
+) {
+    // SAFETY: the caller proved equal contiguous shapes (each pointer spans n
+    // Ts), matching dtypes, and no output/input aliasing.
+    let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<T>(), n) };
+    let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<T>(), n) };
+    let out = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<T>(), n) };
+    for ((out, &lhs), &rhs) in out.iter_mut().zip(lhs).zip(rhs) {
+        *out = T::from_acc(op.apply(lhs.to_acc(), rhs.to_acc()));
+    }
 }
 
 /// Base-storage behavior for ONNX Pow.  The exponent is allowed to have a
@@ -929,6 +956,32 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_bf16_as_f32(), vec![9., 18., 27., 36.]);
+    }
+
+    #[test]
+    fn mul_f16_contiguous_matches_broadcast_path() {
+        // Same-shape contiguous inputs take the `binary_contiguous` fast path,
+        // which must be byte-identical to the general broadcast_apply path (same
+        // to_acc/from_acc f16->f32->f16 rounding). Values with non-trivial f16
+        // rounding exercise the round-trip.
+        let lhs: Vec<f32> = (0..64).map(|i| (i as f32) * 0.3 - 5.0).collect();
+        let rhs: Vec<f32> = (0..64).map(|i| 1.0 / (i as f32 + 1.7)).collect();
+        let a = Owned::f16(&[64], &lhs);
+        let b = Owned::f16(&[64], &rhs);
+        let mut fast = Owned::zeros(DataType::Float16, &[64]);
+        BinaryKernel { op: BinOp::Mul }
+            .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
+            .unwrap();
+        // Reference: reproduce the general per-element f16 compute directly.
+        let want: Vec<f32> = lhs
+            .iter()
+            .zip(&rhs)
+            .map(|(&x, &y)| {
+                half::f16::from_f32(half::f16::from_f32(x).to_f32() * half::f16::from_f32(y).to_f32())
+                    .to_f32()
+            })
+            .collect();
+        assert_eq!(fast.to_f16_as_f32(), want);
     }
 
     #[test]

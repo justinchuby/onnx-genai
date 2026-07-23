@@ -304,3 +304,15 @@ extern "C" void mlas_sgemm_packed(
         /*ThreadPool=*/nullptr,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
+
+// ---- Vectorized logistic (sigmoid) -----------------------------------------
+// Exposes MLAS's SIMD sigmoid so callers can build activations such as SiLU
+// (`x * sigmoid(x)`) on top of a battle-tested vectorized exp instead of a
+// scalar `expf` loop. Single-threaded: the caller drives any outer sharding.
+extern "C" void mlas_compute_logistic(
+    const float* input,
+    float* output,
+    size_t n)
+{
+    MlasComputeLogistic(input, output, n);
+}

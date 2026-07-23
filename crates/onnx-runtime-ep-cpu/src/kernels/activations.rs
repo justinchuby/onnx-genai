@@ -286,10 +286,31 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
     // pointers span n elements; the range check proves output does not alias input.
     let input = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), n) };
     let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
-    for (output, &input) in output.iter_mut().zip(input) {
-        *output = silu(input);
-    }
+    silu_f32_slice(input, output);
     true
+}
+
+/// SiLU (`x * sigmoid(x)`) over equal-length contiguous f32 slices.
+///
+/// With the `mlas` feature the sigmoid comes from MLAS's SIMD logistic (the same
+/// vectorized routine ORT's activations use), turning the hot MLP activation
+/// into two vectorized passes instead of a scalar `expf`/`exp` loop that LLVM
+/// cannot autovectorize. Without `mlas` we keep the scalar reference.
+fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
+    #[cfg(feature = "mlas")]
+    {
+        // output = sigmoid(input); then output *= input  =>  x * sigmoid(x).
+        mlas_sys::compute_logistic(input, output);
+        for (output, &input) in output.iter_mut().zip(input) {
+            *output *= input;
+        }
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        for (output, &input) in output.iter_mut().zip(input) {
+            *output = silu(input);
+        }
+    }
 }
 
 #[cfg(test)]
