@@ -20,6 +20,12 @@ enum ExecutionProvider {
     Cuda,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DecodeBackend {
+    Native,
+    Ort,
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Profile native nxrt token generation through the engine decode loop")]
 struct Args {
@@ -49,6 +55,9 @@ struct Args {
     decode_skip: usize,
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
     ep: ExecutionProvider,
+    /// Decoder implementation driven through the same engine generation loop.
+    #[arg(long, value_enum, default_value_t = DecodeBackend::Native)]
+    backend: DecodeBackend,
     #[arg(long, default_value = "Hello")]
     prompt: String,
     /// When set, capture an `onnx-runtime-tracer` timeline of a single traced
@@ -122,10 +131,15 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
 
     let mut config = EngineConfig {
-        decode_backend: EngineDecodeBackend::Native,
+        decode_backend: match args.backend {
+            DecodeBackend::Native => EngineDecodeBackend::Native,
+            DecodeBackend::Ort => EngineDecodeBackend::Ort,
+        },
         ..EngineConfig::default()
     };
-    config.native_device = Some(device);
+    if matches!(args.backend, DecodeBackend::Native) {
+        config.native_device = Some(device);
+    }
     let mut engine = Engine::from_dir(model_dir, config)
         .with_context(|| format!("load native engine {}", model_dir.display()))?;
 
@@ -136,6 +150,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
                 .context("steady warmup generation")?,
         );
     }
+    profile::reset();
 
     let mut prefills_ms = Vec::with_capacity(args.runs);
     let mut decode_ms_per_token = Vec::with_capacity(args.runs);
@@ -182,8 +197,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
 
     println!(
-        "steady_median: prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
+        "steady_median: backend={:?} prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
          (runs={} warmups={} decode_skip={})",
+        args.backend,
         median(&mut prefills_ms),
         median(&mut decode_ms_per_token),
         median(&mut throughputs),
@@ -193,6 +209,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     );
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
+    }
+    if profile::enabled() {
+        println!("{}", profile::report((args.tokens * args.runs) as u64));
     }
     Ok(())
 }

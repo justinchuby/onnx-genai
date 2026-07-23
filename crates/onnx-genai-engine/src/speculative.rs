@@ -1603,7 +1603,7 @@ impl Engine {
                 }
                 let finish_reason = commit_selected_token(
                     &mut commit_state,
-                    prompt_tokens,
+                    &prompt_tokens,
                     token_id,
                     options,
                     chain,

@@ -148,6 +148,7 @@ impl DecodeBackend for DecodeSession<'static> {
         token_ids: &[TokenId],
         past_len: usize,
     ) -> anyhow::Result<Option<u32>> {
+        let prepare_span = onnx_genai_ort::prof_span!("engine.ort_prepare_inputs");
         let total_len = past_len + token_ids.len();
         let input_ids = token_ids
             .iter()
@@ -157,6 +158,7 @@ impl DecodeBackend for DecodeSession<'static> {
         let position_ids = (past_len..total_len)
             .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        drop(prepare_span);
         let token = self.step_argmax(&input_ids, &attention_mask, &position_ids)?;
         Ok(Some(token))
     }
@@ -1182,6 +1184,7 @@ pub(crate) fn next_session_token_argmax(
     let input_len = input_tokens.len();
     let token = run_decode_session_argmax(&mut state.decode_state, &input_tokens, past_len)?
         .context("argmax-capable decode runner returned no token")?;
+    let _kv_span = onnx_genai_ort::prof_span!("engine.kv_bookkeeping");
     kv_cache
         .append(seq, input_len)
         .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;

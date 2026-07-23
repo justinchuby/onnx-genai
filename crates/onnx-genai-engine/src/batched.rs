@@ -292,7 +292,7 @@ impl<'a> ContinuousBatchManager<'a> {
         };
         let finish_reason = commit_selected_token(
             &mut row.state,
-            row.context_tokens.clone(),
+            &row.context_tokens,
             token_id,
             &row.options,
             &row.chain,
@@ -526,7 +526,7 @@ impl Engine {
 
                 let finish_reason = commit_selected_token(
                     &mut row.state,
-                    row.context_tokens.clone(),
+                    &row.context_tokens,
                     token_id,
                     &row.options,
                     &row.chain,

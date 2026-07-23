@@ -2265,8 +2265,8 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         self.context_tokens.len()
     }
 
-    fn processor_prompt_tokens(&self) -> Vec<TokenId> {
-        self.context_tokens.clone()
+    fn processor_prompt_tokens(&self) -> &[TokenId] {
+        &self.context_tokens
     }
 
     fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {

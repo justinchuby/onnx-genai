@@ -55,7 +55,7 @@ impl DecodeLoopState {
 
 pub(crate) trait DecodeLoopBackend {
     fn context_len(&self) -> usize;
-    fn processor_prompt_tokens(&self) -> Vec<TokenId>;
+    fn processor_prompt_tokens(&self) -> &[TokenId];
     fn next_logits(&mut self) -> anyhow::Result<Vec<f32>>;
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()>;
     /// Whether the backend can select the greedy (argmax) token internally,
@@ -102,6 +102,14 @@ pub(crate) fn run_decode_loop<B: DecodeLoopBackend>(
     max_context: Option<usize>,
     mut callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<GenerateResult> {
+    state.generated_tokens.reserve(
+        options
+            .max_new_tokens
+            .saturating_sub(state.generated_tokens.len()),
+    );
+    if let Some(logprobs) = state.logprobs.as_mut() {
+        logprobs.reserve(options.max_new_tokens.saturating_sub(logprobs.len()));
+    }
     while state.generated_tokens.len() < options.max_new_tokens {
         if let Some(result) = step_decode_loop(
             backend,
@@ -135,6 +143,7 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
     max_context: Option<usize>,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<GenerateResult>> {
+    let _step_span = onnx_genai_ort::prof_span!("loop.step");
     if reached_context_limit(backend.context_len(), max_context) {
         ensure_constrained_finish(options, &state.generated_text, FinishReason::Length)?;
         return finish_result(
@@ -189,11 +198,15 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
     }
 
     let mut host_token = |rng_value: Option<f32>| -> anyhow::Result<TokenId> {
-        let context = ProcessorContext {
-            prompt_tokens: backend.processor_prompt_tokens(),
-            generated_tokens: state.generated_tokens.clone(),
-            generated_text: state.generated_text.clone(),
-            step: state.step,
+        let context = if chain.is_empty() && state.custom_sampler.is_none() {
+            ProcessorContext::default()
+        } else {
+            ProcessorContext {
+                prompt_tokens: backend.processor_prompt_tokens().to_vec(),
+                generated_tokens: state.generated_tokens.clone(),
+                generated_text: state.generated_text.clone(),
+                step: state.step,
+            }
         };
         let mut logits = {
             let _span = onnx_genai_ort::prof_span!("loop.next_logits");
@@ -256,7 +269,7 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
 
 pub(crate) fn commit_selected_token(
     state: &mut DecodeLoopState,
-    prompt_tokens: Vec<TokenId>,
+    prompt_tokens: &[TokenId],
     token_id: TokenId,
     options: &GenerateOptions,
     chain: &ProcessorChain,
@@ -264,20 +277,29 @@ pub(crate) fn commit_selected_token(
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     state.generated_tokens.push(token_id);
-    let token_text = {
+    let token_text = if callback.is_some() || !chain.is_empty() {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         tokenizer
             .decode(&[token_id])
             .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?
+    } else {
+        String::new()
     };
-    state.generated_text.push_str(&token_text);
-    let context = ProcessorContext {
-        prompt_tokens,
-        generated_tokens: state.generated_tokens.clone(),
-        generated_text: state.generated_text.clone(),
-        step: state.step,
+    if !chain.is_empty() {
+        state.generated_text.push_str(&token_text);
+    }
+    let finish_reason = if chain.is_empty() {
+        (options.stop_on_eos && options.eos_token_id == Some(token_id))
+            .then_some(FinishReason::EosToken)
+    } else {
+        let context = ProcessorContext {
+            prompt_tokens: prompt_tokens.to_vec(),
+            generated_tokens: state.generated_tokens.clone(),
+            generated_text: state.generated_text.clone(),
+            step: state.step,
+        };
+        finish_reason_after_token(token_id, options, chain, &context)
     };
-    let finish_reason = finish_reason_after_token(token_id, options, chain, &context);
     if let Some(callback) = callback {
         callback(GenerateToken {
             token_id,
@@ -417,8 +439,8 @@ mod tests {
             self.committed.len() + 1
         }
 
-        fn processor_prompt_tokens(&self) -> Vec<TokenId> {
-            vec![0]
+        fn processor_prompt_tokens(&self) -> &[TokenId] {
+            &[0]
         }
 
         fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
@@ -593,6 +615,55 @@ mod tests {
         assert!(!result.token_ids.is_empty());
         assert_eq!(backend.sampled_attempts, 0);
         assert!(!backend.sampled_failed);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_processor_chain_preserves_final_and_streamed_text() -> anyhow::Result<()> {
+        let options = GenerateOptions {
+            max_new_tokens: 3,
+            greedy: true,
+            temperature: 0.0,
+            stop_on_eos: false,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, None)?;
+        assert!(chain.is_empty());
+        let tokenizer = tokenizer()?;
+
+        let mut plain_backend = MockBackend::new(false);
+        let mut plain_state = DecodeLoopState::new(0, options.seed, None);
+        let plain = run_decode_loop(
+            &mut plain_backend,
+            &mut plain_state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            None,
+        )?;
+
+        let mut streamed_ids = Vec::new();
+        let mut callback = |token: GenerateToken| {
+            streamed_ids.push(token.token_id);
+            assert!(!token.text.is_empty());
+            Ok(())
+        };
+        let mut streamed_backend = MockBackend::new(false);
+        let mut streamed_state = DecodeLoopState::new(0, options.seed, None);
+        let streamed = run_decode_loop(
+            &mut streamed_backend,
+            &mut streamed_state,
+            &options,
+            &chain,
+            &tokenizer,
+            None,
+            Some(&mut callback),
+        )?;
+
+        assert_eq!(plain.token_ids, streamed.token_ids);
+        assert_eq!(plain.text, streamed.text);
+        assert_eq!(streamed_ids, streamed.token_ids);
         Ok(())
     }
 }

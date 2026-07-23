@@ -14,7 +14,7 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1865,31 +1865,22 @@ fn cuda_kv_max_len_from_env() -> anyhow::Result<usize> {
     }
 }
 
-impl DecodeBackend for NativeDecodeSession {
-    fn current_len(&self) -> usize {
-        self.current_len
-    }
+enum NativeCpuDecodeResult {
+    Logits(Vec<Vec<f32>>),
+    Token(TokenId),
+}
 
-    fn max_context(&self) -> Option<usize> {
-        self.cuda.as_ref().map(|state| state.max_len)
-    }
-
-    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
-        if token_ids.is_empty() {
-            bail!("native decode requires at least one token");
-        }
-        if past_len != self.current_len {
-            bail!(
-                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
-                self.current_len
-            );
-        }
-        if self.cuda.is_some() {
-            return self.decode_cuda(token_ids, past_len);
-        }
+impl NativeDecodeSession {
+    fn decode_cpu(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        greedy: bool,
+    ) -> anyhow::Result<NativeCpuDecodeResult> {
         let total_len = past_len
             .checked_add(token_ids.len())
             .context("native decode context length overflow")?;
+        let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
         let ids = token_ids
             .iter()
             .map(|&id| i64::from(id))
@@ -1918,17 +1909,17 @@ impl DecodeBackend for NativeDecodeSession {
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
             .collect::<Vec<_>>();
-        // Single-token CPU decode: run the whole forward inside one decode-pool
-        // installation so the ~121 per-op `MatMulNBits` projections execute
-        // inline on resident workers instead of each re-installing the pool
-        // (eliminating the per-op fork-join crossing). Prefill (M>1) and the CUDA
-        // path (handled above) must keep using the global pool, so gate on M==1.
-        let run_result: anyhow::Result<_> = if token_ids.len() == 1 {
-            onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
+        drop(prepare_span);
+
+        let run_result: anyhow::Result<_> = {
+            let _run_span = onnx_genai_ort::prof_span!("native.session_run");
+            if token_ids.len() == 1 {
+                onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
+                    self.session.run(&bindings).map_err(anyhow::Error::from)
+                })
+            } else {
                 self.session.run(&bindings).map_err(anyhow::Error::from)
-            })
-        } else {
-            self.session.run(&bindings).map_err(anyhow::Error::from)
+            }
         };
         let outputs = match run_result {
             Ok(outputs) => outputs,
@@ -1937,52 +1928,134 @@ impl DecodeBackend for NativeDecodeSession {
                 bail!("native decoder forward pass failed{diagnosis}: {error}");
             }
         };
-        let names = self
-            .session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.clone())
-            .collect::<Vec<_>>();
-        let mut named = names.into_iter().zip(outputs).collect::<HashMap<_, _>>();
-        let logits = named
-            .remove(&self.logits)
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let logits = extract_logits(&logits)?;
-        if logits.iter().flatten().any(|value| !value.is_finite()) {
-            bail!("native decoder produced non-finite logits");
-        }
-        self.last_hidden = self
-            .hidden_output
-            .as_ref()
-            .map(|name| {
-                let tensor = named.remove(name).with_context(|| {
-                    format!("native decoder omitted declared hidden output '{name}'")
-                })?;
-                extract_last_row(&tensor)
-                    .with_context(|| format!("read native decoder hidden output '{name}'"))
-            })
-            .transpose()?;
 
-        let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
-        for (present, past) in &self.present_to_past {
-            let tensor = named
-                .remove(present)
-                .with_context(|| format!("native decoder omitted present output '{present}'"))?;
-            let seq_axis =
-                tensor.shape.len().checked_sub(2).with_context(|| {
-                    format!("native present tensor '{present}' rank is below 2")
-                })?;
-            if tensor.shape[seq_axis] != total_len {
-                bail!(
-                    "native present tensor '{present}' sequence length {} does not match {total_len}",
-                    tensor.shape[seq_axis]
-                );
-            }
-            next_past.insert(past.clone(), tensor);
+        let fetch_span = onnx_genai_ort::prof_span!("native.logits_fetch");
+        if outputs.len() != self.session.outputs().len() {
+            bail!(
+                "native decoder returned {} outputs, but the graph declares {}",
+                outputs.len(),
+                self.session.outputs().len()
+            );
         }
+        let mut logits = None;
+        let mut hidden = None;
+        let mut next_past = HashMap::with_capacity(self.kv_inputs.len());
+        for (metadata, tensor) in self.session.outputs().iter().zip(outputs) {
+            if metadata.name == self.logits {
+                logits = Some(tensor);
+            } else if self.hidden_output.as_deref() == Some(metadata.name.as_str()) {
+                hidden = Some(tensor);
+            } else if let Some(past) = self.present_to_past.get(&metadata.name) {
+                let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
+                    format!("native present tensor '{}' rank is below 2", metadata.name)
+                })?;
+                if tensor.shape[seq_axis] != total_len {
+                    bail!(
+                        "native present tensor '{}' sequence length {} does not match {total_len}",
+                        metadata.name,
+                        tensor.shape[seq_axis]
+                    );
+                }
+                next_past.insert(past.clone(), tensor);
+            }
+        }
+        let logits = logits
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        let result = if greedy {
+            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
+            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
+        } else {
+            let logits = extract_logits(&logits)?;
+            if logits.iter().flatten().any(|value| !value.is_finite()) {
+                bail!("native decoder produced non-finite logits");
+            }
+            NativeCpuDecodeResult::Logits(logits)
+        };
+        self.last_hidden = match (&self.hidden_output, hidden) {
+            (Some(name), Some(tensor)) => Some(
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
+            ),
+            (Some(name), None) => {
+                bail!("native decoder omitted declared hidden output '{name}'")
+            }
+            (None, _) => None,
+        };
+        for (present, past) in &self.present_to_past {
+            if !next_past.contains_key(past) {
+                bail!("native decoder omitted present output '{present}'");
+            }
+        }
+        drop(fetch_span);
+
+        let _kv_span = onnx_genai_ort::prof_span!("native.kv_update");
         self.past = next_past;
         self.current_len = total_len;
-        Ok(logits)
+        Ok(result)
+    }
+}
+
+impl DecodeBackend for NativeDecodeSession {
+    fn current_len(&self) -> usize {
+        self.current_len
+    }
+
+    fn max_context(&self) -> Option<usize> {
+        self.cuda.as_ref().map(|state| state.max_len)
+    }
+
+    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
+        if token_ids.is_empty() {
+            bail!("native decode requires at least one token");
+        }
+        if past_len != self.current_len {
+            bail!(
+                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
+                self.current_len
+            );
+        }
+        if self.cuda.is_some() {
+            return self.decode_cuda(token_ids, past_len);
+        }
+        match self.decode_cpu(token_ids, past_len, false)? {
+            NativeCpuDecodeResult::Logits(logits) => Ok(logits),
+            NativeCpuDecodeResult::Token(_) => unreachable!("logits decode requested"),
+        }
+    }
+
+    fn decode_argmax(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Option<u32>> {
+        if token_ids.is_empty() {
+            bail!("native decode requires at least one token");
+        }
+        if past_len != self.current_len {
+            bail!(
+                "native decode past length mismatch: caller supplied {past_len}, adapter holds {}",
+                self.current_len
+            );
+        }
+        if self.cuda.is_some() {
+            if token_ids.len() == 1 {
+                return self.decode_cuda_greedy(token_ids[0], past_len).map(Some);
+            }
+            let token = self
+                .decode_cuda(token_ids, past_len)?
+                .pop()
+                .map(|logits| sample_greedy(&logits))
+                .context("native CUDA decoder produced no logits")?;
+            return Ok(Some(token));
+        }
+        match self.decode_cpu(token_ids, past_len, true)? {
+            NativeCpuDecodeResult::Token(token) => Ok(Some(token)),
+            NativeCpuDecodeResult::Logits(_) => unreachable!("greedy token decode requested"),
+        }
+    }
+
+    fn supports_argmax(&self) -> bool {
+        true
     }
 
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
@@ -2048,8 +2121,8 @@ impl DecodeLoopBackend for NativeLoopAdapter<'_> {
         self.session.current_len() + self.pending_tokens.len()
     }
 
-    fn processor_prompt_tokens(&self) -> Vec<TokenId> {
-        self.prompt_tokens.clone()
+    fn processor_prompt_tokens(&self) -> &[TokenId] {
+        &self.prompt_tokens
     }
 
     fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
@@ -2061,19 +2134,26 @@ impl DecodeLoopBackend for NativeLoopAdapter<'_> {
     }
 
     fn greedy_fastpath_supported(&self) -> bool {
-        self.session
-            .cuda
-            .as_ref()
-            .is_some_and(DecodeCudaState::greedy_fastpath_supported)
+        self.session.cuda.is_none()
+            || self
+                .session
+                .cuda
+                .as_ref()
+                .is_some_and(DecodeCudaState::greedy_fastpath_supported)
     }
 
     fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
         if self.pending_tokens.len() != 1 {
-            return Ok(sample_greedy(&self.next_logits()?));
+            let past_len = self.session.current_len();
+            return self
+                .session
+                .decode_argmax(&self.pending_tokens, past_len)?
+                .context("native decoder did not return an argmax token");
         }
         let past_len = self.session.current_len();
         self.session
-            .decode_cuda_greedy(self.pending_tokens[0], past_len)
+            .decode_argmax(&self.pending_tokens, past_len)?
+            .context("native decoder did not return an argmax token")
     }
 
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
@@ -2200,6 +2280,135 @@ fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
             .collect()),
         shape => bail!("unsupported logits tensor shape: {shape:?}"),
     }
+}
+
+fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
+    let (value_count, vocab) = match tensor.shape.as_slice() {
+        [vocab] if *vocab > 0 => (*vocab, *vocab),
+        [seq, vocab] if *seq > 0 && *vocab > 0 => (seq * vocab, *vocab),
+        [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => (seq * vocab, *vocab),
+        shape => bail!("unsupported logits tensor shape: {shape:?}"),
+    };
+    let row_start = value_count - vocab;
+    let mut best = f32::NEG_INFINITY;
+    let mut best_index = 0;
+    let mut seen = 0;
+    let mut visit = |value: f32| -> anyhow::Result<()> {
+        if !value.is_finite() {
+            bail!("native decoder produced non-finite logits");
+        }
+        if seen >= row_start && value > best {
+            best = value;
+            best_index = seen - row_start;
+        }
+        seen += 1;
+        Ok(())
+    };
+    match tensor.dtype {
+        DataType::Float32 => {
+            if let Some(values) = tensor.try_as_slice_f32() {
+                if values.len() < value_count {
+                    bail!(
+                        "native logits tensor shape {:?} requires {value_count} values, but only {} were readable",
+                        tensor.shape,
+                        values.len()
+                    );
+                }
+                let values = &values[..value_count];
+                if values.iter().any(|value| !value.is_finite()) {
+                    bail!("native decoder produced non-finite logits");
+                }
+                return Ok(sample_greedy(&values[row_start..]) as TokenId);
+            }
+            for bytes in tensor.as_bytes().chunks_exact(4).take(value_count) {
+                visit(f32::from_le_bytes(
+                    bytes.try_into().expect("four-byte chunk"),
+                ))?;
+            }
+        }
+        DataType::Float16 => {
+            if let Some(bits) = tensor.try_as_slice_u16() {
+                use half::slice::HalfBitsSliceExt;
+                let halves: &[half::f16] = bits.reinterpret_cast();
+                return argmax_finite_half_values(halves, value_count, row_start)
+                    .map(|index| index as TokenId);
+            }
+            for bytes in tensor.as_bytes().chunks_exact(2).take(value_count) {
+                visit(f16_to_f32(u16::from_le_bytes(
+                    bytes.try_into().expect("two-byte chunk"),
+                )))?;
+            }
+        }
+        DataType::BFloat16 => {
+            if let Some(bits) = tensor.try_as_slice_u16() {
+                use half::slice::HalfBitsSliceExt;
+                let halves: &[half::bf16] = bits.reinterpret_cast();
+                return argmax_finite_half_values(halves, value_count, row_start)
+                    .map(|index| index as TokenId);
+            }
+            for bytes in tensor.as_bytes().chunks_exact(2).take(value_count) {
+                visit(f32::from_bits(
+                    u32::from(u16::from_le_bytes(
+                        bytes.try_into().expect("two-byte chunk"),
+                    )) << 16,
+                ))?;
+            }
+        }
+        dtype => bail!("native logits must be Float32, Float16, or BFloat16, got {dtype:?}"),
+    }
+    if seen != value_count {
+        bail!(
+            "native logits tensor shape {:?} requires {value_count} values, but only {seen} were readable",
+            tensor.shape
+        );
+    }
+    Ok(best_index as TokenId)
+}
+
+fn argmax_finite_half_values<H>(
+    halves: &[H],
+    value_count: usize,
+    row_start: usize,
+) -> anyhow::Result<usize>
+where
+    [H]: half::slice::HalfFloatSliceExt,
+{
+    use half::slice::HalfFloatSliceExt;
+
+    if halves.len() < value_count {
+        bail!(
+            "native logits tensor requires {value_count} values, but only {} were readable",
+            halves.len()
+        );
+    }
+    const CHUNK: usize = 4096;
+    let mut scratch = [0.0f32; CHUNK];
+    let mut best = f32::NEG_INFINITY;
+    let mut best_index = 0;
+    for (chunk_index, chunk) in halves[..value_count].chunks(CHUNK).enumerate() {
+        let widened = &mut scratch[..chunk.len()];
+        chunk.convert_to_f32_slice(widened);
+        if widened.iter().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
+        let chunk_start = chunk_index * CHUNK;
+        let candidate_start = row_start.saturating_sub(chunk_start).min(chunk.len());
+        if candidate_start == chunk.len() {
+            continue;
+        }
+        let candidates = &widened[candidate_start..];
+        let chunk_max = candidates.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if chunk_max > best {
+            best = chunk_max;
+            best_index = chunk_start
+                + candidate_start
+                + candidates
+                    .iter()
+                    .position(|&value| value == chunk_max)
+                    .expect("finite non-empty chunk has a maximum");
+        }
+    }
+    Ok(best_index - row_start)
 }
 
 fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
@@ -2362,6 +2571,29 @@ mod tests {
     use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
     use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
     use prost::Message;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn tensor_argmax_reads_only_the_final_logits_row_and_keeps_first_tie() {
+        let tensor =
+            Tensor::from_f32(&[1, 2, 4], &[100.0, 0.0, 0.0, 0.0, 1.0, 7.0, 7.0, 2.0]).unwrap();
+        assert_eq!(argmax_logits_tensor(&tensor).unwrap(), 1);
+    }
+
+    #[test]
+    fn tensor_argmax_matches_across_supported_logits_dtypes() {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let tensor = tensor_from_f32_as(dtype, &[1, 4], &[-2.0, 3.0, 1.0, 0.0]).unwrap();
+            assert_eq!(argmax_logits_tensor(&tensor).unwrap(), 1, "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn tensor_argmax_rejects_non_finite_logits_like_full_extraction() {
+        let tensor = Tensor::from_f32(&[1, 3], &[0.0, f32::NAN, 1.0]).unwrap();
+        let error = argmax_logits_tensor(&tensor).unwrap_err().to_string();
+        assert!(error.contains("non-finite logits"), "{error}");
+    }
 
     #[test]
     fn graph_capture_auto_enables_for_owned_cuda_kv() {

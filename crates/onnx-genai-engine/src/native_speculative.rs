@@ -269,7 +269,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 let token = sample_greedy(&base_logits);
                 if let Some(reason) = commit_selected_token(
                     &mut state,
-                    prompt_tokens.to_vec(),
+                    prompt_tokens,
                     token,
                     options,
                     chain,
@@ -356,7 +356,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 }
                 if let Some(reason) = commit_selected_token(
                     &mut state,
-                    prompt_tokens.to_vec(),
+                    prompt_tokens,
                     token,
                     options,
                     chain,

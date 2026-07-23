@@ -2246,8 +2246,8 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         self.state.tokens.len()
     }
 
-    fn processor_prompt_tokens(&self) -> Vec<TokenId> {
-        self.state.tokens.clone()
+    fn processor_prompt_tokens(&self) -> &[TokenId] {
+        &self.state.tokens
     }
 
     fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
