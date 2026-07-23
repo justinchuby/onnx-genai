@@ -3582,6 +3582,154 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mlas")]
+    const MLAS_SHARD_PARITY_CHILD_ENV: &str = "NXRT_MLAS_SHARD_PARITY_CHILD";
+    #[cfg(feature = "mlas")]
+    const MLAS_SHARD_PARITY_MARKER: &str = "NXRT_MLAS_SHARD_PARITY_BYTES=";
+
+    #[cfg(feature = "mlas")]
+    fn mlas_shard_parity_child_output(no_shard: bool) -> Vec<f32> {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::mlas_sharded_decode_parity_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(MLAS_SHARD_PARITY_CHILD_ENV, "1")
+            .env(DECODE_THREADS_ENV, "3")
+            .env("RAYON_NUM_THREADS", "3")
+            .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if no_shard {
+            command.env("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD", "1");
+        } else {
+            command.env_remove("ONNX_GENAI_CPU_MM_MLAS_NO_SHARD");
+        }
+        let output = command
+            .output()
+            .expect("run MLAS-shard parity child process");
+        assert!(
+            output.status.success(),
+            "MLAS-shard parity child failed (no_shard={no_shard}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("child output is UTF-8");
+        let encoded = stdout
+            .lines()
+            .find_map(|line| {
+                line.find(MLAS_SHARD_PARITY_MARKER)
+                    .map(|index| &line[index + MLAS_SHARD_PARITY_MARKER.len()..])
+            })
+            .expect("child emitted MLAS-shard parity bytes");
+        assert_eq!(encoded.len() % 8, 0);
+        encoded
+            .as_bytes()
+            .chunks_exact(8)
+            .map(|hex| {
+                let hex = std::str::from_utf8(hex).unwrap();
+                f32::from_bits(u32::from_str_radix(hex, 16).unwrap())
+            })
+            .collect()
+    }
+
+    /// Isolated child so the persistent-pool and `NO_SHARD` one-time env gates
+    /// are initialized independently. This exercises the actual cached
+    /// `mlas_shards` + SPMD-scope route, not a manually assembled shard proxy.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_sharded_decode_parity_subprocess() {
+        if std::env::var(MLAS_SHARD_PARITY_CHILD_ENV).is_err() {
+            return;
+        }
+
+        let (n, k, block_size) = (97usize, 256usize, 64usize);
+        let pool = crate::decode_spmd::pools().expect("forced persistent SPMD pool");
+        let segments = pool.output_column_segments(n);
+        assert_eq!(
+            segments.len(),
+            3,
+            "child requested three persistent workers"
+        );
+        assert_eq!(segments.iter().map(|&(_, len)| len).sum::<usize>(), n);
+        assert!(
+            segments.windows(2).any(|pair| pair[0].1 != pair[1].1),
+            "N={n} must create uneven worker output-column segments: {segments:?}"
+        );
+
+        let blocks = k.div_ceil(block_size);
+        let weights_nk = pseudo(n * k, 0.3);
+        let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed_bytes);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        let kernel = test_kernel(k, n, block_size);
+        let activation = pseudo(k, 0.8);
+        let mut output = vec![0.0f32; n];
+
+        let served = with_decode_pool_scope(|| {
+            assert!(
+                spmd_decode_active().is_some(),
+                "the actual MLAS call must run inside the persistent SPMD scope"
+            );
+            kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    None,
+                    None,
+                    true,
+                    &activation,
+                    1,
+                    None,
+                    &mut output,
+                )
+                .unwrap()
+        });
+        assert_eq!(served, Some(()), "MLAS CompFp32 must serve this decode");
+
+        if mlas_no_shard() {
+            assert!(
+                kernel.mlas_shards.get().is_none(),
+                "NO_SHARD must select the full-width MLAS call"
+            );
+        } else {
+            let shards = kernel
+                .mlas_shards
+                .get()
+                .expect("the cached sharded MLAS route must be populated")
+                .as_ref()
+                .expect("MLAS packed every worker shard");
+            assert_eq!(shards.len(), segments.len());
+            assert!(
+                shards.iter().flatten().count() > 1,
+                "the cached route must contain multiple real MLAS shards"
+            );
+        }
+
+        let encoded: String = output
+            .iter()
+            .map(|value| format!("{:08x}", value.to_bits()))
+            .collect();
+        println!("{MLAS_SHARD_PARITY_MARKER}{encoded}");
+    }
+
+    /// Chew #2: the real cached SPMD MLAS-shard decode route must agree with
+    /// the `NO_SHARD=1` full-width route. MLAS may change a result by ~1 ULP at
+    /// a SIMD N-tile boundary, so use the same 1e-3 tolerance as mlas-sys'
+    /// direct sharded-vs-full parity invariant.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_sharded_decode_matches_no_shard_full_width() {
+        let sharded = mlas_shard_parity_child_output(false);
+        let full_width = mlas_shard_parity_child_output(true);
+        mlas_close(
+            &sharded,
+            &full_width,
+            1e-3,
+            "cached SPMD MLAS shards vs NO_SHARD full-width decode",
+        );
+    }
+
     const AFFINITY_DEFER_CHILD_ENV: &str = "NXRT_AFFINITY_DEFER_CHILD";
     const AFFINITY_DEFER_MARKER: &str = "NXRT_AFFINITY_DEFER=";
 
