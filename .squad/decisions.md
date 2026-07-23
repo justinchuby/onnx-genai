@@ -3349,3 +3349,14 @@ New 0.5B per-op steady: **MatMulNBits ~82%, GroupQueryAttention ~14%** (was 54%)
 **What:** Benchmarked foundry-local CPU decode with persistent SPMD left as the default. Qwen 2.5 Coder 7B generic-cpu ran at 28.62 tok/s native versus 21.00 tok/s ORT GenAI 0.14.1 CPU (1.36x native). Qwen 3.5 9B generic-cpu ran in ORT at 13.63 tok/s but cannot be loaded by this native checkout: direct loading sees multiple ONNX files and compatibility pipeline loading rejects unspecified smart-resize semantics.
 
 **Why:** The available evidence confirms the default native win on one fair generic-cpu model, but does not support a cross-two-model generality claim until the Qwen 3.5 multimodal package has complete native pipeline metadata/support. CUDA-export f16-GQA models were recorded separately as a native CPU follow-up; ORT CPU could not load them because its CUDA interface library was absent.
+
+<!-- scribe-merge-2026-07-23T05-00-00Z-f16-widen-parity-tests -->
+## 2026-07-23 — f16 GQA lazy-widen parity closure
+
+**What:** The f16 GQA lazy-widen optimization in `eedbf93` now has bit-exact old-versus-new parity coverage, merged to main as `80b09c3`. The multistep test compares production lazy per-head widening with the former eager full-f16-cache-to-f32 reference. An independent no-tail-with-past assertion hand-assembles expected f16 present K/V bits, covering the uninitialized `set_len` fast path with nonempty past cache.
+
+**Why:** Chew rejected the initial parity test because its no-tail case only exercised an empty past cache and shared present construction with the reference. The independent assertion catches skipped writes, incorrect offsets, and read-before-write defects that shared logic could mask. Chew subsequently approved.
+
+**Sources reconciled:** `pris-f16-widen-parity-test.md` and `gaff-notail-widen-test.md`.
+
+Decision archive gate checked at 2026-07-23T05:00:00Z: the active ledger was 266888 bytes before this entry. No dated ledger entries older than 2026-06-23T05:00:00Z were present, so no archive was created or updated.
