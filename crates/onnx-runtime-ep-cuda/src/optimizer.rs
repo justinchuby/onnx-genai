@@ -78,11 +78,267 @@ pub(crate) struct CudaSwiGluFusion;
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaFoldConstantTranspose),
+        // Runs before the fusions so they see the fp16-native normalization
+        // form (no `Cast` wrappers) that the rest of the pipeline expects.
+        Box::new(CudaDropNormalizationCasts),
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
         Box::new(CudaSkipRmsNormMatMulFusion),
     ]
+}
+
+/// Drop the redundant `Cast` pairs that some exporters (e.g. Phi-4-mini) wrap
+/// around every simplified-layer-norm, running the norm directly on its fp16
+/// activations instead.
+///
+/// ## The pattern
+///
+/// Certain decoders export each `SimplifiedLayerNormalization` /
+/// `SkipSimplifiedLayerNormalization` in fp32: each fp16 activation input is
+/// preceded by a `Cast(fp16 → fp32)`, and each fp32 result is followed by a
+/// `Cast(fp32 → fp16)` back to the residual stream. A 32-layer decoder emits
+/// ~256 of these tiny `Cast` kernels per token — a per-token launch/round-trip
+/// cost that is pure overhead. Models like Qwen2.5 instead run the same norm in
+/// fp16 with **no** surrounding casts.
+///
+/// ## Where the win lands
+///
+/// Removing the casts shrinks the graph and drops hundreds of kernels per
+/// token, but the throughput benefit is concentrated in the **eager** decode
+/// path, where each removed kernel is a saved launch. Measured on Phi-4-mini
+/// (H200): eager decode improves ~25 %. When the decode step is CUDA-graph
+/// captured (Phi's production path, zero fallbacks), replay already amortizes
+/// per-kernel launch overhead, so the captured-path decode throughput is flat
+/// (within run-to-run noise). The pass is still net-positive there — fewer
+/// kernels, a smaller captured graph, and a real prefill/eager win — but it is
+/// not the lever that closes Phi's captured-path gap to ORT (that is
+/// GroupQueryAttention, tracked separately).
+///
+/// ## The rewrite
+///
+/// For a matching norm this pass rewires each activation input to the fp16
+/// value feeding its `Cast`, retypes the consumed norm outputs to fp16, and
+/// bypasses/deletes the surrounding `Cast` nodes. The CUDA norm kernels already
+/// accept fp16 activations with fp32 accumulation (and either fp16 or fp32
+/// `gamma`), so the fp32 scale weight is left untouched — the arithmetic is the
+/// same fp32-accumulate / fp16-rounded scheme those kernels use for natively
+/// fp16 models such as Qwen2.5.
+///
+/// ## Generality and safety
+///
+/// The rewrite is driven purely by topology + tensor dtypes, never by model
+/// identity:
+/// * the node is a simplified-layer-norm in its expected domain;
+/// * every activation data input is produced by a `Cast(→ fp32)` whose source
+///   is fp16 (weights are producer-less initializers, so they never match and
+///   are left alone);
+/// * every consumed norm output feeds only `Cast(→ fp16)` nodes and is not a
+///   graph output;
+/// * an optional norm bias is required absent (kept conservative).
+///
+/// When any condition fails the norm is left exactly as exported. Input `Cast`
+/// nodes are deleted only once they are provably orphaned, so a `Cast` shared
+/// with another consumer stays intact.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaDropNormalizationCasts;
+
+/// Environment opt-out for [`CudaDropNormalizationCasts`], mirroring the other
+/// CUDA-fusion switches. Any value other than unset/empty/`0` restores the
+/// exact exported cast-wrapped normalization form (for A/B measurement or
+/// rollback).
+const NORM_CAST_FOLD_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD";
+
+fn norm_cast_fold_disabled() -> bool {
+    std::env::var_os(NORM_CAST_FOLD_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// A planned rewrite of one cast-wrapped normalization node.
+struct NormCastFoldPlan {
+    node_id: NodeId,
+    /// Full input vector with each fp16-cast activation input rewired to the
+    /// pre-cast fp16 source value.
+    new_inputs: Vec<Option<ValueId>>,
+    /// Norm outputs to retype from fp32 to fp16 (the consumed float results).
+    retyped_outputs: Vec<ValueId>,
+    /// `(cast_output, norm_output, cast_node)` triples: downstream uses of
+    /// `cast_output` are moved onto `norm_output` and the `Cast` is deleted.
+    output_cast_bypass: Vec<(ValueId, ValueId, NodeId)>,
+    /// Input `Cast` nodes to delete once they are left with no consumers.
+    dead_input_casts: Vec<NodeId>,
+}
+
+impl OptimizationPass for CudaDropNormalizationCasts {
+    fn name(&self) -> &str {
+        "CudaDropNormalizationCasts"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if norm_cast_fold_disabled() {
+            return Ok(());
+        }
+        // Fold one norm at a time, re-planning against the live graph. Adjacent
+        // layers share a residual `Cast`, so folding one layer moves the value
+        // its neighbour's plan referenced; re-planning after every rewrite keeps
+        // every source value current. Each fold deletes at least one `Cast`, so
+        // the loop strictly shrinks the graph and always terminates.
+        let mut changed = false;
+        loop {
+            let candidates: Vec<NodeId> = graph
+                .nodes
+                .iter()
+                .filter_map(|(id, node)| Self::activation_input_indices(node).map(|_| id))
+                .collect();
+            let Some(plan) = candidates
+                .into_iter()
+                .find_map(|id| self.plan_fold(graph, id))
+            else {
+                break;
+            };
+            self.apply_fold(graph, plan);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaDropNormalizationCasts {
+    fn apply_fold(&self, graph: &mut Graph, plan: NormCastFoldPlan) {
+        // 1. Rewire the norm onto its pre-cast fp16 activation inputs.
+        let mut node = graph.node(plan.node_id).clone();
+        node.inputs = plan.new_inputs;
+        graph.replace_node(plan.node_id, node);
+
+        // 2. Retype the consumed float outputs to fp16 to match the inputs.
+        for output in plan.retyped_outputs {
+            graph.value_mut(output).dtype = DataType::Float16;
+        }
+
+        // 3. Bypass and delete the output `Cast` nodes.
+        for (cast_output, norm_output, cast_id) in plan.output_cast_bypass {
+            graph.replace_all_uses(cast_output, norm_output);
+            graph.remove_node(cast_id);
+        }
+
+        // 4. Delete the input `Cast` nodes that are now orphaned.
+        for cast_id in plan.dead_input_casts {
+            if let Some(cast) = graph.try_node(cast_id) {
+                let cast_output = *cast.outputs.first().expect("Cast has one output");
+                if graph.consumers(cast_output).is_empty()
+                    && !graph.value(cast_output).is_graph_output
+                {
+                    graph.remove_node(cast_id);
+                }
+            }
+        }
+    }
+}
+
+impl CudaDropNormalizationCasts {
+    /// The activation (non-weight) input indices for a supported simplified
+    /// layer-norm, or `None` if the node is not one. `SkipSimplified*` takes
+    /// `(input, skip, gamma[, bias])`; the plain `Simplified*` takes
+    /// `(X, scale)`. Only the data inputs are candidates for un-casting; the
+    /// weight (`gamma` / `scale`) and any bias are producer-less initializers.
+    fn activation_input_indices(node: &onnx_runtime_ir::Node) -> Option<&'static [usize]> {
+        match (node.op_type.as_str(), node.domain.as_str()) {
+            ("SkipSimplifiedLayerNormalization", MICROSOFT_DOMAIN) => Some(&[0, 1]),
+            ("SimplifiedLayerNormalization", "" | "ai.onnx") => Some(&[0]),
+            _ => None,
+        }
+    }
+
+    /// If `value` is produced by a `Cast(fp16 → fp32)`, return the `Cast` node
+    /// and its fp16 source value.
+    fn fp32_cast_from_fp16(&self, graph: &Graph, value: ValueId) -> Option<(NodeId, ValueId)> {
+        let producer = graph.try_value(value)?.producer?;
+        let node = graph.try_node(producer)?;
+        if node.op_type != "Cast" || !matches!(node.domain.as_str(), "" | "ai.onnx") {
+            return None;
+        }
+        if cast_target(node)? != DataType::Float32 {
+            return None;
+        }
+        let source = node.inputs.first().copied().flatten()?;
+        if graph.try_value(source)?.dtype != DataType::Float16 {
+            return None;
+        }
+        Some((producer, source))
+    }
+
+    fn plan_fold(&self, graph: &Graph, node_id: NodeId) -> Option<NormCastFoldPlan> {
+        let node = graph.try_node(node_id)?;
+        let activation_indices = Self::activation_input_indices(node)?;
+
+        // A norm bias (index 3 for the skip form) is left conservatively alone.
+        if node.op_type == "SkipSimplifiedLayerNormalization"
+            && node.inputs.get(3).copied().flatten().is_some()
+        {
+            return None;
+        }
+
+        // Every activation input must be a fp16 → fp32 `Cast`; rewire it to the
+        // fp16 source.
+        let mut new_inputs = node.inputs.clone();
+        let mut dead_input_casts = Vec::new();
+        for &index in activation_indices {
+            let value = node.inputs.get(index).copied().flatten()?;
+            let (cast_id, source) = self.fp32_cast_from_fp16(graph, value)?;
+            new_inputs[index] = Some(source);
+            dead_input_casts.push(cast_id);
+        }
+
+        // Every consumed float output must feed only `Cast(→ fp16)` nodes.
+        let mut retyped_outputs = Vec::new();
+        let mut output_cast_bypass = Vec::new();
+        for &output in &node.outputs {
+            if graph.value(output).is_graph_output {
+                return None;
+            }
+            let consumers = graph.consumers(output);
+            if consumers.is_empty() {
+                continue;
+            }
+            for consumer in &consumers {
+                let cast = graph.try_node(*consumer)?;
+                if cast.op_type != "Cast" || !matches!(cast.domain.as_str(), "" | "ai.onnx") {
+                    return None;
+                }
+                if cast_target(cast)? != DataType::Float16 {
+                    return None;
+                }
+                let cast_output = *cast.outputs.first()?;
+                output_cast_bypass.push((cast_output, output, *consumer));
+            }
+            retyped_outputs.push(output);
+        }
+
+        // The primary (normalized) output must actually be one we retyped; the
+        // kernel requires the output dtype to match the fp16 input dtype.
+        let primary = *node.outputs.first()?;
+        if !retyped_outputs.contains(&primary) {
+            return None;
+        }
+
+        Some(NormCastFoldPlan {
+            node_id,
+            new_inputs,
+            retyped_outputs,
+            output_cast_bypass,
+            dead_input_casts,
+        })
+    }
+}
+
+/// Read a `Cast` node's `to` attribute as a [`DataType`].
+fn cast_target(node: &onnx_runtime_ir::Node) -> Option<DataType> {
+    let raw = node.attr("to").and_then(Attribute::as_int)?;
+    DataType::from_onnx(raw as i32)
 }
 
 /// Fold a `Transpose` whose sole input is a constant initializer (weight) into
@@ -750,7 +1006,11 @@ impl CudaSkipRmsNormMatMulFusion {
         }
 
         let preceding = graph.node(preceding_id);
-        let preceding_inputs = [preceding.inputs[0]?, preceding.inputs[1]?, preceding.inputs[2]?];
+        let preceding_inputs = [
+            preceding.inputs[0]?,
+            preceding.inputs[1]?,
+            preceding.inputs[2]?,
+        ];
 
         // The normalized output must feed at least one, and only, prologue-capable
         // following GEMV(s).
@@ -881,7 +1141,8 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return false;
         }
-        if node.attr("block_size").and_then(Attribute::as_int) != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
+        if node.attr("block_size").and_then(Attribute::as_int)
+            != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
         {
             return false;
         }
@@ -2143,7 +2404,11 @@ mod tests {
         // and its activation input is now the preceding residual sum.
         let post_out = value_id_by_name(&graph, "post_out");
         let following = node_producing(&graph, post_out);
-        assert_eq!(following.inputs[0], Some(pre_out), "activation is residual sum");
+        assert_eq!(
+            following.inputs[0],
+            Some(pre_out),
+            "activation is residual sum"
+        );
         assert_eq!(following.inputs.get(6).copied().flatten(), Some(gamma));
         assert_eq!(
             following
@@ -2221,9 +2486,7 @@ mod tests {
         let skip_id = graph
             .nodes
             .iter()
-            .find_map(|(id, n)| {
-                (n.op_type == "SkipSimplifiedLayerNormalization").then_some(id)
-            })
+            .find_map(|(id, n)| (n.op_type == "SkipSimplifiedLayerNormalization").then_some(id))
             .unwrap();
         let mut skip = graph.node(skip_id).clone();
         skip.inputs.push(Some(bias));
@@ -2637,7 +2900,10 @@ mod tests {
                 .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
             "both chained norms must fold"
         );
-        assert!(graph.validate().is_ok(), "no dangling shared residual value");
+        assert!(
+            graph.validate().is_ok(),
+            "no dangling shared residual value"
+        );
 
         // Block 1's preceding GEMV folds the *redirected* residual: sum0 became
         // block 0's preceding output (pre0_out), so pre1 must fold pre0_out.
@@ -2649,5 +2915,351 @@ mod tests {
             Some(pre0_out),
             "block 1 folds the redirected residual (block 0's preceding output)"
         );
+    }
+
+    /// Build a `Cast(input) -> output` node and return the fresh output value.
+    fn cast_node(
+        graph: &mut Graph,
+        name: &str,
+        input: ValueId,
+        to: DataType,
+        width: usize,
+    ) -> ValueId {
+        let out = value(graph, name, to, width);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(input)], vec![out]);
+        node.attributes
+            .insert("to".into(), Attribute::Int(to as i64));
+        graph.insert_node(node);
+        out
+    }
+
+    /// A `SkipSimplifiedLayerNormalization` exported in fp32 with a `Cast` on
+    /// every fp16 activation input and every fp32 result (the Phi-4-mini shape).
+    /// The `gamma` weight stays fp32. Returns the graph plus the pre-cast fp16
+    /// activation values and the fp32 gamma so tests can assert the rewiring.
+    fn cast_wrapped_skip_norm_graph(hidden: usize) -> (Graph, ValueId, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let residual = value(&mut graph, "residual", DataType::Float16, hidden);
+        let mm = value(&mut graph, "mm", DataType::Float16, hidden);
+        graph.add_input(residual);
+        graph.add_input(mm);
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float32, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![hidden],
+                vec![0u8; hidden * 4],
+            )),
+        );
+
+        let in0 = cast_node(&mut graph, "in0", residual, DataType::Float32, hidden);
+        let in1 = cast_node(&mut graph, "in1", mm, DataType::Float32, hidden);
+        let norm_out = value(&mut graph, "norm_out", DataType::Float32, hidden);
+        let sum_out = value(&mut graph, "sum_out", DataType::Float32, hidden);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(in0), Some(in1), Some(gamma)],
+            vec![norm_out, sum_out],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        skip.attributes
+            .insert("epsilon".into(), Attribute::Float(1e-5));
+        graph.insert_node(skip);
+
+        let normalized = cast_node(
+            &mut graph,
+            "normalized",
+            norm_out,
+            DataType::Float16,
+            hidden,
+        );
+        let residual_out = cast_node(
+            &mut graph,
+            "residual_out",
+            sum_out,
+            DataType::Float16,
+            hidden,
+        );
+        graph.add_output(normalized);
+        graph.add_output(residual_out);
+        (graph, residual, mm, gamma)
+    }
+
+    #[test]
+    fn drops_casts_around_fp32_wrapped_skip_norm() {
+        let hidden = 128;
+        let (mut graph, residual, mm, gamma) = cast_wrapped_skip_norm_graph(hidden);
+
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Every wrapping Cast is gone.
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "all cast wrappers must be removed"
+        );
+
+        // The norm now reads its fp16 activations directly and keeps fp32 gamma.
+        let skip = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SkipSimplifiedLayerNormalization")
+            .expect("norm node retained");
+        assert_eq!(
+            skip.inputs,
+            vec![Some(residual), Some(mm), Some(gamma)],
+            "activation inputs rewired to fp16 sources; gamma untouched"
+        );
+        // Its consumed float outputs are retyped to fp16, matching the inputs.
+        for &out in &skip.outputs {
+            assert_eq!(graph.value(out).dtype, DataType::Float16);
+        }
+        // The fp32 gamma weight is preserved (kernel upcasts it internally).
+        assert_eq!(graph.value(gamma).dtype, DataType::Float32);
+        // Graph outputs are now the norm's fp16 outputs.
+        assert_eq!(graph.outputs.len(), 2);
+        for &out in &graph.outputs {
+            assert_eq!(graph.value(out).dtype, DataType::Float16);
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_native_fp16_skip_norm_untouched() {
+        // A norm already exported in fp16 (no cast wrappers, like Qwen2.5) must
+        // be left byte-for-byte unchanged.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+        let residual = value(&mut graph, "residual", DataType::Float16, hidden);
+        let mm = value(&mut graph, "mm", DataType::Float16, hidden);
+        graph.add_input(residual);
+        graph.add_input(mm);
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float16, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![hidden],
+                vec![0u8; hidden * 2],
+            )),
+        );
+        let norm_out = value(&mut graph, "norm_out", DataType::Float16, hidden);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(residual), Some(mm), Some(gamma)],
+            vec![norm_out],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(skip);
+        graph.add_output(norm_out);
+
+        let before = graph.nodes.len();
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.nodes.len(), before, "no nodes added or removed");
+        let skip = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SkipSimplifiedLayerNormalization")
+            .expect("norm retained");
+        assert_eq!(skip.inputs, vec![Some(residual), Some(mm), Some(gamma)]);
+        assert_eq!(graph.value(norm_out).dtype, DataType::Float16);
+    }
+
+    #[test]
+    fn norm_cast_fold_fires_through_full_cuda_pass_list() {
+        // End-to-end through the registered CUDA passes: the cast-drop pass runs
+        // and removes every wrapper, leaving the norm in fp16-native form.
+        let (mut graph, ..) = cast_wrapped_skip_norm_graph(128);
+        for pass in cuda_optimization_passes() {
+            pass.run(&mut graph, &PassContext::new()).unwrap();
+        }
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "cast wrappers must be gone after the full pass list"
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_cast_wrapped_norm_with_fp32_consumer_intact() {
+        // A cast-wrapped norm whose fp32 result also feeds a genuine fp32
+        // consumer (not a `Cast(-> fp16)`) is a real fp32 boundary: retyping the
+        // output to fp16 would silently change that consumer's input dtype, so
+        // the pass must leave the whole norm — casts and all — as exported.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let residual = value(&mut graph, "residual", DataType::Float16, hidden);
+        let mm = value(&mut graph, "mm", DataType::Float16, hidden);
+        graph.add_input(residual);
+        graph.add_input(mm);
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float32, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![hidden],
+                vec![0u8; hidden * 4],
+            )),
+        );
+
+        let in0 = cast_node(&mut graph, "in0", residual, DataType::Float32, hidden);
+        let in1 = cast_node(&mut graph, "in1", mm, DataType::Float32, hidden);
+        let norm_out = value(&mut graph, "norm_out", DataType::Float32, hidden);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(in0), Some(in1), Some(gamma)],
+            vec![norm_out],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(skip);
+
+        // Consumer A: the usual `Cast(-> fp16)` back to the residual stream.
+        let normalized = cast_node(
+            &mut graph,
+            "normalized",
+            norm_out,
+            DataType::Float16,
+            hidden,
+        );
+        graph.add_output(normalized);
+        // Consumer B: a genuine fp32 sink — the boundary that blocks folding.
+        let fp32_kept = value(&mut graph, "fp32_kept", DataType::Float32, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(norm_out)],
+            vec![fp32_kept],
+        ));
+        graph.add_output(fp32_kept);
+
+        let casts_before = graph.nodes.values().filter(|n| n.op_type == "Cast").count();
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Nothing folded: both input casts survive, the norm still reads them,
+        // and its output stays fp32 for the fp32 consumer.
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            casts_before,
+            "a fp32 boundary consumer must block the fold"
+        );
+        let skip = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SkipSimplifiedLayerNormalization")
+            .expect("norm retained");
+        assert_eq!(skip.inputs, vec![Some(in0), Some(in1), Some(gamma)]);
+        assert_eq!(graph.value(norm_out).dtype, DataType::Float32);
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_norms_sharing_an_input_cast() {
+        // Two norms consume the *same* fp16 -> fp32 input `Cast`. Folding the
+        // first rewires it off the shared cast but must not delete that cast
+        // while the second norm still consumes it; folding the second then
+        // orphans and removes it. Both norms end up reading the pre-cast fp16
+        // source and no `Cast` survives, with the graph structurally valid.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let x = value(&mut graph, "x", DataType::Float16, hidden);
+        let res_a = value(&mut graph, "res_a", DataType::Float16, hidden);
+        let res_b = value(&mut graph, "res_b", DataType::Float16, hidden);
+        graph.add_input(x);
+        graph.add_input(res_a);
+        graph.add_input(res_b);
+
+        let gamma_a = vec1d(&mut graph, "gamma_a", DataType::Float32, hidden);
+        let gamma_b = vec1d(&mut graph, "gamma_b", DataType::Float32, hidden);
+        for g in [gamma_a, gamma_b] {
+            graph.set_initializer(
+                g,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Float32,
+                    vec![hidden],
+                    vec![0u8; hidden * 4],
+                )),
+            );
+        }
+
+        // The single shared input cast, consumed by both norms' input slot 0.
+        let shared = cast_node(&mut graph, "shared", x, DataType::Float32, hidden);
+        let skip_a_in = cast_node(&mut graph, "skip_a_in", res_a, DataType::Float32, hidden);
+        let skip_b_in = cast_node(&mut graph, "skip_b_in", res_b, DataType::Float32, hidden);
+
+        let norm_a = value(&mut graph, "norm_a", DataType::Float32, hidden);
+        let mut skip_a = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(shared), Some(skip_a_in), Some(gamma_a)],
+            vec![norm_a],
+        );
+        skip_a.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(skip_a);
+
+        let norm_b = value(&mut graph, "norm_b", DataType::Float32, hidden);
+        let mut skip_b = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(shared), Some(skip_b_in), Some(gamma_b)],
+            vec![norm_b],
+        );
+        skip_b.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(skip_b);
+
+        let out_a = cast_node(&mut graph, "out_a", norm_a, DataType::Float16, hidden);
+        let out_b = cast_node(&mut graph, "out_b", norm_b, DataType::Float16, hidden);
+        graph.add_output(out_a);
+        graph.add_output(out_b);
+
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Both norms fold: every Cast (shared input, per-norm inputs, outputs)
+        // is gone and each norm now reads the pre-cast fp16 sources directly.
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "the shared input cast and all wrappers must be removed once unused"
+        );
+        let norms: Vec<_> = graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "SkipSimplifiedLayerNormalization")
+            .collect();
+        assert_eq!(norms.len(), 2, "both norms retained");
+        for norm in norms {
+            assert_eq!(
+                norm.inputs[0],
+                Some(x),
+                "both norms read the shared pre-cast fp16 source"
+            );
+        }
+        assert_eq!(graph.value(norm_a).dtype, DataType::Float16);
+        assert_eq!(graph.value(norm_b).dtype, DataType::Float16);
+        assert!(graph.validate().is_ok());
     }
 }
