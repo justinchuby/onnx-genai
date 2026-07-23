@@ -1,9 +1,10 @@
 //! `Relu`: elementwise `max(0, x)` for f32 (`docs/ORT2.md` §4.4).
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
 
 /// Apply `max(0, x)` in place. Shared with the fused `FusedGemm` kernel so the
 /// ReLU activation has a single source of truth.
@@ -34,10 +35,10 @@ impl KernelFactory for ReluFactory {
 impl Kernel for ReluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Relu", inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let mut y = x;
+        let x = to_dense_f32_widen("Relu", &inputs[0])?;
+        let mut y = x.into_owned();
         relu_in_place(&mut y);
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("Relu", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -72,5 +73,16 @@ mod tests {
         assert!(data[0].is_nan());
         assert_eq!(data[1], 0.0);
         assert_eq!(data[2], 2.0);
+    }
+    #[test]
+    fn relu_bf16_matches_widened_f32_reference_and_preserves_nan() {
+        let x = Owned::bf16(&[5], &[f32::NAN, -80., -0., 1., 80.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[5]);
+        ReluKernel
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        let result = out.to_bf16_as_f32();
+        assert!(result[0].is_nan());
+        assert_eq!(&result[1..], &[0., 0., 1., 80.]);
     }
 }

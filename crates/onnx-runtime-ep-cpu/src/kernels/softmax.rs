@@ -21,10 +21,11 @@
 //! Stability: each reduction slice subtracts its max before `exp`, so large
 //! logits (e.g. masked-attention `-inf`/`1e9` fills) never overflow.
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
 use crate::strided::numel;
 
 /// f32 Softmax kernel carrying the raw `axis` attribute and the opset semantics.
@@ -104,7 +105,7 @@ pub(crate) fn softmax_slices(
 impl Kernel for SoftmaxKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Softmax", inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen("Softmax", &inputs[0])?;
         let shape = inputs[0].shape;
         let rank = shape.len();
         if rank == 0 {
@@ -153,7 +154,7 @@ impl Kernel for SoftmaxKernel {
             let inner: usize = shape[axis + 1..].iter().product();
             softmax_slices(&x, &mut out, outer, axis_dim, inner);
         }
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("Softmax", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -315,5 +316,23 @@ mod tests {
         run(-1, &x, &mut per_axis);
         run_legacy(-1, &x, &mut legacy);
         approx(&per_axis.to_f32(), &legacy.to_f32());
+    }
+    #[test]
+    fn softmax_bf16_matches_widened_f32_reference() {
+        let values = [-10.0, 0.0, 1.0, 80.0, -80.0, f32::INFINITY];
+        let x = Owned::bf16(&[2, 3], &values);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
+        run(-1, &x, &mut out);
+        let rounded = x.to_bf16_as_f32();
+        let mut reference = vec![0.0; rounded.len()];
+        softmax_slices(&rounded, &mut reference, 2, 3, 1);
+        let expected: Vec<_> = reference
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        for (got, want) in out.to_bf16_as_f32().into_iter().zip(expected) {
+            assert!(got == want || (got.is_nan() && want.is_nan()));
+        }
     }
 }

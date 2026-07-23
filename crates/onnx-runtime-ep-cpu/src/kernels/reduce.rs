@@ -11,10 +11,11 @@
 //! axis, `1` is an identity (the input is copied through). Negative axes index
 //! from the end.
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, compute_contiguous_strides};
+use onnx_runtime_ir::{compute_contiguous_strides, Node};
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_i64};
 use crate::strided::{next_index, numel};
 
 /// f32 ReduceMean kernel carrying the legacy `axes` attribute (may be negative;
@@ -54,7 +55,7 @@ impl Kernel for ReduceMeanKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         // Opset ≥ 18 adds the optional `axes` input; opset ≤ 17 has data only.
         check_arity("ReduceMean", inputs, outputs, 1, 2, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen("ReduceMean", &inputs[0])?;
         let in_shape = inputs[0].shape;
         let rank = in_shape.len();
 
@@ -134,7 +135,7 @@ impl Kernel for ReduceMeanKernel {
         // dense buffer already matches it element-for-element regardless of
         // whether reduced axes are retained as size-1 or squeezed.
         let _ = self.keepdims;
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("ReduceMean", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
@@ -290,5 +291,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.to_f32(), vec![2.0, 5.0]);
+    }
+    #[test]
+    fn reduce_mean_bf16_matches_widened_f32_reference() {
+        let x = Owned::bf16(&[2, 3], &[-80., 0., 1., 80., -1., 2.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 1]);
+        run(Some(vec![1]), true, &x, &mut out);
+        assert_eq!(
+            out.to_bf16_as_f32(),
+            vec![
+                half::bf16::from_f32(-79. / 3.).to_f32(),
+                half::bf16::from_f32(81. / 3.).to_f32()
+            ]
+        );
     }
 }
