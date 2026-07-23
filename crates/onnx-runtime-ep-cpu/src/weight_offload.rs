@@ -76,6 +76,7 @@ pub(crate) struct WeightOffloadMetrics {
     layer_executions: AtomicU64,
     active_experts: AtomicU64,
     unique_experts_per_batch: AtomicU64,
+    current_dequantized_experts: AtomicU64,
     peak_dequantized_experts: AtomicU64,
     host_cache_hits: AtomicU64,
     host_cache_misses: AtomicU64,
@@ -133,9 +134,20 @@ impl WeightOffloadMetrics {
         Ok(())
     }
 
-    pub fn record_dequantized_window(&self, experts: usize) {
+    pub fn record_dequantized_expert_materialized(&self) {
+        let current = self
+            .current_dequantized_experts
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         self.peak_dequantized_experts
-            .fetch_max(experts as u64, Ordering::Relaxed);
+            .fetch_max(current, Ordering::Relaxed);
+    }
+
+    pub fn record_dequantized_expert_released(&self) {
+        let previous = self
+            .current_dequantized_experts
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "dequantized expert residency underflow");
     }
 
     pub fn record_host_cache_hit(&self) {
@@ -281,7 +293,10 @@ impl WeightOffloadMetrics {
             .lock()
             .expect("weight-offload mapped-region lock poisoned") = MappedRegionState::default();
         self.bytes_read_from_mmap.store(0, Ordering::Relaxed);
-        self.peak_dequantized_experts.store(0, Ordering::Relaxed);
+        self.peak_dequantized_experts.store(
+            self.current_dequantized_experts.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.host_cache_hits.store(0, Ordering::Relaxed);
         self.host_cache_misses.store(0, Ordering::Relaxed);
         self.host_cache_evictions.store(0, Ordering::Relaxed);

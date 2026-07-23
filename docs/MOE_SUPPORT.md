@@ -1,9 +1,9 @@
 # First-Class Mixture-of-Experts Support
 
-**Status:** Phase 1 in progress. Mobius implements a standard-operator dense reference
-fallback plus generic typed inference metadata and a synthetic DeepSeek-style
-correctness test. Fused `MoE`/`QMoE`, QMoE packing validation, grouped kernels, and
-expert streaming are **NOT YET IMPLEMENTED**.
+**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP registers
+grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`; quantized kernels
+dequantize active experts route-first. CUDA grouped MoE and the broader Phase 3
+streaming/scheduling work are not claimed complete.
 
 ## 1. Executive recommendation
 
@@ -158,9 +158,10 @@ Relevant existing seams are:
   CUDA attention demonstrates two batched cuBLAS GEMMs around a custom dispatch
   stage on one stream
   ([`attention.rs` lines 21-49](../crates/onnx-runtime-ep-cuda/src/kernels/attention.rs#L21-L49)).
-- The in-tree CPU/CUDA EPs do **not currently register `MatMulNBits`, `MoE`, or
-  `QMoE` kernels**. Today `MatMulNBits` model execution is an ONNX Runtime/other-EP
-  capability documented by the project, not an in-tree grouped-expert kernel.
+- The in-tree CPU EP registers `MatMulNBits`, grouped float `MoE`, integer `QMoE`,
+  and `BlockQuantizedMoE`. Its quantized MoE paths dequantize only routed experts.
+  The in-tree CUDA EP does not yet register grouped `MoE`/`QMoE` kernels; this
+  document makes no CUDA completion claim.
 - The engine owns generation, KV integration, and the Resource Governor
   ([`engine.rs` lines 24-34](../crates/onnx-genai-engine/src/engine.rs#L24-L34),
   [`engine.rs` lines 56-117](../crates/onnx-genai-engine/src/engine.rs#L56-L117)).
@@ -361,20 +362,24 @@ Empty experts launch no GEMM.
 
 ### 6.2 CPU EP
 
-Integration points:
+Implemented integration points:
 
 - `crates/onnx-runtime-ep-cpu/src/kernels/selection.rs`: TopK reference behavior.
 - `.../gather.rs` and indexing/movement kernels: correctness building blocks.
 - `.../matmul.rs` / `gemm.rs`: dense grouped/batched baseline.
-- a future quantized kernel module: expert-batched int4 `QMoE`, using a conversion
+- `.../moe.rs`: grouped floating-point `MoE` execution.
+- `.../qmoe.rs`: expert-batched integer `QMoE`, including int4, using a conversion
   established by the Phase 1 packing-validation gate rather than assuming that
   Mobius/`MatMulNBits` storage is already identical.
-- `.../mod.rs`: register `com.microsoft::MoE` and `QMoE`.
+- `.../block_quantized_moe.rs`: the `pkg.nxrt::BlockQuantizedMoE` CPU parity kernel.
+- `.../mod.rs`: registrations for `com.microsoft::MoE`, `com.microsoft::QMoE`, and
+  `pkg.nxrt::BlockQuantizedMoE`.
 
-The CPU correctness kernel may initially gather into dense scratch buffers and call
-existing GEMM paths. The performance kernel should avoid dequantizing a whole expert:
-unpack/dequantize blocks inside the dot-product loop and parallelize over active
-experts and token rows without oversubscribing Rayon.
+The implemented kernels route and group the token batch before expert execution.
+`QMoE` dequantizes only active experts, one expert at a time, so the route-first path
+keeps the peak dequantized residency to one expert. Remaining CPU work is performance
+optimization, including packing/prepacking improvements and reducing temporary expert
+materialization while preserving the bounded-residency behavior.
 
 ### 6.3 CUDA EP
 
@@ -476,7 +481,7 @@ memory concepts, not KV tensor formats or KV connector APIs.
 | Area | Current integration point | Required future work |
 |---|---|---|
 | Mobius export | External exporter; contracts documented in `docs/OPERATORS.md` and `MODEL_METADATA.md` | Emit explicit router + `MoE`/`QMoE`; expert-major external data; dense reference mode; metadata validation |
-| CPU EP | `crates/onnx-runtime-ep-cpu/src/kernels/{matmul,gather,selection}.rs`, `mod.rs` | Reference MoE, then grouped quantized expert kernel and registration |
+| CPU EP | `crates/onnx-runtime-ep-cpu/src/kernels/{moe,qmoe,block_quantized_moe}.rs`, `mod.rs` | Grouped float and quantized expert execution is implemented; further packing/prepacking optimization remains |
 | CUDA EP | `crates/onnx-runtime-ep-cuda/src/kernels/{matmul,gemm,attention}.rs`, `mod.rs` | Device dispatch/scatter, grouped int4 expert GEMM, async residency |
 | Engine | `crates/onnx-genai-engine/src/{engine,batched}.rs` | Expert store lifecycle, leases, telemetry, batch residency plan |
 | Scheduler | `crates/onnx-genai-scheduler/src/{lib,policy,governor}.rs` | Expert/scratch byte accounting, affinity tie-breaker, imbalance-aware plans |
@@ -487,7 +492,11 @@ memory concepts, not KV tensor formats or KV connector APIs.
 
 ### Phase 1 — representation and dense-fallback correctness
 
-**Status: NOT YET IMPLEMENTED**
+**Status: PARTIALLY IMPLEMENTED**
+
+The CPU EP has float `MoE`, integer `QMoE`, and dequantized dense-oracle
+coverage. The full cross-toolchain gate below (Mobius export, source-framework
+routes/logits, fused ORT parity, and packing proof) is not claimed complete here.
 
 Deliverables:
 
@@ -513,7 +522,29 @@ grouped kernel is required.
 
 ### Phase 2 — grouped-expert kernels
 
-**Status: NOT YET IMPLEMENTED**
+**Status: PARTIALLY IMPLEMENTED — CPU COMPLETE; CUDA tracked separately**
+
+The CPU EP routes the complete token batch first, groups routed rows by expert,
+and invokes one expert computation per active expert. Multi-row expert groups use
+the CPU EP's shared GEMM backend; decode groups of one use the scalar GEMV path
+without issuing a per-token GEMM. `QMoE` and `BlockQuantizedMoE` dequantize only
+active experts, one expert at a time, then consume all rows routed to that expert.
+They do not materialize a full all-expert dequantization buffer.
+
+CPU differential coverage:
+
+- `grouped_moe_matches_per_token_dense_fallback_for_eight_experts_top2`
+  compares grouped float `MoE` with the per-token dense oracle.
+- `grouped_int4_qmoe_matches_per_token_dense_fallback_for_eight_experts_top2`
+  compares int4 `QMoE`, grouped float `MoE`, and the per-token dequantized oracle.
+- `route_first_bounds_dequantized_residency_when_all_experts_are_selected`
+  proves the mmap/offload path's peak dequantized window remains one expert.
+
+The ignored release-mode characterization
+`grouped_moe_measures_benefit_over_dense_fallback_decode_and_prefill` is the
+reproducible CPU performance gate. On the implementation host it measured a
+4.31x benefit at decode (`M=1`, 8 experts, top-2, H=128, I=256) and 1.71x at
+prefill (`M=64`) over the Phase-1 all-expert dense fallback.
 
 Deliverables:
 
@@ -525,6 +556,8 @@ Deliverables:
 
 Acceptance gate: no per-token expert GEMM launch, no full-expert dequantization, and
 measured benefit over the dense fallback at representative decode/prefill shapes.
+The CPU portion meets this gate via the grouped/GEMV split and tests above. This
+document does not make a CUDA completion claim.
 
 ### Phase 3 — expert offload, streaming, and routing-aware scheduling
 
