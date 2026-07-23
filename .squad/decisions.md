@@ -1,9 +1,24 @@
 # Decisions
 
-> Current decision ledger. Previous active ledger through 2026-07-23T11:40Z is archived in
-> `.squad/decisions/archive/2026-07-23T11-40-00Z-decisions-active-ledger.md`.
+> Current decision ledger. Older ledgers are under `.squad/decisions/archive/`.
 
 > Scribe archive policy: when this file exceeds the hard gate, keep only the current active reconciliation here and move older active ledger content into `.squad/decisions/archive/`.
+
+
+<!-- scribe-merge-2026-07-23T09-10-00Z-cuda-perf-wave2-3 -->
+## 2026-07-23 — CUDA performance wave 2/3 reconciliation
+
+- **Keaton — IndexShare f16/bf16 storage (`69ee4e4`):** CUDA `IndexShare` now supports homogeneous f16/bf16 KV/cache storage with fp32 score, softmax, and value accumulation, avoiding cache widening.
+- **Irmgard — native engine and MoE fixture (`64238b5`):** Fixed the CUDA native-engine build path and added MoE fixture coverage.
+- **Irmgard — CUDA lib-test expectations (`de831fd`):** Updated hardcoded CUDA unit-test expectations: covered ops **87→88** and the GQA unsupported-reason substring.
+- **Marsten — native post-fusion ladder (`16e434d`):** Consolidated the post-fusion benchmark ladder from `marsten-post-fusion-ladder.md` and `marsten-native-post-fusion-ladder.md`.
+- **Deckard — fusion follow-ups (`05e1fd1`):** Landed SwiGLU-RMS fusion and its size-floor gate; the 7B result improved **23.5%**.
+- **Marsten — SwiGLU fusion ladder (`749170a`):** Native decode now beats ORT on the measured 7B fusion-ladder case.
+- **Batty — Phi graph capture (`17ac19f`):** `CudaDropNormalizationCasts` cast folding enabled Phi graph capture; eager decode improved about **25%** while captured performance was flat.
+- **Marsten — smoothness sweep:** This host has only Qwen2.5 and Phi CUDA-GPU models available; remaining benchmark gaps are Qwen2.5-0.5B batch-size-128 failure and Qwen2.5-1.5B repeated-text output.
+- **Open investigation — Qwen2.5-1.5B:** Native decode diverges from coherent ORT through degenerate repetition. SwiGLU-RMS fusion is proven not causal (fusion enabled/disabled is byte-identical); this is a pre-existing native numerical bug under root cause on `fix/qwen15b-native-divergence`.
+- **Review requirement — CUDA EP lib tests:** Reviewers must run `cargo test -p onnx-runtime-ep-cuda --features cuda --lib`; it contains hardcoded-expectation tests (including covered-op count and GQA error substrings) missed by targeted GPU tests.
+
 
 <!-- scribe-merge-2026-07-23T11-40-00Z-cpu-moe-h200-mobius-lmhead -->
 ## 2026-07-23 — CPU MoE review, H200 survey, Mobius #422, and lm_head fusion
@@ -346,17 +361,3 @@ regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
 - **Qwen2.5-0.5B O(seq) decode collapse fixed (`798d430`, Irmgard; landed by Sadik; reviewed 🟢 Borogrove/re-benched Marsten).** Root cause: f32 KV graph selected the single-warp-per-row f32 GQA decode kernel that serially walked full context. Fix: capture-safe 1/2/4/8/16-way split-K online-softmax kernel + merge, selected purely by dtype/shape. Qwen 313→460 tok/s @128, 84→448 @1024; Llama Q4KM flat; generic (no model-name), capture-safe, SM-portable. Marsten H200 re-bench: Qwen0.5B 459/446, 1.5B 486/460, 7B 230/223, Llama-1B Q4KM 450/439 tok/s.
 - **CPU MoE Phase 2 landed (`dc0cc18`, Sloat) + MOE_SUPPORT.md §6.2 honesty fix (Sapper; Voight 🔴→🟢).** Route-first int4 QMoE (peak-1-expert residency via RAII guard), grouped-expert GEMM (4.12x decode / 1.83x prefill), doc now correctly states CPU MoE/QMoE/BlockQuantizedMoE implemented + registered, CUDA incomplete. 648 CPU unit tests pass.
 - **Mobius PR #423 (DeepSeek MoE Phase 1 conformance) CI remediation (Abdul).** Ruff lint + codecov fixed; Integration/L4/L5 jobs fail on infra (`libcudart.so.13` missing on runner, identical on main). PR remains OPEN/UNMERGED for Justin.
-
----
-
-## 2026-07-23 — CUDA perf + smoothness wave 1 (5 tracks merged to main `0672400`)
-
-Requested by Justin Chu. Coordinator fanned out 5 parallel worktree agents; each reviewed before ff-merge (main enforces `required_linear_history` — rebase/ff only, no merge commits).
-
-1. **GQA scalar `seqlens_k` (Irmgard, `d2582df`, Chew 🟢).** Generic batch-1 rank-0→`[1]` promotion for `com.microsoft::GroupQueryAttention` on CPU+CUDA; removed the metadata opt-in policy. Validates int32/contiguous/non-negative/capacity; rejects scalar for batch>1.
-2. **ORT-vs-native CUDA baseline (Marsten, `f0af865`).** onnxruntime-genai-cuda 0.14.1 vs native, foundry cuda-gpu int4, greedy min_length-forced, 3-run median @128: Qwen0.5B **821 vs 732 (+12%)**, 1.5B 481 vs 483 (~parity), 7B 231 vs 280 (−18%), Phi-4-mini 93 vs 237 (−58%). 815-vs-459 resolved = graph-replay vs eager. Doc: `docs/benchmarks/ort-vs-native-cuda-2026-07-23.md`.
-3. **IndexShare CUDA-graph capture (Keaton, `3ff0f12`, Chew 🟢).** Device-resident `validate_index_rows` + capture-error latch (`0x200`) replaces D2H validation; pooled stable-address scratch; capture enabled after warmup. 10/10 GPU tests.
-4. **Epilogue fusion (Deckard, `8dd3072`, Luv 🟢 GPU-verified).** `CudaSkipRmsNormMatMulFusion` folds SkipSimplifiedLayerNormalization into neighbouring GEMVs. **7B +9.5% (231→254 tok/s), −28 kernels/token, byte-identical.** 0.5B −2.7% (structural; still beats ORT). Toggle `ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION`.
-5. **bf16 Attention + mask-dtype fix (Roy→Holden, `0672400`, Gaff 🔴→🟢).** Completed f32/f16/bf16 Attention (fp32 accum, mutation-guarded). Gaff rejected v1 for a floating mask dtype ≠ Q/K/V; per strict lockout Roy barred, **Holden owned the fix**.
-
-**Net vs ORT:** 0.5B +12%; 1.5B parity; 7B narrowed −18%→~−9%; Phi −58% is the top target. **Wave 2:** post-fusion re-bench (Marsten), 0.5B size-floor + next fusion (Deckard), Phi graph-capture (Batty), f16/bf16 IndexShare (Keaton), native_engine MoE-fixture (Irmgard).
