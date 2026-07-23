@@ -53,6 +53,33 @@ Enable any quantization format to be:
 2. **Executed** by any conformant runtime (through fallback dequantization)
 3. **Accelerated** by EPs with native support (no mandatory dequant)
 
+## Comparison with QDQ (QuantizeLinear / DequantizeLinear)
+
+### What QDQ Can Express
+
+Uniform affine quantization: `DequantizeLinear(x, scale, zp) = (x - zp) * scale`
+with built-in data types (INT4/INT8/UINT8/FP8), per-tensor or per-channel.
+
+### What QDQ Cannot Express
+
+1. **Non-linear mappings.** NF4 (QLoRA), IQ4_NL — decode via codebook lookup, not
+   `(x-zp)*scale`. No QDQ representation exists.
+2. **Non-standard packing.** Base-3 ternary (1 byte = 5 values), bit-interleaved
+   importance quant — no matching `data_type` in ONNX.
+3. **Multi-field block decode.** K-Quants (Q4_K): one 144-byte super-block with
+   nested 6-bit sub-scales decodes 256 values cooperatively. QDQ has no
+   "block" concept — it is element-wise.
+4. **EP identification.** QDQ requires fragile subgraph pattern matching
+   (DQ→MatMul→Q). Graph transformations easily break patterns. Extensible types
+   use explicit `quant_type_uri` — structural, not positional.
+
+### Coexistence
+
+- QDQ remains valid indefinitely (no deprecation)
+- Both can coexist in one model
+- `ConvertQDQToExtensible` converter available (opt-in)
+- Old runtimes reject extensible-type models via IR version gate
+
 ## Design
 
 ### Principle: Declaration ≠ Implementation
@@ -116,6 +143,25 @@ message EncodingDescriptor {
   BitOrder bit_order = 4;
   repeated float codebook = 5;     // LOOKUP_TABLE: fixed codebook values
   float value_offset = 6;          // additive offset after raw decode
+
+  // Nested block structure (K-Quants, MXFP shared exponent, etc.)
+  optional NestedBlockLayout nested = 7;
+}
+
+message NestedBlockLayout {
+  int32 super_block_size = 1;        // total elements per super-block (e.g., 256)
+  int32 sub_block_size = 2;          // elements per sub-block (e.g., 32)
+  int32 sub_blocks_per_super = 3;    // super / sub
+
+  repeated BlockField super_fields = 4;  // decoded once per super-block
+  repeated BlockField sub_fields = 5;    // decoded once per sub-block
+}
+
+message BlockField {
+  string name = 1;       // referenced in DequantFormula as "super.<name>" or "sub.<name>"
+  int32 data_type = 2;   // TensorProto.DataType
+  int32 bits = 3;        // for sub-byte fields (e.g., 6-bit scales)
+  int32 count = 4;       // elements of this field per block (default 1)
 }
 
 enum EncodingFamily {
@@ -255,7 +301,82 @@ Versions are immutable. Semantic changes require a new version string.
 
 ## Examples
 
-### Example 1: 1.58-bit Ternary (BitNet-style)
+### Example 1: INT4 Symmetric (GPTQ/AWQ-style, QDQ-equivalent)
+
+```
+type_uri: "onnx:int4-symmetric/v1"
+block_size: 32
+bytes_per_block: 18            // 2 (fp16 scale) + 16 (4-bit × 32)
+encoding: { family: ENCODING_SYMMETRIC, bit_order: BIT_ORDER_LSB_FIRST }
+group_size: 32
+scale_data_type: FLOAT16
+dequant_formula: { steps: [UNPACK, CAST(f16), MULTIPLY(scale)] }
+```
+
+### Example 2: NF4 (QLoRA / bitsandbytes)
+
+Non-linear 4-bit with 16-value codebook. **Not expressible in QDQ.**
+
+```
+type_uri: "onnx-community:nf4/v1"
+block_size: 64
+bytes_per_block: 34
+encoding: {
+  family: ENCODING_LOOKUP_TABLE
+  codebook: [-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0,
+             0.0796, 0.1609, 0.2461, 0.3379, 0.4407, 0.5626, 0.7230, 1.0]
+}
+group_size: 64
+scale_data_type: FLOAT16
+dequant_formula: { steps: [UNPACK, LOOKUP(codebook), CAST(f16), MULTIPLY(scale)] }
+```
+
+### Example 3: Q4_K (llama.cpp K-Quant, nested super-blocks)
+
+256-weight super-block with nested 6-bit sub-block scales. **Not expressible in QDQ.**
+
+```
+type_uri: "ggml:q4_k/v1"
+block_size: 256
+bytes_per_block: 144
+encoding: {
+  family: ENCODING_AFFINE
+  nested: {
+    super_block_size: 256
+    sub_block_size: 32
+    sub_blocks_per_super: 8
+    super_fields: [ {name:"d", data_type:FLOAT16}, {name:"dmin", data_type:FLOAT16} ]
+    sub_fields: [ {name:"scale", bits:6}, {name:"min", bits:6} ]
+  }
+}
+group_size: 256
+dequant_formula: {
+  steps: [UNPACK, CAST(f32), MULTIPLY(sub.scale), MULTIPLY(super.d),
+          SUBTRACT(sub.min * super.dmin), CAST(f16)]
+}
+```
+
+### Example 4: MXFP4 (OCP Microscaling, nested shared exponent)
+
+```
+type_uri: "onnx:mxfp4-block32/v1"
+block_size: 32
+bytes_per_block: 20
+encoding: {
+  family: ENCODING_AFFINE
+  nested: {
+    super_block_size: 32
+    sub_block_size: 8
+    sub_blocks_per_super: 4
+    sub_fields: [ {name:"shared_exp", data_type:UINT8, bits:8} ]
+  }
+}
+dequant_formula: { steps: [UNPACK, CAST(f16), MULTIPLY(sub.shared_exp)] }
+```
+
+### Example 5: 1.58-bit Ternary (BitNet b1.58)
+
+Base-3 packed. 5 values per byte. **Not expressible in QDQ.**
 
 ```
 type_uri: "onnx-community:ternary-1.58bit/v1"
@@ -264,47 +385,62 @@ bytes_per_block: 1
 encoding: {
   family: ENCODING_PACKED_INTEGER
   packing_base: 3
-  elements_per_unit: 5    // 3^5 = 243 fits in 1 byte
-  bit_order: BIT_ORDER_LSB_FIRST
-  value_offset: -1.0      // map {0,1,2} → {-1,0,1}
+  elements_per_unit: 5
+  value_offset: -1.0
 }
 group_size: 64
 scale_data_type: FLOAT16
-dequant_formula: {
-  steps: [
-    { op: DEQUANT_UNPACK },                    // base-3 decode → {0,1,2}
-    { op: DEQUANT_ADD, constant: -1.0 },       // → {-1,0,1}
-    { op: DEQUANT_CAST, cast_to: FLOAT16 },
-    { op: DEQUANT_MULTIPLY, operand: "scale" }
-  ]
-}
-test_vector_packed: <0xA4>   // byte 164 = 2*81 + 0*27 + 1*9 + 2*3 + 2 → [2,2,1,0,2]
-test_vector_float32: <...>   // [-1,0,1,-1,1] * scale
+dequant_formula: { steps: [UNPACK, ADD(-1.0), CAST(f16), MULTIPLY(scale)] }
+test_vector_packed: <0xA4>   // byte 164 = 2*81+0*27+1*9+2*3+2 → [2,2,1,0,2]
+test_vector_float32: <...>   // [1,-1,0,-1,1] * 0.5
 test_vector_scale: 0.5
 ```
 
-### Example 2: IQ4_NL (Non-Linear 4-bit)
+### Example 6: IQ4_NL (Non-Linear 4-bit, fixed codebook)
 
 ```
 type_uri: "ggml:iq4_nl/v1"
 block_size: 32
-bytes_per_block: 18         // 2 (fp16 scale) + 16 (4-bit indices)
+bytes_per_block: 18
 encoding: {
   family: ENCODING_LOOKUP_TABLE
-  codebook: [-1.0, -0.6962, -0.5251, -0.3949, ..., 1.0]  // 16 values
+  codebook: [-1.27, -0.9834, -0.7852, -0.6187, -0.4702, -0.3320, -0.2000, -0.0710,
+             0.0710, 0.2000, 0.3320, 0.4702, 0.6187, 0.7852, 0.9834, 1.27]
   bit_order: BIT_ORDER_LSB_FIRST
 }
 group_size: 32
 scale_data_type: FLOAT16
-dequant_formula: {
-  steps: [
-    { op: DEQUANT_UNPACK },                      // extract 4-bit indices
-    { op: DEQUANT_LOOKUP, operand: "codebook" }, // index → codebook value
-    { op: DEQUANT_CAST, cast_to: FLOAT16 },
-    { op: DEQUANT_MULTIPLY, operand: "scale" }
-  ]
-}
+dequant_formula: { steps: [UNPACK, LOOKUP(codebook), CAST(f16), MULTIPLY(scale)] }
 ```
+
+### Example 7: IQ1_S (ENCODING_CUSTOM — requires plugin)
+
+```
+type_uri: "ggml:iq1_s/v1"
+block_size: 256
+bytes_per_block: 50
+encoding: { family: ENCODING_CUSTOM }
+group_size: 256
+scale_data_type: FLOAT16
+// No formula. Requires codec plugin: "cargo add onnx-codec-ggml"
+test_vector_packed: <50 bytes>
+test_vector_float32: <256 × f32>
+```
+
+### Format Coverage Summary
+
+| Format | bpw | Family | Nested | Auto-Codec | QDQ-Expressible |
+|--------|-----|--------|--------|------------|------------------|
+| INT4 Symmetric | 4.5 | SYMMETRIC | No | ✅ | ✅ |
+| NF4 (QLoRA) | 4.5 | LOOKUP_TABLE | No | ✅ | ❌ |
+| MXFP4 | 5.0 | AFFINE | Yes | ✅ | ❌ |
+| Q4_K | 4.5 | AFFINE | Yes (2-level) | ✅ | ❌ |
+| Q2_K | 2.625 | AFFINE | Yes (2-level) | ✅ | ❌ |
+| IQ4_NL | 4.5 | LOOKUP_TABLE | No | ✅ | ❌ |
+| IQ1_S | 1.56 | CUSTOM | N/A | ❌ | ❌ |
+| Ternary 1.58 | 1.63 | PACKED_INTEGER | No | ✅ | ❌ |
+| FP8 E4M3 | 8.0 | SYMMETRIC | No | ✅ | ✅ |
+| AQLM 2×8 | 3.0 | CUSTOM | N/A | ❌ | ❌ |
 
 ## Impact Assessment
 

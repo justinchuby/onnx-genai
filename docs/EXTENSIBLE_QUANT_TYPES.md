@@ -21,7 +21,56 @@ This design introduces a **pluggable type system** that:
 3. Guarantees every model can still run (fallback through dequantization)
 4. Supports both weight quantization (static, in-model) and activation quantization (dynamic/static)
 
-## 2. Design Overview
+## 2. Comparison with QDQ
+
+### 2.1 What QDQ Can Express
+
+ONNX's QuantizeLinear/DequantizeLinear represents uniform affine quantization:
+
+```
+DequantizeLinear(x, scale, zp) = (x - zp) * scale
+```
+
+This covers INT4/INT8/UINT8/FP8 with per-tensor or per-channel granularity.
+
+### 2.2 What QDQ Cannot Express
+
+| Capability | QDQ | Extensible Types |
+|---|---|---|
+| Uniform affine (int4/int8) | ✅ | ✅ |
+| Non-linear codebook (IQ4_NL, NF4) | ❌ | ✅ |
+| Non-standard packing (base-3 ternary) | ❌ | ✅ |
+| Multi-field block decode (K-Quants) | ❌ | ✅ |
+| Nested super-block / sub-block scales | ❌ | ✅ |
+| EP identification of quant type | Fragile pattern match | Explicit declaration |
+| Adding new types | Spec amendment | Register |
+
+**Fundamental limitations of QDQ:**
+
+1. **Fixed formula.** QDQ hardcodes `(x - zp) * scale`. Non-linear mappings
+   (codebook lookup, base-3 decode + offset) simply cannot be expressed.
+
+2. **No block-level structure.** QDQ is element-wise: each element has one scale
+   and one zero-point. But formats like IQ1_S have a single super-block with
+   `fp16 d` + `u8 qs[32]` + `u16 qh[8]` that cooperatively decode 256 values.
+   There is no QDQ representation for "these 50 bytes decode into 256 floats."
+
+3. **No custom packing.** QDQ relies on `data_type` to tell the runtime how to
+   read raw bytes (INT4 = two nibbles per byte). Base-3 packing, grid-based
+   importance quantization, and bit-interleaved formats have no `data_type`.
+
+4. **EP optimization is fragile.** EPs must pattern-match `DQ → MatMul → Q`
+   subgraphs. Graph optimizers (reshape insertion, transpose folding) can break
+   the pattern. Our approach: EP simply checks `tensor.quant_type_uri`.
+
+### 2.3 Coexistence
+
+- QDQ remains valid indefinitely — no deprecation, no forced migration
+- A model MAY contain both QDQ ops and extensible-type tensors
+- Converter tool `ConvertQDQToExtensible` available for opt-in migration
+- Old runtimes reject extensible-type models via IR version gate
+
+## 3. Design Overview
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -101,6 +150,47 @@ message EncodingDescriptor {
   BitOrder bit_order = 4;       // LSB_FIRST or MSB_FIRST
   repeated float codebook = 5;  // for LOOKUP_TABLE: the fixed codebook values
   float value_offset = 6;       // additive offset applied after decode (e.g., -1 for {0,1,2}→{-1,0,1})
+
+  // Nested block structure (for K-Quants, GGUF super-blocks, MXFP)
+  optional NestedBlockLayout nested = 7;
+}
+
+// Nested (hierarchical) block layout for formats with super-block + sub-block
+// structure. Examples: Q2_K through Q6_K, MXFP with shared exponent.
+message NestedBlockLayout {
+  int32 super_block_size = 1;         // total elements per super-block (e.g., 256)
+  int32 sub_block_size = 2;           // elements per sub-block (e.g., 32)
+  int32 sub_blocks_per_super = 3;     // super_block_size / sub_block_size
+
+  // Fields at the super-block level (decoded once per super-block)
+  repeated BlockField super_fields = 4;
+
+  // Fields at the sub-block level (decoded once per sub-block)
+  repeated BlockField sub_fields = 5;
+
+  // Byte layout within one super-block: field order in serialized bytes.
+  // If omitted, fields are packed in declaration order:
+  // [super_fields...] [sub_block_0_fields... sub_block_0_data...] [sub_block_1...] ...
+  optional BlockByteLayout byte_layout = 6;
+}
+
+message BlockField {
+  string name = 1;        // referenced in DequantFormula as "super.<name>" or "sub.<name>"
+  int32 data_type = 2;    // TensorProto.DataType (FLOAT16, UINT8, etc.)
+  int32 bits = 3;         // for sub-byte fields (e.g., 6-bit scales)
+  int32 count = 4;        // number of this field per block (default 1)
+}
+
+message BlockByteLayout {
+  // Explicit byte ranges for each field within the super-block.
+  // Useful when fields are interleaved or non-contiguous.
+  repeated FieldRange ranges = 1;
+}
+
+message FieldRange {
+  string field_ref = 1;   // "super.d" or "sub[*].scale"
+  int32 byte_offset = 2;
+  int32 byte_length = 3;
 }
 
 message DequantFormula {
@@ -433,7 +523,274 @@ Minimum viable implementation:
 Advanced implementation:
 - Streaming dequant, EP negotiation, native kernels, plugin registry
 
-## 12. Relationship to Existing `SUB4BIT_QUANT.md`
+## 12. Popular Format Examples
+
+This section demonstrates how widely-used quantization formats are declared using
+the extensible type system.
+
+### 12.1 INT4 Symmetric (GPTQ/AWQ-style)
+
+The simplest case — uniform affine, directly expressible by QDQ today.
+Included to show backward-compatible representation.
+
+```yaml
+type_uri: "onnx:int4-symmetric/v1"
+block_size: 32
+bytes_per_block: 18          # 2 (fp16 scale) + 16 (4-bit × 32 values)
+encoding:
+  family: ENCODING_SYMMETRIC
+  bit_order: BIT_ORDER_LSB_FIRST
+group_size: 32
+scale_data_type: FLOAT16
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                      # extract 4-bit signed int
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+    - { op: DEQUANT_MULTIPLY, operand: "scale" }  # value * scale
+```
+
+### 12.2 NF4 (QLoRA / bitsandbytes)
+
+Non-linear 4-bit: 16 fixed values optimized for normal distributions.
+QDQ cannot express this (not affine).
+
+```yaml
+type_uri: "onnx-community:nf4/v1"
+block_size: 64
+bytes_per_block: 34          # 2 (fp16 absmax) + 32 (4-bit × 64 values)
+encoding:
+  family: ENCODING_LOOKUP_TABLE
+  codebook:   # 16 values from bitsandbytes
+    [-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0,
+     0.0796, 0.1609, 0.2461, 0.3379, 0.4407, 0.5626, 0.7230, 1.0]
+  bit_order: BIT_ORDER_LSB_FIRST
+group_size: 64
+scale_data_type: FLOAT16      # absmax scale
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                       # extract 4-bit index
+    - { op: DEQUANT_LOOKUP, operand: "codebook" }  # codebook[index]
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+    - { op: DEQUANT_MULTIPLY, operand: "scale" }   # * absmax
+```
+
+### 12.3 MXFP4 (OCP Microscaling)
+
+Block floating point with shared exponent. Sub-block structure:
+8 elements share one E8M0 scale.
+
+```yaml
+type_uri: "onnx:mxfp4-block32/v1"
+block_size: 32
+bytes_per_block: 20          # 4 (4× E8M0 shared exponent) + 16 (4-bit × 32 values)
+encoding:
+  family: ENCODING_AFFINE
+  nested:
+    super_block_size: 32
+    sub_block_size: 8
+    sub_blocks_per_super: 4
+    super_fields: []           # no super-block-level field
+    sub_fields:
+      - { name: "shared_exp", data_type: UINT8, bits: 8 }  # E8M0 exponent
+  bit_order: BIT_ORDER_LSB_FIRST
+group_size: 32
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                              # extract FP4 mantissa
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+    - { op: DEQUANT_MULTIPLY, operand: "sub.shared_exp" } # * 2^(exp - 127)
+```
+
+### 12.4 Q4_K (llama.cpp K-Quant)
+
+Nested super-block with 6-bit sub-block scales. 256 weights per super-block,
+8 sub-blocks of 32 each. QDQ has no way to represent this structure.
+
+```yaml
+type_uri: "ggml:q4_k/v1"
+block_size: 256
+bytes_per_block: 144
+#   Byte layout: fp16 d (2) + fp16 dmin (2) + 12 bytes packed 6-bit scales/mins
+#                + 128 bytes (4-bit × 256 quants)
+encoding:
+  family: ENCODING_AFFINE
+  bit_order: BIT_ORDER_LSB_FIRST
+  nested:
+    super_block_size: 256
+    sub_block_size: 32
+    sub_blocks_per_super: 8
+    super_fields:
+      - { name: "d", data_type: FLOAT16 }      # super scale
+      - { name: "dmin", data_type: FLOAT16 }   # super minimum
+    sub_fields:
+      - { name: "scale", bits: 6 }             # per sub-block scale
+      - { name: "min", bits: 6 }               # per sub-block minimum
+group_size: 256
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                                    # extract 4-bit values
+    - { op: DEQUANT_CAST, cast_to: FLOAT32 }
+    - { op: DEQUANT_MULTIPLY, operand: "sub.scale" }            # * sub_scale
+    - { op: DEQUANT_MULTIPLY, operand: "super.d" }              # * d
+    - { op: DEQUANT_SUBTRACT, operand: "sub.min * super.dmin" } # - sub_min * dmin
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+```
+
+### 12.5 Q2_K (llama.cpp, aggressive 2-bit K-Quant)
+
+Same nested structure as Q4_K but only 2 bits per weight.
+
+```yaml
+type_uri: "ggml:q2_k/v1"
+block_size: 256
+bytes_per_block: 84
+#   fp16 d (2) + fp16 dmin (2) + 16 bytes (4-bit scales+mins for 16 sub-blocks)
+#   + 64 bytes (2-bit × 256 quants)
+encoding:
+  family: ENCODING_AFFINE
+  bit_order: BIT_ORDER_LSB_FIRST
+  nested:
+    super_block_size: 256
+    sub_block_size: 16
+    sub_blocks_per_super: 16
+    super_fields:
+      - { name: "d", data_type: FLOAT16 }
+      - { name: "dmin", data_type: FLOAT16 }
+    sub_fields:
+      - { name: "scale", bits: 4 }
+      - { name: "min", bits: 4 }
+group_size: 256
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                                    # extract 2-bit values
+    - { op: DEQUANT_CAST, cast_to: FLOAT32 }
+    - { op: DEQUANT_MULTIPLY, operand: "sub.scale" }
+    - { op: DEQUANT_MULTIPLY, operand: "super.d" }
+    - { op: DEQUANT_SUBTRACT, operand: "sub.min * super.dmin" }
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+```
+
+### 12.6 IQ4_NL (Non-Linear 4-bit with fixed codebook)
+
+Importance-weighted quantization with a 16-entry non-linear codebook.
+
+```yaml
+type_uri: "ggml:iq4_nl/v1"
+block_size: 32
+bytes_per_block: 18          # 2 (fp16 d) + 16 (4-bit × 32 indices)
+encoding:
+  family: ENCODING_LOOKUP_TABLE
+  codebook:
+    [-1.27, -0.9834, -0.7852, -0.6187, -0.4702, -0.3320, -0.2000, -0.0710,
+     0.0710, 0.2000, 0.3320, 0.4702, 0.6187, 0.7852, 0.9834, 1.27]
+  bit_order: BIT_ORDER_LSB_FIRST
+group_size: 32
+scale_data_type: FLOAT16
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                       # extract 4-bit index
+    - { op: DEQUANT_LOOKUP, operand: "codebook" }  # codebook[index]
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+    - { op: DEQUANT_MULTIPLY, operand: "scale" }   # * d
+```
+
+### 12.7 IQ1_S (1.56-bit Importance Quant)
+
+Extreme compression: base-3 ternary with grid shifts and 3-bit odd multipliers.
+Highly non-trivial packing — requires `ENCODING_CUSTOM` because the decode
+algorithm involves conditional grid shifts that can't be expressed as simple steps.
+
+```yaml
+type_uri: "ggml:iq1_s/v1"
+block_size: 256
+bytes_per_block: 50          # fp16 d (2) + u8 qs[32] + u16 qh[8]
+encoding:
+  family: ENCODING_CUSTOM     # too complex for auto-generation
+group_size: 256
+scale_data_type: FLOAT16
+# No dequant_formula — requires codec plugin.
+# Runtime without the plugin will error:
+# "Missing codec for ggml:iq1_s/v1. Install: cargo add onnx-codec-ggml"
+test_vector_packed: <50 bytes>
+test_vector_float32: <256 × f32>
+test_vector_scale: 0.0234375
+```
+
+### 12.8 1.58-bit Ternary (BitNet b1.58)
+
+Pure ternary {-1, 0, 1} with base-3 packing. 5 values per byte.
+
+```yaml
+type_uri: "onnx-community:ternary-1.58bit/v1"
+block_size: 5
+bytes_per_block: 1           # 3^5 = 243 < 256, fits in 1 byte
+encoding:
+  family: ENCODING_PACKED_INTEGER
+  packing_base: 3
+  packing_radix: 5            # 5 values per byte
+  bit_order: BIT_ORDER_LSB_FIRST
+  value_offset: -1.0          # map {0,1,2} → {-1,0,1}
+group_size: 64
+scale_data_type: FLOAT16
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                      # base-3 decode → {0,1,2}
+    - { op: DEQUANT_ADD, constant: -1.0 }         # → {-1,0,1}
+    - { op: DEQUANT_CAST, cast_to: FLOAT16 }
+    - { op: DEQUANT_MULTIPLY, operand: "scale" }  # * group scale
+```
+
+### 12.9 FP8 E4M3 (per-tensor, standard)
+
+Standard 8-bit float — trivially representable, included for completeness.
+
+```yaml
+type_uri: "onnx:fp8_e4m3fn/v1"
+block_size: 1
+bytes_per_block: 1
+encoding:
+  family: ENCODING_SYMMETRIC
+group_size: 0                 # per-tensor scale
+scale_data_type: FLOAT32
+dequant_formula:
+  steps:
+    - { op: DEQUANT_UNPACK }                      # interpret as fp8 → float
+    - { op: DEQUANT_MULTIPLY, operand: "scale" }
+```
+
+### 12.10 AQLM (Additive Quantization for LLMs)
+
+Multi-codebook additive quantization: each weight group is represented as
+a sum of codeword lookups from multiple learned codebooks.
+
+```yaml
+type_uri: "onnx-community:aqlm-2x8/v1"
+block_size: 8                 # 8 weights per group
+bytes_per_block: 3            # 2 bytes (2 × 8-bit codebook indices) + 1 byte metadata
+encoding:
+  family: ENCODING_CUSTOM     # additive multi-codebook needs plugin
+group_size: 8
+scale_data_type: FLOAT16
+# Codec implements: output[i] = sum(codebook_k[index_k][i]) * scale
+# Two codebooks, 256 entries each, 8-dimensional vectors
+```
+
+### Summary Table
+
+| Format | bpw | Encoding Family | Nested | Auto-Codec | Notes |
+|--------|-----|-----------------|--------|------------|-------|
+| INT4 Symmetric | 4.5 | SYMMETRIC | No | ✅ | QDQ-equivalent |
+| NF4 (QLoRA) | 4.5 | LOOKUP_TABLE | No | ✅ | 16-entry codebook |
+| MXFP4 | 5.0 | AFFINE | Yes | ✅ | Shared exponent |
+| Q4_K | 4.5 | AFFINE | Yes (2-level) | ✅ | 6-bit sub-scales |
+| Q2_K | 2.625 | AFFINE | Yes (2-level) | ✅ | Aggressive 2-bit |
+| IQ4_NL | 4.5 | LOOKUP_TABLE | No | ✅ | Non-linear codebook |
+| IQ1_S | 1.56 | CUSTOM | N/A | ❌ (needs plugin) | Grid shifts |
+| Ternary 1.58 | 1.63 | PACKED_INTEGER | No | ✅ | Base-3 |
+| FP8 E4M3 | 8.0 | SYMMETRIC | No | ✅ | Standard float |
+| AQLM 2×8 | 3.0 | CUSTOM | N/A | ❌ (needs plugin) | Multi-codebook |
+
+## 13. Relationship to Existing `SUB4BIT_QUANT.md`
 
 This design subsumes and generalizes the approach in `SUB4BIT_QUANT.md`. The IQ/MXFP4
 types documented there become concrete instances:
