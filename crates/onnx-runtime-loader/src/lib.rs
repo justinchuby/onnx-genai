@@ -620,8 +620,8 @@ pub fn validate_no_control_flow(graph: &Graph) -> Result<(), LoaderError> {
     /// The standard subgraph-bearing ops the CPU executor can run recursively.
     ///
     /// Operates on loaded IR, where the default domain is canonically `""`.
-    fn is_implemented_control_flow(op_type: &str, domain: &str) -> bool {
-        domain.is_empty() && matches!(op_type, "If" | "Loop" | "Scan")
+    fn is_implemented_control_flow(node: &onnx_runtime_ir::Node) -> bool {
+        node.is_default_domain() && matches!(node.op_type.as_str(), "If" | "Loop" | "Scan")
     }
 
     fn check_graph(graph: &Graph) -> Result<(), LoaderError> {
@@ -637,7 +637,7 @@ pub fn validate_no_control_flow(graph: &Graph) -> Result<(), LoaderError> {
             if let Some(attr) = subgraph_attrs.first() {
                 // A subgraph body is fine when its owner is an implemented
                 // control-flow op; otherwise fail fast.
-                if !is_implemented_control_flow(&node.op_type, &node.domain) {
+                if !is_implemented_control_flow(node) {
                     return Err(LoaderError::UnsupportedControlFlow {
                         op_type: node.op_type.clone(),
                         node: node_label(node),

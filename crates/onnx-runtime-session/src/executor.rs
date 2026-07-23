@@ -1124,7 +1124,7 @@ fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
     // graphs intentionally read Shape at the allocation extent and ReduceSum is
     // unchanged by that suffix; prefix-sensitive transforms such as CumSum must
     // instead see the logical valid length.
-    node.domain.is_empty()
+    node.is_default_domain()
         && input_index == 0
         && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
 }
@@ -1136,7 +1136,7 @@ fn runtime_elementwise_output_shape(
     node: &Node,
     input_shapes: &[Vec<usize>],
 ) -> Option<std::result::Result<Vec<usize>, onnx_runtime_ir::IrError>> {
-    if !node.domain.is_empty() {
+    if !node.is_default_domain() {
         return None;
     }
 
@@ -1182,7 +1182,7 @@ fn dynamic_output_shapes(
         // per-axis element count mirrors the `Slice` kernel's clamp semantics
         // exactly (ONNX reference), so the buffer we size here matches what the
         // kernel writes.
-        "Slice" if node.domain.is_empty() => {
+        "Slice" if node.is_default_domain() => {
             let data_shape = input_shapes.first()?;
             let starts = input_values.get(1)?.as_ref()?;
             let ends = input_values.get(2)?.as_ref()?;
@@ -1315,7 +1315,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         .iter()
         .filter_map(|(id, node)| {
             (node.op_type == "Sigmoid"
-                && node.domain.is_empty()
+                && node.is_default_domain()
                 && node.inputs.len() == 1
                 && node.outputs.len() == 1)
                 .then_some(id)
@@ -1341,7 +1341,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         let mul_id = consumers[0];
         let mul = graph.node(mul_id);
         if mul.op_type != "Mul"
-            || !mul.domain.is_empty()
+            || !mul.is_default_domain()
             || mul.inputs.len() != 2
             || mul.outputs.len() != 1
             || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
@@ -6426,7 +6426,7 @@ mod tests {
                 ));
             }
             if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
-                || (op.domain.is_empty() && op.op_type == "Identity")
+                || (op.is_default_domain() && op.op_type == "Identity")
             {
                 KernelMatch::Supported {
                     cost: Cost::ZERO,

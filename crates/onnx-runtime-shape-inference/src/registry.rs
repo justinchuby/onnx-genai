@@ -82,7 +82,7 @@ impl InferenceRegistry {
         let version = {
             // Loaded IR is canonical (`normalize_domain` applied at load), so the
             // default domain is `""` for both node domains and opset-import keys.
-            if node.domain.is_empty() {
+            if node.is_default_domain() {
                 opset_imports.get("").copied().unwrap_or(1)
             } else {
                 opset_imports.get(&node.domain).copied().unwrap_or(1)
