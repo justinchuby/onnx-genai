@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -33,6 +33,17 @@ const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
 const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
 const GEMM_F16_ENTRY: &str = "matmul_nbits_gemm_f16";
 const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
+/// General fp16/fp16-scales GEMV with a fused RMS-normalization prologue (see
+/// [`crate::optimizer::CudaSkipRmsNormMatMulFusion`]). It normalizes the input
+/// activation in-kernel — byte-identically to `skip_rmsnorm_f16_warp_half4` —
+/// before the standard `scales_f16` int4 dot, folding a
+/// `SkipSimplifiedLayerNormalization` normalization into the following GEMV.
+const GEMV_F16_SCALES_F16_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_rmsnorm";
+/// Standalone RMS-normalization prologue used by the fused GEMV's M>1 prefill
+/// path (see [`MatMulNBitsKernel::launch_rmsnorm_prefill`]).
+const RMSNORM_PREFILL_ENTRY: &str = "matmul_nbits_rmsnorm_f16_warp_half4";
+/// One warp (32 lanes) normalizes one token row in the prefill prologue.
+const RMSNORM_PREFILL_THREADS: u32 = 32;
 const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
 const GEMM_F16_TILE: usize = 16;
 const GEMV_F16_SMALL_THREADS: u32 = 64;
@@ -492,7 +503,8 @@ extern "C" __global__ void matmul_nbits_gemm_f16(
     const int k_blocks,
     const int bits,
     const int scales_fp16,
-    const int bias_post_round)
+    const int bias_post_round,
+    const int bias_row_stride)
 {
     __shared__ float activation_tile[16][32];
     __shared__ float weight_tile[32][16];
@@ -560,8 +572,11 @@ extern "C" __global__ void matmul_nbits_gemm_f16(
     }
 
     if (row < m && column < n) {
+        // A folded residual epilogue binds a per-token residual (row stride N)
+        // into the bias slot; a genuine broadcast bias keeps stride 0.
+        const __half* row_bias = bias ? bias + (long)row * bias_row_stride : bias;
         output[(long)row * n + column] =
-            fold_bias_f16(value, bias, column, bias_post_round);
+            fold_bias_f16(value, row_bias, column, bias_post_round);
     }
 }
 
@@ -950,6 +965,222 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16(
     }
 }
 
+// Half4 view matching `skip_rmsnorm_f16_warp_half4` so the fused prologue below
+// reduces the activation with the exact same chunking and rounding.
+union MatMulNBitsSkipHalf4 {
+    unsigned long long raw;
+    __half2 pair[2];
+};
+
+// General fp16/fp16-scales GEMV with a fused RMS-normalization prologue. The
+// preceding GEMV's residual epilogue already produced the byte-identical
+// residual sum that `SkipSimplifiedLayerNormalization` would emit as its
+// residual output, so this kernel only has to (1) reduce that sum exactly as
+// `skip_rmsnorm_f16_warp_half4` does, (2) write the normalized activation into
+// shared memory with the same rounding, and (3) run the standard `scales_f16`
+// int4 dot over that staged, normalized activation. Every arithmetic step
+// mirrors the standalone norm + GEMV pair, so tokens stay bit-for-bit identical
+// while the separate normalization kernel is removed from the decode graph.
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const __half* __restrict__ gamma,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int bias_post_round,
+    const float epsilon)
+{
+    // Normalized activation, staged 16-byte aligned so the dot below can reuse
+    // the `scales_f16` `uint4` activation loads unchanged.
+    extern __shared__ __align__(16) __half staged_activation[];
+    __shared__ float shared_inv_std;
+
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // --- RMS reduction, byte-identical to `skip_rmsnorm_f16_warp_half4`. ---
+    if (warp == 0) {
+        const int chunks_per_lane = k / (32 * 4);
+        const unsigned long long* activation4 =
+            reinterpret_cast<const unsigned long long*>(activation);
+        float ss0 = 0.0f;
+        float ss1 = 0.0f;
+        float ss2 = 0.0f;
+        float ss3 = 0.0f;
+        for (int item = 0; item < chunks_per_lane; ++item) {
+            const int chunk = lane + item * 32;
+            MatMulNBitsSkipHalf4 residual;
+            residual.raw = activation4[chunk];
+            const float2 rounded0 = __half22float2(residual.pair[0]);
+            const float2 rounded1 = __half22float2(residual.pair[1]);
+            ss0 += rounded0.x * rounded0.x;
+            ss1 += rounded0.y * rounded0.y;
+            ss2 += rounded1.x * rounded1.x;
+            ss3 += rounded1.y * rounded1.y;
+        }
+        float ss = (ss0 + ss1) + (ss2 + ss3);
+        for (int off = 16; off > 0; off >>= 1) {
+            ss += __shfl_down_sync(0xffffffffu, ss, off);
+        }
+        if (lane == 0) {
+            shared_inv_std = 1.0f / sqrtf(ss / (float)k + epsilon);
+        }
+    }
+    __syncthreads();
+    const float inv_std = shared_inv_std;
+
+    // --- Normalized activation, matching the norm kernel's rounded output. ---
+    for (int j = tid; j < k; j += (int)blockDim.x) {
+        const float residual = __half2float(activation[j]);
+        const float scale = __half2float(gamma[j]);
+        staged_activation[j] = __float2half((residual * inv_std) * scale);
+    }
+    __syncthreads();
+
+    // --- Standard `scales_f16` int4 dot over the staged, normalized input. ---
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+
+    __half2 sum0 = __float2half2_rn(0.0f);
+    __half2 sum1 = __float2half2_rn(0.0f);
+    __half2 sum2 = __float2half2_rn(0.0f);
+    __half2 sum3 = __float2half2_rn(0.0f);
+    float tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        const __half* activation_ptr = staged_activation + lane_depth;
+        const unsigned char* packed_ptr =
+            packed + (long)column * k_blocks * blob_size + lane * 4;
+        const __half* scale_ptr =
+            scales + (long)column * k_blocks + (lane >> 2);
+        int depth_base = 0;
+        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            accumulate_int4x8_f16(
+                packed_word,
+                activation_ptr,
+                *scale_ptr,
+                sum0,
+                sum1,
+                sum2,
+                sum3);
+            activation_ptr += 256;
+            packed_ptr += 128;
+            scale_ptr += 8;
+        }
+        const int tail_depth = depth_base + lane_depth;
+        if (tail_depth < k) {
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            const float scale = __half2float(*scale_ptr);
+            const int valid = min(8, k - tail_depth);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < valid) {
+                    const int q = (int)((packed_word >> (i * 4)) & 15u) - 8;
+                    tail += (float)q * __half2float(activation_ptr[i]) * scale;
+                }
+            }
+        }
+    }
+    const float2 value04 = __half22float2(sum0);
+    const float2 value15 = __half22float2(sum1);
+    const float2 value26 = __half22float2(sum2);
+    const float2 value37 = __half22float2(sum3);
+    float value = tail + value04.x;
+    value += value15.x;
+    value += value26.x;
+    value += value37.x;
+    value += value04.y;
+    value += value15.y;
+    value += value26.y;
+    value += value37.y;
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// Standalone RMS-normalization prologue for the M>1 prefill path of the fused
+// GEMV. It reproduces `skip_rmsnorm_f16_warp_half4` (minus the residual add,
+// which the preceding GEMV's epilogue already applied) bit-for-bit: identical
+// half4 chunking, identical `(ss0+ss1)+(ss2+ss3)` reduction, identical warp
+// shuffle, and identical `__floats2half2_rn` output rounding. One warp
+// normalizes one token row into `normalized`, which the portable tiled GEMM
+// then consumes exactly as it would the standalone norm's fp16 output.
+extern "C" __global__ void matmul_nbits_rmsnorm_f16_warp_half4(
+    const __half* __restrict__ activation,
+    const void* __restrict__ gamma,
+    __half* __restrict__ normalized,
+    const int norm_size,
+    const int num_groups,
+    const float epsilon)
+{
+    const int g = (int)blockIdx.x;
+    if (g >= num_groups) return;
+    const long base = (long)g * norm_size;
+    const int lane = (int)threadIdx.x;
+    const int chunks_per_lane = norm_size / (32 * 4);
+    const unsigned long long* activation4 =
+        reinterpret_cast<const unsigned long long*>(activation + base);
+    const unsigned long long* gamma4 =
+        reinterpret_cast<const unsigned long long*>(gamma);
+    unsigned long long* normalized4 =
+        reinterpret_cast<unsigned long long*>(normalized + base);
+    float ss0 = 0.0f;
+    float ss1 = 0.0f;
+    float ss2 = 0.0f;
+    float ss3 = 0.0f;
+    for (int item = 0; item < chunks_per_lane; ++item) {
+        const int chunk = lane + item * 32;
+        MatMulNBitsSkipHalf4 residual;
+        residual.raw = activation4[chunk];
+        const float2 rounded0 = __half22float2(residual.pair[0]);
+        const float2 rounded1 = __half22float2(residual.pair[1]);
+        ss0 += rounded0.x * rounded0.x;
+        ss1 += rounded0.y * rounded0.y;
+        ss2 += rounded1.x * rounded1.x;
+        ss3 += rounded1.y * rounded1.y;
+    }
+    float ss = (ss0 + ss1) + (ss2 + ss3);
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+    float inv_std = 0.0f;
+    if (lane == 0) {
+        inv_std = 1.0f / sqrtf(ss / (float)norm_size + epsilon);
+    }
+    inv_std = __shfl_sync(0xffffffffu, inv_std, 0);
+    for (int item = 0; item < chunks_per_lane; ++item) {
+        const int chunk = lane + item * 32;
+        MatMulNBitsSkipHalf4 residual;
+        MatMulNBitsSkipHalf4 scale;
+        MatMulNBitsSkipHalf4 output;
+        residual.raw = activation4[chunk];
+        scale.raw = gamma4[chunk];
+        const float2 value0 = __half22float2(residual.pair[0]);
+        const float2 value1 = __half22float2(residual.pair[1]);
+        const float2 scale0 = __half22float2(scale.pair[0]);
+        const float2 scale1 = __half22float2(scale.pair[1]);
+        output.pair[0] = __floats2half2_rn(
+            value0.x * inv_std * scale0.x,
+            value0.y * inv_std * scale0.y);
+        output.pair[1] = __floats2half2_rn(
+            value1.x * inv_std * scale1.x,
+            value1.y * inv_std * scale1.y);
+        normalized4[chunk] = output.raw;
+    }
+}
+
 // SwiGLU activation, byte-identical to the standalone `op_silu` in the
 // elementwise kernels: silu(x) = x * sigmoid(x), evaluated in the same
 // rounding-stable form so the paired epilogue reproduces the two-op tokens.
@@ -1313,6 +1544,14 @@ impl KernelFactory for MatMulNBitsFactory {
                 .attr(crate::optimizer::GATE_UP_SWIGLU_FUSION_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
                 == Some(1),
+            rmsnorm_prologue: node
+                .attr(crate::optimizer::MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR)
+                .and_then(onnx_runtime_ir::Attribute::as_int)
+                == Some(1),
+            rmsnorm_epsilon: node
+                .attr(crate::optimizer::MATMUL_NBITS_RMSNORM_EPSILON_ATTR)
+                .and_then(onnx_runtime_ir::Attribute::as_float)
+                .unwrap_or(1e-5),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -1368,15 +1607,25 @@ pub struct MatMulNBitsKernel {
     /// `[x, W_gate, scales_gate, W_up, scales_up]` and the kernel writes
     /// `silu(gate) * up` directly (see [`GATE_UP_SWIGLU_ENTRY`]).
     gate_up_swiglu: bool,
+    /// Set on a general fp16 GEMV whose input activation must be RMS-normalized
+    /// in-kernel before the int4 dot, produced by
+    /// [`crate::optimizer::CudaSkipRmsNormMatMulFusion`]. The `gamma` weight is
+    /// bound at input slot 6 and the kernel reproduces
+    /// `skip_rmsnorm_f16_warp_half4` bit-for-bit (see
+    /// [`GEMV_F16_SCALES_F16_RMSNORM_ENTRY`]).
+    rmsnorm_prologue: bool,
+    /// Epsilon copied from the folded `SkipSimplifiedLayerNormalization` node so
+    /// the fused prologue reproduces its `1/sqrt(mean_sq + epsilon)`.
+    rmsnorm_epsilon: f32,
     last_call_capture_safe: AtomicBool,
 }
 
 impl MatMulNBitsKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
-        if !(3..=6).contains(&inputs.len()) || outputs.len() != 1 {
+        if !(3..=7).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
-                "expected 3 to 6 inputs and 1 output, got {} inputs and {} outputs",
+                "expected 3 to 7 inputs and 1 output, got {} inputs and {} outputs",
                 inputs.len(),
                 outputs.len()
             )));
@@ -1662,9 +1911,29 @@ impl MatMulNBitsKernel {
         }
         let group_indices = optional_input(inputs, 4);
         let bias = optional_input(inputs, 5);
+        let rows = a_shape[..a_shape.len() - 1].iter().product::<usize>();
         if let Some(bias) = bias {
             require_dtype("bias", bias.dtype, DataType::Float16)?;
-            require_shape("bias", bias.shape, &[self.n])?;
+            // A folded residual epilogue binds the residual activation into this
+            // same slot: `[1, 1, N]` (N elements) at decode, or `[1, S, N]`
+            // (rows * N elements) at prefill. A genuine broadcast bias is `[N]`.
+            if bias.numel() != self.n && bias.numel() != rows * self.n {
+                return Err(error(format!(
+                    "bias must have {} elements (broadcast [N]) or {} elements (per-token \
+                     [1, S, N] residual), got {:?}",
+                    self.n,
+                    rows * self.n,
+                    bias.shape
+                )));
+            }
+        }
+        let gamma = optional_input(inputs, 6);
+        if self.rmsnorm_prologue {
+            let gamma = gamma.ok_or_else(|| {
+                error("rmsnorm_prologue fusion requires the normalization weight at input 6")
+            })?;
+            require_dtype("gamma", gamma.dtype, DataType::Float16)?;
+            require_shape("gamma", gamma.shape, &[self.k])?;
         }
 
         for (name, contiguous) in [
@@ -1676,6 +1945,7 @@ impl MatMulNBitsKernel {
                 zero_points.is_none_or(TensorView::is_contiguous),
             ),
             ("bias", bias.is_none_or(TensorView::is_contiguous)),
+            ("gamma", gamma.is_none_or(TensorView::is_contiguous)),
             ("Y", outputs[0].is_contiguous()),
         ] {
             if !contiguous {
@@ -1709,6 +1979,36 @@ impl MatMulNBitsKernel {
             // advertised capture contract conservative: variable-M prefill is
             // outside the persistent M=1 decode graph and has no replay coverage.
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            // A folded residual epilogue supplies a per-token residual (rows * N
+            // elements) in the bias slot; index it with row stride N. A genuine
+            // broadcast bias (N elements) keeps stride 0.
+            let bias_row_stride = match bias {
+                Some(bias) if bias.numel() == m * self.n && m * self.n != self.n => self.n,
+                _ => 0,
+            };
+            if self.rmsnorm_prologue {
+                let gamma = gamma.ok_or_else(|| {
+                    error("rmsnorm_prologue fusion requires the normalization weight at input 6")
+                })?;
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemm_f16_tiled_rmsnorm",
+                    "M={} prefill: RMS-normalization prologue (SkipSimplifiedLayerNormalization \
+                     folded) into a per-token scratch, then portable 16x16 tiled GEMM with fp32 \
+                     accumulation; not advertised as CUDA-graph capture-safe",
+                    m
+                );
+                return self.launch_f16_gemm_rmsnorm_prefill(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    gamma,
+                    bias,
+                    &mut outputs[0],
+                    m,
+                    k_blocks,
+                    bias_row_stride,
+                );
+            }
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemm_f16_tiled",
                 "M={} prefill: fp16 activation, bits={}, block_size=32, zero_points={}, \
@@ -1729,6 +2029,7 @@ impl MatMulNBitsKernel {
                 &mut outputs[0],
                 m,
                 k_blocks,
+                bias_row_stride,
             );
         }
 
@@ -1749,6 +2050,32 @@ impl MatMulNBitsKernel {
                 bias,
                 &mut outputs[0],
                 k_blocks,
+            );
+        }
+        if self.rmsnorm_prologue {
+            let gamma = gamma.ok_or_else(|| {
+                error("rmsnorm_prologue fusion requires the normalization weight at input 6")
+            })?;
+            if !scales_fp16 || zero_points.is_some() {
+                return Err(error(
+                    "rmsnorm_prologue fusion requires fp16 scales and no zero_points (the fused \
+                     kernel replicates the fp16 general scales path)",
+                ));
+            }
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "gemv_f16_scales_f16_rmsnorm",
+                "M==1 decode: fp16 activation, bits=4, block_size=32, fp16 scales → general GEMV \
+                 with fused RMS-normalization prologue (SkipSimplifiedLayerNormalization folded)"
+            );
+            return self.launch_f16_gemv_rmsnorm(
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                gamma,
+                bias,
+                &mut outputs[0],
+                k_blocks,
+                blob_size,
             );
         }
         self.launch_f16_gemv(
@@ -1777,6 +2104,7 @@ impl MatMulNBitsKernel {
         output: &mut TensorMut,
         m: usize,
         k_blocks: usize,
+        bias_row_stride: usize,
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 prefill GEMM")?;
@@ -1800,6 +2128,7 @@ impl MatMulNBitsKernel {
         let bits = as_i32("bits", self.bits)?;
         let scales_fp16_flag = scales_fp16 as i32;
         let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+        let bias_row_stride_i32 = as_i32("bias row stride", bias_row_stride)?;
         let grid_x = u32::try_from(self.n.div_ceil(GEMM_F16_TILE))
             .map_err(|_| error(format!("N={} exceeds CUDA prefill grid limits", self.n)))?;
         let grid_y = u32::try_from(m.div_ceil(GEMM_F16_TILE))
@@ -1818,7 +2147,8 @@ impl MatMulNBitsKernel {
             .arg(&k_blocks)
             .arg(&bits)
             .arg(&scales_fp16_flag)
-            .arg(&bias_post_round_flag);
+            .arg(&bias_post_round_flag)
+            .arg(&bias_row_stride_i32);
         // SAFETY: dense block-32 tensors and all dimensions were validated
         // above. The 16x16 CTA uses 4 KiB of statically sized shared memory,
         // ordinary fp32 CUDA-core arithmetic, and fp16 conversions only. It has
@@ -1833,6 +2163,99 @@ impl MatMulNBitsKernel {
         }
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMulNBits fp16 prefill GEMM", err))
+    }
+
+    /// M>1 prefill path for the fused RMS-normalization prologue. It stages the
+    /// per-token normalized activation (byte-identical to the standalone
+    /// `skip_rmsnorm_f16_warp_half4` output) into scratch, then runs the
+    /// portable tiled GEMM over it. Prefill is outside the persistent decode
+    /// graph, so the scratch allocation here is not on any captured path.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_f16_gemm_rmsnorm_prefill(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        gamma: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+        k_blocks: usize,
+        bias_row_stride: usize,
+    ) -> Result<()> {
+        let scratch = self
+            .runtime
+            .alloc_raw(m * self.k * std::mem::size_of::<half::f16>())?;
+        let scratch_shape = [m, self.k];
+        let scratch_strides = [self.k as i64, 1];
+        let normalized = TensorView::new(
+            DevicePtr(raw_ptr(scratch) as *const c_void),
+            DataType::Float16,
+            &scratch_shape,
+            &scratch_strides,
+            activation.device,
+        );
+        let result = self.launch_rmsnorm_prefill(activation, gamma, scratch, m).and_then(|()| {
+            self.launch_f16_gemm(
+                &normalized,
+                packed,
+                scales,
+                true,
+                None,
+                bias,
+                output,
+                m,
+                k_blocks,
+                bias_row_stride,
+            )
+        });
+        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly
+        // once; `cuMemFree` waits for the preceding norm + GEMM stream work.
+        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
+        result.and(free_scratch)
+    }
+
+    /// Launches the standalone RMS-normalization prologue used by prefill. One
+    /// warp normalizes one token row of `activation` into `normalized`.
+    fn launch_rmsnorm_prefill(
+        &self,
+        activation: &TensorView,
+        gamma: &TensorView,
+        normalized: CUdeviceptr,
+        m: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits fp16 RMS-norm prefill prologue")?;
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, RMSNORM_PREFILL_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let normalized_ptr = normalized;
+        let norm_size = as_i32("K", self.k)?;
+        let num_groups = as_i32("M", m)?;
+        let epsilon = self.rmsnorm_epsilon;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&gamma_ptr)
+            .arg(&normalized_ptr)
+            .arg(&norm_size)
+            .arg(&num_groups)
+            .arg(&epsilon);
+        // SAFETY: `activation` and `gamma` are validated contiguous fp16 tensors
+        // and `normalized` is a `K * M`-half scratch buffer allocated by the
+        // caller. Each of the `M` one-warp blocks reads/writes only its own row
+        // with the launch-predicate-guaranteed `K % 128 == 0` half4 chunking.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (m as u32, 1, 1),
+                block_dim: (RMSNORM_PREFILL_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits fp16 RMS-norm prefill prologue", err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2055,9 +2478,10 @@ impl MatMulNBitsKernel {
                 &mut gate_output,
                 m,
                 k_blocks,
+                0,
             )?;
             self.launch_f16_gemm(
-                activation, packed_up, scales_up, true, None, None, output, m, k_blocks,
+                activation, packed_up, scales_up, true, None, None, output, m, k_blocks, 0,
             )?;
             let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
             crate::kernels::elementwise::launch_silu_mul_f16_raw(
@@ -2291,6 +2715,99 @@ impl MatMulNBitsKernel {
                 err,
             )
         })
+    }
+
+    /// General fp16 GEMV whose input activation is RMS-normalized in-kernel
+    /// (the [`GEMV_F16_SCALES_F16_RMSNORM_ENTRY`] entry). Bit-for-bit identical
+    /// to the standalone `SkipSimplifiedLayerNormalization` residual output
+    /// followed by the general `scales_f16` GEMV, so decode tokens are
+    /// unchanged while the separate normalization launch is removed.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_f16_gemv_rmsnorm(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        gamma: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits fp16 RMS-norm-prologue GEMV")?;
+        if bias.is_some() {
+            if self.fold_bias_post_round {
+                onnx_runtime_ep_api::record_kernel_variant_stage!(
+                    "bias",
+                    "qkv_bias_fused",
+                    "folded standalone Add(MatMulNBits, bias) into GEMV epilogue with \
+                     fp16-after-round semantics fp16(fp16(acc)+bias) (token-identity preserved)"
+                );
+            } else {
+                onnx_runtime_ep_api::record_kernel_variant_stage!(
+                    "bias",
+                    "bias_native",
+                    "native MatMulNBits bias: single-round epilogue fp16(acc+bias)"
+                );
+            }
+        }
+        let function = self.runtime.nvrtc_function(
+            GEMV_F16_MODULE,
+            GEMV_F16_SRC,
+            GEMV_F16_SCALES_F16_RMSNORM_ENTRY,
+        )?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let blob_size = as_i32("block blob size", blob_size)?;
+        let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+        let epsilon = self.rmsnorm_epsilon;
+        let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+            GEMV_F16_SMALL_THREADS
+        } else {
+            GEMV_F16_LARGE_THREADS
+        };
+        let columns_per_block = (threads / 32) as usize;
+        let shared_mem_bytes = (self.k * std::mem::size_of::<half::f16>()) as u32;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&gamma_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks)
+            .arg(&blob_size)
+            .arg(&bias_post_round_flag)
+            .arg(&epsilon);
+        // SAFETY: restricted to block-32 M=1 fp16 inputs with fp16 scales and no
+        // zero_points, all dtype/shape/contiguity validated above. The kernel
+        // stages the normalized activation in launch-time dynamic shared memory
+        // (`K * sizeof(f16)`, bounded by the fusion's `K % 128 == 0` predicate)
+        // and uses only registers, warp shuffles, and `__syncthreads` — no
+        // per-call allocation or host synchronization — so it is legal to record
+        // into and replay from a CUDA graph.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits fp16 RMS-norm-prologue GEMV", err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2960,6 +3477,8 @@ mod tests {
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
         };
         kernel.run(&inputs, &mut outputs).unwrap();
@@ -3108,6 +3627,8 @@ mod tests {
                 accuracy4_workspace: None,
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
             };
             kernel
@@ -3407,6 +3928,8 @@ mod tests {
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
         };
         let kernel_fold = MatMulNBitsKernel {
@@ -3419,6 +3942,8 @@ mod tests {
             accuracy4_workspace: None,
             fold_bias_post_round: true,
             gate_up_swiglu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
         };
         kernel_nobias
@@ -3674,6 +4199,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 accuracy4_workspace: None,
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
             };
             // Reference: two standalone MatMulNBits projections.
@@ -3726,6 +4253,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                         &mut gate_out,
                         m,
                         k_blocks,
+                        0,
                     )
                     .unwrap();
                 gemv_kernel
@@ -3739,6 +4267,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                         &mut up_out,
                         m,
                         k_blocks,
+                        0,
                     )
                     .unwrap();
             }
@@ -3820,6 +4349,452 @@ extern "C" __global__ void ref_silu_mul_f16(
                     index % n,
                     fused[index],
                     reference[index]
+                );
+            }
+        }
+    }
+
+    /// Byte-for-byte parity of the fused SkipSimplifiedLayerNormalization
+    /// epilogue/prologue against the standalone three-op sequence
+    /// (`preceding MatMulNBits` → `SkipSimplifiedLayerNormalization` →
+    /// `following MatMulNBits`) on GPU.
+    ///
+    /// The reference path runs the exact production kernels: a plain preceding
+    /// GEMV, the standalone `skip_rmsnorm_f16_warp_half4` kernel (producing the
+    /// normalized output and the residual sum), then a plain following GEMV. The
+    /// fused path folds the residual add into the preceding GEMV's bias-slot
+    /// epilogue and the RMS normalization into the following GEMV's prologue. The
+    /// residual sum (`preceding fused output`) must equal the standalone norm's
+    /// `input_skip_bias_sum`, and the final projection must be bit-identical —
+    /// for decode (M==1) and prefill (M>1), with and without a following bias.
+    #[test]
+    fn fused_skip_rmsnorm_is_bit_exact_to_three_op_path() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping fused skip-rmsnorm parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            eprintln!("skipping fused skip-rmsnorm parity test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        // hidden % 128 == 0 (warp_half4 gate); preceding is a down projection
+        // (pre_k > hidden), the following is a general projection (hidden <= n).
+        let hidden = 896usize;
+        let pre_k = QWEN_DOWN_K; // 4864 > 896 → down variant preceding GEMV.
+        let post_n = 1152usize; // hidden <= post_n → general variant following GEMV.
+        let epsilon = 1e-5f32;
+        let block_size = 32usize;
+        let blob_size = block_size / 2;
+        let device = DeviceId::cuda(0);
+
+        for (m, following_bias) in [(1usize, false), (1, true), (5, true)] {
+            let mut state = 0x51ce_d00d_f00d_1234u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            // Pack random int4 codes into the block-32 layout the kernels unpack.
+            let pack = |next: &mut dyn FnMut() -> f32, n: usize, k: usize| -> Vec<u8> {
+                let k_blocks = k / block_size;
+                let mut quant = vec![0u8; n * k];
+                for value in quant.iter_mut() {
+                    *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                }
+                let mut packed = vec![0u8; n * k_blocks * blob_size];
+                for col in 0..n {
+                    for block in 0..k_blocks {
+                        for pair in 0..blob_size {
+                            let low = quant[col * k + block * block_size + pair * 2] & 15;
+                            let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                            packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                        }
+                    }
+                }
+                packed
+            };
+
+            let pre_k_blocks = pre_k / block_size;
+            let post_k_blocks = hidden / block_size;
+
+            let activation: Vec<f16> = (0..m * pre_k).map(|_| f16::from_f32(next())).collect();
+            let packed_pre = pack(&mut next, hidden, pre_k);
+            let scales_pre: Vec<f16> = (0..hidden * pre_k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            let packed_post = pack(&mut next, post_n, hidden);
+            let scales_post: Vec<f16> = (0..post_n * post_k_blocks)
+                .map(|_| f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+                .collect();
+            // The residual is a plain fp16 activation, one hidden vector per token.
+            let residual: Vec<f16> = (0..m * hidden).map(|_| f16::from_f32(next())).collect();
+            let gamma: Vec<f16> = (0..hidden)
+                .map(|_| f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5)))
+                .collect();
+            let bias_post: Vec<f16> = (0..post_n).map(|_| f16::from_f32(next())).collect();
+
+            // Device buffers.
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let packed_pre_dev = runtime.alloc_raw(packed_pre.len()).unwrap();
+            let scales_pre_dev = runtime.alloc_raw(scales_pre.len() * 2).unwrap();
+            let packed_post_dev = runtime.alloc_raw(packed_post.len()).unwrap();
+            let scales_post_dev = runtime.alloc_raw(scales_post.len() * 2).unwrap();
+            let residual_dev = runtime.alloc_raw(residual.len() * 2).unwrap();
+            let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+            let bias_post_dev = runtime.alloc_raw(bias_post.len() * 2).unwrap();
+            let matmul_out_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
+            let normalized_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
+            let sum_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
+            let mean_dev = runtime.alloc_raw(m * 2).unwrap();
+            let invstd_dev = runtime.alloc_raw(m * 2).unwrap();
+            let y_ref_dev = runtime.alloc_raw(m * post_n * 2).unwrap();
+            let pre_fused_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
+            let y_fused_dev = runtime.alloc_raw(m * post_n * 2).unwrap();
+
+            // SAFETY: device buffers exactly cover their source slices.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(&packed_pre, packed_pre_dev).unwrap();
+                runtime.htod(as_bytes(&scales_pre), scales_pre_dev).unwrap();
+                runtime.htod(&packed_post, packed_post_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&scales_post), scales_post_dev)
+                    .unwrap();
+                runtime.htod(as_bytes(&residual), residual_dev).unwrap();
+                runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+                runtime.htod(as_bytes(&bias_post), bias_post_dev).unwrap();
+            }
+
+            // Tensor descriptors.
+            let pre_a_shape = [m, pre_k];
+            let pre_a_strides = [pre_k as i64, 1];
+            let pre_b_shape = [hidden, pre_k_blocks, blob_size];
+            let pre_b_strides = [(pre_k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let pre_scales_shape = [hidden, pre_k_blocks];
+            let pre_scales_strides = [pre_k_blocks as i64, 1];
+            let hidden_shape = [m, hidden];
+            let hidden_strides = [hidden as i64, 1];
+            let gamma_shape = [hidden];
+            let gamma_strides = [1i64];
+            let post_b_shape = [post_n, post_k_blocks, blob_size];
+            let post_b_strides = [(post_k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let post_scales_shape = [post_n, post_k_blocks];
+            let post_scales_strides = [post_k_blocks as i64, 1];
+            let post_bias_shape = [post_n];
+            let post_bias_strides = [1i64];
+            let y_shape = [m, post_n];
+            let y_strides = [post_n as i64, 1];
+            let stat_shape = [m];
+            let stat_strides = [1i64];
+
+            let activation_view = TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &pre_a_shape,
+                &pre_a_strides,
+                device,
+            );
+            let packed_pre_view = TensorView::new(
+                device_ptr(packed_pre_dev),
+                DataType::Uint8,
+                &pre_b_shape,
+                &pre_b_strides,
+                device,
+            );
+            let scales_pre_view = TensorView::new(
+                device_ptr(scales_pre_dev),
+                DataType::Float16,
+                &pre_scales_shape,
+                &pre_scales_strides,
+                device,
+            );
+            let packed_post_view = TensorView::new(
+                device_ptr(packed_post_dev),
+                DataType::Uint8,
+                &post_b_shape,
+                &post_b_strides,
+                device,
+            );
+            let scales_post_view = TensorView::new(
+                device_ptr(scales_post_dev),
+                DataType::Float16,
+                &post_scales_shape,
+                &post_scales_strides,
+                device,
+            );
+            let residual_view = TensorView::new(
+                device_ptr(residual_dev),
+                DataType::Float16,
+                &hidden_shape,
+                &hidden_strides,
+                device,
+            );
+            let gamma_view = TensorView::new(
+                device_ptr(gamma_dev),
+                DataType::Float16,
+                &gamma_shape,
+                &gamma_strides,
+                device,
+            );
+            let bias_post_view = TensorView::new(
+                device_ptr(bias_post_dev),
+                DataType::Float16,
+                &post_bias_shape,
+                &post_bias_strides,
+                device,
+            );
+            let matmul_out_view = TensorView::new(
+                device_ptr(matmul_out_dev),
+                DataType::Float16,
+                &hidden_shape,
+                &hidden_strides,
+                device,
+            );
+            let normalized_input_view = TensorView::new(
+                device_ptr(normalized_dev),
+                DataType::Float16,
+                &hidden_shape,
+                &hidden_strides,
+                device,
+            );
+            let pre_fused_input_view = TensorView::new(
+                device_ptr(pre_fused_dev),
+                DataType::Float16,
+                &hidden_shape,
+                &hidden_strides,
+                device,
+            );
+
+            let make_kernel = |k: usize, n: usize, fold: bool, rmsnorm: bool| MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 4,
+                accuracy4_workspace: None,
+                fold_bias_post_round: fold,
+                gate_up_swiglu: false,
+                rmsnorm_prologue: rmsnorm,
+                rmsnorm_epsilon: epsilon,
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+
+            // ── Reference: preceding GEMV → skip_rmsnorm → following GEMV ──
+            let preceding_ref = make_kernel(pre_k, hidden, false, false);
+            {
+                let mut matmul_out = TensorMut::new(
+                    device_ptr_mut(matmul_out_dev),
+                    DataType::Float16,
+                    &hidden_shape,
+                    &hidden_strides,
+                    device,
+                );
+                preceding_ref
+                    .run(
+                        &[
+                            activation_view,
+                            packed_pre_view,
+                            scales_pre_view,
+                        ],
+                        std::slice::from_mut(&mut matmul_out),
+                    )
+                    .unwrap();
+            }
+
+            let mut skip_node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "SkipSimplifiedLayerNormalization",
+                Vec::new(),
+                Vec::new(),
+            );
+            skip_node
+                .attributes
+                .insert("epsilon".into(), onnx_runtime_ir::Attribute::Float(epsilon));
+            let skip_kernel = crate::kernels::normalization::SkipSimplifiedLayerNormFactory {
+                runtime: runtime.clone(),
+            }
+            .create(&skip_node, &[])
+            .unwrap();
+            {
+                let normalized = TensorMut::new(
+                    device_ptr_mut(normalized_dev),
+                    DataType::Float16,
+                    &hidden_shape,
+                    &hidden_strides,
+                    device,
+                );
+                let mean = TensorMut::new(
+                    device_ptr_mut(mean_dev),
+                    DataType::Float16,
+                    &stat_shape,
+                    &stat_strides,
+                    device,
+                );
+                let invstd = TensorMut::new(
+                    device_ptr_mut(invstd_dev),
+                    DataType::Float16,
+                    &stat_shape,
+                    &stat_strides,
+                    device,
+                );
+                let sum = TensorMut::new(
+                    device_ptr_mut(sum_dev),
+                    DataType::Float16,
+                    &hidden_shape,
+                    &hidden_strides,
+                    device,
+                );
+                skip_kernel
+                    .execute(
+                        &[matmul_out_view, residual_view, gamma_view],
+                        &mut [normalized, mean, invstd, sum],
+                    )
+                    .unwrap();
+            }
+
+            let following_ref = make_kernel(hidden, post_n, false, false);
+            {
+                let mut y_ref = TensorMut::new(
+                    device_ptr_mut(y_ref_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                );
+                let mut inputs = vec![
+                    normalized_input_view,
+                    packed_post_view,
+                    scales_post_view,
+                ];
+                if following_bias {
+                    inputs.push(TensorView::absent(DataType::Uint8));
+                    inputs.push(TensorView::absent(DataType::Int32));
+                    inputs.push(bias_post_view);
+                }
+                following_ref
+                    .run(&inputs, std::slice::from_mut(&mut y_ref))
+                    .unwrap();
+            }
+
+            // ── Fused: residual epilogue in preceding, norm prologue in following ──
+            let preceding_fused = make_kernel(pre_k, hidden, true, false);
+            {
+                let mut pre_fused = TensorMut::new(
+                    device_ptr_mut(pre_fused_dev),
+                    DataType::Float16,
+                    &hidden_shape,
+                    &hidden_strides,
+                    device,
+                );
+                preceding_fused
+                    .run(
+                        &[
+                            activation_view,
+                            packed_pre_view,
+                            scales_pre_view,
+                            TensorView::absent(DataType::Uint8),
+                            TensorView::absent(DataType::Int32),
+                            residual_view,
+                        ],
+                        std::slice::from_mut(&mut pre_fused),
+                    )
+                    .unwrap();
+            }
+
+            let following_fused = make_kernel(hidden, post_n, false, true);
+            {
+                let mut y_fused = TensorMut::new(
+                    device_ptr_mut(y_fused_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                );
+                let mut inputs = vec![
+                    pre_fused_input_view,
+                    packed_post_view,
+                    scales_post_view,
+                    TensorView::absent(DataType::Uint8),
+                    TensorView::absent(DataType::Int32),
+                ];
+                if following_bias {
+                    inputs.push(bias_post_view);
+                } else {
+                    inputs.push(TensorView::absent(DataType::Float16));
+                }
+                inputs.push(gamma_view);
+                following_fused
+                    .run(&inputs, std::slice::from_mut(&mut y_fused))
+                    .unwrap();
+            }
+
+            runtime.synchronize().unwrap();
+
+            let mut sum_host = vec![f16::ZERO; m * hidden];
+            let mut pre_fused_host = vec![f16::ZERO; m * hidden];
+            let mut y_ref_host = vec![f16::ZERO; m * post_n];
+            let mut y_fused_host = vec![f16::ZERO; m * post_n];
+            // SAFETY: host buffers match their device sources.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut sum_host), sum_dev).unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut pre_fused_host), pre_fused_dev)
+                    .unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut y_ref_host), y_ref_dev)
+                    .unwrap();
+                runtime
+                    .dtoh(as_bytes_mut(&mut y_fused_host), y_fused_dev)
+                    .unwrap();
+                for buffer in [
+                    activation_dev,
+                    packed_pre_dev,
+                    scales_pre_dev,
+                    packed_post_dev,
+                    scales_post_dev,
+                    residual_dev,
+                    gamma_dev,
+                    bias_post_dev,
+                    matmul_out_dev,
+                    normalized_dev,
+                    sum_dev,
+                    mean_dev,
+                    invstd_dev,
+                    y_ref_dev,
+                    pre_fused_dev,
+                    y_fused_dev,
+                ] {
+                    runtime.free_raw(buffer).unwrap();
+                }
+            }
+
+            // The preceding fused output is the residual sum (input + skip).
+            for index in 0..m * hidden {
+                assert_eq!(
+                    pre_fused_host[index].to_bits(),
+                    sum_host[index].to_bits(),
+                    "residual epilogue diverged from skip_rmsnorm sum at M={m}, \
+                     following_bias={following_bias}, token={}, column={}",
+                    index / hidden,
+                    index % hidden
+                );
+            }
+            // The fused projection is bit-identical to the three-op sequence.
+            for index in 0..m * post_n {
+                assert_eq!(
+                    y_fused_host[index].to_bits(),
+                    y_ref_host[index].to_bits(),
+                    "fused norm prologue diverged from skip_rmsnorm + GEMV at M={m}, \
+                     following_bias={following_bias}, token={}, column={}",
+                    index / post_n,
+                    index % post_n
                 );
             }
         }

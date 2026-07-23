@@ -28,6 +28,20 @@ pub(crate) const MATMUL_NBITS_FOLDED_BIAS_ATTR: &str = "_cuda_matmul_nbits_folde
 /// graph before any non-CUDA fallback, so no other EP ever sees this node.
 pub(crate) const GATE_UP_SWIGLU_FUSION_ATTR: &str = "_cuda_gate_up_swiglu";
 
+/// Private marker set on a general fp16 `MatMulNBits` GEMV whose input
+/// activation must be RMS-normalized in-kernel before the int4 dot, produced by
+/// [`CudaSkipRmsNormMatMulFusion`]. It folds a `SkipSimplifiedLayerNormalization`
+/// (the 24%-of-decode `skip_rmsnorm` kernel) into its two neighbours: the
+/// preceding GEMV's bias-slot epilogue absorbs the residual add (producing the
+/// byte-identical residual sum), and this following GEMV's prologue absorbs the
+/// normalization. The normalization weight (`gamma`) is bound at input slot 6.
+pub(crate) const MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR: &str = "_cuda_matmul_nbits_rmsnorm_prologue";
+
+/// Companion of [`MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR`]: the `epsilon` copied
+/// from the folded `SkipSimplifiedLayerNormalization` node so the fused prologue
+/// reproduces its `1/sqrt(mean_sq + epsilon)`.
+pub(crate) const MATMUL_NBITS_RMSNORM_EPSILON_ATTR: &str = "_cuda_matmul_nbits_rmsnorm_epsilon";
+
 const MICROSOFT_DOMAIN: &str = "com.microsoft";
 
 /// Capability constraints of the paired gate/up SwiGLU kernel
@@ -67,6 +81,7 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
+        Box::new(CudaSkipRmsNormMatMulFusion),
     ]
 }
 
@@ -433,6 +448,353 @@ impl CudaMatMulNBitsBiasFusion {
         let producer = graph.try_value(value)?.producer?;
         let node = graph.try_node(producer)?;
         (node.op_type == "MatMulNBits" && node.domain == MICROSOFT_DOMAIN).then_some(producer)
+    }
+}
+
+/// Block-quantization the fused RMS-norm GEMV kernels assume (`bits`,
+/// `block_size`), derived from the kernels themselves — not any model.
+const RMSNORM_FUSION_SUPPORTED_BITS: i64 = 4;
+const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE: i64 = 32;
+/// The fused prologue/epilogue reproduce `skip_rmsnorm_f16_warp_half4`, which
+/// covers the hidden size in 128-wide (`32 lanes * 4 halves`) chunks, so the
+/// fusion only fires when the hidden size is a whole multiple of 128.
+const RMSNORM_FUSION_WARP_HALF4_MULTIPLE: usize = 128;
+/// Setting this environment variable to a non-empty, non-`0` value disables the
+/// `SkipSimplifiedLayerNormalization` fusion, leaving the standalone norm launch
+/// in place. It exists purely for A/B benchmarking of the fused decode path.
+const RMSNORM_FUSION_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_RMSNORM_FUSION";
+
+fn rmsnorm_fusion_disabled() -> bool {
+    std::env::var_os(RMSNORM_FUSION_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Fold a `SkipSimplifiedLayerNormalization` (the standalone `skip_rmsnorm`
+/// kernel — the single largest consumer of decode GPU time) into its two
+/// neighbouring `MatMulNBits` GEMVs, deleting the separate normalization launch.
+///
+/// This is a purely topological rewrite driven by tensor roles, never by model
+/// identity. It matches a `SkipSimplifiedLayerNormalization` whose:
+/// * residual output (`input + skip`) is produced entirely by folding into the
+///   **preceding** GEMV's bias-slot epilogue — the preceding GEMV must be a
+///   plain int4/fp16 `MatMulNBits` whose only consumer is this norm, so it can
+///   emit the byte-identical residual sum (`fp16(fp16(acc) + residual)` ==
+///   `skip_rmsnorm`'s `__hadd2(input, skip)`); and
+/// * normalized output feeds only prologue-capable **following** GEMVs (general
+///   int4/fp16 `MatMulNBits`, `K <= N` so the general — not down — variant is
+///   selected), which absorb the RMS normalization into an in-kernel prologue.
+///
+/// The fusion is gated on exactly the conditions under which the standalone norm
+/// uses `skip_rmsnorm_f16_warp_half4` (dense skip, fp16 input/gamma, no norm
+/// bias, hidden % 128 == 0), so the fused arithmetic is bit-for-bit identical.
+/// Any other shape safely keeps the standalone norm.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaSkipRmsNormMatMulFusion;
+
+struct SkipRmsNormPlan {
+    skip_id: NodeId,
+    preceding_id: NodeId,
+    preceding_inputs: [ValueId; 3],
+    preceding_out: ValueId,
+    residual: ValueId,
+    gamma: ValueId,
+    epsilon: f32,
+    normalized_out: ValueId,
+    sum_out: Option<ValueId>,
+    following_ids: Vec<NodeId>,
+}
+
+impl OptimizationPass for CudaSkipRmsNormMatMulFusion {
+    fn name(&self) -> &str {
+        "CudaSkipRmsNormMatMulFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if rmsnorm_fusion_disabled() {
+            return Ok(());
+        }
+        let skip_nodes: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "SkipSimplifiedLayerNormalization"
+                    && node.domain == MICROSOFT_DOMAIN)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<SkipRmsNormPlan> = Vec::new();
+        let mut used_nodes: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        for skip_id in skip_nodes {
+            if let Some(plan) = self.plan_fusion(graph, skip_id) {
+                // Keep plans node-disjoint so overlapping rewrites cannot race.
+                if std::iter::once(plan.preceding_id)
+                    .chain(std::iter::once(plan.skip_id))
+                    .chain(plan.following_ids.iter().copied())
+                    .any(|id| used_nodes.contains(&id))
+                {
+                    continue;
+                }
+                used_nodes.insert(plan.preceding_id);
+                used_nodes.insert(plan.skip_id);
+                used_nodes.extend(plan.following_ids.iter().copied());
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // 1. Rewire the norm's outputs onto the preceding GEMV output, which
+            //    the residual epilogue now makes hold the byte-identical residual
+            //    sum. The following GEMVs then normalize it in their prologue.
+            graph.replace_all_uses(plan.normalized_out, plan.preceding_out);
+            if let Some(sum_out) = plan.sum_out {
+                graph.replace_all_uses(sum_out, plan.preceding_out);
+            }
+
+            // 2. Rebuild each following GEMV: its activation input is now the
+            //    residual sum; attach gamma at slot 6 and the prologue markers.
+            for following_id in &plan.following_ids {
+                let mut fused = graph.node(*following_id).clone();
+                while fused.inputs.len() < 7 {
+                    fused.inputs.push(None);
+                }
+                fused.inputs[6] = Some(plan.gamma);
+                fused
+                    .attributes
+                    .insert(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR.into(), Attribute::Int(1));
+                fused.attributes.insert(
+                    MATMUL_NBITS_RMSNORM_EPSILON_ATTR.into(),
+                    Attribute::Float(plan.epsilon),
+                );
+                graph.replace_node(*following_id, fused);
+            }
+
+            // 3. Rebuild the preceding GEMV with the residual folded into its
+            //    bias slot (post-round semantics), then drop the norm node.
+            let mut preceding = graph.node(plan.preceding_id).clone();
+            preceding.inputs = vec![
+                Some(plan.preceding_inputs[0]),
+                Some(plan.preceding_inputs[1]),
+                Some(plan.preceding_inputs[2]),
+                None,
+                None,
+                Some(plan.residual),
+            ];
+            preceding
+                .attributes
+                .insert(MATMUL_NBITS_FOLDED_BIAS_ATTR.into(), Attribute::Int(1));
+            graph.replace_node(plan.preceding_id, preceding);
+
+            graph.remove_node(plan.skip_id);
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaSkipRmsNormMatMulFusion {
+    fn plan_fusion(&self, graph: &Graph, skip_id: NodeId) -> Option<SkipRmsNormPlan> {
+        let skip = graph.try_node(skip_id)?;
+        // Inputs: [input, skip, gamma, (bias)]. A norm bias would break the
+        // warp_half4 byte-identity contract, so require it absent.
+        if skip.inputs.len() < 3 {
+            return None;
+        }
+        let input_value = skip.inputs[0]?;
+        let skip_value = skip.inputs[1]?;
+        let gamma = skip.inputs[2]?;
+        if skip.inputs.get(3).copied().flatten().is_some() {
+            return None;
+        }
+
+        // Outputs: [normalized, mean, inv_std, residual_sum]. mean/inv_std must
+        // be unused (the fused path does not compute stats).
+        let normalized_out = *skip.outputs.first()?;
+        for stat in skip.outputs.iter().skip(1).take(2) {
+            if !graph.consumers(*stat).is_empty() || graph.value(*stat).is_graph_output {
+                return None;
+            }
+        }
+        let sum_out = skip.outputs.get(3).copied();
+        if graph.value(normalized_out).is_graph_output {
+            return None;
+        }
+        if let Some(sum_out) = sum_out
+            && graph.value(sum_out).is_graph_output
+        {
+            return None;
+        }
+
+        // Gate on the standalone warp_half4 conditions for byte-identity:
+        // fp16 input/skip/gamma, dense skip (identical shapes), hidden % 128 == 0.
+        let input_meta = graph.value(input_value);
+        let skip_meta = graph.value(skip_value);
+        let gamma_meta = graph.value(gamma);
+        if input_meta.dtype != DataType::Float16
+            || skip_meta.dtype != DataType::Float16
+            || gamma_meta.dtype != DataType::Float16
+        {
+            return None;
+        }
+        if input_meta.shape != skip_meta.shape {
+            return None;
+        }
+        // Only the hidden (last) dimension must be static; batch/sequence dims
+        // stay symbolic in the shared decode/prefill graph, so requiring the
+        // whole shape static would (wrongly) never fire.
+        let norm_size = input_meta.shape.last()?.as_static()?;
+        if norm_size == 0 || !norm_size.is_multiple_of(RMSNORM_FUSION_WARP_HALF4_MULTIPLE) {
+            return None;
+        }
+        let gamma_dims = onnx_runtime_ir::as_static_shape(&gamma_meta.shape)?;
+        if gamma_dims != [norm_size] {
+            return None;
+        }
+
+        // Identify which data input is produced by a fusable preceding GEMV; the
+        // other is the residual.
+        let (preceding_out, residual) = match (
+            self.preceding_gemv(graph, input_value, norm_size),
+            self.preceding_gemv(graph, skip_value, norm_size),
+        ) {
+            (Some(_), Some(_)) => return None,
+            (Some(_), None) => (input_value, skip_value),
+            (None, Some(_)) => (skip_value, input_value),
+            (None, None) => return None,
+        };
+        let preceding_id = self.preceding_gemv(graph, preceding_out, norm_size)?;
+        if graph.value(residual).dtype != DataType::Float16 {
+            return None;
+        }
+
+        let preceding = graph.node(preceding_id);
+        let preceding_inputs = [preceding.inputs[0]?, preceding.inputs[1]?, preceding.inputs[2]?];
+
+        // The normalized output must feed at least one, and only, prologue-capable
+        // following GEMV(s).
+        let following_ids = graph.consumers(normalized_out);
+        if following_ids.is_empty() {
+            return None;
+        }
+        for following_id in &following_ids {
+            if !self.following_gemv_is_fusable(graph, *following_id) {
+                return None;
+            }
+        }
+        // A following GEMV must not also be the preceding GEMV (no self-fusion).
+        if following_ids.contains(&preceding_id) {
+            return None;
+        }
+
+        let epsilon = skip
+            .attr("epsilon")
+            .and_then(Attribute::as_float)
+            .unwrap_or(1e-5);
+
+        Some(SkipRmsNormPlan {
+            skip_id,
+            preceding_id,
+            preceding_inputs,
+            preceding_out,
+            residual,
+            gamma,
+            epsilon,
+            normalized_out,
+            sum_out,
+            following_ids,
+        })
+    }
+
+    /// A preceding GEMV is fusable when it is a plain int4/fp16 `MatMulNBits`
+    /// (no zero-points, group index or existing bias), its only consumer is the
+    /// norm, it is not a graph output, and its output width equals the hidden
+    /// size (so the residual add is well-shaped).
+    fn preceding_gemv(&self, graph: &Graph, value: ValueId, norm_size: usize) -> Option<NodeId> {
+        let producer = graph.try_value(value)?.producer?;
+        let node = graph.try_node(producer)?;
+        if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
+            return None;
+        }
+        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some()
+            || node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some()
+        {
+            return None;
+        }
+        // Plain A/B/scales form only: no zero-points, group index, or bias.
+        if node.input_values().count() != 3 || node.inputs.iter().skip(3).any(Option::is_some) {
+            return None;
+        }
+        if !self.is_int4_fp16_matmul(graph, node) {
+            return None;
+        }
+        if node.attr("N").and_then(Attribute::as_int)? as usize != norm_size {
+            return None;
+        }
+        if graph.consumers(value).len() != 1 || graph.value(value).is_graph_output {
+            return None;
+        }
+        Some(producer)
+    }
+
+    /// A following GEMV is prologue-capable when it is a general int4/fp16
+    /// `MatMulNBits` (no zero-points or group index, an optional bias allowed),
+    /// with `K <= N` so the general — not the tall-skinny down — variant runs.
+    fn following_gemv_is_fusable(&self, graph: &Graph, id: NodeId) -> bool {
+        let Some(node) = graph.try_node(id) else {
+            return false;
+        };
+        if node.op_type != "MatMulNBits" || node.domain != MICROSOFT_DOMAIN {
+            return false;
+        }
+        if node.attr(GATE_UP_SWIGLU_FUSION_ATTR).is_some()
+            || node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some()
+        {
+            return false;
+        }
+        // No zero-points (slot 3), no group index (slot 4), no pre-existing
+        // gamma (slot 6). An optional bias (slot 5) is allowed.
+        if node.inputs.get(3).copied().flatten().is_some()
+            || node.inputs.get(4).copied().flatten().is_some()
+            || node.inputs.get(6).copied().flatten().is_some()
+        {
+            return false;
+        }
+        if !self.is_int4_fp16_matmul(graph, node) {
+            return false;
+        }
+        let (Some(k), Some(n)) = (
+            node.attr("K").and_then(Attribute::as_int),
+            node.attr("N").and_then(Attribute::as_int),
+        ) else {
+            return false;
+        };
+        // Keep the general scales_f16 entry: the down variant is chosen when
+        // K > N, and it has no normalization prologue.
+        k <= n
+    }
+
+    /// Shared block-quantization + fp16-scales checks for the fused GEMVs.
+    fn is_int4_fp16_matmul(&self, graph: &Graph, node: &onnx_runtime_ir::Node) -> bool {
+        if node.attr("bits").and_then(Attribute::as_int).unwrap_or(4)
+            != RMSNORM_FUSION_SUPPORTED_BITS
+        {
+            return false;
+        }
+        if node.attr("block_size").and_then(Attribute::as_int) != Some(RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE)
+        {
+            return false;
+        }
+        // Scales (input 2) must be fp16 so the general scales_f16 kernel runs.
+        let Some(scales) = node.inputs.get(2).copied().flatten() else {
+            return false;
+        };
+        graph
+            .try_value(scales)
+            .is_some_and(|value| value.dtype == DataType::Float16)
     }
 }
 
@@ -1555,6 +1917,326 @@ mod tests {
                 .attr(GATE_UP_SWIGLU_FUSION_ATTR)
                 .and_then(Attribute::as_int),
             Some(1)
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    // === SkipSimplifiedLayerNormalization <-> MatMulNBits fold ===
+
+    /// Build the decode hot chain the fusion targets:
+    ///
+    /// ```text
+    ///   preceding MatMulNBits (down, N == norm_size) ─┐
+    ///                                                 ├─► SkipSimplifiedLayerNormalization
+    ///   residual (fp16 activation) ────────────────────┘        │ normalized │ sum
+    ///                                                            ▼            ▼
+    ///                                       following MatMulNBits (K==norm_size)   Identity → out
+    /// ```
+    ///
+    /// `norm_size` is the hidden width, and the following GEMV runs `K==norm_size
+    /// → N==following_n`. Nothing is named after any architecture. The middle
+    /// `mean`/`inv_std` outputs are anonymous (unused), matching how the loader
+    /// materializes omitted optional outputs.
+    fn skip_rms_graph(norm_size: usize, following_n: usize) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        // Preceding GEMV: any activation width → the hidden width.
+        let pre_x = value(&mut graph, "pre_x", DataType::Float16, norm_size + 128);
+        graph.add_input(pre_x);
+        let pre_out = projection(&mut graph, "pre", pre_x, norm_size + 128, norm_size);
+
+        // The residual (skip) term is a plain fp16 activation of the hidden width.
+        let residual = value(&mut graph, "residual", DataType::Float16, norm_size);
+        graph.add_input(residual);
+
+        // Gamma scale initializer `[norm_size]`.
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float16, norm_size);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![norm_size],
+                vec![0u8; norm_size * 2],
+            )),
+        );
+
+        let normalized = value(&mut graph, "normalized", DataType::Float16, norm_size);
+        let stat_mean = graph.create_value(DataType::Float32, Vec::new());
+        let stat_inv_std = graph.create_value(DataType::Float32, Vec::new());
+        let sum = value(&mut graph, "sum", DataType::Float16, norm_size);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(pre_out), Some(residual), Some(gamma)],
+            vec![normalized, stat_mean, stat_inv_std, sum],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        skip.attributes
+            .insert("epsilon".into(), Attribute::Float(9.999_999e-7));
+        graph.insert_node(skip);
+
+        // Following GEMV normalizes and projects; K == norm_size, N == following_n.
+        let post_out = projection(&mut graph, "post", normalized, norm_size, following_n);
+        graph.add_output(post_out);
+
+        // Keep the residual sum live so its rewiring onto the preceding GEMV
+        // output is observable.
+        let sum_sink = value(&mut graph, "sum_sink", DataType::Float16, norm_size);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(sum)],
+            vec![sum_sink],
+        ));
+        graph.add_output(sum_sink);
+
+        graph
+    }
+
+    fn value_id_by_name(graph: &Graph, name: &str) -> ValueId {
+        graph
+            .values
+            .iter()
+            .find_map(|(id, v)| (v.name.as_deref() == Some(name)).then_some(id))
+            .unwrap()
+    }
+
+    fn node_producing(graph: &Graph, output: ValueId) -> &Node {
+        let producer = graph.value(output).producer.unwrap();
+        graph.node(producer)
+    }
+
+    #[test]
+    fn folds_skip_rmsnorm_into_neighbouring_gemvs() {
+        // norm_size % 128 == 0, following K(256) <= N(512): general variant.
+        let mut graph = skip_rms_graph(256, 512);
+        let pre_out = value_id_by_name(&graph, "pre_out");
+        let residual = value_id_by_name(&graph, "residual");
+        let gamma = value_id_by_name(&graph, "gamma");
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // The standalone norm launch is gone.
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "the SkipSimplifiedLayerNormalization must be deleted"
+        );
+
+        // Preceding GEMV now folds the residual into its bias slot (post-round).
+        let preceding = node_producing(&graph, pre_out);
+        assert_eq!(preceding.op_type, "MatMulNBits");
+        assert_eq!(
+            preceding
+                .attr(MATMUL_NBITS_FOLDED_BIAS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(preceding.inputs.len(), 6);
+        assert_eq!(preceding.inputs[5], Some(residual), "residual at slot 5");
+        assert!(preceding.inputs[3].is_none() && preceding.inputs[4].is_none());
+
+        // Following GEMV carries the norm prologue: gamma at slot 6, markers set,
+        // and its activation input is now the preceding residual sum.
+        let post_out = value_id_by_name(&graph, "post_out");
+        let following = node_producing(&graph, post_out);
+        assert_eq!(following.inputs[0], Some(pre_out), "activation is residual sum");
+        assert_eq!(following.inputs.get(6).copied().flatten(), Some(gamma));
+        assert_eq!(
+            following
+                .attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            following
+                .attr(MATMUL_NBITS_RMSNORM_EPSILON_ATTR)
+                .and_then(Attribute::as_float),
+            Some(9.999_999e-7)
+        );
+
+        // The residual-sum consumer (Identity) is rewired onto the preceding GEMV.
+        let identity = graph
+            .nodes
+            .values()
+            .find(|node| node.op_type == "Identity")
+            .unwrap();
+        assert_eq!(identity.inputs[0], Some(pre_out));
+
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_skip_rmsnorm_when_hidden_not_multiple_of_128() {
+        // 200 % 128 != 0 → warp_half4 byte-identity does not hold, so no fusion.
+        let mut graph = skip_rms_graph(200, 400);
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "an unaligned hidden size must keep the standalone norm"
+        );
+    }
+
+    #[test]
+    fn leaves_skip_rmsnorm_when_following_is_down_variant() {
+        // Following K(256) > N(128): the tall-skinny down variant has no prologue.
+        let mut graph = skip_rms_graph(256, 128);
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "a down-variant following GEMV must block the fusion"
+        );
+    }
+
+    #[test]
+    fn leaves_skip_rmsnorm_with_norm_bias() {
+        // A norm bias (4th input) breaks the no-bias warp_half4 contract.
+        let mut graph = skip_rms_graph(256, 512);
+        let bias = vec1d(&mut graph, "norm_bias", DataType::Float16, 256);
+        graph.set_initializer(
+            bias,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float16,
+                vec![256],
+                vec![0u8; 512],
+            )),
+        );
+        let skip_id = graph
+            .nodes
+            .iter()
+            .find_map(|(id, n)| {
+                (n.op_type == "SkipSimplifiedLayerNormalization").then_some(id)
+            })
+            .unwrap();
+        let mut skip = graph.node(skip_id).clone();
+        skip.inputs.push(Some(bias));
+        graph.replace_node(skip_id, skip);
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "a norm bias must block the fusion"
+        );
+    }
+
+    #[test]
+    fn leaves_skip_rmsnorm_when_preceding_gemv_shared() {
+        // A second consumer of the preceding GEMV output means the residual
+        // epilogue would drop an observable value; the fusion must decline.
+        let mut graph = skip_rms_graph(256, 512);
+        let pre_out = value_id_by_name(&graph, "pre_out");
+        let sink = value(&mut graph, "pre_sink", DataType::Float16, 256);
+        graph.insert_node(Node::new(NodeId(0), "Neg", vec![Some(pre_out)], vec![sink]));
+        graph.add_output(sink);
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "a shared preceding GEMV must block the fusion"
+        );
+    }
+
+    #[test]
+    fn leaves_skip_rmsnorm_when_broadcast_skip() {
+        // A broadcast (non-dense) skip term is not covered by warp_half4.
+        let mut graph = skip_rms_graph(256, 512);
+        let residual = value_id_by_name(&graph, "residual");
+        graph.value_mut(residual).shape = vec![Dim::Static(1), Dim::Static(1)];
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|node| node.op_type == "SkipSimplifiedLayerNormalization"),
+            "a broadcast skip must block the fusion"
+        );
+    }
+
+    #[test]
+    fn folds_skip_rmsnorm_with_symbolic_batch_and_sequence_dims() {
+        // Regression: the real decode graph carries symbolic batch/sequence dims
+        // ([batch, sequence, hidden]); only the hidden dim is static. The fusion
+        // must still fire — an earlier version required the whole shape static
+        // and silently never matched in production.
+        let mut graph = skip_rms_graph(256, 512);
+        let batch = graph.create_symbol(Some("batch".into()));
+        let sequence = graph.create_symbol(Some("sequence".into()));
+        let symbolic = vec![
+            Dim::Symbolic(batch),
+            Dim::Symbolic(sequence),
+            Dim::Static(256),
+        ];
+        // Retype every hidden-width activation edge to the symbolic 3-D shape.
+        for name in ["pre_out", "residual", "normalized", "sum"] {
+            let id = value_id_by_name(&graph, name);
+            graph.value_mut(id).shape = symbolic.clone();
+        }
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "symbolic batch/sequence dims must not block the fusion"
+        );
+        let post_out = value_id_by_name(&graph, "post_out");
+        let following = node_producing(&graph, post_out);
+        assert_eq!(
+            following
+                .attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn skip_rmsnorm_fires_through_full_cuda_pass_list() {
+        // End-to-end through the registered CUDA passes: the fusion is the last
+        // pass and must fire on the eligible chain.
+        let mut graph = skip_rms_graph(256, 512);
+        for pass in cuda_optimization_passes() {
+            pass.run(&mut graph, &PassContext::new()).unwrap();
+        }
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "the fusion must fire through the full pass list"
         );
         assert!(graph.validate().is_ok());
     }
