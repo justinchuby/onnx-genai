@@ -85,6 +85,27 @@ effect. Its 537-event trace retains the unfused `gate_up_swiglu_*` and
 `skip_rmsnorm_f16_warp_half4` variants, confirming the size floor kept the new
 SwiGLU fusion inert.
 
+### Post-Phi vectorization (main cf65ea7)
+
+Three-run medians on physical GPU 5 refresh the four-model 128-token ladder
+(the earlier ladders described in the Method section used physical GPU 0):
+
+| Model | Native @128 tok/s (ms/token) | ORT 0.14.1 @128 tok/s (ms/token) | Native / ORT @128 | Change vs. 05e1fd1 | Smoothness spot check |
+|---|---:|---:|---:|---:|---|
+| Qwen2.5-0.5B int4 | 823.45 (1.214) | 741.83 (1.348) | **111.00% BEATS +11.00%** | +0.57% | readable, deterministic; long raw continuation eventually repeats |
+| Qwen2.5-1.5B int4 | 574.31 (1.741) | 487.14 (2.053) | **117.89% BEATS +17.89%** | +0.37% | readable, deterministic; long raw continuation eventually repeats |
+| Qwen2.5-7B int4 | 287.66 (3.476) | 267.23 (3.742) | **107.65% BEATS +7.65%** | +0.26% | readable, deterministic; raw continuation includes a `Human:` turn |
+| Phi-4-mini int4/int8 | 131.40 (7.610) | 229.62 (4.355) | **57.22% TRAILS −42.78%** | **+39.90%** | readable, deterministic; raw continuation includes a `# Exercise` turn |
+
+Phi rises from 93.92 to **131.40 tok/s** after the fp32-gamma vectorized
+SkipRMSNorm (`8a0814e`) and int8 FP16-GEMV vectorization (`cf65ea7`). This
+closes its native/ORT gap from −59.10% to **−42.78%**. All four timed runs
+were deterministic; their real-prompt continuations were readable and
+non-garbled, although the known raw-prompt template/repetition behavior is
+recorded above rather than called smooth. The three per-run Phi samples were
+131.40, 129.35, and 132.00 tok/s. Host load was 22.14/23.02/31.56 before and
+16.96/21.79/30.97 after the sequential GPU-5 ladder.
+
 ## Method and validity checks
 
 - Source: current `bench/ort-vs-native-cuda` checkout; release build:
