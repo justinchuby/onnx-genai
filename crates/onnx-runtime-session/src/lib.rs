@@ -32,7 +32,7 @@ pub use error::SessionError;
 pub use executor::{
     CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
     DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
-    ExecutionProviderFallbackReport, SeamReason,
+    ExecutionProviderFallbackReport, SeamReason, print_exec_phase_profile,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,

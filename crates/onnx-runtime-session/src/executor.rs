@@ -83,6 +83,158 @@ fn profile_ops_enabled() -> bool {
     })
 }
 
+/// Low-overhead, env-gated (`NXRT_EXEC_PHASE_PROFILE=1`) phase profiler for the
+/// executor's control-flow / subgraph-dispatch machinery. When disabled every
+/// entry point is a single relaxed-atomic load and an early return, so the
+/// production decode hot path pays no measurable cost. When enabled it
+/// accumulates wall-clock nanoseconds and a call count per named phase, which
+/// [`phase_profile_report`] renders to stderr. This exists to attribute the
+/// per-decode-step control-flow overhead (`exec_if` / `run_subgraph` / child
+/// setup) that the op-level profiler folds into the single `If` bucket.
+mod phase_profile {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+
+    pub fn enabled() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = std::env::var("NXRT_EXEC_PHASE_PROFILE")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Test-only override of the env-derived enable state.
+    #[cfg(test)]
+    pub(super) fn force_enabled(on: bool) {
+        STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// Test-only snapshot of a phase's accumulated `(total_ns, count)`.
+    #[cfg(test)]
+    pub(super) fn snapshot(phase: &'static str) -> Option<(u128, u64)> {
+        registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get(phase).map(|s| (s.total_ns, s.count)))
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct PhaseStat {
+        total_ns: u128,
+        count: u64,
+    }
+
+    fn registry() -> &'static Mutex<BTreeMap<&'static str, PhaseStat>> {
+        static REGISTRY: OnceLock<Mutex<BTreeMap<&'static str, PhaseStat>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Accumulate `nanos` against `phase`. No-op unless the profiler is enabled.
+    pub fn record(phase: &'static str, nanos: u128) {
+        if !enabled() {
+            return;
+        }
+        if let Ok(mut reg) = registry().lock() {
+            let entry = reg.entry(phase).or_default();
+            entry.total_ns += nanos;
+            entry.count += 1;
+        }
+    }
+
+    /// Scoped timer that records its lifetime to `phase` on drop.
+    pub struct PhaseSpan {
+        phase: &'static str,
+        start: Option<Instant>,
+    }
+
+    impl PhaseSpan {
+        pub fn new(phase: &'static str) -> Self {
+            let active = enabled();
+            Self {
+                phase,
+                // Avoid the clock read entirely on the disabled hot path.
+                start: if active { Some(Instant::now()) } else { None },
+            }
+        }
+    }
+
+    impl Drop for PhaseSpan {
+        fn drop(&mut self) {
+            if let Some(start) = self.start {
+                record(self.phase, start.elapsed().as_nanos());
+            }
+        }
+    }
+
+    /// Render and reset the accumulated per-phase table to stderr. Called once at
+    /// process exit (or on demand) so a single line-oriented dump is available.
+    pub fn report_to_stderr() {
+        if !enabled() {
+            return;
+        }
+        let rows: Vec<(&'static str, PhaseStat)> = match registry().lock() {
+            Ok(reg) => reg.iter().map(|(n, s)| (*n, *s)).collect(),
+            Err(_) => return,
+        };
+        static PRINTED: AtomicBool = AtomicBool::new(false);
+        if PRINTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut rows = rows;
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1.total_ns));
+        eprintln!("[nxrt-phase] phase,total_ms,calls,us/call");
+        for (name, stat) in &rows {
+            if name.ends_with("_bytes") {
+                continue;
+            }
+            let total_ms = stat.total_ns as f64 / 1_000_000.0;
+            let us_per_call = if stat.count > 0 {
+                (stat.total_ns as f64 / 1_000.0) / stat.count as f64
+            } else {
+                0.0
+            };
+            eprintln!("[nxrt-phase] {name},{total_ms:.3},{},{us_per_call:.2}", stat.count);
+        }
+        // Byte-valued counters (host traffic) are reported separately in MB.
+        for (name, stat) in &rows {
+            if !name.ends_with("_bytes") {
+                continue;
+            }
+            let total_mb = stat.total_ns as f64 / (1024.0 * 1024.0);
+            let mb_per_call = if stat.count > 0 {
+                total_mb / stat.count as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[nxrt-phase] {name},total_mb={total_mb:.1},calls={},mb/call={mb_per_call:.3}",
+                stat.count
+            );
+        }
+    }
+}
+
+/// Open an env-gated executor phase-profiling span (see [`phase_profile`]).
+macro_rules! phase_span {
+    ($phase:expr) => {
+        phase_profile::PhaseSpan::new($phase)
+    };
+}
+
+/// Public re-export so the bench/profile harness can dump the phase table.
+pub fn print_exec_phase_profile() {
+    phase_profile::report_to_stderr();
+}
+
 fn host_dtype_alignment(dtype: DataType) -> usize {
     match dtype {
         DataType::Float16 | DataType::BFloat16 | DataType::Int16 | DataType::Uint16 => 2,
@@ -2493,6 +2645,25 @@ impl Executor {
         external: &ExternalBindings,
         mode: RunMode,
     ) -> Result<ScopedRunResult> {
+        // Distinguish the outermost (top-level graph) run from nested
+        // control-flow subgraph runs so the phase profiler can attribute
+        // overhead to the right layer.
+        thread_local! {
+            static RUN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let depth = RUN_DEPTH.with(|d| {
+            let cur = d.get();
+            d.set(cur + 1);
+            cur
+        });
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                RUN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let _depth_guard = DepthGuard;
+        let nested = depth > 0;
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
         self.views.clear();
@@ -2504,6 +2675,11 @@ impl Executor {
         self.restore_shared_buffers()?;
 
         // --- Resolve shapes from the actual bound inputs --------------------
+        let _phase_setup = phase_span!(if nested {
+            "run_scoped.setup_total.child"
+        } else {
+            "run_scoped.setup_total.top"
+        });
         let bindings = self.bind_symbols(inputs, external)?;
 
         for (name, _) in inputs {
@@ -2537,13 +2713,14 @@ impl Executor {
         // the run-scoped buffers from them (reused when unchanged). Values with a
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
-        let mut resolved = self.resolve_soft(&bindings);
-        if mode != RunMode::Eager {
-            // Persistent bindings seed the kernel-visible geometry selected by
-            // their input/output contracts. Seed only unresolved values:
-            // statically/symbolically resolved shapes remain authoritative.
-            external.seed_capture_shapes(&mut resolved);
-        }
+        let mut resolved = {
+            let _s = phase_span!("run_scoped.resolve_soft");
+            let mut resolved = self.resolve_soft(&bindings);
+            if mode != RunMode::Eager {
+                external.seed_capture_shapes(&mut resolved);
+            }
+            resolved
+        };
         let external_values = external
             .inputs
             .keys()
@@ -2557,7 +2734,10 @@ impl Executor {
             self.shared_buffers.remove(&vid);
             self.buffer_shapes.remove(&vid);
         }
-        self.size_buffers_excluding(&resolved, &external_values)?;
+        {
+            let _s = phase_span!("run_scoped.size_buffers");
+            self.size_buffers_excluding(&resolved, &external_values)?;
+        }
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
         for (name, tensor) in inputs {
@@ -2568,6 +2748,7 @@ impl Executor {
                 .expect("input value has a buffer");
             self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
+        drop(_phase_setup);
 
         // --- Execute nodes ---------------------------------------------------
         // Iterate by index so a control-flow node can take `&mut self` (it must
@@ -2575,6 +2756,11 @@ impl Executor {
         // disjoint-field borrow split inside `exec_kernel_node`.
         match mode {
             RunMode::Eager => {
+                let _s = phase_span!(if nested {
+                    "run_scoped.plan_eager.child"
+                } else {
+                    "run_scoped.plan_eager.top"
+                });
                 self.run_plan_eager(&mut resolved, outer_scope, external)?;
             }
             RunMode::Capture => {
@@ -2634,7 +2820,13 @@ impl Executor {
         // A view output (a layout op whose result aliases an input buffer) is
         // materialized to contiguous owned bytes here — external consumers and
         // the Python/DLPack boundary expect contiguous tensors.
+        let _phase_collect = phase_span!(if nested {
+            "run_scoped.collect_outputs.child"
+        } else {
+            "run_scoped.collect_outputs.top"
+        });
         let mut results = Vec::with_capacity(self.graph.outputs.len());
+        let mut host_output_bytes = 0usize;
         for &vid in &self.graph.outputs {
             if external.outputs.contains_key(&vid) {
                 results.push(None);
@@ -2654,9 +2846,18 @@ impl Executor {
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
+            host_output_bytes += bytes.len();
             results.push(Some(SessionOutput::Tensor(Tensor::from_raw(
                 dtype, shape, &bytes,
             )?)));
+        }
+        // Attribution aid: at the top level, the number of graph-output bytes
+        // materialized to host each run is the per-step cost of *not* keeping
+        // outputs (e.g. a growing KV cache) in persistent device/host bindings.
+        // Recorded as a counter (bytes as the "nanos" field) so the phase table
+        // exposes total and per-call host-output traffic without extra logging.
+        if !nested {
+            phase_profile::record("collect_outputs.top_host_bytes", host_output_bytes as u128);
         }
         Ok(ScopedRunResult::Executed(results))
     }
@@ -4897,8 +5098,14 @@ impl Executor {
         })?;
 
         let attr_key = if cond { "then_branch" } else { "else_branch" };
-        let prepared = self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?;
-        let outs = self.run_subgraph(&prepared, &[])?;
+        let prepared = {
+            let _s = phase_span!("execif.prepare_subgraph");
+            self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?
+        };
+        let outs = {
+            let _s = phase_span!("execif.run_subgraph");
+            self.run_subgraph(&prepared, &[])?
+        };
 
         if outs.len() != node.outputs.len() {
             return Err(SessionError::OutputShapeCountMismatch {
@@ -4907,8 +5114,11 @@ impl Executor {
                 got: outs.len(),
             });
         }
-        for (vid, t) in node.outputs.iter().zip(outs.iter()) {
-            self.store_output_tensor(*vid, t, resolved)?;
+        {
+            let _s = phase_span!("execif.store_output");
+            for (vid, t) in node.outputs.iter().zip(outs.iter()) {
+                self.store_output_tensor(*vid, t, resolved)?;
+            }
         }
         Ok(())
     }
@@ -5796,6 +6006,45 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn phase_profile_gating_and_accumulation() {
+        // Single test (not two) so the process-global enable flag is never
+        // toggled concurrently by a sibling test under the parallel runner.
+
+        // Disabled: a span records nothing and never captures a timestamp.
+        phase_profile::force_enabled(false);
+        let disabled_phase = "test.phase.disabled";
+        let before = phase_profile::snapshot(disabled_phase);
+        {
+            let _s = phase_span!(disabled_phase);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            phase_profile::snapshot(disabled_phase),
+            before,
+            "a disabled phase span must not accumulate any samples"
+        );
+
+        // Enabled: a span accumulates exactly one positive-duration sample.
+        phase_profile::force_enabled(true);
+        let enabled_phase = "test.phase.enabled";
+        let (base_ns, base_count) = phase_profile::snapshot(enabled_phase).unwrap_or((0, 0));
+        {
+            let _s = phase_span!(enabled_phase);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (after_ns, after_count) =
+            phase_profile::snapshot(enabled_phase).expect("enabled span must record a sample");
+        assert_eq!(after_count, base_count + 1, "one span => one sample");
+        assert!(
+            after_ns > base_ns,
+            "an enabled span must accumulate a positive duration"
+        );
+
+        // Restore the default (disabled) state so other tests stay inert.
+        phase_profile::force_enabled(false);
+    }
 
     struct CaptureDecliningKernel;
 
