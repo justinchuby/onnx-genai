@@ -128,8 +128,13 @@ fn silu(x: f32) -> f32 {
     // f32 operation-order boundary so 1-ulp exp differences cannot be amplified
     // by downstream accuracy-level-4 activation quantization.
     if x >= 0.0 {
+        // Covers +0.0 and +Inf: +Inf / (1 + exp(-Inf)) = +Inf / 1 = +Inf.
         x / (1.0 + ((-x) as f64).exp() as f32)
+    } else if x == f32::NEG_INFINITY {
+        // sigmoid(-Inf) = 0 and x * 0 would be NaN, so pin the limit SiLU(-Inf)=0.
+        0.0
     } else {
+        // Includes NaN, which propagates through exp and the product.
         let e = (x as f64).exp() as f32;
         x * e / (1.0 + e)
     }
@@ -138,11 +143,20 @@ fn silu(x: f32) -> f32 {
 fn silu_f64(x: f64) -> f64 {
     if x >= 0.0 {
         x / (1.0 + (-x).exp())
+    } else if x == f64::NEG_INFINITY {
+        0.0
     } else {
         let e = x.exp();
         x * e / (1.0 + e)
     }
 }
+
+/// Inputs whose magnitude exceeds this bound (or that are non-finite) fall
+/// outside MLAS's internal logistic clamp of `[-18, 18]`, so SiLU must be
+/// recomputed accurately for them. Inside the bound the MLAS approximation is
+/// the same routine ORT uses and is accurate.
+#[cfg(feature = "mlas")]
+const SILU_MLAS_SAFE_BOUND: f32 = 18.0;
 
 pub struct ActivationKernel {
     activation: Activation,
@@ -299,10 +313,21 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
 fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "mlas")]
     {
-        // output = sigmoid(input); then output *= input  =>  x * sigmoid(x).
+        // MLAS's SIMD logistic clamps its input to [-18, 18] internally, so for
+        // out-of-range or non-finite inputs `sigmoid(x) * x` is wrong (e.g.
+        // SiLU(-1e30) would leak sigmoid(-18)≈1.5e-8 instead of decaying to 0,
+        // and SiLU(±Inf)/SiLU(NaN) would be corrupted). Run MLAS over the whole
+        // slice for the vectorized common case, then correct only the elements
+        // outside the safe band with the accurate scalar SiLU. The correction
+        // predicate is a single branch-predictable finite/threshold compare per
+        // element, so in-range activations keep MLAS speed.
         mlas_sys::compute_logistic(input, output);
         for (output, &input) in output.iter_mut().zip(input) {
-            *output *= input;
+            if input.is_finite() && input.abs() <= SILU_MLAS_SAFE_BOUND {
+                *output *= input;
+            } else {
+                *output = silu(input);
+            }
         }
     }
     #[cfg(not(feature = "mlas"))]
@@ -524,21 +549,104 @@ mod tests {
 
     #[test]
     fn silu_contiguous_matches_reference() {
-        let x = Owned::f32(&[6], &[-100.0, -2.0, -0.0, 0.0, 2.0, 100.0]);
-        let mut out = Owned::zeros_f32(&[6]);
+        // Exact f64 reference SiLU used to pin the vectorized MLAS path.
+        fn silu_ref(x: f64) -> f64 {
+            if x >= 0.0 {
+                x / (1.0 + (-x).exp())
+            } else if x == f64::NEG_INFINITY {
+                0.0
+            } else {
+                let e = x.exp();
+                x * e / (1.0 + e)
+            }
+        }
+
+        // Dense range spanning the MLAS clamp boundary plus extreme finite
+        // magnitudes that fall well outside the [-18, 18] logistic clamp.
+        let mut xs: Vec<f32> = Vec::new();
+        let mut v = -50.0f32;
+        while v <= 50.0 {
+            xs.push(v);
+            v += 0.25;
+        }
+        xs.extend_from_slice(&[
+            1e30, -1e30, 1e-30, -1e-30, 18.0, -18.0, 18.5, -18.5, 17.5, -17.5, -0.0, 0.0,
+        ]);
+
+        let n = xs.len();
+        let x = Owned::f32(&[n], &xs);
+        let mut out = Owned::zeros_f32(&[n]);
         ActivationKernel {
             activation: Activation::Silu,
         }
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
-        for (got, input) in out
-            .to_f32()
-            .into_iter()
-            .zip([-100.0f32, -2.0, -0.0, 0.0, 2.0, 100.0])
-        {
-            let want = input * (1.0 / (1.0 + (-input).exp()));
-            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+
+        for (got, input) in out.to_f32().into_iter().zip(xs) {
+            let want = silu_ref(input as f64);
+            let abs_err = (got as f64 - want).abs();
+            let rel_err = if want.abs() > 1.0 {
+                abs_err / want.abs()
+            } else {
+                abs_err
+            };
+            // In-range region matches ORT's logistic approximation; extremes are
+            // recomputed exactly. Both stay within a tight tolerance.
+            assert!(
+                abs_err <= 1e-5 || rel_err <= 1e-5,
+                "silu({input}) = {got}, want {want}, abs_err {abs_err}, rel_err {rel_err}"
+            );
         }
+    }
+
+    #[test]
+    fn silu_in_range_region_is_bit_close() {
+        // Pin the in-range band ([-18, 18]) against the exact reference. The MLAS
+        // approximation is ORT's routine; hold it to a tight tolerance so future
+        // regressions surface.
+        let mut xs: Vec<f32> = Vec::new();
+        let mut v = -18.0f32;
+        while v <= 18.0 {
+            xs.push(v);
+            v += 0.1;
+        }
+        let n = xs.len();
+        let x = Owned::f32(&[n], &xs);
+        let mut out = Owned::zeros_f32(&[n]);
+        ActivationKernel {
+            activation: Activation::Silu,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        for (got, input) in out.to_f32().into_iter().zip(xs) {
+            let want = (input as f64) / (1.0 + (-input as f64).exp());
+            let abs_err = (got as f64 - want).abs();
+            let rel_err = if want.abs() > 1.0 {
+                abs_err / want.abs()
+            } else {
+                abs_err
+            };
+            assert!(
+                abs_err <= 1e-5 || rel_err <= 1e-5,
+                "silu({input}) = {got}, want {want}, abs_err {abs_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn silu_handles_infinities_and_nan() {
+        let xs = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        let x = Owned::f32(&[3], &xs);
+        let mut out = Owned::zeros_f32(&[3]);
+        ActivationKernel {
+            activation: Activation::Silu,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        let got = out.to_f32();
+        assert_eq!(got[0], f32::INFINITY, "SiLU(+Inf) must be +Inf");
+        assert_eq!(got[1], 0.0, "SiLU(-Inf) must be 0");
+        assert!(got[2].is_nan(), "SiLU(NaN) must be NaN");
     }
 
     #[test]

@@ -977,11 +977,86 @@ mod tests {
             .iter()
             .zip(&rhs)
             .map(|(&x, &y)| {
-                half::f16::from_f32(half::f16::from_f32(x).to_f32() * half::f16::from_f32(y).to_f32())
-                    .to_f32()
+                half::f16::from_f32(
+                    half::f16::from_f32(x).to_f32() * half::f16::from_f32(y).to_f32(),
+                )
+                .to_f32()
             })
             .collect();
         assert_eq!(fast.to_f16_as_f32(), want);
+
+        // Force the general broadcast fallback by reshaping one operand so the
+        // contiguous fast path is bypassed (shape [64,1] x [1,1] broadcasts a
+        // scalar over the column). The fast path and broadcast path must agree
+        // bit-for-bit on the equal-shape region, so compare RAW f16 bits.
+        let a_col = Owned::f16(&[64, 1], &lhs);
+        let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
+        let mut broadcast = Owned::zeros(DataType::Float16, &[64, 1]);
+        BinaryKernel { op: BinOp::Mul }
+            .execute(
+                &[a_col.view(), b_scalar.view()],
+                &mut [broadcast.view_mut()],
+            )
+            .unwrap();
+        // Recompute the fast path with the same scalar multiplier as a full
+        // [64] contiguous op, then compare raw bits against the broadcast result.
+        let rhs_scalar = vec![rhs[0]; 64];
+        let a_flat = Owned::f16(&[64], &lhs);
+        let b_flat = Owned::f16(&[64], &rhs_scalar);
+        let mut fast_scalar = Owned::zeros(DataType::Float16, &[64]);
+        BinaryKernel { op: BinOp::Mul }
+            .execute(
+                &[a_flat.view(), b_flat.view()],
+                &mut [fast_scalar.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(
+            fast_scalar.to_u16_bits(),
+            broadcast.to_u16_bits(),
+            "contiguous fast path and broadcast fallback must be bit-identical"
+        );
+    }
+
+    #[test]
+    fn sub_div_f16_contiguous_matches_broadcast_path() {
+        // Cover the generalized contiguous fast path for Sub and Div in f16,
+        // asserting bit-identity with the broadcast fallback (Gaff nit).
+        let lhs: Vec<f32> = (0..48).map(|i| (i as f32) * 0.25 - 6.0).collect();
+        let rhs: Vec<f32> = (0..48).map(|i| (i as f32) * 0.1 + 1.3).collect();
+        for op in [BinOp::Sub, BinOp::Div] {
+            let a = Owned::f16(&[48], &lhs);
+            let b = Owned::f16(&[48], &rhs);
+            let mut fast = Owned::zeros(DataType::Float16, &[48]);
+            BinaryKernel { op }
+                .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
+                .unwrap();
+
+            // Broadcast fallback over [48,1] x [1,1] with the first rhs value.
+            let a_col = Owned::f16(&[48, 1], &lhs);
+            let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
+            let mut broadcast = Owned::zeros(DataType::Float16, &[48, 1]);
+            BinaryKernel { op }
+                .execute(
+                    &[a_col.view(), b_scalar.view()],
+                    &mut [broadcast.view_mut()],
+                )
+                .unwrap();
+            let rhs_scalar = vec![rhs[0]; 48];
+            let b_flat = Owned::f16(&[48], &rhs_scalar);
+            let a_flat = Owned::f16(&[48], &lhs);
+            let mut fast_scalar = Owned::zeros(DataType::Float16, &[48]);
+            BinaryKernel { op }
+                .execute(
+                    &[a_flat.view(), b_flat.view()],
+                    &mut [fast_scalar.view_mut()],
+                )
+                .unwrap();
+            assert_eq!(
+                fast_scalar.to_u16_bits(),
+                broadcast.to_u16_bits(),
+                "contiguous and broadcast f16 paths must be bit-identical"
+            );
+        }
     }
 
     #[test]
