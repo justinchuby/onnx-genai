@@ -108,6 +108,9 @@ GLM-4 export from **41 captured segments / 40 eager seams** to **1 captured
 segment / 0 eager seams**, with zero fallbacks. This is a general EP
 improvement: any graph whose split sizes and output shapes are static can
 benefit without requiring a model-specific rewrite.
+The 40 capture-breaking nodes are the fused-MLP gate/up activation Split
+(one per layer), `Split(axis=-1, num_outputs=2)` on `gate_up_proj`, named
+`model/layers.N/mlp/Split_node_*`; they are not RoPE splits.
 
 | Model | Native tok/s (median of 3) | Prior native | Change | Coherent? | Segments / fallbacks |
 |---|---:|---:|---:|:---:|---:|
@@ -116,7 +119,9 @@ benefit without requiring a model-specific rewrite.
 The measured samples were 118.85/118.41/118.88 tok/s. The third run had a
 noisy 131.144-ms prefill, but its 118.88 tok/s steady decode was not an
 outlier. ORT GenAI 0.14.1 still cannot load this graph because its bundled GQA
-schema rejects the required partial-RoPE `rotary_embedding_dim` attribute.
+attention schema rejects the required partial-RoPE `rotary_embedding_dim`
+attribute. This separate GQA-schema incompatibility is unrelated to the
+fused-MLP Split seams.
 Relative to forced eager execution at 85.51 tok/s, whole-graph capture is now
 **+38.99%**.
 
