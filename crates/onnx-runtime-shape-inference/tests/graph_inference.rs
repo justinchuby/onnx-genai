@@ -24,6 +24,8 @@ fn if_graph(then_branch: Graph, else_branch: Graph) -> (Graph, ValueId) {
     let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
     graph.add_input(condition);
     let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(output);
+    graph.mark_value_shape_unknown(output);
     let if_node = graph.insert_node(node(0, "If", vec![Some(condition)], vec![output]));
     graph
         .subgraphs
@@ -104,10 +106,14 @@ fn nested_captured_if_branch(value_name: &str, condition_name: &str) -> Graph {
 }
 
 fn identity_branch(shape: Shape) -> Graph {
+    identity_branch_with_element_type(DataType::Float32, shape)
+}
+
+fn identity_branch_with_element_type(element_type: DataType, shape: Shape) -> Graph {
     let mut branch = Graph::new();
-    let input = branch.create_named_value("local", DataType::Float32, shape);
+    let input = branch.create_named_value("local", element_type, shape);
     branch.add_input(input);
-    let output = branch.create_named_value("branch_output", DataType::Float32, Shape::new());
+    let output = branch.create_named_value("branch_output", element_type, Shape::new());
     branch.insert_node(node(0, "Identity", vec![Some(input)], vec![output]));
     branch.add_output(output);
     branch
@@ -349,23 +355,53 @@ fn if_more_declared_outputs_leaves_unpaired_outputs_unresolved() {
     assert!(report.unresolved.contains(&outputs[2]));
 }
 
+fn assert_if_rank_mismatch_is_dynamic(then_rank: usize, else_rank: usize) {
+    let then_shape = (1..=then_rank).map(Dim::Static).collect();
+    let else_shape = (1..=else_rank).map(Dim::Static).collect();
+    let (mut graph, output) = if_graph(
+        identity_branch_with_element_type(DataType::Float16, then_shape),
+        identity_branch_with_element_type(DataType::Float16, else_shape),
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("branch rank mismatch must produce a dynamic-rank output");
+
+    assert_eq!(graph.value(output).dtype, DataType::Float16);
+    assert!(graph.value_type_is_known(output));
+    assert!(!graph.value_shape_is_known(output));
+    assert!(report.unresolved.contains(&output));
+}
+
 #[test]
-fn if_branch_rank_mismatch_is_an_error() {
+fn if_rank_two_and_rank_three_branches_produce_dynamic_rank() {
+    assert_if_rank_mismatch_is_dynamic(2, 3);
+}
+
+#[test]
+fn if_rank_four_and_rank_five_branches_produce_dynamic_rank() {
+    assert_if_rank_mismatch_is_dynamic(4, 5);
+}
+
+#[test]
+fn if_branch_element_type_mismatch_is_an_error() {
     let (mut graph, _) = if_graph(
-        identity_branch(vec![Dim::Static(2)]),
-        identity_branch(vec![Dim::Static(2), Dim::Static(3)]),
+        identity_branch_with_element_type(DataType::Float16, vec![Dim::Static(2)]),
+        identity_branch_with_element_type(DataType::Float32, vec![Dim::Static(2)]),
     );
 
     let registry = InferenceRegistry::default_registry();
     let opsets = graph.opset_imports.clone();
     let error = registry
         .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
-        .expect_err("branch rank mismatch must fail");
+        .expect_err("branch element type mismatch must fail");
 
     assert!(matches!(
         error,
         onnx_runtime_shape_inference::ShapeInferError::Invalid { op, detail }
-            if op == "If" && detail.contains("branch output ranks differ")
+            if op == "If" && detail.contains("branch output element types differ")
     ));
 }
 

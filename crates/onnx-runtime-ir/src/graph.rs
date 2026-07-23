@@ -124,6 +124,11 @@ impl Graph {
         self.unknown_value_types.insert(id);
     }
 
+    /// Mark a value's element type as known.
+    pub fn mark_value_type_known(&mut self, id: ValueId) {
+        self.unknown_value_types.remove(&id);
+    }
+
     /// Mark a value's placeholder shape as unknown.
     pub fn mark_value_shape_unknown(&mut self, id: ValueId) {
         self.unknown_value_shapes.insert(id);
