@@ -707,9 +707,11 @@ impl CudaMatMulNBitsBiasFusion {
     }
 }
 
-/// Block-quantization the fused RMS-norm GEMV kernels assume (`bits`,
-/// `block_size`), derived from the kernels themselves — not any model.
-const RMSNORM_FUSION_SUPPORTED_BITS: i64 = 4;
+/// Block-quantization the fused RMS-norm GEMV kernels assume. The fused decode
+/// GEMVs (and their prefill GEMM) implement both the packed int4 layout and the
+/// one-byte-per-weight int8 layout, so either bit width fuses; the block size is
+/// fixed at 32 by the tuned four-lane/eight-block warp walk.
+const RMSNORM_FUSION_SUPPORTED_BITS: [i64; 2] = [4, 8];
 const RMSNORM_FUSION_SUPPORTED_BLOCK_SIZE: i64 = 32;
 /// The fused prologue/epilogue reproduce `skip_rmsnorm_f16_warp_half4`, which
 /// covers the hidden size in 128-wide (`32 lanes * 4 halves`) chunks, so the
@@ -1099,7 +1101,7 @@ impl CudaSkipRmsNormMatMulFusion {
         {
             return None;
         }
-        if !self.is_int4_fp16_matmul(graph, node) {
+        if !self.is_fusable_bits_fp16_matmul(graph, node) {
             return None;
         }
         if node.attr("N").and_then(Attribute::as_int)? as usize != norm_size {
@@ -1111,9 +1113,10 @@ impl CudaSkipRmsNormMatMulFusion {
         Some(producer)
     }
 
-    /// A following GEMV is prologue-capable when it is a general int4/fp16
-    /// `MatMulNBits` (no zero-points or group index, an optional bias allowed),
-    /// with `K <= N` so the general — not the tall-skinny down — variant runs.
+    /// A following GEMV is prologue-capable when it is a general int4/int8 fp16
+    /// `MatMulNBits` (an optional asymmetric zero point and/or bias allowed, no
+    /// group index), with `K <= N` so the general — not the tall-skinny down —
+    /// variant runs.
     fn following_gemv_is_fusable(&self, graph: &Graph, id: NodeId) -> bool {
         let Some(node) = graph.try_node(id) else {
             return false;
@@ -1125,7 +1128,7 @@ impl CudaSkipRmsNormMatMulFusion {
         if node.attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR).is_some() {
             return false;
         }
-        if !self.is_int4_fp16_matmul(graph, node) {
+        if !self.is_fusable_bits_fp16_matmul(graph, node) {
             return false;
         }
         let (Some(k), Some(n)) = (
@@ -1145,10 +1148,16 @@ impl CudaSkipRmsNormMatMulFusion {
             let value_count = node.input_values().count();
             return (value_count == 5 || value_count == 7) && k <= n;
         }
-        // No zero-points (slot 3), no group index (slot 4), no pre-existing
-        // gamma (slot 6). An optional bias (slot 5) is allowed.
-        if node.inputs.get(3).copied().flatten().is_some()
-            || node.inputs.get(4).copied().flatten().is_some()
+        // An optional asymmetric zero point (slot 3, uint8) is allowed — the
+        // fused GEMVs dequant it exactly as the non-fused path. No group index
+        // (slot 4), no pre-existing gamma (slot 6); an optional bias (slot 5) is
+        // allowed.
+        if let Some(zero_points) = node.inputs.get(3).copied().flatten()
+            && graph.try_value(zero_points).map(|value| value.dtype) != Some(DataType::Uint8)
+        {
+            return false;
+        }
+        if node.inputs.get(4).copied().flatten().is_some()
             || node.inputs.get(6).copied().flatten().is_some()
         {
             return false;
@@ -1158,10 +1167,13 @@ impl CudaSkipRmsNormMatMulFusion {
         k <= n
     }
 
-    /// Shared block-quantization + fp16-scales checks for the fused GEMVs.
-    fn is_int4_fp16_matmul(&self, graph: &Graph, node: &onnx_runtime_ir::Node) -> bool {
-        if node.attr("bits").and_then(Attribute::as_int).unwrap_or(4)
-            != RMSNORM_FUSION_SUPPORTED_BITS
+    /// Shared block-quantization + fp16-scales checks for the fused GEMVs. Admits
+    /// both int4 (packed nibble) and int8 (one byte per weight) MatMulNBits: the
+    /// fused decode GEMVs and prefill GEMM implement both layouts, keyed off the
+    /// `bits` attribute — never a model name.
+    fn is_fusable_bits_fp16_matmul(&self, graph: &Graph, node: &onnx_runtime_ir::Node) -> bool {
+        if !RMSNORM_FUSION_SUPPORTED_BITS
+            .contains(&node.attr("bits").and_then(Attribute::as_int).unwrap_or(4))
         {
             return false;
         }
@@ -2497,6 +2509,47 @@ mod tests {
             .unwrap();
         assert_eq!(identity.inputs[0], Some(pre_out));
 
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_skip_rmsnorm_into_int8_neighbouring_gemvs() {
+        // Phi's qkv/down are int8 (bits == 8), block-32, fp16 scales. The fused
+        // GEMV family implements the one-byte-per-weight int8 dequant, so the
+        // skip-rmsnorm fold must fire on int8 exactly as on int4 — keyed off the
+        // `bits` attribute, never a model name.
+        let mut graph = skip_rms_graph(RMSNORM_FUSION_MIN_HIDDEN, RMSNORM_FUSION_MIN_HIDDEN + 256);
+        set_matmul_attr(&mut graph, "bits", 8);
+        let pre_out = value_id_by_name(&graph, "pre_out");
+        let gamma = value_id_by_name(&graph, "gamma");
+
+        CudaSkipRmsNormMatMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|node| node.op_type != "SkipSimplifiedLayerNormalization"),
+            "int8 skip-rmsnorm must fuse just like int4"
+        );
+        let preceding = node_producing(&graph, pre_out);
+        assert_eq!(
+            preceding
+                .attr(MATMUL_NBITS_FOLDED_BIAS_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
+        let post_out = value_id_by_name(&graph, "post_out");
+        let following = node_producing(&graph, post_out);
+        assert_eq!(following.inputs.get(6).copied().flatten(), Some(gamma));
+        assert_eq!(
+            following
+                .attr(MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR)
+                .and_then(Attribute::as_int),
+            Some(1)
+        );
         assert!(graph.validate().is_ok());
     }
 

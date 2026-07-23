@@ -61,6 +61,18 @@ const GEMV_F16_SCALES_F16_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f1
 /// (see [`GEMV_F16_SCALES_F16_ZP_ENTRY`] for the `HasZp` specialization scheme).
 const GEMV_F16_SCALES_F16_RMSNORM_ZP_ENTRY: &str =
     "matmul_nbits_gemv_f16_scales_f16_rmsnorm_zp";
+/// INT8 sibling of [`GEMV_F16_SCALES_F16_RMSNORM_ENTRY`]. Shares the RMS
+/// reduction and normalized-activation staging bit-for-bit and swaps in the
+/// block-32 int8 dequant dot, fusing a `SkipSimplifiedLayerNormalization` into
+/// the following int8 GEMV (e.g. Phi's int8 qkv projection). Compiled in the
+/// same symmetric/`_zp` `HasZp` pair as the int4 sibling so a future
+/// symmetric-int8 model keeps the constant-subtrahend (no per-block load) path.
+const GEMV_INT8_F16_SCALES_F16_RMSNORM_ENTRY: &str =
+    "matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm";
+/// Asymmetric-zero-point specialization of
+/// [`GEMV_INT8_F16_SCALES_F16_RMSNORM_ENTRY`] (Phi int8 qkv carries zero points).
+const GEMV_INT8_F16_SCALES_F16_RMSNORM_ZP_ENTRY: &str =
+    "matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm_zp";
 /// Standalone RMS-normalization prologue used by the fused GEMV's M>1 prefill
 /// path (see [`MatMulNBitsKernel::launch_rmsnorm_prefill`]).
 const RMSNORM_PREFILL_ENTRY: &str = "matmul_nbits_rmsnorm_f16_warp_half4";
@@ -1411,6 +1423,187 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_zp(
     const float epsilon)
 {
     matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl<true>(activation, packed, scales_raw, zero_points, gamma, bias, output, k, n, k_blocks, blob_size, zp_row_bytes, bias_post_round, gamma_is_half, epsilon);
+}
+
+// Compile-time-specialized per-block int8 zero point. `HasZp == false`
+// (symmetric int8) folds to the constant 128 with no load — mirroring the int4
+// `block_zp` helper — so a future symmetric-int8 model keeps the constant
+// subtrahend and never pays the per-block occupancy cost the int4 path shed.
+template <bool HasZp>
+__device__ __forceinline__ int block_zp_int8(
+    const unsigned char* __restrict__ zero_points,
+    const long column,
+    const int block,
+    const int k_blocks)
+{
+    if (!HasZp) {
+        return 128;
+    }
+    return (int)zero_points[column * k_blocks + block];
+}
+
+// INT8 sibling of `matmul_nbits_gemv_f16_scales_f16_rmsnorm`. The RMS reduction
+// and normalized-activation staging are byte-identical to the int4 fused kernel
+// (and to the standalone `skip_rmsnorm_f16_warp_half4`); only the quantized dot
+// differs, reusing the exact block-32 int8 dequant work split from
+// `matmul_nbits_gemv_int8_f16` (one byte per weight, per-block uint8 zero point
+// defaulting to 128, fp32 accumulation). Specialized on `HasZp` like the int4
+// sibling so the symmetric case emits no per-block zero-point load.
+template <bool HasZp>
+__device__ __forceinline__ void matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm_tpl(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const void* __restrict__ gamma,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int bias_post_round,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    extern __shared__ __align__(16) __half staged_activation[];
+    __shared__ float shared_inv_std;
+
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    // --- RMS reduction, byte-identical to `skip_rmsnorm_f16_warp_half4`. ---
+    if (warp == 0) {
+        const int chunks_per_lane = k / (32 * 4);
+        const unsigned long long* activation4 =
+            reinterpret_cast<const unsigned long long*>(activation);
+        float ss0 = 0.0f;
+        float ss1 = 0.0f;
+        float ss2 = 0.0f;
+        float ss3 = 0.0f;
+        for (int item = 0; item < chunks_per_lane; ++item) {
+            const int chunk = lane + item * 32;
+            MatMulNBitsSkipHalf4 residual;
+            residual.raw = activation4[chunk];
+            const float2 rounded0 = __half22float2(residual.pair[0]);
+            const float2 rounded1 = __half22float2(residual.pair[1]);
+            ss0 += rounded0.x * rounded0.x;
+            ss1 += rounded0.y * rounded0.y;
+            ss2 += rounded1.x * rounded1.x;
+            ss3 += rounded1.y * rounded1.y;
+        }
+        float ss = (ss0 + ss1) + (ss2 + ss3);
+        for (int off = 16; off > 0; off >>= 1) {
+            ss += __shfl_down_sync(0xffffffffu, ss, off);
+        }
+        if (lane == 0) {
+            shared_inv_std = 1.0f / sqrtf(ss / (float)k + epsilon);
+        }
+    }
+    __syncthreads();
+    const float inv_std = shared_inv_std;
+
+    // --- Normalized activation, matching the norm kernel's rounded output. ---
+    for (int j = tid; j < k; j += (int)blockDim.x) {
+        const float residual = __half2float(activation[j]);
+        const float scale = load_rmsnorm_gamma(gamma, gamma_is_half, j);
+        staged_activation[j] = __float2half((residual * inv_std) * scale);
+    }
+    __syncthreads();
+
+    // --- INT8 dot over the staged, normalized input (mirrors the non-fused
+    //     `matmul_nbits_gemv_int8_f16` work split, fp32 accumulation). ---
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+
+    float value = 0.0f;
+    if (column < n) {
+        const int quarter = lane & 3;
+        for (int block_base = 0; block_base < k_blocks; block_base += 8) {
+            const int block = block_base + (lane >> 2);
+            float block_partial = 0.0f;
+            if (block < k_blocks) {
+                const int zero_point =
+                    block_zp_int8<HasZp>(zero_points, column, block, k_blocks);
+                const int depth = block * 32 + quarter * 8;
+                const long packed_start =
+                    ((long)column * k_blocks + block) * 32 + quarter * 8;
+                if (depth + 8 <= k) {
+                    const uint2 packed_word =
+                        *reinterpret_cast<const uint2*>(packed + packed_start);
+                    const unsigned char* bytes =
+                        reinterpret_cast<const unsigned char*>(&packed_word);
+                    const uint4 act =
+                        *reinterpret_cast<const uint4*>(staged_activation + depth);
+                    const __half* acth = reinterpret_cast<const __half*>(&act);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        block_partial += ((float)(int)bytes[i] - (float)zero_point)
+                            * __half2float(acth[i]);
+                    }
+                } else if (depth < k) {
+                    const int valid = min(8, k - depth);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid) {
+                            const int quantized = (int)packed[packed_start + i];
+                            block_partial += ((float)quantized - (float)zero_point)
+                                * __half2float(staged_activation[depth + i]);
+                        }
+                    }
+                }
+            }
+            block_partial += __shfl_down_sync(0xffffffffu, block_partial, 2, 4);
+            block_partial += __shfl_down_sync(0xffffffffu, block_partial, 1, 4);
+            if (quarter == 0 && block < k_blocks) {
+                const float scale =
+                    __half2float(scales[(long)column * k_blocks + block]);
+                value += block_partial * scale;
+            }
+        }
+    }
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const void* __restrict__ gamma,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int bias_post_round,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm_tpl<false>(activation, packed, scales_raw, zero_points, gamma, bias, output, k, n, k_blocks, bias_post_round, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm_zp(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const void* __restrict__ gamma,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int bias_post_round,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_int8_f16_scales_f16_rmsnorm_tpl<true>(activation, packed, scales_raw, zero_points, gamma, bias, output, k, n, k_blocks, bias_post_round, gamma_is_half, epsilon);
 }
 
 // Standalone RMS-normalization prologue for the M>1 prefill path of the fused
@@ -2771,6 +2964,7 @@ impl MatMulNBitsKernel {
                     &inputs[0],
                     &inputs[1],
                     &inputs[2],
+                    zero_points,
                     gamma,
                     bias,
                     &mut outputs[0],
@@ -2807,6 +3001,34 @@ impl MatMulNBitsKernel {
 
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
         if self.bits == 8 {
+            if self.rmsnorm_prologue {
+                let gamma = gamma.ok_or_else(|| {
+                    error("rmsnorm_prologue fusion requires the normalization weight at input 6")
+                })?;
+                if !scales_fp16 {
+                    return Err(error(
+                        "rmsnorm_prologue fusion requires fp16 scales (the fused kernel replicates \
+                         the fp16 general scales path)",
+                    ));
+                }
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_int8_f16_scales_f16_rmsnorm",
+                    "M==1 decode: fp16 activation, bits=8, block_size=32, fp16 scales, \
+                     zero_points={} → int8 GEMV with fused RMS-normalization prologue \
+                     (SkipSimplifiedLayerNormalization folded)",
+                    zero_points.is_some()
+                );
+                return self.launch_int8_f16_gemv_rmsnorm(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    gamma,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                );
+            }
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemv_int8_f16",
                 "M==1 decode: fp16 activation, bits=8, block_size=32, zero_points={} → direct \
@@ -2967,6 +3189,7 @@ impl MatMulNBitsKernel {
         activation: &TensorView,
         packed: &TensorView,
         scales: &TensorView,
+        zero_points: Option<&TensorView>,
         gamma: &TensorView,
         bias: Option<&TensorView>,
         output: &mut TensorMut,
@@ -2992,7 +3215,7 @@ impl MatMulNBitsKernel {
                 packed,
                 scales,
                 true,
-                None,
+                zero_points,
                 bias,
                 output,
                 m,
@@ -3116,6 +3339,108 @@ impl MatMulNBitsKernel {
         }
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMulNBits int8 fp16 GEMV", err))
+    }
+
+    /// INT8 decode GEMV with a fused RMS-normalization prologue. Mirrors
+    /// [`Self::launch_f16_gemv_rmsnorm`] but dispatches the int8 sibling kernel,
+    /// which shares the RMS reduction / normalized-activation staging bit-for-bit
+    /// and swaps in the block-32 int8 dequant dot. Restricted to fp16 scales and
+    /// block-32, matching the fusion's eligibility gates.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int8_f16_gemv_rmsnorm(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        gamma: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits int8 fp16 RMS-norm-prologue GEMV")?;
+        if bias.is_some() {
+            if self.fold_bias_post_round {
+                onnx_runtime_ep_api::record_kernel_variant_stage!(
+                    "bias",
+                    "qkv_bias_fused",
+                    "folded standalone Add(MatMulNBits, bias) into GEMV epilogue with \
+                     fp16-after-round semantics fp16(fp16(acc)+bias) (token-identity preserved)"
+                );
+            } else {
+                onnx_runtime_ep_api::record_kernel_variant_stage!(
+                    "bias",
+                    "bias_native",
+                    "native MatMulNBits bias: single-round epilogue fp16(acc+bias)"
+                );
+            }
+        }
+        let entry = if zero_points.is_some() {
+            GEMV_INT8_F16_SCALES_F16_RMSNORM_ZP_ENTRY
+        } else {
+            GEMV_INT8_F16_SCALES_F16_RMSNORM_ENTRY
+        };
+        let function = self.runtime.nvrtc_function(
+            GEMV_F16_MODULE,
+            GEMV_F16_SRC,
+            entry,
+        )?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+        let gamma_is_half: i32 = (gamma.dtype == DataType::Float16) as i32;
+        let epsilon = self.rmsnorm_epsilon;
+        let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+            GEMV_F16_SMALL_THREADS
+        } else {
+            GEMV_F16_LARGE_THREADS
+        };
+        let columns_per_block = (threads / 32) as usize;
+        let shared_mem_bytes = (self.k * std::mem::size_of::<half::f16>()) as u32;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&gamma_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks)
+            .arg(&bias_post_round_flag)
+            .arg(&gamma_is_half)
+            .arg(&epsilon);
+        // SAFETY: restricted to block-32 M=1 fp16 inputs with fp16 scales, all
+        // dtype/shape/contiguity validated above. The kernel stages the
+        // normalized activation in launch-time dynamic shared memory
+        // (`K * sizeof(f16)`, bounded by the fusion's `K % 128 == 0` predicate)
+        // and uses only registers, warp shuffles, and `__syncthreads` — no
+        // per-call allocation or host synchronization — so it is legal to record
+        // into and replay from a CUDA graph.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits int8 fp16 RMS-norm-prologue GEMV", err))
     }
 
     /// Paired gate/up projection + SwiGLU path (see
@@ -6461,7 +6786,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// for decode (M==1) and prefill (M>1), with and without a following bias.
     #[test]
     fn fused_skip_rmsnorm_is_bit_exact_to_three_op_path() {
-        run_fused_skip_rmsnorm_parity(DataType::Float16);
+        run_fused_skip_rmsnorm_parity(DataType::Float16, 4, false);
     }
 
     /// Phi-4-mini exports its `SkipSimplifiedLayerNormalization` gamma in fp32.
@@ -6470,10 +6795,22 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// fusion fires on Phi as well as on Qwen (fp16 gamma).
     #[test]
     fn fused_skip_rmsnorm_fp32_gamma_is_bit_exact_to_three_op_path() {
-        run_fused_skip_rmsnorm_parity(DataType::Float32);
+        run_fused_skip_rmsnorm_parity(DataType::Float32, 4, false);
     }
 
-    fn run_fused_skip_rmsnorm_parity(gamma_dtype: DataType) {
+    /// Phi-4-mini's qkv/down projections are int8 with non-trivial asymmetric
+    /// zero points. The fused int8 RMS-norm-prologue GEMV (following) and the
+    /// int8 residual-fold epilogue (preceding) must stay bit-identical to the
+    /// standalone int8 GEMV + skip_rmsnorm + int8 GEMV sequence at Phi's dims
+    /// (down K=8192>hidden=3072, qkv hidden=3072<=N=5120), fp32 gamma. The
+    /// asymmetric zero points make this a mutation guard: ignoring the zero
+    /// point (or dropping to fp16 accumulation) diverges from the reference.
+    #[test]
+    fn fused_skip_rmsnorm_int8_asymmetric_zp_is_bit_exact_to_three_op_path() {
+        run_fused_skip_rmsnorm_parity(DataType::Float32, 8, true);
+    }
+
+    fn run_fused_skip_rmsnorm_parity(gamma_dtype: DataType, bits: usize, explicit_zp: bool) {
         let Some(runtime) = runtime() else {
             eprintln!("skipping fused skip-rmsnorm parity test: CUDA runtime unavailable");
             return;
@@ -6488,12 +6825,15 @@ extern "C" __global__ void ref_silu_mul_f16(
 
         // hidden % 128 == 0 (warp_half4 gate); preceding is a down projection
         // (pre_k > hidden), the following is a general projection (hidden <= n).
-        let hidden = 896usize;
-        let pre_k = QWEN_DOWN_K; // 4864 > 896 → down variant preceding GEMV.
-        let post_n = 1152usize; // hidden <= post_n → general variant following GEMV.
+        // int8 exercises Phi's actual qkv/down dims; int4 keeps the Qwen shapes.
+        let (hidden, pre_k, post_n) = if bits == 8 {
+            (3072usize, 8192usize, 5120usize)
+        } else {
+            (896usize, QWEN_DOWN_K, 1152usize)
+        };
         let epsilon = 1e-5f32;
         let block_size = 32usize;
-        let blob_size = block_size / 2;
+        let blob_size = block_size * bits / 8;
         let device = DeviceId::cuda(0);
 
         for (m, following_bias) in [(1usize, false), (1, true), (5, true)] {
@@ -6505,14 +6845,21 @@ extern "C" __global__ void ref_silu_mul_f16(
                 ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
             };
 
-            // Pack random int4 codes into the block-32 layout the kernels unpack.
+            // Pack random int4/int8 codes into the block-32 layout the kernels
+            // unpack (nibble pairs for int4, one byte per weight for int8).
             let pack = |next: &mut dyn FnMut() -> f32, n: usize, k: usize| -> Vec<u8> {
                 let k_blocks = k / block_size;
+                let mut packed = vec![0u8; n * k_blocks * blob_size];
+                if bits == 8 {
+                    for byte in packed.iter_mut() {
+                        *byte = ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+                    }
+                    return packed;
+                }
                 let mut quant = vec![0u8; n * k];
                 for value in quant.iter_mut() {
                     *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
                 }
-                let mut packed = vec![0u8; n * k_blocks * blob_size];
                 for col in 0..n {
                     for block in 0..k_blocks {
                         for pair in 0..blob_size {
@@ -6523,6 +6870,16 @@ extern "C" __global__ void ref_silu_mul_f16(
                     }
                 }
                 packed
+            };
+
+            // Non-uniform asymmetric zero points, one byte per block (int8) so the
+            // dequant is `(code - zp) * scale`. `None` keeps the symmetric default
+            // (zp == 128 for int8), preserving the byte-identical int4 path.
+            let zp_bytes = |next: &mut dyn FnMut() -> f32, n: usize, k: usize| -> Vec<u8> {
+                let k_blocks = k / block_size;
+                (0..n * k_blocks)
+                    .map(|_| (128.0 + (next() * 16.0)).round().clamp(96.0, 160.0) as u8)
+                    .collect()
             };
 
             let pre_k_blocks = pre_k / block_size;
@@ -6554,6 +6911,18 @@ extern "C" __global__ void ref_silu_mul_f16(
                     .collect()
             };
             let bias_post: Vec<f16> = (0..post_n).map(|_| f16::from_f32(next())).collect();
+            // Per-block asymmetric zero points (int8 only); `explicit_zp == false`
+            // uses the symmetric default and omits the input entirely.
+            let zp_pre: Vec<u8> = if explicit_zp {
+                zp_bytes(&mut next, hidden, pre_k)
+            } else {
+                Vec::new()
+            };
+            let zp_post: Vec<u8> = if explicit_zp {
+                zp_bytes(&mut next, post_n, hidden)
+            } else {
+                Vec::new()
+            };
 
             // Device buffers.
             let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
@@ -6572,6 +6941,8 @@ extern "C" __global__ void ref_silu_mul_f16(
             let y_ref_dev = runtime.alloc_raw(m * post_n * 2).unwrap();
             let pre_fused_dev = runtime.alloc_raw(m * hidden * 2).unwrap();
             let y_fused_dev = runtime.alloc_raw(m * post_n * 2).unwrap();
+            let zp_pre_dev = explicit_zp.then(|| runtime.alloc_raw(zp_pre.len()).unwrap());
+            let zp_post_dev = explicit_zp.then(|| runtime.alloc_raw(zp_post.len()).unwrap());
 
             // SAFETY: device buffers exactly cover their source slices.
             unsafe {
@@ -6585,6 +6956,12 @@ extern "C" __global__ void ref_silu_mul_f16(
                 runtime.htod(as_bytes(&residual), residual_dev).unwrap();
                 runtime.htod(&gamma_bytes, gamma_dev).unwrap();
                 runtime.htod(as_bytes(&bias_post), bias_post_dev).unwrap();
+                if let Some(dev) = zp_pre_dev {
+                    runtime.htod(&zp_pre, dev).unwrap();
+                }
+                if let Some(dev) = zp_post_dev {
+                    runtime.htod(&zp_post, dev).unwrap();
+                }
             }
 
             // Tensor descriptors.
@@ -6686,12 +7063,35 @@ extern "C" __global__ void ref_silu_mul_f16(
                 &hidden_strides,
                 device,
             );
+            // Asymmetric zero-point views (int8 only), one byte per block.
+            let pre_zp_shape = [hidden, pre_k_blocks];
+            let pre_zp_strides = [pre_k_blocks as i64, 1];
+            let post_zp_shape = [post_n, post_k_blocks];
+            let post_zp_strides = [post_k_blocks as i64, 1];
+            let zp_pre_view = zp_pre_dev.map(|dev| {
+                TensorView::new(
+                    device_ptr(dev),
+                    DataType::Uint8,
+                    &pre_zp_shape,
+                    &pre_zp_strides,
+                    device,
+                )
+            });
+            let zp_post_view = zp_post_dev.map(|dev| {
+                TensorView::new(
+                    device_ptr(dev),
+                    DataType::Uint8,
+                    &post_zp_shape,
+                    &post_zp_strides,
+                    device,
+                )
+            });
 
             let make_kernel = |k: usize, n: usize, fold: bool, rmsnorm: bool| MatMulNBitsKernel {
                 runtime: runtime.clone(),
                 k,
                 n,
-                bits: 4,
+                bits,
                 block_size,
                 accuracy_level: 4,
                 accuracy4_workspace: None,
@@ -6714,11 +7114,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                 );
                 preceding_ref
                     .run(
-                        &[
-                            activation_view,
-                            packed_pre_view,
-                            scales_pre_view,
-                        ],
+                        &{
+                            let mut inputs =
+                                vec![activation_view, packed_pre_view, scales_pre_view];
+                            if let Some(zp) = zp_pre_view {
+                                inputs.push(zp);
+                            }
+                            inputs
+                        },
                         std::slice::from_mut(&mut matmul_out),
                     )
                     .unwrap();
@@ -6789,8 +7192,10 @@ extern "C" __global__ void ref_silu_mul_f16(
                     packed_post_view,
                     scales_post_view,
                 ];
+                if zp_post_view.is_some() || following_bias {
+                    inputs.push(zp_post_view.unwrap_or(TensorView::absent(DataType::Uint8)));
+                }
                 if following_bias {
-                    inputs.push(TensorView::absent(DataType::Uint8));
                     inputs.push(TensorView::absent(DataType::Int32));
                     inputs.push(bias_post_view);
                 }
@@ -6815,7 +7220,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             activation_view,
                             packed_pre_view,
                             scales_pre_view,
-                            TensorView::absent(DataType::Uint8),
+                            zp_pre_view.unwrap_or(TensorView::absent(DataType::Uint8)),
                             TensorView::absent(DataType::Int32),
                             residual_view,
                         ],
@@ -6837,7 +7242,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     pre_fused_input_view,
                     packed_post_view,
                     scales_post_view,
-                    TensorView::absent(DataType::Uint8),
+                    zp_post_view.unwrap_or(TensorView::absent(DataType::Uint8)),
                     TensorView::absent(DataType::Int32),
                 ];
                 if following_bias {
@@ -6887,6 +7292,9 @@ extern "C" __global__ void ref_silu_mul_f16(
                     pre_fused_dev,
                     y_fused_dev,
                 ] {
+                    runtime.free_raw(buffer).unwrap();
+                }
+                for buffer in [zp_pre_dev, zp_post_dev].into_iter().flatten() {
                     runtime.free_raw(buffer).unwrap();
                 }
             }
