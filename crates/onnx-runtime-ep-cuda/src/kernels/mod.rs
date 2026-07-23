@@ -42,6 +42,7 @@ pub mod gemm;
 mod gqa_decode;
 mod gqa_decode_fp16;
 pub mod group_query_attention;
+pub mod index_share;
 pub mod indexing;
 pub mod matmul;
 pub mod matmul_nbits;
@@ -111,6 +112,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "BlockQuantizedMatMul",
     "SparseKvGather",
     "CompressedSparseAttention",
+    "IndexShare",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -382,6 +384,12 @@ pub fn build_cuda_registry_with_metrics(
                 metrics: csa_metrics.clone(),
             },
         ),
+    );
+    reg.register(
+        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
     );
     reg.register(
         OpKey::new("Gemm", "", 1),

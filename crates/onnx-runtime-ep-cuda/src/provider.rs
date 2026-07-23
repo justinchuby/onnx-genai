@@ -208,6 +208,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "IndexShare"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                onnx_runtime_ep_cpu::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "QMoE"
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::qmoe::unsupported_reason(op)
