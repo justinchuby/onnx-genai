@@ -169,20 +169,116 @@ and practical sparse MoE emission remain separate work.
    reproducible manual smoke target (done).**
    It is the smallest true DeepSeek checkpoint, uses only proven dense
    Llama-style ops, and already runs on native CUDA with zero fallbacks.
-2. **Generate GLM-4-9B int4 through Mobius plus an external RTN/GPTQ/AWQ
-   quantization step (2-4 days).** Graph support is tractable; the missing piece
-   is a production packed checkpoint, because Mobius's CLI is an emitter/repacker,
-   not a float-to-int4 quantizer.
-3. **Run a real DeepSeek-V2-Lite/V3 MLA float or per-expert-int4 structural
+2. **Use DeepSeek-R1-Distill-Qwen-1.5B as the reasoning-model smoke
+   target (done).** Its Qwen2 graph captures as one segment with zero fallbacks.
+3. **Implement quantization-aware GLM-4 preprocessing in Mobius, then emit the
+   downloaded GPTQ checkpoint (3-5 days).** Graph support and a packed int4
+   checkpoint are available; the remaining blocker is checkpoint-name mapping
+   plus fused packed-QKV splitting/repacking.
+4. **Run a real DeepSeek-V2-Lite/V3 MLA float or per-expert-int4 structural
    parity export (3-5 days).** This validates MLA shapes and partial RoPE while
    explicitly accepting that unrolled MoE is not performant.
-4. **Finish real fused-QMoE packing in Mobius (1-2 weeks).** Required for a
+5. **Finish real fused-QMoE packing in Mobius (1-2 weeks).** Required for a
    practical V2/V3 or GLM MoE package; validate expert-major packing against
    the CUDA `QMoE` ABI.
-5. **Only then onboard GLM-5.2 / DeepSeek-V4 (multi-week).** Requires real CSA /
+6. **Only then onboard GLM-5.2 / DeepSeek-V4 (multi-week).** Requires real CSA /
    IndexShare artifacts, sparse-path E2E, capture work, and model-specific MTP
    state/indexer-cache orchestration.
 
 The truly blocked items are practical MoE packing and V4/GLM-5.2 sparse+MTP
-orchestration. Dense DeepSeek-Coder and dense GLM-4 graph execution are
-tractable now.
+orchestration. Dense DeepSeek-Coder and R1-Distill run now; dense GLM-4 graph
+execution is tractable but export is blocked on quantized-weight preprocessing.
+
+## Weight generation progress 2026-07-23
+
+### DeepSeek-R1-Distill-Qwen-1.5B: runnable
+
+ORT GenAI successfully exported the Qwen2-based reasoning distill:
+
+```bash
+python3 -m onnxruntime_genai.models.builder \
+  -m deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  -o /home/justinchu/glm-e2e-artifacts/deepseek-r1-distill-qwen-1.5b-int4-cuda \
+  -p int4 -e cuda \
+  --extra_options int4_block_size=32 int4_is_symmetric=true \
+                  int4_accuracy_level=0 hf_token=false
+```
+
+The 1.3 GB package contains 141 symmetric block-32 `MatMulNBits`, 28 GQA,
+56 skip-RMSNorm, and no uncovered operator. Checksums:
+
+```text
+378380244262cc9c297f49161647a2e2e11c7be83b4657e82df1d2d13f602666  model.onnx
+51064450ed6f55b5c2337bf25305f932d724d922c5eb1eb2a08b527764540485  model.onnx.data
+b9ab37b59318bc067b9516dceccff1d9d15148ac9e4aa4e7ff4fa74990a42750  genai_config.json
+```
+
+Native CUDA on GPU 4, with graph capture enabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 cargo run -q -p onnx-genai-bench \
+  --features bench-native,cuda --bin profile_native -- \
+  --model /home/justinchu/glm-e2e-artifacts/deepseek-r1-distill-qwen-1.5b-int4-cuda \
+  --ep cuda --steady --warmups 1 --runs 1 --tokens 32 \
+  --prompt 'Solve: what is 17*23? Think step by step.'
+```
+
+Steady decode was 549.88 tok/s (1.819 ms/token, 24 timed tokens after an
+eight-token skip). A diagnostic non-steady run reported one captured segment,
+zero eager seams, and `captures=1 replays=29 fallbacks=0` during measurement.
+The greedy output was grammatical but degenerated into repeated
+`"Show all your thinking"` text and did not answer the arithmetic problem.
+Thus execution/capture is proven, but this plain-prompt greedy smoke is not a
+quality validation.
+
+### GLM-4-9B: exporter weight mapping blocked
+
+The ORT GenAI builder does recognize `zai-org/GLM-4-9B` as `ChatGLMModel` and
+selects GQA/int4 CUDA. It downloaded the ten-file checkpoint, then failed while
+instantiating the current remote model code:
+
+```text
+AttributeError: 'ChatGLMConfig' object has no attribute 'max_length'.
+Did you mean: 'seq_length'?
+```
+
+Therefore B1 is not blocked on architecture dispatch; it is blocked by
+incompatibility between the builder's Transformers/config loading path and the
+current GLM-4 remote implementation.
+
+For B2, two public, ungated int4 checkpoints were downloaded:
+
+| Checkpoint | Local source | Format / size |
+|---|---|---|
+| `jfiekdjdk/glm-4-9b-chat-awq` | `/home/justinchu/glm-e2e-artifacts/glm-4-9b-chat-awq-source` | AWQ asymmetric int4, group 128, 6.3 GB, PyTorch `.bin` shards |
+| `ModelCloud/glm-4-9b-gptq-4bit` | `/home/justinchu/glm-e2e-artifacts/glm-4-9b-gptq-source` | GPTQ symmetric int4, group 128, 6.3 GB, one safetensors file |
+
+The unmodified Mobius invocations fail on missing normalized metadata:
+`num_hidden_layers must be positive, got 0` for the GPTQ config (which exposes
+`num_layers=40`), and `hidden_act is None` for AWQ. After supplying only those
+equivalent config fields (`num_hidden_layers=40`, `hidden_act=silu`) to isolate
+the next failure:
+
+- the AWQ local path is rejected because Mobius's local loader accepts only
+  safetensors, while this checkpoint is stored as `.bin`;
+- the GPTQ safetensors load succeeds, but package validation reports:
+
+```text
+ValueError: Component 'model' has 643 initializer(s) without weights:
+'model.embed_tokens.weight', 'model.layers.0.input_layernorm.weight',
+'model.layers.0.self_attn.q_proj.weight',
+'model.layers.0.self_attn.q_proj.scales',
+'model.layers.0.self_attn.k_proj.weight' (and 638 more).
+Ensure all weights are loaded before saving.
+Check if the preprocess_weights logic is correct.
+```
+
+The source checkpoint uses names such as
+`transformer.encoder.layers.0.self_attention.query_key_value.qweight` and a
+fused interleaved QKV projection. Mobius's current ChatGLM preprocessing only
+renames `self_attention` and MLP projection names; it does not remap the
+`transformer.encoder` hierarchy and split/repack the fused quantized QKV into
+the graph's `q_proj`/`k_proj`/`v_proj` initializers. No runnable GLM-4 artifact
+was emitted. The concrete next implementation is a quantization-aware GLM-4
+weight preprocessor in Mobius, plus `.bin` support or use of the downloaded
+GPTQ safetensors checkpoint.
