@@ -3741,3 +3741,12 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Validation:** 731 library tests passed; Clippy with warnings denied and rustfmt were clean.
 **Merged:** `1be1bd5`.
 <!-- scribe-merge-2026-07-23T11-25-00Z-pris-parity-gate-end -->
+
+<!-- scribe-merge-2026-07-23T14-45-00Z-bf16-coverage-start -->
+## 2026-07-23 — CPU EP bfloat16 (bf16) coverage extended
+**By:** Zhora (impl), Gaff/opus (non-author review), requested by justinchuby.
+**What:** ORT's CPU EP lacks bf16 for most ops; extended native CPU EP so every capable op accepts bf16. Audit found most of ~158 ops were already class-A (bf16 present). Added widen→f32→narrow bf16 compute paths for Softmax/LogSoftmax/all Reduce*/LayerNorm/Relu/all unary-math (Abs..Tan)/Attention/FusedAttention/GroupQueryAttention (incl. KV-cache decode round-trip)/Range/Constant/ConstantOfShape/CenterCropPad. **Fixed Transpose — it was secretly f32-only**, now byte/element-size generic (bit-exact). Added bf16 bit-lock regression tests on movement ops (Transpose/Concat/Slice/Gather/Split/Pad/Where/GatherElements/GatherND/ScatterElements/Compress/Tile/Reshape/Unsqueeze/Identity). Narrowing uses round-to-nearest-even (half::bf16::from_f32); softmax/scaling done in f32. Class-D int/bool/logical/quantized/window/bitwise ops correctly REJECT bf16 (no byte reinterpretation).
+**Why:** User: "cpu ep所有可以支持bf16的op都要支持。ort现在就是cpu ep bf16不支持 很难用。我们要支持."
+**Validation:** 757 ep-cpu lib tests + 10 numeric-regression golden tests green (752→771 total incl. new bf16 tests); clippy -D warnings clean. Non-author reviewed by Gaff (opus): attention KV round-trip verified single-narrow (no double-truncation), movement genuinely byte-generic, tests assert independent f32 reference / exact bit equality. Verdict ✅ ship.
+**Merged:** cherry-picked to perf/cpu-ep-mlas as `84b40d9` + `a68b076`, pushed (PR #105).
+<!-- scribe-merge-2026-07-23T14-45-00Z-bf16-coverage-end -->
