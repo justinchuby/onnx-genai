@@ -8,12 +8,17 @@
 //! the scaled dot-product scores, a numerically-stable fp32 softmax over the
 //! selected keys, and the probability·value reduction all run in NVRTC kernels.
 //! Query, key, value, bias, the present KV cache, and the output tensor stay
-//! resident on the device; the only host round-trip is the small
-//! `selected_indices` tensor, copied D2H so the ONNX-required deterministic
-//! index validation (strictly-increasing order, trailing `-1` padding, range)
-//! produces the same errors as the CPU oracle. This mirrors the
-//! [`super::sparse_kv_gather`] precedent, where the candidate index table is the
-//! only tensor validated host-side.
+//! resident on the device. In eager (non-capturing) execution the small
+//! `selected_indices` tensor is copied D2H so the ONNX-required deterministic
+//! index validation (strictly-increasing order, trailing `-1` padding, range,
+//! not-all-`-1`) produces the same hard errors as the CPU oracle. During
+//! CUDA-graph capture and replay that host round-trip is illegal (it would
+//! synchronize the stream), so the identical checks run **on the device** in
+//! [`validate_index_rows`], which latches any violation into the runtime's
+//! persistent capture-error word (read back by the host at the per-step logits
+//! sync, outside the captured region). The bulk attention row kernel additionally
+//! clamps every gathered key index into range so a poisoned replay can never
+//! issue an out-of-bounds load.
 //!
 //! ## Determinism / bit-parity
 //!
@@ -27,10 +32,25 @@
 //!
 //! ## Capture support
 //!
-//! Like [`super::sparse_kv_gather`], the host-side index validation copies the
-//! `selected_indices` tensor D2H and synchronizes the stream, which is not legal
-//! during CUDA-graph capture. Capture is therefore gated off with an explicit
-//! reason; the bulk attention math is fully device-resident.
+//! After a warmed eager execution has sized the module-global-style pooled
+//! scratch (present K/V staging and the per-row score scratch keep stable device
+//! addresses across warmup → capture → replay), the launch path is legal to
+//! record into a CUDA graph and replay with only device-buffer contents
+//! changing:
+//!
+//!   * No `stream.synchronize()` on the capturing path (the initial input-upload
+//!     wait and the trailing completion wait are both skipped while capturing;
+//!     same-stream ordering guarantees inputs are ready).
+//!   * No per-call `cudaMalloc`/`cudaFree`: scratch is reused from the pool that
+//!     the warmup pass allocated. Growth (a fresh alloc) only ever happens in
+//!     eager mode, so captured replay keeps fixed buffer addresses.
+//!   * No `selected_indices` D2H copy: [`validate_index_rows`] performs the
+//!     deterministic ONNX index validation on the device and latches violations
+//!     into the runtime capture-error word.
+//!
+//! Capture stays gated off until such a warmup has run (mirroring
+//! [`super::gather`]); until then [`capture_support`] reports the missing
+//! precondition.
 //!
 //! ## Claim-time gating
 //!
@@ -40,7 +60,8 @@
 //! node and falling back inside the kernel.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -51,6 +72,14 @@ use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "IndexShare";
+
+/// Capture-error latch bit raised by [`validate_index_rows`] when a captured
+/// replay observes a `selected_indices` row that fails the deterministic ONNX
+/// validation (out of range, not strictly increasing, index after trailing
+/// `-1` padding, or an all-`-1` row). The host reads the shared latch at the
+/// per-step logits sync, so a poisoned replay is rejected before its token is
+/// consumed.
+pub const INDEX_SHARE_CAPTURE_ERROR_INDEX: u32 = 512;
 const INPUT_NAMES: [&str; 7] = [
     "query",
     "key",
@@ -65,7 +94,7 @@ const INPUT_NAMES: [&str; 7] = [
 const BLOCK: u32 = 256;
 /// Threads per block for `index_share_row` (one block services one output row).
 const ROW_THREADS: u32 = 128;
-const MODULE: &str = "index_share_f32_v1";
+const MODULE: &str = "index_share_f32_v2";
 const SOURCE: &str = r#"
 #define NEG_INF __int_as_float(0xff800000)
 
@@ -126,6 +155,61 @@ __device__ __forceinline__ long long load_index(
       : (long long)((const int*)indices)[offset];
 }
 
+// Device port of the CPU oracle's deterministic `selected_indices` validation.
+// One thread owns one [batch, index_head, query] row and scans its
+// `selected_width` columns, reproducing the exact rejection rules: an index
+// below the -1 sentinel, a non-(-1) index after trailing -1 padding, an index
+// outside [0, total_seq), a non-strictly-increasing (or duplicate) index, and
+// an all-(-1) row. Any violation latches INDEX_SHARE_CAPTURE_ERROR_INDEX into
+// the shared capture-error word via atomicOr; the host reads it back outside the
+// captured region. This replaces the host D2H validation on the capture path.
+extern "C" __global__ void validate_index_rows(
+    const void* indices, unsigned int* capture_error,
+    unsigned long long batch, unsigned long long index_heads,
+    unsigned long long q_seq, unsigned long long selected_width,
+    unsigned long long total_seq, int index_is_i64) {
+  const unsigned long long rows = batch * index_heads * q_seq;
+  for (unsigned long long row = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+       row < rows; row += (unsigned long long)gridDim.x * blockDim.x) {
+    const unsigned long long base = row * selected_width;
+    long long previous = 0;
+    int seen_padding = 0;
+    unsigned long long count = 0;
+    int bad = 0;
+    for (unsigned long long s = 0; s < selected_width; ++s) {
+      const long long index = load_index(indices, base + s, index_is_i64);
+      if (index == -1) {
+        seen_padding = 1;
+        continue;
+      }
+      if (index < -1) {
+        bad = 1;
+        break;
+      }
+      if (seen_padding) {
+        bad = 1;
+        break;
+      }
+      if ((unsigned long long)index >= total_seq) {
+        bad = 1;
+        break;
+      }
+      if (count > 0 && index <= previous) {
+        bad = 1;
+        break;
+      }
+      previous = index;
+      count += 1;
+    }
+    if (count == 0) {
+      bad = 1;
+    }
+    if (bad && capture_error) {
+      atomicOr(capture_error, 512u);
+    }
+  }
+}
+
 // One block per (batch, q_head, query) output row. Gathers the selected keys,
 // computes scaled QK scores (+ optional bias), a numerically-stable softmax
 // over the valid selections, and the probability-weighted value sum.
@@ -156,9 +240,10 @@ extern "C" __global__ void index_share_row(
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
-  // Valid count: entries before the trailing -1 padding. The host validation
-  // guarantees strictly-increasing indices with only trailing -1 padding, so
-  // counting non-(-1) entries reproduces the CPU take_while.
+  // Valid count: entries before the trailing -1 padding. Eager host validation
+  // and the capturing-path `validate_index_rows` both guarantee
+  // strictly-increasing indices with only trailing -1 padding, so counting
+  // non-(-1) entries reproduces the CPU take_while.
   __shared__ unsigned long long valid_sh;
   if (tid == 0) {
     unsigned long long valid = 0;
@@ -178,7 +263,15 @@ extern "C" __global__ void index_share_row(
   // Stage 1: scaled QK score per selected key (sqrt(scale) folded into each
   // operand), plus optional additive bias.
   for (unsigned long long s = tid; s < valid; s += nthreads) {
-    const unsigned long long key = (unsigned long long)load_index(indices, index_row + s, index_is_i64);
+    const long long raw_key = load_index(indices, index_row + s, index_is_i64);
+    // Clamp into [0, total_seq): eager mode has already validated every index,
+    // so this is a no-op there. On a poisoned captured replay (caught by
+    // validate_index_rows) it keeps the gather in bounds; the tainted output is
+    // discarded by the host once the capture-error latch is read.
+    const unsigned long long key =
+        (raw_key >= 0 && (unsigned long long)raw_key < total_seq)
+            ? (unsigned long long)raw_key
+            : 0ULL;
     const unsigned long long koff = ((b * kv_heads + kvh) * total_seq + key) * head_size;
     float acc = 0.0f;
     for (unsigned long long d = 0; d < head_size; ++d) {
@@ -237,7 +330,11 @@ extern "C" __global__ void index_share_row(
   for (unsigned long long d = tid; d < head_size; d += nthreads) {
     float acc = 0.0f;
     for (unsigned long long s = 0; s < valid; ++s) {
-      const unsigned long long key = (unsigned long long)load_index(indices, index_row + s, index_is_i64);
+      const long long raw_key = load_index(indices, index_row + s, index_is_i64);
+      const unsigned long long key =
+          (raw_key >= 0 && (unsigned long long)raw_key < total_seq)
+              ? (unsigned long long)raw_key
+              : 0ULL;
       const unsigned long long voff = ((b * kv_heads + kvh) * total_seq + key) * head_size + d;
       acc += scores[score_row + s] * present_v[voff];
     }
@@ -269,6 +366,109 @@ struct BiasMeta {
     dims: [u64; 4],
 }
 
+/// Pooled, stable-address device scratch reused across calls so the capturing
+/// path never issues a per-call `cudaMalloc`/`cudaFree`. Each buffer grows (a
+/// fresh allocation) only in eager mode; a warmed graph replay keeps the exact
+/// addresses the warmup pass established. A zero pointer means "not yet
+/// allocated"; `capacity` is the current allocation size in bytes.
+#[derive(Debug, Default)]
+struct ScratchPool {
+    present_key: CUdeviceptr,
+    present_key_capacity: usize,
+    present_value: CUdeviceptr,
+    present_value_capacity: usize,
+    scores: CUdeviceptr,
+    scores_capacity: usize,
+}
+
+impl ScratchPool {
+    fn ensure_present_key(
+        &mut self,
+        runtime: &CudaRuntime,
+        bytes: usize,
+        capturing: bool,
+    ) -> Result<CUdeviceptr> {
+        ensure_scratch(
+            runtime,
+            &mut self.present_key,
+            &mut self.present_key_capacity,
+            bytes,
+            capturing,
+            "present_key",
+        )
+    }
+
+    fn ensure_present_value(
+        &mut self,
+        runtime: &CudaRuntime,
+        bytes: usize,
+        capturing: bool,
+    ) -> Result<CUdeviceptr> {
+        ensure_scratch(
+            runtime,
+            &mut self.present_value,
+            &mut self.present_value_capacity,
+            bytes,
+            capturing,
+            "present_value",
+        )
+    }
+
+    fn ensure_scores(
+        &mut self,
+        runtime: &CudaRuntime,
+        bytes: usize,
+        capturing: bool,
+    ) -> Result<CUdeviceptr> {
+        ensure_scratch(
+            runtime,
+            &mut self.scores,
+            &mut self.scores_capacity,
+            bytes,
+            capturing,
+            "scores",
+        )
+    }
+}
+
+/// Reuse (or, only in eager mode, grow) a pooled scratch buffer, keeping its
+/// device address stable whenever the current capacity already suffices. A grow
+/// allocates before freeing the previous block so a failed allocation leaves the
+/// pool intact. Growing while capturing is impossible (`cudaMalloc` is illegal
+/// during capture), so an under-sized buffer on the capturing path is a hard
+/// error pointing at the missing warmup.
+fn ensure_scratch(
+    runtime: &CudaRuntime,
+    ptr: &mut CUdeviceptr,
+    capacity: &mut usize,
+    bytes: usize,
+    capturing: bool,
+    what: &str,
+) -> Result<CUdeviceptr> {
+    let bytes = bytes.max(1);
+    if *ptr != 0 && *capacity >= bytes {
+        return Ok(*ptr);
+    }
+    if capturing {
+        return Err(error(format!(
+            "{what} scratch ({bytes} bytes) exceeds the warmed pool capacity ({} bytes); \
+             a fixed-shape eager warmup must run before capture",
+            *capacity
+        )));
+    }
+    let fresh = runtime.alloc_raw(bytes)?;
+    if *ptr != 0 {
+        // SAFETY: the previous pointer came from this runtime's `alloc_raw` and
+        // is freed exactly once here, after the replacement is secured.
+        unsafe {
+            let _ = runtime.free_raw(*ptr);
+        }
+    }
+    *ptr = fresh;
+    *capacity = bytes;
+    Ok(fresh)
+}
+
 pub struct IndexShareFactory {
     pub runtime: Arc<CudaRuntime>,
 }
@@ -298,6 +498,8 @@ impl KernelFactory for IndexShareFactory {
             num_heads,
             kv_num_heads,
             scale,
+            scratch: Mutex::new(ScratchPool::default()),
+            warmed: AtomicBool::new(false),
         }))
     }
 }
@@ -308,6 +510,30 @@ pub struct IndexShareKernel {
     num_heads: usize,
     kv_num_heads: usize,
     scale: Option<f32>,
+    /// Pooled stable-address scratch (present K/V staging + per-row scores).
+    scratch: Mutex<ScratchPool>,
+    /// Set after a successful eager execution has compiled every NVRTC kernel
+    /// and sized the scratch pool, which is the precondition for capturing this
+    /// kernel into a CUDA graph.
+    warmed: AtomicBool,
+}
+
+impl Drop for IndexShareKernel {
+    fn drop(&mut self) {
+        let pool = self
+            .scratch
+            .get_mut()
+            .expect("cuda_ep IndexShare scratch pool poisoned");
+        for ptr in [pool.present_key, pool.present_value, pool.scores] {
+            if ptr != 0 {
+                // SAFETY: every non-zero pointer came from this runtime's
+                // `alloc_raw` in `ScratchPool::ensure` and is freed exactly once.
+                unsafe {
+                    let _ = self.runtime.free_raw(ptr);
+                }
+            }
+        }
+    }
 }
 
 impl Kernel for IndexShareKernel {
@@ -324,8 +550,16 @@ impl Kernel for IndexShareKernel {
                 outputs.len()
             )));
         }
-        // Inputs may have been uploaded asynchronously on the EP stream.
-        self.runtime.synchronize()?;
+        // Whether the EP stream is recording into a CUDA graph. On the capturing
+        // path a stream synchronize and any host D2H copy are illegal, so the
+        // input-upload wait below and the deterministic index validation are
+        // skipped; same-stream ordering guarantees the inputs are ready and the
+        // device-side `validate_index_rows` latch covers correctness instead.
+        let capturing = self.runtime.is_capturing()?;
+        if !capturing {
+            // Inputs may have been uploaded asynchronously on the EP stream.
+            self.runtime.synchronize()?;
+        }
 
         for &index in &[0, 1, 2, 5] {
             if inputs[index].is_absent() {
@@ -388,10 +622,15 @@ impl Kernel for IndexShareKernel {
 
         let dims = self.validate_shapes(inputs, outputs)?;
 
-        // Copy the small index tensor to the host for the deterministic ONNX
-        // range/order validation (bulk Q/K/V/bias stay on device).
-        let indices = self.read_indices(&inputs[5], dims)?;
-        validate_indices(&indices, dims)?;
+        // Eager (non-capturing) execution mirrors the CPU oracle: copy the small
+        // index tensor D2H and reject any malformed row synchronously. Capturing
+        // execution cannot round-trip to the host, so this is skipped and the
+        // device-side `validate_index_rows` latch (checked outside the captured
+        // region) enforces the same contract instead.
+        if !capturing {
+            let indices = self.read_indices(&inputs[5], dims)?;
+            validate_indices(&indices, dims)?;
+        }
 
         let bias = self.bias_meta(inputs, dims)?;
 
@@ -427,25 +666,25 @@ impl Kernel for IndexShareKernel {
             (0, 0)
         };
 
-        let mut owned: Vec<CUdeviceptr> = Vec::new();
         let result = (|| -> Result<()> {
-            let alloc = |owned: &mut Vec<CUdeviceptr>, bytes: usize| -> Result<CUdeviceptr> {
-                let ptr = self.runtime.alloc_raw(bytes.max(1))?;
-                owned.push(ptr);
-                Ok(ptr)
-            };
+            let mut pool = self
+                .scratch
+                .lock()
+                .expect("cuda_ep IndexShare scratch pool poisoned");
 
+            // Present K/V land in the caller's output slots when requested;
+            // otherwise they use pooled scratch that only feeds the row kernel.
             let present_key_ptr = if want_present {
                 present_key_out
             } else {
-                alloc(&mut owned, present_elements * 4)?
+                pool.ensure_present_key(&self.runtime, present_elements * 4, capturing)?
             };
             let present_value_ptr = if want_present {
                 present_value_out
             } else {
-                alloc(&mut owned, present_elements * 4)?
+                pool.ensure_present_value(&self.runtime, present_elements * 4, capturing)?
             };
-            let scores_ptr = alloc(&mut owned, scores_elements * 4)?;
+            let scores_ptr = pool.ensure_scores(&self.runtime, scores_elements * 4, capturing)?;
 
             self.build_present(past_key_ptr, key_ptr, present_key_ptr, has_past_key, dims)?;
             self.build_present(
@@ -455,6 +694,13 @@ impl Kernel for IndexShareKernel {
                 has_past_value,
                 dims,
             )?;
+
+            // On the capturing path record the device-side index validation so a
+            // poisoned replay latches the shared capture-error word (read by the
+            // host at the per-step logits sync, outside the captured region).
+            if capturing {
+                self.launch_index_validation(indices_ptr, dims, index_is_i64)?;
+            }
 
             self.launch_rows(
                 q_ptr,
@@ -468,14 +714,13 @@ impl Kernel for IndexShareKernel {
                 index_is_i64,
                 output_elements,
             )?;
-            self.runtime.synchronize()
+            if capturing { Ok(()) } else { self.runtime.synchronize() }
         })();
 
-        for ptr in owned {
-            // SAFETY: every pointer came from this runtime's `alloc_raw`.
-            unsafe {
-                let _ = self.runtime.free_raw(ptr);
-            }
+        if result.is_ok() && !capturing {
+            // A warmed eager pass has compiled every kernel and sized the pooled
+            // scratch: capture may now record this kernel with stable addresses.
+            self.warmed.store(true, Ordering::Relaxed);
         }
         result
     }
@@ -485,9 +730,14 @@ impl Kernel for IndexShareKernel {
     }
 
     fn capture_support(&self) -> CaptureSupport {
-        CaptureSupport::unsupported(
-            "host-side selected_indices validation copies the index tensor D2H and synchronizes the stream",
-        )
+        if self.warmed.load(Ordering::Relaxed) {
+            CaptureSupport::Supported
+        } else {
+            CaptureSupport::unsupported(
+                "requires a warmed fixed-shape eager IndexShare pass to size the pooled scratch and \
+                 prime device-side selected_indices validation",
+            )
+        }
     }
 }
 
@@ -645,6 +895,55 @@ impl IndexShareKernel {
                 dims: [1u64; 4],
             }),
         }
+    }
+
+    /// Record the device-side deterministic `selected_indices` validation on the
+    /// EP stream. One thread scans each `[batch, index_head, query]` row and
+    /// latches [`INDEX_SHARE_CAPTURE_ERROR_INDEX`] into the runtime capture-error
+    /// word on any violation. Used only on the capturing path, where the host
+    /// D2H validation is illegal; the latch is read back outside the captured
+    /// region so a poisoned replay is rejected before its token is consumed.
+    fn launch_index_validation(
+        &self,
+        indices_ptr: CUdeviceptr,
+        dims: Dims,
+        index_is_i64: i32,
+    ) -> Result<()> {
+        let rows = (dims.batch * dims.index_heads * dims.q_seq) as u64;
+        if rows == 0 {
+            return Ok(());
+        }
+        let func = self
+            .runtime
+            .nvrtc_function(MODULE, SOURCE, "validate_index_rows")?;
+        let capture_error = self.runtime.capture_error_ptr();
+        let batch = dims.batch as u64;
+        let index_heads = dims.index_heads as u64;
+        let q_seq = dims.q_seq as u64;
+        let selected_width = dims.selected_width as u64;
+        let total_seq = dims.total_seq as u64;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&indices_ptr)
+            .arg(&capture_error)
+            .arg(&batch)
+            .arg(&index_heads)
+            .arg(&q_seq)
+            .arg(&selected_width)
+            .arg(&total_seq)
+            .arg(&index_is_i64);
+        // SAFETY: argument types/order match `validate_index_rows`; the index
+        // tensor is a live contiguous device allocation and `capture_error` is
+        // the runtime's persistent four-byte latch word.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (rows.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| driver_err("launch validate_index_rows", e))
+        .map(|_| ())
     }
 
     fn build_present(
