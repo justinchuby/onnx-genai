@@ -1,7 +1,8 @@
 //! `com.microsoft::SkipSimplifiedLayerNormalization`: fused residual add and
 //! last-axis RMS normalization.
 //!
-//! This correctness kernel currently supports f32 tensors only:
+//! Floating-point inputs are widened to f32 for the calculation and narrowed
+//! back to the requested output dtype.
 //!
 //! ```text
 //! sum = input + skip + bias
@@ -15,8 +16,8 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use super::{check_arity, require_dtype, write_dense_f32};
-use crate::dtype::to_dense_f32_widen;
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
@@ -45,10 +46,6 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 outputs.len()
             )));
         }
-        for input in inputs.iter().filter(|input| !input.is_absent()) {
-            require_dtype(input.dtype, DataType::Float32, OP)?;
-        }
-
         let input = to_dense_f32_widen(OP, &inputs[0])?;
         let skip = to_dense_f32_widen(OP, &inputs[1])?;
         let gamma = to_dense_f32_widen(OP, &inputs[2])?;
@@ -173,15 +170,15 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             }
         }
 
-        write_dense_f32(&mut outputs[0], &output)?;
+        write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
         if writes_mean {
-            write_dense_f32(&mut outputs[1], &vec![0.0f32; groups])?;
+            write_dense_f32_narrow(OP, &mut outputs[1], &vec![0.0f32; groups])?;
         }
         if let Some(inv_std_vars) = inv_std_vars {
-            write_dense_f32(&mut outputs[2], &inv_std_vars)?;
+            write_dense_f32_narrow(OP, &mut outputs[2], &inv_std_vars)?;
         }
         if outputs.get(3).is_some_and(|output| output.shape == shape) {
-            write_dense_f32(&mut outputs[3], &sum)?;
+            write_dense_f32_narrow(OP, &mut outputs[3], &sum)?;
         }
         Ok(())
     }
@@ -447,5 +444,40 @@ mod tests {
             )
             .unwrap();
         assert_close(&output.to_f32(), &want);
+    }
+
+    #[test]
+    fn skip_simplified_layer_norm_f16_widens_and_narrows() {
+        let input = Owned::f16(&[1, 1, 4], &[1., 2., 3., 4.]);
+        let skip = Owned::f16(&[1, 1, 4], &[0.5, -1., 1., 0.]);
+        let gamma = Owned::f16(&[4], &[1., 2., 0.5, 1.5]);
+        let mut output = Owned::zeros(DataType::Float16, &[1, 1, 4]);
+        let mut mean = Owned::zeros(DataType::Float16, &[1, 1, 1]);
+        let mut inv_std = Owned::zeros(DataType::Float16, &[1, 1, 1]);
+        let mut sum = Owned::zeros(DataType::Float16, &[1, 1, 4]);
+        SkipSimplifiedLayerNormKernel { epsilon: 1e-4 }
+            .execute(
+                &[input.view(), skip.view(), gamma.view()],
+                &mut [
+                    output.view_mut(),
+                    mean.view_mut(),
+                    inv_std.view_mut(),
+                    sum.view_mut(),
+                ],
+            )
+            .unwrap();
+        let (want, want_sum) = reference(
+            &[1., 2., 3., 4.],
+            &[0.5, -1., 1., 0.],
+            &[1., 2., 0.5, 1.5],
+            None,
+            1e-4,
+        );
+        for (got, expected) in output.to_f16_as_f32().iter().zip(&want) {
+            assert!((got - expected).abs() < 1e-3);
+        }
+        for (got, expected) in sum.to_f16_as_f32().iter().zip(&want_sum) {
+            assert!((got - expected).abs() < 1e-3);
+        }
     }
 }
