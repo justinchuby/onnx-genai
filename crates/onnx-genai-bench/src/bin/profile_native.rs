@@ -11,13 +11,40 @@ use onnx_genai_engine::{
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
     ProcessorChain,
 };
-use onnx_genai_ort::{Tokenizer, available_execution_providers};
+use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExecutionProvider {
     Cpu,
     Cuda,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DecodeBackend {
+    Native,
+    Ort,
+    Auto,
+}
+
+impl DecodeBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Ort => "ort",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl From<DecodeBackend> for EngineDecodeBackend {
+    fn from(value: DecodeBackend) -> Self {
+        match value {
+            DecodeBackend::Native => Self::Native,
+            DecodeBackend::Ort => Self::Ort,
+            DecodeBackend::Auto => Self::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -49,8 +76,15 @@ struct Args {
     decode_skip: usize,
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
     ep: ExecutionProvider,
+    #[arg(long, value_enum, default_value_t = DecodeBackend::Native)]
+    backend: DecodeBackend,
     #[arg(long, default_value = "Hello")]
     prompt: String,
+    /// Write per-token selected and top-k log probabilities as JSON.
+    #[arg(long)]
+    dump_logprobs: Option<PathBuf>,
+    #[arg(long, default_value_t = 40)]
+    logprobs_k: usize,
     /// When set, capture an `onnx-runtime-tracer` timeline of a single traced
     /// generation and write it as Chrome JSON to this path. Surfaces the per-op
     /// executor spans with `kernel_variant` / `capture_status` fields. Tracing
@@ -121,13 +155,35 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         bail!("--tokens must be greater than --decode-skip");
     }
 
+    if !matches!(args.backend, DecodeBackend::Native) {
+        let requested_provider = match args.ep {
+            ExecutionProvider::Cpu => "cpu",
+            ExecutionProvider::Cuda => "cuda",
+        };
+        // This single-threaded CLI sets provider selection before the process-wide
+        // runtime configuration is first read while constructing the ORT session.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_EP", requested_provider);
+        }
+    }
     let mut config = EngineConfig {
-        decode_backend: EngineDecodeBackend::Native,
+        decode_backend: args.backend.into(),
         ..EngineConfig::default()
     };
     config.native_device = Some(device);
-    let mut engine = Engine::from_dir(model_dir, config)
-        .with_context(|| format!("load native engine {}", model_dir.display()))?;
+    let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
+        format!(
+            "load {} engine {}",
+            args.backend.as_str(),
+            model_dir.display()
+        )
+    })?;
+    println!(
+        "profile_native: model={} ep={:?} backend={}",
+        model_dir.display(),
+        args.ep,
+        args.backend.as_str()
+    );
 
     for _ in 0..args.warmups {
         std::hint::black_box(
@@ -148,9 +204,29 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             token_times.push(start.elapsed());
             Ok(())
         };
+        let mut measured_request = request(&args.prompt, args.tokens);
+        measured_request.options.top_logprobs =
+            args.dump_logprobs.as_ref().map(|_| args.logprobs_k);
         let result = engine
-            .generate_with_callback(request(&args.prompt, args.tokens), Some(&mut callback))
+            .generate_with_callback(measured_request, Some(&mut callback))
             .context("steady measured generation")?;
+        if run == 1
+            && let (Some(path), Some(logprobs)) =
+                (args.dump_logprobs.as_ref(), result.logprobs.as_ref())
+        {
+            let entries: Vec<_> = logprobs
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "token_id": entry.token_id,
+                        "logprob": entry.logprob,
+                        "top": entry.top,
+                    })
+                })
+                .collect();
+            std::fs::write(path, serde_json::to_vec_pretty(&entries)?)
+                .with_context(|| format!("write logprobs to {}", path.display()))?;
+        }
         if token_times.len() <= args.decode_skip {
             bail!(
                 "generation emitted {} tokens, not enough for --decode-skip {}",
@@ -160,7 +236,10 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         }
         if let Some(reference) = &reference_tokens {
             if reference != &result.token_ids {
-                bail!("native greedy decode was not deterministic across measured runs");
+                bail!(
+                    "{} greedy decode was not deterministic across measured runs",
+                    args.backend.as_str()
+                );
             }
         } else {
             reference_tokens = Some(result.token_ids.clone());
@@ -182,8 +261,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
 
     println!(
-        "steady_median: prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
+        "steady_median: backend={} prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
          (runs={} warmups={} decode_skip={})",
+        args.backend.as_str(),
         median(&mut prefills_ms),
         median(&mut decode_ms_per_token),
         median(&mut throughputs),
@@ -469,6 +549,7 @@ fn main() -> Result<()> {
             args.tokens,
         )?);
     }
+    profile::reset();
 
     let stats_before = session.cuda_kv_debug_stats();
     let mut generated = 0usize;
@@ -529,6 +610,9 @@ fn main() -> Result<()> {
                 .decode(&tokens)
                 .context("decode generated tokens")?
         );
+    }
+    if profile::enabled() {
+        println!("{}", profile::report(generated as u64));
     }
     Ok(())
 }

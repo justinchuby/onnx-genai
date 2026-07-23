@@ -28,6 +28,7 @@ cuda = [
     "onnx-genai-ort/cuda",
     "onnx-genai-ort/cuda-13000",
     "onnx-runtime-session?/cuda",
+    "dep:onnx-runtime-ep-api",
     "dep:onnx-runtime-ep-cuda",
 ]
 # ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
@@ -51,6 +52,7 @@ onnx-genai-scheduler = { workspace = true }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
+onnx-runtime-ep-api = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
