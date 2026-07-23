@@ -41,7 +41,9 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::Node;
 
 use super::check_arity;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{
+    output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
+};
 use crate::kernels::activations::silu_f32_slice;
 
 /// Post-convolution activation. `Swish` with the op's implicit `β = 1` is
@@ -144,13 +146,29 @@ impl Kernel for CausalConvWithStateKernel {
 
         let (primary_output, present_outputs) = outputs.split_at_mut(1);
         let out_len = batch * channels * length;
-        let direct_out = primary_output[0].dtype == onnx_runtime_ir::DataType::Float32
-            && primary_output[0].is_contiguous()
-            && primary_output[0].device.is_host_accessible();
+
+        // In-place-aliasing guard: `y`/`present_state` are written directly into
+        // their executor buffers, but a persistent DeviceIoBinding may bind an
+        // input (`x`/`past_state`) onto one of them. The `y` and `present_state`
+        // loops read `x`/`state` after (and interleaved with) their own writes,
+        // so a direct write into an aliased input would corrupt data still being
+        // read. Take the fast direct path only when the output byte range is
+        // disjoint from every widened input we read; otherwise compute into an
+        // owned buffer and copy out at the end. `weight`/`bias` are read too and
+        // included defensively; a `Cow::Owned` widen never overlaps.
+        let read_ranges: Vec<_> = [Some(&*x), Some(&*weight), bias.as_deref(), state.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(slice_byte_range)
+            .collect();
+
+        let direct_out =
+            output_direct_write_eligible(&mut primary_output[0], out_len, &read_ranges);
         let mut owned_out;
         let out: &mut [f32] = if direct_out {
-            // SAFETY: the executor owns an exclusive contiguous output buffer
-            // whose validated shape contains exactly `out_len` f32 values.
+            // SAFETY: `output_direct_write_eligible` proved the buffer is a
+            // host-accessible contiguous Float32 tensor of exactly `out_len`
+            // elements whose byte range does not alias any input we read.
             unsafe {
                 std::slice::from_raw_parts_mut(primary_output[0].data_ptr_mut::<f32>(), out_len)
             }
@@ -160,16 +178,16 @@ impl Kernel for CausalConvWithStateKernel {
         };
 
         let present_len = batch * channels * pad;
-        let direct_present = present_outputs.first().is_some_and(|present| {
-            present.dtype == onnx_runtime_ir::DataType::Float32
-                && present.is_contiguous()
-                && present.device.is_host_accessible()
+        let direct_present = present_outputs.first_mut().is_some_and(|present| {
+            output_direct_write_eligible(present, present_len, &read_ranges)
         });
         let mut owned_present;
         let mut present = if let Some(output) = present_outputs.first_mut() {
             if direct_present {
-                // SAFETY: same output-buffer contract as `out`, with
-                // `present_len` validated by the shape checks above.
+                // SAFETY: `output_direct_write_eligible` proved this buffer is a
+                // host-accessible contiguous Float32 tensor of exactly
+                // `present_len` elements whose byte range does not alias any
+                // input we read.
                 Some(unsafe {
                     std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), present_len)
                 })
@@ -425,6 +443,90 @@ mod tests {
         let want = bits(&g::CONVC_Y);
         for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
             assert!((a - b).abs() <= 2e-2, "f16 y[{i}]: got {a}, want {b}");
+        }
+    }
+
+    /// Persistent DeviceIoBindings may bind an input buffer onto an output
+    /// buffer, so the direct-write decode path must stay correct when `y`
+    /// aliases `x` or `present_state` aliases `past_state`. Both aliased runs
+    /// must reproduce the disjoint-binding result exactly (the owned-buffer
+    /// fallback fires on the detected overlap).
+    #[test]
+    fn aliased_bindings_match_disjoint_result() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
+
+        // K=3 (pad=2), C=2, S=1 decode step with non-zero incoming state.
+        let (batch, c, k, s) = (1usize, 2usize, 3usize, 1usize);
+        let pad = k - 1;
+        let x_vals = [0.5f32, -1.5];
+        let w_vals = [0.1f32, 0.2, 0.3, -0.4, 0.5, -0.6];
+        let b_vals = [0.05f32, -0.05];
+        let st_vals = [1.0f32, 2.0, -3.0, 4.0];
+
+        let owned_x = || Owned::f32(&[batch, c, s], &x_vals);
+        let owned_w = || Owned::f32(&[c, 1, k], &w_vals);
+        let owned_bias = || Owned::f32(&[c], &b_vals);
+        let owned_state = || Owned::f32(&[batch, c, pad], &st_vals);
+
+        // Disjoint reference.
+        let (y_ref, present_ref) = {
+            let (x, w, bias, state) = (owned_x(), owned_w(), owned_bias(), owned_state());
+            let mut y = Owned::zeros_f32(&[batch, c, s]);
+            let mut present = Owned::zeros_f32(&[batch, c, pad]);
+            kernel(true)
+                .execute(
+                    &[x.view(), w.view(), bias.view(), state.view()],
+                    &mut [y.view_mut(), present.view_mut()],
+                )
+                .unwrap();
+            (y.to_f32(), present.to_f32())
+        };
+
+        let f32c = DataType::Float32;
+        let cpu = DeviceId::cpu();
+
+        // Alias 1: present_state output shares past_state input's buffer.
+        {
+            let mut shared_state = st_vals.to_vec();
+            let state_ptr = shared_state.as_ptr() as *const std::ffi::c_void;
+            let present_ptr = shared_state.as_mut_ptr() as *mut std::ffi::c_void;
+            let sshape = [batch, c, pad];
+            let sstrides = compute_contiguous_strides(&sshape);
+            let (x, w, bias) = (owned_x(), owned_w(), owned_bias());
+            let mut y = Owned::zeros_f32(&[batch, c, s]);
+            let state_view = TensorView::new(DevicePtr(state_ptr), f32c, &sshape, &sstrides, cpu);
+            let present_mut =
+                TensorMut::new(DevicePtrMut(present_ptr), f32c, &sshape, &sstrides, cpu);
+            kernel(true)
+                .execute(
+                    &[x.view(), w.view(), bias.view(), state_view],
+                    &mut [y.view_mut(), present_mut],
+                )
+                .unwrap();
+            assert_close(&y.to_f32(), &y_ref, "present-aliases-state y");
+            assert_close(&shared_state, &present_ref, "present-aliases-state present");
+        }
+
+        // Alias 2: y output shares x input's buffer (same [B,C,1] shape).
+        {
+            let mut shared_x = x_vals.to_vec();
+            let x_ptr = shared_x.as_ptr() as *const std::ffi::c_void;
+            let y_ptr = shared_x.as_mut_ptr() as *mut std::ffi::c_void;
+            let xshape = [batch, c, s];
+            let xstrides = compute_contiguous_strides(&xshape);
+            let (w, bias, state) = (owned_w(), owned_bias(), owned_state());
+            let mut present = Owned::zeros_f32(&[batch, c, pad]);
+            let x_view = TensorView::new(DevicePtr(x_ptr), f32c, &xshape, &xstrides, cpu);
+            let y_mut = TensorMut::new(DevicePtrMut(y_ptr), f32c, &xshape, &xstrides, cpu);
+            kernel(true)
+                .execute(
+                    &[x_view, w.view(), bias.view(), state.view()],
+                    &mut [y_mut, present.view_mut()],
+                )
+                .unwrap();
+            assert_close(&shared_x, &y_ref, "y-aliases-x y");
+            assert_close(&present.to_f32(), &present_ref, "y-aliases-x present");
         }
     }
 }
