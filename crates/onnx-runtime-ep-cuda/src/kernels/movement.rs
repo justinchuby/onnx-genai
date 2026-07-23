@@ -267,8 +267,15 @@ fn copy_reshape(
     }
     let bytes = input.dtype.storage_bytes(input.numel());
     if bytes != 0 {
+        // Stream-ordered device copy on the EP's compute stream: the producer
+        // that wrote `input` and every downstream consumer of `output` are
+        // enqueued on the same stream, so the copy is implicitly ordered with
+        // both without a host-blocking `synchronize()`. This keeps Reshape/
+        // Squeeze off the default-stream `cuMemcpyDtoD` sync path (which drains
+        // the stream on every call and is illegal during CUDA-graph capture),
+        // while preserving the same-stream ordering that guarantees correctness.
         unsafe {
-            runtime.dtod(
+            runtime.dtod_async(
                 cuptr(input.data_ptr::<u8>() as *const c_void),
                 cuptr(output.data_ptr_mut::<u8>() as *const c_void),
                 bytes,

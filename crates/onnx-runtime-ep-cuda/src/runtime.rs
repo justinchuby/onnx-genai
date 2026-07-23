@@ -962,4 +962,69 @@ extern "C" __global__ void slow_fill(float* out, unsigned long long n, long long
         unsafe { runtime.free_raw(src) }.unwrap();
         unsafe { runtime.free_raw(dst) }.unwrap();
     }
+
+    // Companion to the sync-`dtod` guard: a stream-ordered `dtod_async` issued on
+    // the EP compute stream (as `copy_reshape` uses for Reshape/Squeeze) must be
+    // implicitly ordered after a producer kernel on the same stream, WITHOUT any
+    // host synchronize. A later `dtoh` (which drains the stream) must then read
+    // the fully-produced sentinel, never the pre-launch poison.
+    #[test]
+    fn dtod_async_is_ordered_after_same_stream_producer() {
+        const MODULE: &str = "runtime_dtod_async_order_test";
+        const SOURCE: &str = r#"
+extern "C" __global__ void slow_fill(float* out, unsigned long long n, long long spin) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+    out[i] = 1.0f + (float)(i % 7);
+}
+"#;
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping dtod_async ordering test: CUDA runtime unavailable");
+            return;
+        };
+        let function = runtime.nvrtc_function(MODULE, SOURCE, "slow_fill").unwrap();
+        let n = 4096usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let src = runtime.alloc_raw(bytes).unwrap();
+        let dst = runtime.alloc_raw(bytes).unwrap();
+        let poison = vec![-999.0f32; n];
+        let poison_bytes =
+            unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
+
+        for _ in 0..8 {
+            unsafe { runtime.htod(poison_bytes, src) }.unwrap();
+            runtime.synchronize().unwrap();
+
+            let spin: i64 = 8_000_000;
+            let mut builder = runtime.stream().launch_builder(&function);
+            let n_u64 = n as u64;
+            builder.arg(&src).arg(&n_u64).arg(&spin);
+            unsafe {
+                builder
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap();
+            }
+            // Stream-ordered copy: no explicit synchronize, ordering is by stream.
+            unsafe { runtime.dtod_async(src, dst, bytes) }.unwrap();
+
+            let mut out = vec![0.0f32; n];
+            let out_bytes =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(out_bytes, dst) }.unwrap();
+
+            for (i, value) in out.iter().enumerate() {
+                let expected = 1.0f32 + (i % 7) as f32;
+                assert_eq!(
+                    *value, expected,
+                    "dtod_async observed poison at index {i}: got {value}, expected {expected} \
+                     (same-stream ordering violated)"
+                );
+            }
+        }
+
+        unsafe { runtime.free_raw(src) }.unwrap();
+        unsafe { runtime.free_raw(dst) }.unwrap();
+    }
 }
