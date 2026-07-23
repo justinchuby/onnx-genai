@@ -3992,6 +3992,104 @@ mod tests {
         mlas_close(&result, &expected, 2e-3, "slow-dequant m1 CompFp32");
     }
 
+    /// CompInt8 activation rounding can reverse a close greedy argmax even when
+    /// the dequantized-f32 winner is stable. This regression fixture preserves
+    /// that failure mode and proves the CompFp32 route tracks the f32 oracle,
+    /// providing a CI target for a future accuracy-level-4 decode fix.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_compint8_argmax_reversal_is_caught_by_fp32_oracle() {
+        let (n, k, block_size) = (2usize, 64usize, 32usize);
+        let k_blocks = k.div_ceil(block_size);
+        let mut case = None;
+        for seed in 1..=100 {
+            let weights = pseudo(n * k, seed as f32 * 0.013);
+            let activations = pseudo(k, seed as f32 * 0.029 + 0.7);
+            let (packed, scales, _zps, dequantized) =
+                quantize(&weights, n, k, block_size, false);
+            let mut expected = reference(&activations, &dequantized, 1, k, n);
+            let packed_weight = PackedInt4Weight {
+                values: packed.clone(),
+                scales: scales.clone(),
+            };
+            let mut comp_int8 = vec![0.0; n];
+            int4_matmul_m1(
+                &activations,
+                &packed_weight,
+                &mut comp_int8,
+                k,
+                n,
+                DotKernel::Scalar,
+            );
+            let error_delta =
+                (comp_int8[1] - comp_int8[0]) - (expected[1] - expected[0]);
+            if error_delta.abs() <= 1e-4 {
+                continue;
+            }
+            let target_margin = -error_delta * 0.5;
+            let bias = [0.0, expected[0] - expected[1] + target_margin];
+            expected[1] += bias[1];
+            comp_int8[1] += bias[1];
+            let expected_winner = usize::from(expected[1] > expected[0]);
+            if expected_winner != usize::from(comp_int8[1] > comp_int8[0]) {
+                case = Some((
+                    packed,
+                    scales,
+                    activations,
+                    bias,
+                    expected,
+                    expected_winner,
+                ));
+                break;
+            }
+        }
+        let (packed, scales, activations, bias, expected, expected_winner) =
+            case.expect("deterministic search must find a CompInt8 argmax reversal");
+
+        if mlas_sys::SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            mlas_sys::SQNBitComputeType::Fp32,
+            &packed,
+            &scales,
+            None,
+        )
+        .is_none()
+        {
+            eprintln!("MLAS SQNBit int4 CompFp32 unavailable; skipping argmax-oracle test");
+            return;
+        }
+
+        let kernel = test_kernel(k, n, block_size);
+        let b = Owned::u8(&[n, k_blocks, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, k_blocks], &scales);
+        let mut comp_fp32 = vec![0.0; n];
+        assert_eq!(
+            kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    None,
+                    None,
+                    false,
+                    &activations,
+                    1,
+                    Some(&bias),
+                    &mut comp_fp32,
+                )
+                .unwrap(),
+            Some(()),
+        );
+        mlas_close(&comp_fp32, &expected, 2e-3, "CompFp32 near-tie oracle");
+        assert_eq!(
+            usize::from(comp_fp32[1] > comp_fp32[0]),
+            expected_winner,
+            "CompFp32 must preserve the dequantized-f32 argmax",
+        );
+    }
+
     /// Regression for the `accuracy_level = 0` slow-path bug: MLAS SQNBit is a
     /// specialized quantized kernel independent of the dense-f32 [`CpuBackend`]
     /// microkernel, so an `accuracy_level != 4` MatMulNBits must route to MLAS
