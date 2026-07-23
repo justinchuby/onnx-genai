@@ -1,120 +1,146 @@
-### 2026-07-23: Block-32 real DeepSeek-V2-Lite remains semantically broken on native CUDA
+### 2026-07-23: Clean-main real DeepSeek-V2-Lite semantic validation fails for block-128 and block-32
 **By:** Marsten
-**What:** ❌ The block-32 real-weight artifact runs 64 tokens at 23.23 tok/s
-with zero CPU EP placement fallbacks, but native output is multilingual garbage
-with repetition collapse and diverges from HF at token 1. CUDA graph capture also
-falls back at the first MLA `Attention` because its capacity-backed output fails
-the kernel's contiguous/dtype/expected-size check.
-**Why:** Block-32 removes the earlier `MatMulNBits` hard failure but does not
-establish semantic correctness. ORT CUDA on the identical ONNX produces the
-HF-matching first eight tokens, proving the artifact and prompt are viable.
+**What:** ❌ Both real int4 exports run entirely on native CUDA from clean
+`origin/main` `569507c`, but neither is semantically coherent for the exact
+prompt `The capital of France is`. Block-128 produces multilingual garbage at
+25.58 tok/s; block-32 immediately collapses to repeated `3` tokens at
+26.01 tok/s. Both diverge from HF at token 1.
+**Why:** This supersedes Marsten's earlier stale-checkout reports. The clean-main
+binary proves block-128 execution support and zero EP fallbacks, but not semantic
+fidelity. Isolated real-input checks clear QMoE packing/execution and MLA
+Attention; the first demonstrated native-vs-ORT numerical divergence is the
+layer-0 fp16 `MatMulNBits` q-projection, whose small prefill error is amplified
+through MoE routing across 27 layers.
 
-## Prompt
+## Authoritative environment
 
-Rendered DeepSeek chat template:
-
-```text
-<｜begin▁of▁sentence｜>User: Answer in one concise sentence: What is the capital of France and what landmark is it famous for?
-
-Assistant:
-```
-
-Both native and HF use prompt IDs:
-
-```text
-[100000, 5726, 25, 35829, 279, 634, 46019, 4976, 25, 2461, 317,
- 254, 6077, 280, 7239, 285, 856, 44872, 317, 359, 9679, 327, 30,
- 185, 185, 77398, 25]
-```
-
-## Native CUDA result
-
-- Artifact:
-  `/home/justinchu/ds-e2e-artifacts/deepseek-v2-lite-real-int4-blk32/`
+- Binary:
+  `/home/justinchu/wt-ds-semantic/target/release/profile_native`
+- Source worktree: `/home/justinchu/wt-ds-semantic`
+- Revision: clean `origin/main` at `569507c`
 - GPU: physical GPU 0, idle NVIDIA H200
 - Strict placement: `ONNX_GENAI_REQUIRE_CUDA=1`
-- Generated: 64/64 valid vocabulary token IDs; no NaN/inf error surfaced
-- Throughput: **23.23 tok/s**, 43.053 ms/token
-- CPU EP placement fallbacks: **0**
-- CUDA graph fallbacks: **2 cumulative, 1 measured**
-- Semantic divergence: **token 1**
-
-Actual native decoded text:
+- Prompt: `The capital of France is`
+- Prompt IDs: `[549, 6077, 280, 7239, 317]`
+- Greedy, 48 new tokens, one warmup, one measured run
+- HF bf16 reference:
 
 ```text
- interns找工作 fibre间接 tanMNR Hiram contrast centred Hiram直观以外» centred直观 centred Hiram直观 hashtag hashtag hashtagonar hashtag tan hashtag hashtagonar hashtag hashtag hashtag hashtag hashtag Tweet hashtag hashtag Tweet Tweet TweetExpectedExpectedExpected tan tan tan tan tan MST hashtag MST MSTmosphere replic MSTITES MST MSTExpected博客博客 iPod Responsible souvenir sloganiero
+ Paris. The most famous landmark in Paris is the Eiffel Tower.
 ```
 
-This is not coherent language output and collapses into repeated `hashtag`,
-`Tweet`, `Expected`, `tan`, and `MST` tokens.
+## A. Real block-128 export
 
-## HF bf16 reference
+Artifact:
+`/home/justinchu/ds-e2e-artifacts/deepseek-v2-lite-real-int4/`
 
-Actual reference text:
+- Verdict: ❌ **broken**
+- Throughput: **25.58 tok/s**, 39.088 ms/token
+- Generated: 48/48 valid vocabulary IDs
+- Finite: all top-20 token-0 log-probabilities finite; no NaN/inf surfaced
+- CPU EP fallbacks: **0** (strict CUDA placement accepted)
+- CUDA graph: `enabled=false`, captures 0, replays 0, fallbacks **0**
+- MLA capture status: not attempted because graph capture is disabled; importantly,
+  the stale-checkout MLA capture fallback is absent
+- First HF divergence: token **1**
+
+Actual decoded text:
 
 ```text
- The capital of France is Paris. The most famous landmark in Paris is the Eiffel Tower.
+ Grants. Links Choir SAC Candle CSP CSP Kir Kirpt充满 ... Kir三位季充满正是日本优生活是指从优cons我们充满充满地充满充满从这些充满建议华式悠生活从充满生活。充满严到今天支配
 ```
 
-## Early token comparison
+Early comparison:
 
-| # | Native ID / text | HF bf16 ID / text |
+| # | Block-128 native | HF bf16 |
 |---:|---|---|
-| 1 | `60936` / `" interns"` | `429` / `" The"` |
-| 2 | `96847` / `"找工作"` | `6077` / `" capital"` |
-| 3 | `38130` / `" fibre"` | `280` / `" of"` |
-| 4 | `60461` / `"间接"` | `7239` / `" France"` |
-| 5 | `12749` / `" tan"` | `317` / `" is"` |
-| 6 | `43781` / `"MNR"` | `8913` / `" Paris"` |
-| 7 | `90390` / `" Hiram"` | `13` / `"."` |
-| 8 | `8659` / `" contrast"` | `429` / `" The"` |
-| 9 | `62083` / `" centred"` | `1094` / `" most"` |
-| 10 | `90390` / `" Hiram"` | `9679` / `" famous"` |
-| 11 | `80333` / `"直观"` | `44872` / `" landmark"` |
-| 12 | `35448` / `"以外"` | `279` / `" in"` |
-| 13 | `5608` / `"»"` | `8913` / `" Paris"` |
-| 14 | `62083` / `" centred"` | `317` / `" is"` |
-| 15 | `80333` / `"直观"` | `254` / `" the"` |
+| 1 | `67545` / `" Grants"` | `8913` / `" Paris"` |
+| 2 | `13` / `"."` | `13` / `"."` |
+| 3 | `32556` / `" Links"` | `429` / `" The"` |
+| 4 | `73915` / `" Choir"` | `1094` / `" most"` |
+| 5 | `85499` / `" SAC"` | `9679` / `" famous"` |
+| 6 | `82234` / `" Candle"` | `44872` / `" landmark"` |
+| 7 | `95910` / `" CSP"` | `279` / `" in"` |
+| 8 | `95910` / `" CSP"` | `8913` / `" Paris"` |
+| 9 | `27421` / `" Kir"` | `317` / `" is"` |
+| 10 | `27421` / `" Kir"` | `254` / `" the"` |
+| 11 | `462` / `"pt"` | `427` / `" E"` |
+| 12 | `17057` / `"充满"` | `96575` / `"iffel"` |
 
-No early top-1 agreement exists.
+## B. Block-32 cross-check
 
-## Root-cause evidence
+Artifact:
+`/home/justinchu/ds-e2e-artifacts/deepseek-v2-lite-real-int4-blk32/`
 
-1. **CUDA graph fallback is precisely MLA `Attention` node 38.**
-   `model/layers.0/self_attn/Attention_node_40` has Q/K head width 192 and V
-   width 128. Capture rejects its output with:
+- Verdict: ❌ **broken**
+- Throughput: **26.01 tok/s**, 38.444 ms/token
+- Generated: 48/48 valid vocabulary IDs
+- Finite: all top-20 token-0 log-probabilities finite; no NaN/inf surfaced
+- CPU EP fallbacks: **0** (strict CUDA placement accepted)
+- CUDA graph: `enabled=false`, captures 0, replays 0, fallbacks **0**
+- MLA capture status: not attempted; no capture fallback
+- First HF divergence: token **1**
 
-   ```text
-   Attention: output must be contiguous and use the input dtype with the expected shape
-   ```
+Actual decoded text:
 
-   Graph-disabled native execution has zero graph fallbacks but remains broken,
-   so this capture defect is real but is not the sole semantic cause.
+```text
+ to成3333333333333333333333333333333333333333333333
+```
 
-2. **The ONNX artifact itself produces faithful quantized output under ORT.**
-   ORT CUDA on the same model/prompt starts:
+Early comparison:
 
-   ```text
-   [429, 6077, 280, 7239, 317, 8913, 13, 429, 427, 96575, 25943, ...]
-    The capital of France is Paris. The Eiffel Tower ...
-   ```
+| # | Block-32 native | HF bf16 |
+|---:|---|---|
+| 1 | `276` / `" to"` | `8913` / `" Paris"` |
+| 2 | `1114` / `"成"` | `13` / `"."` |
+| 3 | `18` / `"3"` | `429` / `" The"` |
+| 4 | `18` / `"3"` | `1094` / `" most"` |
+| 5 | `18` / `"3"` | `9679` / `" famous"` |
+| 6 | `18` / `"3"` | `44872` / `" landmark"` |
+| 7 | `18` / `"3"` | `279` / `" in"` |
+| 8 | `18` / `"3"` | `8913` / `" Paris"` |
+| 9 | `18` / `"3"` | `317` / `" is"` |
+| 10 | `18` / `"3"` | `254` / `" the"` |
+| 11 | `18` / `"3"` | `427` / `" E"` |
+| 12 | `18` / `"3"` | `96575` / `"iffel"` |
 
-   It matches HF exactly for tokens 1-8 before reasonable int4 divergence.
+## Root-cause isolation
 
-3. **QMoE export packing is not the demonstrated fault.** Manual dequantization
-   of layer-1 expert 0 against the bf16 checkpoint gives cosine similarity
-   0.99670 for interleaved gate/up FC1 and 0.99674 for FC2. Forcing native QMoE
-   prefill away from grouped GEMM and onto GEMV still begins with the wrong
-   newline token, so the failure is not limited to grouped-prefill packing.
+The following probes used the block-32 model, exact real prefill tensors produced
+by ORT for the same prompt, and clean-main native CUDA:
 
-The remaining semantic fault is therefore inside native CUDA execution, after
-placement and before logits. Current evidence narrows dispatch to the native
-fp16 MLA `Attention` path or the general QMoE execution path; it does not justify
-claiming one without an intermediate-tensor oracle. The proven, separately
-actionable defect is the MLA `Attention` capture output binding above.
+1. **MLA Attention is not the semantic fault.** Isolated layer-0 standard
+   `Attention` with Q/K width 192 and V width 128 matches ORT:
+   output MAE `3.09e-6`, maximum error `2.44e-4`, cosine `1.0000001`;
+   present K and V are bit-exact. All values are finite.
 
-## Verdict
+2. **QMoE packing/kernel is not the semantic fault on exact inputs.** Isolated
+   layer-1 64-expert/top-6 QMoE matches ORT:
+   MAE `1.45e-8`, maximum error `1.49e-7`, cosine `1.0000001`.
+   Separately, checkpoint dequantization gave cosine `0.99670` for interleaved
+   gate/up FC1 and `0.99674` for FC2, confirming exporter packing.
 
-❌ **Broken.** Zero CPU EP fallbacks and finite token IDs are insufficient:
-native diverges at token 1 and emits systematic garbage/repetition, while ORT on
-the same quantized graph is semantically faithful.
+3. **The first demonstrated divergence is fp16 `MatMulNBits` prefill.**
+   Isolated layer-0 `q_proj` on the exact ORT RMSNorm input differs from ORT:
+
+   | Export | MAE | RMSE | Max error | Finite |
+   |---|---:|---:|---:|---|
+   | block-128 | `2.79e-4` | `5.78e-4` | `0.015625` | yes |
+   | block-32 | `2.52e-4` | `5.37e-4` | `0.015625` | yes |
+
+   The individual projection remains high-cosine, but DeepSeek's 26 routed
+   layers make router top-k decisions discontinuous; repeated fp16 projection
+   drift can change expert selection and cascade into completely different
+   logits. Replacing either every QMoE output or every Attention output with
+   ORT intermediates restores token 1 to `8913` (`" Paris"`), consistent with
+   accumulated upstream projection drift rather than a QMoE packing or MLA
+   latent-cache implementation error.
+
+## Final verdict
+
+❌ **Shipping-code semantic milestone does not pass for this prompt.**
+Block-128 support itself is proven operational, both exports have zero EP and
+graph fallbacks, and all inspected values are finite. However, both outputs are
+systematic garbage from token 1. Dispatch the numerical investigation to the
+native fp16 `MatMulNBits` prefill/reduction owner, with MoE router top-k
+sensitivity as the amplification mechanism; do not dispatch QMoE packing or MLA.
