@@ -2430,7 +2430,7 @@ mod tests {
             let error = validate_sequence_lengths_shape(&shape, 3, 3)
                 .expect_err("noncanonical seqlens_k shape must fail");
             let message = format!("{error}");
-            assert!(message.contains("[batch_size] or [batch_size, 1]"));
+            assert!(message.contains("[batch_size], [batch_size, 1]"));
             assert!(message.contains(&format!("got shape {shape:?}")));
         }
     }
