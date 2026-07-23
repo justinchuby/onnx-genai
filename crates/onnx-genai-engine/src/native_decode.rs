@@ -759,7 +759,7 @@ impl NativeDecodeSession {
                 "native target decoder requires metadata kv_ownership 'owned'; got '{kv_ownership:?}'. Shared KV is valid for proposer graphs that reference this target's cache"
             );
         }
-        let (kv_inputs, present_outputs) = match io {
+        let (mut kv_inputs, mut present_outputs) = match io {
             Some(io) => match (&io.kv_inputs, &io.kv_outputs) {
                 (Some(inputs), Some(outputs)) => (inputs.clone(), outputs.clone()),
                 (None, None) => (Vec::new(), Vec::new()),
@@ -780,6 +780,29 @@ impl NativeDecodeSession {
                     .collect(),
             ),
         };
+
+        // Fixed loop-carried recurrent states (hybrid linear-attention
+        // `conv_state` / `recurrent_state`) are declared through `io.state_pairs`
+        // rather than the growable `kv_inputs`/`kv_outputs` lists. The native
+        // decode loop binds any past→present pair the same way — it seeds each
+        // past input (recurrent states are seeded at their full static extent by
+        // `make_empty_input_tensor`) and copies the present output back each step
+        // (`replace` semantics fall out naturally from the wholesale tensor swap).
+        // So fold the declared state pairs into the same positionally-paired
+        // lists. This is what lets hybrid SSM/attention decoders (qwen3.5) decode:
+        // their linear-attention layers carry state only through these pairs.
+        // Appending to both lists in the same order keeps the positional zip below
+        // correct; `present_to_past` also records each pair explicitly, so the
+        // recurrent tail never depends on the zip.
+        let mut state_pairs: Vec<(String, String)> = Vec::new();
+        if let Some(pairs) = io.and_then(|io| io.state_pairs.as_ref()) {
+            for pair in pairs {
+                kv_inputs.push(pair.input.clone());
+                present_outputs.push(pair.output.clone());
+                state_pairs.push((pair.output.clone(), pair.input.clone()));
+            }
+        }
+
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
                 "native decode requires decoder-with-past I/O; past inputs: {:?}, present outputs: {:?}",
@@ -790,12 +813,16 @@ impl NativeDecodeSession {
 
         let mut present_to_past = HashMap::new();
         if io.is_some() {
+            // KV pairs pair positionally; state pairs carry explicit names.
+            let kv_pair_count = kv_inputs.len() - state_pairs.len();
             present_to_past.extend(
                 present_outputs
                     .iter()
+                    .take(kv_pair_count)
                     .cloned()
-                    .zip(kv_inputs.iter().cloned()),
+                    .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
             );
+            present_to_past.extend(state_pairs.iter().cloned());
         } else {
             for output in &present_outputs {
                 let Some(input) = matching_past_name(output, &kv_inputs) else {
