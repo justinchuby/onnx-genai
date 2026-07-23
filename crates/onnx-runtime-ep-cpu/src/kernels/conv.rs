@@ -82,9 +82,14 @@ enum ConvImpl {
 
 pub struct ConvKernel {
     imp: ConvImpl,
-    expected_input_shape: Vec<usize>,
     expected_weight_shape: Vec<usize>,
     expected_output_shape: Vec<usize>,
+    /// Run-time tensor shapes validated in [`Kernel::execute`]. These match the
+    /// tensors the graph actually passes: rank-3 for a lifted 1-D `Conv`,
+    /// otherwise identical to the rank-4 `expected_*` shapes above.
+    runtime_input_shape: Vec<usize>,
+    runtime_weight_shape: Vec<usize>,
+    runtime_output_shape: Vec<usize>,
     output_channels: usize,
     /// Fused activation applied in the convolution epilogue. Set by the
     /// `CpuConvBatchNormActivationFusion` graph pass via the `activation`
@@ -220,6 +225,98 @@ fn to_i64(values: impl IntoIterator<Item = usize>, what: &str) -> Result<Vec<i64
         .collect()
 }
 
+/// Read a single-spatial-dimension (`len == 1`) positive `Conv` attribute for a
+/// rank-3 (1-D) convolution, falling back to `default` when the attribute is
+/// absent.
+fn rank3_positive_attribute(node: &Node, name: &str, default: i64) -> Result<i64> {
+    match node.attr(name).and_then(Attribute::as_ints) {
+        None => Ok(default),
+        Some(values) if values.len() == 1 && values[0] > 0 => Ok(values[0]),
+        Some(values) => Err(EpError::KernelFailed(format!(
+            "Conv: {name} must contain one positive value for a 1-D convolution, got {values:?}"
+        ))),
+    }
+}
+
+/// Read the `pads` attribute (`[begin, end]`) for a rank-3 (1-D) convolution,
+/// defaulting to no padding when the attribute is absent.
+fn rank3_pads(node: &Node) -> Result<[i64; 2]> {
+    match node.attr("pads").and_then(Attribute::as_ints) {
+        None => Ok([0, 0]),
+        Some(values) if values.len() == 2 && values.iter().all(|&value| value >= 0) => {
+            Ok([values[0], values[1]])
+        }
+        Some(values) => Err(EpError::KernelFailed(format!(
+            "Conv: pads must contain two non-negative values for a 1-D convolution, got {values:?}"
+        ))),
+    }
+}
+
+/// Adaptation of a rank-3 (1-D) `Conv` to the rank-4 (2-D NCHW) MLAS path.
+///
+/// A 1-D convolution is a 2-D convolution with a singleton height axis: the
+/// input `X[N, C, L]` is lifted to `[N, C, 1, L]`, the filter `W[M, C/group, k]`
+/// to `[M, C/group, 1, k]`, and every 1-D spatial attribute
+/// (`strides`/`dilations`/`kernel_shape`/`pads`) is prepended with the
+/// height-axis identity (stride 1, dilation 1, kernel 1, zero padding). The 2-D
+/// convolution is numerically identical, so this reuses the fast rank-4 path
+/// verbatim and reports the output back as the rank-3 shape the graph expects.
+struct Conv1dAdaptation {
+    /// Node clone whose spatial attributes have been lifted to rank-4.
+    node: Node,
+    /// Lifted input shape `[N, C, 1, L]`.
+    lifted_x_shape: Vec<usize>,
+    /// Lifted filter shape `[M, C/group, 1, k]`.
+    lifted_w_shape: Vec<usize>,
+    /// Original rank-3 input shape `[N, C, L]`, validated at run time.
+    original_x_shape: Vec<usize>,
+    /// Original rank-3 filter shape `[M, C/group, k]`, validated at run time.
+    original_w_shape: Vec<usize>,
+}
+
+impl Conv1dAdaptation {
+    /// Detect a rank-3 `Conv` and build the rank-4 lifting, or return `None`
+    /// when the operands are not both rank-3 (leaving the rank-4 path to handle
+    /// or reject them).
+    fn detect(node: &Node, x_shape: &[usize], w_shape: &[usize]) -> Result<Option<Self>> {
+        if x_shape.len() != 3 || w_shape.len() != 3 {
+            return Ok(None);
+        }
+        let kernel = rank3_positive_attribute(node, "kernel_shape", w_shape[2] as i64)?;
+        if kernel as usize != w_shape[2] {
+            return Err(EpError::KernelFailed(format!(
+                "Conv: kernel_shape must match W spatial shape [{}], got [{kernel}]",
+                w_shape[2]
+            )));
+        }
+        let stride = rank3_positive_attribute(node, "strides", 1)?;
+        let dilation = rank3_positive_attribute(node, "dilations", 1)?;
+        let pads = rank3_pads(node)?;
+
+        let mut lifted = node.clone();
+        lifted
+            .attributes
+            .insert("kernel_shape".into(), Attribute::Ints(vec![1, kernel]));
+        lifted
+            .attributes
+            .insert("strides".into(), Attribute::Ints(vec![1, stride]));
+        lifted
+            .attributes
+            .insert("dilations".into(), Attribute::Ints(vec![1, dilation]));
+        lifted
+            .attributes
+            .insert("pads".into(), Attribute::Ints(vec![0, pads[0], 0, pads[1]]));
+
+        Ok(Some(Self {
+            node: lifted,
+            lifted_x_shape: vec![x_shape[0], x_shape[1], 1, x_shape[2]],
+            lifted_w_shape: vec![w_shape[0], w_shape[1], 1, w_shape[2]],
+            original_x_shape: x_shape.to_vec(),
+            original_w_shape: w_shape.to_vec(),
+        }))
+    }
+}
+
 impl KernelFactory for ConvFactory {
     fn create(&self, node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let x_shape = shapes
@@ -228,9 +325,20 @@ impl KernelFactory for ConvFactory {
         let w_shape = shapes
             .get(1)
             .ok_or_else(|| EpError::KernelFailed("Conv: missing W shape".into()))?;
+
+        // Rank-3 (1-D) `Conv` adaptation shim: lift `X`/`W` and the spatial
+        // attributes to rank-4 so the general 2-D NCHW path below runs verbatim.
+        // The original rank-3 shapes are preserved for run-time validation and
+        // the output is reported back as rank-3. This is deliberately localized
+        // so the rank-4 path stays untouched.
+        let adaptation = Conv1dAdaptation::detect(node, x_shape, w_shape)?;
+        let node = adaptation.as_ref().map_or(node, |a| &a.node);
+        let x_shape = adaptation.as_ref().map_or(x_shape, |a| &a.lifted_x_shape);
+        let w_shape = adaptation.as_ref().map_or(w_shape, |a| &a.lifted_w_shape);
+
         if x_shape.len() != 4 || w_shape.len() != 4 {
             return Err(EpError::KernelFailed(format!(
-                "Conv: MLAS kernel currently supports 2-D NCHW tensors; got X={x_shape:?}, W={w_shape:?}"
+                "Conv: MLAS kernel currently supports 2-D NCHW or 1-D NCL tensors; got X={x_shape:?}, W={w_shape:?}"
             )));
         }
 
@@ -301,11 +409,31 @@ impl KernelFactory for ConvFactory {
             activation,
         )?;
 
+        // Run-time tensor shapes the executor passes in. For a lifted rank-3
+        // (1-D) `Conv` these stay rank-3 (`[N, C, L]` / `[M, C/group, k]` /
+        // `[N, M, L_out]`); otherwise they equal the rank-4 shapes above.
+        let (runtime_input_shape, runtime_weight_shape, runtime_output_shape) =
+            if let Some(adaptation) = &adaptation {
+                (
+                    adaptation.original_x_shape.clone(),
+                    adaptation.original_w_shape.clone(),
+                    vec![x_shape[0], output_channels, output_spatial[1]],
+                )
+            } else {
+                (
+                    x_shape.clone(),
+                    w_shape.clone(),
+                    expected_output_shape.clone(),
+                )
+            };
+
         Ok(Box::new(ConvKernel {
             imp,
-            expected_input_shape: x_shape.clone(),
             expected_weight_shape: w_shape.clone(),
             expected_output_shape,
+            runtime_input_shape,
+            runtime_weight_shape,
+            runtime_output_shape,
             output_channels,
             activation,
         }))
@@ -619,18 +747,18 @@ impl Kernel for ConvKernel {
                 "Conv: MLAS kernel requires Float32 X, W, optional B, and Y".into(),
             ));
         }
-        if inputs[0].shape != self.expected_input_shape
-            || inputs[1].shape != self.expected_weight_shape
-            || outputs[0].shape != self.expected_output_shape
+        if inputs[0].shape != self.runtime_input_shape
+            || inputs[1].shape != self.runtime_weight_shape
+            || outputs[0].shape != self.runtime_output_shape
         {
             return Err(EpError::KernelFailed(format!(
                 "Conv: runtime shapes X={:?}, W={:?}, Y={:?}; expected X={:?}, W={:?}, Y={:?}",
                 inputs[0].shape,
                 inputs[1].shape,
                 outputs[0].shape,
-                self.expected_input_shape,
-                self.expected_weight_shape,
-                self.expected_output_shape
+                self.runtime_input_shape,
+                self.runtime_weight_shape,
+                self.runtime_output_shape
             )));
         }
         if let Some(bias) = inputs.get(2)
@@ -794,8 +922,118 @@ mod tests {
         );
         assert_eq!(
             depthwise,
-            vec![1., 2., 3., 4., 3., 5., 7., 9., 32., 62., 92., 122., 43., 83., 123., 163.]
+            vec![
+                1., 2., 3., 4., 3., 5., 7., 9., 32., 62., 92., 122., 43., 83., 123., 163.
+            ]
         );
+    }
+
+    /// Assert two float slices match within an absolute tolerance suited to f32
+    /// convolution accumulation.
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - e).abs() <= 1e-5 * e.abs().max(1.0),
+                "mismatch at {index}: actual {a}, expected {e}"
+            );
+        }
+    }
+
+    // Oracle values below were generated with onnxruntime's CPU provider
+    // (`ai.onnx::Conv`, opset 18) — see the crate's 1-D Conv regression fixtures.
+
+    #[test]
+    fn conv_rank3_1d_stride_and_padding() {
+        // X=[1,2,8], W=[3,2,3], stride 2, pad 1, with bias. Mirrors the shape of
+        // a Whisper-style 1-D audio-encoder Conv (kernel 3, stride/padding).
+        let x: Vec<f32> = (1..=16).map(|value| value as f32).collect();
+        let w: Vec<f32> = (1..=18).map(|value| value as f32 * 0.1).collect();
+        let output = run_conv(
+            &[1, 2, 8],
+            &x,
+            &[3, 2, 3],
+            &w,
+            Some(&[0.5, -0.5, 1.0]),
+            &[1, 3, 4],
+            &[
+                ("strides", Attribute::Ints(vec![2])),
+                ("pads", Attribute::Ints(vec![1, 1])),
+            ],
+        );
+        assert_close(
+            &output,
+            &[
+                11.8, 19.2, 23.4, 27.6, 24.0, 43.4, 54.8, 66.2, 38.7, 70.1, 88.7, 107.3,
+            ],
+        );
+    }
+
+    #[test]
+    fn conv_rank3_1d_pointwise() {
+        // X=[1,4,5], W=[6,4,1] pointwise kernel — mirrors the Nemotron ASR
+        // encoder's kernel-1 1-D convolutions.
+        let x: Vec<f32> = (1..=20).map(|value| value as f32 * 0.5).collect();
+        let w: Vec<f32> = (1..=24).map(|value| value as f32 * 0.1).collect();
+        let output = run_conv(&[1, 4, 5], &x, &[6, 4, 1], &w, None, &[1, 6, 5], &[]);
+        assert_close(
+            &output,
+            &[
+                5.5, 6.0, 6.5, 7.0, 7.5, 12.3, 13.6, 14.9, 16.2, 17.5, 19.1, 21.2, 23.3, 25.4,
+                27.5, 25.9, 28.8, 31.7, 34.6, 37.5, 32.7, 36.4, 40.1, 43.8, 47.5, 39.5, 44.0, 48.5,
+                53.0, 57.5,
+            ],
+        );
+    }
+
+    #[test]
+    fn conv_rank3_1d_dilation() {
+        // X=[1,1,6], W=[1,1,2], dilation 2 — exercises the dilation lift.
+        let output = run_conv(
+            &[1, 1, 6],
+            &[1., 2., 3., 4., 5., 6.],
+            &[1, 1, 2],
+            &[1., 1.],
+            None,
+            &[1, 1, 4],
+            &[("dilations", Attribute::Ints(vec![2]))],
+        );
+        assert_close(&output, &[4.0, 6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn conv_rank3_1d_accepts_foundry_encoder_shapes() {
+        // The exact Whisper Tiny and Nemotron ASR encoder Conv shapes must build
+        // and run natively (values are arbitrary; this guards kernel creation and
+        // the rank-3 -> rank-4 lifting for the real Foundry-model shapes).
+        let whisper_x = vec![0.01f32; 80 * 3000];
+        let whisper_w = vec![0.001f32; 384 * 80 * 3];
+        let whisper = run_conv(
+            &[1, 80, 3000],
+            &whisper_x,
+            &[384, 80, 3],
+            &whisper_w,
+            None,
+            &[1, 384, 3000],
+            &[
+                ("strides", Attribute::Ints(vec![1])),
+                ("pads", Attribute::Ints(vec![1, 1])),
+            ],
+        );
+        assert_eq!(whisper.len(), 384 * 3000);
+
+        let nemotron_x = vec![0.5f32; 1024 * 7];
+        let nemotron_w = vec![0.01f32; 2048 * 1024];
+        let nemotron = run_conv(
+            &[1, 1024, 7],
+            &nemotron_x,
+            &[2048, 1024, 1],
+            &nemotron_w,
+            None,
+            &[1, 2048, 7],
+            &[],
+        );
+        assert_eq!(nemotron.len(), 2048 * 7);
     }
 
     #[test]
