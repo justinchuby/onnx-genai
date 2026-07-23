@@ -2102,26 +2102,70 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
         const __half* scale_up_ptr =
             scales_up + (long)column * k_blocks + (lane >> 2);
         int depth_base = 0;
-        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
-            const uint4 permuted = permute_activation_f16x8(activation_ptr);
-            const int block = (depth_base >> 5) + (lane >> 2);
-            const unsigned int gate_sub2 =
-                block_sub2<HasZp>(zero_points_gate, column, block, zp_row_bytes);
-            const unsigned int up_sub2 =
-                block_sub2<HasZp>(zero_points_up, column, block, zp_row_bytes);
-            const unsigned int gate_word =
+        if constexpr (HasZp) {
+            // Asymmetric (zero-point) path — the dominant Phi decode kernel, which
+            // ncu shows is Long-Scoreboard/global-load-latency bound. Software-
+            // pipeline the int4 gate/up weight loads: issue the next iteration's
+            // two 128-byte weight words before consuming the current ones so the
+            // load latency overlaps this iteration's compute. Pure scheduling
+            // change (identical accumulation order/ops) → bit-identical to the
+            // non-prefetched loop. Only the weight words are prefetched; also
+            // prefetching the small (L1/L2-resident) scales and per-block zero
+            // points pushed registers 48->56 and the occupancy loss erased the
+            // latency win. The symmetric (`HasZp == false`) path below keeps its
+            // exact original instruction stream so Qwen stays byte-identical with
+            // no register/occupancy change.
+            unsigned int gate_word_next =
                 *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
-            accumulate_int4x8_f16_permuted_zp(
-                gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
-            const unsigned int up_word =
+            unsigned int up_word_next =
                 *reinterpret_cast<const unsigned int*>(packed_up_ptr);
-            accumulate_int4x8_f16_permuted_zp(
-                up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
-            activation_ptr += 256;
-            packed_gate_ptr += 128;
-            packed_up_ptr += 128;
-            scale_gate_ptr += 8;
-            scale_up_ptr += 8;
+            for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                const int block = (depth_base >> 5) + (lane >> 2);
+                const unsigned int gate_sub2 =
+                    block_sub2<HasZp>(zero_points_gate, column, block, zp_row_bytes);
+                const unsigned int up_sub2 =
+                    block_sub2<HasZp>(zero_points_up, column, block, zp_row_bytes);
+                const unsigned int gate_word = gate_word_next;
+                const unsigned int up_word = up_word_next;
+                if (depth_base + 256 + lane_depth + 8 <= k) {
+                    gate_word_next = *reinterpret_cast<const unsigned int*>(
+                        packed_gate_ptr + 128);
+                    up_word_next = *reinterpret_cast<const unsigned int*>(
+                        packed_up_ptr + 128);
+                }
+                accumulate_int4x8_f16_permuted_zp(
+                    gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
+                accumulate_int4x8_f16_permuted_zp(
+                    up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
+                activation_ptr += 256;
+                packed_gate_ptr += 128;
+                packed_up_ptr += 128;
+                scale_gate_ptr += 8;
+                scale_up_ptr += 8;
+            }
+        } else {
+            for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                const int block = (depth_base >> 5) + (lane >> 2);
+                const unsigned int gate_sub2 =
+                    block_sub2<HasZp>(zero_points_gate, column, block, zp_row_bytes);
+                const unsigned int up_sub2 =
+                    block_sub2<HasZp>(zero_points_up, column, block, zp_row_bytes);
+                const unsigned int gate_word =
+                    *reinterpret_cast<const unsigned int*>(packed_gate_ptr);
+                accumulate_int4x8_f16_permuted_zp(
+                    gate_word, permuted, *scale_gate_ptr, gate_sub2, g0, g1, g2, g3);
+                const unsigned int up_word =
+                    *reinterpret_cast<const unsigned int*>(packed_up_ptr);
+                accumulate_int4x8_f16_permuted_zp(
+                    up_word, permuted, *scale_up_ptr, up_sub2, u0, u1, u2, u3);
+                activation_ptr += 256;
+                packed_gate_ptr += 128;
+                packed_up_ptr += 128;
+                scale_gate_ptr += 8;
+                scale_up_ptr += 8;
+            }
         }
         const int tail_depth = depth_base + lane_depth;
         if (tail_depth < k) {
