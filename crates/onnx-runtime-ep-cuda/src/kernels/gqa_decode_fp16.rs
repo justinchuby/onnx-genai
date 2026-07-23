@@ -53,7 +53,7 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f16_v4";
+const MODULE_KEY: &str = "gqa_decode_attention_f16_v5";
 const ENTRY: &str = "gqa_decode_attention_f16";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
@@ -117,7 +117,8 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const int group_size,
     const float scale,
     const int local_window,
-    const float softcap)
+    const float softcap,
+    const int single_split_direct)
 {
     // Dynamic shared layout: warp_max[warps], warp_sum[warps], then
     // warp_acc[warps * head_size] (fp32 partial value accumulators per warp).
@@ -248,7 +249,14 @@ extern "C" __global__ void gqa_decode_attention_f16(
     }
     // Rows beyond the bounded module scratch retain the original one-CTA
     // implementation, preserving the supported() contract for unusual shapes.
-    const bool direct_output = row >= GQA_MAX_SCRATCH_ROWS;
+    // When `single_split_direct` is enabled and the on-device length selects a
+    // single split, the sole active CTA already owns the complete flash state,
+    // so it normalizes and writes the final output directly, skipping the
+    // scratch round-trip and the merge pass. This is bit-identical to the
+    // two-step path (the merge with one split multiplies by exp(0)==1 and the
+    // same 1/denom), and strictly removes work.
+    const bool direct_output =
+        (row >= GQA_MAX_SCRATCH_ROWS) || (single_split_direct != 0 && active_splits == 1);
     half2* out2 = reinterpret_cast<half2*>(output + q_base);
     float* split_state = direct_output
         ? nullptr
@@ -288,7 +296,8 @@ extern "C" __global__ void gqa_decode_attention_f16_merge(
     const int query_heads,
     const int query_seq,
     const int head_size,
-    const int local_window)
+    const int local_window,
+    const int single_split_direct)
 {
     const int row = blockIdx.x;
     const int rows = batch * query_heads * query_seq;
@@ -305,6 +314,8 @@ extern "C" __global__ void gqa_decode_attention_f16_merge(
             : 0;
     const int sequence_length = max(0, causal_limit + 1 - local_start);
     const int active_splits = gqa_active_splits(sequence_length);
+    // Single-split rows were finalized in-place by the decode kernel.
+    if (single_split_direct != 0 && active_splits <= 1) return;
 
     float global_max = __int_as_float(0xff800000);
     for (int split = 0; split < active_splits; ++split) {
@@ -419,6 +430,7 @@ pub(super) fn run(
         })?;
 
     let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, ENTRY)?;
+    let single_split_direct = super::gqa_decode::single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
         .arg(&query)
@@ -435,7 +447,8 @@ pub(super) fn run(
         .arg(&group_i)
         .arg(&scale)
         .arg(&local_window)
-        .arg(&softcap);
+        .arg(&softcap)
+        .arg(&single_split_direct);
     // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
     // caller (present K/V span `cache_capacity` rows, query/output span
     // `query_seq` tokens). Scratch is fixed module-global plus dynamic shared
@@ -459,7 +472,8 @@ pub(super) fn run(
         .arg(&heads_i)
         .arg(&query_seq_i)
         .arg(&dim_i)
-        .arg(&local_window);
+        .arg(&local_window)
+        .arg(&single_split_direct);
     // SAFETY: the partial launch immediately above writes every active split
     // state consumed by this same-stream merge launch. Module-global scratch is
     // persistent for the loaded module and both launches are graph-recordable.
@@ -799,6 +813,127 @@ mod tests {
             worst_rel < 5e-2,
             "fp16 decode kernel diverged from reference softmax: max_rel={worst_rel:.3e}"
         );
+    }
+
+    /// The single-split direct-output fast path (flag=1) must be bit-identical
+    /// to the original two-step decode+merge path (flag=0) across Phi's
+    /// head_dim (128) and Qwen's (64), for both single-split (short-context)
+    /// and multi-split (long-context) decode lengths.
+    #[test]
+    fn single_split_direct_output_is_bit_exact_to_two_step_path() {
+        use std::sync::atomic::Ordering;
+
+        let _serial = super::super::gqa_decode::TEST_SINGLE_SPLIT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping GQA fp16 single-split parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("gqa_decode_attention_f16")
+            .is_err()
+        {
+            eprintln!("skipping GQA fp16 single-split parity test: fp16 NVRTC headers unavailable");
+            return;
+        }
+
+        let batch = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let cache_capacity = 1024usize;
+        let group = num_heads / num_kv_heads;
+
+        let mut state = 0xA5A5_1234u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        for head_dim in [64usize, 128usize] {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_f16 = vec![f16::ZERO; num_heads * head_dim];
+            for slot in q_f16.iter_mut() {
+                *slot = f16::from_f32(next());
+            }
+            let kv_len = num_kv_heads * cache_capacity * head_dim;
+            let mut k_f16 = vec![f16::ZERO; kv_len];
+            let mut v_f16 = vec![f16::ZERO; kv_len];
+            for i in 0..kv_len {
+                k_f16[i] = f16::from_f32(next());
+                v_f16[i] = f16::from_f32(next());
+            }
+
+            let query_dev = runtime.alloc_raw(q_f16.len() * 2).unwrap();
+            let key_dev = runtime.alloc_raw(k_f16.len() * 2).unwrap();
+            let value_dev = runtime.alloc_raw(v_f16.len() * 2).unwrap();
+            let output_dev = runtime.alloc_raw(num_heads * head_dim * 2).unwrap();
+            let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            // SAFETY: device buffers were sized to hold each source slice.
+            unsafe {
+                runtime.htod(as_bytes(&q_f16), query_dev).unwrap();
+                runtime.htod(as_bytes(&k_f16), key_dev).unwrap();
+                runtime.htod(as_bytes(&v_f16), value_dev).unwrap();
+            }
+
+            let launch = |flag: i32, total: usize| -> Vec<f16> {
+                super::super::gqa_decode::TEST_SINGLE_SPLIT_OVERRIDE.store(flag, Ordering::Relaxed);
+                let totals = [total as i32];
+                // SAFETY: `totals_dev` holds `batch` i32 values.
+                unsafe {
+                    runtime.htod(as_bytes(&totals), totals_dev).unwrap();
+                }
+                run(
+                    &runtime,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    1,
+                    head_dim,
+                    cache_capacity,
+                    group,
+                    scale,
+                    query_dev,
+                    key_dev,
+                    value_dev,
+                    output_dev,
+                    totals_dev,
+                    0,
+                    0.0,
+                )
+                .unwrap();
+                let mut got = vec![f16::ZERO; num_heads * head_dim];
+                // SAFETY: `output_dev` holds `num_heads * head_dim` fp16 values.
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+                }
+                got
+            };
+
+            // total<=64 -> 1 split (fast path fires); >64 -> multi-split
+            // (fast path inert, output must still match).
+            for total in [1usize, 8, 33, 64, 65, 129, 300] {
+                let direct = launch(1, total);
+                let two_step = launch(0, total);
+                assert_eq!(
+                    direct.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    two_step.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "single-split fast path diverged from two-step path at head_dim={head_dim} total={total}"
+                );
+            }
+
+            super::super::gqa_decode::TEST_SINGLE_SPLIT_OVERRIDE.store(-1, Ordering::Relaxed);
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(query_dev).unwrap();
+                runtime.free_raw(key_dev).unwrap();
+                runtime.free_raw(value_dev).unwrap();
+                runtime.free_raw(output_dev).unwrap();
+                runtime.free_raw(totals_dev).unwrap();
+            }
+        }
     }
 
     #[test]

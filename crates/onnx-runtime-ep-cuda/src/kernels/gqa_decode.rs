@@ -27,7 +27,7 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f32_v2";
+const MODULE_KEY: &str = "gqa_decode_attention_f32_v3";
 const ENTRY: &str = "gqa_decode_attention_f32";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f32_merge";
 
@@ -46,6 +46,45 @@ pub(super) const MAX_SPLITS: usize = 16;
 pub(super) fn supported(query_seq: usize, head_dim: usize) -> bool {
     query_seq == 1 && (1..=MAX_HEAD_DIM).contains(&head_dim)
 }
+
+/// Env toggle for the single-split direct-output fast path (shared by the f32
+/// and fp16 split-K decode kernels). When a decode step's on-device valid length
+/// selects a single split, the sole active CTA already owns the complete flash
+/// state, so it writes the normalized output directly and the merge pass skips
+/// that row — bit-identical to the two-step path, strictly less work. Set
+/// `ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT=0` to force the original two-step
+/// path (A/B + rollback). The value is read once and cached; it is a scalar
+/// kernel argument fixed at graph-capture time.
+pub(super) fn single_split_direct_flag() -> i32 {
+    #[cfg(test)]
+    {
+        let override_value =
+            TEST_SINGLE_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if override_value >= 0 {
+            return override_value;
+        }
+    }
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<i32> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        match std::env::var("ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT") {
+            Ok(value) if value == "0" => 0,
+            _ => 1,
+        }
+    })
+}
+
+/// Test-only override for [`single_split_direct_flag`]: `-1` defers to the env
+/// var (default), `0`/`1` force the two-step / direct path so parity tests can
+/// A/B both branches within one process.
+#[cfg(test)]
+pub(super) static TEST_SINGLE_SPLIT_OVERRIDE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
+
+/// Serializes the f32/fp16 single-split parity tests so their overrides of
+/// [`TEST_SINGLE_SPLIT_OVERRIDE`] cannot interleave.
+#[cfg(test)]
+pub(super) static TEST_SINGLE_SPLIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const DECODE_SRC: &str = r#"
 #define GQA_WARP_SIZE 32
@@ -81,7 +120,8 @@ extern "C" __global__ void gqa_decode_attention_f32(
     const int group_size,
     const float scale,
     const int local_window,
-    const float softcap)
+    const float softcap,
+    const int single_split_direct)
 {
     extern __shared__ float smem[];
     const int warps_per_block = blockDim.x / GQA_WARP_SIZE;
@@ -191,7 +231,13 @@ extern "C" __global__ void gqa_decode_attention_f32(
     for (int w = 0; w < warps_per_block; ++w) {
         denom += warp_sum[w] * expf(warp_max[w] - global_max);
     }
-    const bool direct_output = row >= GQA_MAX_SCRATCH_ROWS;
+    // When `single_split_direct` is enabled and the on-device length selects a
+    // single split, the sole active CTA already owns the complete flash state,
+    // so it normalizes and writes the final output directly, skipping the
+    // scratch round-trip and the merge pass. Bit-identical to the two-step path
+    // (the merge with one split multiplies by exp(0)==1 and the same 1/denom).
+    const bool direct_output =
+        (row >= GQA_MAX_SCRATCH_ROWS) || (single_split_direct != 0 && active_splits == 1);
     float* split_state = direct_output
         ? nullptr
         : gqa_split_scratch
@@ -227,7 +273,8 @@ extern "C" __global__ void gqa_decode_attention_f32_merge(
     const int query_heads,
     const int query_seq,
     const int head_size,
-    const int local_window)
+    const int local_window,
+    const int single_split_direct)
 {
     const int row = blockIdx.x;
     const int rows = batch * query_heads * query_seq;
@@ -244,6 +291,8 @@ extern "C" __global__ void gqa_decode_attention_f32_merge(
             : 0;
     const int sequence_length = max(0, causal_limit + 1 - local_start);
     const int active_splits = gqa_active_splits(sequence_length);
+    // Single-split rows were finalized in-place by the decode kernel.
+    if (single_split_direct != 0 && active_splits <= 1) return;
 
     float global_max = __int_as_float(0xff800000);
     for (int split = 0; split < active_splits; ++split) {
@@ -341,6 +390,7 @@ pub(super) fn run(
         })?;
 
     let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, ENTRY)?;
+    let single_split_direct = single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
         .arg(&query)
@@ -357,7 +407,8 @@ pub(super) fn run(
         .arg(&group_i)
         .arg(&scale)
         .arg(&local_window)
-        .arg(&softcap);
+        .arg(&softcap)
+        .arg(&single_split_direct);
     // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
     // caller. Fixed module-global and dynamic shared scratch make the launch
     // legal to record into and replay from a CUDA graph.
@@ -379,7 +430,8 @@ pub(super) fn run(
         .arg(&heads_i)
         .arg(&query_seq_i)
         .arg(&dim_i)
-        .arg(&local_window);
+        .arg(&local_window)
+        .arg(&single_split_direct);
     // SAFETY: the same-stream partial launch writes every active split state
     // consumed here; both launches are graph-recordable.
     unsafe {
@@ -601,5 +653,117 @@ mod tests {
         assert!(!supported(1, 129));
         assert!(!supported(2, 64));
         assert!(!supported(1, 0));
+    }
+
+    /// The single-split direct-output fast path (flag=1) must be bit-identical
+    /// to the original two-step decode+merge path (flag=0) across Phi's
+    /// head_dim (128) and Qwen's (64), for both single-split and multi-split
+    /// decode lengths.
+    #[test]
+    fn single_split_direct_output_is_bit_exact_to_two_step_path_f32() {
+        use std::sync::atomic::Ordering;
+
+        let _serial = TEST_SINGLE_SPLIT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping GQA f32 single-split parity test: CUDA runtime unavailable");
+            return;
+        };
+
+        let batch = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let cache_capacity = 1024usize;
+        let group = num_heads / num_kv_heads;
+
+        let mut state = 0x51A9_7C3Du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        for head_dim in [64usize, 128usize] {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q = vec![0.0f32; num_heads * head_dim];
+            for slot in q.iter_mut() {
+                *slot = next();
+            }
+            let kv_len = num_kv_heads * cache_capacity * head_dim;
+            let mut k = vec![0.0f32; kv_len];
+            let mut v = vec![0.0f32; kv_len];
+            for i in 0..kv_len {
+                k[i] = next();
+                v[i] = next();
+            }
+
+            let query_dev = runtime.alloc_raw(q.len() * 4).unwrap();
+            let key_dev = runtime.alloc_raw(k.len() * 4).unwrap();
+            let value_dev = runtime.alloc_raw(v.len() * 4).unwrap();
+            let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
+            let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            // SAFETY: device buffers were sized to hold each source slice.
+            unsafe {
+                runtime.htod(as_bytes(&q), query_dev).unwrap();
+                runtime.htod(as_bytes(&k), key_dev).unwrap();
+                runtime.htod(as_bytes(&v), value_dev).unwrap();
+            }
+
+            let launch = |flag: i32, total: usize| -> Vec<f32> {
+                TEST_SINGLE_SPLIT_OVERRIDE.store(flag, Ordering::Relaxed);
+                let totals = [total as i32];
+                // SAFETY: `totals_dev` holds `batch` i32 values.
+                unsafe {
+                    runtime.htod(as_bytes(&totals), totals_dev).unwrap();
+                }
+                run(
+                    &runtime,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    1,
+                    head_dim,
+                    cache_capacity,
+                    group,
+                    scale,
+                    query_dev,
+                    key_dev,
+                    value_dev,
+                    output_dev,
+                    totals_dev,
+                    0,
+                    0.0,
+                )
+                .unwrap();
+                let mut got = vec![0.0f32; num_heads * head_dim];
+                // SAFETY: `output_dev` holds `num_heads * head_dim` f32 values.
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+                }
+                got
+            };
+
+            for total in [1usize, 8, 33, 64, 65, 129, 300] {
+                let direct = launch(1, total);
+                let two_step = launch(0, total);
+                assert_eq!(
+                    direct.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    two_step.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "single-split fast path diverged from two-step path at head_dim={head_dim} total={total}"
+                );
+            }
+
+            TEST_SINGLE_SPLIT_OVERRIDE.store(-1, Ordering::Relaxed);
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(query_dev).unwrap();
+                runtime.free_raw(key_dev).unwrap();
+                runtime.free_raw(value_dev).unwrap();
+                runtime.free_raw(output_dev).unwrap();
+                runtime.free_raw(totals_dev).unwrap();
+            }
+        }
     }
 }
