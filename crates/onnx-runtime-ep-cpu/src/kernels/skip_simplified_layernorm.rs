@@ -88,7 +88,6 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         let writes_inv_std = outputs
             .get(2)
             .is_some_and(|output| is_stats_shape(output.shape, shape));
-
         if inputs[1].shape == shape
             && inputs[0].is_contiguous()
             && inputs[1].is_contiguous()
@@ -102,12 +101,11 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             && outputs.get(3).is_some_and(|output| {
                 output.shape == shape && output.dtype == DataType::Float32 && output.is_contiguous()
             })
-            && !writes_mean
-            && !writes_inv_std
         {
             let (output, remaining) = outputs.split_at_mut(1);
             let output = &mut output[0];
-            let sum_output = &mut remaining[2];
+            let (stats_outputs, sum_output) = remaining.split_at_mut(2);
+            let sum_output = &mut sum_output[0];
             output.validate()?;
             sum_output.validate()?;
 
@@ -121,20 +119,28 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 std::slice::from_raw_parts_mut(sum_output.data_ptr_mut::<f32>(), input.len())
             };
 
-            for index in 0..input.len() {
-                sum_output[index] = input[index]
-                    + skip[index]
-                    + bias.as_ref().map_or(0.0, |values| values[index % hidden]);
-            }
-            for (row, normalized) in sum_output
+            let mut inv_std_vars = writes_inv_std.then(|| vec![0.0f32; groups]);
+            for (group, (((input_row, skip_row), sum_row), normalized)) in input
                 .chunks_exact(hidden)
+                .zip(skip.chunks_exact(hidden))
+                .zip(sum_output.chunks_exact_mut(hidden))
                 .zip(output.chunks_exact_mut(hidden))
+                .enumerate()
             {
-                let variance = row.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+                let square_sum =
+                    assemble_sum_and_sum_squares(input_row, skip_row, bias.as_deref(), sum_row);
+                let variance = square_sum / hidden as f32;
                 let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
-                for column in 0..hidden {
-                    normalized[column] = row[column] * inv_std_var * gamma[column];
+                if let Some(values) = inv_std_vars.as_mut() {
+                    values[group] = inv_std_var;
                 }
+                normalize_and_scale(sum_row, normalized, inv_std_var, &gamma);
+            }
+            if writes_mean {
+                write_dense_f32_narrow(OP, &mut stats_outputs[0], &vec![0.0f32; groups])?;
+            }
+            if let Some(inv_std_vars) = inv_std_vars {
+                write_dense_f32_narrow(OP, &mut stats_outputs[1], &inv_std_vars)?;
             }
             return Ok(());
         }
@@ -160,14 +166,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         for group in 0..groups {
             let base = group * hidden;
             let row = &sum[base..base + hidden];
-            let variance = row.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+            let variance = sum_squares(row) / hidden as f32;
             let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
             if let Some(values) = inv_std_vars.as_mut() {
                 values[group] = inv_std_var;
             }
-            for column in 0..hidden {
-                output[base + column] = row[column] * inv_std_var * gamma[column];
-            }
+            normalize_and_scale(row, &mut output[base..base + hidden], inv_std_var, &gamma);
         }
 
         write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
@@ -185,6 +189,89 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+}
+
+const SIMD_LANES: usize = 8;
+
+fn assemble_sum_and_sum_squares(
+    input: &[f32],
+    skip: &[f32],
+    bias: Option<&[f32]>,
+    sum: &mut [f32],
+) -> f32 {
+    debug_assert_eq!(input.len(), skip.len());
+    debug_assert_eq!(input.len(), sum.len());
+    debug_assert!(bias.is_none_or(|bias| bias.len() == input.len()));
+
+    let mut lane_sums = [0.0f32; SIMD_LANES];
+    let bulk_len = input.len() / SIMD_LANES * SIMD_LANES;
+    let mut base = 0;
+    if let Some(bias) = bias {
+        while base < bulk_len {
+            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
+                let index = base + lane;
+                let value = input[index] + skip[index] + bias[index];
+                sum[index] = value;
+                *lane_sum += value * value;
+            }
+            base += SIMD_LANES;
+        }
+    } else {
+        while base < bulk_len {
+            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
+                let index = base + lane;
+                let value = input[index] + skip[index];
+                sum[index] = value;
+                *lane_sum += value * value;
+            }
+            base += SIMD_LANES;
+        }
+    }
+
+    let mut square_sum = lane_sums.into_iter().sum::<f32>();
+    for index in bulk_len..input.len() {
+        let value = input[index] + skip[index] + bias.map_or(0.0, |bias| bias[index]);
+        sum[index] = value;
+        square_sum += value * value;
+    }
+    square_sum
+}
+
+fn sum_squares(values: &[f32]) -> f32 {
+    let mut lane_sums = [0.0f32; SIMD_LANES];
+    let bulk_len = values.len() / SIMD_LANES * SIMD_LANES;
+    let mut base = 0;
+    while base < bulk_len {
+        for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
+            let value = values[base + lane];
+            *lane_sum += value * value;
+        }
+        base += SIMD_LANES;
+    }
+
+    let mut square_sum = lane_sums.into_iter().sum::<f32>();
+    for &value in &values[bulk_len..] {
+        square_sum += value * value;
+    }
+    square_sum
+}
+
+fn normalize_and_scale(sum: &[f32], output: &mut [f32], inv_std: f32, gamma: &[f32]) {
+    debug_assert_eq!(sum.len(), output.len());
+    debug_assert_eq!(sum.len(), gamma.len());
+
+    let bulk_len = sum.len() / SIMD_LANES * SIMD_LANES;
+    let mut base = 0;
+    while base < bulk_len {
+        for lane in 0..SIMD_LANES {
+            let index = base + lane;
+            output[index] = sum[index] * inv_std * gamma[index];
+        }
+        base += SIMD_LANES;
+    }
+    for index in bulk_len..sum.len() {
+        output[index] = sum[index] * inv_std * gamma[index];
     }
 }
 
@@ -447,6 +534,60 @@ mod tests {
     }
 
     #[test]
+    fn skip_simplified_layer_norm_vector_bulk_and_remainder_match_reference() {
+        for hidden in [13, 4096] {
+            let shape = [2, hidden];
+            let input_data = (0..2 * hidden)
+                .map(|index| (index % 31) as f32 * 0.03125 - 0.5)
+                .collect::<Vec<_>>();
+            let skip_data = (0..2 * hidden)
+                .map(|index| (index % 17) as f32 * -0.015625 + 0.125)
+                .collect::<Vec<_>>();
+            let gamma_data = (0..hidden)
+                .map(|index| 0.75 + (index % 11) as f32 * 0.03125)
+                .collect::<Vec<_>>();
+            let bias_data = (0..hidden)
+                .map(|index| (index % 7) as f32 * 0.0078125 - 0.015625)
+                .collect::<Vec<_>>();
+            let (want, want_sum) =
+                reference(&input_data, &skip_data, &gamma_data, Some(&bias_data), 1e-5);
+            let input = Owned::f32(&shape, &input_data);
+            let skip = Owned::f32(&shape, &skip_data);
+            let gamma = Owned::f32(&[hidden], &gamma_data);
+            let bias = Owned::f32(&[hidden], &bias_data);
+            let mut output = Owned::zeros_f32(&shape);
+            let mut mean = Owned::zeros_f32(&[2, 1]);
+            let mut inv_std = Owned::zeros_f32(&[2, 1]);
+            let mut sum = Owned::zeros_f32(&shape);
+
+            SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                .execute(
+                    &[input.view(), skip.view(), gamma.view(), bias.view()],
+                    &mut [
+                        output.view_mut(),
+                        mean.view_mut(),
+                        inv_std.view_mut(),
+                        sum.view_mut(),
+                    ],
+                )
+                .unwrap();
+
+            assert_close(&output.to_f32(), &want);
+            assert_eq!(sum.to_f32(), want_sum);
+            assert_eq!(mean.to_f32(), vec![0.0; 2]);
+            let want_inv_std = want_sum
+                .chunks_exact(hidden)
+                .map(|row| {
+                    1.0 / (row.iter().map(|value| value * value).sum::<f32>() / hidden as f32
+                        + 1e-5)
+                        .sqrt()
+                })
+                .collect::<Vec<_>>();
+            assert_close(&inv_std.to_f32(), &want_inv_std);
+        }
+    }
+
+    #[test]
     fn skip_simplified_layer_norm_f16_widens_and_narrows() {
         let input = Owned::f16(&[1, 1, 4], &[1., 2., 3., 4.]);
         let skip = Owned::f16(&[1, 1, 4], &[0.5, -1., 1., 0.]);
@@ -478,6 +619,30 @@ mod tests {
         }
         for (got, expected) in sum.to_f16_as_f32().iter().zip(&want_sum) {
             assert!((got - expected).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn skip_simplified_layer_norm_bf16_widens_and_narrows() {
+        let input = Owned::bf16(&[1, 1, 4], &[1., 2., 3., 4.]);
+        let skip = Owned::bf16(&[1, 1, 4], &[0.5, -1., 1., 0.]);
+        let gamma = Owned::bf16(&[4], &[1., 2., 0.5, 1.5]);
+        let mut output = Owned::zeros(DataType::BFloat16, &[1, 1, 4]);
+        SkipSimplifiedLayerNormKernel { epsilon: 1e-4 }
+            .execute(
+                &[input.view(), skip.view(), gamma.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        let (want, _) = reference(
+            &[1., 2., 3., 4.],
+            &[0.5, -1., 1., 0.],
+            &[1., 2., 0.5, 1.5],
+            None,
+            1e-4,
+        );
+        for (got, expected) in output.to_bf16_as_f32().iter().zip(&want) {
+            assert!((got - expected).abs() < 1e-2);
         }
     }
 }
