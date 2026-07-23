@@ -2229,17 +2229,18 @@ impl GroupQueryAttentionKernel {
             )?;
         } else if q.dtype == DataType::Float32 && gqa_decode::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
-                "attention_gqa_decode_f32",
-                "capture-safe f32 warp-parallel single-token decode: q_seq={}, head_dim={}; \
+                "attention_gqa_decode_f32_splitk",
+                "capture-safe f32 split-K single-token decode: q_seq={}, head_dim={}; \
+                 active split count (1/2/4/8/16, max {}) is chosen on-device; \
                  flash backend={:?} not selected",
                 q_seq,
                 dim,
+                gqa_decode::MAX_SPLITS,
                 selected_backend
             );
-            // Capture-safe warp-parallel single-token GQA decode. Reads the
-            // valid length on-device from `totals_gpu` and allocates no scratch,
-            // so it records/replays inside a CUDA graph. Keeps the reference
-            // kernel below for f32 prefill and unsupported head dims.
+            // Capture-safe split-K single-token GQA decode. Reads the valid
+            // length on-device and uses fixed module-global scratch, so both
+            // partial and merge launches record/replay inside a CUDA graph.
             gqa_decode::run(
                 &self.runtime,
                 batch,
