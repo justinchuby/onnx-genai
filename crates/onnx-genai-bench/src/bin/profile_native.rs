@@ -58,6 +58,13 @@ struct Args {
     /// unaffected.
     #[arg(long)]
     trace: Option<PathBuf>,
+    /// Dump native token-0 top-K log-probabilities (log-softmax) as JSON to this
+    /// path for a single-token greedy forward, then exit. Used to bisect
+    /// native-vs-ORT logit divergence.
+    #[arg(long)]
+    dump_logprobs: Option<PathBuf>,
+    #[arg(long, default_value_t = 40)]
+    logprobs_k: usize,
 }
 
 fn model_file(path: &Path) -> PathBuf {
@@ -164,6 +171,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             }
         } else {
             reference_tokens = Some(result.token_ids.clone());
+            println!("generated_text: {:?}", result.text);
         }
 
         let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
@@ -433,6 +441,42 @@ fn main() -> Result<()> {
         args.warmups,
         args.runs
     );
+    if let Some(dump_path) = args.dump_logprobs.as_ref() {
+        let options = GenerateOptions {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            greedy: true,
+            stop_on_eos: false,
+            top_logprobs: Some(args.logprobs_k),
+            ..GenerateOptions::default()
+        };
+        let result =
+            session.generate(&prompt_tokens, &options, &ProcessorChain::new(), &tokenizer)?;
+        let logprobs = result
+            .logprobs
+            .and_then(|entries| entries.into_iter().next())
+            .context("native generation did not return token-0 logprobs")?;
+        let top: Vec<serde_json::Value> = logprobs
+            .top
+            .iter()
+            .map(|(id, lp)| serde_json::json!([*id, *lp]))
+            .collect();
+        let payload = serde_json::json!({
+            "n_prompt_tokens": prompt_tokens.len(),
+            "selected_token": logprobs.token_id,
+            "selected_logprob": logprobs.logprob,
+            "top": top,
+        });
+        std::fs::write(dump_path, serde_json::to_string(&payload)?)
+            .with_context(|| format!("write logprobs to {}", dump_path.display()))?;
+        println!(
+            "dumped native token-0 top-{} logprobs (selected={}) to {}",
+            args.logprobs_k,
+            logprobs.token_id,
+            dump_path.display()
+        );
+        return Ok(());
+    }
     if let Some(trace_path) = args.trace.as_ref() {
         // Capture one *traced* generation before the timed runs. Enabling the
         // tracer opens a per-op executor span for every node it dispatches,

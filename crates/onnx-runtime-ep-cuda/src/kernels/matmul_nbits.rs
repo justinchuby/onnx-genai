@@ -3635,6 +3635,21 @@ mod tests {
     /// accumulation precision and fp16 output rounding — not input quantization,
     /// which both sides share.
     fn run_parity(scales_fp16: bool, with_bias: bool) -> (f32, f32, f32, bool) {
+        // K spans 128 block-32 groups (contraction depth 4096, near the model's
+        // widest hidden path), N covers several 8-column CTAs plus a ragged tail.
+        run_parity_dims(4096, 70, scales_fp16, with_bias)
+    }
+
+    /// Parametrized fp16 GEMV parity harness. `k` and `n` pick the projection
+    /// shape so callers can pin the exact production dims (e.g. Qwen2.5-1.5B's
+    /// gate/up K=1536,N=8960 and down-projection K=8960,N=1536) that select
+    /// different GEMV variants and block-count boundaries.
+    fn run_parity_dims(
+        k: usize,
+        n: usize,
+        scales_fp16: bool,
+        with_bias: bool,
+    ) -> (f32, f32, f32, bool) {
         let Some(runtime) = runtime() else {
             eprintln!("skipping MatMulNBits fp16 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
@@ -3647,10 +3662,6 @@ mod tests {
             return (0.0, 0.0, 0.0, true);
         }
 
-        // K spans 128 block-32 groups (contraction depth 4096, near the model's
-        // widest hidden path), N covers several 8-column CTAs plus a ragged tail.
-        let k = 4096usize;
-        let n = 70usize;
         let block_size = 32usize;
         let k_blocks = k / block_size;
         let blob_size = block_size / 2;
@@ -4142,6 +4153,50 @@ mod tests {
             worst_rel < 5e-2,
             "fp16 GEMV diverged from dequant reference: max_rel={worst_rel:.3e}"
         );
+    }
+
+    /// Regression guard for the native-vs-ORT divergence investigated on
+    /// Qwen2.5-1.5B-instruct (int4, block-32). Its MLP projections use dims that
+    /// no other Qwen2.5 size hits: gate/up is K=1536,N=8960 (K<N → *general*
+    /// GEMV) and the down-projection is K=8960,N=1536 (K>N → *tall-skinny*
+    /// specialized GEMV). K=1536 is 48 block-32 groups and N=8960 is a whole
+    /// multiple of the 8-column CTA width, exercising the block-count and column
+    /// tiling boundaries at the exact production shapes. Both variants must track
+    /// the f64 dequant-and-matmul oracle within the fp16 accumulation floor so a
+    /// future kernel change cannot silently reintroduce a decode-step logit
+    /// divergence at these dims.
+    #[test]
+    fn fp16_gemv_matches_dequant_reference_qwen_1_5b_dims() {
+        // (k, n) → (gate/up general GEMV, down-projection tall-skinny GEMV).
+        for (k, n) in [(1536usize, 8960usize), (8960usize, 1536usize)] {
+            let (mut worst_abs, mut worst_rel, mut max_out, mut all_finite) =
+                (0.0f32, 0.0f32, 0.0f32, true);
+            for (scales_fp16, with_bias) in [(false, false), (true, false), (true, true)] {
+                let (abs, rel, out, finite) = run_parity_dims(k, n, scales_fp16, with_bias);
+                worst_abs = worst_abs.max(abs);
+                worst_rel = worst_rel.max(rel);
+                max_out = max_out.max(out);
+                all_finite &= finite;
+            }
+            // Same fp16-ULP-scaled bound as the general parity test, with 2x
+            // headroom for reduction-order drift accumulated over the (here
+            // deeper, K up to 8960) contraction.
+            let abs_bound = (max_out * 1e-3).max(1e-3);
+            eprintln!(
+                "MatMulNBits fp16 GEMV parity K={k} N={n}: max_abs={worst_abs:.3e} \
+                 max_rel={worst_rel:.3e} max_out={max_out:.3e} abs_bound={abs_bound:.3e}"
+            );
+            assert!(all_finite, "fp16 GEMV produced a non-finite output (K={k} N={n})");
+            assert!(
+                worst_abs < abs_bound,
+                "fp16 GEMV diverged from dequant reference at K={k} N={n}: \
+                 max_abs={worst_abs:.3e} bound={abs_bound:.3e}"
+            );
+            assert!(
+                worst_rel < 5e-2,
+                "fp16 GEMV diverged from dequant reference at K={k} N={n}: max_rel={worst_rel:.3e}"
+            );
+        }
     }
 
     /// Folding a standalone `Add(MatMulNBits, bias)` into the GEMV epilogue must
