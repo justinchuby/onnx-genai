@@ -641,6 +641,71 @@ mod phase_prof {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+impl GroupQueryAttentionKernel {
+    /// Decide whether the present KV outputs alias the past KV inputs onto one
+    /// persistent, full-capacity buffer (a present==past device binding — the
+    /// CPU analogue of the CUDA in-place KV cache). When they do, the append-only
+    /// fast path can write the current step's K/V rows directly into the buffer
+    /// instead of widening/copying the whole growing past and round-tripping the
+    /// present output.
+    ///
+    /// The gate is purely structural so it can never fire for an ordinary run:
+    /// the present output pointer must be byte-identical to the past input
+    /// pointer, both caches must be contiguous f32 at the full physical capacity
+    /// (`present_len` elements), and that capacity must already cover the new
+    /// `total` (`present_sequence_length == cache.seq`, which the caller derives
+    /// as `max(cache.seq, total)`). Key and value must be distinct buffers.
+    fn detect_inplace_kv(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        present_sequence_length: usize,
+        present_len: usize,
+        past_key: Option<&PastCache>,
+    ) -> bool {
+        use onnx_runtime_ir::DataType::Float32;
+        let Some(cache) = past_key else {
+            return false;
+        };
+        // Capacity must already hold the new total; `present_sequence_length`
+        // equals the physical cache extent exactly in that case.
+        if outputs.len() < 3 || present_sequence_length != cache.seq {
+            return false;
+        }
+        if inputs.len() < 5 {
+            return false;
+        }
+        // Restrict to contiguous f32 caches at the exact physical capacity.
+        for view in [&inputs[3], &inputs[4]] {
+            if view.is_absent()
+                || view.dtype != Float32
+                || !view.is_contiguous()
+                || view.numel() != present_len
+            {
+                return false;
+            }
+        }
+        for out in [&outputs[1], &outputs[2]] {
+            if out.dtype != Float32 || !out.is_contiguous() || out.numel() != present_len {
+                return false;
+            }
+        }
+        // Structural aliasing: each present output origin must be the exact same
+        // address as its past input origin, computed identically to `data_ptr`.
+        let in_ptr = |view: &TensorView| {
+            (view.data.0 as *const u8).wrapping_add(view.byte_offset) as usize
+        };
+        let out_ptr = |out: &TensorMut| {
+            (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize
+        };
+        let pk_in = in_ptr(&inputs[3]);
+        let pv_in = in_ptr(&inputs[4]);
+        let pk_out = out_ptr(&outputs[1]);
+        let pv_out = out_ptr(&outputs[2]);
+        pk_in != 0 && pv_in != 0 && pk_in == pk_out && pv_in == pv_out && pk_in != pv_in
+    }
+}
+
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         #[cfg(feature = "gqa_phase_profile")]
@@ -875,55 +940,118 @@ impl Kernel for GroupQueryAttentionKernel {
             cache.seq.max(total_sequence_length)
         });
         let present_len = q.batch * self.kv_num_heads * present_sequence_length * cache_dim;
-        // A "tail" is any padding row beyond a batch's logical `total` that is
-        // emitted into the present output but never attended; those rows must be
-        // zero. In steady decode every batch's `total` exactly fills
-        // `present_sequence_length`, so the per-(b,h) loop below overwrites every
-        // element and pre-zeroing is pure waste — skip it in that case.
-        let has_tail = totals.iter().any(|&t| t < present_sequence_length);
-        let (mut present_k, mut present_v) = if has_tail {
-            (vec![0.0f32; present_len], vec![0.0f32; present_len])
-        } else {
-            let mut present_k = Vec::<f32>::with_capacity(present_len);
-            let mut present_v = Vec::<f32>::with_capacity(present_len);
-            // SAFETY: `!has_tail` ⇒ every batch's `total == present_sequence_length`,
-            // so for each `(b, h)` the loop below writes the past prefix
-            // `[0, past_len)` and the current span `[past_len, total)` =
-            // `[0, present_sequence_length)` rows, i.e. every element of both
-            // buffers, before any read (attention and the output narrow both run
-            // strictly after this loop). No uninitialized element is observed.
-            unsafe {
-                present_k.set_len(present_len);
-                present_v.set_len(present_len);
-            }
-            (present_k, present_v)
-        };
-        for (b, &past_len) in past_lengths.iter().enumerate() {
-            for h in 0..self.kv_num_heads {
-                let head = b * self.kv_num_heads + h;
-                let dst_base = head * present_sequence_length * cache_dim;
-                // `present_k`/`present_v` and the past caches are both
-                // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is a
-                // single contiguous run in each: widen the whole past prefix
-                // directly into `present` (F16C for f16), skipping the separate
-                // owned widen + f32 copy the decode path used to pay every token.
-                if past_len > 0 {
-                    let copy = past_len * cache_dim;
-                    let pk = past_key.as_ref().unwrap();
-                    let pv = past_value.as_ref().unwrap();
-                    let src = head * pk.seq * cache_dim;
-                    pk.widen_run(src, &mut present_k[dst_base..dst_base + copy]);
-                    pv.widen_run(src, &mut present_v[dst_base..dst_base + copy]);
+
+        // ── In-place persistent KV fast path ────────────────────────────────
+        // When the session has bound each `present` output onto its `past`
+        // input (a present==past device binding — the CPU analogue of the CUDA
+        // in-place KV cache), the past prefix is ALREADY resident in the output
+        // buffer at full physical capacity. Detect that purely *structurally* —
+        // the present output pointer aliases the past input pointer, both are
+        // contiguous f32, and capacity already covers the new total — then
+        // append only the current step's K/V rows in place and attend directly
+        // over the buffer. This eliminates the O(capacity) past widen/copy and
+        // the entire present round-trip the copy path pays every token. Any
+        // non-aliased call (every ordinary model/run and test) is byte-identical
+        // to before because it falls through to the copy path below.
+        let in_place = self.detect_inplace_kv(
+            inputs,
+            outputs,
+            present_sequence_length,
+            present_len,
+            past_key.as_ref(),
+        );
+
+        // Owned present storage backs only the copy path; the in-place path
+        // writes straight into the aliased output buffer and never touches these.
+        let owned_present_k: Vec<f32>;
+        let owned_present_v: Vec<f32>;
+        let (present_k, present_v): (&[f32], &[f32]) = if in_place {
+            let pk_ptr = outputs[1].data_ptr_mut::<f32>();
+            let pv_ptr = outputs[2].data_ptr_mut::<f32>();
+            // Release the immutable past borrows before mutating the aliased
+            // buffer: past_key/past_value view the SAME memory as pk_ptr/pv_ptr,
+            // so no live `&[f32]` may coexist with the `&mut [f32]` below.
+            drop(past_key);
+            drop(past_value);
+            // SAFETY: `detect_inplace_kv` proved outputs[1]/[2] are contiguous
+            // f32 buffers of exactly `present_len` elements. They are the graph
+            // outputs, exclusively owned by this kernel invocation. The past
+            // prefix [0, past_len) per head is already resident from prior steps;
+            // we write only the current [past_len, total) rows, all within each
+            // head's [0, present_sequence_length) region, and never read
+            // uninitialized capacity (attention is causal-bounded to `total`).
+            let present_k = unsafe { std::slice::from_raw_parts_mut(pk_ptr, present_len) };
+            let present_v = unsafe { std::slice::from_raw_parts_mut(pv_ptr, present_len) };
+            for (b, &past_len) in past_lengths.iter().enumerate() {
+                for h in 0..self.kv_num_heads {
+                    let head = b * self.kv_num_heads + h;
+                    let dst_base = head * present_sequence_length * cache_dim;
+                    let cur = k.seq * cache_dim;
+                    let dst_cur = dst_base + past_len * cache_dim;
+                    let src_cur = head * k.seq * cache_dim;
+                    present_k[dst_cur..dst_cur + cur]
+                        .copy_from_slice(&k.data[src_cur..src_cur + cur]);
+                    present_v[dst_cur..dst_cur + cur]
+                        .copy_from_slice(&v.data[src_cur..src_cur + cur]);
                 }
-                // Append the current token(s) directly after the past prefix;
-                // the current K/V blocks are contiguous in `[s, d]` as well.
-                let cur = k.seq * cache_dim;
-                let dst_cur = dst_base + past_len * cache_dim;
-                let src_cur = head * k.seq * cache_dim;
-                present_k[dst_cur..dst_cur + cur].copy_from_slice(&k.data[src_cur..src_cur + cur]);
-                present_v[dst_cur..dst_cur + cur].copy_from_slice(&v.data[src_cur..src_cur + cur]);
             }
-        }
+            (&*present_k, &*present_v)
+        } else {
+            // A "tail" is any padding row beyond a batch's logical `total` that
+            // is emitted into the present output but never attended; those rows
+            // must be zero. In steady decode every batch's `total` exactly fills
+            // `present_sequence_length`, so the per-(b,h) loop below overwrites
+            // every element and pre-zeroing is pure waste — skip it in that case.
+            let has_tail = totals.iter().any(|&t| t < present_sequence_length);
+            let (mut present_k, mut present_v) = if has_tail {
+                (vec![0.0f32; present_len], vec![0.0f32; present_len])
+            } else {
+                let mut present_k = Vec::<f32>::with_capacity(present_len);
+                let mut present_v = Vec::<f32>::with_capacity(present_len);
+                // SAFETY: `!has_tail` ⇒ every batch's `total == present_sequence_length`,
+                // so for each `(b, h)` the loop below writes the past prefix
+                // `[0, past_len)` and the current span `[past_len, total)` =
+                // `[0, present_sequence_length)` rows, i.e. every element of both
+                // buffers, before any read (attention and the output narrow both
+                // run strictly after this loop). No uninitialized element is observed.
+                unsafe {
+                    present_k.set_len(present_len);
+                    present_v.set_len(present_len);
+                }
+                (present_k, present_v)
+            };
+            for (b, &past_len) in past_lengths.iter().enumerate() {
+                for h in 0..self.kv_num_heads {
+                    let head = b * self.kv_num_heads + h;
+                    let dst_base = head * present_sequence_length * cache_dim;
+                    // `present_k`/`present_v` and the past caches are both
+                    // BNSH-contiguous, so for a fixed (b, h) the `[s, d]` block is
+                    // a single contiguous run in each: widen the whole past prefix
+                    // directly into `present` (F16C for f16), skipping the separate
+                    // owned widen + f32 copy the decode path used to pay every token.
+                    if past_len > 0 {
+                        let copy = past_len * cache_dim;
+                        let pk = past_key.as_ref().unwrap();
+                        let pv = past_value.as_ref().unwrap();
+                        let src = head * pk.seq * cache_dim;
+                        pk.widen_run(src, &mut present_k[dst_base..dst_base + copy]);
+                        pv.widen_run(src, &mut present_v[dst_base..dst_base + copy]);
+                    }
+                    // Append the current token(s) directly after the past prefix;
+                    // the current K/V blocks are contiguous in `[s, d]` as well.
+                    let cur = k.seq * cache_dim;
+                    let dst_cur = dst_base + past_len * cache_dim;
+                    let src_cur = head * k.seq * cache_dim;
+                    present_k[dst_cur..dst_cur + cur]
+                        .copy_from_slice(&k.data[src_cur..src_cur + cur]);
+                    present_v[dst_cur..dst_cur + cur]
+                        .copy_from_slice(&v.data[src_cur..src_cur + cur]);
+                }
+            }
+            owned_present_k = present_k;
+            owned_present_v = present_v;
+            (&owned_present_k[..], &owned_present_v[..])
+        };
 
         let scale = self
             .scale
@@ -1062,18 +1190,23 @@ impl Kernel for GroupQueryAttentionKernel {
         } else {
             write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
         }
-        if outputs.len() >= 2 {
-            if decode_fast_write {
-                write_decode_output(&mut outputs[1], &present_k)?;
-            } else {
-                write_dense_f32_narrow("GroupQueryAttention", &mut outputs[1], &present_k)?;
+        // In the in-place fast path the present outputs ARE the past buffer and
+        // were already updated in place above, so re-emitting them would be a
+        // redundant self-copy — skip it. The copy path materializes them here.
+        if !in_place {
+            if outputs.len() >= 2 {
+                if decode_fast_write {
+                    write_decode_output(&mut outputs[1], present_k)?;
+                } else {
+                    write_dense_f32_narrow("GroupQueryAttention", &mut outputs[1], present_k)?;
+                }
             }
-        }
-        if outputs.len() >= 3 {
-            if decode_fast_write {
-                write_decode_output(&mut outputs[2], &present_v)?;
-            } else {
-                write_dense_f32_narrow("GroupQueryAttention", &mut outputs[2], &present_v)?;
+            if outputs.len() >= 3 {
+                if decode_fast_write {
+                    write_decode_output(&mut outputs[2], present_v)?;
+                } else {
+                    write_dense_f32_narrow("GroupQueryAttention", &mut outputs[2], present_v)?;
+                }
             }
         }
         #[cfg(feature = "gqa_phase_profile")]
@@ -2933,6 +3066,411 @@ mod tests {
                 .map(half::bf16::from_f32)
                 .map(half::bf16::to_bits)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── In-place persistent KV (present==past device binding) ────────────────
+    //
+    // These tests exercise the append-only fast path that fires when the
+    // executor aliases each `present` output onto its `past` input at full
+    // physical capacity (the CPU analogue of the CUDA in-place KV cache). They
+    // construct that aliasing directly with raw pointers — exactly as the
+    // executor does under `run_with_device_bindings` — and prove byte-for-byte
+    // parity with the ordinary copy path, correct fallback when NOT aliased, and
+    // correctness across the prefill→decode boundary.
+
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut};
+    use onnx_runtime_ir::compute_contiguous_strides;
+
+    const IP_NUM_HEADS: usize = 4;
+    const IP_KV_HEADS: usize = 2;
+    const IP_DIM: usize = 2;
+
+    fn raw_gqa_kernel(local_window_size: i64, do_rotary: bool) -> GroupQueryAttentionKernel {
+        GroupQueryAttentionKernel {
+            num_heads: IP_NUM_HEADS,
+            kv_num_heads: IP_KV_HEADS,
+            scale: None,
+            do_rotary,
+            rotary_interleaved: false,
+            local_window_size,
+            softcap: 0.0,
+        }
+    }
+
+    /// Build a `[1, KV, capacity, DIM]` BNSH capacity buffer, filling the first
+    /// `past` sequence rows of each head from `past_data` (laid out
+    /// `[1, KV, past, DIM]`) and every capacity row beyond `past` with `tail`.
+    fn build_capacity_buffer(capacity: usize, past: usize, past_data: &[f32], tail: f32) -> Vec<f32> {
+        let mut buf = vec![tail; IP_KV_HEADS * capacity * IP_DIM];
+        for h in 0..IP_KV_HEADS {
+            for s in 0..past {
+                for x in 0..IP_DIM {
+                    buf[(h * capacity + s) * IP_DIM + x] = past_data[(h * past + s) * IP_DIM + x];
+                }
+            }
+        }
+        buf
+    }
+
+    /// Extract the valid `[0, total)` sequence prefix of every head from a
+    /// `[1, KV, capacity, DIM]` buffer, yielding a dense `[1, KV, total, DIM]`.
+    fn head_prefix(buf: &[f32], capacity: usize, total: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(IP_KV_HEADS * total * IP_DIM);
+        for h in 0..IP_KV_HEADS {
+            for s in 0..total {
+                for x in 0..IP_DIM {
+                    out.push(buf[(h * capacity + s) * IP_DIM + x]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Run one step through the copy path: a distinct `[1, KV, past, DIM]` past
+    /// input and freshly-allocated present outputs. Returns
+    /// `(attention_output, present_key, present_value)` with the present caches
+    /// densely shaped `[1, KV, total, DIM]`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_copy_step(
+        kernel: &dyn Kernel,
+        past: usize,
+        total: usize,
+        q_seq: usize,
+        query: &[f32],
+        cur_k: &[f32],
+        cur_v: &[f32],
+        past_key: &[f32],
+        past_value: &[f32],
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut out = Owned::zeros_f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM]);
+        let mut pk = Owned::zeros_f32(&[1, IP_KV_HEADS, total, IP_DIM]);
+        let mut pv = Owned::zeros_f32(&[1, IP_KV_HEADS, total, IP_DIM]);
+        let past_k_owned = Owned::f32(&[1, IP_KV_HEADS, past, IP_DIM], past_key);
+        let past_v_owned = Owned::f32(&[1, IP_KV_HEADS, past, IP_DIM], past_value);
+        kernel
+            .execute(
+                &[
+                    Owned::f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM], query).view(),
+                    Owned::f32(&[1, q_seq, IP_KV_HEADS * IP_DIM], cur_k).view(),
+                    Owned::f32(&[1, q_seq, IP_KV_HEADS * IP_DIM], cur_v).view(),
+                    past_k_owned.view(),
+                    past_v_owned.view(),
+                    Owned::i32(&[1], &[(total - 1) as i32]).view(),
+                    Owned::i32(&[], &[total as i32]).view(),
+                ],
+                &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
+            )
+            .unwrap();
+        (out.to_f32(), pk.to_f32(), pv.to_f32())
+    }
+
+    /// Run one step through the in-place path: `kbuf`/`vbuf` are a
+    /// `[1, KV, capacity, DIM]` buffer whose `[0, past)` rows already hold the
+    /// past cache. The current step's K/V is appended in place and the buffers
+    /// are mutated; returns the attention output.
+    #[allow(clippy::too_many_arguments)]
+    fn run_inplace_step(
+        kernel: &dyn Kernel,
+        capacity: usize,
+        total: usize,
+        q_seq: usize,
+        query: &[f32],
+        cur_k: &[f32],
+        cur_v: &[f32],
+        kbuf: &mut [f32],
+        vbuf: &mut [f32],
+    ) -> Vec<f32> {
+        let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
+        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let k_ptr = kbuf.as_mut_ptr();
+        let v_ptr = vbuf.as_mut_ptr();
+        let query_owned = Owned::f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM], query);
+        let ck = Owned::f32(&[1, q_seq, IP_KV_HEADS * IP_DIM], cur_k);
+        let cv = Owned::f32(&[1, q_seq, IP_KV_HEADS * IP_DIM], cur_v);
+        let seqlens = Owned::i32(&[1], &[(total - 1) as i32]);
+        let tsl = Owned::i32(&[], &[total as i32]);
+        let mut out = Owned::zeros_f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM]);
+        // Past inputs (const) and present outputs (mut) intentionally alias the
+        // same capacity buffers — this is the structural signal the kernel gates
+        // on. Raw pointers mirror the executor's device-binding wiring.
+        let past_k_view = TensorView::new(
+            DevicePtr(k_ptr as *const std::ffi::c_void),
+            DataType::Float32,
+            &kv_shape,
+            &kv_strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        let past_v_view = TensorView::new(
+            DevicePtr(v_ptr as *const std::ffi::c_void),
+            DataType::Float32,
+            &kv_shape,
+            &kv_strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        let present_k = TensorMut::new(
+            DevicePtrMut(k_ptr as *mut std::ffi::c_void),
+            DataType::Float32,
+            &kv_shape,
+            &kv_strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        let present_v = TensorMut::new(
+            DevicePtrMut(v_ptr as *mut std::ffi::c_void),
+            DataType::Float32,
+            &kv_shape,
+            &kv_strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        kernel
+            .execute(
+                &[
+                    query_owned.view(),
+                    ck.view(),
+                    cv.view(),
+                    past_k_view,
+                    past_v_view,
+                    seqlens.view(),
+                    tsl.view(),
+                ],
+                &mut [out.view_mut(), present_k, present_v],
+            )
+            .unwrap();
+        out.to_f32()
+    }
+
+    #[test]
+    fn inplace_decode_matches_copy_path_with_spare_capacity() {
+        let kernel = gqa_kernel(&[]);
+        let past = 2usize;
+        let total = 3usize;
+        let capacity = 6usize; // capacity strictly greater than total
+        let query = vec![1., 0., 1., 0., 0., 1., 0., 1.];
+        // Past cache laid out [1, KV, past, DIM].
+        let past_k = vec![1., 0., 0., 1., 10., 0., 0., 10.];
+        let past_v = vec![1., 2., 3., 4., 10., 20., 30., 40.];
+        let cur_k = vec![1., 1., 10., 10.];
+        let cur_v = vec![5., 6., 50., 60.];
+
+        let (copy_out, copy_pk, copy_pv) =
+            run_copy_step(kernel.as_ref(), past, total, 1, &query, &cur_k, &cur_v, &past_k, &past_v);
+
+        // The tail sentinel proves the kernel never rewrites capacity beyond the
+        // live length: rows [total, capacity) must survive untouched.
+        const TAIL: f32 = -999.0;
+        let mut kbuf = build_capacity_buffer(capacity, past, &past_k, TAIL);
+        let mut vbuf = build_capacity_buffer(capacity, past, &past_v, TAIL);
+        let inplace_out =
+            run_inplace_step(kernel.as_ref(), capacity, total, 1, &query, &cur_k, &cur_v, &mut kbuf, &mut vbuf);
+
+        assert_eq!(inplace_out, copy_out, "attention output must be byte-identical");
+        assert_eq!(head_prefix(&kbuf, capacity, total), copy_pk, "present_key prefix mismatch");
+        assert_eq!(head_prefix(&vbuf, capacity, total), copy_pv, "present_value prefix mismatch");
+        // Tail untouched: append-only, no capacity rewrite.
+        for h in 0..IP_KV_HEADS {
+            for s in total..capacity {
+                for x in 0..IP_DIM {
+                    assert_eq!(kbuf[(h * capacity + s) * IP_DIM + x], TAIL, "key tail rewritten");
+                    assert_eq!(vbuf[(h * capacity + s) * IP_DIM + x], TAIL, "value tail rewritten");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inplace_decode_matches_copy_path_at_exact_capacity() {
+        // capacity == total ⇒ the in-place buffer layout is identical to the
+        // copy path's present, so the whole cache compares byte-for-byte.
+        let kernel = gqa_kernel(&[]);
+        let past = 3usize;
+        let total = 4usize;
+        let capacity = 4usize;
+        let query = vec![0.5, -0.5, 1., 0., 0.25, 1., -1., 0.75];
+        let past_k = vec![1., 0., 0., 1., 2., -1., 10., 0., 0., 10., 5., 5.];
+        let past_v = vec![1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60.];
+        let cur_k = vec![0.5, 0.5, 7., 7.];
+        let cur_v = vec![7., 8., 70., 80.];
+
+        let (copy_out, copy_pk, copy_pv) =
+            run_copy_step(kernel.as_ref(), past, total, 1, &query, &cur_k, &cur_v, &past_k, &past_v);
+
+        let mut kbuf = build_capacity_buffer(capacity, past, &past_k, 0.0);
+        let mut vbuf = build_capacity_buffer(capacity, past, &past_v, 0.0);
+        let inplace_out =
+            run_inplace_step(kernel.as_ref(), capacity, total, 1, &query, &cur_k, &cur_v, &mut kbuf, &mut vbuf);
+
+        assert_eq!(inplace_out, copy_out);
+        assert_eq!(kbuf, copy_pk);
+        assert_eq!(vbuf, copy_pv);
+    }
+
+    #[test]
+    fn inplace_prefill_then_decode_boundary_matches_copy_path() {
+        // Prefill P tokens into an empty capacity buffer, then decode one token,
+        // driving BOTH the copy path and the in-place path with the same inputs
+        // and asserting identical logits/cache at every step.
+        let kernel = gqa_kernel(&[]);
+        let capacity = 8usize;
+        // ── Prefill: past=0, total=P, q_seq=P ──
+        let prefill = 3usize;
+        let query_p = vec![
+            1., 0., 0., 1., 1., 1., 0., 0., // s0
+            0., 1., 1., 0., 0., 1., 1., 1., // s1
+            1., 1., 0., 0., 1., 0., 0., 1., // s2
+        ];
+        let cur_k_p = vec![1., 0., 0., 1., 0., 1., 1., 0., 1., 1., 0., 1.];
+        let cur_v_p = vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.];
+        let empty: Vec<f32> = Vec::new();
+        let (copy_out_p, copy_pk_p, copy_pv_p) = run_copy_step(
+            kernel.as_ref(), 0, prefill, prefill, &query_p, &cur_k_p, &cur_v_p, &empty, &empty,
+        );
+        let mut kbuf = vec![0.0f32; IP_KV_HEADS * capacity * IP_DIM];
+        let mut vbuf = vec![0.0f32; IP_KV_HEADS * capacity * IP_DIM];
+        let inplace_out_p = run_inplace_step(
+            kernel.as_ref(), capacity, prefill, prefill, &query_p, &cur_k_p, &cur_v_p, &mut kbuf, &mut vbuf,
+        );
+        assert_eq!(inplace_out_p, copy_out_p, "prefill logits mismatch");
+        assert_eq!(head_prefix(&kbuf, capacity, prefill), copy_pk_p, "prefill key mismatch");
+        assert_eq!(head_prefix(&vbuf, capacity, prefill), copy_pv_p, "prefill value mismatch");
+
+        // ── Decode: past=P, total=P+1, q_seq=1 — reads the prefilled rows ──
+        let total = prefill + 1;
+        let query_d = vec![0.3, 0.7, 1., -1., 0., 1., 0.5, 0.5];
+        let cur_k_d = vec![0.9, 0.1, 2., 2.];
+        let cur_v_d = vec![13., 14., 15., 16.];
+        // The copy path's past is the prefill present cache [1, KV, P, DIM].
+        let (copy_out_d, copy_pk_d, copy_pv_d) = run_copy_step(
+            kernel.as_ref(), prefill, total, 1, &query_d, &cur_k_d, &cur_v_d, &copy_pk_p, &copy_pv_p,
+        );
+        let inplace_out_d = run_inplace_step(
+            kernel.as_ref(), capacity, total, 1, &query_d, &cur_k_d, &cur_v_d, &mut kbuf, &mut vbuf,
+        );
+        assert_eq!(inplace_out_d, copy_out_d, "decode logits mismatch");
+        assert_eq!(head_prefix(&kbuf, capacity, total), copy_pk_d, "decode key mismatch");
+        assert_eq!(head_prefix(&vbuf, capacity, total), copy_pv_d, "decode value mismatch");
+    }
+
+    #[test]
+    fn inplace_matches_copy_path_with_rotary_and_local_window() {
+        // The append fast path must be invariant to rotary embedding and local
+        // (sliding-window) masking, which alter K storage and attention bounds.
+        let past = 4usize;
+        let total = 5usize;
+        let capacity = 7usize;
+        let extra = vec![
+            ("num_heads", Attribute::Int(IP_NUM_HEADS as i64)),
+            ("kv_num_heads", Attribute::Int(IP_KV_HEADS as i64)),
+            ("local_window_size", Attribute::Int(3)),
+        ];
+        let kernel = kernel(&extra);
+        let query: Vec<f32> = (0..IP_NUM_HEADS * IP_DIM).map(|i| mixed_scale_value(i, 11)).collect();
+        let past_k: Vec<f32> = (0..IP_KV_HEADS * past * IP_DIM).map(|i| mixed_scale_value(i, 22)).collect();
+        let past_v: Vec<f32> = (0..IP_KV_HEADS * past * IP_DIM).map(|i| mixed_scale_value(i, 33)).collect();
+        let cur_k: Vec<f32> = (0..IP_KV_HEADS * IP_DIM).map(|i| mixed_scale_value(i, 44)).collect();
+        let cur_v: Vec<f32> = (0..IP_KV_HEADS * IP_DIM).map(|i| mixed_scale_value(i, 55)).collect();
+
+        let (copy_out, copy_pk, copy_pv) =
+            run_copy_step(kernel.as_ref(), past, total, 1, &query, &cur_k, &cur_v, &past_k, &past_v);
+        let mut kbuf = build_capacity_buffer(capacity, past, &past_k, 42.0);
+        let mut vbuf = build_capacity_buffer(capacity, past, &past_v, 42.0);
+        let inplace_out =
+            run_inplace_step(kernel.as_ref(), capacity, total, 1, &query, &cur_k, &cur_v, &mut kbuf, &mut vbuf);
+
+        assert_eq!(inplace_out, copy_out);
+        assert_eq!(head_prefix(&kbuf, capacity, total), copy_pk);
+        assert_eq!(head_prefix(&vbuf, capacity, total), copy_pv);
+    }
+
+    #[test]
+    fn detect_inplace_kv_gate_true_only_on_structural_aliasing() {
+        let kernel = raw_gqa_kernel(0, false);
+        let capacity = 5usize;
+        let total = 3usize;
+        let present_seq = capacity; // == cache.seq for the aliased buffer
+        let present_len = IP_KV_HEADS * present_seq * IP_DIM;
+        let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
+        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let mut kbuf = vec![0.0f32; present_len];
+        let mut vbuf = vec![0.0f32; present_len];
+        let k_ptr = kbuf.as_mut_ptr();
+        let v_ptr = vbuf.as_mut_ptr();
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let make_view = |ptr: *const f32| {
+            TensorView::new(DevicePtr(ptr as *const std::ffi::c_void), DataType::Float32, &kv_shape, &kv_strides, cpu)
+        };
+        let make_mut = |ptr: *mut f32| {
+            TensorMut::new(DevicePtrMut(ptr as *mut std::ffi::c_void), DataType::Float32, &kv_shape, &kv_strides, cpu)
+        };
+        let past_view_gate = make_view(k_ptr);
+        let past_key = PastCache::from_cache(&past_view_gate, IP_KV_HEADS, "past_key").unwrap();
+
+        // Aliased (present==past) ⇒ fast path fires.
+        let out0 = Owned::zeros_f32(&[1, 1, IP_NUM_HEADS * IP_DIM]);
+        let inputs_aliased = [
+            out0.view(), out0.view(), out0.view(),
+            make_view(k_ptr), make_view(v_ptr),
+            out0.view(), out0.view(),
+        ];
+        let outputs_aliased = [make_mut(k_ptr.cast()), make_mut(k_ptr), make_mut(v_ptr)];
+        assert!(
+            kernel.detect_inplace_kv(&inputs_aliased, &outputs_aliased, present_seq, present_len, Some(&past_key)),
+            "structural present==past aliasing must be detected"
+        );
+
+        // Distinct present buffers ⇒ copy path.
+        let mut other_k = vec![0.0f32; present_len];
+        let mut other_v = vec![0.0f32; present_len];
+        let outputs_distinct = [make_mut(k_ptr.cast()), make_mut(other_k.as_mut_ptr()), make_mut(other_v.as_mut_ptr())];
+        assert!(
+            !kernel.detect_inplace_kv(&inputs_aliased, &outputs_distinct, present_seq, present_len, Some(&past_key)),
+            "non-aliased present must fall back to the copy path"
+        );
+
+        // Capacity does not cover total (present_sequence_length != cache.seq).
+        assert!(
+            !kernel.detect_inplace_kv(&inputs_aliased, &outputs_aliased, total, present_len, Some(&past_key)),
+            "capacity-limited case must fall back"
+        );
+
+        // No past cache ⇒ copy path.
+        assert!(
+            !kernel.detect_inplace_kv(&inputs_aliased, &outputs_aliased, present_seq, present_len, None),
+            "absent past must fall back"
+        );
+    }
+
+    #[test]
+    fn detect_inplace_kv_gate_rejects_f16_cache() {
+        let kernel = raw_gqa_kernel(0, false);
+        let capacity = 4usize;
+        let present_seq = capacity;
+        let present_len = IP_KV_HEADS * present_seq * IP_DIM;
+        let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
+        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        // f16 aliased buffer: the append path only supports contiguous f32, so
+        // the gate must reject it and preserve the widen/copy path.
+        let mut kbuf = Owned::f16(&kv_shape, &vec![0.0; present_len]);
+        let mut vbuf = Owned::f16(&kv_shape, &vec![0.0; present_len]);
+        let k_ptr = kbuf.bytes.as_mut_ptr() as *mut std::ffi::c_void;
+        let v_ptr = vbuf.bytes.as_mut_ptr() as *mut std::ffi::c_void;
+        let past_view = TensorView::new(DevicePtr(k_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu);
+        let past_key = PastCache::from_cache(&past_view, IP_KV_HEADS, "past_key").unwrap();
+        let out0 = Owned::zeros_f32(&[1, 1, IP_NUM_HEADS * IP_DIM]);
+        let inputs = [
+            out0.view(), out0.view(), out0.view(),
+            TensorView::new(DevicePtr(k_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
+            TensorView::new(DevicePtr(v_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
+            out0.view(), out0.view(),
+        ];
+        let outputs = [
+            TensorMut::new(DevicePtrMut(out0.bytes.as_ptr() as *mut std::ffi::c_void), DataType::Float32, &kv_shape, &kv_strides, cpu),
+            TensorMut::new(DevicePtrMut(k_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
+            TensorMut::new(DevicePtrMut(v_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
+        ];
+        assert!(
+            !kernel.detect_inplace_kv(&inputs, &outputs, present_seq, present_len, Some(&past_key)),
+            "f16 caches must not take the f32-only in-place path"
         );
     }
 }
