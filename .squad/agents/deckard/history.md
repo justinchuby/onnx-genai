@@ -90,3 +90,8 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default classification but was superseded by Sapper's v3 raw signature fix.
 
 - 2026-07-23: Authored Phi int8 fused norm work (`c644b0f`, +13% Phi) and root-caused/fixed the real Qwen int4 fused-GEMV regression with `12efc92` (`HasZp` specialization), merged to main.
+
+## 2026-07-23T14:55:00Z — Qwen-7B decode roofline no-go
+
+- Completed Qwen-7B column-split, true K-slice split-K, and vectorized-load/roofline investigations. All were no-go; the remaining int4 GEMVs are shared-memory/weight-read-efficiency bound, so main stayed clean.
+- Standalone Phi int8-zp split-K remains a validated +2.1% branch result with clean CUDA tests/clippy.

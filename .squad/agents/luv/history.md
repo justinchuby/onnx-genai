@@ -55,3 +55,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 2026-07-21T23:55Z — Reviewed/approved VLM WP0 metadata and WP3 generic every_step executor; segment decisions now record both landings.
 ## 2026-07-22T12:00:00Z — Partial CUDA-graph Phase 0 landed
 - Landed Phase 0 capture path-kind diagnostics on `main` as `3c94a57`, adding structural `CapturePathKind`/`SeamReason` metadata and seam labels without changing partitioning behavior. Deckard reviewed 🟢 GREEN.
+
+## 2026-07-23T14:55:00Z — Domain normalization review
+
+- Cleared Sapper's IR domain-normalization refactor in both full and delta passes; the change merged as `06d71ba` + `1073404`.

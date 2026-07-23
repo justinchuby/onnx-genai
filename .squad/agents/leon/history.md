@@ -103,3 +103,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 2026-07-21T23:55Z — VLM WP2 native image processor landed via Sapper revision after Chew rejection; living VLM scope artifact preserved in inbox.
 
 - 2026-07-22T00:00:00Z — Reviewed Batty CUDA-graph auto-enable 🟢 GREEN: 7/7 criteria passed, no model-name gating, correct env/metadata precedence, and capture-safety fallback intact.
+
+## 2026-07-23T14:55:00Z — Mobius PR #404 non-MoE fixes
+
+- Addressed eleven non-MoE PR #404 comments at `958f2eb`, including INT64 TopK indices, finite mask minima, indexer schedule length, export hygiene, and MTP option-a. Gaff reviewed DSA correctness green.

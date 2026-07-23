@@ -165,3 +165,31 @@ The full source notes for this reconciliation are preserved in `2026-07-23T00-00
 **By:** Deckard
 **What:** Int8-zp prefetch reduced scoreboard stalls but left the ~20µs kernel and end-to-end decode flat. Split-K increased waves/SM but also washed or regressed because the serial full-vector RMSNorm reduction/staging prologue dominates; both spikes were reverted.
 **Why:** Grid-starvation remedies help pure GEMVs, not this fused kernel's Amdahl-limited prologue; investigate the standalone grid-starved int8 down-projection instead.
+
+
+## 2026-07-23 — Domain normalization, Mobius QMoE emitter, and Qwen-7B roofline
+
+### Normalize default ONNX domains at IR load boundaries
+**By:** Sapper
+**What:** `ai.onnx` is normalized to the empty default domain at load time, with the new IR domain helper collapsing roughly fifteen call sites to `Node::is_default_domain()` and removing duplicate helper logic; merged to `origin/main` as `06d71ba` and `1073404` after Luv green reviews.
+**Why:** Canonical domain representation prevents repeated ad-hoc normalization and keeps operator dispatch/default-domain checks consistent.
+
+### Record Qwen-7B down-projection column-split as a no-go
+**By:** Deckard
+**What:** A bounded Qwen-7B decode spike found the down-projection GEMV grid-starved on paper, but column-splitting doubled activation staging and washed end-to-end; the gate/up shared-prefetch attempt regressed. No code shipped.
+**Why:** The clean bounded levers did not convert into throughput, and true K-slice split-K required a separate scratch/reduction design before being attempted.
+
+### Record Qwen-7B true K-slice split-K as a no-go
+**By:** Deckard
+**What:** A correct two-kernel K-slice split-K implementation filled waves/SM for the int4 down-projection, but the partial kernel stayed flat and the reduction node regressed Qwen-7B about 2.3%; the prototype was reverted.
+**Why:** The kernel is limited by int4 weight-read efficiency/shared-memory latency rather than available grid parallelism.
+
+### Close Qwen-7B int4 vectorized-load investigation as roofline-limited
+**By:** Deckard
+**What:** Profile-only analysis showed int4 weight loads already use contiguous 128-byte warp regions with about 94–100% global-load sector efficiency; dominant stalls are short-scoreboard shared-memory dependencies. No load-pattern code changed.
+**Why:** 128-bit load widening or coalescing changes cannot reduce bytes moved or the binding shared-memory dependency; further 7B micro-optimization should stop absent a larger GEMV redesign.
+
+### Keep standalone Phi int8 zero-point split-K as a validated win
+**By:** Deckard
+**What:** The standalone asymmetric int8 GEMV split-K path improved Phi end-to-end throughput about 2.1% while leaving Qwen unchanged by construction; CUDA tests and clippy were clean on the feature branch.
+**Why:** Unlike fused int8 kernels, this standalone GEMV has no serial RMSNorm prologue, so K_SPLIT=2 converts grid fill into useful wall-time.

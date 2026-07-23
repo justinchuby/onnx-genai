@@ -142,3 +142,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Sapper's WP-B3 v3 admission fix landed at `3d84b9b`, making raw `GraphProto.input` authoritative for optional fallback validation.
+
+## 2026-07-23T14:55:00Z — Domain normalization merged
+
+- Landed IR domain normalization (`ai.onnx` → default empty domain at load) as `06d71ba` + `1073404`; Luv cleared both full and delta reviews.

@@ -133,3 +133,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-22T21-35-00Z — ORT CUDA attention review
 Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CUDA_ATTENTION` bypassed the typed `RuntimeConfig` registry. Named Deckard as reviser and locked Howie out of this artifact.
+
+## 2026-07-23T14:55:00Z — Mobius PR #404 DSA review
+
+- Reviewed Leon's PR #404 DSA correctness fixes green: INT64 TopK indices, target-dtype finite mask handling, and indexer schedule length were cleared.
