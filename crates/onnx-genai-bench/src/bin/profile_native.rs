@@ -11,6 +11,7 @@ use onnx_genai_engine::{
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
     ProcessorChain,
 };
+use onnx_genai_engine::logits::{MinPProcessor, RepetitionPenaltyProcessor};
 use onnx_genai_ort::{Tokenizer, available_execution_providers};
 use onnx_runtime_session::InferenceSession;
 
@@ -71,6 +72,51 @@ struct Args {
     /// --dump-logprobs.
     #[arg(long)]
     prompt_ids: Option<PathBuf>,
+    /// HF-style repetition penalty applied host-side to the output logits before
+    /// token selection (divides positive / multiplies negative logits of tokens
+    /// already in the prompt+generated stream). Default 1.0 is OFF and keeps the
+    /// captured device-argmax greedy fast path byte-identical.
+    #[arg(long, default_value_t = 1.0)]
+    repetition_penalty: f32,
+    /// Optional window: only penalize the most recent N tokens of the combined
+    /// prompt+generated stream. Unset penalizes the whole history.
+    #[arg(long)]
+    repetition_window: Option<usize>,
+    /// Min-p nucleus threshold (relative to the top token's probability). Default
+    /// 0.0 is OFF. Only affects categorical (non-greedy) sampling.
+    #[arg(long, default_value_t = 0.0)]
+    min_p: f32,
+}
+
+/// Whether any host-side sampling policy (penalty / min-p) is enabled. When
+/// false the decode path is byte-identical to the default greedy benchmark and,
+/// on CUDA, keeps the captured device-argmax fast path.
+fn sampling_enabled(args: &Args) -> bool {
+    args.repetition_penalty != 1.0 || args.min_p > 0.0
+}
+
+/// Copy the CLI sampling policy onto generation options (default values are
+/// no-ops, preserving existing greedy behavior exactly).
+fn apply_sampling_options(options: &mut GenerateOptions, args: &Args) {
+    options.repetition_penalty = args.repetition_penalty;
+    options.repetition_window = args.repetition_window;
+    options.min_p = args.min_p;
+}
+
+/// Build the host-side processor chain from the CLI sampling policy. Empty when
+/// sampling is OFF, so the greedy fast path stays armed.
+fn sampling_chain(args: &Args) -> ProcessorChain {
+    let mut chain = ProcessorChain::new();
+    if args.repetition_penalty != 1.0 {
+        chain.add(Box::new(RepetitionPenaltyProcessor {
+            penalty: args.repetition_penalty,
+            window: args.repetition_window,
+        }));
+    }
+    if args.min_p > 0.0 {
+        chain.add(Box::new(MinPProcessor { min_p: args.min_p }));
+    }
+    chain
 }
 
 fn model_file(path: &Path) -> PathBuf {
@@ -96,29 +142,49 @@ fn generate(
     prompt_tokens: &[u32],
     tokenizer: &Tokenizer,
     tokens: usize,
+    args: &Args,
 ) -> Result<Vec<u32>> {
-    let options = GenerateOptions {
+    let mut options = GenerateOptions {
         max_new_tokens: tokens,
         temperature: 0.0,
         greedy: true,
         stop_on_eos: false,
         ..GenerateOptions::default()
     };
-    let result = session.generate(prompt_tokens, &options, &ProcessorChain::new(), tokenizer)?;
+    apply_sampling_options(&mut options, args);
+    // Empty when sampling is OFF, so the greedy device fast path stays armed;
+    // otherwise the penalty/min-p run host-side on the output logits, outside
+    // the captured graph replay.
+    let chain = sampling_chain(args);
+    let result = session.generate(prompt_tokens, &options, &chain, tokenizer)?;
     Ok(result.token_ids)
 }
 
-fn request(prompt: &str, tokens: usize) -> GenerateRequest {
-    let mut request = GenerateRequest::new(prompt.to_string());
+fn request(args: &Args, tokens: usize) -> GenerateRequest {
+    let mut request = GenerateRequest::new(args.prompt.clone());
     request.options.max_new_tokens = tokens;
     request.options.temperature = 0.0;
     request.options.greedy = true;
     request.options.stop_on_eos = false;
+    apply_sampling_options(&mut request.options, args);
     request
 }
 
-fn pipeline_request(prompt: &str, tokens: usize) -> PipelineGenerateRequest {
-    PipelineGenerateRequest::new(request(prompt, tokens))
+fn pipeline_request(args: &Args, tokens: usize) -> PipelineGenerateRequest {
+    PipelineGenerateRequest::new(request(args, tokens))
+}
+
+fn describe_sampling(args: &Args) -> String {
+    if !sampling_enabled(args) {
+        return "sampling: OFF (greedy, byte-identical fast path)".to_string();
+    }
+    let window = args
+        .repetition_window
+        .map_or_else(|| "all".to_string(), |w| w.to_string());
+    format!(
+        "sampling: ON repetition_penalty={} repetition_window={} min_p={}",
+        args.repetition_penalty, window, args.min_p
+    )
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -133,6 +199,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
     }
+    println!("profile_native: {}", describe_sampling(args));
 
     let mut config = EngineConfig {
         decode_backend: EngineDecodeBackend::Native,
@@ -145,7 +212,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate(request(&args.prompt, args.tokens))
+                .generate(request(args, args.tokens))
                 .context("steady warmup generation")?,
         );
     }
@@ -162,7 +229,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             Ok(())
         };
         let result = engine
-            .generate_with_callback(request(&args.prompt, args.tokens), Some(&mut callback))
+            .generate_with_callback(request(args, args.tokens), Some(&mut callback))
             .context("steady measured generation")?;
         if token_times.len() <= args.decode_skip {
             bail!(
@@ -250,7 +317,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate_with_pipeline_request(pipeline_request(&args.prompt, args.tokens))
+                .generate_with_pipeline_request(pipeline_request(args, args.tokens))
                 .context("pipeline warmup generation")?,
         );
     }
@@ -270,7 +337,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             };
             let result = engine
                 .generate_with_callback(
-                    pipeline_request(&args.prompt, args.tokens),
+                    pipeline_request(args, args.tokens),
                     Some(&mut callback),
                 )
                 .context("steady pipeline measured generation")?;
@@ -332,7 +399,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.runs {
         let start = Instant::now();
         let result = engine
-            .generate_with_pipeline_request(pipeline_request(&args.prompt, args.tokens))
+            .generate_with_pipeline_request(pipeline_request(args, args.tokens))
             .context("pipeline measured generation")?;
         elapsed += start.elapsed();
         generated += result.token_ids.len();
@@ -447,6 +514,7 @@ fn main() -> Result<()> {
         args.warmups,
         args.runs
     );
+    println!("profile_native: {}", describe_sampling(&args));
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
         let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
             let raw = std::fs::read_to_string(ids_path)
@@ -512,6 +580,7 @@ fn main() -> Result<()> {
             &prompt_tokens,
             &tokenizer,
             args.tokens,
+            &args,
         )?);
         session.set_trace_context(onnx_runtime_tracer::TraceContext::noop());
         let json = collector.to_chrome_json();
@@ -530,6 +599,7 @@ fn main() -> Result<()> {
             &prompt_tokens,
             &tokenizer,
             args.tokens,
+            &args,
         )?);
     }
 
@@ -539,7 +609,7 @@ fn main() -> Result<()> {
     let mut reference_tokens = None;
     for _ in 0..args.runs {
         let start = Instant::now();
-        let tokens = generate(&mut session, &prompt_tokens, &tokenizer, args.tokens)?;
+        let tokens = generate(&mut session, &prompt_tokens, &tokenizer, args.tokens, &args)?;
         elapsed += start.elapsed();
         generated += tokens.len();
         if let Some(reference) = &reference_tokens {

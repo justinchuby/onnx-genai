@@ -833,6 +833,10 @@ impl LogitProcessor for TemperatureProcessor {
 
 pub struct RepetitionPenaltyProcessor {
     pub penalty: f32,
+    /// When `Some(n)`, only the most recent `n` tokens of the combined
+    /// prompt+generated stream are penalized; `None` penalizes the whole
+    /// history (HF default behavior).
+    pub window: Option<usize>,
 }
 
 impl LogitProcessor for RepetitionPenaltyProcessor {
@@ -841,11 +845,17 @@ impl LogitProcessor for RepetitionPenaltyProcessor {
             return;
         }
 
+        let total = context.prompt_tokens.len() + context.generated_tokens.len();
+        let skip = match self.window {
+            Some(window) => total.saturating_sub(window),
+            None => 0,
+        };
         let mut seen = HashSet::new();
         for &token_id in context
             .prompt_tokens
             .iter()
             .chain(context.generated_tokens.iter())
+            .skip(skip)
         {
             if !seen.insert(token_id) {
                 continue;
@@ -1116,10 +1126,49 @@ mod tests {
 
     #[test]
     fn repetition_penalty_applies_once_per_seen_token() {
-        let processor = RepetitionPenaltyProcessor { penalty: 2.0 };
+        let processor = RepetitionPenaltyProcessor {
+            penalty: 2.0,
+            window: None,
+        };
         let mut logits = vec![4.0, -4.0, 8.0];
         processor.process(&mut logits, &context(vec![0, 0], vec![1, 1]));
         assert_eq!(logits, vec![2.0, -8.0, 8.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_window_limits_to_recent_tokens() {
+        // Combined stream is prompt [0,1] ++ generated [2,3]; a window of 2 keeps
+        // only the last two tokens (2 and 3), leaving 0 and 1 untouched.
+        let processor = RepetitionPenaltyProcessor {
+            penalty: 2.0,
+            window: Some(2),
+        };
+        let mut logits = vec![4.0, 4.0, 4.0, -4.0];
+        processor.process(&mut logits, &context(vec![0, 1], vec![2, 3]));
+        assert_eq!(logits, vec![4.0, 4.0, 2.0, -8.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_window_zero_penalizes_nothing() {
+        let processor = RepetitionPenaltyProcessor {
+            penalty: 2.0,
+            window: Some(0),
+        };
+        let mut logits = vec![4.0, 4.0];
+        processor.process(&mut logits, &context(vec![0], vec![1]));
+        assert_eq!(logits, vec![4.0, 4.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_disabled_is_identity() {
+        let processor = RepetitionPenaltyProcessor {
+            penalty: 1.0,
+            window: None,
+        };
+        let mut logits = vec![4.0, -4.0, 8.0];
+        let original = logits.clone();
+        processor.process(&mut logits, &context(vec![0, 1], vec![2]));
+        assert_eq!(logits, original);
     }
 
     #[test]
