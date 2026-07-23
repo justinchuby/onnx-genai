@@ -33,10 +33,10 @@
 //! parity contract, not a universal greedy-token identity guarantee; model-level
 //! greedy parity is established empirically by profiling.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::Node;
 
 // Below this many row × key × head-dimension elements, Rayon synchronization
 // costs more than the attention work on the decode pool.
@@ -390,6 +390,40 @@ fn rotate(
     Ok(())
 }
 
+/// Widen only the first `rows` rows (`rows * half` contiguous elements) of a
+/// rank-2 `[cache_rows, half]` rotary `cos`/`sin` cache into `f32`.
+///
+/// The rotary caches ship the model's *entire* position table (commonly
+/// `max_position_embeddings` = tens of thousands of rows). Decode/prefill only
+/// index positions up to the live context length, so widening the whole cache
+/// (`f16`→`f32`) on every `GroupQueryAttention` call was an `O(cache_rows)`
+/// per-token cost dwarfing the attention itself; this bounds it to the rows
+/// actually addressed. Contiguous `f16`/`f32` caches take the fast path; exotic
+/// layouts fall back to a full widen + truncate (correct, rarely hit).
+fn widen_rotary_prefix(op: &str, view: &TensorView, rows: usize, half: usize) -> Result<Vec<f32>> {
+    view.validate()?;
+    let count = rows * half;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if view.dtype == onnx_runtime_ir::DataType::Float16 && view.is_contiguous() {
+        // SAFETY: a validated contiguous Float16 view addresses `numel() >= count`
+        // 2-byte elements; `half::f16` is `repr(transparent)` over `u16`.
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), count) };
+        let mut dst = vec![0.0f32; count];
+        crate::dtype::widen_f16_slice_into(src, &mut dst);
+        return Ok(dst);
+    }
+    if view.dtype == onnx_runtime_ir::DataType::Float32 && view.is_contiguous() {
+        // SAFETY: a validated contiguous Float32 view addresses `numel() >= count`
+        // initialized f32 elements.
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), count) };
+        return Ok(src.to_vec());
+    }
+    let full = to_dense_f32_widen(op, view)?;
+    Ok(full[..count.min(full.len())].to_vec())
+}
+
 fn write_decode_output(out: &mut TensorMut, data: &[f32]) -> Result<()> {
     if out.dtype != onnx_runtime_ir::DataType::Float32 || !out.is_contiguous() {
         return write_dense_f32_narrow("GroupQueryAttention", out, data);
@@ -552,6 +586,7 @@ mod phase_prof {
     pub static PRESENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static OUT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
     pub static CALLS: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
@@ -587,13 +622,16 @@ mod phase_prof {
             let p = PRESENT_NS.load(Ordering::Relaxed) as f64 / 1e6;
             let a = ATTN_NS.load(Ordering::Relaxed) as f64 / 1e6;
             let o = OUT_NS.load(Ordering::Relaxed) as f64 / 1e6;
+            let total = TOTAL_NS.load(Ordering::Relaxed) as f64 / 1e6;
             let tot = w + p + a + o;
+            let other = total - tot;
             eprintln!(
-                "[gqa-phase] calls={calls} total={tot:.1}ms widen={w:.1}ms({wp:.1}%) present={p:.1}ms({pp:.1}%) attn={a:.1}ms({ap:.1}%) out={o:.1}ms({op:.1}%)",
-                wp = 100.0 * w / tot,
-                pp = 100.0 * p / tot,
-                ap = 100.0 * a / tot,
-                op = 100.0 * o / tot,
+                "[gqa-phase] calls={calls} exec_total={total:.1}ms widen={w:.1}ms({wp:.1}%) present={p:.1}ms({pp:.1}%) attn={a:.1}ms({ap:.1}%) out={o:.1}ms({op:.1}%) other={other:.1}ms({ot:.1}%)",
+                wp = 100.0 * w / total,
+                pp = 100.0 * p / total,
+                ap = 100.0 * a / total,
+                op = 100.0 * o / total,
+                ot = 100.0 * other / total,
             );
         }
     }
@@ -603,6 +641,8 @@ mod phase_prof {
 
 impl Kernel for GroupQueryAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        #[cfg(feature = "gqa_phase_profile")]
+        let _total_phase = phase_prof::Phase::start(&phase_prof::TOTAL_NS);
         check_arity("GroupQueryAttention", inputs, outputs, 7, 14, 1)?;
         if outputs.len() > 3 {
             return Err(EpError::KernelFailed(
@@ -780,13 +820,30 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
                 ids
             };
-            let cos = to_dense_f32_widen("GroupQueryAttention", cos_view)?;
-            let sin = to_dense_f32_widen("GroupQueryAttention", sin_view)?;
+            let cache_rows = cos_view.shape[0];
+            let half = q.dim / 2;
+            // Only positions up to the live context length are indexed; widening
+            // the whole (often 32k-row) cache every call was the dominant GQA
+            // decode cost. Bound the widen to the addressed row prefix.
+            let max_position = query_positions
+                .iter()
+                .chain(key_positions.iter())
+                .copied()
+                .max()
+                .unwrap_or(0);
+            if max_position >= cache_rows {
+                return Err(EpError::KernelFailed(format!(
+                    "GroupQueryAttention: rotary position {max_position} exceeds cache rows {cache_rows}"
+                )));
+            }
+            let rows_needed = max_position + 1;
+            let cos = widen_rotary_prefix("GroupQueryAttention", cos_view, rows_needed, half)?;
+            let sin = widen_rotary_prefix("GroupQueryAttention", sin_view, rows_needed, half)?;
             rotate(
                 &mut q,
                 &cos,
                 &sin,
-                cos_view.shape[0],
+                rows_needed,
                 &query_positions,
                 self.rotary_interleaved,
             )?;
@@ -794,7 +851,7 @@ impl Kernel for GroupQueryAttentionKernel {
                 &mut k,
                 &cos,
                 &sin,
-                cos_view.shape[0],
+                rows_needed,
                 &key_positions,
                 self.rotary_interleaved,
             )?;
@@ -1011,6 +1068,7 @@ impl Kernel for GroupQueryAttentionKernel {
         #[cfg(feature = "gqa_phase_profile")]
         {
             drop(_out_phase);
+            drop(_total_phase);
             phase_prof::tick();
         }
         Ok(())
@@ -1786,8 +1844,8 @@ mod tests {
                     // Past prefix rows, copied bit-for-bit.
                     for sequence_index in 0..PAST_LEN {
                         for dimension_index in 0..HEAD_WIDTH {
-                            let destination =
-                                (head * PRESENT_LEN + sequence_index) * HEAD_WIDTH + dimension_index;
+                            let destination = (head * PRESENT_LEN + sequence_index) * HEAD_WIDTH
+                                + dimension_index;
                             let source =
                                 (head * PAST_LEN + sequence_index) * HEAD_WIDTH + dimension_index;
                             expected[destination] = past_bits[source];
@@ -2031,6 +2089,86 @@ mod tests {
                     Owned::i32(&[], &[2]).view(),
                     Owned::f32(&[5, 1], &cos).view(),
                     Owned::f32(&[5, 1], &sin).view(),
+                    Owned::i64(&[1, 2], &[2, 4]).view(),
+                ],
+                &mut [out.view_mut(), present_k.view_mut()],
+            )
+            .unwrap();
+        close(&present_k.to_f32(), &k_rot_bnsh);
+        close(
+            &out.to_f32(),
+            &reference(&q_rot, &k_rot_bnsh, &v_bnsh, 2, 2, 0),
+        );
+    }
+
+    #[test]
+    fn widen_rotary_prefix_bounds_widen_to_row_prefix() {
+        // A cache far larger than the addressed prefix: only the first `rows`
+        // rows may be widened, and trailing rows (poisoned with NaN) must never
+        // be touched. `half_dim = 3` is not a multiple of 8, exercising the
+        // F16C scalar tail in the widen path.
+        let half_dim = 3usize;
+        let cache_rows = 40usize;
+        let rows = 4usize;
+        let mut data = vec![0.0f32; cache_rows * half_dim];
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = (i as f32) * 0.25 - 3.0;
+        }
+        for slot in data.iter_mut().skip(rows * half_dim) {
+            *slot = f32::NAN;
+        }
+        let cache = Owned::f16(&[cache_rows, half_dim], &data);
+        let prefix = super::widen_rotary_prefix("test", &cache.view(), rows, half_dim).unwrap();
+        assert_eq!(prefix.len(), rows * half_dim);
+        for k in 0..rows * half_dim {
+            let expected = half::f16::from_f32(data[k]).to_f32();
+            assert_eq!(prefix[k], expected, "prefix element {k}");
+        }
+        assert!(
+            prefix.iter().all(|v| v.is_finite()),
+            "poisoned tail rows leaked into the widened prefix"
+        );
+    }
+
+    #[test]
+    fn rotary_oversized_cache_only_reads_addressed_prefix() {
+        // Identical setup to `rotary_explicit_position_ids_apply_to_query_and_key`
+        // but with a 4096-row rotary cache whose rows past the max addressed
+        // position (4) are NaN. The prefix-bounded widen must ignore them and
+        // reproduce the exact-size cache result bit-for-bit (parity lock for the
+        // widen-placement optimization).
+        let q = vec![
+            1., 2., 2., -1., -1., 3., 4., 2., 3., -2., 1., 4., -3., 1., 2., 5.,
+        ];
+        let k = vec![2., 1., -1., 3., 4., -2., 2., 5.];
+        let v = vec![1., 2., 10., 20., 3., 4., 30., 40.];
+        let angles = [0.0_f32, 0.2, 0.7, 1.1, 1.6];
+        let cos: Vec<f32> = angles.iter().map(|angle| angle.cos()).collect();
+        let sin: Vec<f32> = angles.iter().map(|angle| angle.sin()).collect();
+        let positions = [2_usize, 4];
+        let q_rot = reference_rope_bsh(&q, 2, 4, &positions, &cos, &sin);
+        let k_rot_bsh = reference_rope_bsh(&k, 2, 2, &positions, &cos, &sin);
+        let k_rot_bnsh = bsh_to_bnsh(&k_rot_bsh, 2, 2);
+        let v_bnsh = bsh_to_bnsh(&v, 2, 2);
+        let big_rows = 4096usize;
+        let mut cos_big = vec![f32::NAN; big_rows];
+        let mut sin_big = vec![f32::NAN; big_rows];
+        cos_big[..cos.len()].copy_from_slice(&cos);
+        sin_big[..sin.len()].copy_from_slice(&sin);
+        let mut out = Owned::zeros_f32(&[1, 2, 8]);
+        let mut present_k = Owned::zeros_f32(&[1, 2, 2, 2]);
+        gqa_kernel(&[("do_rotary", Attribute::Int(1))])
+            .execute(
+                &[
+                    Owned::f32(&[1, 2, 8], &q).view(),
+                    Owned::f32(&[1, 2, 4], &k).view(),
+                    Owned::f32(&[1, 2, 4], &v).view(),
+                    absent(),
+                    absent(),
+                    Owned::i32(&[1], &[1]).view(),
+                    Owned::i32(&[], &[2]).view(),
+                    Owned::f32(&[big_rows, 1], &cos_big).view(),
+                    Owned::f32(&[big_rows, 1], &sin_big).view(),
                     Owned::i64(&[1, 2], &[2, 4]).view(),
                 ],
                 &mut [out.view_mut(), present_k.view_mut()],
