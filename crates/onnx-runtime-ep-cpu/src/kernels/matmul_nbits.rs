@@ -2800,6 +2800,185 @@ mod tests {
         );
     }
 
+    /// Round-trip quantize `weights_nk` ([N, K], row-major) to 8-bit blocks the
+    /// way ORT's `MatMulNBits` stores them (LSB-first, one byte per weight, one
+    /// scale per K block, an optional one-byte-per-block uint8 zero point).
+    /// Returns the packed bytes, scales, optional zero points, and the exact f32
+    /// dequantization (`(q - zp) * scale`) so a test can build the same oracle
+    /// the kernel's `dequantize_weight` reconstructs.
+    fn quantize_8bit(
+        weights_nk: &[f32],
+        n: usize,
+        k: usize,
+        block_size: usize,
+        asymmetric: bool,
+    ) -> (Vec<u8>, Vec<f32>, Option<Vec<u8>>, Vec<f32>) {
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size; // 8 bits -> one byte per weight
+        let mut packed = vec![0u8; n * blocks * blob];
+        let mut scales = vec![0.0f32; n * blocks];
+        let mut zps = vec![128u8; n * blocks];
+        let mut dequantized = vec![0.0f32; n * k];
+        for row in 0..n {
+            for block in 0..blocks {
+                let start = block * block_size;
+                let end = (start + block_size).min(k);
+                let values = &weights_nk[row * k + start..row * k + end];
+                let (scale, zp) = if asymmetric {
+                    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+                    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let scale = ((max - min) / 255.0).max(1e-6);
+                    (scale, (-min / scale).round().clamp(0.0, 255.0) as u8)
+                } else {
+                    let max_abs = values.iter().map(|value| value.abs()).fold(0.0, f32::max);
+                    ((max_abs / 127.0).max(1e-6), 128u8)
+                };
+                scales[row * blocks + block] = scale;
+                zps[row * blocks + block] = zp;
+                for (offset, &value) in values.iter().enumerate() {
+                    let q = (value / scale + zp as f32).round().clamp(0.0, 255.0) as u8;
+                    packed[(row * blocks + block) * blob + offset] = q;
+                    dequantized[row * k + start + offset] = (q as f32 - zp as f32) * scale;
+                }
+            }
+        }
+        (packed, scales, asymmetric.then_some(zps), dequantized)
+    }
+
+    /// Run the real end-to-end `MatMulNBits` kernel (`execute`) for an 8-bit,
+    /// block-128 weight -- the exact path Qwen3-0.6B CPU int8 decode and prefill
+    /// take (`dequantize_weight` -> `gemv_nk` for M=1, `-> gemm` for M>1). The
+    /// output must track an independent dequantize-to-f32 oracle to near-float
+    /// precision AND, crucially for greedy token selection, pick the SAME argmax
+    /// in every row. This pins the 8-bit block-128 route that previously had no
+    /// end-to-end execute-level oracle coverage.
+    fn run_8bit_execute(
+        n: usize,
+        k: usize,
+        block_size: usize,
+        m: usize,
+        asymmetric: bool,
+        activations: &[f32],
+        weights_nk: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let blocks = k.div_ceil(block_size);
+        let (packed, scales, zps, dequantized) =
+            quantize_8bit(weights_nk, n, k, block_size, asymmetric);
+
+        let zp_shape = zps.as_ref().map(|_| vec![n, blocks]);
+        let (graph, node) = model_node(
+            &[m, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            zp_shape.as_deref(),
+            &[m, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 block-128 kernel must build");
+
+        let a = Owned::f32(&[m, k], activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let zp_owned = zps.as_ref().map(|z| Owned::u8(&[n, blocks], z));
+        let mut inputs = vec![a.view(), b.view(), scales_tensor.view()];
+        if let Some(zp) = zp_owned.as_ref() {
+            inputs.push(zp.view());
+        }
+        let mut y = Owned::zeros_f32(&[m, n]);
+        kernel
+            .execute(&inputs, &mut [y.view_mut()])
+            .expect("8-bit block-128 execute must succeed");
+
+        let oracle = reference(activations, &dequantized, m, k, n);
+        (y.to_f32(), oracle)
+    }
+
+    /// Qwen3-0.6B CPU int8/block-128 regression: the production `execute` path
+    /// for 8-bit weights (symmetric default zero point and explicit asymmetric
+    /// uint8 zero points; decode M=1 and prefill M=5) must reconstruct the same
+    /// values as a from-scratch dequantize-to-f32 GEMM and, for every output
+    /// row, select the same greedy argmax. Divergence here is exactly the
+    /// native-vs-ORT token mismatch this path is meant to prevent.
+    #[test]
+    fn matmulnbits_8bit_block128_execute_matches_dequant_f32_oracle() {
+        let (n, k, block_size) = (48usize, 256usize, 128usize);
+        let weights_nk: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.013).sin() * 1.3 + (i as f32 * 0.0007).cos() * 0.4)
+            .collect();
+        for &asymmetric in &[false, true] {
+            for &m in &[1usize, 5] {
+                let activations: Vec<f32> = (0..m * k)
+                    .map(|i| (i as f32 * 0.021 + 0.3).cos() * 0.9)
+                    .collect();
+                let (out, oracle) =
+                    run_8bit_execute(n, k, block_size, m, asymmetric, &activations, &weights_nk);
+                let oracle_rms = rmse(&oracle, &vec![0.0; oracle.len()]).max(1e-6);
+                let rel = rmse(&out, &oracle) / oracle_rms;
+                assert!(
+                    rel <= 1e-5,
+                    "asymmetric={asymmetric} m={m}: 8-bit execute relative RMSE {rel} exceeds float-reconstruction tolerance 1e-5",
+                );
+                for row in 0..m {
+                    let winner = |v: &[f32]| {
+                        (0..n).max_by(|&a, &b| v[row * n + a].total_cmp(&v[row * n + b])).unwrap()
+                    };
+                    assert_eq!(
+                        winner(&out),
+                        winner(&oracle),
+                        "asymmetric={asymmetric} m={m} row={row}: 8-bit execute argmax != f32 oracle",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The 8-bit block-128 `execute` path must pick the SAME greedy winner as the
+    /// dequantized-f32 oracle even when two output columns are a genuine near tie
+    /// -- the regime where a token id actually flips. A deterministic seed sweep
+    /// finds real near-ties (relative margin in a narrow window) and asserts the
+    /// production kernel never reverses the oracle's argmax.
+    #[test]
+    fn matmulnbits_8bit_block128_argmax_matches_dequant_f32_oracle_at_near_tie() {
+        let (n, k, block_size) = (2usize, 128usize, 128usize);
+        let mut checked = 0usize;
+        for seed in 1..=400u32 {
+            let s = seed as f32;
+            let activations: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.017 + s * 0.013).sin() * 0.8)
+                .collect();
+            let weights_nk: Vec<f32> = (0..n * k)
+                .map(|i| (i as f32 * 0.011 + s * 0.019).cos())
+                .collect();
+            let (out, oracle) =
+                run_8bit_execute(n, k, block_size, 1, false, &activations, &weights_nk);
+            let oracle_rms = rmse(&oracle, &vec![0.0; n]).max(1e-6);
+            let margin_rel = (oracle[1] - oracle[0]).abs() / oracle_rms;
+            if !(0.001..=0.02).contains(&margin_rel) {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                usize::from(out[1] > out[0]),
+                usize::from(oracle[1] > oracle[0]),
+                "seed {seed}: 8-bit execute argmax != f32 oracle (margin_rel {margin_rel}, out {out:?}, oracle {oracle:?})",
+            );
+        }
+        assert!(
+            checked >= 5,
+            "deterministic search must exercise several 8-bit near-tie cases (got {checked})",
+        );
+    }
+
     #[test]
     fn matmulnbits_direct_int4_parallel_partial_k_matches_serial() {
         let (k, n, block_size) = (77usize, 1025usize, 32usize);
