@@ -3388,3 +3388,265 @@ Decision archive gate checked at 2026-07-23T06:31:00Z: the active ledger was 268
 **Sources reconciled:** `roy-f16-gqa-decode.md` and `pris-gqa-rotary-tests.md`.
 
 Decision archive gate checked at 2026-07-23T08:50:00Z: the active ledger exceeded 20480 bytes, but no dated entries were older than 2026-06-23T08:50:00Z; no archive was created or updated.
+
+<!-- scribe-merge-2026-07-23T10-30-00Z-perop-audit-silu-robustness -->
+## 2026-07-23 — CPU per-op audit and SiLU MLAS robustness remediation
+
+<!-- merged from .squad/decisions/inbox/deckard-perop-audit.md -->
+# Per-op audit: every CPU-EP decode op vs onnxruntime-genai (ORT)
+
+**Author:** Deckard (perf) · **Branch:** perf/perop-audit (off 6941a9a) · **Date:** 2026-07-23
+**Goal (user directive):** 每个 op 的性能都要超过 ORT，然后用模型 benchmark 确保整体性能也超过.
+= EVERY CPU-EP decode op must beat ORT per-op, AND whole-model must beat ORT.
+
+Host: shared 96-core box, very noisy (other users: clamscan/VLLM/etc). All numbers
+are medians of ≥3 runs taken in low-load windows (1-min load < ~5), native vs ORT
+interleaved A/B. `uptime` gated every run.
+
+Method:
+- OUR whole-model / per-op: `profile_native --steady --decode-skip 8 --tokens 128`,
+  per-op via `ONNX_GENAI_PROFILE_OPS=1` (executor.rs print_op_profile), aggregated
+  over the 248 steady decode steps (audit_scripts/agg_ours.py).
+- ORT whole-model: onnxruntime-genai 0.14.1, CPU provider (Config.clear_providers),
+  min_length-forced 128 new tokens (audit_scripts/ort_wholemodel.py).
+- ORT per-op: raw decoder model.onnx driven through onnxruntime 1.27 CPU with
+  enable_profiling, single decode step (input_ids[1,1], past-KV @ len=64), node
+  kernel times aggregated by op_type (audit_scripts/ort_perop.py).
+- Caveat: both profilers add measurement overhead, so per-op *absolute* ms are
+  inflated vs whole-model; per-op *ratios / winners* are the signal.
+
+Op-name mapping: RotaryEmbedding is fused inside GroupQueryAttention (do_rotary);
+ORT fuses SiLU's sigmoid*x into `QuickGelu` (= our `Sigmoid`+`Mul` → our `Silu`);
+ORT folds the residual add into `SkipSimplifiedLayerNormalization`.
+
+---
+
+## 1. WHOLE-MODEL native vs ORT  (整体性能) — ALL THREE WIN
+
+| Model                         | dtype | Native tok/s | ORT tok/s | Ratio | Verdict |
+|-------------------------------|-------|--------------|-----------|-------|---------|
+| qwen2.5-0.5b (cuda-gpu build) | f16   | 124.6        | 81.9      | 1.52x | WIN     |
+| qwen2.5-1.5b (cuda-gpu build) | f16   | 61.1         | 43.3      | 1.41x | WIN     |
+| qwen2.5-coder-7b generic-cpu  | int4/f32 | 29.1–31.3 | 21.0–21.7 | 1.39–1.44x | WIN |
+
+(0.5B/1.5B numbers rose after the Mul fix + measured in a quieter window than the
+pre-fix baselines of ~100 / ~50; 7B rose 27.1 → ~30 from the SiLU fix. See §3.)
+Parity openers byte-identical (0.5B [271,40,1079,264,48948,304,13027,323,358,1079,
+4460,311,1855,264,4285,2025]; 7B [48298,271,9707,0,2585,646,358,7789,498,3351,...]).
+
+---
+
+## 2. PER-OP native vs ORT (ms per decode step; ORT past=64)
+
+### 0.5B (f16)  — BEFORE fixes
+| op-type                        | ours | ORT (QuickGelu=SiLU) | ratio | WIN/LOSE |
+|--------------------------------|------|------|-------|----------|
+| MatMulNBits                    | 3.32 | 9.50 | 0.35 | WIN |
+| GroupQueryAttention            | 1.05 | 1.90 | 0.55 | WIN |
+| SkipSimplifiedLayerNormalization | 0.63 | 1.37 | 0.46 | WIN |
+| Cast                           | 0.005| 3.04 | —    | WIN |
+| **Mul (gate*up)**              | 2.61 | 0.65 | 4.02 | **LOSE** |
+| **Silu**                       | 1.09 | 0.68 | 1.60 | **LOSE** |
+| **Add (qkv bias)**             | 0.66 | 0.62 | 1.06 | ~tie/LOSE |
+
+### 0.5B (f16)  — AFTER fixes
+| op-type                        | ours | ORT | ratio | WIN/LOSE |
+|--------------------------------|------|------|-------|----------|
+| MatMulNBits                    | 2.83 | 9.50 | 0.30 | WIN |
+| GroupQueryAttention            | 1.04 | 1.90 | 0.55 | WIN |
+| SkipSimplifiedLayerNormalization | 0.63 | 1.37 | 0.46 | WIN |
+| **Mul (gate*up)**              | 0.69 | 0.65 | 1.06 | ~tie (was 4.02) |
+| Silu                           | 1.06 | 0.68 | 1.56 | LOSE (f16, follow-up) |
+| Add (qkv bias)                 | 0.70 | 0.62 | 1.13 | LOSE (f16, follow-up) |
+
+### 7B generic-cpu (int4 weights / f32 activations)  — BEFORE fixes
+| op-type                        | ours  | ORT   | ratio | WIN/LOSE |
+|--------------------------------|-------|-------|-------|----------|
+| MatMulNBits                    | 18.92 | 101.17| 0.19 | WIN (int4 MLAS SQNBit, 5.3x) |
+| GroupQueryAttention            | 3.06  | 4.22  | 0.72 | WIN |
+| Mul                            | 0.34  | 1.14  | 0.30 | WIN |
+| **Silu**                       | 4.90  | 1.00  | 4.90 | **LOSE (worst offender)** |
+| **SkipSimplifiedLayerNormalization** | 2.91 | 2.05 | 1.42 | **LOSE** |
+| **Add (qkv bias)**             | 1.83  | (fused in ORT SkipLN) | — | **LOSE** (ORT spends 0 here) |
+
+### 7B generic-cpu  — AFTER fixes
+| op-type                        | ours  | ORT   | ratio | WIN/LOSE |
+|--------------------------------|-------|-------|-------|----------|
+| MatMulNBits                    | 19.47 | 101.17| 0.19 | WIN |
+| **Silu**                       | 0.375 | 1.00  | 0.37 | **WIN (was 4.90 — 13x faster)** |
+| GroupQueryAttention            | 3.02  | 4.22  | 0.72 | WIN |
+| Mul                            | 0.31  | 1.14  | 0.27 | WIN |
+| SkipSimplifiedLayerNormalization | 3.05 | 2.05 | 1.49 | LOSE (follow-up) |
+| Add (qkv bias)                 | 1.88  | (fused) | — | LOSE (follow-up) |
+
+---
+
+## 3. ACTION TAKEN — fixed the two worst offenders (profile-first, RULES.md §4)
+
+**Fix commit:** `22db607` on branch `perf/perop-audit` (not pushed/merged).
+
+
+### Fix A — SiLU f32 → MLAS vectorized logistic  (the #1 loser: 7B SiLU 4.9x, 15% of decode)
+Root cause: `silu_contiguous_f32` ran a scalar `x/(1+exp(-x))` with f64 `exp` per
+element; LLVM cannot autovectorize a libm `exp` call, so it stayed scalar while
+ORT uses MLAS's SIMD sigmoid.
+Change: bind MLAS `MlasComputeLogistic` (shim.cpp + mlas-sys `compute_logistic`) and
+compute SiLU as `out = sigmoid(x); out *= x` — two vectorized passes, reusing the
+same battle-tested routine ORT uses (§4: reuse MLAS where it wins). Non-mlas builds
+keep the scalar reference.
+Result: 7B Silu 4.90 → 0.375 ms/step (13x); now beats ORT (0.375 vs 1.00).
+Whole-model 7B 27.1 → ~30–31 tok/s (+~12–15%). Parity byte-identical (openers unchanged;
+existing `silu_contiguous_matches_reference` @1e-6 passes under --features mlas).
+
+### Fix B — generic contiguous binary Mul/Sub/Div fast path for ALL float dtypes
+(the #1 0.5B loser: f16 Mul 4.0x)
+Root cause: the contiguous fast path was f32-only (`multiply_contiguous_f32`); the
+f16 models fell to `binary_typed` → `broadcast_apply`, which recomputes a multi-axis
+source index per element and allocates an accumulator + dense staging buffers — ~0.11ms
+for a tiny [1,4864] multiply (pure index/alloc overhead).
+Change: `binary_contiguous<T: NumericElem>` handles same-shape contiguous, non-aliasing
+Sub/Mul/Div for f32/f64/f16/bf16 in one tight loop using the identical
+`to_acc`/`from_acc` rounding and `BinOp::apply` combiner → byte-identical to the slow
+path (new test `mul_f16_contiguous_matches_broadcast_path`).
+Result: 0.5B Mul 2.61 → 0.69 ms/step (3.8x); now ~tie with ORT (0.69 vs 0.65).
+Also speeds 1.5B (larger intermediate) — contributes to 1.5B 49.6 → 61.1.
+
+Files: crates/mlas-sys/vendor/shim.cpp (+mlas_compute_logistic),
+crates/mlas-sys/src/lib.rs (+compute_logistic),
+crates/onnx-runtime-ep-cpu/src/kernels/activations.rs (silu_f32_slice),
+crates/onnx-runtime-ep-cpu/src/kernels/elementwise.rs (binary_contiguous + test).
+
+Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas` = 718 pass;
+`cargo clippy -p onnx-runtime-ep-cpu --features mlas -- -D warnings` clean;
+`cargo clippy -p mlas-sys` clean; parity openers identical on 0.5B and 7B; 7B no regression.
+
+---
+
+## 4. REMAINING LOSERS — precise follow-ups (not fixed here)
+
+1. **SiLU on f16 (0.5B/1.5B): 1.56x** — ours 1.06 vs ORT 0.68 ms/step.
+   f16 SiLU still uses the widen→scalar-f64-exp→narrow path (activations.rs execute,
+   `to_dense_f32_widen` branch). Fix: widen f16→f32 scratch, `mlas_sys::compute_logistic`,
+   multiply, narrow — same pattern as Fix A. Parity: f16 narrowing swamps f32-vs-f64 exp
+   diff (already verified argmax-stable on the f32 side). Est. ~0.4ms/step.
+
+2. **qkv-bias Add: 7B 1.88ms / 0.5B 0.70ms** — ORT spends ~0 (folds the qkv bias into
+   its attention/MatMul path; we run a standalone Add x{layers}). Two options:
+   (a) route Add through the same `binary_contiguous` fast path (AddKernel in add.rs has
+   its own broadcast_apply loop — check whether the bias is same-shape-contiguous or a
+   [N]-broadcast; if broadcast, add a broadcast-row fast path), or
+   (b) fuse the qkv bias into MatMulNBits/GQA input like ORT. (a) is the smaller, general
+   win. File under EP fusion (RULES.md §2.1).
+
+3. **SkipSimplifiedLayerNormalization: 7B 1.49x (3.05 vs 2.05), 0.5B we already WIN.**
+   Only the 7B f32 case loses. Profile the f32 RMS/skip-norm kernel (norm_ops.rs/rmsnorm.rs)
+   — likely scalar rsqrt / non-SIMD reduction vs MLAS. Candidate: MLAS has no direct
+   SkipLayerNorm export in our shim; a SIMD f32 reduction + rsqrt pass (or bind ORT's
+   contrib SkipLayerNorm math) would close it. Lower leverage (9% of 7B, 1.49x).
+
+---
+
+## 5. RESIDUAL RISKS & RANKED NEXT OPTIMIZATIONS
+
+Risks:
+- Host is extremely noisy; absolute tok/s shift ±15% with load. Ratios (native/ORT,
+  interleaved A/B) are the trustworthy signal; all A/B pairs were taken in the same
+  low-load window.
+- ORT per-op ms are enable_profiling-inflated; used only for winner/ratio direction.
+- MLAS logistic is f32 (vs our historical f64 exp). Verified argmax/opener parity on
+  0.5B and 7B; if any future model shows drift, the non-mlas scalar path is unchanged.
+
+Next optimizations, ranked by leverage:
+1. (highest) f16 SiLU → MLAS logistic (follow-up #1): closes the last material 0.5B/1.5B
+   activation loser; mirrors the done f32 fix. ~0.4ms/step on 0.5B.
+2. qkv-bias Add fast-path / fusion (follow-up #2): removes 1.9ms/step of pure overhead on
+   7B that ORT doesn't pay — biggest remaining 7B gap after SiLU.
+3. 7B f32 SkipSimplifiedLayerNormalization SIMD (follow-up #3): 1.49x, 9% of 7B.
+4. MatMulNBits already dominant-win (0.19–0.35x). No action; it is why we win overall.
+
+**Bottom line:** After Fix A + Fix B, we WIN whole-model on all three models (1.39–1.52x)
+and WIN or tie every *material* per-op on the real 7B CPU target (only the small f32
+SkipLN and the ORT-fused qkv Add remain, both follow-ups). The remaining per-op losses are
+f16-only (0.5B/1.5B, GPU-targeted builds) small-tensor activations, tracked as follow-ups.
+
+<!-- merged from .squad/decisions/inbox/bryant-silu-robustness.md -->
+# Decision: SiLU MLAS robustness fix (remediation of Deckard's REJECT)
+
+**Author:** Bryant (principal kernel engineer, CPU-EP)
+**Branch:** perf/perop-audit (remediation on top of 22db607)
+**Date:** 2026-07-23
+**Reviewers context:** Gaff APPROVED FFI/dispatch; Chew REJECTED on SiLU numerics + thin tests.
+
+## What changed
+
+### 1. SiLU numerics cliff fixed without losing the 13x MLAS win
+`crates/onnx-runtime-ep-cpu/src/kernels/activations.rs`
+
+MLAS's `MlasComputeLogistic` clamps its input to `[-18, 18]` internally.
+SiLU(x) = x·σ(x), so `sigmoid(x) * x` was wrong for out-of-range / non-finite
+inputs:
+- SiLU(-1e30) leaked σ(-18)≈1.5e-8 → -1.5e22 instead of decaying to ~0.
+- SiLU(-Inf) → -Inf·1.5e-8 = -Inf (should be 0).
+- SiLU(+Inf), SiLU(NaN) were also corrupted.
+
+Fix (`silu_f32_slice`, ~activations.rs:313): keep the vectorized MLAS logistic +
+multiply for the whole slice (the hot path stays fully vectorized), then run a
+single correction pass that overwrites only elements where the input is
+non-finite or `|x| > 18` with an accurate scalar SiLU. The correction predicate
+is one branch-predictable `is_finite() && abs() <= 18.0` compare per element, so
+in-range (bounded LLM) activations keep MLAS speed. New constant
+`SILU_MLAS_SAFE_BOUND = 18.0` (mlas-gated) documents the clamp boundary.
+
+Scalar reference (`silu`, `silu_f64`, ~activations.rs:126/143) hardened so the
+`#[cfg(not(feature="mlas"))]` path is the exact reference at the extremes too:
+SiLU(-Inf)=0 (previously produced NaN via -Inf·0), SiLU(+Inf)=+Inf, SiLU(NaN)=NaN.
+
+### 2. (B) f16 Mul generic contiguous fast path — kept as-is (Gaff-approved)
+No behavioral change; only tests strengthened (below).
+
+## Tests added / strengthened
+
+`activations.rs`:
+- `silu_contiguous_matches_reference`: now a DENSE sweep -50..50 step 0.25 plus
+  extreme finite magnitudes (±1e30, ±1e-30) and clamp-boundary values, compared
+  to an EXACT f64 reference with a tight abs-or-rel 1e-5 tolerance.
+- `silu_in_range_region_is_bit_close`: pins [-18,18] against the exact reference
+  (MLAS approximation held to abs-or-rel 1e-5; its tail flushes σ→0 near -16).
+- `silu_handles_infinities_and_nan`: SiLU(+Inf)=+Inf, SiLU(-Inf)=0, SiLU(NaN)=NaN.
+
+`elementwise.rs`:
+- `mul_f16_contiguous_matches_broadcast_path`: now also exercises the broadcast
+  fallback and asserts RAW f16 bits (`to_u16_bits`) equal between the contiguous
+  fast path and the broadcast path (not just decoded f32).
+- `sub_div_f16_contiguous_matches_broadcast_path` (new, Gaff nit): Sub and Div
+  f16 contiguous-vs-broadcast bit-identity.
+
+## Parity / generality
+
+- In-range elements use the identical arithmetic (`*output *= input`) as the
+  approved 22db607, so bounded activations are byte-identical by construction.
+  The 0.5B and 7B openers (bounded activations, no |x|>18) stay byte-identical;
+  the correction path is only entered for out-of-range/special values that do
+  not occur in those models.
+- Portable: no new x86-only intrinsics; MLAS logistic is cross-ISA; scalar
+  fallback unchanged off-mlas.
+
+## Validation
+
+- `cargo test -p onnx-runtime-ep-cpu --features mlas`: 721 passed, 0 failed.
+- `cargo test -p mlas-sys`: 12 passed, 0 failed.
+- `cargo clippy -p onnx-runtime-ep-cpu --features mlas --tests -- -D warnings`: clean.
+- `cargo fmt` clean on changed files (activations.rs, elementwise.rs).
+
+## Residual risk
+
+- MLAS logistic in-range approximation flushes very small σ to 0 near the clamp
+  edge (abs error ≤ ~1.2e-6, e.g. SiLU(-16.4)→-0 vs -1.2e-6). This matches ORT's
+  routine and is within the pinned tolerance; acceptable for accuracy-level-4.
+- The 18.0 boundary is tied to MLAS's internal clamp; if a future MLAS version
+  changes that clamp, the constant must track it (documented at the constant).
+- Opener byte-identity argued by construction (in-range arithmetic unchanged);
+  a live low-load opener run was not executed here as it requires model weights.
+
+Decision archive gate checked at 2026-07-23T10:30:00Z: the active ledger was 271720 bytes before this merge and exceeded 51200 bytes. No dated ledger entries older than 2026-07-16T10:30:00Z were present, so no archive was created or updated.
+<!-- scribe-merge-2026-07-23T10-30-00Z-perop-audit-silu-robustness-end -->
