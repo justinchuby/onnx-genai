@@ -33,9 +33,10 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_i64};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
-/// f32 RotaryEmbedding kernel carrying the resolved attributes.
+/// Floating-point RotaryEmbedding kernel carrying the resolved attributes.
 pub struct RotaryEmbeddingKernel {
     interleaved: bool,
     num_heads: usize,
@@ -107,9 +108,9 @@ impl Kernel for RotaryEmbeddingKernel {
             // ai.onnx: (X, cos_cache, sin_cache, position_ids?).
             (1, 2, if inputs.len() == 4 { Some(3) } else { None })
         };
-        let x = to_dense_f32(&inputs[0])?;
-        let cos_cache = to_dense_f32(&inputs[cos_i])?;
-        let sin_cache = to_dense_f32(&inputs[sin_i])?;
+        let x = to_dense_f32_widen("RotaryEmbedding", &inputs[0])?;
+        let cos_cache = to_dense_f32_widen("RotaryEmbedding", &inputs[cos_i])?;
+        let sin_cache = to_dense_f32_widen("RotaryEmbedding", &inputs[sin_i])?;
         let position_ids = match pos_i {
             Some(i) => Some(to_dense_i64(&inputs[i])?),
             None => None,
@@ -165,7 +166,7 @@ impl Kernel for RotaryEmbeddingKernel {
         // Zero-sized input: nothing to rotate. Emit an empty output rather than
         // underflowing on the `batch-1`/`seq-1` bounds computation below.
         if x.is_empty() {
-            return write_dense_f32(&mut outputs[0], &[]);
+            return write_dense_f32_narrow("RotaryEmbedding", &mut outputs[0], &[]);
         }
 
         let expected_cache_shape = if position_ids.is_some() {
@@ -279,7 +280,7 @@ impl Kernel for RotaryEmbeddingKernel {
             }
         }
 
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("RotaryEmbedding", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -324,6 +325,43 @@ mod tests {
         for (g, w) in out.to_f32().iter().zip(&want) {
             assert!((g - w).abs() < 1e-6, "got {g}, want {w}");
         }
+    }
+
+    #[test]
+    fn rope_f16_matches_f32_reference_after_narrowing() {
+        let x_values = [1.25, -0.75, 2.5, -3.0];
+        let cos_values = [0.5, 0.875];
+        let sin_values = [0.75, -0.25];
+        let x_f32 = Owned::f32(&[1, 1, 1, 4], &x_values);
+        let cos_f32 = Owned::f32(&[1, 1, 2], &cos_values);
+        let sin_f32 = Owned::f32(&[1, 1, 2], &sin_values);
+        let mut out_f32 = Owned::zeros_f32(&[1, 1, 1, 4]);
+        let kernel = RotaryEmbeddingKernel {
+            interleaved: false,
+            num_heads: 0,
+            rotary_embedding_dim: 0,
+            contrib: false,
+        };
+        kernel
+            .execute(
+                &[x_f32.view(), cos_f32.view(), sin_f32.view()],
+                &mut [out_f32.view_mut()],
+            )
+            .unwrap();
+
+        let x_f16 = Owned::f16(&[1, 1, 1, 4], &x_values);
+        let cos_f16 = Owned::f16(&[1, 1, 2], &cos_values);
+        let sin_f16 = Owned::f16(&[1, 1, 2], &sin_values);
+        let mut out_f16 = Owned::f16(&[1, 1, 1, 4], &[0.0; 4]);
+        kernel
+            .execute(
+                &[x_f16.view(), cos_f16.view(), sin_f16.view()],
+                &mut [out_f16.view_mut()],
+            )
+            .unwrap();
+
+        let expected = Owned::f16(&[1, 1, 1, 4], &out_f32.to_f32()).to_f16_as_f32();
+        assert_eq!(out_f16.to_f16_as_f32(), expected);
     }
 
     #[test]
