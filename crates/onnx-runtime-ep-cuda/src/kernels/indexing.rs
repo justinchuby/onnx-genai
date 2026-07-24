@@ -12,6 +12,7 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 pub const SCATTER_CAPTURE_ERROR_INDEX: u32 = 256;
+pub const GATHER_ELEMENTS_CAPTURE_ERROR_INDEX: u32 = 1_024;
 const SOURCE: &str = r#"
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
 #define NXRT_HAS_CUDA_HALF_HEADERS 1
@@ -20,9 +21,9 @@ const SOURCE: &str = r#"
 #endif
 
 extern "C" __global__ void gather_elements(
-    const unsigned char* data, const long long* indices, unsigned char* output,
+    const unsigned char* data, const void* indices, unsigned char* output,
     const unsigned long long* meta, int rank, int axis, int elem_bytes,
-    unsigned long long elements) {
+    unsigned long long elements, int index_is_i64, unsigned int* capture_error) {
   const unsigned long long* index_dims = meta;
   const unsigned long long* index_strides = meta + rank;
   const unsigned long long* data_strides = meta + 2 * rank;
@@ -33,9 +34,17 @@ extern "C" __global__ void gather_elements(
       unsigned long long coordinate = rem / index_strides[d];
       rem %= index_strides[d];
       if (d == axis) {
-        long long selected = indices[linear];
-        if (selected < 0) selected += (long long)meta[3 * rank + d];
-        coordinate = (unsigned long long)selected;
+        long long selected = index_is_i64
+            ? ((const long long*)indices)[linear]
+            : (long long)((const int*)indices)[linear];
+        unsigned long long dim = meta[3 * rank + d];
+        if ((selected >= 0 && (unsigned long long)selected >= dim) ||
+            (selected < 0 && (0ull - (unsigned long long)selected) > dim)) {
+          if (capture_error) atomicOr(capture_error, 1024u);
+          continue;
+        }
+        coordinate = selected < 0 ? dim - (0ull - (unsigned long long)selected)
+                                  : (unsigned long long)selected;
       }
       data_offset += coordinate * data_strides[d];
     }
@@ -334,6 +343,84 @@ struct ScatterCaptureSignature {
     indices_shape: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GatherElementsMetadataKey {
+    data_shape: Vec<usize>,
+    indices_shape: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct GatherElementsMetadataCache {
+    runtime: Arc<CudaRuntime>,
+    key: Option<GatherElementsMetadataKey>,
+    ptr: CUdeviceptr,
+}
+
+impl GatherElementsMetadataCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            key: None,
+            ptr: 0,
+        }
+    }
+
+    fn prepare(&mut self, data_shape: &[usize], indices_shape: &[usize]) -> Result<CUdeviceptr> {
+        let key = GatherElementsMetadataKey {
+            data_shape: data_shape.to_vec(),
+            indices_shape: indices_shape.to_vec(),
+        };
+        if self.key.as_ref() == Some(&key) {
+            return Ok(self.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep GatherElements: shape changed during CUDA graph capture; warm the exact shape first".into(),
+            ));
+        }
+        if self.ptr != 0 {
+            self.runtime.synchronize()?;
+        }
+
+        let mut meta = indices_shape.to_vec();
+        meta.extend(
+            compute_contiguous_strides(indices_shape)
+                .into_iter()
+                .map(|value| value as usize),
+        );
+        meta.extend(
+            compute_contiguous_strides(data_shape)
+                .into_iter()
+                .map(|value| value as usize),
+        );
+        meta.extend(data_shape.iter().copied());
+        let ptr = upload_meta(&self.runtime, &meta)?;
+        if self.ptr != 0 {
+            unsafe { self.runtime.free_raw(self.ptr) }?;
+        }
+        self.key = Some(key);
+        self.ptr = ptr;
+        Ok(ptr)
+    }
+}
+
+impl Drop for GatherElementsMetadataCache {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GatherElementsCaptureSignature {
+    data_dtype: DataType,
+    indices_dtype: DataType,
+    data_shape: Vec<usize>,
+    indices_shape: Vec<usize>,
+}
+
 pub struct GatherElementsFactory {
     pub runtime: Arc<CudaRuntime>,
 }
@@ -343,6 +430,8 @@ impl KernelFactory for GatherElementsFactory {
         Ok(Box::new(GatherElementsKernel {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
+            metadata: Mutex::new(GatherElementsMetadataCache::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
         }))
     }
 }
@@ -350,6 +439,8 @@ impl KernelFactory for GatherElementsFactory {
 struct GatherElementsKernel {
     runtime: Arc<CudaRuntime>,
     axis: i64,
+    metadata: Mutex<GatherElementsMetadataCache>,
+    warmed_signature: Mutex<Option<GatherElementsCaptureSignature>>,
 }
 
 impl Kernel for GatherElementsKernel {
@@ -382,8 +473,35 @@ impl Kernel for GatherElementsKernel {
                 )));
             }
         }
-        validate_indices(&self.runtime, indices, data.shape[axis], "GatherElements")?;
+        if !matches!(indices.dtype, DataType::Int32 | DataType::Int64) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep GatherElements: indices must be Int32 or Int64".into(),
+            ));
+        }
+        let capturing = self.runtime.is_capturing()?;
+        let signature = GatherElementsCaptureSignature {
+            data_dtype: data.dtype,
+            indices_dtype: indices.dtype,
+            data_shape: data.shape.to_vec(),
+            indices_shape: indices.shape.to_vec(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep GatherElements: capture signature lock was poisoned".into(),
+            )
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep GatherElements: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
+            ));
+        }
+        if !capturing {
+            validate_indices(&self.runtime, indices, data.shape[axis], "GatherElements")?;
+        }
         if output.numel() == 0 {
+            if !capturing {
+                *warmed_signature = Some(signature);
+            }
             return Ok(());
         }
         let elem_bytes = i32::try_from(data.dtype.byte_size()).map_err(|_| {
@@ -392,64 +510,71 @@ impl Kernel for GatherElementsKernel {
         if elem_bytes == 0 {
             return Err(not_implemented("GatherElements for variable-width dtype"));
         }
-        let mut meta = indices.shape.to_vec();
-        meta.extend(
-            compute_contiguous_strides(indices.shape)
-                .into_iter()
-                .map(|v| v as usize),
-        );
-        meta.extend(
-            compute_contiguous_strides(data.shape)
-                .into_iter()
-                .map(|v| v as usize),
-        );
-        meta.extend(data.shape);
-        let meta_ptr = upload_meta(&self.runtime, &meta)?;
-        let result = (|| {
-            let func = self
-                .runtime
-                .nvrtc_function("indexing_ops", SOURCE, "gather_elements")?;
-            let data_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
-            let indices_ptr = cuptr(indices.data_ptr::<i64>() as *const c_void);
-            let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-            let rank = rank as i32;
-            let axis = axis as i32;
-            let elements = output.numel() as u64;
-            let mut builder = self.runtime.stream().launch_builder(&func);
-            builder
-                .arg(&data_ptr)
-                .arg(&indices_ptr)
-                .arg(&output_ptr)
-                .arg(&meta_ptr)
-                .arg(&rank)
-                .arg(&axis)
-                .arg(&elem_bytes)
-                .arg(&elements);
-            unsafe {
-                builder.launch(LaunchConfig {
-                    grid_dim: (
-                        (elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32),
-                        1,
-                        1,
-                    ),
-                    block_dim: (BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|e| driver_err("launch gather_elements", e))?;
-            self.runtime.synchronize()
-        })();
-        let free = unsafe { self.runtime.free_raw(meta_ptr) };
-        result.and(free)
+        let func = self
+            .runtime
+            .nvrtc_function("indexing_ops", SOURCE, "gather_elements")?;
+        let mut metadata = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep GatherElements: metadata lock was poisoned".into())
+        })?;
+        let meta_ptr = metadata.prepare(data.shape, indices.shape)?;
+        let data_ptr = cuptr(data.data_ptr::<u8>() as *const c_void);
+        let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let rank = i32::try_from(rank).map_err(|_| {
+            EpError::KernelFailed("cuda_ep GatherElements: rank exceeds i32".into())
+        })?;
+        let axis = axis as i32;
+        let elements = output.numel() as u64;
+        let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
+        let capture_error = if capturing {
+            self.runtime.capture_error_ptr()
+        } else {
+            0
+        };
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&data_ptr)
+            .arg(&indices_ptr)
+            .arg(&output_ptr)
+            .arg(&meta_ptr)
+            .arg(&rank)
+            .arg(&axis)
+            .arg(&elem_bytes)
+            .arg(&elements)
+            .arg(&index_is_i64)
+            .arg(&capture_error);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (
+                    (elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32),
+                    1,
+                    1,
+                ),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| driver_err("launch gather_elements", e))?;
+        if !capturing {
+            *warmed_signature = Some(signature);
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "GatherElements allocates/uploads/frees per-call indexing metadata and synchronizes the stream",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "GatherElements must warm its exact shape/dtype signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "GatherElements capture signature lock was poisoned",
+            ),
+        }
     }
 }
 

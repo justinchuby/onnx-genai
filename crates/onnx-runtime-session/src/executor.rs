@@ -388,6 +388,11 @@ pub enum SeamReason {
     KernelNotWarmed,
     /// The selected device kernel explicitly opts out of capture.
     KernelCaptureUnsupported,
+    /// The kernel aborted device-graph *recording* (e.g. it advertised capture
+    /// support but issued a stream synchronize, which CUDA rejects mid-capture)
+    /// and was quarantined to a forced eager seam so the rest of the graph can
+    /// still be captured.
+    CaptureRecordingFailed,
 }
 
 impl SeamReason {
@@ -398,6 +403,7 @@ impl SeamReason {
             Self::UnresolvedOutputShape
             | Self::UnresolvedInputShape
             | Self::KernelNotWarmed
+            | Self::CaptureRecordingFailed
             | Self::KernelCaptureUnsupported => CapturePathKind::EagerDeviceSeam,
         }
     }
@@ -903,6 +909,37 @@ pub(crate) struct Executor {
     /// threshold) the installed graph's baked device pointers are stale, so the
     /// step falls back to eager and the graph is retired for re-capture.
     capture_cf_shapes: HashMap<ValueId, Vec<usize>>,
+    /// Persistent-binding signature the most recent eager warmup ran under (see
+    /// [`ExternalBindings::capture_signature`]). Capture-mode shape seeding only
+    /// trusts the warm just-in-time shapes recorded in [`Self::buffer_shapes`]
+    /// when a later step presents this exact signature, so any changed pointer
+    /// or capacity withholds the seed instead of baking a stale shape.
+    capture_warm_signature: Option<Vec<ExternalCaptureSig>>,
+    /// Every value's concrete just-in-time shape as resolved by the most recent
+    /// eager warmup. The data-dependent decode shapes we seed for capture are
+    /// JIT-sized on the compute path (which populates `buffers` but not
+    /// [`Self::buffer_shapes`]), so the authoritative warm geometry is snapshotted
+    /// from the eager run's fully-resolved shape map, not the buffer bookkeeping.
+    capture_warm_shapes: HashMap<ValueId, Vec<usize>>,
+    /// The warm decode shapes actually seeded into the most recent capture. After
+    /// the capture pass re-resolves each node's true shape, a divergence here
+    /// means the warm seed was stale for this step, so the graph is retired and
+    /// the caller re-warms/re-captures rather than replaying a stale shape.
+    capture_warm_seeded: HashMap<ValueId, Vec<usize>>,
+    /// `(domain, op_type)` pairs whose kernel aborted device-graph *recording*
+    /// during a capture pass (e.g. it declared `CaptureSupport::Supported` but
+    /// issued a stream synchronize, which CUDA rejects mid-capture). Warm-decode
+    /// shape seeding can admit such a node once its output shape is known; if the
+    /// resulting capture fails, the offending op-type is quarantined here and
+    /// [`Self::node_capture_reason`] then forces every node of that op-type to a
+    /// forced eager seam, so the capture is re-planned and the remaining
+    /// genuinely-capturable ops still fold. Grows monotonically within an
+    /// executor: a kernel that breaks recording once breaks it every time.
+    capture_quarantine_ops: HashSet<(String, String)>,
+    /// Node whose kernel returned an error while recording a captured segment,
+    /// set transiently by [`Self::run_plan_segmented`] so the capture retry loop
+    /// can quarantine its op-type. `None` outside a failed capture pass.
+    last_capture_failed_node: Option<NodeId>,
     /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
     /// a strided view aliasing another value's buffer (a layout/movement-op
     /// output such as `Slice`) rather than an owner in [`Self::buffers`]. Built
@@ -1023,11 +1060,50 @@ struct ExternalBindings {
     outputs: HashMap<ValueId, ExternalValue>,
 }
 
+/// One persistent (device-bound) I/O binding's identity for capture: its value,
+/// role, dtype, kernel-visible shape, backing device pointer and byte capacity.
+/// The full set forms the *decode binding signature* under which a warm eager
+/// resolution's just-in-time shapes are trusted for capture-mode seeding: a
+/// change to any pointer or shape means the warm geometry may be stale, so the
+/// seed is withheld (nodes stay eager) rather than baked into a captured graph.
+#[derive(Clone, PartialEq, Eq)]
+struct ExternalCaptureSig {
+    vid: ValueId,
+    is_input: bool,
+    dtype: DataType,
+    shape: Vec<usize>,
+    ptr: usize,
+    len: usize,
+}
+
 impl ExternalBindings {
     fn seed_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
         for (&vid, value) in self.inputs.iter().chain(&self.outputs) {
             resolved.entry(vid).or_insert_with(|| value.shape.clone());
         }
+    }
+
+    /// Order-independent signature of every persistent binding (pointer, byte
+    /// capacity and kernel-visible shape). Two runs whose signatures compare
+    /// equal present pointer- and capacity-stable buffers, which is the exact
+    /// precondition for trusting a prior eager run's just-in-time shapes.
+    fn capture_signature(&self) -> Vec<ExternalCaptureSig> {
+        let mut sig: Vec<ExternalCaptureSig> = self
+            .inputs
+            .iter()
+            .map(|(&vid, v)| (vid, true, v))
+            .chain(self.outputs.iter().map(|(&vid, v)| (vid, false, v)))
+            .map(|(vid, is_input, v)| ExternalCaptureSig {
+                vid,
+                is_input,
+                dtype: v.dtype,
+                shape: v.shape.clone(),
+                ptr: v.ptr as usize,
+                len: v.len,
+            })
+            .collect();
+        sig.sort_by_key(|a| (a.vid.0, a.is_input));
+        sig
     }
 }
 
@@ -1294,9 +1370,27 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
     // GQA treats the cache tensor extent as capacity and obtains the valid past
     // length from seqlens_k. Standard Attention instead derives past length from
     // the cache tensor extent itself.
-    node.domain == "com.microsoft"
+    if node.domain == "com.microsoft"
         && node.op_type == "GroupQueryAttention"
         && matches!(input_index, 3 | 4)
+    {
+        return true;
+    }
+    // Default-domain `Attention` with an in-op KV cache (past_key=input 4,
+    // past_value=input 5) can likewise treat the cache extent as physical
+    // capacity, deriving the valid attended length on-device from the additive
+    // attention mask (input 3) instead of the growing cache extent. This mirrors
+    // the GQA treatment and is what lets the decode step bind the KV cache at a
+    // fixed capacity so whole-step CUDA-graph capture stays shape-static. Gated
+    // to the mask-driven, non-causal form (a present mask input and no
+    // `is_causal` attribute): that path derives length from the mask frontier,
+    // so the cache extent is pure capacity. Causal-attribute or mask-less
+    // Attention still reads the cache extent as the valid length.
+    node.is_default_domain()
+        && node.op_type == "Attention"
+        && matches!(input_index, 4 | 5)
+        && node.inputs.get(3).is_some_and(Option::is_some)
+        && node.attr("is_causal").and_then(|attr| attr.as_int()).unwrap_or(0) == 0
 }
 
 fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
@@ -2219,6 +2313,11 @@ impl Executor {
             capture_segmentation: Vec::new(),
             control_flow_output_values,
             capture_cf_shapes: HashMap::new(),
+            capture_warm_signature: None,
+            capture_warm_shapes: HashMap::new(),
+            capture_warm_seeded: HashMap::new(),
+            capture_quarantine_ops: HashSet::new(),
+            last_capture_failed_node: None,
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
@@ -2744,6 +2843,7 @@ impl Executor {
         self.device_graph_signature = None;
         self.capture_schedule = None;
         self.capture_cf_shapes.clear();
+        self.capture_warm_seeded.clear();
         Ok(self.ep.reset_device_graph()?)
     }
 
@@ -2989,6 +3089,14 @@ impl Executor {
                 // prior-run shape so downstream capturable consumers fold into
                 // captured segments instead of forming per-consumer eager seams.
                 self.seed_control_flow_capture_shapes(&mut resolved);
+                // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
+                // output shape is data-dependent stay unresolved in `resolve_soft`
+                // and would each form an eager seam even though their kernels are
+                // already capture-safe. Seed their exact just-in-time shapes from
+                // the eager warmup — but only for the identical persistent-binding
+                // signature the warmup ran under, so a changed pointer/capacity
+                // withholds the seed instead of baking a stale shape.
+                self.seed_warm_decode_capture_shapes(&mut resolved, external);
             }
             resolved
         };
@@ -3033,6 +3141,14 @@ impl Executor {
                     "run_scoped.plan_eager.top"
                 });
                 self.run_plan_eager(&mut resolved, outer_scope, external)?;
+                // Snapshot the exact just-in-time shapes this warm run resolved,
+                // together with the persistent-binding signature they were
+                // derived under. Capture-mode seeding replays these shapes only
+                // when a later step presents this exact signature (pointer- and
+                // capacity-stable), so a changed binding forces recapture, never
+                // a stale-shape replay.
+                self.capture_warm_shapes = resolved.clone();
+                self.capture_warm_signature = Some(external.capture_signature());
             }
             RunMode::Capture => {
                 // A fresh capture may have resized/reallocated the `If` output
@@ -3045,24 +3161,90 @@ impl Executor {
                 // separated by non-capturable seam nodes. Only a graph-level hard
                 // decline (e.g. no persistent output binding, or nothing
                 // capturable at all) falls back to a fully eager run.
-                let schedule = match self.plan_capture_segments(&resolved, external) {
-                    Ok(schedule) => schedule,
-                    Err(report) => return Ok(ScopedRunResult::NotCapturable(report)),
+                //
+                // Warm-decode shape seeding can admit a node whose kernel wrongly
+                // advertises capture support but aborts device-graph recording
+                // (e.g. a stream synchronize, which CUDA rejects mid-capture).
+                // A single such kernel aborts the whole segmented capture. Rather
+                // than regress to a fully eager step, quarantine the offending
+                // op-type to a forced eager seam and re-plan/re-record: the
+                // genuinely-capturable ops still fold while the mislabeled kernel
+                // stays eager. Re-recording a fixed-capacity decode step is
+                // idempotent (same position/token → same values into the same
+                // slots), so retrying is safe. Bounded by the node count.
+                let max_capture_attempts = self.plan.len() + 1;
+                let schedule = 'capture: loop {
+                    let schedule = match self.plan_capture_segments(&resolved, external) {
+                        Ok(schedule) => schedule,
+                        Err(report) => return Ok(ScopedRunResult::NotCapturable(report)),
+                    };
+                    self.last_capture_failed_node = None;
+                    match self.run_plan_segmented(
+                        &schedule,
+                        RunMode::Capture,
+                        &mut resolved,
+                        outer_scope,
+                        external,
+                    ) {
+                        Ok(_) => break 'capture schedule,
+                        Err(error) => {
+                            let _ = self.ep.reset_device_graph();
+                            // Quarantine the op-type that aborted recording and
+                            // retry, unless we already quarantined it (no
+                            // progress), hit the attempt bound, or cannot
+                            // attribute the failure to a node.
+                            let quarantined = self.last_capture_failed_node.take().and_then(
+                                |node_id| {
+                                    let node = self.graph.node(node_id);
+                                    let key = (canonical_domain(node), node.op_type.clone());
+                                    self.capture_quarantine_ops
+                                        .insert(key)
+                                        .then_some(())
+                                },
+                            );
+                            if quarantined.is_some()
+                                && self.capture_quarantine_ops.len() < max_capture_attempts
+                            {
+                                // Re-plan with the offending op-type forced eager.
+                                self.if_last_predicate.clear();
+                                continue 'capture;
+                            }
+                            self.capture_schedule = None;
+                            self.capture_segmentation.clear();
+                            self.capture_cf_shapes.clear();
+                            self.capture_warm_seeded.clear();
+                            return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
+                                CaptureDecline::graph(format!(
+                                    "segmented CUDA graph capture failed: {error}"
+                                )),
+                            )));
+                        }
+                    }
                 };
-                if let Err(error) = self.run_plan_segmented(
-                    &schedule,
-                    RunMode::Capture,
-                    &mut resolved,
-                    outer_scope,
-                    external,
-                ) {
+                // A warm-seeded shape that the capture pass re-resolved to a
+                // different value means the seed was stale for this step (a
+                // genuinely per-step-varying interior extent). The recorded
+                // graph would replay that shape unconditionally, so retire it
+                // and decline: the caller re-warms and either re-captures (if
+                // the shape restabilizes) or keeps this op eager. This upholds
+                // "recapture when any shape changes; never replay a stale graph."
+                if let Some((vid, seeded)) = self
+                    .capture_warm_seeded
+                    .iter()
+                    .find(|(vid, seeded)| resolved.get(vid) != Some(*seeded))
+                    .map(|(vid, seeded)| (*vid, seeded.clone()))
+                {
+                    let current = resolved.get(&vid).cloned();
                     let _ = self.ep.reset_device_graph();
                     self.capture_schedule = None;
                     self.capture_segmentation.clear();
                     self.capture_cf_shapes.clear();
+                    self.capture_warm_seeded.clear();
                     return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
                         CaptureDecline::graph(format!(
-                            "segmented CUDA graph capture failed: {error}"
+                            "warm decode shape seed for value#{} ({seeded:?}) diverged from the \
+                             captured shape ({current:?}); recapturing",
+                            vid.0
                         )),
                     )));
                 }
@@ -3201,6 +3383,62 @@ impl Executor {
         }
     }
 
+    /// Seed every still-unresolved value's shape from the most recent eager
+    /// warmup's fully-resolved shape map ([`Self::capture_warm_shapes`]) so the
+    /// decode ops whose output shape is data-dependent (omitted by
+    /// [`Self::resolve_soft`]) — Cast/Mul/QMoE/ScatterElements downstream of a
+    /// data-dependent extent — resolve their input/output shapes and fold into
+    /// captured segments instead of each forming an eager seam. This generalizes
+    /// the control-flow seeding above from `If`/`Loop`/`Scan` outputs to any
+    /// warmed data-dependent value.
+    ///
+    /// Correctness rests entirely on the *decode binding signature*: the warm
+    /// shapes are trusted only when the current persistent-binding signature is
+    /// byte-for-byte identical to the one the warmup ran under
+    /// ([`ExternalBindings::capture_signature`]). A changed pointer or capacity
+    /// withholds every seed (those values stay unresolved → eager seams), and the
+    /// top-level replay guard ([`Self::replay_device_graph`]) independently
+    /// retires the installed graph on any binding change. Values resolvable from
+    /// the current symbol bindings are never overridden — only genuinely
+    /// unresolved (value-dependent) extents are seeded — and the capture pass
+    /// re-resolves each seeded shape, retiring the graph if any diverged, so a
+    /// per-step-varying extent can never be replayed against a stale shape.
+    /// Persistent bindings and initializers are excluded (seeded/owned elsewhere).
+    fn seed_warm_decode_capture_shapes(
+        &mut self,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) {
+        self.capture_warm_seeded.clear();
+        // Trust the warm just-in-time shapes only for the exact signature they
+        // were derived under; otherwise leave values unresolved (eager seams).
+        if self.capture_warm_signature.as_ref() != Some(&external.capture_signature()) {
+            return;
+        }
+        let external_values: HashSet<ValueId> = external
+            .inputs
+            .keys()
+            .chain(external.outputs.keys())
+            .copied()
+            .collect();
+        let warm: Vec<(ValueId, Vec<usize>)> = self
+            .capture_warm_shapes
+            .iter()
+            .map(|(&vid, shape)| (vid, shape.clone()))
+            .collect();
+        for (vid, shape) in warm {
+            if resolved.contains_key(&vid)
+                || external_values.contains(&vid)
+                || self.graph.initializers.contains_key(&vid)
+                || self.sequence_values.contains(&vid)
+            {
+                continue;
+            }
+            self.capture_warm_seeded.insert(vid, shape.clone());
+            resolved.insert(vid, shape);
+        }
+    }
+
     /// Whether the control-flow seam node at plan index `pi` produced a different
     /// output shape than the most recent capture assumed. A change means a branch
     /// flip (e.g. LongRoPE short↔long at the context threshold) reallocated an
@@ -3230,6 +3468,22 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Option<CaptureDecline> {
         let node = self.graph.node(plan.node_id);
+        // A kernel that aborted device-graph recording on a prior capture pass is
+        // quarantined by op-type: force it (and every sibling of the same op-type)
+        // to an eager seam so warm-decode shape seeding can still fold the rest of
+        // the graph instead of one mislabeled kernel aborting the whole capture.
+        if self
+            .capture_quarantine_ops
+            .contains(&(canonical_domain(node), node.op_type.clone()))
+        {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                SeamReason::CaptureRecordingFailed,
+                "kernel aborted device-graph recording on a prior capture pass; \
+                 quarantined to an eager seam",
+            ));
+        }
         let outputs_resolved = plan
             .outputs
             .iter()
@@ -3515,13 +3769,21 @@ impl Executor {
                         // `end_device_graph_capture()` on the success path.
                         let mut capture_guard = SegmentCaptureGuard::arm(ep.as_ref());
                         for pi in seg.start..seg.end {
-                            self.exec_plan_node(
+                            let node_id = self.plan[pi].node_id;
+                            if let Err(error) = self.exec_plan_node(
                                 pi,
                                 resolved,
                                 outer_scope,
                                 external,
                                 OpCaptureTrace::Captured,
-                            )?;
+                            ) {
+                                // Record which node aborted recording so the
+                                // capture retry loop can quarantine its op-type.
+                                // `capture_guard` drops here, ending the wedged
+                                // stream capture before the error propagates.
+                                self.last_capture_failed_node = Some(node_id);
+                                return Err(error);
+                            }
                         }
                         capture_guard.disarm();
                         ep.end_device_graph_capture()?;
@@ -3667,7 +3929,53 @@ impl Executor {
                 resolved.insert(ovid, out_shapes[oi].clone());
             }
         }
-        let output_shapes: Vec<Vec<usize>> = outputs.iter().map(|v| resolved[v].clone()).collect();
+        let mut output_shapes: Vec<Vec<usize>> =
+            outputs.iter().map(|v| resolved[v].clone()).collect();
+        // Fixed-capacity KV for the default-domain Attention op. Its present
+        // K/V outputs (slots 1..) are consumer-less graph outputs bound to a
+        // growing device cache. Expose them to the kernel at the binding's
+        // physical capacity so the kernel can append the new token into a fixed
+        // per-head slot (constant stride, no per-step restride) instead of
+        // repacking the whole cache densely. The valid attended length is still
+        // derived from the logical past+current extent, so this only widens the
+        // *storage* stride and never changes what the kernel attends over. Only
+        // present slots that are bound sub-shape (logical != physical) capacity
+        // buffers are widened; a dense/unbound present keeps its inferred shape.
+        {
+            let node = self.graph.node(node_id);
+            if node.is_default_domain() && node.op_type == "Attention" {
+                // When the past K/V inputs are themselves bound at physical
+                // capacity (fixed-capacity decode, capture path), the standard
+                // `present = past + current` shape rule sees the *physical* past
+                // extent and over-counts the present seq axis beyond the bound
+                // buffer. In that case the present buffer's true shape is simply
+                // its physical capacity (mirroring GroupQueryAttention, whose
+                // present rule takes `past_capacity.max(total)`); the valid
+                // length lives on-device and context-overflow is caught earlier
+                // in the decoder (`total_len > max_len`). Otherwise keep the
+                // conservative `physical >= logical` guard.
+                let kv_capacity_bound = kernel_input_uses_physical_capacity(node, 4)
+                    && kernel_input_uses_physical_capacity(node, 5);
+                for (oi, &ovid) in outputs.iter().enumerate() {
+                    if oi == 0 {
+                        continue;
+                    }
+                    if let Some(value) = external.outputs.get(&ovid)
+                        && value.accepts_subshape
+                        && value.shape.len() == output_shapes[oi].len()
+                        && value.shape.iter().zip(&output_shapes[oi]).enumerate().all(
+                            |(axis, (&physical, &logical))| axis == 2 || physical == logical,
+                        )
+                        && (kv_capacity_bound
+                            || value.shape.get(2).zip(output_shapes[oi].get(2)).is_some_and(
+                                |(&physical, &logical)| physical >= logical,
+                            ))
+                    {
+                        output_shapes[oi] = value.shape.clone();
+                    }
+                }
+            }
+        }
         let capabilities = self.ep.capabilities();
         let accepts_lazy_weights =
             LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
@@ -8606,5 +8914,216 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Stage-0 capture prerequisite: a data-dependent decode shape that
+    /// `resolve_soft` omits (here `Range`'s runtime-length output feeding a
+    /// capture-safe `Cast`) forms an *unresolved-shape* eager seam. After one
+    /// eager warmup, [`Executor::seed_warm_decode_capture_shapes`] seeds that
+    /// value's exact just-in-time shape for the identical decode binding
+    /// signature, and the node no longer reports an unresolved-shape seam — the
+    /// executor now *admits* the already-capture-safe node instead of rejecting
+    /// it before consulting its kernel. Non-tautological: it asserts the
+    /// before/after seam transition and the concrete seeded extent.
+    #[test]
+    fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
+        use onnx_runtime_ir::{Attribute, static_shape};
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        // Range(start, limit, delta) with all three supplied at run time, so
+        // static shape inference cannot pin the output length: it stays symbolic
+        // (data-dependent) and `resolve_soft` omits it.
+        let start = graph.create_named_value("start", DataType::Int64, static_shape([]));
+        let limit = graph.create_named_value("limit", DataType::Int64, static_shape([]));
+        let delta = graph.create_named_value("delta", DataType::Int64, static_shape([]));
+        graph.add_input(start);
+        graph.add_input(limit);
+        graph.add_input(delta);
+        let len_sym = graph.intern_symbol("range_len");
+        let r = graph.create_named_value("r", DataType::Int64, vec![len_sym.into()]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Range",
+            vec![Some(start), Some(limit), Some(delta)],
+            vec![r],
+        ));
+        let y = graph.create_named_value("y", DataType::Float32, vec![len_sym.into()]);
+        let mut cast = Node::new(NodeId(0), "Cast", vec![Some(r)], vec![y]);
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+        graph.insert_node(cast);
+        graph.add_output(y);
+
+        let mut exec = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let zero = Tensor::from_raw(DataType::Int64, vec![], &0i64.to_le_bytes()).unwrap();
+        let four = Tensor::from_raw(DataType::Int64, vec![], &4i64.to_le_bytes()).unwrap();
+        let one = Tensor::from_raw(DataType::Int64, vec![], &1i64.to_le_bytes()).unwrap();
+        let inputs = [("start", &zero), ("limit", &four), ("delta", &one)];
+
+        let cast_pi = exec
+            .plan
+            .iter()
+            .position(|p| exec.graph.node(p.node_id).op_type == "Cast")
+            .expect("plan contains the Cast node");
+
+        // --- Before any warmup: the Cast is an unresolved-shape eager seam. ---
+        let bindings = exec
+            .bind_symbols(&inputs, &ExternalBindings::default())
+            .unwrap();
+        let pre = exec.resolve_soft(&bindings);
+        assert!(
+            !pre.contains_key(&r) && !pre.contains_key(&y),
+            "Range's runtime-length output (and its Cast) must be data-dependent (unresolved)"
+        );
+        let pre_seam = exec
+            .node_capture_reason(&exec.plan[cast_pi], &pre)
+            .and_then(|decline| decline.seam_reason);
+        assert!(
+            matches!(
+                pre_seam,
+                Some(SeamReason::UnresolvedInputShape) | Some(SeamReason::UnresolvedOutputShape)
+            ),
+            "without seeding the Cast must be an unresolved-shape seam; got {pre_seam:?}"
+        );
+
+        // --- One eager warmup records the exact just-in-time shapes. ----------
+        let out = exec.run(&inputs).unwrap();
+        assert_eq!(out[0].to_vec_f32(), vec![0.0, 1.0, 2.0, 3.0]);
+
+        // --- After warmup: the identical signature seeds the warm shapes. -----
+        let bindings2 = exec
+            .bind_symbols(&inputs, &ExternalBindings::default())
+            .unwrap();
+        let mut post = exec.resolve_soft(&bindings2);
+        assert!(
+            !post.contains_key(&r),
+            "resolve_soft alone still omits the data-dependent value"
+        );
+        exec.seed_warm_decode_capture_shapes(&mut post, &ExternalBindings::default());
+        assert_eq!(
+            post.get(&r),
+            Some(&vec![4usize]),
+            "warm seeding must restore Range's exact eager-resolved output shape"
+        );
+        assert_eq!(post.get(&y), Some(&vec![4usize]));
+
+        // The unresolved-shape seam is gone: the executor admits the node to the
+        // shape gate (any remaining decline is a kernel-capability decision, not
+        // a missing-shape rejection).
+        let post_seam = exec
+            .node_capture_reason(&exec.plan[cast_pi], &post)
+            .and_then(|decline| decline.seam_reason);
+        assert!(
+            !matches!(
+                post_seam,
+                Some(SeamReason::UnresolvedInputShape) | Some(SeamReason::UnresolvedOutputShape)
+            ),
+            "warm-seeded decode shapes must clear the unresolved-shape seam; got {post_seam:?}"
+        );
+
+        // A changed decode signature must NOT seed (pointer/capacity instability):
+        // a phantom persistent input binding makes the current signature differ
+        // from the warmup's, so the warm shapes are withheld and the value stays
+        // unresolved rather than risk baking a stale shape into a captured graph.
+        let mut mismatched = exec.resolve_soft(&bindings2);
+        let mut other = ExternalBindings::default();
+        other.inputs.insert(
+            start,
+            ExternalValue {
+                dtype: DataType::Int64,
+                shape: vec![],
+                accepts_subshape: false,
+                ptr: 0x1000 as *mut std::ffi::c_void,
+                len: 8,
+                alignment: 8,
+                device: onnx_runtime_ir::DeviceId::cpu(),
+            },
+        );
+        exec.seed_warm_decode_capture_shapes(&mut mismatched, &other);
+        assert!(
+            !mismatched.contains_key(&r),
+            "a changed persistent-binding signature must withhold the warm seed"
+        );
+    }
+
+    /// A kernel that aborts device-graph *recording* (e.g. it advertises capture
+    /// support but synchronizes, which CUDA rejects mid-capture) is quarantined
+    /// by op-type so a single mislabeled kernel cannot abort the whole segmented
+    /// capture. Once its `(domain, op_type)` is quarantined,
+    /// [`Executor::node_capture_reason`] must force that node to a
+    /// `CaptureRecordingFailed` eager seam even when its shapes are fully
+    /// resolved and it would otherwise reach the kernel gate. Non-tautological:
+    /// it asserts the *transition* from "not an unresolved-shape seam" to a
+    /// forced-seam classification caused solely by the quarantine.
+    #[test]
+    fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
+        use onnx_runtime_ir::{Attribute, static_shape};
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let x = graph.create_named_value("x", DataType::Int64, static_shape([4]));
+        graph.add_input(x);
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+        let mut cast = Node::new(NodeId(0), "Cast", vec![Some(x)], vec![y]);
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+        graph.insert_node(cast);
+        graph.add_output(y);
+
+        let mut exec = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let cast_pi = exec
+            .plan
+            .iter()
+            .position(|p| exec.graph.node(p.node_id).op_type == "Cast")
+            .expect("plan contains the Cast node");
+
+        // Statically-shaped Cast: its I/O shapes resolve without any seeding, so
+        // it is NOT an unresolved-shape seam and reaches the kernel gate.
+        let xt = Tensor::from_raw(
+            DataType::Int64,
+            vec![4],
+            &[0i64, 1, 2, 3]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let bindings = exec
+            .bind_symbols(&[("x", &xt)], &ExternalBindings::default())
+            .unwrap();
+        let resolved = exec.resolve_soft(&bindings);
+        let pre_seam = exec
+            .node_capture_reason(&exec.plan[cast_pi], &resolved)
+            .and_then(|decline| decline.seam_reason);
+        assert!(
+            !matches!(pre_seam, Some(SeamReason::CaptureRecordingFailed)),
+            "a non-quarantined statically-shaped node must not be a recording-failed seam; \
+             got {pre_seam:?}"
+        );
+
+        // Quarantine the Cast op-type (as the capture retry loop does after a
+        // kernel aborts recording) and re-check: it is now a forced eager seam
+        // regardless of its resolved shapes or kernel capability.
+        exec.capture_quarantine_ops
+            .insert(("ai.onnx".to_string(), "Cast".to_string()));
+        let post = exec.node_capture_reason(&exec.plan[cast_pi], &resolved);
+        assert_eq!(
+            post.and_then(|decline| decline.seam_reason),
+            Some(SeamReason::CaptureRecordingFailed),
+            "a quarantined op-type must be forced to a CaptureRecordingFailed eager seam"
+        );
     }
 }

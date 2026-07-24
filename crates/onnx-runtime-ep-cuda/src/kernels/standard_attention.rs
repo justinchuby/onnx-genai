@@ -77,7 +77,7 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -120,6 +120,46 @@ __device__ __forceinline__ void store_float(void* data, unsigned long long index
 }
 
 // Gather a K/V input into a contiguous [batch, heads, total_seq, dim] present
+// Derive the valid attended length on-device by scanning ONE row of the additive
+// attention mask bias for its first masked (large-negative) entry. The scanned
+// row is the LAST query row (`row_base` = the element offset of query i=q_seq-1
+// within the broadcast [.., q_seq, key_len] mask); at the final query position
+// the causal+padding frontier equals the total valid key length, so this returns
+// `total_seq` for a single-token decode AND `prompt_len` for a multi-token
+// prefill (row 0 would wrongly report 1 under a causal mask — hence the last
+// row). At fixed capacity the row is [.., max_len] with 0 bias for valid keys
+// [0,total) and a large-negative bias for padding [total,max_len); the frontier
+// index is the valid length. This lets both phases read their length from device
+// memory (the mask the kernel already consumes) instead of host shape metadata,
+// so the launch geometry stays fixed and capture-safe. Assumes a single
+// contiguous right-aligned valid run (greedy decode, no interior pads).
+extern "C" __global__ void derive_len(
+    const void* mask, int mask_kind, unsigned long long key_len,
+    unsigned long long row_base, int* out_len) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int total = (int)key_len;
+  for (unsigned long long j = 0; j < key_len; ++j) {
+    const unsigned long long idx = row_base + j;
+    float v;
+    if (mask_kind == 1) {
+      v = ((const float*)mask)[idx];
+    } else if (mask_kind == 3) {
+      v = __half2float(((const __half*)mask)[idx]);
+    } else if (mask_kind == 4) {
+      v = __bfloat162float(((const __nv_bfloat16*)mask)[idx]);
+    } else {
+      v = ((const unsigned char*)mask)[idx] != 0 ? 0.0f : NEG_INF;
+    }
+    if (v < -1000.0f) {
+      total = (int)j;
+      break;
+    }
+  }
+  out_len[0] = total;
+}
+
 // buffer, applying the 3D->4D head reshape and the past ++ current concat.
 extern "C" __global__ void build_kv(
     const void* past, const void* cur, void* out, int dtype,
@@ -127,20 +167,40 @@ extern "C" __global__ void build_kv(
     unsigned long long batch, unsigned long long heads,
     unsigned long long past_seq, unsigned long long cur_seq,
     unsigned long long total_seq, unsigned long long dim,
-    unsigned long long elements) {
+    unsigned long long out_cap, unsigned long long past_cap,
+    unsigned long long write_start, unsigned long long elements,
+    const int* dev_len) {
+  // Capture-safe path: when `dev_len` is provided the valid length (and hence
+  // the append slot) is read from device memory rather than the host-provided
+  // `total_seq`/`write_start`/`past_seq`. `cur_seq` (=1 at decode) and the
+  // per-head capacities stay host-constant, so grid geometry never changes.
+  if (dev_len != nullptr) {
+    const int total = dev_len[0];
+    past_seq = (unsigned long long)(total - (long long)cur_seq);
+    total_seq = (unsigned long long)total;
+    write_start = past_seq;
+  }
+  // `out_cap`/`past_cap` are the per-head seq strides of the destination and
+  // (4D) source caches. When they exceed the valid length the cache is stored
+  // at a fixed physical capacity, so head h occupies a constant slot and the
+  // new token is appended at row `t` without restriding the prior rows. In the
+  // dense case out_cap==total_seq and past_cap==past_seq (legacy behavior).
+  // `write_start` lets the fixed-slot append rebuild only rows [write_start,
+  // total_seq); a full rebuild passes 0.
+  const unsigned long long span = total_seq - write_start;
   for (unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < elements;
        idx += (unsigned long long)gridDim.x * blockDim.x) {
     unsigned long long d = idx % dim;
     unsigned long long rem = idx / dim;
-    unsigned long long t = rem % total_seq;
-    rem /= total_seq;
+    unsigned long long t = write_start + (rem % span);
+    rem /= span;
     unsigned long long h = rem % heads;
     unsigned long long b = rem / heads;
     float val;
     if (has_past && t < past_seq) {
       unsigned long long off = past_is_3d
           ? (b * past_seq + t) * (heads * dim) + h * dim + d
-          : ((b * heads + h) * past_seq + t) * dim + d;
+          : ((b * heads + h) * past_cap + t) * dim + d;
       val = load_float(past, off, dtype);
     } else {
       unsigned long long c = has_past ? (t - past_seq) : t;
@@ -149,7 +209,8 @@ extern "C" __global__ void build_kv(
           : ((b * heads + h) * cur_seq + c) * dim + d;
       val = load_float(cur, off, dtype);
     }
-    store_float(out, idx, val, dtype);
+    unsigned long long out_off = ((b * heads + h) * out_cap + t) * dim + d;
+    store_float(out, out_off, val, dtype);
   }
 }
 
@@ -199,7 +260,8 @@ extern "C" __global__ void attention_row(
     const void* mask, float* scores, void* y, void* qk_out,
     const long long* offsets, const long long* pad_limits,
     unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
-    unsigned long long kv_heads, unsigned long long total_seq,
+    unsigned long long kv_heads, unsigned long long total_seq_arg,
+    unsigned long long cap,
     unsigned long long head_size, unsigned long long v_head_size,
     unsigned long long group,
     int dtype, int q_is_3d, int out_is_3d, int is_causal,
@@ -207,12 +269,19 @@ extern "C" __global__ void attention_row(
     int mask_kind, int mask_rank,
     unsigned long long md0, unsigned long long md1,
     unsigned long long md2, unsigned long long md3,
-    int qk_mode, int want_qk) {
+    int qk_mode, int want_qk, const int* dev_len) {
   const unsigned long long row = blockIdx.x;
   const unsigned long long total_rows = batch * q_heads * q_seq;
   if (row >= total_rows) {
     return;
   }
+  // Capture-safe path: read the growing valid length from device memory (the
+  // frontier `derive_len` scanned from the mask) instead of the host-provided
+  // extent, so the launch geometry stays fixed. The per-head key/value stride
+  // (`cap`) is the fixed physical capacity, and the score scratch is sized for
+  // `total_rows * cap`, so a device length <= cap indexes within bounds.
+  const unsigned long long total_seq =
+      (dev_len != nullptr) ? (unsigned long long)dev_len[0] : total_seq_arg;
   const unsigned long long i = row % q_seq;
   unsigned long long rem = row / q_seq;
   const unsigned long long qh = rem % q_heads;
@@ -229,7 +298,7 @@ extern "C" __global__ void attention_row(
 
   // Stage 1: scaled Q·Kᵀ scores (sqrt(scale) folded into each operand).
   for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-    const unsigned long long koff = ((b * kv_heads + kvh) * total_seq + j) * head_size;
+    const unsigned long long koff = ((b * kv_heads + kvh) * cap + j) * head_size;
     float acc = 0.0f;
     for (unsigned long long p = 0; p < head_size; ++p) {
       acc += (load_float(q, qoff + p, dtype) * sqrt_scale)
@@ -333,7 +402,7 @@ extern "C" __global__ void attention_row(
   for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
     float acc = 0.0f;
     for (unsigned long long j = 0; j < total_seq; ++j) {
-      const unsigned long long voff = ((b * kv_heads + kvh) * total_seq + j) * v_head_size;
+      const unsigned long long voff = ((b * kv_heads + kvh) * cap + j) * v_head_size;
       acc += scores[srow + j] * load_float(value, voff + c, dtype);
     }
     store_float(y, ybase + c, acc, dtype);
@@ -461,6 +530,101 @@ pub struct StandardAttentionKernel {
     /// The registered opset version this kernel serves (23, or 24 for 24–26).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
+    /// Persistent device scratch for the fixed-capacity, device-valid-length
+    /// decode path so the captured hot path performs no per-op allocation.
+    /// Reserved lazily during the eager warmup step and reused (never grown)
+    /// during CUDA-graph capture/replay. Unused by the eager/dense/growing
+    /// paths, which keep their per-op scratch.
+    workspace: Mutex<StdAttnWorkspace>,
+    /// Set to the fixed-capacity decode signature after a successful
+    /// capture-eligible call; gates [`Self::capture_support`] to Supported only
+    /// once such a step has been warmed (mirrors GroupQueryAttention).
+    last_capture_safe_signature: Mutex<Option<StdAttnCaptureSignature>>,
+}
+
+/// Fixed-capacity decode signature warmed as capture-safe. A subsequent capture
+/// pass reuses the workspace slots sized for this shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StdAttnCaptureSignature {
+    dtype: DataType,
+    batch: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    q_seq: usize,
+    key_cap: usize,
+    head_size: usize,
+    v_head_size: usize,
+}
+
+const WS_SCORES: usize = 0;
+const WS_DEV_LEN: usize = 1;
+const WS_OFFSETS: usize = 2;
+const WS_PAD_LIMITS: usize = 3;
+const WS_COUNT: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StdWorkspaceSlot {
+    ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct StdAttnWorkspace {
+    runtime: Arc<CudaRuntime>,
+    slots: [StdWorkspaceSlot; WS_COUNT],
+}
+
+impl StdAttnWorkspace {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            slots: [StdWorkspaceSlot::default(); WS_COUNT],
+        }
+    }
+
+    /// Return a device pointer for slot `index` with at least `bytes` capacity.
+    /// Reuses the existing allocation when large enough; otherwise (re)allocates
+    /// — but never during graph capture, where a grow would record an illegal
+    /// allocation, so the caller must have warmed the exact decode shape first.
+    fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        let bytes = bytes.max(1);
+        let slot = self.slots[index];
+        if slot.bytes >= bytes {
+            return Ok(slot.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: workspace slot {index} requires {bytes} bytes during CUDA graph \
+                 capture; warm the fixed decode shape before capture"
+            )));
+        }
+        let ptr = self.runtime.alloc_raw(bytes)?;
+        if slot.ptr != 0 {
+            // A growing (prefill/eager) shape may outgrow a slot warmed for a
+            // smaller step. Wait for queued users of the old storage before
+            // freeing; the fixed-capacity decode path never reaches here.
+            if let Err(error) = self.runtime.synchronize() {
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.slots[index] = StdWorkspaceSlot { ptr, bytes };
+        Ok(ptr)
+    }
+}
+
+impl Drop for StdAttnWorkspace {
+    fn drop(&mut self) {
+        for slot in &self.slots {
+            if slot.ptr != 0 {
+                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
+            }
+        }
+    }
 }
 
 /// Factory for [`StandardAttentionKernel`], reading the standard-`Attention`
@@ -505,6 +669,8 @@ impl KernelFactory for StandardAttentionFactory {
             qk_matmul_output_mode,
             softcap,
             since_version: self.since_version,
+            workspace: Mutex::new(StdAttnWorkspace::new(self.runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -661,8 +827,20 @@ impl StandardAttentionKernel {
         cur_seq: usize,
         total_seq: usize,
         dim: usize,
+        out_cap: usize,
+        past_cap: usize,
+        write_start: usize,
+        dev_len: CUdeviceptr,
     ) -> Result<()> {
-        let elements = (batch * heads * total_seq * dim) as u64;
+        // With a device length the append rebuilds exactly `cur_seq` rows into
+        // their fixed slot, so the element count (and thus grid geometry) is
+        // host-constant regardless of the growing valid length.
+        let span = if dev_len != 0 {
+            cur_seq
+        } else {
+            total_seq.saturating_sub(write_start)
+        };
+        let elements = (batch * heads * span * dim) as u64;
         if elements == 0 {
             return Ok(());
         }
@@ -678,6 +856,9 @@ impl StandardAttentionKernel {
         let cur_seq = cur_seq as u64;
         let total_seq = total_seq as u64;
         let dim = dim as u64;
+        let out_cap = out_cap as u64;
+        let past_cap = past_cap as u64;
+        let write_start = write_start as u64;
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder
             .arg(&past_ptr)
@@ -693,7 +874,11 @@ impl StandardAttentionKernel {
             .arg(&cur_seq)
             .arg(&total_seq)
             .arg(&dim)
-            .arg(&elements);
+            .arg(&out_cap)
+            .arg(&past_cap)
+            .arg(&write_start)
+            .arg(&elements)
+            .arg(&dev_len);
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (
@@ -708,13 +893,51 @@ impl StandardAttentionKernel {
         .map_err(|error| driver_err("launch build_kv", error))
         .map(|_| ())
     }
+
+    /// Scan the additive attention-mask bias for its valid-length frontier and
+    /// write it to `out_len` (a device `i32`). One launch of a single thread;
+    /// used by the capture-safe decode path so the growing length is read from
+    /// device memory rather than host shape metadata.
+    fn launch_derive_len(
+        &self,
+        mask_ptr: CUdeviceptr,
+        mask_kind: i32,
+        key_len: u64,
+        row_base: u64,
+        out_len: CUdeviceptr,
+    ) -> Result<()> {
+        let func =
+            self.runtime
+                .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "derive_len")?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&mask_ptr)
+            .arg(&mask_kind)
+            .arg(&key_len)
+            .arg(&row_base)
+            .arg(&out_len);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch derive_len", error))
+        .map(|_| ())
+    }
 }
 
 impl Kernel for StandardAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
-        // Inputs may have been uploaded asynchronously on the EP stream.
-        self.runtime.synchronize()?;
+        // Inputs may have been uploaded asynchronously on the EP stream. During
+        // CUDA-graph capture the uploads are recorded into the graph, so no host
+        // synchronize is issued (and none is legal); ordering is preserved by
+        // the stream the capture records.
+        if !self.runtime.is_capturing()? {
+            self.runtime.synchronize()?;
+        }
 
         let q_rank = inputs[0].shape.len();
         let q = resolve_bhsd(&inputs[0], "Q", self.q_num_heads)?;
@@ -919,8 +1142,62 @@ impl Kernel for StandardAttentionKernel {
         let want_present_key = outputs.len() >= 2;
         let want_present_value = outputs.len() >= 3;
         let want_qk = outputs.len() >= 4;
-        let present_key_expected = batch * kv_heads * total_seq * head_size;
-        let present_value_expected = batch * kv_heads * total_seq * v_head_size;
+        // Physical per-head seq capacity of the bound present K/V slots (their
+        // stride when exposed at fixed capacity). Zero for dense/unbound slots.
+        let present_key_phys = if want_present_key && outputs[1].shape.len() == 4 {
+            outputs[1].shape[2]
+        } else {
+            0
+        };
+        let present_value_phys = if want_present_value && outputs[2].shape.len() == 4 {
+            outputs[2].shape[2]
+        } else {
+            0
+        };
+        // Frozen (fixed-capacity) KV binding: the past K/V *input* is bound at its
+        // physical capacity too (extent == present capacity), so its tensor
+        // extent no longer reports the valid past length — that length now lives
+        // on-device (the attention-mask frontier scanned by `derive_len`). This
+        // is what makes the decode step carry no growing logical input shape, so
+        // whole-step CUDA-graph capture stays shape-static. The eager-growing
+        // path (past extent < present capacity, exercised by the unit tests with
+        // explicit shapes) keeps host-derived lengths and is left untouched.
+        let kv_frozen = has_past_key
+            && has_past_value
+            && present_key_phys > 0
+            && present_value_phys > 0
+            && key_past_seq >= present_key_phys
+            && value_past_seq >= present_value_phys;
+        // Fixed-capacity KV: a bound present K/V output may be exposed at its
+        // physical capacity (seq stride > valid length) so the cache lives at a
+        // constant per-head slot and the new token is appended without
+        // restriding the prior rows. `*_cap` is that per-head seq stride; it
+        // collapses to the valid length for dense (non-capacity) present slots,
+        // preserving the legacy contiguous layout. When the binding is frozen
+        // the host cannot see the valid length, so it sizes everything to the
+        // physical capacity and the device length bounds the actual compute.
+        let (key_cap, value_cap, total_seq, value_total_seq) = if kv_frozen {
+            (
+                present_key_phys,
+                present_value_phys,
+                present_key_phys,
+                present_value_phys,
+            )
+        } else {
+            let key_cap = if want_present_key && outputs[1].shape.len() == 4 {
+                outputs[1].shape[2].max(total_seq)
+            } else {
+                total_seq
+            };
+            let value_cap = if want_present_value && outputs[2].shape.len() == 4 {
+                outputs[2].shape[2].max(value_total_seq)
+            } else {
+                value_total_seq
+            };
+            (key_cap, value_cap, total_seq, value_total_seq)
+        };
+        let present_key_expected = batch * kv_heads * key_cap * head_size;
+        let present_value_expected = batch * kv_heads * value_cap * v_head_size;
         let qk_expected = batch * q_heads * q_seq * total_seq;
 
         // Validate present/qk outputs and capture their device pointers. Split
@@ -1012,17 +1289,30 @@ impl Kernel for StandardAttentionKernel {
                 )?,
             };
 
-            // In-place KV growth: the decode graph binds the present K/V output
-            // onto the same buffer as the past K/V input. `build_kv` rewrites the
-            // whole cache with a *wider* per-head stride (total_seq > past_seq),
-            // so writing directly into that buffer makes head h's current-token
-            // store overlap head h+1's past load across unordered threads — a
-            // data race that leaves every head beyond head 0 nondeterministic.
-            // Stage the rebuild in a disjoint scratch buffer (reads the pristine
-            // past), then copy the fully-formed dense cache back. General: any
-            // model whose default-domain Attention grows an aliased KV cache.
-            let stage_key = has_past_key && present_key_out == Some(past_key_ptr);
-            let stage_value = has_past_value && present_value_out == Some(past_value_ptr);
+            // In-place KV growth. The decode graph binds the present K/V output
+            // onto the same buffer as the past K/V input.
+            //
+            // Fixed-capacity present (key_cap/value_cap > valid length): the
+            // cache lives at a constant per-head stride, so `build_kv` appends
+            // only the new token's rows into their fixed slot and leaves the
+            // prior rows (already at that stride) untouched — no restride, no
+            // cross-head overlap, race-free and deterministic in place. No
+            // staging needed.
+            //
+            // Dense present (legacy): `build_kv` rewrites the whole cache with a
+            // *wider* per-head stride (total_seq > past_seq), so an aliased
+            // in-place write makes head h's current-token store overlap head
+            // h+1's past load across unordered threads — a data race that leaves
+            // every head beyond head 0 nondeterministic. Stage the rebuild in a
+            // disjoint scratch buffer (reads the pristine past), then copy the
+            // fully-formed dense cache back. General: any model whose
+            // default-domain Attention grows an aliased KV cache.
+            let alias_key = has_past_key && present_key_out == Some(past_key_ptr);
+            let alias_value = has_past_value && present_value_out == Some(past_value_ptr);
+            let capacity_key = kv_frozen || key_cap > total_seq;
+            let capacity_value = kv_frozen || value_cap > value_total_seq;
+            let stage_key = alias_key && !capacity_key;
+            let stage_value = alias_value && !capacity_value;
             let key_kv_ptr = if stage_key {
                 alloc(&self.runtime, &mut owned, present_key_expected * element_bytes)?
             } else {
@@ -1037,21 +1327,102 @@ impl Kernel for StandardAttentionKernel {
             } else {
                 present_value_ptr
             };
-            let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
-            // Upload the per-batch control arrays.
-            let offsets_ptr = alloc(&self.runtime, &mut owned, offsets.len() * 8)?;
-            let pad_limits_ptr = alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?;
-            let offsets_bytes = unsafe {
-                std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
-            };
-            let pad_bytes = unsafe {
-                std::slice::from_raw_parts(pad_limits.as_ptr().cast::<u8>(), pad_limits.len() * 8)
-            };
-            unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
-            unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
+            // On-device valid length ABI for default-domain Attention: derive
+            // the valid attended length from the attention-mask frontier so the
+            // kernel reads it from device memory instead of host shape metadata
+            // (whose extent is frozen when a CUDA graph is captured). Scanning
+            // the LAST query row makes it correct for BOTH phases — prefill
+            // returns prompt_len, decode returns total_seq (row 0 would report 1
+            // under a causal prefill mask). Eligible only for the fixed-capacity,
+            // mask-masked (non-causal) fixed-slot-append path; every other path
+            // passes a null pointer and keeps the host-derived length, so
+            // eager/dense/GQA are bit-for-bit unchanged.
+            let dev_length_eligible = has_past_key
+                && has_past_value
+                && !self.is_causal
+                && mask.kind != 0
+                && capacity_key
+                && capacity_value
+                && alias_key
+                && alias_value;
 
-            // Build present_key / present_value on the device.
+            // Fixed-capacity + device-length decode is the capture-safe path: its
+            // launch geometry is host-constant, so its scratch lives in a
+            // persistent per-kernel workspace (reserved during the eager warmup
+            // step, reused with no allocation during capture/replay) rather than
+            // per-op allocations. Every other path keeps its per-op scratch.
+            let capturing = self.runtime.is_capturing()?;
+            let mut ws = if dev_length_eligible {
+                Some(self.workspace.lock().map_err(|_| {
+                    EpError::KernelFailed("Attention: workspace lock poisoned".into())
+                })?)
+            } else {
+                None
+            };
+            let scores_ptr = match ws.as_mut() {
+                Some(ws) => ws.reserve(WS_SCORES, qk_expected * 4)?,
+                None => alloc(&self.runtime, &mut owned, qk_expected * 4)?,
+            };
+            let dev_len_ptr = if dev_length_eligible {
+                let ptr = match ws.as_mut() {
+                    Some(ws) => ws.reserve(WS_DEV_LEN, std::mem::size_of::<i32>())?,
+                    None => unreachable!("dev_length_eligible implies a workspace"),
+                };
+                let key_len = mask.dims[3];
+                let mask_q = mask.dims[2];
+                let last_row = mask_q.saturating_sub(1);
+                let row_base = last_row * key_len;
+                self.launch_derive_len(mask.ptr, mask.kind, key_len, row_base, ptr)?;
+                ptr
+            } else {
+                0
+            };
+
+            // Per-batch control arrays. On the capture path they live in fixed
+            // workspace slots and are (re)uploaded only outside capture — their
+            // values are host-constant for a frozen decode (offset unused with
+            // `is_causal=false`, pad `-1`), so the warmup upload is what a replay
+            // reuses. The eager/dense path uploads fresh per call.
+            let offsets_ptr = match ws.as_mut() {
+                Some(ws) => ws.reserve(WS_OFFSETS, offsets.len() * 8)?,
+                None => alloc(&self.runtime, &mut owned, offsets.len() * 8)?,
+            };
+            let pad_limits_ptr = match ws.as_mut() {
+                Some(ws) => ws.reserve(WS_PAD_LIMITS, pad_limits.len() * 8)?,
+                None => alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?,
+            };
+            if !capturing {
+                let offsets_bytes = unsafe {
+                    std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
+                };
+                let pad_bytes = unsafe {
+                    std::slice::from_raw_parts(pad_limits.as_ptr().cast::<u8>(), pad_limits.len() * 8)
+                };
+                unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
+                unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
+            }
+            drop(ws);
+
+            // Build present_key / present_value on the device. In capacity mode
+            // the append writes only the new rows [past_seq, total_seq) into
+            // their fixed slot; the dense path rebuilds all rows.
+            let key_write_start = if capacity_key && alias_key {
+                key_past_seq
+            } else {
+                0
+            };
+            let key_past_cap = if capacity_key { key_cap } else { key_past_seq };
+            let value_write_start = if capacity_value && alias_value {
+                value_past_seq
+            } else {
+                0
+            };
+            let value_past_cap = if capacity_value {
+                value_cap
+            } else {
+                value_past_seq
+            };
             self.launch_build_kv(
                 past_key_ptr,
                 k_cur_ptr,
@@ -1066,6 +1437,10 @@ impl Kernel for StandardAttentionKernel {
                 k_cur.seq,
                 total_seq,
                 head_size,
+                key_cap,
+                key_past_cap,
+                key_write_start,
+                dev_len_ptr,
             )?;
             self.launch_build_kv(
                 past_value_ptr,
@@ -1081,6 +1456,10 @@ impl Kernel for StandardAttentionKernel {
                 v_cur.seq,
                 value_total_seq,
                 v_head_size,
+                value_cap,
+                value_past_cap,
+                value_write_start,
+                dev_len_ptr,
             )?;
 
             // When staged, publish the freshly-built dense cache back into the
@@ -1116,6 +1495,7 @@ impl Kernel for StandardAttentionKernel {
                 let q_seq_u = q_seq as u64;
                 let kv_heads_u = kv_heads as u64;
                 let total_seq_u = total_seq as u64;
+                let kv_cap_u = key_cap as u64;
                 let head_size_u = head_size as u64;
                 let v_head_size_u = v_head_size as u64;
                 let group_u = group as u64;
@@ -1144,6 +1524,7 @@ impl Kernel for StandardAttentionKernel {
                     .arg(&q_seq_u)
                     .arg(&kv_heads_u)
                     .arg(&total_seq_u)
+                    .arg(&kv_cap_u)
                     .arg(&head_size_u)
                     .arg(&v_head_size_u)
                     .arg(&group_u)
@@ -1160,7 +1541,8 @@ impl Kernel for StandardAttentionKernel {
                     .arg(&md2)
                     .arg(&md3)
                     .arg(&qk_mode)
-                    .arg(&want_qk_i);
+                    .arg(&want_qk_i)
+                    .arg(&dev_len_ptr);
                 unsafe {
                     builder.launch(LaunchConfig {
                         grid_dim: (total_rows.min(u32::MAX as u64).max(1) as u32, 1, 1),
@@ -1170,7 +1552,29 @@ impl Kernel for StandardAttentionKernel {
                 }
                 .map_err(|error| driver_err("launch attention_row", error))?;
             }
-            self.runtime.synchronize()
+            if !self.runtime.is_capturing()? {
+                self.runtime.synchronize()?;
+            }
+            // Record the fixed-capacity decode signature as capture-safe once a
+            // single-token step has run through the device-length workspace path
+            // with no per-op allocation or synchronize. `capture_support` gates
+            // on this so the session only captures a warmed decode shape.
+            if dev_length_eligible && batch == 1 && q_seq == 1 {
+                let signature = StdAttnCaptureSignature {
+                    dtype,
+                    batch,
+                    q_heads,
+                    kv_heads,
+                    q_seq,
+                    key_cap,
+                    head_size,
+                    v_head_size,
+                };
+                if let Ok(mut slot) = self.last_capture_safe_signature.lock() {
+                    *slot = Some(signature);
+                }
+            }
+            Ok(())
         })();
 
         let mut free_result = Ok(());
@@ -1188,9 +1592,20 @@ impl Kernel for StandardAttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "setup synchronously uploads per-batch control arrays and reads nonpad_kv_seqlen D2H",
-        )
+        // Eligible once a fixed-capacity, device-valid-length, single-token
+        // decode step has been warmed (its scratch reserved in the persistent
+        // workspace and its control uploads done outside capture). Until then —
+        // or for the eager/dense/growing paths, which never set the signature —
+        // capture is declined so those steps run eagerly.
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-capacity device-valid-length single-token decode step",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Attention capture signature is unavailable because its state lock was poisoned",
+            ),
+        }
     }
 }
 
@@ -1272,6 +1687,8 @@ mod alias_tests {
             qk_matmul_output_mode: 0,
             softcap: 0.0,
             since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         };
 
         // Runs one decode step; when `alias` the present KV outputs share the
@@ -1373,5 +1790,312 @@ mod alias_tests {
                 "aliased KV-cache growth must be deterministic across runs (iteration {i})"
             );
         }
+    }
+
+    /// Fixed-capacity / fixed-slot append path (the eager perf deliverable):
+    /// when the `present` KV output is bound at a *physical capacity* wider than
+    /// the valid length, `build_kv` must lay the cache out at the CAPACITY
+    /// per-head stride and append the new token into slot `[past_seq]`, while the
+    /// attention read is bounded to the valid `[0, total_seq)` rows. Physical
+    /// slots `[total_seq, cap)` hold uninitialised padding that must never be
+    /// read. This guards against a regression to reading the KV tensor *extent*
+    /// as the sequence length: if the kernel used `cap` (or the padded buffer) as
+    /// the loop bound it would fold the non-zero padding into the scores and
+    /// diverge from the dense reference.
+    #[test]
+    fn decode_kv_capacity_append_matches_reference_and_ignores_padding() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let device = DeviceId::cuda(0);
+
+        let heads = 4usize;
+        let past = 3usize;
+        let qlen = 1usize;
+        let total = past + qlen;
+        let kdim = 6usize;
+        let vdim = 4usize;
+
+        let q = fill(heads * qlen * kdim, 1);
+        let k_cur = fill(heads * qlen * kdim, 2);
+        let v_cur = fill(heads * qlen * vdim, 3);
+        let past_k = fill(heads * past * kdim, 4);
+        let past_v = fill(heads * past * vdim, 5);
+
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: true,
+            q_num_heads: Some(heads),
+            kv_num_heads: Some(heads),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
+        };
+
+        // Lay a `[heads, valid, dim]` contiguous tensor into a `[heads, cap, dim]`
+        // capacity-strided buffer; the padding `[valid, cap)` is filled with
+        // `garbage` to prove the kernel never reads it.
+        let cap_strided =
+            |rows: &[f32], valid: usize, dim: usize, cap: usize, garbage: f32| -> Vec<f32> {
+                let mut buf = vec![garbage; heads * cap * dim];
+                for h in 0..heads {
+                    for t in 0..valid {
+                        for d in 0..dim {
+                            buf[(h * cap + t) * dim + d] = rows[(h * valid + t) * dim + d];
+                        }
+                    }
+                }
+                buf
+            };
+
+        // `cap == total` + non-aliased is the dense, race-free ground truth.
+        // `cap > total` + aliased is the fixed-slot capacity append under test.
+        let run = |alias: bool, cap: usize| -> Vec<f32> {
+            let q_sh = [1usize, heads, qlen, kdim];
+            let kcur_sh = [1usize, heads, qlen, kdim];
+            let vcur_sh = [1usize, heads, qlen, vdim];
+            let pastk_sh = [1usize, heads, past, kdim];
+            let pastv_sh = [1usize, heads, past, vdim];
+            let presk_sh = [1usize, heads, cap, kdim];
+            let presv_sh = [1usize, heads, cap, vdim];
+            let y_sh = [1usize, heads, qlen, vdim];
+
+            let q_st = compute_contiguous_strides(&q_sh);
+            let kcur_st = compute_contiguous_strides(&kcur_sh);
+            let vcur_st = compute_contiguous_strides(&vcur_sh);
+            let pastk_st = compute_contiguous_strides(&pastk_sh);
+            let pastv_st = compute_contiguous_strides(&pastv_sh);
+            let presk_st = compute_contiguous_strides(&presk_sh);
+            let presv_st = compute_contiguous_strides(&presv_sh);
+            let y_st = compute_contiguous_strides(&y_sh);
+
+            let key_cap_bytes = heads * cap * kdim * 4;
+            let val_cap_bytes = heads * cap * vdim * 4;
+            // The kernel reads `past` at the *past_cap* per-head stride: the full
+            // physical capacity `cap` for the capacity/fixed-slot path (aliased,
+            // cap > total), or the dense valid `past` length otherwise. Lay the
+            // past buffer out at exactly that stride, with non-zero padding in the
+            // physical slots beyond the valid length so a stride/bound regression
+            // is caught.
+            let capacity_case = alias && cap > total;
+            let pcap = if capacity_case { cap } else { past };
+            let key_init = cap_strided(&past_k, past, kdim, pcap, 7.5);
+            let val_init = cap_strided(&past_v, past, vdim, pcap, -4.25);
+            let key_past_bytes = heads * pcap * kdim * 4;
+            let val_past_bytes = heads * pcap * vdim * 4;
+            let q_bytes = f32_bytes(&q);
+            let kcur_bytes = f32_bytes(&k_cur);
+            let vcur_bytes = f32_bytes(&v_cur);
+
+            unsafe {
+                let key_buf = rt.alloc_raw(key_past_bytes.max(key_cap_bytes)).unwrap();
+                let val_buf = rt.alloc_raw(val_past_bytes.max(val_cap_bytes)).unwrap();
+                let q_buf = rt.alloc_raw(q_bytes.len()).unwrap();
+                let kcur_buf = rt.alloc_raw(kcur_bytes.len()).unwrap();
+                let vcur_buf = rt.alloc_raw(vcur_bytes.len()).unwrap();
+                rt.htod(&f32_bytes(&key_init), key_buf).unwrap();
+                rt.htod(&f32_bytes(&val_init), val_buf).unwrap();
+                rt.htod(&q_bytes, q_buf).unwrap();
+                rt.htod(&kcur_bytes, kcur_buf).unwrap();
+                rt.htod(&vcur_bytes, vcur_buf).unwrap();
+
+                let (presk_buf, presv_buf) = if alias {
+                    (key_buf, val_buf)
+                } else {
+                    (
+                        rt.alloc_raw(key_cap_bytes).unwrap(),
+                        rt.alloc_raw(val_cap_bytes).unwrap(),
+                    )
+                };
+                let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
+
+                let dp = |p: CUdeviceptr| DevicePtr(p as *const c_void);
+                let dpm = |p: CUdeviceptr| DevicePtrMut(p as *mut c_void);
+
+                let inputs = [
+                    TensorView::new(dp(q_buf), DataType::Float32, &q_sh, &q_st, device),
+                    TensorView::new(dp(kcur_buf), DataType::Float32, &kcur_sh, &kcur_st, device),
+                    TensorView::new(dp(vcur_buf), DataType::Float32, &vcur_sh, &vcur_st, device),
+                    TensorView::absent(DataType::Float32),
+                    TensorView::new(dp(key_buf), DataType::Float32, &pastk_sh, &pastk_st, device),
+                    TensorView::new(dp(val_buf), DataType::Float32, &pastv_sh, &pastv_st, device),
+                ];
+                let mut outputs = [
+                    TensorMut::new(dpm(y_buf), DataType::Float32, &y_sh, &y_st, device),
+                    TensorMut::new(dpm(presk_buf), DataType::Float32, &presk_sh, &presk_st, device),
+                    TensorMut::new(dpm(presv_buf), DataType::Float32, &presv_sh, &presv_st, device),
+                ];
+
+                kernel.execute(&inputs, &mut outputs).unwrap();
+
+                let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
+                rt.dtoh(&mut y_bytes, y_buf).unwrap();
+
+                rt.free_raw(key_buf).unwrap();
+                rt.free_raw(val_buf).unwrap();
+                rt.free_raw(q_buf).unwrap();
+                rt.free_raw(kcur_buf).unwrap();
+                rt.free_raw(vcur_buf).unwrap();
+                rt.free_raw(y_buf).unwrap();
+                if !alias {
+                    rt.free_raw(presk_buf).unwrap();
+                    rt.free_raw(presv_buf).unwrap();
+                }
+                bytes_f32(&y_bytes)
+            }
+        };
+
+        // Dense reference at exactly the valid length (no padding).
+        let reference = run(false, total);
+        // Fixed-slot append into a wider physical capacity with non-zero padding
+        // must reproduce the reference exactly (padding ignored) and be stable.
+        let capacity = run(true, total + 5);
+        assert_eq!(
+            capacity, reference,
+            "capacity/fixed-slot KV append must match the dense reference and \
+             ignore the non-zero physical padding beyond the valid length"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                run(true, total + 5),
+                capacity,
+                "capacity KV append must be deterministic across runs (iteration {i})"
+            );
+        }
+    }
+
+    /// The on-device valid-length ABI must be correct for BOTH decode and
+    /// prefill: scanning the LAST query row of the additive mask returns
+    /// `total_seq` for a single-token decode and `prompt_len` for a multi-token
+    /// causal prefill. This locks the last-row behavior — a row-0 (decode-only)
+    /// scan would wrongly report 1 for a causal prefill mask, so this test fails
+    /// if the kernel reverts to scanning row 0 or to host shape metadata.
+    #[test]
+    fn derive_len_reads_valid_length_from_device_for_prefill_and_decode() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: false,
+            q_num_heads: Some(1),
+            kv_num_heads: Some(1),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
+        };
+        const NEG: f32 = -65504.0;
+        let mask_kind = 1i32; // f32 additive bias
+
+        // Launch derive_len over `mask` scanning the row at `row_base` and read
+        // the device-written i32 back to the host.
+        let derive = |mask: &[f32], key_len: u64, row_base: u64| -> i32 {
+            let mask_buf = rt.alloc_raw(mask.len() * 4).unwrap();
+            unsafe { rt.htod(&f32_bytes(mask), mask_buf).unwrap() };
+            let out_buf = rt.alloc_raw(std::mem::size_of::<i32>()).unwrap();
+            kernel
+                .launch_derive_len(mask_buf, mask_kind, key_len, row_base, out_buf)
+                .unwrap();
+            rt.synchronize().unwrap();
+            let mut out = [0u8; 4];
+            unsafe { rt.dtoh(&mut out, out_buf).unwrap() };
+            unsafe { rt.free_raw(mask_buf).unwrap() };
+            unsafe { rt.free_raw(out_buf).unwrap() };
+            i32::from_le_bytes(out)
+        };
+
+        // Decode: mask row [1,1,1,cap] with `total` valid then padding.
+        let cap = 8u64;
+        let total = 5i32;
+        let mut decode = vec![0.0f32; total as usize];
+        decode.extend(std::iter::repeat(NEG).take(cap as usize - total as usize));
+        assert_eq!(
+            derive(&decode, cap, 0),
+            total,
+            "decode: device valid length must equal total_seq"
+        );
+
+        // Prefill: causal mask [1,1,prompt_len,cap], row i valid for keys [0,i].
+        let prompt_len = 4usize;
+        let mut prefill = Vec::with_capacity(prompt_len * cap as usize);
+        for i in 0..prompt_len {
+            for j in 0..cap as usize {
+                prefill.push(if j <= i { 0.0 } else { NEG });
+            }
+        }
+        let last_row_base = (prompt_len as u64 - 1) * cap;
+        assert_eq!(
+            derive(&prefill, cap, last_row_base),
+            prompt_len as i32,
+            "prefill: last-row scan must return prompt_len"
+        );
+        // Row 0 (the decode-only bug) reports 1 for a causal prefill mask, which
+        // is why the ABI scans the last query row.
+        assert_eq!(
+            derive(&prefill, cap, 0),
+            1,
+            "row-0 scan reports 1 for a causal prefill mask (decode-only bug guard)"
+        );
+    }
+
+    /// Capture eligibility of the default-domain Attention path is gated on a
+    /// warmed, fixed-capacity, device-valid-length single-token decode step: the
+    /// kernel only reports `Supported` after such a step records its capture
+    /// signature. A fresh kernel (and every eager/dense/growing path, which never
+    /// records a signature) must decline capture. This locks the gate — the test
+    /// fails if `capture_support` reverts to unconditionally returning `Supported`
+    /// or the device-valid-length signature requirement is dropped.
+    #[test]
+    fn capture_support_gated_on_warmed_device_valid_length_signature() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: false,
+            q_num_heads: Some(1),
+            kv_num_heads: Some(1),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
+        };
+        // No warmed decode step yet -> capture declined.
+        assert!(
+            !matches!(
+                kernel.capture_support(),
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            ),
+            "fresh kernel must decline capture until a fixed-capacity device-valid-length decode step is warmed"
+        );
+        // Simulate a warmed single-token decode step recording its signature.
+        *kernel.last_capture_safe_signature.lock().unwrap() = Some(StdAttnCaptureSignature {
+            dtype: DataType::Float16,
+            batch: 1,
+            q_heads: 1,
+            kv_heads: 1,
+            q_seq: 1,
+            key_cap: 4096,
+            head_size: 192,
+            v_head_size: 128,
+        });
+        assert!(
+            matches!(
+                kernel.capture_support(),
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            ),
+            "capture must be Supported once a device-valid-length single-token decode step is warmed"
+        );
     }
 }

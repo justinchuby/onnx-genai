@@ -7,17 +7,9 @@
 //! synchronize. That is the prerequisite for a `Where` to fold into a captured
 //! CUDA graph instead of forcing a seam.
 //!
-//! Capture is only advertised for the **loop-invariant scalar-predicate select**
-//! shape — a single-element condition selecting between two equal-shaped
-//! operands (`x.shape == y.shape == output.shape`). That is exactly the shape
-//! produced when a capture-unsafe `If` whose branches are pure constant
-//! selections is lowered to an on-device `Where` (see
-//! `CudaOnDeviceConstantSelect` in `crate::optimizer`): the two branch caches
-//! stay resident as constants and the scalar predicate is evaluated on-device
-//! every step, so the whole decode collapses into one captured graph with no
-//! per-step host cond readback. A general broadcasting / data-dependent `Where`
-//! keeps the conservative `CaptureSupport::Unsupported` disposition and still
-//! runs correctly as an eager seam node.
+//! Capture is advertised after an exact dtype/shape signature has warmed. The
+//! condition remains device-resident and may vary between replays; only the
+//! broadcast geometry must remain fixed.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -168,21 +160,6 @@ struct WhereKernel {
     last_capture_safe_signature: Mutex<Option<WhereCaptureSignature>>,
 }
 
-/// Whether a `Where` launch is the capture-safe loop-invariant scalar-predicate
-/// select: a single-element condition choosing between two operands whose shapes
-/// already equal the output (a pure select, no data-operand broadcast). Its
-/// metadata is invariant across decode steps, so it can fold into a captured
-/// graph. Any other `Where` (data-dependent condition, broadcasting operands)
-/// stays an eager seam.
-fn is_invariant_scalar_select(
-    condition: &TensorView,
-    x: &TensorView,
-    y: &TensorView,
-    out_shape: &[usize],
-) -> bool {
-    condition.numel() == 1 && x.shape == out_shape && y.shape == out_shape
-}
-
 impl Kernel for WhereKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
@@ -226,20 +203,15 @@ impl Kernel for WhereKernel {
             )));
         }
 
-        // Only the invariant scalar-select shape may enter capture. Recording a
-        // signature for it lets `capture_support` advertise `Supported`; the
-        // signature guard below rejects any drift between the warmed shape and
-        // the shape seen during capture, exactly as the binary kernel does.
-        let current_signature =
-            is_invariant_scalar_select(condition, x, y, &expected).then(|| WhereCaptureSignature {
-                dtype: x.dtype,
-                shapes: WhereMetadataKey {
-                    condition_shape: condition.shape.to_vec(),
-                    x_shape: x.shape.to_vec(),
-                    y_shape: y.shape.to_vec(),
-                    out_shape: expected.clone(),
-                },
-            });
+        let current_signature = Some(WhereCaptureSignature {
+            dtype: x.dtype,
+            shapes: WhereMetadataKey {
+                condition_shape: condition.shape.to_vec(),
+                x_shape: x.shape.to_vec(),
+                y_shape: y.shape.to_vec(),
+                out_shape: expected.clone(),
+            },
+        });
         require_matching_capture_signature(
             &self.runtime,
             "Where",
@@ -307,63 +279,14 @@ impl Kernel for WhereKernel {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // Only the invariant scalar-select signature recorded by the most recent
-        // successful call may enter capture; every other `Where` stays an eager
-        // seam (the general broadcasting path allocates per-call metadata).
         match self.last_capture_safe_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "Where is capture-safe only as an invariant scalar-predicate select over \
-                 equal-shaped operands; this launch broadcasts or has a non-scalar condition",
+                "Where must warm its exact broadcast shape/dtype signature before capture",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "Where capture signature is unavailable because its state lock was poisoned",
             ),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_invariant_scalar_select;
-    use onnx_runtime_ep_api::{DevicePtr, DeviceId, TensorView};
-    use onnx_runtime_ir::DataType;
-
-    fn view<'a>(shape: &'a [usize], strides: &'a [i64], dtype: DataType) -> TensorView<'a> {
-        TensorView::new(
-            DevicePtr(std::ptr::null()),
-            dtype,
-            shape,
-            strides,
-            DeviceId::cpu(),
-        )
-    }
-
-    // Capture is safe only when the predicate is a single scalar and both branch
-    // operands already match the output shape (no broadcast), mirroring the
-    // loop-invariant on-device LongRoPE cos/sin select the optimizer lowers to.
-    #[test]
-    fn scalar_predicate_equal_shape_select_is_capture_safe() {
-        let cond = view(&[1], &[1], DataType::Bool);
-        let x = view(&[131072, 48], &[48, 1], DataType::Float16);
-        let y = view(&[131072, 48], &[48, 1], DataType::Float16);
-        assert!(is_invariant_scalar_select(&cond, &x, &y, &[131072, 48]));
-    }
-
-    #[test]
-    fn non_scalar_condition_is_not_capture_safe() {
-        let cond = view(&[131072, 48], &[48, 1], DataType::Bool);
-        let x = view(&[131072, 48], &[48, 1], DataType::Float16);
-        let y = view(&[131072, 48], &[48, 1], DataType::Float16);
-        assert!(!is_invariant_scalar_select(&cond, &x, &y, &[131072, 48]));
-    }
-
-    #[test]
-    fn broadcasting_branch_is_not_capture_safe() {
-        let cond = view(&[1], &[1], DataType::Bool);
-        // y broadcasts along axis 0 -> shape differs from output, not capture-safe.
-        let x = view(&[131072, 48], &[48, 1], DataType::Float16);
-        let y = view(&[1, 48], &[48, 1], DataType::Float16);
-        assert!(!is_invariant_scalar_select(&cond, &x, &y, &[131072, 48]));
     }
 }

@@ -11,6 +11,7 @@
 
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_cuda::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 
@@ -157,6 +158,55 @@ fn run_gpu_matmul_f32(
     bytes_to_f32(&out_bytes)
 }
 
+/// Run the pre-fast-path cuBLASLt implementation directly as a numeric oracle.
+fn run_cublaslt_gemv_f32(
+    ep: &CudaExecutionProvider,
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let rt = ep.runtime();
+    let a_buf = ep.allocate(std::mem::size_of_val(a), 256).unwrap();
+    let b_buf = ep.allocate(std::mem::size_of_val(b), 256).unwrap();
+    let c_buf = ep.allocate(n * std::mem::size_of::<f32>(), 256).unwrap();
+    let workspace = rt.alloc_raw(WORKSPACE_BYTES).unwrap();
+    unsafe {
+        rt.htod(f32_bytes(a), cuptr(a_buf.as_ptr())).unwrap();
+        rt.htod(f32_bytes(b), cuptr(b_buf.as_ptr())).unwrap();
+        blas::gemm(
+            rt.blas(),
+            rt.stream_ptr(),
+            &GemmParams {
+                dtype: GemmDtype::F32,
+                a: cuptr(a_buf.as_ptr()),
+                b: cuptr(b_buf.as_ptr()),
+                c: cuptr(c_buf.as_ptr()),
+                m: 1,
+                k,
+                n,
+                batch: 1,
+                a_batch_stride: 0,
+                b_batch_stride: 0,
+                epilogue: None,
+            },
+            workspace,
+            WORKSPACE_BYTES,
+        )
+        .unwrap();
+    }
+    rt.synchronize().unwrap();
+    let mut bytes = vec![0u8; n * std::mem::size_of::<f32>()];
+    unsafe {
+        rt.dtoh(&mut bytes, cuptr(c_buf.as_ptr())).unwrap();
+        rt.free_raw(workspace).unwrap();
+    }
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(b_buf).unwrap();
+    ep.deallocate(c_buf).unwrap();
+    bytes_to_f32(&bytes)
+}
+
 fn approx_eq(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
 }
@@ -234,6 +284,126 @@ fn matmul_f32_on_gpu_matches_cpu_reference() {
     );
 
     println!("all cuBLASLt MatMul cases passed on {:?}", ep.device_id());
+}
+
+#[test]
+fn matmul_f32_gemv_matches_cublaslt_bitwise() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    for &(k, n) in &[(37usize, 17usize), (259, 300), (2048, 64)] {
+        let a: Vec<f32> = (0..k)
+            .map(|i| (((i * 29 + 7) % 251) as f32 - 125.0) / 97.0)
+            .collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| (((i * 37 + 11) % 509) as f32 - 254.0) / 193.0)
+            .collect();
+        let gemv = run_gpu_matmul_f32(&ep, &a, &b, &[1, k], &[k, n], &[1, n]);
+        let cublaslt = run_cublaslt_gemv_f32(&ep, &a, &b, k, n);
+        assert_eq!(
+            gemv.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            cublaslt
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "f32 GEMV must be bit-identical to cuBLASLt for K={k}, N={n}"
+        );
+    }
+}
+
+#[test]
+fn matmul_f32_gemv_is_capture_safe_after_warmup() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+    let rt = ep.runtime();
+    let dev = ep.device_id();
+    let (k, n) = (259usize, 300usize);
+    let a: Vec<f32> = (0..k).map(|i| i as f32 / 257.0 - 0.5).collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| (i.wrapping_mul(17) % 127) as f32 / 127.0 - 0.5)
+        .collect();
+    let a_buf = ep.allocate(std::mem::size_of_val(&a[..]), 256).unwrap();
+    let b_buf = ep.allocate(std::mem::size_of_val(&b[..]), 256).unwrap();
+    let mut c_buf = ep.allocate(n * std::mem::size_of::<f32>(), 256).unwrap();
+    unsafe {
+        rt.htod(f32_bytes(&a), cuptr(a_buf.as_ptr())).unwrap();
+        rt.htod(f32_bytes(&b), cuptr(b_buf.as_ptr())).unwrap();
+    }
+    let a_shape = [1, k];
+    let b_shape = [k, n];
+    let c_shape = [1, n];
+    let a_strides = compute_contiguous_strides(&a_shape);
+    let b_strides = compute_contiguous_strides(&b_shape);
+    let c_strides = compute_contiguous_strides(&c_shape);
+    let a_view = TensorView::new(
+        DevicePtr(a_buf.as_ptr()),
+        DataType::Float32,
+        &a_shape,
+        &a_strides,
+        dev,
+    );
+    let b_view = TensorView::new(
+        DevicePtr(b_buf.as_ptr()),
+        DataType::Float32,
+        &b_shape,
+        &b_strides,
+        dev,
+    );
+    let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+    let kernel = ep
+        .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
+        .unwrap();
+    let execute = |c_buf: &mut onnx_runtime_ep_api::DeviceBuffer| {
+        kernel
+            .execute(
+                &[a_view.clone(), b_view.clone()],
+                &mut [TensorMut::new(
+                    DevicePtrMut(c_buf.as_mut_ptr()),
+                    DataType::Float32,
+                    &c_shape,
+                    &c_strides,
+                    dev,
+                )],
+            )
+            .unwrap();
+    };
+
+    execute(&mut c_buf);
+    assert!(
+        kernel.capture_support().is_supported(),
+        "warmed f32 M==1 signature must advertise capture support"
+    );
+    let allocations = rt.allocation_counts();
+    rt.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&mut c_buf);
+    assert!(
+        rt.is_capturing().unwrap(),
+        "execute must not synchronize and invalidate stream capture"
+    );
+    assert_eq!(
+        rt.allocation_counts(),
+        allocations,
+        "captured f32 GEMV must not allocate or free"
+    );
+    rt.end_graph_capture().unwrap();
+    rt.replay_graph().unwrap();
+    rt.synchronize().unwrap();
+    assert_eq!(rt.allocation_counts(), allocations);
+    assert!(rt.reset_graph().unwrap());
+
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(b_buf).unwrap();
+    ep.deallocate(c_buf).unwrap();
 }
 
 /// Run one dense fp16 MatMul on the GPU and return the host result as f32.

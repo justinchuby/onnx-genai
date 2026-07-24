@@ -1,9 +1,9 @@
 //! Dtype-agnostic CUDA kernels for ONNX construction and movement operators.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
@@ -254,6 +254,102 @@ fn launch_metadata(
     sync.and(free)
 }
 
+#[derive(Debug)]
+struct PersistentMetadata {
+    runtime: Arc<CudaRuntime>,
+    values: Option<Vec<u64>>,
+    ptr: CUdeviceptr,
+}
+
+impl PersistentMetadata {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            values: None,
+            ptr: 0,
+        }
+    }
+
+    fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
+        if self.values.as_deref() == Some(values) {
+            return Ok(self.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: shape changed during CUDA graph capture; warm the exact shape first"
+            )));
+        }
+        if self.ptr != 0 {
+            self.runtime.synchronize()?;
+        }
+        let scalar_metadata = [0_u64];
+        let bytes = u64_bytes(if values.is_empty() {
+            &scalar_metadata
+        } else {
+            values
+        });
+        let ptr = self.runtime.alloc_raw(bytes.len())?;
+        if let Err(error) = unsafe { self.runtime.htod(bytes, ptr) } {
+            let _ = unsafe { self.runtime.free_raw(ptr) };
+            return Err(error);
+        }
+        if self.ptr != 0 {
+            unsafe { self.runtime.free_raw(self.ptr) }?;
+        }
+        self.values = Some(values.to_vec());
+        self.ptr = ptr;
+        Ok(ptr)
+    }
+}
+
+impl Drop for PersistentMetadata {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
+}
+
+fn launch_persistent_metadata(
+    runtime: &CudaRuntime,
+    entry: &'static str,
+    input: &TensorView,
+    output: &mut TensorMut,
+    metadata_ptr: CUdeviceptr,
+) -> Result<()> {
+    let elements = output.numel();
+    if elements == 0 {
+        return Ok(());
+    }
+    let rank = i32::try_from(output.shape.len())
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep {entry}: rank exceeds i32")))?;
+    let elem_bytes = i32::try_from(fixed_width(entry, input.dtype)?).map_err(|_| {
+        EpError::KernelFailed(format!("cuda_ep {entry}: element width exceeds i32"))
+    })?;
+    let elements_u64 = elements as u64;
+    let func = runtime.nvrtc_function("movement_ops", MOVEMENT_SOURCE, entry)?;
+    let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
+    let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+    let mut builder = runtime.stream().launch_builder(&func);
+    builder
+        .arg(&input_ptr)
+        .arg(&output_ptr)
+        .arg(&metadata_ptr)
+        .arg(&rank)
+        .arg(&elem_bytes)
+        .arg(&elements_u64);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid(elements), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+    Ok(())
+}
+
 fn copy_reshape(
     runtime: &CudaRuntime,
     op: &str,
@@ -292,6 +388,70 @@ pub struct SqueezeFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
+impl KernelFactory for ReshapeFactory {
+    fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ReshapeKernel {
+            runtime: self.runtime.clone(),
+            warmed_signature: Mutex::new(None),
+        }))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReshapeCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct ReshapeKernel {
+    runtime: Arc<CudaRuntime>,
+    warmed_signature: Mutex<Option<ReshapeCaptureSignature>>,
+}
+
+impl Kernel for ReshapeKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        arity("Reshape", inputs, outputs, 1, 2, 1)?;
+        require_dense("Reshape", inputs, outputs)?;
+        let capturing = self.runtime.is_capturing()?;
+        let signature = ReshapeCaptureSignature {
+            dtype: inputs[0].dtype,
+            input_shape: inputs[0].shape.to_vec(),
+            output_shape: outputs[0].shape.to_vec(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Reshape: capture signature lock was poisoned".into())
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Reshape: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
+            ));
+        }
+        copy_reshape(&self.runtime, "Reshape", &inputs[0], &mut outputs[0])?;
+        if !capturing {
+            *warmed_signature = Some(signature);
+        }
+        Ok(())
+    }
+
+    fn supports_strided_input(&self, _idx: usize) -> bool {
+        false
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Reshape must warm its exact shape/dtype copy signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Reshape capture signature lock was poisoned",
+            ),
+        }
+    }
+}
+
 macro_rules! copy_factory {
     ($factory:ident, $kernel:ident, $op:literal, $min:literal, $max:literal) => {
         impl KernelFactory for $factory {
@@ -323,7 +483,6 @@ macro_rules! copy_factory {
         }
     };
 }
-copy_factory!(ReshapeFactory, ReshapeKernel, "Reshape", 1, 2);
 copy_factory!(SqueezeFactory, SqueezeKernel, "Squeeze", 1, 2);
 
 pub struct UnsqueezeFactory {
@@ -337,19 +496,47 @@ impl KernelFactory for UnsqueezeFactory {
                 .attr("axes")
                 .and_then(Attribute::as_ints)
                 .map(<[i64]>::to_vec),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnsqueezeCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    axes_len: usize,
 }
 #[derive(Debug)]
 struct UnsqueezeKernel {
     runtime: Arc<CudaRuntime>,
     axes: Option<Vec<i64>>,
+    warmed_signature: Mutex<Option<UnsqueezeCaptureSignature>>,
 }
 impl Kernel for UnsqueezeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         arity("Unsqueeze", inputs, outputs, 1, 2, 1)?;
         require_dense("Unsqueeze", inputs, outputs)?;
-        let axes_len = if inputs.get(1).is_some_and(|v| !v.is_absent()) {
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Unsqueeze: capture signature lock was poisoned".into())
+        })?;
+        let axes_len = if capturing {
+            let signature = warmed_signature.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep Unsqueeze: capture started before the fixed shape was warmed".into(),
+                )
+            })?;
+            if signature.dtype != inputs[0].dtype
+                || signature.input_shape != inputs[0].shape
+                || signature.output_shape != outputs[0].shape
+            {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Unsqueeze: shape or dtype changed during CUDA graph capture".into(),
+                ));
+            }
+            signature.axes_len
+        } else if inputs.get(1).is_some_and(|v| !v.is_absent()) {
             host_ints(&self.runtime, &inputs[1], "Unsqueeze")?.len()
         } else {
             self.axes
@@ -366,15 +553,30 @@ impl Kernel for UnsqueezeKernel {
                 "cuda_ep Unsqueeze: output rank mismatch".into(),
             ));
         }
-        copy_reshape(&self.runtime, "Unsqueeze", &inputs[0], &mut outputs[0])
+        copy_reshape(&self.runtime, "Unsqueeze", &inputs[0], &mut outputs[0])?;
+        if !capturing {
+            *warmed_signature = Some(UnsqueezeCaptureSignature {
+                dtype: inputs[0].dtype,
+                input_shape: inputs[0].shape.to_vec(),
+                output_shape: outputs[0].shape.to_vec(),
+                axes_len,
+            });
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Unsqueeze reads runtime axes on the host and uses a non-validated copy path",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Unsqueeze must warm its fixed axes/shape signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Unsqueeze capture signature lock was poisoned",
+            ),
+        }
     }
 }
 
@@ -385,12 +587,22 @@ impl KernelFactory for ExpandFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ExpandKernel {
             runtime: self.runtime.clone(),
+            metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpandCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
 }
 #[derive(Debug)]
 struct ExpandKernel {
     runtime: Arc<CudaRuntime>,
+    metadata: Mutex<PersistentMetadata>,
+    warmed_signature: Mutex<Option<ExpandCaptureSignature>>,
 }
 impl Kernel for ExpandKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -409,23 +621,54 @@ impl Kernel for ExpandKernel {
                 "cuda_ep Expand: output shape {out_shape:?}, expected broadcast shape {expected:?}"
             )));
         }
+        let capturing = self.runtime.is_capturing()?;
+        let signature = ExpandCaptureSignature {
+            dtype: inputs[0].dtype,
+            input_shape: inputs[0].shape.to_vec(),
+            output_shape: out_shape.clone(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Expand: capture signature lock was poisoned".into())
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Expand: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
+            ));
+        }
         let mut metadata = out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>();
         metadata.extend(broadcast_strides(inputs[0].shape, &out_shape));
-        launch_metadata(
+        let metadata_ptr = self
+            .metadata
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep Expand: metadata lock was poisoned".into())
+            })?
+            .prepare(&metadata, "Expand")?;
+        launch_persistent_metadata(
             &self.runtime,
             "expand_bytes",
             &inputs[0],
             &mut outputs[0],
-            &metadata,
-        )
+            metadata_ptr,
+        )?;
+        if !capturing {
+            *warmed_signature = Some(signature);
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Expand allocates/uploads/frees per-call broadcast metadata and synchronizes the stream",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Expand must warm its exact shape/dtype signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Expand capture signature lock was poisoned",
+            ),
+        }
     }
 }
 
@@ -513,7 +756,7 @@ impl Kernel for TransposeKernel {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SlicePlan {
     start: i64,
     step: i64,
@@ -599,12 +842,25 @@ impl KernelFactory for SliceFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(SliceKernel {
             runtime: self.runtime.clone(),
+            dims: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            strides: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SliceCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    plan: Vec<SlicePlan>,
 }
 #[derive(Debug)]
 struct SliceKernel {
     runtime: Arc<CudaRuntime>,
+    dims: Mutex<PersistentMetadata>,
+    strides: Mutex<PersistentMetadata>,
+    warmed_signature: Mutex<Option<SliceCaptureSignature>>,
 }
 impl Kernel for SliceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -615,19 +871,40 @@ impl Kernel for SliceKernel {
                 "cuda_ep Slice: output dtype must match data".into(),
             ));
         }
-        let starts = host_ints(&self.runtime, &inputs[1], "Slice")?;
-        let ends = host_ints(&self.runtime, &inputs[2], "Slice")?;
-        let axes = if inputs.get(3).is_some_and(|v| !v.is_absent()) {
-            host_ints(&self.runtime, &inputs[3], "Slice")?
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Slice: capture signature lock was poisoned".into())
+        })?;
+        let plan = if capturing {
+            let signature = warmed_signature.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep Slice: capture started before the fixed bounds were warmed".into(),
+                )
+            })?;
+            if signature.dtype != inputs[0].dtype
+                || signature.input_shape != inputs[0].shape
+                || signature.output_shape != outputs[0].shape
+            {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Slice: shape or dtype changed during CUDA graph capture".into(),
+                ));
+            }
+            signature.plan.clone()
         } else {
-            (0..starts.len() as i64).collect()
+            let starts = host_ints(&self.runtime, &inputs[1], "Slice")?;
+            let ends = host_ints(&self.runtime, &inputs[2], "Slice")?;
+            let axes = if inputs.get(3).is_some_and(|v| !v.is_absent()) {
+                host_ints(&self.runtime, &inputs[3], "Slice")?
+            } else {
+                (0..starts.len() as i64).collect()
+            };
+            let steps = if inputs.get(4).is_some_and(|v| !v.is_absent()) {
+                host_ints(&self.runtime, &inputs[4], "Slice")?
+            } else {
+                vec![1; starts.len()]
+            };
+            slice_plan(inputs[0].shape, &starts, &ends, &axes, &steps)?
         };
-        let steps = if inputs.get(4).is_some_and(|v| !v.is_absent()) {
-            host_ints(&self.runtime, &inputs[4], "Slice")?
-        } else {
-            vec![1; starts.len()]
-        };
-        let plan = slice_plan(inputs[0].shape, &starts, &ends, &axes, &steps)?;
         let expected = plan.iter().map(|p| p.count).collect::<Vec<_>>();
         if outputs[0].shape != expected {
             return Err(EpError::KernelFailed(format!(
@@ -636,10 +913,27 @@ impl Kernel for SliceKernel {
             )));
         }
         if outputs[0].numel() == 0 {
+            if !capturing {
+                *warmed_signature = Some(SliceCaptureSignature {
+                    dtype: inputs[0].dtype,
+                    input_shape: inputs[0].shape.to_vec(),
+                    output_shape: outputs[0].shape.to_vec(),
+                    plan,
+                });
+            }
             return Ok(());
         }
         if expected.is_empty() {
-            return copy_reshape(&self.runtime, "Slice", &inputs[0], &mut outputs[0]);
+            copy_reshape(&self.runtime, "Slice", &inputs[0], &mut outputs[0])?;
+            if !capturing {
+                *warmed_signature = Some(SliceCaptureSignature {
+                    dtype: inputs[0].dtype,
+                    input_shape: inputs[0].shape.to_vec(),
+                    output_shape: outputs[0].shape.to_vec(),
+                    plan,
+                });
+            }
+            return Ok(());
         }
         let contiguous = compute_contiguous_strides(inputs[0].shape);
         let dims = expected.iter().map(|&v| v as u64).collect::<Vec<_>>();
@@ -657,31 +951,19 @@ impl Kernel for SliceKernel {
             .runtime
             .nvrtc_function("movement_ops", MOVEMENT_SOURCE, "slice_bytes")?;
         let dims_ptr = self
-            .runtime
-            .alloc_raw(std::mem::size_of_val(dims.as_slice()))?;
-        let strides_bytes = unsafe {
-            std::slice::from_raw_parts(
-                strides.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(strides.as_slice()),
-            )
-        };
-        let strides_ptr = match self.runtime.alloc_raw(strides_bytes.len()) {
-            Ok(ptr) => ptr,
-            Err(error) => {
-                let _ = unsafe { self.runtime.free_raw(dims_ptr) };
-                return Err(error);
-            }
-        };
-        if let Err(error) = unsafe { self.runtime.htod(u64_bytes(&dims), dims_ptr) } {
-            let _ = unsafe { self.runtime.free_raw(dims_ptr) };
-            let _ = unsafe { self.runtime.free_raw(strides_ptr) };
-            return Err(error);
-        }
-        if let Err(error) = unsafe { self.runtime.htod(strides_bytes, strides_ptr) } {
-            let _ = unsafe { self.runtime.free_raw(dims_ptr) };
-            let _ = unsafe { self.runtime.free_raw(strides_ptr) };
-            return Err(error);
-        }
+            .dims
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: dims lock was poisoned".into()))?
+            .prepare(&dims, "Slice")?;
+        let stride_bits = strides
+            .iter()
+            .map(|&value| value as u64)
+            .collect::<Vec<_>>();
+        let strides_ptr = self
+            .strides
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: strides lock was poisoned".into()))?
+            .prepare(&stride_bits, "Slice")?;
         let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let rank = expected.len() as i32;
@@ -697,26 +979,37 @@ impl Kernel for SliceKernel {
             .arg(&rank)
             .arg(&elem_bytes)
             .arg(&elements);
-        let launch = unsafe {
+        unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (grid(outputs[0].numel()), 1, 1),
                 block_dim: (BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|e| driver_err("launch slice_bytes", e));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free_dims = unsafe { self.runtime.free_raw(dims_ptr) };
-        let free_strides = unsafe { self.runtime.free_raw(strides_ptr) };
-        sync.and(free_dims).and(free_strides)
+        .map_err(|e| driver_err("launch slice_bytes", e))?;
+        if !capturing {
+            *warmed_signature = Some(SliceCaptureSignature {
+                dtype: inputs[0].dtype,
+                input_shape: inputs[0].shape.to_vec(),
+                output_shape: outputs[0].shape.to_vec(),
+                plan,
+            });
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Slice reads runtime bounds on the host, allocates per-call metadata, and synchronizes the stream",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Slice must warm its fixed bounds/shape signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Slice capture signature lock was poisoned",
+            ),
+        }
     }
 }
 
@@ -789,10 +1082,13 @@ pub struct ConcatFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 impl KernelFactory for ConcatFactory {
-    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ConcatKernel {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
+            fixed_input_shapes: (!input_shapes.is_empty()
+                && input_shapes.iter().all(|shape| !shape.is_empty()))
+            .then(|| input_shapes.to_vec()),
         }))
     }
 }
@@ -800,12 +1096,27 @@ impl KernelFactory for ConcatFactory {
 struct ConcatKernel {
     runtime: Arc<CudaRuntime>,
     axis: i64,
+    fixed_input_shapes: Option<Vec<Vec<usize>>>,
 }
 impl Kernel for ConcatKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         if inputs.is_empty() || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep Concat: requires inputs and one output".into(),
+            ));
+        }
+        let capturing = self.runtime.is_capturing()?;
+        if capturing
+            && self.fixed_input_shapes.as_ref().is_none_or(|shapes| {
+                shapes.len() != inputs.len()
+                    || shapes
+                        .iter()
+                        .zip(inputs)
+                        .any(|(shape, input)| shape != input.shape)
+            })
+        {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Concat: input shape changed during CUDA graph capture".into(),
             ));
         }
         require_dense("Concat", inputs, outputs)?;
@@ -874,15 +1185,23 @@ impl Kernel for ConcatKernel {
             }
             prefix += input.shape[axis] as u64;
         }
-        self.runtime.synchronize()
+        if capturing {
+            Ok(())
+        } else {
+            self.runtime.synchronize()
+        }
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Concat performs a trailing host stream synchronization",
-        )
+        if self.fixed_input_shapes.is_some() {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Concat requires a fixed-shape signature for capture",
+            )
+        }
     }
 }
 
@@ -999,7 +1318,8 @@ impl KernelFactory for SplitFactory {
             axis,
             split,
             num_outputs,
-            static_plan,
+            static_plan: Mutex::new(static_plan),
+            constant_split_input: false,
         }))
     }
 }
@@ -1009,9 +1329,10 @@ struct SplitKernel {
     axis: i64,
     split: Option<Vec<i64>>,
     num_outputs: Option<i64>,
-    /// Precomputed capturable plan for the static, single-data-input form; the
-    /// dynamic (runtime split-size) form leaves this `None`.
-    static_plan: Option<StaticSplitPlan>,
+    /// Capturable plan from attributes/even split or a warmed constant split-size
+    /// initializer; genuinely dynamic runtime split sizes leave this `None`.
+    static_plan: Mutex<Option<StaticSplitPlan>>,
+    constant_split_input: bool,
 }
 impl SplitKernel {
     /// Launch one copy kernel per output on the runtime stream. Validates each
@@ -1071,6 +1392,10 @@ impl SplitKernel {
     }
 }
 impl Kernel for SplitKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.constant_split_input = constant_inputs.get(1).copied().unwrap_or(false);
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         arity("Split", inputs, outputs, 1, 2, outputs.len())?;
         if outputs.is_empty() {
@@ -1082,15 +1407,21 @@ impl Kernel for SplitKernel {
         // at build time, so no host read of split sizes and no trailing
         // synchronization are needed. Copies are ordered on the stream, which is
         // exactly what makes this recordable inside a CUDA graph capture.
-        if let Some(plan) = &self.static_plan {
-            let runtime_split_input = inputs.get(1).is_some_and(|v| !v.is_absent());
-            if !runtime_split_input
-                && plan.axis < rank
-                && inputs[0].shape[plan.axis] == plan.axis_extent
-                && plan.sizes.len() == outputs.len()
-            {
-                return self.launch_copies(inputs, outputs, plan.axis, &plan.sizes);
-            }
+        let runtime_split_input = inputs.get(1).is_some_and(|v| !v.is_absent());
+        let static_plan = self
+            .static_plan
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep Split: static plan lock was poisoned".into())
+            })?
+            .clone();
+        if let Some(plan) = static_plan
+            && (!runtime_split_input || self.constant_split_input)
+            && plan.axis < rank
+            && inputs[0].shape[plan.axis] == plan.axis_extent
+            && plan.sizes.len() == outputs.len()
+        {
+            return self.launch_copies(inputs, outputs, plan.axis, &plan.sizes);
         }
         let axis = if self.axis < 0 {
             self.axis + rank as i64
@@ -1103,7 +1434,13 @@ impl Kernel for SplitKernel {
             ));
         }
         let axis = axis as usize;
-        let sizes_i64 = if inputs.get(1).is_some_and(|v| !v.is_absent()) {
+        if runtime_split_input && self.constant_split_input && self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Split: constant split sizes were not warmed before CUDA graph capture"
+                    .into(),
+            ));
+        }
+        let sizes_i64 = if runtime_split_input {
             host_ints(&self.runtime, &inputs[1], "Split")?
         } else if let Some(split) = &self.split {
             split.clone()
@@ -1129,6 +1466,16 @@ impl Kernel for SplitKernel {
                 "cuda_ep Split: split sizes do not match outputs/axis".into(),
             ));
         }
+        if runtime_split_input && self.constant_split_input {
+            *self.static_plan.lock().map_err(|_| {
+                EpError::KernelFailed("cuda_ep Split: static plan lock was poisoned".into())
+            })? = Some(StaticSplitPlan {
+                axis,
+                axis_extent: inputs[0].shape[axis],
+                sizes: sizes.clone(),
+            });
+            return self.launch_copies(inputs, outputs, axis, &sizes);
+        }
         self.launch_copies(inputs, outputs, axis, &sizes)?;
         self.runtime.synchronize()
     }
@@ -1136,12 +1483,17 @@ impl Kernel for SplitKernel {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        if self.static_plan.is_some() {
-            onnx_runtime_ep_api::CaptureSupport::Supported
-        } else {
-            onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "Split reads runtime split sizes on the host and performs a trailing stream synchronization",
-            )
+        match self.static_plan.lock() {
+            Ok(plan) if plan.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) if self.constant_split_input => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Split must warm its constant split-size initializer before capture",
+            ),
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Split reads dynamic split sizes on the host and performs a trailing stream synchronization",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Split static plan lock was poisoned",
+            ),
         }
     }
 }
