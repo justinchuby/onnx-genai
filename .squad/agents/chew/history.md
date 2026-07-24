@@ -125,3 +125,8 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 
 - Approved Rachael-3's Qwen1.5B native decode regression 🟢: it is model-gated, skips cleanly without the CUDA package, and locks the higher-precision native token 1909 at index 26.
 - The coverage merged as `c4690bf7`.
+
+## 2026-07-24T07:25:03+0000 — GLM-5.2 runtime IndexShare review
+
+- Reviewed the runtime companion for GLM-5.2 IndexShare lowering 🟡; only a pre-existing formatting nit was found and it was fixed during integration.
+- The index-share shape handler and native CUDA E2E coverage merged as `6fdc8742`; tiny QMoE native CUDA decode is byte-identical to CPU.

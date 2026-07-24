@@ -17,3 +17,7 @@
 
 - Assigned independent Qwen-7B end-to-end measurement for the merged, bit-exact int4 down-GEMV shared-staging removal (`720fa032`).
 - No performance result is yet available; retain the change's validation evidence but do not claim a throughput delta.
+
+## 2026-07-24T07:25:03+0000 — Down-GEMV performance confirmed
+
+- Independent runs close the pending validation: Qwen2.5-7B improved 296.21→302.34 tok/s (+2.07%) and ratio to ORT 1.08→1.10×. Qwen 1.5B and 0.5B improved +1.79% and +1.24%; all runs retained identical tokens and capture.

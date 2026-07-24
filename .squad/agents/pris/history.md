@@ -130,3 +130,8 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 - DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
 - Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
+
+## 2026-07-24T07:25:03+0000 — GLM DSA investigation
+
+- Confirmed GLM-4-9B int4 continues to work native end-to-end with whole-step capture.
+- Identified GLM-5.2 DSA-MoE's decode broadcast failure as dense-mask emission in place of `pkg.nxrt::IndexShare`; the subsequent exporter/runtime work unblocked eager native decode.

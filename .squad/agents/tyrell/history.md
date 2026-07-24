@@ -35,3 +35,9 @@ WP-B landed: Progress docs should now treat WP-B as fully landed after WP-B3 `3d
 
 - DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
 - Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
+
+## 2026-07-24T07:25:03+0000 — GLM-5.2 DSA IndexShare native E2E
+
+- Mobius now emits `pkg.nxrt::IndexShare`, causal-bias slicing, sorted TopK, and MLA v-head zero-padding for GLM-5.2 DSA-MoE. Runtime gained the companion index-share shape handler and native CUDA E2E test.
+- Tiny QMoE decodes native CUDA with CPU byte parity and GLM-4 remains non-regressed. Runtime merged as `6fdc8742`; Mobius commits `4816c20` and `7453e2c` are folded into PR #404 awaiting Justin's merge.
+- DSA decode is eager for now: an unresolved symbolic auxiliary output axis forfeits CUDA-graph capture; consume fixed-capacity past K/V tensors directly when capture is required.

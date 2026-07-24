@@ -155,3 +155,7 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 
 - Cleared the int4 down-projection GEMV shared-staging removal 🟢 after proving the direct-register offset algebra and exact-byte staged-reference parity.
 - Qwen-7B greedy decoding was deterministic; CUDA gate 206/0 and clippy were clean. Merged as `720fa032`; perf delta remains independently pending.
+
+## 2026-07-24T07:25:03+0000 — GLM-5.2 IndexShare exporter review
+
+- Reviewed Tyrell's Mobius IndexShare emission. Initial 🔴 was limited to stale test coverage; after Roy changed the test to assert IndexShare lowering, the exporter was 🟢 approved.

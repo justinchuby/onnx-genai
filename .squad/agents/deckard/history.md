@@ -119,3 +119,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - Removed redundant activation shared-memory staging in the int4 down-projection GEMV, using direct register loads while preserving reduction order.
 - NVRTC staged-reference bytes are exact; Gaff reviewed 🟢 and the change merged as `720fa032`. Independent 7B perf confirmation is pending.
+
+## 2026-07-24T07:25:03+0000 — ORT baseline and staging audit
+
+- Merged `dde5371a`, defaulting ORT CUDA graphs off for `profile_native --backend ort` after ORT capture failed with `ort_value must contain a constructed tensor`; Chew found only a pre-existing fmt nit.
+- Audit confirms down-GEMV was the only redundant activation shared-memory staging case. QKV/gate-up staging remains load-bearing because eight warps reuse the normalized fp16 vector.

@@ -134,3 +134,8 @@ Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path
 ### 2026-07-23T20:30:00Z — Native/ORT decode parity
 - `569507c` added four real-model parity fixtures. Phi and Qwen-0.5B are exact for 128 tokens; Qwen-1.5B/7B native split tokens match an independent exact-deployed-Q4 f32 oracle.
 - Keep the result scoped to the recorded artifacts, prompt, and divergence positions; it is not a blanket numerical-equivalence claim.
+
+## 2026-07-24T07:25:03+0000 — IndexShare test correction
+
+- Merged mechanical pre-existing rustfmt cleanup as `560ccfab`.
+- Corrected Mobius GLM DSA test coverage to assert `pkg.nxrt::IndexShare` lowering; all eight tests passed.

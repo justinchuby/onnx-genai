@@ -464,3 +464,30 @@ captured/eager fragmentation toward a small number of stable replay graphs.
 **By:** Deckard; reviewed by Gaff
 **What:** `matmul_nbits_gemv_f16_scales_f16_down` now loads activations directly into registers instead of staging them in dynamic shared memory. This removes a synchronization and dynamic shared allocation while preserving reduction order; an NVRTC staged-reference test proves exact-byte parity. The change merged as `720fa032`.
 **Why:** The int4 down projection had avoidable Short-Scoreboard stalls. This is a bit-exact performance lever; independent 7B end-to-end perf-delta confirmation remains pending.
+
+## 2026-07-24 — GLM-5.2 IndexShare and CUDA benchmark follow-up
+
+### GLM-5.2 DSA-MoE native decode is unblocked through IndexShare lowering
+**By:** Tyrell; exporter review by Gaff; runtime review by Chew
+**What:** Mobius PR #404 (`glm5.2-moe-export`, commits `4816c20` and `7453e2c`) emits `pkg.nxrt::IndexShare` rather than a dense DSA mask, with the required causal-bias slice, sorted TopK, and MLA v-head zero-padding. The onnx-genai runtime companion added an `index_share` shape-inference handler and native CUDA E2E coverage. Tiny QMoE now decodes native CUDA with CPU byte parity; GLM-4 remains non-regressed. The Mobius half is folded into PR #404 and awaits Justin's merge; the runtime half merged to main as `6fdc8742`.
+**Why:** The prior dense-mask export caused a decode broadcast error, preventing GLM-5.2 DSA-MoE native end-to-end execution.
+
+### Do not capture auxiliary outputs with unresolved symbolic axes
+**By:** Tyrell
+**What:** Native CUDA-graph capture is forfeited when an auxiliary graph output retains an unresolved symbolic axis, such as a data-dependent index or KV-cache axis. The repair pattern is to consume the fixed-capacity `past_key`/`past_value` tensors directly rather than exporting the symbolic auxiliary result.
+**Why:** Capture requires static, stable output shapes and buffers. GLM-5.2 DSA decode is therefore correct in eager mode while capture work continues.
+
+### Default ORT CUDA graphs off in the benchmark backend
+**By:** Deckard; reviewed by Chew
+**What:** The `profile_native --backend ort` path now defaults ORT CUDA graphs off (`dde5371a`), without requiring `ONNX_GENAI_CUDA_GRAPH=0`.
+**Why:** ORT graph capture errored with `ort_value must contain a constructed tensor`; eager ORT is the reliable baseline for the native-versus-ORT benchmark.
+
+### Retain shared-memory staging for QKV and gate-up GEMVs
+**By:** Deckard
+**What:** The follow-on audit found no other removable activation staging: general `_scales_f16` already loads activations directly, and RMSNorm-fused QKV/gate-up staging is load-bearing because the fp16-normalized vector is reused by eight warps.
+**Why:** The down projection was the sole redundant-staging case; extending its optimization would risk correctness or performance.
+
+### Down-GEMV gain is independently confirmed on Qwen2.5-7B
+**By:** Marsten
+**What:** The bit-exact down-GEMV change increased Qwen2.5-7B native throughput from 296.21 to 302.34 tok/s (+2.07%), raising its ratio against ORT from 1.08× to 1.10×. Qwen 1.5B and 0.5B gained +1.79% and +1.24%, respectively; generated tokens remained unchanged and capture remained intact.
+**Why:** The independent measurements close the pending end-to-end performance validation for `720fa032`.
