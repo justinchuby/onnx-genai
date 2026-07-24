@@ -6,6 +6,8 @@ use onnx_genai_engine::{
 };
 use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
+#[cfg(feature = "cuda")]
+use std::path::PathBuf;
 
 #[test]
 fn engine_generates_through_explicit_native_backend() -> anyhow::Result<()> {
@@ -254,6 +256,44 @@ fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
     assert_eq!(cuda_tokens, cpu_tokens);
     assert_eq!(session_options_tokens, cpu_tokens);
     assert!(cuda_tokens.iter().all(|&token| token == 1));
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn qwen15b_native_decode_locks_accurate_near_tie_token() -> anyhow::Result<()> {
+    let Some(model_dir) = std::env::var_os("ONNX_GENAI_QWEN15B_CUDA_DIR").map(PathBuf::from) else {
+        eprintln!(
+            "skipping Qwen2.5-1.5B native CUDA near-tie regression; \
+             set ONNX_GENAI_QWEN15B_CUDA_DIR"
+        );
+        return Ok(());
+    };
+    if !model_dir.is_dir() {
+        eprintln!(
+            "skipping Qwen2.5-1.5B native CUDA near-tie regression; model is not installed at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!(
+            "skipping Qwen2.5-1.5B native CUDA near-tie regression; CUDA is unavailable: {error}"
+        );
+        return Ok(());
+    }
+
+    let mut engine = native_cuda_engine(&model_dir)?;
+    let generated_token_ids = engine
+        .generate(greedy_request(
+            GeneratePrompt::Text("Hello".to_string()),
+            32,
+        ))?
+        .token_ids;
+
+    // Native FP32 accumulation correctly resolves this <=1-ULP int4 near-tie;
+    // ORT CUDA's FP16 accumulation chooses 821 here, so do not match it.
+    assert_eq!(generated_token_ids[26], 1909, "{generated_token_ids:?}");
     Ok(())
 }
 
