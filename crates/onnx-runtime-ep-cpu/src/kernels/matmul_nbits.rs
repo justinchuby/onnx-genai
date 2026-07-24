@@ -1736,6 +1736,8 @@ fn selected_dot_kernel() -> DotKernel {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vnni")
             && std::arch::is_x86_feature_detected!("avx512vl")
         {
@@ -1916,8 +1918,22 @@ unsafe fn int4_dot_row_avxvnni(
     horizontal_sum_f32_256(accumulator)
 }
 
+/// 512-bit VNNI int4 block dot. Each int4 block is 32 int8 activations / 16
+/// packed nibbles, so two blocks (64 weights) are fused into one 512-bit
+/// `_mm512_dpbusd_epi32`. Rather than the 256-bit path's `sign_epi8` trick
+/// (unavailable at 512-bit), the raw *unsigned* nibbles (0..15) drive `dpbusd`
+/// directly and the `-8` zero-point is corrected once per pair via a second
+/// `dpbusd` against all-ones (the exact per-lane activation sum) shifted left by
+/// 3: `sum((nibble-8)*a) = sum(nibble*a) - 8*sum(a)`. This drops two `sign` ops
+/// per block and lets activations load straight as one 512-bit vector (one fewer
+/// cross-lane insert). The 16 int32 lanes split into the even block (0..8) and
+/// odd block (8..16); a per-lane scale vector folds both into one f32x16
+/// accumulator with a single horizontal reduction. An odd trailing block uses
+/// the same scheme at 256-bit. Each block's dot is an exact integer inside
+/// f32's 2^24 range; the result matches the scalar reference to a few ULP (only
+/// the cross-block f32 accumulation order differs, as in the 256-bit kernel).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,avx512vnni,avx512vl")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni,avx512vl")]
 unsafe fn int4_dot_row_avx512vnni(
     activation: &[i8],
     packed_weight: &[u8],
@@ -1926,28 +1942,61 @@ unsafe fn int4_dot_row_avx512vnni(
 ) -> f32 {
     use std::arch::x86_64::*;
 
-    let mut accumulator = _mm256_setzero_ps();
     let low_mask = _mm_set1_epi8(0x0f);
-    let zero_point = _mm256_set1_epi8(8);
-    for (block, &scale) in scales.iter().enumerate() {
-        // SAFETY: each scale corresponds to 32 activation bytes and 16 packed bytes.
+
+    // Unsigned nibble weights (0..15) for one block, in natural order
+    // (`w[2b]=low(byte b)`, `w[2b+1]=high(byte b)`) so lane j aligns with the
+    // natural-order activation load. The `-8` zero point is applied afterwards.
+    let block_weight = |block: usize| -> __m256i {
+        // SAFETY: each block owns 16 packed bytes.
         let packed = unsafe { _mm_loadu_si128(packed_weight.as_ptr().add(block * 16).cast()) };
         let low = _mm_and_si128(packed, low_mask);
         let high = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
-        let weight = _mm256_sub_epi8(
-            _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high)),
-            zero_point,
-        );
-        // SAFETY: each block has 32 activation bytes, including zero padding.
-        let activation = unsafe { _mm256_loadu_si256(activation.as_ptr().add(block * 32).cast()) };
-        let absolute_weight = _mm256_sign_epi8(weight, weight);
-        let signed_activation = _mm256_sign_epi8(activation, weight);
-        let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), absolute_weight, signed_activation);
-        let block_scale = scale * activation_scales[block];
-        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
-        accumulator = _mm256_add_ps(accumulator, scaled);
+        _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+    };
+
+    let block_count = scales.len();
+    let ones = _mm512_set1_epi8(1);
+    let ones256 = _mm256_set1_epi8(1);
+    let mut accumulator = _mm512_setzero_ps();
+
+    // Fuse two blocks per 512-bit `dpbusd`; defer reduction to one final pass.
+    for pair in 0..block_count / 2 {
+        let b0 = pair * 2;
+        let b1 = b0 + 1;
+        let weight =
+            _mm512_inserti64x4(_mm512_castsi256_si512(block_weight(b0)), block_weight(b1), 1);
+        // SAFETY: two contiguous blocks own 64 activation bytes (incl. padding).
+        let act = unsafe { _mm512_loadu_si512(activation.as_ptr().add(b0 * 32).cast()) };
+        let wdot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), weight, act);
+        let asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, act);
+        let dot = _mm512_sub_epi32(wdot, _mm512_slli_epi32(asum, 3));
+        let s0 = scales[b0] * activation_scales[b0];
+        let s1 = scales[b1] * activation_scales[b1];
+        // Lanes 0..8 carry block b0's scale, lanes 8..16 carry block b1's.
+        let scale_vec =
+            _mm512_set_ps(s1, s1, s1, s1, s1, s1, s1, s1, s0, s0, s0, s0, s0, s0, s0, s0);
+        accumulator =
+            _mm512_add_ps(accumulator, _mm512_mul_ps(_mm512_cvtepi32_ps(dot), scale_vec));
     }
-    horizontal_sum_f32_256(accumulator)
+
+    let mut value = _mm512_reduce_add_ps(accumulator);
+
+    // Odd trailing block via the same unsigned-nibble scheme at 256-bit.
+    if block_count % 2 == 1 {
+        let block = block_count - 1;
+        let weight = block_weight(block);
+        // SAFETY: the final block owns 32 activation bytes (incl. padding).
+        let act = unsafe { _mm256_loadu_si256(activation.as_ptr().add(block * 32).cast()) };
+        let wdot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), weight, act);
+        let asum = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones256, act);
+        let dot = _mm256_sub_epi32(wdot, _mm256_slli_epi32(asum, 3));
+        let block_scale = scales[block] * activation_scales[block];
+        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
+        value += horizontal_sum_f32_256(scaled);
+    }
+
+    value
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2136,21 +2185,33 @@ unsafe fn dot_u8_i8_avxvnni(activation: &[u8], weight: &[i8]) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vnni,avx512vl")]
+#[target_feature(enable = "avx2,avx512f,avx512vnni,avx512vl")]
 unsafe fn dot_u8_i8_avx512vnni(activation: &[u8], weight: &[i8]) -> i32 {
     use std::arch::x86_64::*;
 
-    let vector_len = activation.len() / 32 * 32;
-    let mut accumulator = _mm256_setzero_si256();
-    for index in (0..vector_len).step_by(32) {
-        // SAFETY: index is within equal-length slices and loadu permits unaligned pointers.
-        let a = unsafe { _mm256_loadu_si256(activation.as_ptr().add(index).cast()) };
-        // SAFETY: index is within equal-length slices and loadu permits unaligned pointers.
-        let b = unsafe { _mm256_loadu_si256(weight.as_ptr().add(index).cast()) };
-        accumulator = _mm256_dpbusd_epi32(accumulator, a, b);
+    let len = activation.len();
+    let wide_len = len / 64 * 64;
+    let mut wide = _mm512_setzero_si512();
+    for index in (0..wide_len).step_by(64) {
+        // SAFETY: index + 64 <= len over equal-length slices; loadu allows unaligned.
+        let a = unsafe { _mm512_loadu_si512(activation.as_ptr().add(index).cast()) };
+        // SAFETY: index + 64 <= len over equal-length slices; loadu allows unaligned.
+        let b = unsafe { _mm512_loadu_si512(weight.as_ptr().add(index).cast()) };
+        wide = _mm512_dpbusd_epi32(wide, a, b);
     }
-    horizontal_sum_256(accumulator)
-        + dot_u8_i8_scalar(&activation[vector_len..], &weight[vector_len..])
+    let mut sum = _mm512_reduce_add_epi32(wide);
+
+    // 256-bit VNNI remainder for a trailing 32-byte chunk, then scalar tail.
+    let mut index = wide_len;
+    if index + 32 <= len {
+        // SAFETY: index + 32 <= len over equal-length slices; loadu allows unaligned.
+        let a = unsafe { _mm256_loadu_si256(activation.as_ptr().add(index).cast()) };
+        // SAFETY: index + 32 <= len over equal-length slices; loadu allows unaligned.
+        let b = unsafe { _mm256_loadu_si256(weight.as_ptr().add(index).cast()) };
+        sum += horizontal_sum_256(_mm256_dpbusd_epi32(_mm256_setzero_si256(), a, b));
+        index += 32;
+    }
+    sum + dot_u8_i8_scalar(&activation[index..], &weight[index..])
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2428,6 +2489,10 @@ fn block_dot_u8_i16(weights: &[u8], activation: &[i16], group_scales: &[f32], gr
     debug_assert_eq!(weights.len(), activation.len());
     #[cfg(target_arch = "x86_64")]
     {
+        if have_avx512bw() {
+            // SAFETY: have_avx512bw confirmed AVX-512BW/F support at runtime.
+            return unsafe { block_dot_u8_i16_avx512bw(weights, activation, group_scales, group) };
+        }
         if have_avx2() {
             // SAFETY: have_avx2 confirmed AVX2 support at runtime.
             return unsafe { block_dot_u8_i16_avx2(weights, activation, group_scales, group) };
@@ -2505,7 +2570,81 @@ unsafe fn block_dot_u8_i16_avx2(
     horizontal_sum_f32_256(acc) + scalar_tail
 }
 
-/// Dot product of a `u8` weight block with an int16-quantized activation block,
+/// AVX-512BW grouped block dot: `u8 x i16 -> i32` via `_mm512_madd_epi16` over
+/// 32 int16 lanes per step, converted to f32 and scaled per group into one
+/// f32x16 accumulator (single reduction per block). Mirrors the AVX2 path's
+/// structure exactly -- one running f32 accumulator, one horizontal reduction,
+/// same group=32 int16 quantization -- so it keeps the fp32-correct argmax the
+/// int16 activation path exists to protect, at double the vector width. A
+/// 16-wide (`_mm256_madd_epi16`) step then scalar handle non-multiple-of-32
+/// group tails.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw")]
+unsafe fn block_dot_u8_i16_avx512bw(
+    weights: &[u8],
+    activation: &[i16],
+    group_scales: &[f32],
+    group: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = weights.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut scalar_tail = 0.0f32;
+    let mut position = 0usize;
+    let mut group_index = 0usize;
+    while position < len {
+        let group_end = (position + group).min(len);
+        let group_scale = group_scales[group_index];
+        let mut group_acc = _mm512_setzero_si512();
+        let mut inner = position;
+        while inner + 32 <= group_end {
+            // SAFETY: inner + 32 <= group_end <= len; loadu permits unaligned loads.
+            let weight_bytes = unsafe { _mm256_loadu_si256(weights.as_ptr().add(inner).cast()) };
+            let weight_i16 = _mm512_cvtepu8_epi16(weight_bytes);
+            // SAFETY: 32 i16 = 64 bytes within the equal-length activation slice.
+            let activation_i16 =
+                unsafe { _mm512_loadu_si512(activation.as_ptr().add(inner).cast()) };
+            group_acc =
+                _mm512_add_epi32(group_acc, _mm512_madd_epi16(weight_i16, activation_i16));
+            inner += 32;
+        }
+        // Fold this group's partial into the block f32 accumulator (mul+add,
+        // matching the AVX2/scalar structure -- no FMA feature dependency).
+        acc = _mm512_add_ps(
+            acc,
+            _mm512_mul_ps(_mm512_cvtepi32_ps(group_acc), _mm512_set1_ps(group_scale)),
+        );
+        // 16-wide AVX2 step for a 16..31 int16 remainder, then a scalar tail.
+        if inner + 16 <= group_end {
+            // SAFETY: inner + 16 <= group_end <= len; loadu permits unaligned loads.
+            let weight_bytes = unsafe { _mm_loadu_si128(weights.as_ptr().add(inner).cast()) };
+            let weight_i16 = _mm256_cvtepu8_epi16(weight_bytes);
+            // SAFETY: 16 i16 = 32 bytes within the equal-length activation slice.
+            let activation_i16 =
+                unsafe { _mm256_loadu_si256(activation.as_ptr().add(inner).cast()) };
+            let partial = _mm256_madd_epi16(weight_i16, activation_i16);
+            let dot = horizontal_sum_256(partial);
+            scalar_tail += group_scale * dot as f32;
+            inner += 16;
+        }
+        if inner < group_end {
+            let dot = dot_u8_i16_scalar(&weights[inner..group_end], &activation[inner..group_end]);
+            scalar_tail += group_scale * dot as f32;
+        }
+        position = group_end;
+        group_index += 1;
+    }
+    horizontal_sum_f32_512(acc) + scalar_tail
+}
+
+/// Horizontal sum of a 16-lane f32 vector.
+#[cfg(target_arch = "x86_64")]
+fn horizontal_sum_f32_512(value: std::arch::x86_64::__m512) -> f32 {
+    // SAFETY: __m512 and [f32; 16] are both 64-byte plain-data values.
+    let lanes: [f32; 16] = unsafe { std::mem::transmute(value) };
+    lanes.into_iter().sum()
+}
 /// accumulating in `i32`. Backs the scalar remainder of the grouped block dot.
 ///
 /// A block is at most `block_size` (<= a few hundred) elements with weights in
@@ -2525,6 +2664,17 @@ fn dot_u8_i16_scalar(weight: &[u8], activation: &[i16]) -> i32 {
 fn have_avx2() -> bool {
     static AVX2: OnceLock<bool> = OnceLock::new();
     *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+/// Runtime AVX-512BW/F detection cached for the 512-bit int16 decode dot.
+#[cfg(target_arch = "x86_64")]
+fn have_avx512bw() -> bool {
+    static AVX512BW: OnceLock<bool> = OnceLock::new();
+    *AVX512BW.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+    })
 }
 
 const MIN_PARALLEL_DOT_PRODUCTS_PER_TASK: usize = 32 * 1024;
@@ -3901,6 +4051,266 @@ mod tests {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i)
             .unwrap()
+    }
+
+    /// Microbench (ignored): median-of-3 wall time for the int4 and int16
+    /// decode dots, 256-bit vs 512-bit, on this host. Run with
+    /// `cargo test -p onnx-runtime-ep-cpu --features mlas --release -- --ignored --nocapture avx512_microbench`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore]
+    fn avx512_microbench() {
+        use std::time::Instant;
+        if !have_avx512bw() {
+            eprintln!("avx512 not available; skipping");
+            return;
+        }
+        let median3 = |mut f: Box<dyn FnMut() -> u64>| -> u64 {
+            let mut runs = [f(), f(), f()];
+            runs.sort_unstable();
+            runs[1]
+        };
+
+        // int4: 4096 blocks (K=131072), many rows worth of work.
+        let blocks = 4096usize;
+        let activation: Vec<i8> = (0..blocks * 32)
+            .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
+            .collect();
+        let packed: Vec<u8> = (0..blocks * 16).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+        let scales: Vec<f32> = (0..blocks).map(|i| ((i % 17) + 1) as f32 / 100.0).collect();
+        let ascales: Vec<f32> = (0..blocks).map(|i| ((i % 11) + 1) as f32 / 50.0).collect();
+        let iters = 2000u32;
+        let int4_256 = median3(Box::new(|| {
+            let t = Instant::now();
+            let mut acc = 0.0f32;
+            for _ in 0..iters {
+                // SAFETY: avxvnni present (implied by avx512vnni box) or 256 path.
+                acc += unsafe { int4_dot_row_avxvnni(&activation, &packed, &scales, &ascales) };
+            }
+            std::hint::black_box(acc);
+            t.elapsed().as_nanos() as u64
+        }));
+        let int4_512 = median3(Box::new(|| {
+            let t = Instant::now();
+            let mut acc = 0.0f32;
+            for _ in 0..iters {
+                // SAFETY: avx512 features confirmed above.
+                acc += unsafe { int4_dot_row_avx512vnni(&activation, &packed, &scales, &ascales) };
+            }
+            std::hint::black_box(acc);
+            t.elapsed().as_nanos() as u64
+        }));
+
+        // int16: one big block, group=32 (activation_quant_group), K=65536.
+        let k16 = 65536usize;
+        let group = 32usize;
+        let w16: Vec<u8> = (0..k16).map(|i| ((i * 53 + 11) % 256) as u8).collect();
+        let a16: Vec<i16> = (0..k16)
+            .map(|i| (((i * 1103) % 65535) as i32 - 32767) as i16)
+            .collect();
+        let gs: Vec<f32> = (0..k16.div_ceil(group)).map(|g| 0.001 * (g % 7 + 1) as f32).collect();
+        let iters16 = 2000u32;
+        let int16_256 = median3(Box::new(|| {
+            let t = Instant::now();
+            let mut acc = 0.0f32;
+            for _ in 0..iters16 {
+                // SAFETY: avx2 present.
+                acc += unsafe { block_dot_u8_i16_avx2(&w16, &a16, &gs, group) };
+            }
+            std::hint::black_box(acc);
+            t.elapsed().as_nanos() as u64
+        }));
+        let int16_512 = median3(Box::new(|| {
+            let t = Instant::now();
+            let mut acc = 0.0f32;
+            for _ in 0..iters16 {
+                // SAFETY: avx512bw confirmed above.
+                acc += unsafe { block_dot_u8_i16_avx512bw(&w16, &a16, &gs, group) };
+            }
+            std::hint::black_box(acc);
+            t.elapsed().as_nanos() as u64
+        }));
+
+        eprintln!(
+            "MICROBENCH (median-of-3, {iters} iters):\n\
+             int4  256-bit avxvnni : {:>10.3} ms\n\
+             int4  512-bit avx512  : {:>10.3} ms  ({:.2}x)\n\
+             int16 256-bit avx2    : {:>10.3} ms\n\
+             int16 512-bit avx512bw: {:>10.3} ms  ({:.2}x)",
+            int4_256 as f64 / 1e6,
+            int4_512 as f64 / 1e6,
+            int4_256 as f64 / int4_512 as f64,
+            int16_256 as f64 / 1e6,
+            int16_512 as f64 / 1e6,
+            int16_256 as f64 / int16_512 as f64,
+        );
+    }
+
+    /// The 512-bit VNNI int4 block dot must match the scalar reference to a few
+    /// ULP for any block count, including an odd trailing block routed through
+    /// the 256-bit remainder. (Only the cross-block f32 accumulation order
+    /// differs from scalar, exactly as the existing 256-bit kernel does; each
+    /// block's integer dot is exact.) Skips (no-op passes) where the feature is
+    /// absent so the same test binary is valid on AVX2-only hosts.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_dot_row_avx512vnni_matches_scalar() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl"))
+        {
+            return;
+        }
+        for blocks in [1usize, 2, 3, 4, 5, 8, 9] {
+            let activation: Vec<i8> = (0..blocks * 32)
+                .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
+                .collect();
+            let packed: Vec<u8> = (0..blocks * 16).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+            let scales: Vec<f32> =
+                (0..blocks).map(|i| ((i * 13 % 17) + 1) as f32 / 100.0).collect();
+            let activation_scales: Vec<f32> =
+                (0..blocks).map(|i| ((i * 7 % 11) + 1) as f32 / 50.0).collect();
+            let scalar = int4_dot_row_scalar(&activation, &packed, &scales, &activation_scales);
+            // SAFETY: feature support confirmed above.
+            let wide = unsafe {
+                int4_dot_row_avx512vnni(&activation, &packed, &scales, &activation_scales)
+            };
+            assert!(
+                (wide - scalar).abs() <= 1e-4 * scalar.abs().max(1.0),
+                "blocks={blocks}: avx512 int4 dot {wide} != scalar {scalar}",
+            );
+        }
+    }
+
+    /// The 512-bit VNNI `u8 x i8` dot must equal the scalar reduction exactly
+    /// (pure integer) for lengths that exercise the 64-byte body, the 32-byte
+    /// 256-bit remainder, and the scalar tail.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_u8_i8_avx512vnni_matches_scalar() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl"))
+        {
+            return;
+        }
+        for len in [0usize, 1, 7, 31, 32, 33, 63, 64, 65, 96, 129, 200] {
+            let activation: Vec<u8> = (0..len).map(|i| ((i * 29 + 7) % 255) as u8).collect();
+            let weight: Vec<i8> = (0..len).map(|i| ((i * 17 % 31) as i8) - 15).collect();
+            let scalar = dot_u8_i8_scalar(&activation, &weight);
+            // SAFETY: feature support confirmed above.
+            let wide = unsafe { dot_u8_i8_avx512vnni(&activation, &weight) };
+            assert_eq!(wide, scalar, "len={len}: avx512 u8xi8 dot mismatch");
+        }
+    }
+
+    /// The 512-bit AVX-512BW grouped `u8 x i16` block dot must agree with an
+    /// independent serial reference (and the scalar/AVX2 paths) within the same
+    /// tight tolerance as the AVX2 path, across group and tail sizes that
+    /// exercise the 32-wide body, the 16-wide remainder, and the scalar tail.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_u8_i16_avx512_matches_serial_reference() {
+        if !have_avx512bw() {
+            return;
+        }
+        for &(group, len) in &[
+            (32usize, 32usize),
+            (32, 33),
+            (32, 48),
+            (32, 96),
+            (32, 130),
+            (16, 48),
+            (64, 200),
+            (128, 128),
+        ] {
+            let weight: Vec<u8> = (0..len).map(|i| ((i * 53 + 11) % 256) as u8).collect();
+            let activation: Vec<i16> = (0..len)
+                .map(|i| (((i * 1103) % 65535) as i32 - 32767) as i16)
+                .collect();
+            let n_groups = len.div_ceil(group);
+            let group_scales: Vec<f32> =
+                (0..n_groups).map(|g| 0.01 * (g as f32 + 1.0)).collect();
+            let expected: f32 = (0..n_groups)
+                .map(|g| {
+                    let start = g * group;
+                    let end = (start + group).min(len);
+                    let dot: i32 = (start..end)
+                        .map(|i| weight[i] as i32 * activation[i] as i32)
+                        .sum();
+                    group_scales[g] * dot as f32
+                })
+                .sum();
+            // SAFETY: have_avx512bw confirmed support above.
+            let got = unsafe {
+                block_dot_u8_i16_avx512bw(&weight, &activation, &group_scales, group)
+            };
+            assert!(
+                (got - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+                "group={group} len={len}: avx512bw block dot {got} != reference {expected}",
+            );
+        }
+    }
+
+    /// 512-bit analog of the massive-activation-channel argmax regression: on a
+    /// box with AVX-512BW the int16 GEMV routes through `block_dot_u8_i16_avx512bw`.
+    /// int8-activation quantization FLIPS the argmax; the 512-bit int16 path must
+    /// keep the fp32-reference winner.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn gemv_nk_u8_i16_avx512_preserves_argmax_on_massive_activation_channel() {
+        if !have_avx512bw() {
+            return;
+        }
+        let (n, k, block_size) = (2usize, 128usize, 128usize);
+        let mut values = vec![128u8; n * k];
+        for value in values.iter_mut().take(k).skip(1) {
+            *value = 132; // row0 small channels -> +4
+        }
+        values[k] = 129; // row1 massive channel -> +1
+        let scales = vec![1.0f32; n];
+        let scaled_zero_points = vec![128.0f32; n];
+        let mut activation = vec![1.0f32; k];
+        activation[0] = 300.0;
+
+        let dequantized: Vec<f32> = values.iter().map(|&v| v as f32 - 128.0).collect();
+        let oracle = reference(&activation, &dequantized, 1, k, n);
+        let oracle_argmax = argmax(&oracle);
+
+        // int8-activation simulation MUST flip the argmax (proves the case bites).
+        let amax = activation.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let i8_scale = amax / 127.0;
+        let a_int8: Vec<f32> = activation
+            .iter()
+            .map(|&v| (v / i8_scale).round().clamp(-127.0, 127.0) * i8_scale)
+            .collect();
+        let int8_out = reference(&a_int8, &dequantized, 1, k, n);
+        assert_ne!(
+            argmax(&int8_out),
+            oracle_argmax,
+            "test is vacuous: int8-activation did not flip the argmax",
+        );
+
+        // 512-bit int16 path (via block_dot_u8_i16_avx512bw) must keep the winner.
+        let mut out = vec![0.0f32; n];
+        gemv_nk_u8_i16(
+            &activation,
+            &values,
+            &scales,
+            &scaled_zero_points,
+            &mut out,
+            k,
+            n,
+            block_size,
+        );
+        assert_eq!(
+            argmax(&out),
+            oracle_argmax,
+            "avx512bw int16 flipped the argmax (oracle={oracle:?}, got={out:?})",
+        );
     }
 
     #[test]
