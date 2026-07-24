@@ -61,8 +61,8 @@ use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::sdpa::{
-    AttnBias, BroadcastBias, KeyMask, NoBias, QkCapture, ScaleMode, SdpaConfig, SdpaTensors,
-    sdpa_f32,
+    AttnBias, BroadcastBias, KeyMask, NoBias, QkCapture, QkCaptureStage, ScaleMode, SdpaConfig,
+    SdpaTensors, sdpa_f32,
 };
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
@@ -606,6 +606,7 @@ impl Kernel for MultiHeadAttentionKernel {
         };
         let qk_cap = want_qk.then_some(QkCapture {
             scores: &mut qk_out,
+            stage: QkCaptureStage::PreSoftmax,
         });
         sdpa_f32(&tensors, &cfg, bias_hook, &mask_hook, &mut y, qk_cap);
         let mut y3 = vec![0.0f32; batch * q_seq * v_hidden];

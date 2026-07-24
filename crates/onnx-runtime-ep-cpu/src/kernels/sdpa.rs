@@ -36,7 +36,8 @@
 //!   covering key-padding masks; it is head-independent, matching ORT.
 //! * **Causal masking with a past-KV offset** — key `j` is masked for query `i`
 //!   when `j > past_seq + i`, using a caller-chosen fill (`f32::MIN` for MHA).
-//! * **Optional QK score capture** — the pre-softmax logits (`[B, Nq, Sq, Tk]`)
+//! * **Optional QK score capture** — the logits or probabilities
+//!   (`[B, Nq, Sq, Tk]`) at a caller-chosen pipeline stage ([`QkCaptureStage`])
 //!   for ops that emit `qk_matmul_output`.
 //!
 //! ## Numerical contract (why this is a *drop-in* factoring)
@@ -172,11 +173,33 @@ impl AttnBias for BroadcastBias<'_> {
     }
 }
 
+/// Which point in the per-score pipeline a [`QkCapture`] records.
+///
+/// `ai.onnx::Attention`'s `qk_matmul_output_mode` selects one of these; MHA and
+/// `FusedAttention` capture at [`PreSoftmax`](QkCaptureStage::PreSoftmax).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QkCaptureStage {
+    /// Right after the score scale, before softcap (Attention mode `0`).
+    PostScale,
+    /// After softcap, before bias/mask (Attention mode `1`; identical to
+    /// [`PostScale`](QkCaptureStage::PostScale) when softcap is disabled).
+    PostSoftcap,
+    /// After bias/mask/causal, before softmax (default; MHA/Fused
+    /// `qk_matmul_output`, Attention mode `2`).
+    PreSoftmax,
+    /// After the softmax normalization — i.e. the probabilities (Attention
+    /// mode `3`).
+    PostSoftmax,
+}
+
 /// Optional QK score capture target for ops that emit `qk_matmul_output`.
 ///
-/// Holds the pre-softmax logits in `[batch, num_heads, q_seq, kv_seq]` order.
+/// Holds the logits (or, for [`QkCaptureStage::PostSoftmax`], the
+/// probabilities) in `[batch, num_heads, q_seq, kv_seq]` order, recorded at the
+/// pipeline point named by `stage`.
 pub struct QkCapture<'a> {
     pub scores: &'a mut [f32],
+    pub stage: QkCaptureStage,
 }
 
 /// Run scaled-dot-product attention over `t`, writing the context into `y`
@@ -228,6 +251,7 @@ pub fn sdpa_f32(
             let kv_n = n / heads_per_kv;
             for i in 0..q_seq {
                 let q_base = ((b * num_heads + n) * q_seq + i) * head_size;
+                let cap_base = ((b * num_heads + n) * q_seq + i) * kv_seq;
                 // scores[j] = scale·(Q·Kᵀ) [+softcap] + bias + mask [→ causal].
                 for (j, sc) in scores.iter_mut().enumerate() {
                     let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
@@ -236,8 +260,18 @@ pub fn sdpa_f32(
                         acc += (q[q_base + p] * operand_scale) * (k[k_base + p] * operand_scale);
                     }
                     let mut s = acc * post_scale;
+                    if let Some(cap) = qk.as_mut()
+                        && cap.stage == QkCaptureStage::PostScale
+                    {
+                        cap.scores[cap_base + j] = s;
+                    }
                     if let Some(softcap) = cfg.softcap {
                         s = softcap * (s / softcap).tanh();
+                    }
+                    if let Some(cap) = qk.as_mut()
+                        && cap.stage == QkCaptureStage::PostSoftcap
+                    {
+                        cap.scores[cap_base + j] = s;
                     }
                     s += bias.at(b, n, i, j);
                     s += mask.at(b, i, j);
@@ -247,23 +281,40 @@ pub fn sdpa_f32(
                     *sc = s;
                 }
 
-                if let Some(cap) = qk.as_mut() {
-                    let base = ((b * num_heads + n) * q_seq + i) * kv_seq;
-                    cap.scores[base..base + kv_seq].copy_from_slice(&scores);
+                if let Some(cap) = qk.as_mut()
+                    && cap.stage == QkCaptureStage::PreSoftmax
+                {
+                    cap.scores[cap_base..cap_base + kv_seq].copy_from_slice(&scores);
                 }
 
                 // Numerically-stable softmax (subtract row max, matching ORT's
-                // MlasComputeSoftmax and this crate's softmax kernel).
+                // MlasComputeSoftmax and this crate's softmax kernel). A fully
+                // masked row (every score `-inf`) yields a zero row rather than
+                // NaN — matching ORT's guarded softmax. Fills that stay finite
+                // (e.g. MHA's `f32::MIN`) never trigger this branch, so MHA's
+                // numerics are unchanged.
                 let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for sc in scores.iter_mut() {
-                    let e = (*sc - max).exp();
-                    *sc = e;
-                    sum += e;
+                if max == f32::NEG_INFINITY {
+                    for sc in scores.iter_mut() {
+                        *sc = 0.0;
+                    }
+                } else {
+                    let mut sum = 0.0f32;
+                    for sc in scores.iter_mut() {
+                        let e = (*sc - max).exp();
+                        *sc = e;
+                        sum += e;
+                    }
+                    let inv = 1.0 / sum;
+                    for sc in scores.iter_mut() {
+                        *sc *= inv;
+                    }
                 }
-                let inv = 1.0 / sum;
-                for sc in scores.iter_mut() {
-                    *sc *= inv;
+
+                if let Some(cap) = qk.as_mut()
+                    && cap.stage == QkCaptureStage::PostSoftmax
+                {
+                    cap.scores[cap_base..cap_base + kv_seq].copy_from_slice(&scores);
                 }
 
                 // context = probs · V.
