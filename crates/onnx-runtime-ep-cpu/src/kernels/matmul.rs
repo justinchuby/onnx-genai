@@ -41,6 +41,12 @@ use crate::strided::{next_index, numel};
 #[path = "simd_gemm.rs"]
 mod simd_gemm;
 
+// Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. Same
+// inclusion pattern as `simd_gemm`: an internal perf detail of the bf16 MatMul
+// hot path, runtime-detected with a widen-to-f32 fallback, not a new op.
+#[path = "bf16_gemm.rs"]
+mod bf16_gemm;
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -306,6 +312,14 @@ impl MatMulKernel {
                 .saturating_mul(2)
         });
 
+        // Native bf16 fast path: both operands contiguous BFloat16 on an
+        // avx512_bf16 host → GEMM via `_mm512_dpbf16_ps` (f32 accumulate), then
+        // narrow into the output dtype. Falls through to the widen-to-f32 paths
+        // below on any other dtype/layout or host (the correctness reference).
+        if let Some(result) = try_matmul_bf16_native(&inputs[0], &inputs[1], &geom)? {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
         // Direct f32 output fast path: when the output is a contiguous Float32
         // CPU tensor that does not alias either input, GEMM writes straight into
         // its backing buffer, skipping both the intermediate result `Vec<f32>`
@@ -413,6 +427,85 @@ fn output_overlaps_input(
     out_origin < in_end && in_start < out_end
 }
 
+/// Attempt the native bf16 GEMM path: when both operands are contiguous
+/// `BFloat16` tensors and the host has `avx512_bf16`, compute `A @ B` (batched /
+/// broadcast) into a fresh f32 result via `_mm512_dpbf16_ps`, returning
+/// `Ok(Some(result))`. Returns `Ok(None)` when the native path does not apply
+/// (wrong dtype/layout, or no runtime support), so the caller falls back to the
+/// widen-to-f32 GEMM — the correctness reference that keeps the same binary
+/// correct on AVX2-only and non-x86 hosts.
+///
+/// The accumulator is f32 (the instruction's native accumulate width); operands
+/// stay bf16, halving operand bandwidth versus the upcast path.
+#[allow(unused_variables)]
+fn try_matmul_bf16_native(
+    a: &TensorView,
+    b: &TensorView,
+    geom: &MatMulGeometry,
+) -> Result<Option<Vec<f32>>> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use onnx_runtime_ir::DataType;
+        if a.dtype != DataType::BFloat16
+            || b.dtype != DataType::BFloat16
+            || !a.is_contiguous()
+            || !b.is_contiguous()
+            || !bf16_gemm::native_available()
+        {
+            return Ok(None);
+        }
+        a.validate()?;
+        b.validate()?;
+        let mut out = vec![0.0f32; geom.result_len];
+        if out.is_empty() {
+            return Ok(Some(out));
+        }
+        let a_len = a.numel();
+        let b_len = b.numel();
+        // SAFETY: validated contiguous BFloat16 views address exactly `a_len` /
+        // `b_len` 2-byte elements; `half::bf16` is `repr(transparent)` over
+        // `u16`, so the same storage reads soundly as bf16 bit patterns.
+        let a_bits = unsafe { std::slice::from_raw_parts(a.data_ptr::<u16>(), a_len) };
+        let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), b_len) };
+        bf16_native_dense_into(a_bits, b_bits, geom, &mut out);
+        Ok(Some(out))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Drive the native bf16 GEMM over a single, batched, or broadcast operand pair
+/// into `out` (row-major f32), reusing the shared batch-broadcast walk.
+#[cfg(target_arch = "x86_64")]
+fn bf16_native_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut [f32]) {
+    let (m, k, n) = (geom.m, geom.k, geom.n);
+    let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
+    if geom.batch_shape.is_empty() {
+        bf16_gemm::gemm(a, b, out, m, k, n);
+        return;
+    }
+    let mut bidx = vec![0usize; geom.batch_shape.len()];
+    let mut b_out = 0usize;
+    loop {
+        let a_off = broadcast_offset(&bidx, &geom.a_batch, &geom.a_batch_strides) * a_mat;
+        let b_off = broadcast_offset(&bidx, &geom.b_batch, &geom.b_batch_strides) * b_mat;
+        bf16_gemm::gemm(
+            &a[a_off..a_off + a_mat],
+            &b[b_off..b_off + b_mat],
+            &mut out[b_out * c_mat..b_out * c_mat + c_mat],
+            m,
+            k,
+            n,
+        );
+        b_out += 1;
+        if !next_index(&geom.batch_shape, &mut bidx) {
+            break;
+        }
+    }
+}
+
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
 /// operand promotion) into a dense row-major `Vec<f32>`.
 ///
@@ -421,6 +514,10 @@ fn output_overlaps_input(
 /// (standard mixed-precision matmul). Shared by [`MatMulKernel`] and the fused
 /// `FusedMatMulBias` kernel so both go through exactly one GEMM implementation.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
+    let geom = matmul_geometry(a, b)?;
+    if let Some(result) = try_matmul_bf16_native(a, b, &geom)? {
+        return Ok(result);
+    }
     matmul_dense_impl_with_backend(
         a,
         b,
@@ -446,6 +543,10 @@ fn matmul_dense_prepacked_with_backend(
     prepack: &MatMulPrepack,
     backend: CpuBackend,
 ) -> Result<Vec<f32>> {
+    let geom = matmul_geometry(a, b)?;
+    if let Some(result) = try_matmul_bf16_native(a, b, &geom)? {
+        return Ok(result);
+    }
     matmul_dense_impl_with_backend(
         a,
         b,
@@ -818,6 +919,212 @@ mod tests {
             out.to_bf16_as_f32(),
             vec![1., 2., 3., 4., 10., 12., 14., 16.]
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn matmul_bf16_native_matches_f64_reference_within_bf16_tolerance() {
+        // Native `_mm512_dpbf16_ps` GEMM must (a) match an f64 reference over the
+        // SAME bf16-rounded operands within bf16 tolerance, and (b) be no worse
+        // than the widen-to-f32 upcast path — bf16-input products are exact in
+        // f32, so both paths differ from f64 only by f32 summation rounding.
+        if !bf16_gemm::native_available() {
+            eprintln!("skipping: host lacks avx512_bf16");
+            return;
+        }
+        // Shapes exercise m=1 decode, general prefill, and K/N-32 tails.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 2048, 512),  // decode GEMV
+            (1, 100, 40),    // decode, K & N not multiples of 32
+            (32, 256, 64),   // prefill, aligned
+            (17, 130, 50),   // prefill, ragged M/K/N
+            (4, 33, 3),      // tiny K tail (33 = 32 + 1)
+        ];
+
+        let mut state = 0x9E37_79B9_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0 // ~[-1, 1]
+        };
+
+        let mut worst_native_rel = 0.0f64;
+        let mut worst_ratio = 0.0f64;
+        for &(m, k, n) in SHAPES {
+            let a_f32: Vec<f32> = (0..m * k).map(|_| next()).collect();
+            let b_f32: Vec<f32> = (0..k * n).map(|_| next()).collect();
+
+            // Round operands to bf16; both compute paths and the reference share
+            // these exact bf16 values so the only difference is accumulation.
+            let a_bf: Vec<half::bf16> = a_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let b_bf: Vec<half::bf16> = b_f32.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let a_bits: Vec<u16> = a_bf.iter().map(|v| v.to_bits()).collect();
+            let b_bits: Vec<u16> = b_bf.iter().map(|v| v.to_bits()).collect();
+            let a_wide: Vec<f32> = a_bf.iter().map(|v| v.to_f32()).collect();
+            let b_wide: Vec<f32> = b_bf.iter().map(|v| v.to_f32()).collect();
+
+            // f64 reference over the bf16-rounded values.
+            let mut reference = vec![0.0f64; m * n];
+            // Upcast path: widen bf16 -> f32, accumulate in f32 (current default).
+            let mut upcast = vec![0.0f32; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc64 = 0.0f64;
+                    let mut acc32 = 0.0f32;
+                    for depth in 0..k {
+                        acc64 += a_wide[row * k + depth] as f64 * b_wide[depth * n + col] as f64;
+                        acc32 += a_wide[row * k + depth] * b_wide[depth * n + col];
+                    }
+                    reference[row * n + col] = acc64;
+                    upcast[row * n + col] = acc32;
+                }
+            }
+
+            // Native bf16 path.
+            let mut native = vec![0.0f32; m * n];
+            bf16_gemm::gemm(&a_bits, &b_bits, &mut native, m, k, n);
+
+            let rel = |got: f32, want: f64| -> f64 {
+                let denom = want.abs().max(1.0);
+                (got as f64 - want).abs() / denom
+            };
+            let mut max_native = 0.0f64;
+            let mut max_upcast = 0.0f64;
+            for idx in 0..m * n {
+                max_native = max_native.max(rel(native[idx], reference[idx]));
+                max_upcast = max_upcast.max(rel(upcast[idx], reference[idx]));
+            }
+            worst_native_rel = worst_native_rel.max(max_native);
+            // Native must not be materially worse than the upcast reference.
+            let ratio = max_native / max_upcast.max(1e-9);
+            worst_ratio = worst_ratio.max(ratio);
+            assert!(
+                max_native <= max_upcast * 4.0 + 1e-4,
+                "{m}x{k}@{k}x{n}: native rel {max_native} worse than upcast {max_upcast}"
+            );
+            // bf16 accumulation over K stays within a loose bf16 tolerance.
+            assert!(
+                max_native <= 5e-2,
+                "{m}x{k}@{k}x{n}: native rel {max_native} exceeds bf16 tolerance"
+            );
+        }
+        println!(
+            "native bf16 GEMM: worst native-vs-f64 rel {worst_native_rel:.3e}, \
+             worst native/upcast ratio {worst_ratio:.3}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn matmul_bf16_native_handles_k_tail_and_kernel_matches_kernel_path() {
+        // The public MatMul kernel (which auto-routes to the native path on this
+        // host) must produce a bf16 result matching a direct f64 reference for a
+        // K that is not a multiple of the 32-lane bf16 width.
+        if !bf16_gemm::native_available() {
+            eprintln!("skipping: host lacks avx512_bf16");
+            return;
+        }
+        let (m, k, n) = (3usize, 70usize, 5usize); // 70 = 64 + 6 tail
+        let mut state = 0x1357_9BDF_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 1.0
+        };
+        let a_f32: Vec<f32> = (0..m * k).map(|_| next()).collect();
+        let b_f32: Vec<f32> = (0..k * n).map(|_| next()).collect();
+        let a = Owned::bf16(&[m, k], &a_f32);
+        let b = Owned::bf16(&[k, n], &b_f32);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[m, n]);
+        MatMulKernel::default()
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        // f64 reference over bf16-rounded operands, then rounded to bf16 output.
+        let a_w: Vec<f32> = a_f32.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+        let b_w: Vec<f32> = b_f32.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+        let got = out.to_bf16_as_f32();
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f64;
+                for depth in 0..k {
+                    acc += a_w[row * k + depth] as f64 * b_w[depth * n + col] as f64;
+                }
+                let want = half::bf16::from_f32(acc as f32).to_f32();
+                let denom = want.abs().max(1.0);
+                let rel = (got[row * n + col] - want).abs() / denom;
+                assert!(rel <= 3e-2, "K-tail mismatch at ({row},{col}): rel {rel}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "microbench: run explicitly with --ignored --nocapture"]
+    fn bench_bf16_native_vs_upcast() {
+        use std::time::Instant;
+        if !bf16_gemm::native_available() {
+            eprintln!("skipping bench: host lacks avx512_bf16");
+            return;
+        }
+        // Decode (m=1 GEMV) and prefill (MxKxN) shapes, LLM-representative.
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 4096, 4096),   // decode GEMV
+            (1, 4096, 11008),  // decode MLP up-proj
+            (128, 4096, 4096), // prefill attention proj
+            (256, 2048, 8192), // prefill MLP
+        ];
+        let mut state = 0x5DEE_CE66_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0
+        };
+        let median3 = |mut f: Box<dyn FnMut() -> f64>| {
+            let mut t = [f(), f(), f()];
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            t[1]
+        };
+
+        println!("bf16 GEMM microbench (native _mm512_dpbf16_ps vs widen-to-f32 + SGEMM)");
+        for &(m, k, n) in SHAPES {
+            let a_bits: Vec<u16> = (0..m * k).map(|_| half::bf16::from_f32(next()).to_bits()).collect();
+            let b_bits: Vec<u16> = (0..k * n).map(|_| half::bf16::from_f32(next()).to_bits()).collect();
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+
+            // Native bf16 path.
+            let native_ms = {
+                let (a, b) = (a_bits.clone(), b_bits.clone());
+                median3(Box::new(move || {
+                    let mut c = vec![0.0f32; m * n];
+                    let t = Instant::now();
+                    bf16_gemm::gemm(&a, &b, &mut c, m, k, n);
+                    std::hint::black_box(&c);
+                    t.elapsed().as_secs_f64() * 1e3
+                }))
+            };
+
+            // Upcast path: widen bf16 -> f32 (what the current bf16 path does),
+            // then the crate's f32 SGEMM.
+            let upcast_ms = {
+                let (a, b) = (a_bits.clone(), b_bits.clone());
+                median3(Box::new(move || {
+                    let t = Instant::now();
+                    let a_f: Vec<f32> = a.iter().map(|&x| half::bf16::from_bits(x).to_f32()).collect();
+                    let b_f: Vec<f32> = b.iter().map(|&x| half::bf16::from_bits(x).to_f32()).collect();
+                    let mut c = vec![0.0f32; m * n];
+                    gemm(&a_f, &b_f, &mut c, m, k, n).unwrap();
+                    std::hint::black_box(&c);
+                    t.elapsed().as_secs_f64() * 1e3
+                }))
+            };
+
+            let g = |ms: f64| flops / (ms * 1e-3) / 1e9;
+            println!(
+                "  {m:>4}x{k}x{n}: native {native_ms:>8.3} ms ({:>7.1} GFLOP/s)  \
+                 upcast {upcast_ms:>8.3} ms ({:>7.1} GFLOP/s)  speedup {:.2}x",
+                g(native_ms),
+                g(upcast_ms),
+                upcast_ms / native_ms,
+            );
+        }
     }
 
     #[test]
