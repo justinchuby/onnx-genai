@@ -2,13 +2,17 @@
 
 ## Summary
 
-Native beat ORT on eight of the nine comparable on-box decoder artifacts.
-Qwen3-0.6B is the clear optimization target: the Foundry generic-CPU package
-contains a `GatherBlockQuantized` embedding node that the native CUDA EP does not
-claim, so the requested native-CUDA run fell back to the CPU and reached only
-**0.410x** ORT. Among models that did run on the native CUDA EP, Qwen2.5-7B had
-the thinnest lead at **1.169x**. Qwen3.5-2B-text was not comparable because
-native fell back to CPU and ORT failed during warmup.
+On the credible tight-spread rows, native beat ORT for Qwen2.5-0.5B (**1.56x**),
+Qwen2.5-1.5B (**1.53x**), Qwen2.5-7B (**1.17x**), Phi-4-mini (**1.40x**),
+DeepSeek-R1-1.5B (**1.45x**), and DeepSeek-Coder-1.3B (**1.25x**).
+Phi-3.5-mini and Qwen2.5-Coder-7B are explicitly excluded from win claims:
+their ORT baselines are not trustworthy under this contention window and require
+re-measurement on a quiet host. Qwen3-0.6B remains the clear regression and open
+optimization target: the Foundry generic-CPU package contains a
+`GatherBlockQuantized` embedding node that the native CUDA EP does not claim, so
+the requested native-CUDA run fell back to the CPU and reached only **0.410x**
+ORT. Qwen3.5-2B-text was not comparable because native fell back to CPU and ORT
+failed during warmup.
 
 ## Method
 
@@ -31,9 +35,9 @@ utilization with 34,583 MiB used, while GPU 1 held 129,589 MiB. Contention
 changed during the sweep and later GPU 0 snapshots were idle. Initial depressed
 or noisy measurements were therefore rerun; the table uses the rerun window for
 all comparable rows. Qwen2.5-1.5B retained the largest selected intra-run spread
-(374.82-430.18 tok/s, 14.8%), below the 15% rerun threshold. These results are
-best interpreted as paired ratios and observed ranges, not uncontended absolute
-throughput.
+(374.82-430.18 tok/s, 14.8%), below the 15% rerun threshold. The credible signal is the native-vs-ORT ratio on tight-spread rows, not absolute
+tok/s under this contention window; the results are therefore best interpreted as
+paired ratios and observed ranges rather than uncontended absolute throughput.
 
 ## Results
 
@@ -44,10 +48,10 @@ throughput.
 | Qwen2.5-7B Instruct int4 | 301.41 | 257.89 | **1.169x** | 296.67-301.48 | 254.20-258.39 | ✅ native ahead |
 | Qwen3-0.6B generic int4 | 10.54 | 25.73 | **0.410x** | 10.53-10.66 | 25.64-25.90 | ❌ native slower (CPU fallback) |
 | Phi-4-mini Instruct int4/int8 | 321.35 | 229.16 | **1.402x** | 320.80-321.58 | 226.59-229.51 | ✅ native ahead |
-| Phi-3.5-mini Instruct int4 | 124.49 | 5.56 | **22.390x** | 122.45-125.00 | 5.54-6.12 | ✅ native ahead |
+| Phi-3.5-mini Instruct int4 | 124.49 | 5.56 | **22.390x** | 122.45-125.00 | 5.54-6.12 | ⚠️ INCONCLUSIVE — ORT number anomalously low under contention; ratio not a credible win |
 | DeepSeek-R1-Distill-Qwen-1.5B int4 | 631.61 | 435.96 | **1.449x** | 629.52-632.52 | 431.82-436.09 | ✅ native ahead |
 | DeepSeek-Coder-1.3B int4 | 800.22 | 639.81 | **1.251x** | 799.60-801.48 | 630.13-640.79 | ✅ native ahead |
-| Qwen2.5-Coder-7B Instruct int4 | 130.05 | 29.71 | **4.377x** | 130.01-130.12 | 29.71-29.81 | ✅ native ahead |
+| Qwen2.5-Coder-7B Instruct int4 | 130.05 | 29.71 | **4.377x** | 130.01-130.12 | 29.71-29.81 | ⚠️ INCONCLUSIVE — ORT number anomalously low under contention; ratio not a credible win |
 
 No comparable model landed in the thin-margin band of 1.000x-1.099x.
 Qwen3-0.6B is nevertheless a higher-priority target than the thinnest positive
