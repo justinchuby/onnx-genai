@@ -899,7 +899,11 @@ fn contention_cpu_budget() -> usize {
 /// * `contention <= max_load_per_cpu` (idle/light box) -> enable.
 ///
 /// Forced (`=1`) never calls this: it bypasses the auto gate entirely.
-fn should_auto_enable(available_cpus: usize, contention: Option<f64>, max_load_per_cpu: f64) -> bool {
+fn should_auto_enable(
+    available_cpus: usize,
+    contention: Option<f64>,
+    max_load_per_cpu: f64,
+) -> bool {
     if !auto_enable_suitable(available_cpus) {
         return false;
     }
@@ -1359,7 +1363,10 @@ mod tests {
         // the same system load over fewer allowed CPUs reports more contention.
         if let (Some(wide), Some(narrow)) = (current_contention(64), current_contention(4)) {
             assert!(wide >= 0.0 && narrow >= 0.0);
-            assert!(narrow >= wide, "fewer allowed CPUs must not lower contention");
+            assert!(
+                narrow >= wide,
+                "fewer allowed CPUs must not lower contention"
+            );
         }
     }
 
