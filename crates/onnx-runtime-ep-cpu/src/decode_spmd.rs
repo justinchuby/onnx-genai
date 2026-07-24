@@ -171,7 +171,7 @@ unsafe impl Send for SharedState {}
 impl SharedState {
     /// Publish `job` for `node_pending[node] = counts[node]` workers and wake any
     /// parked worker. Must be paired with [`SharedState::wait`].
-    fn publish(&self, job: Job, counts: &[usize], handles: &[JoinHandle<()>]) {
+    fn publish(&self, job: Job, counts: &[usize], threads: &[thread::Thread]) {
         // Publish the job pointer, then the per-node counts, before the sequence
         // bump makes them visible to workers.
         unsafe {
@@ -191,7 +191,7 @@ impl SharedState {
         // path every flag is false so this issues no syscalls).
         for (index, parked) in self.parked.iter().enumerate() {
             if parked.0.load(Ordering::SeqCst) {
-                handles[index].thread().unpark();
+                threads[index].unpark();
             }
         }
     }
@@ -232,7 +232,15 @@ impl SharedState {
 /// state that drives them.
 pub struct SpmdDecodePools {
     shared: Arc<SharedState>,
-    handles: Vec<JoinHandle<()>>,
+    /// Cloned worker `Thread` handles for the hot dispatch path: `publish` only
+    /// needs these to `unpark` a parked worker, so keeping them in a plain slice
+    /// keeps dispatch lock-free (no `Mutex` on the decode path).
+    worker_threads: Vec<thread::Thread>,
+    /// Owned join handles, held behind a `Mutex` so [`SpmdDecodePools::shutdown`]
+    /// can join the workers through a shared `&self` (the pool is reached as a
+    /// `&'static` through [`pools`]). Only touched at teardown, never on the hot
+    /// path. Drained on the first shutdown so the operation is idempotent.
+    join_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Workers assigned to each node, node-major, matching global worker index
     /// order (workers `0..counts[0]` are node 0, and so on).
     node_worker_counts: Vec<usize>,
@@ -302,9 +310,14 @@ impl SpmdDecodePools {
             std::hint::spin_loop();
         }
 
+        // Snapshot the worker `Thread`s for the lock-free hot-path `unpark`, and
+        // keep the owning join handles behind a `Mutex` for teardown.
+        let worker_threads = handles.iter().map(|h| h.thread().clone()).collect();
+
         Self {
             shared,
-            handles,
+            worker_threads,
+            join_handles: Mutex::new(handles),
             node_worker_counts,
             total_workers,
         }
@@ -318,6 +331,42 @@ impl SpmdDecodePools {
     /// Number of node groups in the layout.
     pub fn node_count(&self) -> usize {
         self.node_worker_counts.len()
+    }
+
+    /// Signal every worker to stop and **join** them. Idempotent: the join
+    /// handles are drained on the first call, so a second call (e.g. `Drop`
+    /// after an explicit [`shutdown_pools`]) is a no-op.
+    ///
+    /// Reachable through a shared `&self` (the process-wide pool is handed out as
+    /// a `&'static` by [`pools`]); the join handles live behind a `Mutex` so this
+    /// can consume them without owning the pool. This is a teardown-only call and
+    /// must not race a live decode dispatch -- after it returns the workers are
+    /// gone and the pool must not be dispatched to again.
+    pub fn shutdown(&self) {
+        // Take the handles first so concurrent callers can't double-join; if
+        // another thread already drained them, there is nothing to do.
+        let handles: Vec<JoinHandle<()>> = {
+            let mut guard = self
+                .join_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.drain(..).collect()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        // Publish the stop flag, then bump the sequence so a spinning worker
+        // observes the change and re-checks `shutdown`, and unpark any parked
+        // worker so it leaves `park_timeout`. SeqCst mirrors the publish path so
+        // the flag/sequence pairing wakes a worker that raced into parking.
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        self.shared.sequence.0.fetch_add(1, Ordering::SeqCst);
+        for thread in &self.worker_threads {
+            thread.unpark();
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 
     /// Broadcast `job` to the workers and block until all have finished.
@@ -344,7 +393,7 @@ impl SpmdDecodePools {
             call: call::<F>,
         };
         self.shared
-            .publish(job, &self.node_worker_counts, &self.handles);
+            .publish(job, &self.node_worker_counts, &self.worker_threads);
         self.shared.wait();
         self.shared.panic_if_poisoned();
     }
@@ -643,15 +692,7 @@ impl SpmdDecodePools {
 
 impl Drop for SpmdDecodePools {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::SeqCst);
-        // Bump the sequence and unpark so parked workers observe the shutdown.
-        self.shared.sequence.0.fetch_add(1, Ordering::AcqRel);
-        for handle in &self.handles {
-            handle.thread().unpark();
-        }
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -793,14 +834,41 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     }
 }
 
+/// The process-wide persistent SPMD layout. `None` (once initialized) means the
+/// mode opted out or the safe auto-enable gate declined. Held at module scope so
+/// [`shutdown_pools`] can *peek* (join the workers if the pool was ever built)
+/// without forcing a build.
+static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
+
 /// The lazily built persistent SPMD layout, or `None` when the mode is opted out
 /// or the safe auto-enable gate declines. Built once and reused for the whole
 /// process.
 pub fn pools() -> Option<&'static SpmdDecodePools> {
-    static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
     POOLS
         .get_or_init(|| build_from_env(default_threads()))
         .as_ref()
+}
+
+/// Signal the persistent pool's workers to stop and **join** them, if the pool
+/// was ever built. Idempotent and safe to call when the pool was never built (it
+/// only inspects the already-initialized static; it never forces a build).
+///
+/// The persistent pool lives in a module-level `static`, and Rust does **not**
+/// run `Drop` on statics at process exit. Without an explicit join the pool's
+/// hot worker threads stay alive (spinning or parked on `Arc<SharedState>`)
+/// while the process tears down its runtime. On weakly-ordered targets (notably
+/// native Windows ARM64) a worker still touching that shared state during
+/// teardown can fault the whole process with `STATUS_ACCESS_VIOLATION`
+/// (0xC0000005) and an empty stderr -- not a Rust panic. Calling this before the
+/// process exits makes teardown deterministic: workers observe the stop flag,
+/// return, and are joined, so none is live during runtime teardown.
+///
+/// This is a teardown-only operation: it takes no locks on the decode hot path
+/// and must not be called between decode ops (it stops the workers).
+pub fn shutdown_pools() {
+    if let Some(Some(pool)) = POOLS.get() {
+        pool.shutdown();
+    }
 }
 
 /// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
