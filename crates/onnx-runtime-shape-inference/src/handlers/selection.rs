@@ -108,6 +108,14 @@ fn non_zero(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `NonMaxSuppression` emits one data-dependent `[batch, class, box]` row per
+/// selected box.
+fn non_max_suppression(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let selected = ctx.fresh_dim();
+    ctx.set_output(0, DataType::Int64, vec![selected, DimExpr::constant(3)]);
+    Ok(())
+}
+
 /// `OneHot`: insert the scalar `depth` extent into the indices shape. The
 /// output element type comes from the two-element `values` input.
 fn one_hot(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -246,6 +254,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "TopK", 11, top_k_v10);
     reg.register("", "NonZero", 9, non_zero);
     reg.register("", "NonZero", 13, non_zero);
+    reg.register("", "NonMaxSuppression", 10, non_max_suppression);
     reg.register("", "OneHot", 9, one_hot);
     reg.register("", "OneHot", 11, one_hot);
     reg.register("", "Compress", 9, compress);

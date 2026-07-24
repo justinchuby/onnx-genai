@@ -5,7 +5,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::add::require_same_dtype;
-use super::{check_arity, to_dense_i64, write_dense_bytes};
+use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes};
 use crate::dispatch_arith;
 use crate::dtype::{
     NumericElem, to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
@@ -236,6 +236,220 @@ pub struct TopKKernel {
     axis: i64,
     largest: bool,
     sorted: bool,
+}
+
+/// ONNX `NonMaxSuppression` for the standard `[batch, boxes, 4]` /
+/// `[batch, classes, boxes]` representation.
+pub struct NonMaxSuppressionKernel {
+    center_point_box: i64,
+}
+
+pub struct NonMaxSuppressionFactory;
+
+impl KernelFactory for NonMaxSuppressionFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let center_point_box = node
+            .attr("center_point_box")
+            .and_then(|attribute| attribute.as_int())
+            .unwrap_or(0);
+        if !matches!(center_point_box, 0 | 1) {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: center_point_box must be 0 or 1, got {center_point_box}"
+            )));
+        }
+        Ok(Box::new(NonMaxSuppressionKernel { center_point_box }))
+    }
+}
+
+impl Kernel for NonMaxSuppressionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("NonMaxSuppression", inputs, outputs, 2, 5, 1)?;
+        if outputs[0].dtype != DataType::Int64 {
+            return Err(EpError::KernelFailed(
+                "NonMaxSuppression: selected_indices output must be Int64".into(),
+            ));
+        }
+        let boxes = to_dense_f32(&inputs[0])?;
+        let scores = to_dense_f32(&inputs[1])?;
+        let max_output_boxes_per_class = optional_i64_scalar(
+            "NonMaxSuppression max_output_boxes_per_class",
+            inputs.get(2),
+        )?
+        .unwrap_or(0);
+        let iou_threshold =
+            optional_f32_scalar("NonMaxSuppression iou_threshold", inputs.get(3))?.unwrap_or(0.0);
+        let score_threshold =
+            optional_f32_scalar("NonMaxSuppression score_threshold", inputs.get(4))?
+                .unwrap_or(f32::NEG_INFINITY);
+        let selected = non_max_suppression(
+            &boxes,
+            inputs[0].shape,
+            &scores,
+            inputs[1].shape,
+            max_output_boxes_per_class,
+            iou_threshold,
+            score_threshold,
+            self.center_point_box,
+        )?;
+        if outputs[0].shape != [selected.len(), 3] {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: output shape {:?} does not match selected index count {}. \
+                 HOW: size selected_indices as [num_selected_indices, 3].",
+                outputs[0].shape,
+                selected.len()
+            )));
+        }
+        let bytes = selected
+            .iter()
+            .flat_map(|indices| indices.iter().flat_map(|index| index.to_le_bytes()))
+            .collect::<Vec<_>>();
+        write_dense_bytes(&mut outputs[0], &bytes)
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+/// Calculate the selected `[batch_index, class_index, box_index]` rows for
+/// ONNX `NonMaxSuppression`. The session uses this same reference routine to
+/// resolve the data-dependent output extent before allocating its output.
+pub fn non_max_suppression(
+    boxes: &[f32],
+    boxes_shape: &[usize],
+    scores: &[f32],
+    scores_shape: &[usize],
+    max_output_boxes_per_class: i64,
+    iou_threshold: f32,
+    score_threshold: f32,
+    center_point_box: i64,
+) -> Result<Vec<[i64; 3]>> {
+    if boxes_shape.len() != 3 || boxes_shape[2] != 4 {
+        return Err(EpError::KernelFailed(format!(
+            "NonMaxSuppression: boxes must have shape [batch, spatial_dimension, 4], got {boxes_shape:?}"
+        )));
+    }
+    if scores_shape.len() != 3
+        || scores_shape[0] != boxes_shape[0]
+        || scores_shape[2] != boxes_shape[1]
+    {
+        return Err(EpError::KernelFailed(format!(
+            "NonMaxSuppression: scores shape {scores_shape:?} must be [batch, classes, spatial_dimension] matching boxes shape {boxes_shape:?}"
+        )));
+    }
+    if max_output_boxes_per_class < 0 {
+        return Err(EpError::KernelFailed(
+            "NonMaxSuppression: max_output_boxes_per_class must be non-negative".into(),
+        ));
+    }
+    let batch = boxes_shape[0];
+    let box_count = boxes_shape[1];
+    let classes = scores_shape[1];
+    if boxes.len() != batch * box_count * 4 || scores.len() != batch * classes * box_count {
+        return Err(EpError::KernelFailed(
+            "NonMaxSuppression: input data length does not match its declared shape".into(),
+        ));
+    }
+    let limit = usize::try_from(max_output_boxes_per_class).map_err(|_| {
+        EpError::KernelFailed(
+            "NonMaxSuppression: max_output_boxes_per_class exceeds this platform's address space"
+                .into(),
+        )
+    })?;
+    let mut selected = Vec::new();
+    for batch_index in 0..batch {
+        for class_index in 0..classes {
+            let score_offset = (batch_index * classes + class_index) * box_count;
+            let mut candidates = (0..box_count)
+                .filter(|&box_index| scores[score_offset + box_index] > score_threshold)
+                .collect::<Vec<_>>();
+            candidates.sort_by(|&left, &right| {
+                scores[score_offset + right]
+                    .total_cmp(&scores[score_offset + left])
+                    .then_with(|| left.cmp(&right))
+            });
+            let mut kept = Vec::new();
+            for candidate in candidates {
+                if kept.len() == limit {
+                    break;
+                }
+                let candidate_box = box_coordinates(
+                    &boxes[(batch_index * box_count + candidate) * 4..][..4],
+                    center_point_box,
+                );
+                if kept.iter().all(|&kept_index| {
+                    let kept_box = box_coordinates(
+                        &boxes[(batch_index * box_count + kept_index) * 4..][..4],
+                        center_point_box,
+                    );
+                    iou(candidate_box, kept_box) <= iou_threshold
+                }) {
+                    kept.push(candidate);
+                    selected.push([batch_index as i64, class_index as i64, candidate as i64]);
+                }
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn optional_i64_scalar(name: &str, input: Option<&TensorView>) -> Result<Option<i64>> {
+    let Some(input) = input.filter(|input| !input.is_absent()) else {
+        return Ok(None);
+    };
+    let values = to_dense_i64(input)?;
+    if values.len() != 1 {
+        return Err(EpError::KernelFailed(format!(
+            "{name}: expected an Int64 scalar"
+        )));
+    }
+    Ok(Some(values[0]))
+}
+
+fn optional_f32_scalar(name: &str, input: Option<&TensorView>) -> Result<Option<f32>> {
+    let Some(input) = input.filter(|input| !input.is_absent()) else {
+        return Ok(None);
+    };
+    let values = to_dense_f32(input)?;
+    if values.len() != 1 {
+        return Err(EpError::KernelFailed(format!(
+            "{name}: expected a Float32 scalar"
+        )));
+    }
+    Ok(Some(values[0]))
+}
+
+fn box_coordinates(values: &[f32], center_point_box: i64) -> (f32, f32, f32, f32) {
+    if center_point_box == 1 {
+        let (x_center, y_center, width, height) = (values[0], values[1], values[2], values[3]);
+        (
+            y_center - height * 0.5,
+            x_center - width * 0.5,
+            y_center + height * 0.5,
+            x_center + width * 0.5,
+        )
+    } else {
+        (
+            values[0].min(values[2]),
+            values[1].min(values[3]),
+            values[0].max(values[2]),
+            values[1].max(values[3]),
+        )
+    }
+}
+
+fn iou(left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)) -> f32 {
+    let intersection_height = (left.2.min(right.2) - left.0.max(right.0)).max(0.0);
+    let intersection_width = (left.3.min(right.3) - left.1.max(right.1)).max(0.0);
+    let intersection = intersection_height * intersection_width;
+    let left_area = (left.2 - left.0).max(0.0) * (left.3 - left.1).max(0.0);
+    let right_area = (right.2 - right.0).max(0.0) * (right.3 - right.1).max(0.0);
+    let union = left_area + right_area - intersection;
+    if union > 0.0 {
+        intersection / union
+    } else {
+        0.0
+    }
 }
 pub struct TopKFactory;
 impl KernelFactory for TopKFactory {
@@ -657,5 +871,37 @@ mod tests {
             .execute(&[z.view()], &mut [o.view_mut()])
             .unwrap();
         assert_eq!(o.to_i64(), vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn non_max_suppression_filters_overlaps_per_class() {
+        let boxes = Owned::f32(
+            &[1, 3, 4],
+            &[
+                0., 0., 1., 1., // box 0
+                0., 0., 0.9, 0.9, // box 1 overlaps box 0
+                2., 2., 3., 3., // box 2 is disjoint
+            ],
+        );
+        let scores = Owned::f32(&[1, 2, 3], &[0.9, 0.8, 0.7, 0.1, 0.95, 0.2]);
+        let max_output = Owned::i64(&[], &[2]);
+        let iou = Owned::f32(&[], &[0.5]);
+        let score = Owned::f32(&[], &[0.15]);
+        let mut output = Owned::zeros(DataType::Int64, &[4, 3]);
+        NonMaxSuppressionKernel {
+            center_point_box: 0,
+        }
+        .execute(
+            &[
+                boxes.view(),
+                scores.view(),
+                max_output.view(),
+                iou.view(),
+                score.view(),
+            ],
+            &mut [output.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(output.to_i64(), vec![0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]);
     }
 }
