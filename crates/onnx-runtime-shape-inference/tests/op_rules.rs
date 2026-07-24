@@ -728,6 +728,199 @@ fn attention_opset24_nonpad_external_cache_no_past_concat() {
     assert_eq!(shape_i(3), vec![c(1), c(2), c(3), c(5)]);
 }
 
+// --- com.microsoft::MultiHeadAttention ------------------------------------
+
+fn multi_head_attention_node(num_inputs: usize, num_outputs: usize, num_heads: i64) -> Node {
+    with_attr(
+        with_domain(
+            node("MultiHeadAttention", num_inputs, num_outputs),
+            "com.microsoft",
+        ),
+        "num_heads",
+        Attribute::Int(num_heads),
+    )
+}
+
+fn shape_at(outs: &[NodeIo], i: usize) -> Vec<DimExpr> {
+    outs[i]
+        .type_info
+        .as_ref()
+        .expect("output type resolved")
+        .shape
+        .clone()
+}
+
+#[test]
+fn multi_head_attention_value_head_size_differs_from_query_key_head_size() {
+    // The defining MHA case: value head size (16) != query/key head size (8).
+    // num_heads=4. Q [2,3,32] -> qk_head_size = 32/4 = 8. V [2,5,64] ->
+    // value_head_size = 64/4 = 16. No past cache, so total_sequence = 5.
+    //
+    // Cross-validated against onnxruntime 1.26.0 (CPUExecutionProvider): a real
+    // MultiHeadAttention session on these exact inputs returns
+    //   output        = (2, 3, 64)   # num_heads * value_head_size
+    //   present_key   = (2, 4, 5, 8) # query/key head size
+    //   present_value = (2, 4, 5, 16)# value head size
+    // confirming present_key and present_value carry DIFFERENT head sizes.
+    let n = multi_head_attention_node(3, 3, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]), // query
+            f32in(vec![c(2), c(5), c(32)]), // key
+            f32in(vec![c(2), c(5), c(64)]), // value
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
+    assert_eq!(shape_at(&outs, 1), vec![c(2), c(4), c(5), c(8)]);
+    assert_eq!(shape_at(&outs, 2), vec![c(2), c(4), c(5), c(16)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn multi_head_attention_past_cache_extends_total_sequence() {
+    // past_key/past_value (inputs 6 and 7) are rank 4 with past_sequence = 7.
+    // kv_sequence = 5, so present total_sequence = 7 + 5 = 12. num_heads=4,
+    // qk_head_size = value_head_size = 8 here (ORT requires them equal on the
+    // past-cache path).
+    let n = multi_head_attention_node(8, 3, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),      // query
+            f32in(vec![c(2), c(5), c(32)]),      // key
+            f32in(vec![c(2), c(5), c(32)]),      // value
+            NodeIo::default(),                   // bias
+            NodeIo::default(),                   // key_padding_mask
+            NodeIo::default(),                   // attention_bias
+            f32in(vec![c(2), c(4), c(7), c(8)]), // past_key
+            f32in(vec![c(2), c(4), c(7), c(8)]), // past_value
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(32)]);
+    assert_eq!(shape_at(&outs, 1), vec![c(2), c(4), c(12), c(8)]);
+    assert_eq!(shape_at(&outs, 2), vec![c(2), c(4), c(12), c(8)]);
+}
+
+#[test]
+fn multi_head_attention_past_cache_keeps_respective_head_sizes() {
+    // Even with a past cache and a differing value head size, present_key is
+    // sized from Q/K (head size 8) and present_value from V (head size 16).
+    // total_sequence = past(7) + kv(5) = 12.
+    let n = multi_head_attention_node(8, 3, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),       // query -> qk head size 8
+            f32in(vec![c(2), c(5), c(32)]),       // key
+            f32in(vec![c(2), c(5), c(64)]),       // value -> value head size 16
+            NodeIo::default(),                    // bias
+            NodeIo::default(),                    // key_padding_mask
+            NodeIo::default(),                    // attention_bias
+            f32in(vec![c(2), c(4), c(7), c(8)]),  // past_key
+            f32in(vec![c(2), c(4), c(7), c(16)]), // past_value
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
+    assert_eq!(shape_at(&outs, 1), vec![c(2), c(4), c(12), c(8)]);
+    assert_eq!(shape_at(&outs, 2), vec![c(2), c(4), c(12), c(16)]);
+}
+
+#[test]
+fn multi_head_attention_rank_four_pretransposed_key_value() {
+    // Rank-4 (already transposed) K/V: (batch, num_heads, kv_sequence,
+    // head_size). Head sizes come straight from the last dim: qk_head_size = 8
+    // from key, value_head_size = 16 from value. No past, so total = kv = 5.
+    let n = multi_head_attention_node(3, 3, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(3), c(32)]),       // query
+            f32in(vec![c(1), c(4), c(5), c(8)]),  // key  (rank 4)
+            f32in(vec![c(1), c(4), c(5), c(16)]), // value (rank 4)
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(1), c(3), c(64)]);
+    assert_eq!(shape_at(&outs, 1), vec![c(1), c(4), c(5), c(8)]);
+    assert_eq!(shape_at(&outs, 2), vec![c(1), c(4), c(5), c(16)]);
+}
+
+#[test]
+fn multi_head_attention_symbolic_sequences_and_optional_qk_output() {
+    // Symbolic batch and sequences survive; the optional 4th output is the QK
+    // attention-score tensor (batch, num_heads, query_sequence, total_sequence).
+    let n = multi_head_attention_node(3, 4, 4);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(1), sym(2), c(32)]), // query
+            f32in(vec![sym(1), sym(3), c(32)]), // key
+            f32in(vec![sym(1), sym(3), c(64)]), // value
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![sym(1), sym(2), c(64)]);
+    assert_eq!(shape_at(&outs, 1), vec![sym(1), c(4), sym(3), c(8)]);
+    assert_eq!(shape_at(&outs, 2), vec![sym(1), c(4), sym(3), c(16)]);
+    assert_eq!(shape_at(&outs, 3), vec![sym(1), c(4), sym(2), sym(3)]);
+}
+
+#[test]
+fn multi_head_attention_missing_num_heads_errors() {
+    // Without the required `num_heads` attribute the per-head split is
+    // undefined; the rule must reject cleanly rather than emit a wrong shape.
+    let n = with_domain(node("MultiHeadAttention", 3, 3), "com.microsoft");
+    let err = try_run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),
+            f32in(vec![c(2), c(5), c(32)]),
+            f32in(vec![c(2), c(5), c(64)]),
+        ],
+        1,
+    )
+    .expect_err("missing num_heads must error");
+    assert_invalid(err, "MultiHeadAttention", "num_heads");
+}
+
+#[test]
+fn multi_head_attention_rejects_unsupported_query_rank() {
+    // Packed-QKV (rank-5 query) is not supported; reject rather than guess.
+    let n = multi_head_attention_node(3, 1, 4);
+    let err = try_run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(4), c(3), c(8)]), // packed QKV query
+            f32in(vec![c(2), c(5), c(32)]),
+            f32in(vec![c(2), c(5), c(64)]),
+        ],
+        1,
+    )
+    .expect_err("rank-5 query must error");
+    assert_invalid(err, "MultiHeadAttention", "query must be rank 3");
+}
+
+#[test]
+fn multi_head_attention_rejects_key_value_rank_mismatch() {
+    // Key and value must share a rank (both 3 or both 4).
+    let n = multi_head_attention_node(3, 3, 4);
+    let err = try_run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),
+            f32in(vec![c(2), c(5), c(32)]),       // key rank 3
+            f32in(vec![c(2), c(4), c(5), c(16)]), // value rank 4
+        ],
+        1,
+    )
+    .expect_err("rank mismatch must error");
+    assert_invalid(err, "MultiHeadAttention", "key and value must both be rank");
+}
+
 #[test]
 fn add_broadcast_concrete() {
     let n = node("Add", 2, 1);

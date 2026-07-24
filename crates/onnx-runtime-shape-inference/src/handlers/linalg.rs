@@ -371,6 +371,160 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `com.microsoft::MultiHeadAttention`: scaled dot-product attention taking
+/// *separate* query/key/value inputs (unlike the packed-QKV
+/// `com.microsoft::Attention`).
+///
+/// The defining property of this operator is that the value tensor's per-head
+/// width (`value_head_size`) is **independent** of the query/key head size
+/// (`query_key_head_size`). The attention output and `present_value` are
+/// therefore sized from the value tensor, while `present_key` is sized from the
+/// query/key tensors; conflating the two produces wrong buffers whenever the
+/// widths differ (as they do for asymmetric value projections).
+///
+/// Supported input layouts, mirroring ONNX Runtime's contrib-op contract:
+/// * query (input 0): rank 3 `(batch, query_sequence, query_hidden)` (unpacked).
+/// * key (input 1): rank 3 `(batch, kv_sequence, key_hidden)` or rank 4
+///   `(batch, num_heads, kv_sequence, query_key_head_size)` (already
+///   transposed, as in cross-attention / past-KV decoding).
+/// * value (input 2): rank 3 `(batch, kv_sequence, value_hidden)` or rank 4
+///   `(batch, num_heads, kv_sequence, value_head_size)`.
+/// * past_key (input 6, optional): rank 4 `(batch, num_heads, past_sequence,
+///   query_key_head_size)`; when present `total_sequence = past_sequence +
+///   kv_sequence`, otherwise `total_sequence = kv_sequence`.
+///
+/// Outputs:
+/// * output 0 — `(batch, query_sequence, num_heads * value_head_size)`.
+/// * present_key (output 1) — `(batch, num_heads, total_sequence,
+///   query_key_head_size)`.
+/// * present_value (output 2) — `(batch, num_heads, total_sequence,
+///   value_head_size)`.
+/// * qk attention scores (output 3, only when emitted) — `(batch, num_heads,
+///   query_sequence, total_sequence)`.
+///
+/// Packed-QKV (rank-5 query) and packed-KV (rank-5 key) layouts are rejected
+/// with [`ShapeInferError::Invalid`] rather than guessing a shape.
+pub fn multi_head_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let query = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let key = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let value = ctx.input_shape(2).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(query), Some(key), Some(value), Some(dtype)) = (query, key, value, dtype) else {
+        return Ok(());
+    };
+
+    if query.len() != 3 {
+        return Err(ShapeInferError::Invalid {
+            op: "MultiHeadAttention".into(),
+            detail: format!(
+                "query must be rank 3 `(batch, sequence, hidden)`; packed-QKV \
+                 layouts are unsupported (got rank {})",
+                query.len()
+            ),
+        });
+    }
+    if !(key.len() == 3 || key.len() == 4) || key.len() != value.len() {
+        return Err(ShapeInferError::Invalid {
+            op: "MultiHeadAttention".into(),
+            detail: format!(
+                "key and value must both be rank 3 `(batch, kv_sequence, hidden)` or \
+                 rank 4 `(batch, num_heads, kv_sequence, head_size)` (got key={}, value={})",
+                key.len(),
+                value.len()
+            ),
+        });
+    }
+
+    let num_heads = ctx
+        .node
+        .attr("num_heads")
+        .and_then(Attribute::as_int)
+        .map(DimExpr::constant)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: "MultiHeadAttention".into(),
+            detail: "missing required `num_heads` attribute".into(),
+        })?;
+
+    let batch = query[0].clone();
+    let query_sequence = query[1].clone();
+
+    // query_key_head_size sizes present_key. A rank-4 (already transposed) key
+    // carries it in its last dim; a rank-3 key packs `num_heads` head slices
+    // into its hidden width (equivalently `query_hidden / num_heads`).
+    let query_key_head_size = if key.len() == 4 {
+        key[3].clone()
+    } else {
+        key[2]
+            .checked_div(&num_heads)
+            .unwrap_or_else(|| ctx.fresh_dim())
+    };
+
+    // value_head_size sizes both the attention output hidden dim and
+    // present_value. It is derived solely from the value tensor and may differ
+    // from query_key_head_size — the exact case a naive rule gets wrong.
+    let (value_hidden, value_head_size) = if value.len() == 4 {
+        (num_heads.mul(&value[3]), value[3].clone())
+    } else {
+        let value_head_size = value[2]
+            .checked_div(&num_heads)
+            .unwrap_or_else(|| ctx.fresh_dim());
+        (value[2].clone(), value_head_size)
+    };
+
+    let kv_sequence = if key.len() == 3 {
+        key[1].clone()
+    } else {
+        key[2].clone()
+    };
+
+    // total_sequence concatenates any past-KV cache (past_key is input 6, a
+    // rank-4 `(batch, num_heads, past_sequence, head_size)` tensor).
+    let total_sequence = match ctx.input_shape(6) {
+        Some(past_key) if past_key.len() == 4 => past_key[2].add(&kv_sequence),
+        _ => kv_sequence,
+    };
+
+    ctx.set_output(
+        0,
+        dtype,
+        vec![batch.clone(), query_sequence.clone(), value_hidden],
+    );
+
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(
+            1,
+            dtype,
+            vec![
+                batch.clone(),
+                num_heads.clone(),
+                total_sequence.clone(),
+                query_key_head_size,
+            ],
+        );
+    }
+    if ctx.num_outputs() > 2 {
+        let value_dtype = ctx.input_dtype(2).unwrap_or(dtype);
+        ctx.set_output(
+            2,
+            value_dtype,
+            vec![
+                batch.clone(),
+                num_heads.clone(),
+                total_sequence.clone(),
+                value_head_size,
+            ],
+        );
+    }
+    if ctx.num_outputs() > 3 {
+        ctx.set_output(
+            3,
+            dtype,
+            vec![batch, num_heads, query_sequence, total_sequence],
+        );
+    }
+    Ok(())
+}
+
 /// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -426,4 +580,13 @@ pub fn register(reg: &mut InferenceRegistry) {
     // cache — total_seq stays kv_seq). The registry resolves the highest
     // `min_opset <= version`, so this single rule serves opsets 23–26.
     reg.register("", "Attention", 23, attention);
+    // com.microsoft::MultiHeadAttention (opset 1): separate Q/K/V inputs whose
+    // value head size may differ from the query/key head size, so the output
+    // and present_value are sized from V while present_key is sized from Q/K.
+    reg.register(
+        "com.microsoft",
+        "MultiHeadAttention",
+        1,
+        multi_head_attention,
+    );
 }
