@@ -8,6 +8,14 @@ _Last updated: 2026-07-24T00:00:00Z_
 
 **Current `origin/main` implementation HEAD:** `2ead1cdd` (rustfmt hygiene for the CI formatting gate).
 
+## 2026-07-24 — Decode-correctness regression-lock coverage milestone
+
+- **Every on-box model now has a dedicated native-CUDA decode-correctness regression lock.** New locks this session: Qwen2.5-0.5B (`cf33a920`), Qwen2.5-7B (`cf33a920`), Phi-4-mini (`445ef3c9`), and GLM-4-9B (`13af95d7`). These four share the generalized `crates/onnx-genai-engine/tests/common/decode_lock.rs` helper: native==ORT bit-exact cross-checks for Qwen/Phi, or a native==golden coherence lock for native-only GLM-4-9B (ORT cannot load it). These four are env/GPU-gated (clean CI skips) and non-inert: exact golden token IDs are checked and perturbed goldens fail. Qwen2.5-1.5B, Qwen3-0.6B, Phi-3.5-mini, and DeepSeek-R1-1.5B already had their own decode-correctness locks from prior sessions.
+- **Qwen2.5-0.5B, Qwen2.5-7B, and Phi-4-mini are bit-exact native==ORT** over 64 greedy tokens.
+- **GLM-4-9B fused-MLP Split capture seams ✅ (`bd9b3a74`):** `StaticSplitPlan` makes static single-input Split CUDA-graph-capturable, reducing captured **segments 41→1** (equivalently, eager **seams 40→0**), improving decode from approximately **110→120 tok/s**, and retaining byte-identical output. The stale 40-seam claim in `docs/glm-deepseek-enablement.md` was corrected by `13af95d7`.
+- **`docs/benchmarks/` hygiene ✅:** snapshot reports are re-prefixed with their real `YYYY-MM-DD` dates; the two reports carrying a fabricated `2026-06-09` date were corrected to their true `2026-07-24` creation date.
+- **CI health ✅:** CPU-team PRs fixed the two long-standing pre-existing failures: mlas-sys AVX-512 kernel-selection portability (`33ee4004`, #109) and the dlpack Windows/ARM64 flaky deleter test (`00f12b7c`, #108).
+
 ## 2026-07-24 — GLM-5.2 native-e2e + DeepSeek breadth + CI hardening
 
 - **GLM-5.2 fixed-capacity foundation + native eager E2E ✅ (`bd9bd60c`, `6600cd7d`, `7c212bc7`, `ec4b62bf`):** CUDA now has the fixed-capacity `pkg.nxrt::IndexShare` present path and executor capacity recognition (`bd9bd60c`); `6600cd7d` supplies its CI-clippy cleanup. The reproducible synthetic tiny-QMoE fixture (about 378 KB of ONNX weights) is locked by `glm_tiny_qmoe_native_cuda_e2e.rs`, gated with `required-features = ["cuda", "native-backend"]` (`ec4b62bf`). It asserts native CPU/CUDA greedy-ID parity at the anchor IDs and confirms current concat-form exports stay eager (`captures=0`); the S3 exporter capacity-form rewrite remains deferred. This is a synthetic native capability milestone, **not** a real-checkpoint quality or performance claim: real GLM-5.2 weights are 217 GB+ and were not benchmarked here.
