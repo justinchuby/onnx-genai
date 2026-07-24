@@ -48,7 +48,10 @@
 //! path), and `=1` forces it on even on hosts the auto policy would decline. The
 //! one-time activation is logged. Auto-enable is conservative: it only fires when
 //! the host is large enough that a spinning worker set is safe (>= 4 logical CPUs,
-//! see [`AUTO_MIN_LOGICAL_CPUS`]); tiny hosts fall back to the flat path, and a
+//! see [`AUTO_MIN_LOGICAL_CPUS`]) **and** the host is not already loaded (the
+//! 1-minute load average per allowed CPU is below [`MAX_LOAD_PER_CPU_FOR_AUTO`],
+//! see [`current_contention`] / [`should_auto_enable`]); tiny or loaded hosts
+//! fall back to the flat path, and a
 //! `THREADS=0` opt-out still leaves the decode path unchanged. The unset worker
 //! count is [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`]
 //! (about half the logical CPUs), not the flat pool's eight-worker ceiling, so the
@@ -98,6 +101,22 @@ pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 /// legacy path. An explicit `=1` bypasses this gate. Derived from topology, not a
 /// model/vendor constant (rule 2).
 const AUTO_MIN_LOGICAL_CPUS: usize = 4;
+
+/// Contention ceiling for the *auto* path: when the 1-minute load average divided
+/// by the number of CPUs the process may run on exceeds this, the Auto default
+/// declines the spinning persistent pool and stays on the flat decode path.
+///
+/// The pool auto-sizes to about half the allowed CPUs as workers that HARD-SPIN
+/// on a per-op barrier before parking. That is a large win on a dedicated/idle
+/// host (workers stay hot, catch back-to-back ops in microseconds), but on a
+/// loaded/oversubscribed host every per-op barrier must wait for the OS to
+/// schedule every spinning worker, so the slowest-scheduled worker gates each of
+/// the ~141 ops/token and per-token latency explodes. At `load_per_cpu > 0.7`
+/// fewer than ~30% of the allowed cores are idle, so a half-the-cores spinning
+/// set cannot run without oversubscription -- decline and let the flat/bounded
+/// path (measured 32-44 tok/s here vs ~1.4 tok/s spinning) handle decode. The
+/// threshold is a heuristic; `=1` (Forced) bypasses it for dedicated-box opt-in.
+const MAX_LOAD_PER_CPU_FOR_AUTO: f64 = 0.7;
 
 /// Spin iterations a worker or the dispatcher busy-waits before yielding /
 /// parking. Sized so back-to-back decode projections (microseconds apart) are
@@ -802,6 +821,91 @@ fn auto_enable_suitable(available: usize) -> bool {
     available >= AUTO_MIN_LOGICAL_CPUS
 }
 
+/// The 1-minute load average, or `None` when it cannot be read on this platform.
+///
+/// Linux reads `/proc/loadavg` directly (no syscall/dep needed); other Unix
+/// platforms use `libc::getloadavg`; Windows (which has no portable load-average
+/// equivalent) and any other target return `None`, so the caller falls back to
+/// the load-agnostic default rather than guessing.
+fn loadavg_one() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_loadavg_one()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        unix_getloadavg_one()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_loadavg_one() -> Option<f64> {
+    // /proc/loadavg is "load1 load5 load15 running/total lastpid"; take load1.
+    let contents = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let load: f64 = contents.split_whitespace().next()?.parse().ok()?;
+    (load.is_finite() && load >= 0.0).then_some(load)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn unix_getloadavg_one() -> Option<f64> {
+    let mut loads = [0.0f64; 3];
+    // SAFETY: getloadavg writes up to `nelem` doubles into the provided buffer
+    // and returns the number written (or -1). We pass a 3-element buffer.
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), loads.len() as libc::c_int) };
+    if n >= 1 && loads[0].is_finite() && loads[0] >= 0.0 {
+        Some(loads[0])
+    } else {
+        None
+    }
+}
+
+/// The system's recent contention as the 1-minute load average divided by the
+/// CPU count the process may run on (`allowed_cpus`). `None` when the load
+/// average is unavailable (e.g. Windows) so the auto path keeps prior behavior.
+///
+/// Using the *allowed* CPU count (the cpuset/taskset restriction) as the divisor
+/// is deliberately conservative: a system-wide load average over a restricted
+/// core budget reports higher contention, biasing the auto path toward declining
+/// the spinning pool exactly when the process has few cores to itself.
+fn current_contention(allowed_cpus: usize) -> Option<f64> {
+    if allowed_cpus == 0 {
+        return None;
+    }
+    loadavg_one().map(|load| load / allowed_cpus as f64)
+}
+
+/// The CPU count used as the contention divisor and tiny-host gate input: the
+/// process's allowed (cpuset/taskset) CPUs when known, else the logical CPU
+/// count. Never zero (falls back to 1) so downstream division is safe.
+fn contention_cpu_budget() -> usize {
+    crate::decode_affinity::allowed_cpus()
+        .map(|c| c.len())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(crate::kernels::matmul_nbits::available_parallelism_public)
+        .max(1)
+}
+
+/// Pure auto-enable decision (unit-tested). The persistent spinning pool
+/// auto-enables only when the host is large enough (`>= AUTO_MIN_LOGICAL_CPUS`)
+/// **and** contention is either unknown or below `max_load_per_cpu`:
+///
+/// * tiny host (`< AUTO_MIN_LOGICAL_CPUS`) -> `false` (decline);
+/// * `contention == None` (unknown, e.g. Windows) -> enable (prior behavior);
+/// * `contention > max_load_per_cpu` (loaded box) -> `false` (decline);
+/// * `contention <= max_load_per_cpu` (idle/light box) -> enable.
+///
+/// Forced (`=1`) never calls this: it bypasses the auto gate entirely.
+fn should_auto_enable(available_cpus: usize, contention: Option<f64>, max_load_per_cpu: f64) -> bool {
+    if !auto_enable_suitable(available_cpus) {
+        return false;
+    }
+    !matches!(contention, Some(load_per_cpu) if load_per_cpu > max_load_per_cpu)
+}
+
 /// Build the persistent SPMD layout unless it is opted out (`=0`), the worker
 /// count is unavailable (`THREADS=0`), or the safe auto-enable gate declines on a
 /// tiny host. Otherwise `Some(layout)` (the decode path uses the persistent pool).
@@ -839,18 +943,36 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     if total == 0 {
         return None;
     }
-    // Safe auto-enable gate (rule 2 conservatism): on a tiny host an auto-enabled
-    // spinning pool can starve the dispatcher, so decline and stay on the flat
-    // legacy path. An explicit `=1` (Forced) bypasses this.
-    if matches!(mode, PersistenceMode::Auto)
-        && !auto_enable_suitable(crate::kernels::matmul_nbits::available_parallelism_public())
-    {
-        report_spmd_fallback(
-            "persistent SPMD decode pool auto-enable declined: fewer than 4 logical CPUs, \
-             where a spinning worker set risks starving the dispatcher -- staying on the flat \
-             decode path. Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to force it on",
-        );
-        return None;
+    // Safe auto-enable gate (rule 2 conservatism): decline the spinning pool on a
+    // tiny host (dispatcher starvation) OR on a loaded/oversubscribed host (every
+    // per-op barrier would wait for the OS to reschedule all spinning workers,
+    // exploding per-token latency). Both stay on the flat legacy path. An explicit
+    // `=1` (Forced) bypasses this entire gate.
+    if matches!(mode, PersistenceMode::Auto) {
+        let available = crate::kernels::matmul_nbits::available_parallelism_public();
+        let budget = contention_cpu_budget();
+        let contention = current_contention(budget);
+        if !should_auto_enable(available, contention, MAX_LOAD_PER_CPU_FOR_AUTO) {
+            if !auto_enable_suitable(available) {
+                report_spmd_fallback(
+                    "persistent SPMD decode pool auto-enable declined: fewer than 4 logical \
+                     CPUs, where a spinning worker set risks starving the dispatcher -- staying \
+                     on the flat decode path. Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to \
+                     force it on",
+                );
+            } else {
+                report_spmd_fallback(&format!(
+                    "persistent SPMD decode pool auto-enable declined: 1-minute load average \
+                     per allowed CPU is {:.2} (> {:.2} threshold) across {budget} allowed CPUs; \
+                     a spinning worker set would oversubscribe this loaded host and gate every \
+                     per-op barrier -- staying on the flat decode path. Set \
+                     ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to force it on",
+                    contention.unwrap_or_default(),
+                    MAX_LOAD_PER_CPU_FOR_AUTO,
+                ));
+            }
+            return None;
+        }
     }
     if matches!(mode, PersistenceMode::Auto) {
         report_default_on();
@@ -1201,6 +1323,44 @@ mod tests {
         assert!(auto_enable_suitable(AUTO_MIN_LOGICAL_CPUS));
         assert!(auto_enable_suitable(8));
         assert!(auto_enable_suitable(96));
+    }
+
+    #[test]
+    fn should_auto_enable_gates_on_host_size_and_contention() {
+        let thr = MAX_LOAD_PER_CPU_FOR_AUTO;
+
+        // Idle / lightly loaded large box -> enable.
+        assert!(should_auto_enable(8, Some(0.0), thr));
+        assert!(should_auto_enable(48, Some(0.1), thr));
+        assert!(should_auto_enable(8, Some(thr), thr)); // exactly at threshold stays on
+
+        // Loaded / oversubscribed box -> decline (this is the reproduced disaster).
+        assert!(!should_auto_enable(48, Some(0.83), thr)); // load 40 / 48 allowed
+        assert!(!should_auto_enable(32, Some(1.25), thr)); // load 40 / 32 allowed
+        assert!(!should_auto_enable(8, Some(thr + 0.01), thr));
+
+        // Unknown contention (e.g. Windows / unreadable loadavg) -> keep prior
+        // behavior and enable on a suitable host.
+        assert!(should_auto_enable(8, None, thr));
+        assert!(should_auto_enable(48, None, thr));
+
+        // Tiny host -> decline regardless of contention (even idle).
+        assert!(!should_auto_enable(1, Some(0.0), thr));
+        assert!(!should_auto_enable(AUTO_MIN_LOGICAL_CPUS - 1, None, thr));
+        assert!(!should_auto_enable(2, Some(0.0), thr));
+    }
+
+    #[test]
+    fn current_contention_is_loadavg_over_allowed_cpus() {
+        // Divisor is the allowed CPU budget; zero budget is unknown (None) so we
+        // never divide by zero.
+        assert_eq!(current_contention(0), None);
+        // When a load average is available, it scales inversely with the budget:
+        // the same system load over fewer allowed CPUs reports more contention.
+        if let (Some(wide), Some(narrow)) = (current_contention(64), current_contention(4)) {
+            assert!(wide >= 0.0 && narrow >= 0.0);
+            assert!(narrow >= wide, "fewer allowed CPUs must not lower contention");
+        }
     }
 
     #[test]
