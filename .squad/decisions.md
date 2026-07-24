@@ -3284,3 +3284,8 @@ Worktree left pristine (no scratch files).
 **By:** Burke (impl), Gorman2 (review 🟢)
 **What:** Fixed ~10× native prefill regression for 8-bit MatMulNBits. The m>1 batched dense-dequant path dequantized into transposed Kn layout (stride-N scatter, cache-thrash, 4773ms). Now dequants once into contiguous Nk (cached in weight_nk OnceLock) + MLAS sgemm(trans_b=true, ldb=k). Prefill 5335→~545ms; gap to ORT ~25×→~2.6× (clean host). Output byte-identical; new regression test matmulnbits_8bit_prefill_batched_matches_dequant_f32_oracle (m=16/32/100 × sym/asym vs independent f32 oracle, RMSE≤1e-5 + argmax parity).
 **Why:** User: native must beat ORT on prefill too. Gorman2 re-verified sgemm math by hand (A·Wᵀ identical to old Kn path/gemv_nk/oracle), confirmed weight_nk OnceLock has no cross-layout aliasing, tests non-vacuous. Cherry-picked 30f5837→a352686 onto perf/cpu-ep-mlas; ep-cpu 884/0, both clippy gates + fmt clean.
+
+### 2026-07-24: Filed ORT issue microsoft/onnxruntime#29853 (MLAS AVX2 M=1 asym int8 bug)
+**By:** Ripley, with Lambert review
+**What:** Filed upstream issue `microsoft/onnxruntime#29853` documenting the MLAS AVX2 M=1 asymmetric CompInt8 SQNBit correctness defect.
+**Why:** The PR #105 production guard prevents affected non-AVX-512 hosts from using the broken route; the upstream report tracks the MLAS fix.

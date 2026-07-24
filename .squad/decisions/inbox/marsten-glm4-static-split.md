@@ -1,4 +1,0 @@
-### 2026-07-23: GLM-4 static Split capture result
-**By:** Marsten
-**What:** Generic EP-side static single-input Split capture reduces GLM-4-9B GPTQ from 41 captured segments and 40 eager seams to one captured segment and zero fallbacks. The seams are the fused-MLP gate/up activation Split (one per layer), `Split(axis=-1, num_outputs=2)` on `gate_up_proj`, named `model/layers.N/mlp/Split_node_*`; they are not RoPE splits. Throughput improves from 110.34 to 118.85 tok/s (+7.71%), or +38.99% over forced eager execution at 85.51 tok/s.
-**Why:** Capturing these static Split nodes removes host-reading, stream-synchronizing seams without requiring a model-specific graph rewrite. Separately, ORT GenAI 0.14.1 still cannot load GLM-4 because its GQA attention schema rejects the required partial-RoPE `rotary_embedding_dim` attribute; that schema issue is unrelated to the fused-MLP Split seams.
