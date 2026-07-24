@@ -4,7 +4,7 @@
 //!
 //! Faithful CPU port of ONNX Runtime's contrib kernel
 //! (`contrib_ops/cpu/bert/linear_attention.cc`), verified to fp32 epsilon
-//! against ORT 1.26 (see `kernels::qwen35_goldens`).
+//! against ORT 1.26 (see `tests/qwen35_ort_parity.rs`).
 //!
 //! ## Contract
 //!
@@ -571,13 +571,8 @@ fn readout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::qwen35_goldens::la as g;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{Attribute, Node, NodeId};
-
-    fn bits(a: &[u32]) -> Vec<f32> {
-        a.iter().map(|&b| f32::from_bits(b)).collect()
-    }
 
     fn kernel(h: i64, scale: f32) -> Box<dyn Kernel> {
         let mut node = Node::new(NodeId(0), "LinearAttention", vec![], vec![]);
@@ -605,158 +600,6 @@ mod tests {
                 "{tag}[{i}]: got {a}, want {b} (abs {diff}, rel {rel})"
             );
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_case(
-        dims: [usize; 5],
-        scale: f32,
-        q: &[u32],
-        k: &[u32],
-        v: &[u32],
-        st: &[u32],
-        gg: &[u32],
-        be: &[u32],
-    ) -> (Vec<f32>, Vec<f32>) {
-        let [batch, h, dk, dv, s] = dims;
-        let q = Owned::f32(&[batch, s, h * dk], &bits(q));
-        let k = Owned::f32(&[batch, s, h * dk], &bits(k));
-        let v = Owned::f32(&[batch, s, h * dv], &bits(v));
-        let st = Owned::f32(&[batch, h, dk, dv], &bits(st));
-        let gd = Owned::f32(&[batch, s, h], &bits(gg));
-        let bd = Owned::f32(&[batch, s, h], &bits(be));
-        let mut out = Owned::zeros_f32(&[batch, s, h * dv]);
-        let mut present = Owned::zeros_f32(&[batch, h, dk, dv]);
-        let ins = [
-            q.view(),
-            k.view(),
-            v.view(),
-            st.view(),
-            gd.view(),
-            bd.view(),
-        ];
-        let mut outs = [out.view_mut(), present.view_mut()];
-        kernel(h as i64, scale).execute(&ins, &mut outs).unwrap();
-        (out.to_f32(), present.to_f32())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_case_bf16(
-        dims: [usize; 5],
-        scale: f32,
-        q: &[u32],
-        k: &[u32],
-        v: &[u32],
-        st: &[u32],
-        gg: &[u32],
-        be: &[u32],
-    ) -> (Vec<f32>, Vec<f32>) {
-        let [batch, h, dk, dv, s] = dims;
-        let q = Owned::bf16(&[batch, s, h * dk], &bits(q));
-        let k = Owned::bf16(&[batch, s, h * dk], &bits(k));
-        let v = Owned::bf16(&[batch, s, h * dv], &bits(v));
-        let st = Owned::bf16(&[batch, h, dk, dv], &bits(st));
-        let gd = Owned::bf16(&[batch, s, h], &bits(gg));
-        let bd = Owned::bf16(&[batch, s, h], &bits(be));
-        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[batch, s, h * dv]);
-        let mut present = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[batch, h, dk, dv]);
-        let ins = [
-            q.view(),
-            k.view(),
-            v.view(),
-            st.view(),
-            gd.view(),
-            bd.view(),
-        ];
-        let mut outs = [out.view_mut(), present.view_mut()];
-        kernel(h as i64, scale).execute(&ins, &mut outs).unwrap();
-        (out.to_bf16_as_f32(), present.to_bf16_as_f32())
-    }
-
-    #[test]
-    fn linear_attention_bf16_matches_widened_f32_reference() {
-        let (o_ref, p_ref) = run_case(
-            g::LAA_DIMS,
-            g::LAA_SCALE,
-            &g::LAA_Q,
-            &g::LAA_K,
-            &g::LAA_V,
-            &g::LAA_STATE,
-            &g::LAA_G,
-            &g::LAA_BETA,
-        );
-        let (o_bf16, p_bf16) = run_case_bf16(
-            g::LAA_DIMS,
-            g::LAA_SCALE,
-            &g::LAA_Q,
-            &g::LAA_K,
-            &g::LAA_V,
-            &g::LAA_STATE,
-            &g::LAA_G,
-            &g::LAA_BETA,
-        );
-        for (&r, &b) in o_ref.iter().zip(o_bf16.iter()) {
-            assert!(
-                (r - b).abs() <= 0.06 * r.abs().max(1.0) + 0.02,
-                "linear_attention out bf16 {b} vs f32 {r}"
-            );
-        }
-        for (&r, &b) in p_ref.iter().zip(p_bf16.iter()) {
-            assert!(
-                (r - b).abs() <= 0.06 * r.abs().max(1.0) + 0.02,
-                "linear_attention present bf16 {b} vs f32 {r}"
-            );
-        }
-    }
-
-    #[test]
-    fn ort_parity_prefill() {
-        let (o, p) = run_case(
-            g::LAA_DIMS,
-            g::LAA_SCALE,
-            &g::LAA_Q,
-            &g::LAA_K,
-            &g::LAA_V,
-            &g::LAA_STATE,
-            &g::LAA_G,
-            &g::LAA_BETA,
-        );
-        assert_close(&o, &bits(&g::LAA_O), "LAA out");
-        assert_close(&p, &bits(&g::LAA_PRESENT), "LAA present");
-    }
-
-    #[test]
-    fn ort_parity_decode_with_state() {
-        // S=1 decode carrying a non-zero incoming recurrent state.
-        let (o, p) = run_case(
-            g::LAB_DIMS,
-            g::LAB_SCALE,
-            &g::LAB_Q,
-            &g::LAB_K,
-            &g::LAB_V,
-            &g::LAB_STATE,
-            &g::LAB_G,
-            &g::LAB_BETA,
-        );
-        assert_close(&o, &bits(&g::LAB_O), "LAB out");
-        assert_close(&p, &bits(&g::LAB_PRESENT), "LAB present");
-    }
-
-    #[test]
-    fn ort_parity_asymmetric_dk_dv_and_scale() {
-        // Dk=2, Dv=5, scale=0.5, 3 heads, 2 timesteps.
-        let (o, p) = run_case(
-            g::LAC_DIMS,
-            g::LAC_SCALE,
-            &g::LAC_Q,
-            &g::LAC_K,
-            &g::LAC_V,
-            &g::LAC_STATE,
-            &g::LAC_G,
-            &g::LAC_BETA,
-        );
-        assert_close(&o, &bits(&g::LAC_O), "LAC out");
-        assert_close(&p, &bits(&g::LAC_PRESENT), "LAC present");
     }
 
     /// Independent hand-computed single-step, single-head gated-delta reference.
