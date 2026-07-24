@@ -20,14 +20,14 @@
 //!   the same stability reason.
 //! * `Softsign` — `x / (1 + |x|)`.
 
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 
 /// The per-element operation for a unary math kernel.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MathOp {
     Abs,
     Neg,
@@ -183,12 +183,37 @@ math_factory!(CoshFactory, MathOp::Cosh);
 math_factory!(SinhFactory, MathOp::Sinh);
 math_factory!(TanFactory, MathOp::Tan);
 
-impl Kernel for UnaryMathKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
+impl UnaryMathKernel {
+    fn execute_f32(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         let x = to_dense_f32_widen(self.op.name(), &inputs[0])?;
         let y: Vec<f32> = x.iter().map(|&v| self.op.apply(v)).collect();
         write_dense_f32_narrow(self.op.name(), &mut outputs[0], &y)
+    }
+}
+
+impl Kernel for UnaryMathKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
+        if self.op == MathOp::Neg {
+            return match inputs[0].dtype {
+                DataType::Int32 => {
+                    let values = to_dense::<i32>(&inputs[0])?
+                        .into_iter()
+                        .map(i32::wrapping_neg)
+                        .collect::<Vec<_>>();
+                    write_dense::<i32>(&mut outputs[0], &values)
+                }
+                DataType::Int64 => {
+                    let values = to_dense::<i64>(&inputs[0])?
+                        .into_iter()
+                        .map(i64::wrapping_neg)
+                        .collect::<Vec<_>>();
+                    write_dense::<i64>(&mut outputs[0], &values)
+                }
+                _ => self.execute_f32(inputs, outputs),
+            };
+        }
+        self.execute_f32(inputs, outputs)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -219,6 +244,33 @@ mod tests {
         let mut o3 = Owned::zeros_f32(&[3]);
         run(MathOp::Reciprocal, &x2, &mut o3);
         assert_eq!(o3.to_f32(), vec![0.5, 0.25, -2.0]);
+    }
+
+    #[test]
+    fn neg_supports_signed_integer_tensors() {
+        let i32_input = Owned::i32(&[3], &[i32::MIN, -7, 3]);
+        let mut i32_output = Owned::zeros(DataType::Int32, &[3]);
+        run(MathOp::Neg, &i32_input, &mut i32_output);
+        assert_eq!(
+            i32_output
+                .bytes
+                .chunks_exact(4)
+                .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![i32::MIN, 7, -3]
+        );
+
+        let i64_input = Owned::i64(&[3], &[i64::MIN, -7, 3]);
+        let mut i64_output = Owned::zeros(DataType::Int64, &[3]);
+        run(MathOp::Neg, &i64_input, &mut i64_output);
+        assert_eq!(
+            i64_output
+                .bytes
+                .chunks_exact(8)
+                .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![i64::MIN, 7, -3]
+        );
     }
 
     #[test]

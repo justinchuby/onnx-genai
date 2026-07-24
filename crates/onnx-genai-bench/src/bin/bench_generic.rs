@@ -151,6 +151,17 @@ fn synthetic_i64(count: usize) -> Vec<i64> {
     (0..count).map(|index| (index % 17) as i64).collect()
 }
 
+fn synthetic_i32(count: usize) -> Vec<i32> {
+    (0..count).map(|index| (index % 17) as i32).collect()
+}
+
+fn i32_bytes(values: &[i32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
 fn build_inputs(
     native_session: &InferenceSession,
     ort_session: &Session,
@@ -201,9 +212,16 @@ fn build_inputs(
                         Value::from_slice_i64(&data, &ort_shape)?,
                     )
                 }
+                (NativeDataType::Int32, OrtDataType::Int32) => {
+                    let bytes = i32_bytes(&synthetic_i32(count));
+                    (
+                        Tensor::from_raw(NativeDataType::Int32, shape.clone(), &bytes)?,
+                        Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Int32)?,
+                    )
+                }
                 (native, ort) => bail!(
                     "input '{}' has unsupported or mismatched dtype: native={native:?} ORT={ort:?}; \
-                     bench_generic currently synthesizes Float32 and Int64 inputs",
+                     bench_generic currently synthesizes Float32, Int32, and Int64 inputs",
                     input.name
                 ),
             };
@@ -240,9 +258,14 @@ fn run_ort_only(
             let value = match input.dtype {
                 OrtDataType::Float32 => Value::from_slice_f32(&synthetic_f32(count), &ort_shape)?,
                 OrtDataType::Int64 => Value::from_slice_i64(&synthetic_i64(count), &ort_shape)?,
+                OrtDataType::Int32 => Value::from_raw_bytes(
+                    i32_bytes(&synthetic_i32(count)),
+                    &ort_shape,
+                    OrtDataType::Int32,
+                )?,
                 dtype => bail!(
                     "input '{}' has unsupported dtype {dtype:?}; bench_generic currently \
-                     synthesizes Float32 and Int64 inputs",
+                     synthesizes Float32, Int32, and Int64 inputs",
                     input.name
                 ),
             };
@@ -542,6 +565,15 @@ mod tests {
         assert_eq!(parse_shape("1,3,224,224").unwrap(), [1, 3, 224, 224]);
         assert_eq!(parse_shape("1x3x416x416").unwrap(), [1, 3, 416, 416]);
         assert!(parse_shape("1,0,224").is_err());
+    }
+
+    #[test]
+    fn serializes_synthetic_i32_inputs_little_endian() {
+        assert_eq!(synthetic_i32(3), [0, 1, 2]);
+        assert_eq!(
+            i32_bytes(&[-1, 0x0102_0304]),
+            [0xff, 0xff, 0xff, 0xff, 0x04, 0x03, 0x02, 0x01]
+        );
     }
 
     #[test]
