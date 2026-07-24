@@ -77,7 +77,7 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -530,6 +530,101 @@ pub struct StandardAttentionKernel {
     /// The registered opset version this kernel serves (23, or 24 for 24–26).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
+    /// Persistent device scratch for the fixed-capacity, device-valid-length
+    /// decode path so the captured hot path performs no per-op allocation.
+    /// Reserved lazily during the eager warmup step and reused (never grown)
+    /// during CUDA-graph capture/replay. Unused by the eager/dense/growing
+    /// paths, which keep their per-op scratch.
+    workspace: Mutex<StdAttnWorkspace>,
+    /// Set to the fixed-capacity decode signature after a successful
+    /// capture-eligible call; gates [`Self::capture_support`] to Supported only
+    /// once such a step has been warmed (mirrors GroupQueryAttention).
+    last_capture_safe_signature: Mutex<Option<StdAttnCaptureSignature>>,
+}
+
+/// Fixed-capacity decode signature warmed as capture-safe. A subsequent capture
+/// pass reuses the workspace slots sized for this shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StdAttnCaptureSignature {
+    dtype: DataType,
+    batch: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    q_seq: usize,
+    key_cap: usize,
+    head_size: usize,
+    v_head_size: usize,
+}
+
+const WS_SCORES: usize = 0;
+const WS_DEV_LEN: usize = 1;
+const WS_OFFSETS: usize = 2;
+const WS_PAD_LIMITS: usize = 3;
+const WS_COUNT: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StdWorkspaceSlot {
+    ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct StdAttnWorkspace {
+    runtime: Arc<CudaRuntime>,
+    slots: [StdWorkspaceSlot; WS_COUNT],
+}
+
+impl StdAttnWorkspace {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            slots: [StdWorkspaceSlot::default(); WS_COUNT],
+        }
+    }
+
+    /// Return a device pointer for slot `index` with at least `bytes` capacity.
+    /// Reuses the existing allocation when large enough; otherwise (re)allocates
+    /// — but never during graph capture, where a grow would record an illegal
+    /// allocation, so the caller must have warmed the exact decode shape first.
+    fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
+        let bytes = bytes.max(1);
+        let slot = self.slots[index];
+        if slot.bytes >= bytes {
+            return Ok(slot.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: workspace slot {index} requires {bytes} bytes during CUDA graph \
+                 capture; warm the fixed decode shape before capture"
+            )));
+        }
+        let ptr = self.runtime.alloc_raw(bytes)?;
+        if slot.ptr != 0 {
+            // A growing (prefill/eager) shape may outgrow a slot warmed for a
+            // smaller step. Wait for queued users of the old storage before
+            // freeing; the fixed-capacity decode path never reaches here.
+            if let Err(error) = self.runtime.synchronize() {
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+            if let Err(error) = unsafe { self.runtime.free_raw(slot.ptr) } {
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(error);
+            }
+        }
+        self.slots[index] = StdWorkspaceSlot { ptr, bytes };
+        Ok(ptr)
+    }
+}
+
+impl Drop for StdAttnWorkspace {
+    fn drop(&mut self) {
+        for slot in &self.slots {
+            if slot.ptr != 0 {
+                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
+            }
+        }
+    }
 }
 
 /// Factory for [`StandardAttentionKernel`], reading the standard-`Attention`
@@ -574,6 +669,8 @@ impl KernelFactory for StandardAttentionFactory {
             qk_matmul_output_mode,
             softcap,
             since_version: self.since_version,
+            workspace: Mutex::new(StdAttnWorkspace::new(self.runtime.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         }))
     }
 }
@@ -834,8 +931,13 @@ impl StandardAttentionKernel {
 impl Kernel for StandardAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
-        // Inputs may have been uploaded asynchronously on the EP stream.
-        self.runtime.synchronize()?;
+        // Inputs may have been uploaded asynchronously on the EP stream. During
+        // CUDA-graph capture the uploads are recorded into the graph, so no host
+        // synchronize is issued (and none is legal); ordering is preserved by
+        // the stream the capture records.
+        if !self.runtime.is_capturing()? {
+            self.runtime.synchronize()?;
+        }
 
         let q_rank = inputs[0].shape.len();
         let q = resolve_bhsd(&inputs[0], "Q", self.q_num_heads)?;
@@ -1040,22 +1142,59 @@ impl Kernel for StandardAttentionKernel {
         let want_present_key = outputs.len() >= 2;
         let want_present_value = outputs.len() >= 3;
         let want_qk = outputs.len() >= 4;
+        // Physical per-head seq capacity of the bound present K/V slots (their
+        // stride when exposed at fixed capacity). Zero for dense/unbound slots.
+        let present_key_phys = if want_present_key && outputs[1].shape.len() == 4 {
+            outputs[1].shape[2]
+        } else {
+            0
+        };
+        let present_value_phys = if want_present_value && outputs[2].shape.len() == 4 {
+            outputs[2].shape[2]
+        } else {
+            0
+        };
+        // Frozen (fixed-capacity) KV binding: the past K/V *input* is bound at its
+        // physical capacity too (extent == present capacity), so its tensor
+        // extent no longer reports the valid past length — that length now lives
+        // on-device (the attention-mask frontier scanned by `derive_len`). This
+        // is what makes the decode step carry no growing logical input shape, so
+        // whole-step CUDA-graph capture stays shape-static. The eager-growing
+        // path (past extent < present capacity, exercised by the unit tests with
+        // explicit shapes) keeps host-derived lengths and is left untouched.
+        let kv_frozen = has_past_key
+            && has_past_value
+            && present_key_phys > 0
+            && present_value_phys > 0
+            && key_past_seq >= present_key_phys
+            && value_past_seq >= present_value_phys;
         // Fixed-capacity KV: a bound present K/V output may be exposed at its
         // physical capacity (seq stride > valid length) so the cache lives at a
         // constant per-head slot and the new token is appended without
         // restriding the prior rows. `*_cap` is that per-head seq stride; it
         // collapses to the valid length for dense (non-capacity) present slots,
-        // preserving the legacy contiguous layout. The valid attended length
-        // stays `total_seq` (from the logical past + current extent).
-        let key_cap = if want_present_key && outputs[1].shape.len() == 4 {
-            outputs[1].shape[2].max(total_seq)
+        // preserving the legacy contiguous layout. When the binding is frozen
+        // the host cannot see the valid length, so it sizes everything to the
+        // physical capacity and the device length bounds the actual compute.
+        let (key_cap, value_cap, total_seq, value_total_seq) = if kv_frozen {
+            (
+                present_key_phys,
+                present_value_phys,
+                present_key_phys,
+                present_value_phys,
+            )
         } else {
-            total_seq
-        };
-        let value_cap = if want_present_value && outputs[2].shape.len() == 4 {
-            outputs[2].shape[2].max(value_total_seq)
-        } else {
-            value_total_seq
+            let key_cap = if want_present_key && outputs[1].shape.len() == 4 {
+                outputs[1].shape[2].max(total_seq)
+            } else {
+                total_seq
+            };
+            let value_cap = if want_present_value && outputs[2].shape.len() == 4 {
+                outputs[2].shape[2].max(value_total_seq)
+            } else {
+                value_total_seq
+            };
+            (key_cap, value_cap, total_seq, value_total_seq)
         };
         let present_key_expected = batch * kv_heads * key_cap * head_size;
         let present_value_expected = batch * kv_heads * value_cap * v_head_size;
@@ -1170,8 +1309,8 @@ impl Kernel for StandardAttentionKernel {
             // default-domain Attention grows an aliased KV cache.
             let alias_key = has_past_key && present_key_out == Some(past_key_ptr);
             let alias_value = has_past_value && present_value_out == Some(past_value_ptr);
-            let capacity_key = key_cap > total_seq;
-            let capacity_value = value_cap > value_total_seq;
+            let capacity_key = kv_frozen || key_cap > total_seq;
+            let capacity_value = kv_frozen || value_cap > value_total_seq;
             let stage_key = alias_key && !capacity_key;
             let stage_value = alias_value && !capacity_value;
             let key_kv_ptr = if stage_key {
@@ -1188,7 +1327,6 @@ impl Kernel for StandardAttentionKernel {
             } else {
                 present_value_ptr
             };
-            let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
             // On-device valid length ABI for default-domain Attention: derive
             // the valid attended length from the attention-mask frontier so the
@@ -1208,8 +1346,29 @@ impl Kernel for StandardAttentionKernel {
                 && capacity_value
                 && alias_key
                 && alias_value;
+
+            // Fixed-capacity + device-length decode is the capture-safe path: its
+            // launch geometry is host-constant, so its scratch lives in a
+            // persistent per-kernel workspace (reserved during the eager warmup
+            // step, reused with no allocation during capture/replay) rather than
+            // per-op allocations. Every other path keeps its per-op scratch.
+            let capturing = self.runtime.is_capturing()?;
+            let mut ws = if dev_length_eligible {
+                Some(self.workspace.lock().map_err(|_| {
+                    EpError::KernelFailed("Attention: workspace lock poisoned".into())
+                })?)
+            } else {
+                None
+            };
+            let scores_ptr = match ws.as_mut() {
+                Some(ws) => ws.reserve(WS_SCORES, qk_expected * 4)?,
+                None => alloc(&self.runtime, &mut owned, qk_expected * 4)?,
+            };
             let dev_len_ptr = if dev_length_eligible {
-                let ptr = alloc(&self.runtime, &mut owned, std::mem::size_of::<i32>())?;
+                let ptr = match ws.as_mut() {
+                    Some(ws) => ws.reserve(WS_DEV_LEN, std::mem::size_of::<i32>())?,
+                    None => unreachable!("dev_length_eligible implies a workspace"),
+                };
                 let key_len = mask.dims[3];
                 let mask_q = mask.dims[2];
                 let last_row = mask_q.saturating_sub(1);
@@ -1220,17 +1379,30 @@ impl Kernel for StandardAttentionKernel {
                 0
             };
 
-            // Upload the per-batch control arrays.
-            let offsets_ptr = alloc(&self.runtime, &mut owned, offsets.len() * 8)?;
-            let pad_limits_ptr = alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?;
-            let offsets_bytes = unsafe {
-                std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
+            // Per-batch control arrays. On the capture path they live in fixed
+            // workspace slots and are (re)uploaded only outside capture — their
+            // values are host-constant for a frozen decode (offset unused with
+            // `is_causal=false`, pad `-1`), so the warmup upload is what a replay
+            // reuses. The eager/dense path uploads fresh per call.
+            let offsets_ptr = match ws.as_mut() {
+                Some(ws) => ws.reserve(WS_OFFSETS, offsets.len() * 8)?,
+                None => alloc(&self.runtime, &mut owned, offsets.len() * 8)?,
             };
-            let pad_bytes = unsafe {
-                std::slice::from_raw_parts(pad_limits.as_ptr().cast::<u8>(), pad_limits.len() * 8)
+            let pad_limits_ptr = match ws.as_mut() {
+                Some(ws) => ws.reserve(WS_PAD_LIMITS, pad_limits.len() * 8)?,
+                None => alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?,
             };
-            unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
-            unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
+            if !capturing {
+                let offsets_bytes = unsafe {
+                    std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
+                };
+                let pad_bytes = unsafe {
+                    std::slice::from_raw_parts(pad_limits.as_ptr().cast::<u8>(), pad_limits.len() * 8)
+                };
+                unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
+                unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
+            }
+            drop(ws);
 
             // Build present_key / present_value on the device. In capacity mode
             // the append writes only the new rows [past_seq, total_seq) into
@@ -1380,7 +1552,29 @@ impl Kernel for StandardAttentionKernel {
                 }
                 .map_err(|error| driver_err("launch attention_row", error))?;
             }
-            self.runtime.synchronize()
+            if !self.runtime.is_capturing()? {
+                self.runtime.synchronize()?;
+            }
+            // Record the fixed-capacity decode signature as capture-safe once a
+            // single-token step has run through the device-length workspace path
+            // with no per-op allocation or synchronize. `capture_support` gates
+            // on this so the session only captures a warmed decode shape.
+            if dev_length_eligible && batch == 1 && q_seq == 1 {
+                let signature = StdAttnCaptureSignature {
+                    dtype,
+                    batch,
+                    q_heads,
+                    kv_heads,
+                    q_seq,
+                    key_cap,
+                    head_size,
+                    v_head_size,
+                };
+                if let Ok(mut slot) = self.last_capture_safe_signature.lock() {
+                    *slot = Some(signature);
+                }
+            }
+            Ok(())
         })();
 
         let mut free_result = Ok(());
@@ -1398,9 +1592,20 @@ impl Kernel for StandardAttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "setup synchronously uploads per-batch control arrays and reads nonpad_kv_seqlen D2H",
-        )
+        // Eligible once a fixed-capacity, device-valid-length, single-token
+        // decode step has been warmed (its scratch reserved in the persistent
+        // workspace and its control uploads done outside capture). Until then —
+        // or for the eager/dense/growing paths, which never set the signature —
+        // capture is declined so those steps run eagerly.
+        match self.last_capture_safe_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-capacity device-valid-length single-token decode step",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Attention capture signature is unavailable because its state lock was poisoned",
+            ),
+        }
     }
 }
 
@@ -1482,6 +1687,8 @@ mod alias_tests {
             qk_matmul_output_mode: 0,
             softcap: 0.0,
             since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         };
 
         // Runs one decode step; when `alias` the present KV outputs share the
@@ -1625,6 +1832,8 @@ mod alias_tests {
             qk_matmul_output_mode: 0,
             softcap: 0.0,
             since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         };
 
         // Lay a `[heads, valid, dim]` contiguous tensor into a `[heads, cap, dim]`
@@ -1780,6 +1989,8 @@ mod alias_tests {
             qk_matmul_output_mode: 0,
             softcap: 0.0,
             since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
         };
         const NEG: f32 = -65504.0;
         let mask_kind = 1i32; // f32 additive bias
@@ -1832,6 +2043,59 @@ mod alias_tests {
             derive(&prefill, cap, 0),
             1,
             "row-0 scan reports 1 for a causal prefill mask (decode-only bug guard)"
+        );
+    }
+
+    /// Capture eligibility of the default-domain Attention path is gated on a
+    /// warmed, fixed-capacity, device-valid-length single-token decode step: the
+    /// kernel only reports `Supported` after such a step records its capture
+    /// signature. A fresh kernel (and every eager/dense/growing path, which never
+    /// records a signature) must decline capture. This locks the gate — the test
+    /// fails if `capture_support` reverts to unconditionally returning `Supported`
+    /// or the device-valid-length signature requirement is dropped.
+    #[test]
+    fn capture_support_gated_on_warmed_device_valid_length_signature() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: false,
+            q_num_heads: Some(1),
+            kv_num_heads: Some(1),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+            workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
+            last_capture_safe_signature: Mutex::new(None),
+        };
+        // No warmed decode step yet -> capture declined.
+        assert!(
+            !matches!(
+                kernel.capture_support(),
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            ),
+            "fresh kernel must decline capture until a fixed-capacity device-valid-length decode step is warmed"
+        );
+        // Simulate a warmed single-token decode step recording its signature.
+        *kernel.last_capture_safe_signature.lock().unwrap() = Some(StdAttnCaptureSignature {
+            dtype: DataType::Float16,
+            batch: 1,
+            q_heads: 1,
+            kv_heads: 1,
+            q_seq: 1,
+            key_cap: 4096,
+            head_size: 192,
+            v_head_size: 128,
+        });
+        assert!(
+            matches!(
+                kernel.capture_support(),
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            ),
+            "capture must be Supported once a device-valid-length single-token decode step is warmed"
         );
     }
 }
