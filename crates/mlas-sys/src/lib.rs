@@ -974,13 +974,13 @@ mod tests {
 
     #[test]
     fn sqnbit_int4_compint8_matches_reference() {
-        // MLAS exposes an AVX2 Int8 implementation, but its numerical output
-        // differs from the reference beyond this test's tolerance on non-AVX-512
-        // hosts. Keep validating the AVX-512 path while that fallback is investigated.
+        // Portability guard pending microsoft/onnxruntime#29853: only the AVX2
+        // CompInt8 SQNBit path with M=1 and asymmetric weights is affected.
+        // Keep validating AVX-512; SQNBit Int8 is not broken on all non-AVX-512 hosts.
         if !std::arch::is_x86_feature_detected!("avx512f") {
             eprintln!(
-                "skipping SQNBit int4 Int8 reference check: AVX-512F is unavailable; \
-                 TODO investigate the available AVX2 fallback's numerical discrepancy"
+                "skipping SQNBit int4 CompInt8 reference check: AVX-512F is unavailable; \
+                 AVX2 CompInt8 SQNBit M=1 asymmetric-weight bug: microsoft/onnxruntime#29853"
             );
             return;
         }
