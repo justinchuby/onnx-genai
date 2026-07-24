@@ -125,16 +125,12 @@ impl DecodeAffinity {
             "numa-split" => Ok(Self::NumaSplit),
             other => {
                 if let Some(index) = other.strip_prefix("node:") {
-                    index
-                        .trim()
-                        .parse::<usize>()
-                        .map(Self::Node)
-                        .map_err(|_| {
-                            format!(
-                                "{DECODE_AFFINITY_ENV}=`{raw}` is not a valid NUMA node selector; \
+                    index.trim().parse::<usize>().map(Self::Node).map_err(|_| {
+                        format!(
+                            "{DECODE_AFFINITY_ENV}=`{raw}` is not a valid NUMA node selector; \
                                  expected `node:<index>` with a non-negative integer index"
-                            )
-                        })
+                        )
+                    })
                 } else {
                     Err(format!(
                         "{DECODE_AFFINITY_ENV}=`{raw}` is not a recognized affinity mode; \
@@ -276,8 +272,11 @@ impl NumaTopology {
             .nodes
             .iter()
             .filter_map(|(&index, cpus)| {
-                let kept: Vec<usize> =
-                    cpus.iter().copied().filter(|c| allowed.contains(c)).collect();
+                let kept: Vec<usize> = cpus
+                    .iter()
+                    .copied()
+                    .filter(|c| allowed.contains(c))
+                    .collect();
                 (!kept.is_empty()).then_some((index, kept))
             })
             .collect();
@@ -376,7 +375,8 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
             continue;
         }
         if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+            if let (Ok(start), Ok(end)) =
+                (start.trim().parse::<usize>(), end.trim().parse::<usize>())
             {
                 cpus.extend(start..=end);
             }
@@ -657,7 +657,6 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
     Ok(DecodePlan { cpus, log })
 }
 
-
 /// Windows NUMA topology discovery and per-thread pinning.
 ///
 /// All Win32 calls here are bounded (fixed-size or single-call-sized buffers),
@@ -671,8 +670,7 @@ mod windows_imp {
     use std::mem::{size_of, zeroed};
 
     use windows_sys::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationNumaNode,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        GetLogicalProcessorInformationEx, RelationNumaNode, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, GetThreadGroupAffinity, SetThreadGroupAffinity,
@@ -736,7 +734,7 @@ mod windows_imp {
             // record the OS wrote; `read_unaligned` needs no alignment guarantee.
             let record = unsafe {
                 std::ptr::read_unaligned(
-                    buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+                    buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
                 )
             };
             let size = record.Size as usize;
@@ -772,15 +770,15 @@ mod windows_imp {
         let bit = cpu % GROUP_BITS;
         // SAFETY: `GROUP_AFFINITY` is plain-old-data; zeroing it and setting the
         // single group + mask we want is a valid initialization.
-        let mut affinity = unsafe { zeroed::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>() };
+        let mut affinity =
+            unsafe { zeroed::<windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY>() };
         affinity.Group = group;
         affinity.Mask = 1usize << bit;
         // SAFETY: `GetCurrentThread` returns a pseudo-handle valid for the call;
         // `affinity` is a live, fully-initialized `GROUP_AFFINITY`; passing a null
         // previous-affinity out-param is documented as "not returned".
-        let ok = unsafe {
-            SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut())
-        };
+        let ok =
+            unsafe { SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut()) };
         if ok != 0 {
             Ok(())
         } else {
@@ -890,12 +888,15 @@ mod tests {
         // Every invalid path names the rejected value, all accepted modes, and
         // the available-node list.
         for (raw, needle) in [
-            ("bogus", "bogus"),         // malformed mode
-            ("node:x", "node:x"),       // non-integer node index
-            ("node:9", "node:9"),       // unknown node index
+            ("bogus", "bogus"),   // malformed mode
+            ("node:x", "node:x"), // non-integer node index
+            ("node:9", "node:9"), // unknown node index
         ] {
             let err = DecodeAffinity::resolve(Some(raw), Some(&topology)).unwrap_err();
-            assert!(err.contains(needle), "names rejected value `{needle}`: {err}");
+            assert!(
+                err.contains(needle),
+                "names rejected value `{needle}`: {err}"
+            );
             assert!(
                 err.contains("`off`")
                     && err.contains("`compact`")

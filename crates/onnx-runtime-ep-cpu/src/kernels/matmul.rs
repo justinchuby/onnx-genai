@@ -934,11 +934,11 @@ mod tests {
         }
         // Shapes exercise m=1 decode, general prefill, and K/N-32 tails.
         const SHAPES: &[(usize, usize, usize)] = &[
-            (1, 2048, 512),  // decode GEMV
-            (1, 100, 40),    // decode, K & N not multiples of 32
-            (32, 256, 64),   // prefill, aligned
-            (17, 130, 50),   // prefill, ragged M/K/N
-            (4, 33, 3),      // tiny K tail (33 = 32 + 1)
+            (1, 2048, 512), // decode GEMV
+            (1, 100, 40),   // decode, K & N not multiples of 32
+            (32, 256, 64),  // prefill, aligned
+            (17, 130, 50),  // prefill, ragged M/K/N
+            (4, 33, 3),     // tiny K tail (33 = 32 + 1)
         ];
 
         let mut state = 0x9E37_79B9_u32;
@@ -1039,8 +1039,14 @@ mod tests {
             .unwrap();
 
         // f64 reference over bf16-rounded operands, then rounded to bf16 output.
-        let a_w: Vec<f32> = a_f32.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
-        let b_w: Vec<f32> = b_f32.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect();
+        let a_w: Vec<f32> = a_f32
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let b_w: Vec<f32> = b_f32
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
         let got = out.to_bf16_as_f32();
         for row in 0..m {
             for col in 0..n {
@@ -1085,8 +1091,12 @@ mod tests {
 
         println!("bf16 GEMM microbench (native _mm512_dpbf16_ps vs widen-to-f32 + SGEMM)");
         for &(m, k, n) in SHAPES {
-            let a_bits: Vec<u16> = (0..m * k).map(|_| half::bf16::from_f32(next()).to_bits()).collect();
-            let b_bits: Vec<u16> = (0..k * n).map(|_| half::bf16::from_f32(next()).to_bits()).collect();
+            let a_bits: Vec<u16> = (0..m * k)
+                .map(|_| half::bf16::from_f32(next()).to_bits())
+                .collect();
+            let b_bits: Vec<u16> = (0..k * n)
+                .map(|_| half::bf16::from_f32(next()).to_bits())
+                .collect();
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
 
             // Native bf16 path.
@@ -1107,8 +1117,14 @@ mod tests {
                 let (a, b) = (a_bits.clone(), b_bits.clone());
                 median3(Box::new(move || {
                     let t = Instant::now();
-                    let a_f: Vec<f32> = a.iter().map(|&x| half::bf16::from_bits(x).to_f32()).collect();
-                    let b_f: Vec<f32> = b.iter().map(|&x| half::bf16::from_bits(x).to_f32()).collect();
+                    let a_f: Vec<f32> = a
+                        .iter()
+                        .map(|&x| half::bf16::from_bits(x).to_f32())
+                        .collect();
+                    let b_f: Vec<f32> = b
+                        .iter()
+                        .map(|&x| half::bf16::from_bits(x).to_f32())
+                        .collect();
                     let mut c = vec![0.0f32; m * n];
                     gemm(&a_f, &b_f, &mut c, m, k, n).unwrap();
                     std::hint::black_box(&c);
@@ -1204,9 +1220,9 @@ mod tests {
         // must still match the generic reference within f32 tolerance, so the
         // faster default never changes decode outputs (token-ID parity).
         const SHAPES: &[(usize, usize, usize)] = &[
-            (1, 2048, 2048),   // decode GEMV (m=1), the dense hot path
-            (1, 2304, 9216),   // GeGLU up/gate projection tile
-            (1, 9216, 2304),   // GeGLU down projection tile
+            (1, 2048, 2048), // decode GEMV (m=1), the dense hot path
+            (1, 2304, 9216), // GeGLU up/gate projection tile
+            (1, 9216, 2304), // GeGLU down projection tile
             (5, 128, 256),
             (32, 512, 512),
         ];

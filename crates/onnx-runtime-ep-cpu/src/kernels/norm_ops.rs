@@ -648,10 +648,7 @@ mod tests {
     #[test]
     fn prelu_bf16_matches_widened_f32_reference() {
         let shapes: &[&[usize]] = &[&[1, 2, 2, 2], &[2, 1, 1]];
-        let inputs: &[&[f32]] = &[
-            &[-1.0, 2.0, -3.0, 4.0, -1.0, 2.0, -3.0, 4.0],
-            &[0.1, 0.5],
-        ];
+        let inputs: &[&[f32]] = &[&[-1.0, 2.0, -3.0, 4.0, -1.0, 2.0, -3.0, 4.0], &[0.1, 0.5]];
         let reference = run_norm(
             "PRelu",
             16,

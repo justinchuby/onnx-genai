@@ -2213,7 +2213,9 @@ mod tests {
 
     fn f32_bytes(values: &[f32]) -> &[u8] {
         // SAFETY: f32 is plain-old-data; reinterpreting as bytes is sound.
-        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
     }
 
     /// Run `SkipSimplifiedLayerNormalization` on the GPU with fp16 activations
@@ -2244,10 +2246,18 @@ mod tests {
             .map(|(input, skip)| f16::from_f32(input.to_f32() + skip.to_f32()))
             .collect::<Vec<_>>();
 
-        let input_buffer = ep.allocate(hidden * std::mem::size_of::<f16>(), 256).unwrap();
-        let skip_buffer = ep.allocate(hidden * std::mem::size_of::<f16>(), 256).unwrap();
-        let gamma_buffer = ep.allocate(hidden * std::mem::size_of::<f32>(), 256).unwrap();
-        let mut output_buffer = ep.allocate(hidden * std::mem::size_of::<f16>(), 256).unwrap();
+        let input_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+        let skip_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
+        let gamma_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f32>(), 256)
+            .unwrap();
+        let mut output_buffer = ep
+            .allocate(hidden * std::mem::size_of::<f16>(), 256)
+            .unwrap();
         let runtime = ep.runtime();
         unsafe {
             runtime

@@ -762,12 +762,12 @@ mod tests {
             1.0,
             -1.0,
             0.5,
-            2049.0,       // rounds to nearest-even in f16
-            65_504.0,     // f16::MAX
-            65_520.0,     // overflows to +inf
-            -65_520.0,    // overflows to -inf
-            6.1e-5,       // near f16 subnormal boundary
-            1e-8,         // flushes toward zero
+            2049.0,    // rounds to nearest-even in f16
+            65_504.0,  // f16::MAX
+            65_520.0,  // overflows to +inf
+            -65_520.0, // overflows to -inf
+            6.1e-5,    // near f16 subnormal boundary
+            1e-8,      // flushes toward zero
             3.140625,
             f32::INFINITY,
             f32::NEG_INFINITY,

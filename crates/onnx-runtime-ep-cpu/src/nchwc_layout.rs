@@ -22,12 +22,12 @@
 
 use std::collections::HashMap;
 
-use onnx_runtime_ir::{as_static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, ValueId};
+use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, Node, NodeId, ValueId, as_static_shape};
 use onnx_runtime_optimizer::{OptimizationPass, OptimizerError, PassContext, Result};
 
 use crate::kernels::nchwc::{
-    round_up, NCHWC_AVERAGE_POOL_OP, NCHWC_CONV_OP, NCHWC_DOMAIN, NCHWC_GLOBAL_AVERAGE_POOL_OP,
-    NCHWC_MAX_POOL_OP, REORDER_TO_BLOCKED_OP, REORDER_TO_NCHW_OP,
+    NCHWC_AVERAGE_POOL_OP, NCHWC_CONV_OP, NCHWC_DOMAIN, NCHWC_GLOBAL_AVERAGE_POOL_OP,
+    NCHWC_MAX_POOL_OP, REORDER_TO_BLOCKED_OP, REORDER_TO_NCHW_OP, round_up,
 };
 
 /// Always-on NCHWc layout-propagation pass. Runs after Conv+BN(+Relu) fusion so

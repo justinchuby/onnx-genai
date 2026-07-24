@@ -18,7 +18,7 @@
 
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{compute_contiguous_strides, DataType, Node};
+use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::{check_arity, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::{next_index, numel};
@@ -486,11 +486,12 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 1]);
         run_attr(ReduceOp::LogSumExp, Some(vec![1]), &x, &mut out);
         let expected = [1.0 + (-1_f32).exp().ln_1p(), 3.0 + (-1_f32).exp().ln_1p()];
-        assert!(out
-            .to_f32()
-            .iter()
-            .zip(expected)
-            .all(|(&actual, expected)| (actual - expected).abs() < 1e-6));
+        assert!(
+            out.to_f32()
+                .iter()
+                .zip(expected)
+                .all(|(&actual, expected)| (actual - expected).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -507,11 +508,12 @@ mod tests {
         .execute(&[x.view(), axes.view()], &mut [out.view_mut()])
         .unwrap();
         let expected = [1.0 + (-1_f32).exp().ln_1p(), 3.0 + (-1_f32).exp().ln_1p()];
-        assert!(out
-            .to_f32()
-            .iter()
-            .zip(expected)
-            .all(|(&actual, expected)| (actual - expected).abs() < 1e-6));
+        assert!(
+            out.to_f32()
+                .iter()
+                .zip(expected)
+                .all(|(&actual, expected)| (actual - expected).abs() < 1e-6)
+        );
     }
 
     #[test]

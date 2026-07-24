@@ -14,8 +14,8 @@ use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
 use super::add::broadcast_apply;
-use super::matmul::{MatMulPrepack, matmul_dense_prepacked};
 use super::check_arity;
+use super::matmul::{MatMulPrepack, matmul_dense_prepacked};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 `MatMul(A, B) + bias` kernel with initializer-only MatMul prepacking.
@@ -70,7 +70,10 @@ mod tests {
         let bias = Owned::f32(&[2], &bias_vals);
         let mut ref_out = Owned::zeros_f32(&[2, 2]);
         FusedMatMulBiasKernel::default()
-            .execute(&[a.view(), b.view(), bias.view()], &mut [ref_out.view_mut()])
+            .execute(
+                &[a.view(), b.view(), bias.view()],
+                &mut [ref_out.view_mut()],
+            )
             .unwrap();
 
         let a = Owned::bf16(&[2, 3], &a_vals);
@@ -84,7 +87,11 @@ mod tests {
             )
             .unwrap();
 
-        for (&r, &g) in ref_out.to_f32().iter().zip(bf16_out.to_bf16_as_f32().iter()) {
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
             assert!(
                 (r - g).abs() <= 0.03 * r.abs().max(1.0),
                 "fused_matmul_bias bf16 {g} vs f32 {r}"

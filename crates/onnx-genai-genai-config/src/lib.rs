@@ -1050,9 +1050,10 @@ pub fn inference_metadata_from_dir_with_graph(
         return Ok(None);
     };
     let config = load(&path)?;
-    Ok(Some(
-        config.to_inference_metadata_with_graph(kv_native_dtype, decoder_graph)?,
-    ))
+    Ok(Some(config.to_inference_metadata_with_graph(
+        kv_native_dtype,
+        decoder_graph,
+    )?))
 }
 
 /// Strict compatibility conversion for an existing multimodal ORT-GenAI package.

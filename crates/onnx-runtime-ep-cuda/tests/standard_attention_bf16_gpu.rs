@@ -614,7 +614,11 @@ fn standard_attention_bf16_accumulates_in_fp32() {
     let query = vec![0.1_f32; HEAD_SIZE];
     let key = vec![0.1_f32; SEQUENCE * HEAD_SIZE];
     let value = vec![VALUE; SEQUENCE * VALUE_HEAD_SIZE];
-    assert_eq!(bf16::from_f32(VALUE).to_f32(), VALUE, "VALUE must be bf16-exact");
+    assert_eq!(
+        bf16::from_f32(VALUE).to_f32(),
+        VALUE,
+        "VALUE must be bf16-exact"
+    );
 
     let attrs = [
         ("q_num_heads", Attribute::Int(1)),

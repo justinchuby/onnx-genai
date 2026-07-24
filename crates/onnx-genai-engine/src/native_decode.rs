@@ -2142,7 +2142,10 @@ impl DecodeCpuKvState {
         // would not append in place and could corrupt output, so require every
         // bound past KV input to feed a GroupQueryAttention node; otherwise leave
         // the model on the safe host copy path.
-        let past_names = pairs.iter().map(|(_, past)| past.clone()).collect::<Vec<_>>();
+        let past_names = pairs
+            .iter()
+            .map(|(_, past)| past.clone())
+            .collect::<Vec<_>>();
         if !all_pasts_consumed_by_gqa(session.graph(), &past_names) {
             return Ok(None);
         }
@@ -3377,9 +3380,8 @@ mod tests {
 
     #[test]
     fn graph_uses_decode_pool_detects_quantized_ops_including_subgraphs() {
-        let f32_vec = |graph: &mut Graph| {
-            graph.create_value(DataType::Float32, vec![1.into(), 8.into()])
-        };
+        let f32_vec =
+            |graph: &mut Graph| graph.create_value(DataType::Float32, vec![1.into(), 8.into()]);
 
         // Dense-f32 graph (only MatMul) gains nothing from the SPMD decode pool.
         let mut dense = Graph::new();
@@ -4918,7 +4920,13 @@ mod tests {
             DataType::Float32,
             vec![batch.into(), 1.into(), past.into(), 1.into()],
         );
-        insert_op(&mut graph, "GroupQueryAttention", vec![past_key], present, &[]);
+        insert_op(
+            &mut graph,
+            "GroupQueryAttention",
+            vec![past_key],
+            present,
+            &[],
+        );
         graph.add_output(present);
         graph
     }
@@ -4965,7 +4973,10 @@ mod tests {
         );
         let state = DecodeCpuKvState::new(&mut session, &present_to_past, 128)
             .expect("gate must not error");
-        assert!(state.is_none(), "Concat producer must not take in-place path");
+        assert!(
+            state.is_none(),
+            "Concat producer must not take in-place path"
+        );
     }
 
     #[test]
@@ -4973,7 +4984,9 @@ mod tests {
         // The Concat model falls back to the copy path regardless of the opt-in
         // env var, so greedy decoding is identical whether the flag is on or off
         // — proving the gate prevents any behavioural change on ineligible models.
-        let _guard = env_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let run = |value: &str| -> Vec<Vec<f32>> {
             // SAFETY: serialized by `env_lock`; restored below.
             unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", value) };
@@ -4993,7 +5006,9 @@ mod tests {
 
     #[test]
     fn cpu_inplace_kv_max_len_env_parsing() {
-        let _guard = env_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // SAFETY: serialized by `env_lock`; each case restores the environment.
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_KV_MAX_LEN") };
@@ -5016,7 +5031,10 @@ mod tests {
         assert!(cpu_inplace_kv_max_len_from_env().is_err(), "zero rejected");
 
         unsafe { std::env::set_var("ONNX_GENAI_CPU_KV_MAX_LEN", "notanumber") };
-        assert!(cpu_inplace_kv_max_len_from_env().is_err(), "garbage rejected");
+        assert!(
+            cpu_inplace_kv_max_len_from_env().is_err(),
+            "garbage rejected"
+        );
 
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_KV_MAX_LEN") };

@@ -523,7 +523,10 @@ impl Tensor {
         shape: Vec<usize>,
         buffer: DeviceBuffer,
     ) -> Self {
-        debug_assert!(!buffer.is_borrowed(), "from_owned_buffer requires an owned buffer");
+        debug_assert!(
+            !buffer.is_borrowed(),
+            "from_owned_buffer requires an owned buffer"
+        );
         debug_assert_eq!(
             buffer.len(),
             dtype.storage_bytes(shape.iter().product::<usize>()).max(1),

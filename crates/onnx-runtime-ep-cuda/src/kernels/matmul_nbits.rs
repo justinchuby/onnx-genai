@@ -80,8 +80,7 @@ const GEMV_F16_SCALES_F16_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp"
 /// parity test tracks a dequant reference to tolerance. Only launched when
 /// `K % 256 == 0` (whole 256-wide steps, no divergent tail); other K fall back to
 /// the plain `_zp` entry.
-const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str =
-    "matmul_nbits_gemv_f16_scales_f16_zp_splitk";
+const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp_splitk";
 /// Warps cooperating per output column in the split-K asymmetric int4 GEMV. Must
 /// match `K_SPLIT` in `matmul_nbits_gemv_f16_scales_f16_splitk`. A block keeps
 /// its `blockDim.x / 32` warps but now covers `warps / K_SPLIT` columns, so the
@@ -95,8 +94,7 @@ const GEMV_F16_SCALES_F16_ZP_SPLITK: usize = 2;
 const GEMV_F16_SCALES_F16_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_rmsnorm";
 /// Asymmetric-zero-point specialization of [`GEMV_F16_SCALES_F16_RMSNORM_ENTRY`]
 /// (see [`GEMV_F16_SCALES_F16_ZP_ENTRY`] for the `HasZp` specialization scheme).
-const GEMV_F16_SCALES_F16_RMSNORM_ZP_ENTRY: &str =
-    "matmul_nbits_gemv_f16_scales_f16_rmsnorm_zp";
+const GEMV_F16_SCALES_F16_RMSNORM_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_rmsnorm_zp";
 /// INT8 sibling of [`GEMV_F16_SCALES_F16_RMSNORM_ENTRY`]. Shares the RMS
 /// reduction and normalized-activation staging bit-for-bit and swaps in the
 /// block-32 int8 dequant dot, fusing a `SkipSimplifiedLayerNormalization` into
@@ -140,8 +138,7 @@ const GATE_UP_SWIGLU_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu
 /// Asymmetric-zero-point specializations of the paired gate/up SwiGLU entries
 /// (see [`GEMV_F16_SCALES_F16_ZP_ENTRY`] for the `HasZp` specialization scheme).
 const GATE_UP_SWIGLU_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_zp";
-const GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY: &str =
-    "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp";
+const GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -3482,21 +3479,23 @@ impl MatMulNBitsKernel {
             &scratch_strides,
             activation.device,
         );
-        let result = self.launch_rmsnorm_prefill(activation, gamma, scratch, m).and_then(|()| {
-            self.launch_f16_gemm(
-                &normalized,
-                packed,
-                scales,
-                true,
-                zero_points,
-                bias,
-                output,
-                m,
-                k_blocks,
-                self.block_size * self.bits / 8,
-                bias_row_stride,
-            )
-        });
+        let result = self
+            .launch_rmsnorm_prefill(activation, gamma, scratch, m)
+            .and_then(|()| {
+                self.launch_f16_gemm(
+                    &normalized,
+                    packed,
+                    scales,
+                    true,
+                    zero_points,
+                    bias,
+                    output,
+                    m,
+                    k_blocks,
+                    self.block_size * self.bits / 8,
+                    bias_row_stride,
+                )
+            });
         // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly
         // once; `cuMemFree` waits for the preceding norm + GEMM stream work.
         let free_scratch = unsafe { self.runtime.free_raw(scratch) };
@@ -3674,11 +3673,9 @@ impl MatMulNBitsKernel {
         } else {
             GEMV_INT8_F16_SCALES_F16_RMSNORM_ENTRY
         };
-        let function = self.runtime.nvrtc_function(
-            GEMV_F16_MODULE,
-            GEMV_F16_SRC,
-            entry,
-        )?;
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -3994,8 +3991,17 @@ impl MatMulNBitsKernel {
                 0,
             )?;
             self.launch_f16_gemm(
-                activation, packed_up, scales_up, true, zp_up, None, output, m, k_blocks,
-                self.block_size * self.bits / 8, 0,
+                activation,
+                packed_up,
+                scales_up,
+                true,
+                zp_up,
+                None,
+                output,
+                m,
+                k_blocks,
+                self.block_size * self.bits / 8,
+                0,
             )?;
             let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
             crate::kernels::elementwise::launch_silu_mul_f16_raw(
@@ -4038,9 +4044,9 @@ impl MatMulNBitsKernel {
         } else {
             GATE_UP_SWIGLU_ENTRY
         };
-        let function =
-            self.runtime
-                .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_gate_ptr = cuptr(packed_gate.data_ptr::<u8>() as *const c_void);
         let scales_gate_ptr = cuptr(scales_gate.data_ptr::<u8>() as *const c_void);
@@ -4121,11 +4127,9 @@ impl MatMulNBitsKernel {
         } else {
             GATE_UP_SWIGLU_RMSNORM_ENTRY
         };
-        let function = self.runtime.nvrtc_function(
-            GEMV_F16_MODULE,
-            GEMV_F16_SRC,
-            entry,
-        )?;
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_gate_ptr = cuptr(packed_gate.data_ptr::<u8>() as *const c_void);
         let scales_gate_ptr = cuptr(scales_gate.data_ptr::<u8>() as *const c_void);
@@ -4504,11 +4508,9 @@ impl MatMulNBitsKernel {
         } else {
             GEMV_F16_SCALES_F16_RMSNORM_ENTRY
         };
-        let function = self.runtime.nvrtc_function(
-            GEMV_F16_MODULE,
-            GEMV_F16_SRC,
-            entry,
-        )?;
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -5954,7 +5956,10 @@ mod tests {
                 "MatMulNBits fp16 GEMV parity K={k} N={n}: max_abs={worst_abs:.3e} \
                  max_rel={worst_rel:.3e} max_out={max_out:.3e} abs_bound={abs_bound:.3e}"
             );
-            assert!(all_finite, "fp16 GEMV produced a non-finite output (K={k} N={n})");
+            assert!(
+                all_finite,
+                "fp16 GEMV produced a non-finite output (K={k} N={n})"
+            );
             assert!(
                 worst_abs < abs_bound,
                 "fp16 GEMV diverged from dequant reference at K={k} N={n}: \
@@ -6064,8 +6069,7 @@ mod tests {
             // preceding projection. Routed through `run_parity_dims` (block-32
             // default) so the `explicit_zp` delegation is actually driven.
             for (with_bias, explicit_zp) in [(false, true), (true, true)] {
-                let (abs, rel, out, finite) =
-                    run_parity_dims(k, n, true, with_bias, explicit_zp);
+                let (abs, rel, out, finite) = run_parity_dims(k, n, true, with_bias, explicit_zp);
                 worst_abs = worst_abs.max(abs);
                 worst_rel = worst_rel.max(rel);
                 max_out = max_out.max(out);
@@ -6757,7 +6761,11 @@ extern "C" __global__ void ref_silu_mul_f16(
         // (M, K=hidden, N=intermediate); hidden % 128 == 0 for the warp_half4
         // reduction. Decode is the capture-safe fused kernel; M=5 prefill routes
         // through the normalize-into-scratch path.
-        for (m, k, n) in [(1usize, 896usize, 2432usize), (1, 3584, 4864), (5, 896, 2432)] {
+        for (m, k, n) in [
+            (1usize, 896usize, 2432usize),
+            (1, 3584, 4864),
+            (5, 896, 2432),
+        ] {
             let block_size = 32usize;
             let k_blocks = k / block_size;
             let blob_size = block_size / 2;
@@ -6983,7 +6991,12 @@ extern "C" __global__ void ref_silu_mul_f16(
             // Reference: normalize the activation (production prefill norm
             // kernel), then run the proven non-prologue paired gate/up SwiGLU.
             plain_swiglu
-                .launch_rmsnorm_prefill(&activation_view, &gamma_view, cuptr(device_ptr(normalized_dev).0), m)
+                .launch_rmsnorm_prefill(
+                    &activation_view,
+                    &gamma_view,
+                    cuptr(device_ptr(normalized_dev).0),
+                    m,
+                )
                 .unwrap();
             {
                 let mut ref_outputs = [ref_out];
@@ -7509,11 +7522,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     &y_strides,
                     device,
                 );
-                let mut inputs = vec![
-                    normalized_input_view,
-                    packed_post_view,
-                    scales_post_view,
-                ];
+                let mut inputs = vec![normalized_input_view, packed_post_view, scales_post_view];
                 if zp_post_view.is_some() || following_bias {
                     inputs.push(zp_post_view.unwrap_or(TensorView::absent(DataType::Uint8)));
                 }

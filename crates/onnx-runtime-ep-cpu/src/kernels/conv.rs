@@ -745,9 +745,7 @@ impl Kernel for ConvKernel {
             DataType::Float32 | DataType::Float16 | DataType::BFloat16
         ) || inputs[0].dtype != out_dtype
             || inputs[1].dtype != out_dtype
-            || inputs
-                .get(2)
-                .is_some_and(|bias| bias.dtype != out_dtype)
+            || inputs.get(2).is_some_and(|bias| bias.dtype != out_dtype)
         {
             return Err(EpError::KernelFailed(
                 "Conv: requires X, W, optional B, and Y to share one float dtype (f32/f16/bf16)"
@@ -918,10 +916,7 @@ mod tests {
         let bias = Owned::bf16(&[1], &bias_vals);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &out_shape);
         kernel
-            .execute(
-                &[x.view(), w.view(), bias.view()],
-                &mut [out.view_mut()],
-            )
+            .execute(&[x.view(), w.view(), bias.view()], &mut [out.view_mut()])
             .unwrap();
 
         for (&r, &g) in reference.iter().zip(out.to_bf16_as_f32().iter()) {
@@ -1120,14 +1115,10 @@ mod tests {
         let [n, cin, ih, iw] = *x_shape;
         let [cout, cin_g, kh, kw] = *w_shape;
         assert_eq!(cin / group, cin_g);
-        let oh = (ih + pads[0] + pads[2])
-            .saturating_sub(dilations[0] * (kh - 1) + 1)
-            / strides[0]
-            + 1;
-        let ow = (iw + pads[1] + pads[3])
-            .saturating_sub(dilations[1] * (kw - 1) + 1)
-            / strides[1]
-            + 1;
+        let oh =
+            (ih + pads[0] + pads[2]).saturating_sub(dilations[0] * (kh - 1) + 1) / strides[0] + 1;
+        let ow =
+            (iw + pads[1] + pads[3]).saturating_sub(dilations[1] * (kw - 1) + 1) / strides[1] + 1;
         let out_per_group = cout / group;
         let mut out = vec![0.0f32; n * cout * oh * ow];
         for image in 0..n {
@@ -1167,7 +1158,9 @@ mod tests {
     fn pseudo_random(count: usize, seed: usize) -> Vec<f32> {
         (0..count)
             .map(|i| {
-                let v = (i.wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40_503))
+                let v = (i
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(seed.wrapping_mul(40_503))
                     % 1000) as f32;
                 v / 500.0 - 1.0
             })
@@ -1267,9 +1260,7 @@ mod tests {
         for case in &cases {
             let x = pseudo_random(case.x_shape.iter().product(), 1);
             let w = pseudo_random(case.w_shape.iter().product(), 7);
-            let bias = case
-                .bias
-                .then(|| pseudo_random(case.w_shape[0], 13));
+            let bias = case.bias.then(|| pseudo_random(case.w_shape[0], 13));
             let (ref_shape, reference) = reference_conv(
                 &case.x_shape,
                 &x,

@@ -851,23 +851,21 @@ impl KernelFactory for GroupQueryAttentionFactory {
                 "cuda_ep GroupQueryAttention: softcap must be non-negative".into(),
             ));
         }
-        Ok(Box::new(
-            GroupQueryAttentionKernel::new(
-                self.runtime.clone(),
-                num_heads,
-                kv_num_heads,
-                node.attr("scale").and_then(|a| a.as_float()),
-                node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
-                node.attr("rotary_interleaved")
-                    .and_then(|a| a.as_int())
-                    .unwrap_or(0)
-                    != 0,
-                node.attr("local_window_size")
-                    .and_then(|a| a.as_int())
-                    .unwrap_or(-1),
-                softcap,
-            )?,
-        ))
+        Ok(Box::new(GroupQueryAttentionKernel::new(
+            self.runtime.clone(),
+            num_heads,
+            kv_num_heads,
+            node.attr("scale").and_then(|a| a.as_float()),
+            node.attr("do_rotary").and_then(|a| a.as_int()).unwrap_or(0) != 0,
+            node.attr("rotary_interleaved")
+                .and_then(|a| a.as_int())
+                .unwrap_or(0)
+                != 0,
+            node.attr("local_window_size")
+                .and_then(|a| a.as_int())
+                .unwrap_or(-1),
+            softcap,
+        )?))
     }
 }
 
@@ -1048,11 +1046,7 @@ fn require_dense(view: &TensorView, name: &str, dtype: DataType) -> Result<()> {
     Ok(())
 }
 
-fn validate_sequence_lengths_shape(
-    shape: &[usize],
-    numel: usize,
-    batch: usize,
-) -> Result<()> {
+fn validate_sequence_lengths_shape(shape: &[usize], numel: usize, batch: usize) -> Result<()> {
     if shape == [batch] || shape == [batch, 1] {
         return Ok(());
     }

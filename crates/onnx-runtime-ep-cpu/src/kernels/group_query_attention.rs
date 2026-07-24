@@ -692,12 +692,10 @@ impl GroupQueryAttentionKernel {
         }
         // Structural aliasing: each present output origin must be the exact same
         // address as its past input origin, computed identically to `data_ptr`.
-        let in_ptr = |view: &TensorView| {
-            (view.data.0 as *const u8).wrapping_add(view.byte_offset) as usize
-        };
-        let out_ptr = |out: &TensorMut| {
-            (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize
-        };
+        let in_ptr =
+            |view: &TensorView| (view.data.0 as *const u8).wrapping_add(view.byte_offset) as usize;
+        let out_ptr =
+            |out: &TensorMut| (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize;
         let pk_in = in_ptr(&inputs[3]);
         let pv_in = in_ptr(&inputs[4]);
         let pk_out = out_ptr(&outputs[1]);
@@ -3142,7 +3140,12 @@ mod tests {
     /// Build a `[1, KV, capacity, DIM]` BNSH capacity buffer, filling the first
     /// `past` sequence rows of each head from `past_data` (laid out
     /// `[1, KV, past, DIM]`) and every capacity row beyond `past` with `tail`.
-    fn build_capacity_buffer(capacity: usize, past: usize, past_data: &[f32], tail: f32) -> Vec<f32> {
+    fn build_capacity_buffer(
+        capacity: usize,
+        past: usize,
+        past_data: &[f32],
+        tail: f32,
+    ) -> Vec<f32> {
         let mut buf = vec![tail; IP_KV_HEADS * capacity * IP_DIM];
         for h in 0..IP_KV_HEADS {
             for s in 0..past {
@@ -3293,26 +3296,63 @@ mod tests {
         let cur_k = vec![1., 1., 10., 10.];
         let cur_v = vec![5., 6., 50., 60.];
 
-        let (copy_out, copy_pk, copy_pv) =
-            run_copy_step(kernel.as_ref(), past, total, 1, &query, &cur_k, &cur_v, &past_k, &past_v);
+        let (copy_out, copy_pk, copy_pv) = run_copy_step(
+            kernel.as_ref(),
+            past,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &past_k,
+            &past_v,
+        );
 
         // The tail sentinel proves the kernel never rewrites capacity beyond the
         // live length: rows [total, capacity) must survive untouched.
         const TAIL: f32 = -999.0;
         let mut kbuf = build_capacity_buffer(capacity, past, &past_k, TAIL);
         let mut vbuf = build_capacity_buffer(capacity, past, &past_v, TAIL);
-        let inplace_out =
-            run_inplace_step(kernel.as_ref(), capacity, total, 1, &query, &cur_k, &cur_v, &mut kbuf, &mut vbuf);
+        let inplace_out = run_inplace_step(
+            kernel.as_ref(),
+            capacity,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &mut kbuf,
+            &mut vbuf,
+        );
 
-        assert_eq!(inplace_out, copy_out, "attention output must be byte-identical");
-        assert_eq!(head_prefix(&kbuf, capacity, total), copy_pk, "present_key prefix mismatch");
-        assert_eq!(head_prefix(&vbuf, capacity, total), copy_pv, "present_value prefix mismatch");
+        assert_eq!(
+            inplace_out, copy_out,
+            "attention output must be byte-identical"
+        );
+        assert_eq!(
+            head_prefix(&kbuf, capacity, total),
+            copy_pk,
+            "present_key prefix mismatch"
+        );
+        assert_eq!(
+            head_prefix(&vbuf, capacity, total),
+            copy_pv,
+            "present_value prefix mismatch"
+        );
         // Tail untouched: append-only, no capacity rewrite.
         for h in 0..IP_KV_HEADS {
             for s in total..capacity {
                 for x in 0..IP_DIM {
-                    assert_eq!(kbuf[(h * capacity + s) * IP_DIM + x], TAIL, "key tail rewritten");
-                    assert_eq!(vbuf[(h * capacity + s) * IP_DIM + x], TAIL, "value tail rewritten");
+                    assert_eq!(
+                        kbuf[(h * capacity + s) * IP_DIM + x],
+                        TAIL,
+                        "key tail rewritten"
+                    );
+                    assert_eq!(
+                        vbuf[(h * capacity + s) * IP_DIM + x],
+                        TAIL,
+                        "value tail rewritten"
+                    );
                 }
             }
         }
@@ -3332,13 +3372,31 @@ mod tests {
         let cur_k = vec![0.5, 0.5, 7., 7.];
         let cur_v = vec![7., 8., 70., 80.];
 
-        let (copy_out, copy_pk, copy_pv) =
-            run_copy_step(kernel.as_ref(), past, total, 1, &query, &cur_k, &cur_v, &past_k, &past_v);
+        let (copy_out, copy_pk, copy_pv) = run_copy_step(
+            kernel.as_ref(),
+            past,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &past_k,
+            &past_v,
+        );
 
         let mut kbuf = build_capacity_buffer(capacity, past, &past_k, 0.0);
         let mut vbuf = build_capacity_buffer(capacity, past, &past_v, 0.0);
-        let inplace_out =
-            run_inplace_step(kernel.as_ref(), capacity, total, 1, &query, &cur_k, &cur_v, &mut kbuf, &mut vbuf);
+        let inplace_out = run_inplace_step(
+            kernel.as_ref(),
+            capacity,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &mut kbuf,
+            &mut vbuf,
+        );
 
         assert_eq!(inplace_out, copy_out);
         assert_eq!(kbuf, copy_pk);
@@ -3363,16 +3421,40 @@ mod tests {
         let cur_v_p = vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.];
         let empty: Vec<f32> = Vec::new();
         let (copy_out_p, copy_pk_p, copy_pv_p) = run_copy_step(
-            kernel.as_ref(), 0, prefill, prefill, &query_p, &cur_k_p, &cur_v_p, &empty, &empty,
+            kernel.as_ref(),
+            0,
+            prefill,
+            prefill,
+            &query_p,
+            &cur_k_p,
+            &cur_v_p,
+            &empty,
+            &empty,
         );
         let mut kbuf = vec![0.0f32; IP_KV_HEADS * capacity * IP_DIM];
         let mut vbuf = vec![0.0f32; IP_KV_HEADS * capacity * IP_DIM];
         let inplace_out_p = run_inplace_step(
-            kernel.as_ref(), capacity, prefill, prefill, &query_p, &cur_k_p, &cur_v_p, &mut kbuf, &mut vbuf,
+            kernel.as_ref(),
+            capacity,
+            prefill,
+            prefill,
+            &query_p,
+            &cur_k_p,
+            &cur_v_p,
+            &mut kbuf,
+            &mut vbuf,
         );
         assert_eq!(inplace_out_p, copy_out_p, "prefill logits mismatch");
-        assert_eq!(head_prefix(&kbuf, capacity, prefill), copy_pk_p, "prefill key mismatch");
-        assert_eq!(head_prefix(&vbuf, capacity, prefill), copy_pv_p, "prefill value mismatch");
+        assert_eq!(
+            head_prefix(&kbuf, capacity, prefill),
+            copy_pk_p,
+            "prefill key mismatch"
+        );
+        assert_eq!(
+            head_prefix(&vbuf, capacity, prefill),
+            copy_pv_p,
+            "prefill value mismatch"
+        );
 
         // ── Decode: past=P, total=P+1, q_seq=1 — reads the prefilled rows ──
         let total = prefill + 1;
@@ -3381,14 +3463,38 @@ mod tests {
         let cur_v_d = vec![13., 14., 15., 16.];
         // The copy path's past is the prefill present cache [1, KV, P, DIM].
         let (copy_out_d, copy_pk_d, copy_pv_d) = run_copy_step(
-            kernel.as_ref(), prefill, total, 1, &query_d, &cur_k_d, &cur_v_d, &copy_pk_p, &copy_pv_p,
+            kernel.as_ref(),
+            prefill,
+            total,
+            1,
+            &query_d,
+            &cur_k_d,
+            &cur_v_d,
+            &copy_pk_p,
+            &copy_pv_p,
         );
         let inplace_out_d = run_inplace_step(
-            kernel.as_ref(), capacity, total, 1, &query_d, &cur_k_d, &cur_v_d, &mut kbuf, &mut vbuf,
+            kernel.as_ref(),
+            capacity,
+            total,
+            1,
+            &query_d,
+            &cur_k_d,
+            &cur_v_d,
+            &mut kbuf,
+            &mut vbuf,
         );
         assert_eq!(inplace_out_d, copy_out_d, "decode logits mismatch");
-        assert_eq!(head_prefix(&kbuf, capacity, total), copy_pk_d, "decode key mismatch");
-        assert_eq!(head_prefix(&vbuf, capacity, total), copy_pv_d, "decode value mismatch");
+        assert_eq!(
+            head_prefix(&kbuf, capacity, total),
+            copy_pk_d,
+            "decode key mismatch"
+        );
+        assert_eq!(
+            head_prefix(&vbuf, capacity, total),
+            copy_pv_d,
+            "decode value mismatch"
+        );
     }
 
     #[test]
@@ -3404,18 +3510,46 @@ mod tests {
             ("local_window_size", Attribute::Int(3)),
         ];
         let kernel = kernel(&extra);
-        let query: Vec<f32> = (0..IP_NUM_HEADS * IP_DIM).map(|i| mixed_scale_value(i, 11)).collect();
-        let past_k: Vec<f32> = (0..IP_KV_HEADS * past * IP_DIM).map(|i| mixed_scale_value(i, 22)).collect();
-        let past_v: Vec<f32> = (0..IP_KV_HEADS * past * IP_DIM).map(|i| mixed_scale_value(i, 33)).collect();
-        let cur_k: Vec<f32> = (0..IP_KV_HEADS * IP_DIM).map(|i| mixed_scale_value(i, 44)).collect();
-        let cur_v: Vec<f32> = (0..IP_KV_HEADS * IP_DIM).map(|i| mixed_scale_value(i, 55)).collect();
+        let query: Vec<f32> = (0..IP_NUM_HEADS * IP_DIM)
+            .map(|i| mixed_scale_value(i, 11))
+            .collect();
+        let past_k: Vec<f32> = (0..IP_KV_HEADS * past * IP_DIM)
+            .map(|i| mixed_scale_value(i, 22))
+            .collect();
+        let past_v: Vec<f32> = (0..IP_KV_HEADS * past * IP_DIM)
+            .map(|i| mixed_scale_value(i, 33))
+            .collect();
+        let cur_k: Vec<f32> = (0..IP_KV_HEADS * IP_DIM)
+            .map(|i| mixed_scale_value(i, 44))
+            .collect();
+        let cur_v: Vec<f32> = (0..IP_KV_HEADS * IP_DIM)
+            .map(|i| mixed_scale_value(i, 55))
+            .collect();
 
-        let (copy_out, copy_pk, copy_pv) =
-            run_copy_step(kernel.as_ref(), past, total, 1, &query, &cur_k, &cur_v, &past_k, &past_v);
+        let (copy_out, copy_pk, copy_pv) = run_copy_step(
+            kernel.as_ref(),
+            past,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &past_k,
+            &past_v,
+        );
         let mut kbuf = build_capacity_buffer(capacity, past, &past_k, 42.0);
         let mut vbuf = build_capacity_buffer(capacity, past, &past_v, 42.0);
-        let inplace_out =
-            run_inplace_step(kernel.as_ref(), capacity, total, 1, &query, &cur_k, &cur_v, &mut kbuf, &mut vbuf);
+        let inplace_out = run_inplace_step(
+            kernel.as_ref(),
+            capacity,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &mut kbuf,
+            &mut vbuf,
+        );
 
         assert_eq!(inplace_out, copy_out);
         assert_eq!(head_prefix(&kbuf, capacity, total), copy_pk);
@@ -3437,10 +3571,22 @@ mod tests {
         let v_ptr = vbuf.as_mut_ptr();
         let cpu = onnx_runtime_ir::DeviceId::cpu();
         let make_view = |ptr: *const f32| {
-            TensorView::new(DevicePtr(ptr as *const std::ffi::c_void), DataType::Float32, &kv_shape, &kv_strides, cpu)
+            TensorView::new(
+                DevicePtr(ptr as *const std::ffi::c_void),
+                DataType::Float32,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            )
         };
         let make_mut = |ptr: *mut f32| {
-            TensorMut::new(DevicePtrMut(ptr as *mut std::ffi::c_void), DataType::Float32, &kv_shape, &kv_strides, cpu)
+            TensorMut::new(
+                DevicePtrMut(ptr as *mut std::ffi::c_void),
+                DataType::Float32,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            )
         };
         let past_view_gate = make_view(k_ptr);
         let past_key = PastCache::from_cache(&past_view_gate, IP_KV_HEADS, "past_key").unwrap();
@@ -3448,34 +3594,66 @@ mod tests {
         // Aliased (present==past) ⇒ fast path fires.
         let out0 = Owned::zeros_f32(&[1, 1, IP_NUM_HEADS * IP_DIM]);
         let inputs_aliased = [
-            out0.view(), out0.view(), out0.view(),
-            make_view(k_ptr), make_view(v_ptr),
-            out0.view(), out0.view(),
+            out0.view(),
+            out0.view(),
+            out0.view(),
+            make_view(k_ptr),
+            make_view(v_ptr),
+            out0.view(),
+            out0.view(),
         ];
         let outputs_aliased = [make_mut(k_ptr.cast()), make_mut(k_ptr), make_mut(v_ptr)];
         assert!(
-            kernel.detect_inplace_kv(&inputs_aliased, &outputs_aliased, present_seq, present_len, Some(&past_key)),
+            kernel.detect_inplace_kv(
+                &inputs_aliased,
+                &outputs_aliased,
+                present_seq,
+                present_len,
+                Some(&past_key)
+            ),
             "structural present==past aliasing must be detected"
         );
 
         // Distinct present buffers ⇒ copy path.
         let mut other_k = vec![0.0f32; present_len];
         let mut other_v = vec![0.0f32; present_len];
-        let outputs_distinct = [make_mut(k_ptr.cast()), make_mut(other_k.as_mut_ptr()), make_mut(other_v.as_mut_ptr())];
+        let outputs_distinct = [
+            make_mut(k_ptr.cast()),
+            make_mut(other_k.as_mut_ptr()),
+            make_mut(other_v.as_mut_ptr()),
+        ];
         assert!(
-            !kernel.detect_inplace_kv(&inputs_aliased, &outputs_distinct, present_seq, present_len, Some(&past_key)),
+            !kernel.detect_inplace_kv(
+                &inputs_aliased,
+                &outputs_distinct,
+                present_seq,
+                present_len,
+                Some(&past_key)
+            ),
             "non-aliased present must fall back to the copy path"
         );
 
         // Capacity does not cover total (present_sequence_length != cache.seq).
         assert!(
-            !kernel.detect_inplace_kv(&inputs_aliased, &outputs_aliased, total, present_len, Some(&past_key)),
+            !kernel.detect_inplace_kv(
+                &inputs_aliased,
+                &outputs_aliased,
+                total,
+                present_len,
+                Some(&past_key)
+            ),
             "capacity-limited case must fall back"
         );
 
         // No past cache ⇒ copy path.
         assert!(
-            !kernel.detect_inplace_kv(&inputs_aliased, &outputs_aliased, present_seq, present_len, None),
+            !kernel.detect_inplace_kv(
+                &inputs_aliased,
+                &outputs_aliased,
+                present_seq,
+                present_len,
+                None
+            ),
             "absent past must fall back"
         );
     }
@@ -3495,19 +3673,58 @@ mod tests {
         let mut vbuf = Owned::f16(&kv_shape, &vec![0.0; present_len]);
         let k_ptr = kbuf.bytes.as_mut_ptr() as *mut std::ffi::c_void;
         let v_ptr = vbuf.bytes.as_mut_ptr() as *mut std::ffi::c_void;
-        let past_view = TensorView::new(DevicePtr(k_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu);
+        let past_view = TensorView::new(
+            DevicePtr(k_ptr),
+            DataType::Float16,
+            &kv_shape,
+            &kv_strides,
+            cpu,
+        );
         let past_key = PastCache::from_cache(&past_view, IP_KV_HEADS, "past_key").unwrap();
         let out0 = Owned::zeros_f32(&[1, 1, IP_NUM_HEADS * IP_DIM]);
         let inputs = [
-            out0.view(), out0.view(), out0.view(),
-            TensorView::new(DevicePtr(k_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
-            TensorView::new(DevicePtr(v_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
-            out0.view(), out0.view(),
+            out0.view(),
+            out0.view(),
+            out0.view(),
+            TensorView::new(
+                DevicePtr(k_ptr),
+                DataType::Float16,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+            TensorView::new(
+                DevicePtr(v_ptr),
+                DataType::Float16,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+            out0.view(),
+            out0.view(),
         ];
         let outputs = [
-            TensorMut::new(DevicePtrMut(out0.bytes.as_ptr() as *mut std::ffi::c_void), DataType::Float32, &kv_shape, &kv_strides, cpu),
-            TensorMut::new(DevicePtrMut(k_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
-            TensorMut::new(DevicePtrMut(v_ptr), DataType::Float16, &kv_shape, &kv_strides, cpu),
+            TensorMut::new(
+                DevicePtrMut(out0.bytes.as_ptr() as *mut std::ffi::c_void),
+                DataType::Float32,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+            TensorMut::new(
+                DevicePtrMut(k_ptr),
+                DataType::Float16,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+            TensorMut::new(
+                DevicePtrMut(v_ptr),
+                DataType::Float16,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
         ];
         assert!(
             !kernel.detect_inplace_kv(&inputs, &outputs, present_seq, present_len, Some(&past_key)),

@@ -1,5 +1,5 @@
 use onnx_runtime_ir::{
-    static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
+    Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
@@ -52,7 +52,10 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     // Always-on NCHWc layout propagation: keeps CNN backbones in the MLAS
     // channels-blocked layout end-to-end so per-Conv NCHW<->NCHWc reorders are
     // eliminated (mirrors ORT's NchwcTransformer). Runs after BN/Relu folding so
-    // interior activations are already fused where possible.
+    // interior activations are already fused where possible. Gated on `mlas`:
+    // the NCHWc kernels are MLAS-backed and unregistered without the feature, so
+    // without MLAS plain Conv kernels run instead.
+    #[cfg(feature = "mlas")]
     passes.push(Box::new(crate::nchwc_layout::NchwcLayoutPropagation::new()));
     passes
 }
@@ -884,8 +887,8 @@ fn remove_orphan_initializer(graph: &mut Graph, value: ValueId) {
 #[cfg(test)]
 mod tests {
     use super::checked_combined_initializer_len;
-    use super::{MatMulNBitsBiasFusion, MICROSOFT_DOMAIN};
-    use onnx_runtime_ir::{static_shape, Attribute, DataType, Dim, Graph, Node, NodeId, ValueId};
+    use super::{MICROSOFT_DOMAIN, MatMulNBitsBiasFusion};
+    use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, Node, NodeId, ValueId, static_shape};
     use onnx_runtime_optimizer::{OptimizationPass, PassContext};
 
     #[test]
@@ -1057,7 +1060,7 @@ mod tests {
         assert_eq!(graph.node(mm_id).inputs.len(), 3);
     }
 
-    use super::{f32_to_bytes, ConvBatchNormActivationFusion};
+    use super::{ConvBatchNormActivationFusion, f32_to_bytes};
     use onnx_runtime_ir::{TensorData, WeightRef};
 
     fn set_f32_initializer(graph: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId {

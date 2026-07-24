@@ -2582,22 +2582,23 @@ fn decoder_graph_info_from_model_path(
 ) -> Option<onnx_genai_genai_config::ModelGraphInfo> {
     use onnx_runtime_ir::Dim;
     let graph = onnx_runtime_loader::load_model(model_path).ok()?;
-    let tensor_info = |id: &onnx_runtime_ir::ValueId| -> Option<onnx_genai_genai_config::GraphTensorInfo> {
-        let value = graph.value(*id);
-        let name = value.name.clone()?;
-        Some(onnx_genai_genai_config::GraphTensorInfo {
-            name,
-            dtype: ir_dtype_name(value.dtype).to_owned(),
-            dimensions: value
-                .shape
-                .iter()
-                .map(|dim| match dim {
-                    Dim::Static(value) => Some(*value),
-                    Dim::Symbolic(_) => None,
-                })
-                .collect(),
-        })
-    };
+    let tensor_info =
+        |id: &onnx_runtime_ir::ValueId| -> Option<onnx_genai_genai_config::GraphTensorInfo> {
+            let value = graph.value(*id);
+            let name = value.name.clone()?;
+            Some(onnx_genai_genai_config::GraphTensorInfo {
+                name,
+                dtype: ir_dtype_name(value.dtype).to_owned(),
+                dimensions: value
+                    .shape
+                    .iter()
+                    .map(|dim| match dim {
+                        Dim::Static(value) => Some(*value),
+                        Dim::Symbolic(_) => None,
+                    })
+                    .collect(),
+            })
+        };
     let inputs = graph
         .inputs
         .iter()
@@ -2686,9 +2687,7 @@ fn genai_config_compat_metadata(
 /// dimensions). ORT reports dynamic axes as negative dimensions, which map to
 /// symbolic (`None`) entries.
 fn session_model_graph_info(session: &Session) -> onnx_genai_genai_config::ModelGraphInfo {
-    fn tensor_info(
-        meta: &onnx_genai_ort::TensorInfo,
-    ) -> onnx_genai_genai_config::GraphTensorInfo {
+    fn tensor_info(meta: &onnx_genai_ort::TensorInfo) -> onnx_genai_genai_config::GraphTensorInfo {
         onnx_genai_genai_config::GraphTensorInfo {
             name: meta.name.clone(),
             dtype: graph_dtype_name(meta.dtype).to_owned(),

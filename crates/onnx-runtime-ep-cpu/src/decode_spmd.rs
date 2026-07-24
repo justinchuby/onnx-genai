@@ -271,8 +271,7 @@ impl SpmdDecodePools {
                 .name(format!("onnx-genai-spmd-n{node_position}-{global_index}"))
                 .spawn(move || {
                     if let Some(cpu) = cpu
-                        && let Err(message) =
-                            crate::decode_affinity::pin_current_thread_to_cpu(cpu)
+                        && let Err(message) = crate::decode_affinity::pin_current_thread_to_cpu(cpu)
                     {
                         report_spmd_fallback(&format!(
                             "worker {global_index} could not pin to cpu {cpu}: {message}"
@@ -727,7 +726,9 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
 /// process.
 pub fn pools() -> Option<&'static SpmdDecodePools> {
     static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
-    POOLS.get_or_init(|| build_from_env(default_threads())).as_ref()
+    POOLS
+        .get_or_init(|| build_from_env(default_threads()))
+        .as_ref()
 }
 
 /// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
@@ -1157,13 +1158,25 @@ mod tests {
         // the default-on Auto rather than silently disabling.
         assert_eq!(persistence_mode_from_raw(None), PersistenceMode::Auto);
         assert_eq!(persistence_mode_from_raw(Some("")), PersistenceMode::Auto);
-        assert_eq!(persistence_mode_from_raw(Some("   ")), PersistenceMode::Auto);
+        assert_eq!(
+            persistence_mode_from_raw(Some("   ")),
+            PersistenceMode::Auto
+        );
         assert_eq!(persistence_mode_from_raw(Some("0")), PersistenceMode::Off);
         assert_eq!(persistence_mode_from_raw(Some(" 0 ")), PersistenceMode::Off);
-        assert_eq!(persistence_mode_from_raw(Some("1")), PersistenceMode::Forced);
-        assert_eq!(persistence_mode_from_raw(Some(" 1 ")), PersistenceMode::Forced);
+        assert_eq!(
+            persistence_mode_from_raw(Some("1")),
+            PersistenceMode::Forced
+        );
+        assert_eq!(
+            persistence_mode_from_raw(Some(" 1 ")),
+            PersistenceMode::Forced
+        );
         // Unknown values stay on (Auto), never a surprise silent opt-out.
-        assert_eq!(persistence_mode_from_raw(Some("true")), PersistenceMode::Auto);
+        assert_eq!(
+            persistence_mode_from_raw(Some("true")),
+            PersistenceMode::Auto
+        );
         assert_eq!(persistence_mode_from_raw(Some("2")), PersistenceMode::Auto);
 
         // Only `Off` disables the pool for callers checking mode-based gates.

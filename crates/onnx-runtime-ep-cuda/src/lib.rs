@@ -75,8 +75,8 @@ pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
 pub use kernels::group_query_attention::{
     GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE, GQA_CAPTURE_ERROR_POSITION,
     GQA_CAPTURE_ERROR_PRESENT_CAPACITY, GQA_CAPTURE_ERROR_QUERY_NEGATIVE,
-    GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GroupQueryAttentionBackend,
-    GroupQueryAttentionKernel, gqa_capture_error_description,
+    GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, GroupQueryAttentionBackend, GroupQueryAttentionKernel,
+    gqa_capture_error_description,
 };
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;

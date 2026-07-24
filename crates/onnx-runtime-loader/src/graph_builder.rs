@@ -57,9 +57,10 @@ pub(crate) fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError>
     // Opset imports: domain -> version.
     for opset in &model.opset_import {
         if opset.version > 0 {
-            graph
-                .opset_imports
-                .insert(normalize_domain(&opset.domain).to_string(), opset.version as u64);
+            graph.opset_imports.insert(
+                normalize_domain(&opset.domain).to_string(),
+                opset.version as u64,
+            );
         }
     }
 

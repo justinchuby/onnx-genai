@@ -921,9 +921,8 @@ extern "C" __global__ void slow_fill(float* out, unsigned long long n, long long
 
         // Poison the source so a premature (racing) copy is detectable.
         let poison = vec![-999.0f32; n];
-        let poison_bytes = unsafe {
-            std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes)
-        };
+        let poison_bytes =
+            unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
         // Run several iterations; a race is probabilistic per launch, but the
         // fix must make every iteration correct.
         for _ in 0..8 {
@@ -944,9 +943,8 @@ extern "C" __global__ void slow_fill(float* out, unsigned long long n, long long
             unsafe { runtime.dtod(src, dst, bytes) }.unwrap();
 
             let mut out = vec![0.0f32; n];
-            let out_bytes = unsafe {
-                std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes)
-            };
+            let out_bytes =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
             unsafe { runtime.dtoh(out_bytes, dst) }.unwrap();
 
             for (i, value) in out.iter().enumerate() {

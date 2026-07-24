@@ -906,9 +906,9 @@ impl StandardAttentionKernel {
         row_base: u64,
         out_len: CUdeviceptr,
     ) -> Result<()> {
-        let func =
-            self.runtime
-                .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "derive_len")?;
+        let func = self
+            .runtime
+            .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "derive_len")?;
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder
             .arg(&mask_ptr)
@@ -1314,7 +1314,11 @@ impl Kernel for StandardAttentionKernel {
             let stage_key = alias_key && !capacity_key;
             let stage_value = alias_value && !capacity_value;
             let key_kv_ptr = if stage_key {
-                alloc(&self.runtime, &mut owned, present_key_expected * element_bytes)?
+                alloc(
+                    &self.runtime,
+                    &mut owned,
+                    present_key_expected * element_bytes,
+                )?
             } else {
                 present_key_ptr
             };
@@ -1397,7 +1401,10 @@ impl Kernel for StandardAttentionKernel {
                     std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
                 };
                 let pad_bytes = unsafe {
-                    std::slice::from_raw_parts(pad_limits.as_ptr().cast::<u8>(), pad_limits.len() * 8)
+                    std::slice::from_raw_parts(
+                        pad_limits.as_ptr().cast::<u8>(),
+                        pad_limits.len() * 8,
+                    )
                 };
                 unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
                 unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
@@ -1735,7 +1742,10 @@ mod alias_tests {
                 let (presk_buf, presv_buf) = if alias {
                     (key_buf, val_buf)
                 } else {
-                    (rt.alloc_raw(key_cap).unwrap(), rt.alloc_raw(val_cap).unwrap())
+                    (
+                        rt.alloc_raw(key_cap).unwrap(),
+                        rt.alloc_raw(val_cap).unwrap(),
+                    )
                 };
                 let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
 
@@ -1752,8 +1762,20 @@ mod alias_tests {
                 ];
                 let mut outputs = [
                     TensorMut::new(dpm(y_buf), DataType::Float32, &y_sh, &y_st, device),
-                    TensorMut::new(dpm(presk_buf), DataType::Float32, &presk_sh, &presk_st, device),
-                    TensorMut::new(dpm(presv_buf), DataType::Float32, &presv_sh, &presv_st, device),
+                    TensorMut::new(
+                        dpm(presk_buf),
+                        DataType::Float32,
+                        &presk_sh,
+                        &presk_st,
+                        device,
+                    ),
+                    TensorMut::new(
+                        dpm(presv_buf),
+                        DataType::Float32,
+                        &presv_sh,
+                        &presv_st,
+                        device,
+                    ),
                 ];
 
                 kernel.execute(&inputs, &mut outputs).unwrap();
@@ -1926,8 +1948,20 @@ mod alias_tests {
                 ];
                 let mut outputs = [
                     TensorMut::new(dpm(y_buf), DataType::Float32, &y_sh, &y_st, device),
-                    TensorMut::new(dpm(presk_buf), DataType::Float32, &presk_sh, &presk_st, device),
-                    TensorMut::new(dpm(presv_buf), DataType::Float32, &presv_sh, &presv_st, device),
+                    TensorMut::new(
+                        dpm(presk_buf),
+                        DataType::Float32,
+                        &presk_sh,
+                        &presk_st,
+                        device,
+                    ),
+                    TensorMut::new(
+                        dpm(presv_buf),
+                        DataType::Float32,
+                        &presv_sh,
+                        &presv_st,
+                        device,
+                    ),
                 ];
 
                 kernel.execute(&inputs, &mut outputs).unwrap();

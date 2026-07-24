@@ -5,11 +5,11 @@
 //! the population statistics over the normalized axes. The optional `Mean` and
 //! `InvStdDev` outputs are filled when the caller provides those output slots.
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
-use super::{check_arity};
+use super::check_arity;
 
 /// f32 LayerNormalization kernel carrying `axis` and `epsilon`.
 pub struct LayerNormKernel {
@@ -240,11 +240,29 @@ mod tests {
         let scale = Owned::bf16(&[3], &[1., 0.5, 2.]);
         let bias = Owned::bf16(&[3], &[0., -1., 1.]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
-        LayerNormKernel { axis: -1, epsilon: 1e-5 }
-            .execute(&[x.view(), scale.view(), bias.view()], &mut [out.view_mut()])
-            .unwrap();
-        let (reference, _, _) = layer_norm_dense(&x.to_bf16_as_f32(), &[2, 3], &scale.to_bf16_as_f32(), Some(&bias.to_bf16_as_f32()), -1, 1e-5).unwrap();
-        let expected: Vec<_> = reference.into_iter().map(half::bf16::from_f32).map(half::bf16::to_f32).collect();
+        LayerNormKernel {
+            axis: -1,
+            epsilon: 1e-5,
+        }
+        .execute(
+            &[x.view(), scale.view(), bias.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        let (reference, _, _) = layer_norm_dense(
+            &x.to_bf16_as_f32(),
+            &[2, 3],
+            &scale.to_bf16_as_f32(),
+            Some(&bias.to_bf16_as_f32()),
+            -1,
+            1e-5,
+        )
+        .unwrap();
+        let expected: Vec<_> = reference
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
         assert_eq!(out.to_bf16_as_f32(), expected);
     }
 }

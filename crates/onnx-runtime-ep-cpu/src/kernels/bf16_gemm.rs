@@ -84,15 +84,17 @@ pub(crate) fn gemm(a: &[u16], b: &[u16], c: &mut [f32], m: usize, k: usize, n: u
 
     // Parallelize over disjoint row blocks of C. Each block reads shared,
     // immutable A/B_t and writes its own C rows, so there is no aliasing.
-    c.par_chunks_mut(MC * n).enumerate().for_each(|(blk, c_blk)| {
-        let i0 = blk * MC;
-        let rows = c_blk.len() / n;
-        let a_blk = &a[i0 * k..i0 * k + rows * k];
-        // SAFETY: `native_available()` (the caller's precondition) confirmed
-        // avx512bf16 + avx512bw + avx512f, which every intrinsic used below
-        // requires. The slice lengths satisfy the microkernel's index bounds.
-        unsafe { gemm_block(a_blk, &b_t, c_blk, rows, k, n) };
-    });
+    c.par_chunks_mut(MC * n)
+        .enumerate()
+        .for_each(|(blk, c_blk)| {
+            let i0 = blk * MC;
+            let rows = c_blk.len() / n;
+            let a_blk = &a[i0 * k..i0 * k + rows * k];
+            // SAFETY: `native_available()` (the caller's precondition) confirmed
+            // avx512bf16 + avx512bw + avx512f, which every intrinsic used below
+            // requires. The slice lengths satisfy the microkernel's index bounds.
+            unsafe { gemm_block(a_blk, &b_t, c_blk, rows, k, n) };
+        });
 }
 
 /// Transpose `b[k,n]` (row-major) into `b_t[n,k]` (row-major), preserving the

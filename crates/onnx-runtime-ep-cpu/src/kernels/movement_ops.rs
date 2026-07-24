@@ -222,10 +222,7 @@ mod tests {
         FlattenKernel
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
-        assert_eq!(
-            out.to_bf16_as_f32(),
-            vec![1.5, -2.25, 3.75, -4.0, 5.5, 6.0]
-        );
+        assert_eq!(out.to_bf16_as_f32(), vec![1.5, -2.25, 3.75, -4.0, 5.5, 6.0]);
     }
 
     #[test]
