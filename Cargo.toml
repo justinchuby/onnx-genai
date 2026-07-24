@@ -157,6 +157,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3.4", features = ["termination"] }
 tower = { version = "0.5", features = ["util"] }
 hound = "3.5"
 rustfft = "6.4"

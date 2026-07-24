@@ -53,6 +53,7 @@ onnx-genai = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-server = { workspace = true }
 clap = { workspace = true }
+ctrlc = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
