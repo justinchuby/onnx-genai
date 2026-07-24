@@ -127,20 +127,29 @@ extern "C" __global__ void build_kv(
     unsigned long long batch, unsigned long long heads,
     unsigned long long past_seq, unsigned long long cur_seq,
     unsigned long long total_seq, unsigned long long dim,
-    unsigned long long elements) {
+    unsigned long long out_cap, unsigned long long past_cap,
+    unsigned long long write_start, unsigned long long elements) {
+  // `out_cap`/`past_cap` are the per-head seq strides of the destination and
+  // (4D) source caches. When they exceed the valid length the cache is stored
+  // at a fixed physical capacity, so head h occupies a constant slot and the
+  // new token is appended at row `t` without restriding the prior rows. In the
+  // dense case out_cap==total_seq and past_cap==past_seq (legacy behavior).
+  // `write_start` lets the fixed-slot append rebuild only rows [write_start,
+  // total_seq); a full rebuild passes 0.
+  const unsigned long long span = total_seq - write_start;
   for (unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x; idx < elements;
        idx += (unsigned long long)gridDim.x * blockDim.x) {
     unsigned long long d = idx % dim;
     unsigned long long rem = idx / dim;
-    unsigned long long t = rem % total_seq;
-    rem /= total_seq;
+    unsigned long long t = write_start + (rem % span);
+    rem /= span;
     unsigned long long h = rem % heads;
     unsigned long long b = rem / heads;
     float val;
     if (has_past && t < past_seq) {
       unsigned long long off = past_is_3d
           ? (b * past_seq + t) * (heads * dim) + h * dim + d
-          : ((b * heads + h) * past_seq + t) * dim + d;
+          : ((b * heads + h) * past_cap + t) * dim + d;
       val = load_float(past, off, dtype);
     } else {
       unsigned long long c = has_past ? (t - past_seq) : t;
@@ -149,7 +158,8 @@ extern "C" __global__ void build_kv(
           : ((b * heads + h) * cur_seq + c) * dim + d;
       val = load_float(cur, off, dtype);
     }
-    store_float(out, idx, val, dtype);
+    unsigned long long out_off = ((b * heads + h) * out_cap + t) * dim + d;
+    store_float(out, out_off, val, dtype);
   }
 }
 
@@ -200,6 +210,7 @@ extern "C" __global__ void attention_row(
     const long long* offsets, const long long* pad_limits,
     unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
     unsigned long long kv_heads, unsigned long long total_seq,
+    unsigned long long cap,
     unsigned long long head_size, unsigned long long v_head_size,
     unsigned long long group,
     int dtype, int q_is_3d, int out_is_3d, int is_causal,
@@ -229,7 +240,7 @@ extern "C" __global__ void attention_row(
 
   // Stage 1: scaled Q·Kᵀ scores (sqrt(scale) folded into each operand).
   for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-    const unsigned long long koff = ((b * kv_heads + kvh) * total_seq + j) * head_size;
+    const unsigned long long koff = ((b * kv_heads + kvh) * cap + j) * head_size;
     float acc = 0.0f;
     for (unsigned long long p = 0; p < head_size; ++p) {
       acc += (load_float(q, qoff + p, dtype) * sqrt_scale)
@@ -333,7 +344,7 @@ extern "C" __global__ void attention_row(
   for (unsigned long long c = tid; c < v_head_size; c += nthreads) {
     float acc = 0.0f;
     for (unsigned long long j = 0; j < total_seq; ++j) {
-      const unsigned long long voff = ((b * kv_heads + kvh) * total_seq + j) * v_head_size;
+      const unsigned long long voff = ((b * kv_heads + kvh) * cap + j) * v_head_size;
       acc += scores[srow + j] * load_float(value, voff + c, dtype);
     }
     store_float(y, ybase + c, acc, dtype);
@@ -661,8 +672,12 @@ impl StandardAttentionKernel {
         cur_seq: usize,
         total_seq: usize,
         dim: usize,
+        out_cap: usize,
+        past_cap: usize,
+        write_start: usize,
     ) -> Result<()> {
-        let elements = (batch * heads * total_seq * dim) as u64;
+        let span = total_seq.saturating_sub(write_start);
+        let elements = (batch * heads * span * dim) as u64;
         if elements == 0 {
             return Ok(());
         }
@@ -678,6 +693,9 @@ impl StandardAttentionKernel {
         let cur_seq = cur_seq as u64;
         let total_seq = total_seq as u64;
         let dim = dim as u64;
+        let out_cap = out_cap as u64;
+        let past_cap = past_cap as u64;
+        let write_start = write_start as u64;
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder
             .arg(&past_ptr)
@@ -693,6 +711,9 @@ impl StandardAttentionKernel {
             .arg(&cur_seq)
             .arg(&total_seq)
             .arg(&dim)
+            .arg(&out_cap)
+            .arg(&past_cap)
+            .arg(&write_start)
             .arg(&elements);
         unsafe {
             builder.launch(LaunchConfig {
@@ -919,8 +940,25 @@ impl Kernel for StandardAttentionKernel {
         let want_present_key = outputs.len() >= 2;
         let want_present_value = outputs.len() >= 3;
         let want_qk = outputs.len() >= 4;
-        let present_key_expected = batch * kv_heads * total_seq * head_size;
-        let present_value_expected = batch * kv_heads * total_seq * v_head_size;
+        // Fixed-capacity KV: a bound present K/V output may be exposed at its
+        // physical capacity (seq stride > valid length) so the cache lives at a
+        // constant per-head slot and the new token is appended without
+        // restriding the prior rows. `*_cap` is that per-head seq stride; it
+        // collapses to the valid length for dense (non-capacity) present slots,
+        // preserving the legacy contiguous layout. The valid attended length
+        // stays `total_seq` (from the logical past + current extent).
+        let key_cap = if want_present_key && outputs[1].shape.len() == 4 {
+            outputs[1].shape[2].max(total_seq)
+        } else {
+            total_seq
+        };
+        let value_cap = if want_present_value && outputs[2].shape.len() == 4 {
+            outputs[2].shape[2].max(value_total_seq)
+        } else {
+            value_total_seq
+        };
+        let present_key_expected = batch * kv_heads * key_cap * head_size;
+        let present_value_expected = batch * kv_heads * value_cap * v_head_size;
         let qk_expected = batch * q_heads * q_seq * total_seq;
 
         // Validate present/qk outputs and capture their device pointers. Split
@@ -1012,17 +1050,30 @@ impl Kernel for StandardAttentionKernel {
                 )?,
             };
 
-            // In-place KV growth: the decode graph binds the present K/V output
-            // onto the same buffer as the past K/V input. `build_kv` rewrites the
-            // whole cache with a *wider* per-head stride (total_seq > past_seq),
-            // so writing directly into that buffer makes head h's current-token
-            // store overlap head h+1's past load across unordered threads — a
-            // data race that leaves every head beyond head 0 nondeterministic.
-            // Stage the rebuild in a disjoint scratch buffer (reads the pristine
-            // past), then copy the fully-formed dense cache back. General: any
-            // model whose default-domain Attention grows an aliased KV cache.
-            let stage_key = has_past_key && present_key_out == Some(past_key_ptr);
-            let stage_value = has_past_value && present_value_out == Some(past_value_ptr);
+            // In-place KV growth. The decode graph binds the present K/V output
+            // onto the same buffer as the past K/V input.
+            //
+            // Fixed-capacity present (key_cap/value_cap > valid length): the
+            // cache lives at a constant per-head stride, so `build_kv` appends
+            // only the new token's rows into their fixed slot and leaves the
+            // prior rows (already at that stride) untouched — no restride, no
+            // cross-head overlap, race-free and deterministic in place. No
+            // staging needed.
+            //
+            // Dense present (legacy): `build_kv` rewrites the whole cache with a
+            // *wider* per-head stride (total_seq > past_seq), so an aliased
+            // in-place write makes head h's current-token store overlap head
+            // h+1's past load across unordered threads — a data race that leaves
+            // every head beyond head 0 nondeterministic. Stage the rebuild in a
+            // disjoint scratch buffer (reads the pristine past), then copy the
+            // fully-formed dense cache back. General: any model whose
+            // default-domain Attention grows an aliased KV cache.
+            let alias_key = has_past_key && present_key_out == Some(past_key_ptr);
+            let alias_value = has_past_value && present_value_out == Some(past_value_ptr);
+            let capacity_key = key_cap > total_seq;
+            let capacity_value = value_cap > value_total_seq;
+            let stage_key = alias_key && !capacity_key;
+            let stage_value = alias_value && !capacity_value;
             let key_kv_ptr = if stage_key {
                 alloc(&self.runtime, &mut owned, present_key_expected * element_bytes)?
             } else {
@@ -1051,7 +1102,25 @@ impl Kernel for StandardAttentionKernel {
             unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
             unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
 
-            // Build present_key / present_value on the device.
+            // Build present_key / present_value on the device. In capacity mode
+            // the append writes only the new rows [past_seq, total_seq) into
+            // their fixed slot; the dense path rebuilds all rows.
+            let key_write_start = if capacity_key && alias_key {
+                key_past_seq
+            } else {
+                0
+            };
+            let key_past_cap = if capacity_key { key_cap } else { key_past_seq };
+            let value_write_start = if capacity_value && alias_value {
+                value_past_seq
+            } else {
+                0
+            };
+            let value_past_cap = if capacity_value {
+                value_cap
+            } else {
+                value_past_seq
+            };
             self.launch_build_kv(
                 past_key_ptr,
                 k_cur_ptr,
@@ -1066,6 +1135,9 @@ impl Kernel for StandardAttentionKernel {
                 k_cur.seq,
                 total_seq,
                 head_size,
+                key_cap,
+                key_past_cap,
+                key_write_start,
             )?;
             self.launch_build_kv(
                 past_value_ptr,
@@ -1081,6 +1153,9 @@ impl Kernel for StandardAttentionKernel {
                 v_cur.seq,
                 value_total_seq,
                 v_head_size,
+                value_cap,
+                value_past_cap,
+                value_write_start,
             )?;
 
             // When staged, publish the freshly-built dense cache back into the
@@ -1116,6 +1191,7 @@ impl Kernel for StandardAttentionKernel {
                 let q_seq_u = q_seq as u64;
                 let kv_heads_u = kv_heads as u64;
                 let total_seq_u = total_seq as u64;
+                let kv_cap_u = key_cap as u64;
                 let head_size_u = head_size as u64;
                 let v_head_size_u = v_head_size as u64;
                 let group_u = group as u64;
@@ -1144,6 +1220,7 @@ impl Kernel for StandardAttentionKernel {
                     .arg(&q_seq_u)
                     .arg(&kv_heads_u)
                     .arg(&total_seq_u)
+                    .arg(&kv_cap_u)
                     .arg(&head_size_u)
                     .arg(&v_head_size_u)
                     .arg(&group_u)
@@ -1371,6 +1448,180 @@ mod alias_tests {
                 run(true),
                 aliased,
                 "aliased KV-cache growth must be deterministic across runs (iteration {i})"
+            );
+        }
+    }
+
+    /// Fixed-capacity / fixed-slot append path (the eager perf deliverable):
+    /// when the `present` KV output is bound at a *physical capacity* wider than
+    /// the valid length, `build_kv` must lay the cache out at the CAPACITY
+    /// per-head stride and append the new token into slot `[past_seq]`, while the
+    /// attention read is bounded to the valid `[0, total_seq)` rows. Physical
+    /// slots `[total_seq, cap)` hold uninitialised padding that must never be
+    /// read. This guards against a regression to reading the KV tensor *extent*
+    /// as the sequence length: if the kernel used `cap` (or the padded buffer) as
+    /// the loop bound it would fold the non-zero padding into the scores and
+    /// diverge from the dense reference.
+    #[test]
+    fn decode_kv_capacity_append_matches_reference_and_ignores_padding() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let device = DeviceId::cuda(0);
+
+        let heads = 4usize;
+        let past = 3usize;
+        let qlen = 1usize;
+        let total = past + qlen;
+        let kdim = 6usize;
+        let vdim = 4usize;
+
+        let q = fill(heads * qlen * kdim, 1);
+        let k_cur = fill(heads * qlen * kdim, 2);
+        let v_cur = fill(heads * qlen * vdim, 3);
+        let past_k = fill(heads * past * kdim, 4);
+        let past_v = fill(heads * past * vdim, 5);
+
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: true,
+            q_num_heads: Some(heads),
+            kv_num_heads: Some(heads),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+        };
+
+        // Lay a `[heads, valid, dim]` contiguous tensor into a `[heads, cap, dim]`
+        // capacity-strided buffer; the padding `[valid, cap)` is filled with
+        // `garbage` to prove the kernel never reads it.
+        let cap_strided =
+            |rows: &[f32], valid: usize, dim: usize, cap: usize, garbage: f32| -> Vec<f32> {
+                let mut buf = vec![garbage; heads * cap * dim];
+                for h in 0..heads {
+                    for t in 0..valid {
+                        for d in 0..dim {
+                            buf[(h * cap + t) * dim + d] = rows[(h * valid + t) * dim + d];
+                        }
+                    }
+                }
+                buf
+            };
+
+        // `cap == total` + non-aliased is the dense, race-free ground truth.
+        // `cap > total` + aliased is the fixed-slot capacity append under test.
+        let run = |alias: bool, cap: usize| -> Vec<f32> {
+            let q_sh = [1usize, heads, qlen, kdim];
+            let kcur_sh = [1usize, heads, qlen, kdim];
+            let vcur_sh = [1usize, heads, qlen, vdim];
+            let pastk_sh = [1usize, heads, past, kdim];
+            let pastv_sh = [1usize, heads, past, vdim];
+            let presk_sh = [1usize, heads, cap, kdim];
+            let presv_sh = [1usize, heads, cap, vdim];
+            let y_sh = [1usize, heads, qlen, vdim];
+
+            let q_st = compute_contiguous_strides(&q_sh);
+            let kcur_st = compute_contiguous_strides(&kcur_sh);
+            let vcur_st = compute_contiguous_strides(&vcur_sh);
+            let pastk_st = compute_contiguous_strides(&pastk_sh);
+            let pastv_st = compute_contiguous_strides(&pastv_sh);
+            let presk_st = compute_contiguous_strides(&presk_sh);
+            let presv_st = compute_contiguous_strides(&presv_sh);
+            let y_st = compute_contiguous_strides(&y_sh);
+
+            let key_cap_bytes = heads * cap * kdim * 4;
+            let val_cap_bytes = heads * cap * vdim * 4;
+            // The kernel reads `past` at the *past_cap* per-head stride: the full
+            // physical capacity `cap` for the capacity/fixed-slot path (aliased,
+            // cap > total), or the dense valid `past` length otherwise. Lay the
+            // past buffer out at exactly that stride, with non-zero padding in the
+            // physical slots beyond the valid length so a stride/bound regression
+            // is caught.
+            let capacity_case = alias && cap > total;
+            let pcap = if capacity_case { cap } else { past };
+            let key_init = cap_strided(&past_k, past, kdim, pcap, 7.5);
+            let val_init = cap_strided(&past_v, past, vdim, pcap, -4.25);
+            let key_past_bytes = heads * pcap * kdim * 4;
+            let val_past_bytes = heads * pcap * vdim * 4;
+            let q_bytes = f32_bytes(&q);
+            let kcur_bytes = f32_bytes(&k_cur);
+            let vcur_bytes = f32_bytes(&v_cur);
+
+            unsafe {
+                let key_buf = rt.alloc_raw(key_past_bytes.max(key_cap_bytes)).unwrap();
+                let val_buf = rt.alloc_raw(val_past_bytes.max(val_cap_bytes)).unwrap();
+                let q_buf = rt.alloc_raw(q_bytes.len()).unwrap();
+                let kcur_buf = rt.alloc_raw(kcur_bytes.len()).unwrap();
+                let vcur_buf = rt.alloc_raw(vcur_bytes.len()).unwrap();
+                rt.htod(&f32_bytes(&key_init), key_buf).unwrap();
+                rt.htod(&f32_bytes(&val_init), val_buf).unwrap();
+                rt.htod(&q_bytes, q_buf).unwrap();
+                rt.htod(&kcur_bytes, kcur_buf).unwrap();
+                rt.htod(&vcur_bytes, vcur_buf).unwrap();
+
+                let (presk_buf, presv_buf) = if alias {
+                    (key_buf, val_buf)
+                } else {
+                    (
+                        rt.alloc_raw(key_cap_bytes).unwrap(),
+                        rt.alloc_raw(val_cap_bytes).unwrap(),
+                    )
+                };
+                let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
+
+                let dp = |p: CUdeviceptr| DevicePtr(p as *const c_void);
+                let dpm = |p: CUdeviceptr| DevicePtrMut(p as *mut c_void);
+
+                let inputs = [
+                    TensorView::new(dp(q_buf), DataType::Float32, &q_sh, &q_st, device),
+                    TensorView::new(dp(kcur_buf), DataType::Float32, &kcur_sh, &kcur_st, device),
+                    TensorView::new(dp(vcur_buf), DataType::Float32, &vcur_sh, &vcur_st, device),
+                    TensorView::absent(DataType::Float32),
+                    TensorView::new(dp(key_buf), DataType::Float32, &pastk_sh, &pastk_st, device),
+                    TensorView::new(dp(val_buf), DataType::Float32, &pastv_sh, &pastv_st, device),
+                ];
+                let mut outputs = [
+                    TensorMut::new(dpm(y_buf), DataType::Float32, &y_sh, &y_st, device),
+                    TensorMut::new(dpm(presk_buf), DataType::Float32, &presk_sh, &presk_st, device),
+                    TensorMut::new(dpm(presv_buf), DataType::Float32, &presv_sh, &presv_st, device),
+                ];
+
+                kernel.execute(&inputs, &mut outputs).unwrap();
+
+                let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
+                rt.dtoh(&mut y_bytes, y_buf).unwrap();
+
+                rt.free_raw(key_buf).unwrap();
+                rt.free_raw(val_buf).unwrap();
+                rt.free_raw(q_buf).unwrap();
+                rt.free_raw(kcur_buf).unwrap();
+                rt.free_raw(vcur_buf).unwrap();
+                rt.free_raw(y_buf).unwrap();
+                if !alias {
+                    rt.free_raw(presk_buf).unwrap();
+                    rt.free_raw(presv_buf).unwrap();
+                }
+                bytes_f32(&y_bytes)
+            }
+        };
+
+        // Dense reference at exactly the valid length (no padding).
+        let reference = run(false, total);
+        // Fixed-slot append into a wider physical capacity with non-zero padding
+        // must reproduce the reference exactly (padding ignored) and be stable.
+        let capacity = run(true, total + 5);
+        assert_eq!(
+            capacity, reference,
+            "capacity/fixed-slot KV append must match the dense reference and \
+             ignore the non-zero physical padding beyond the valid length"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                run(true, total + 5),
+                capacity,
+                "capacity KV append must be deterministic across runs (iteration {i})"
             );
         }
     }

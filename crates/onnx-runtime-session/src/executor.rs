@@ -3246,7 +3246,40 @@ impl Executor {
                 resolved.insert(ovid, out_shapes[oi].clone());
             }
         }
-        let output_shapes: Vec<Vec<usize>> = outputs.iter().map(|v| resolved[v].clone()).collect();
+        let mut output_shapes: Vec<Vec<usize>> =
+            outputs.iter().map(|v| resolved[v].clone()).collect();
+        // Fixed-capacity KV for the default-domain Attention op. Its present
+        // K/V outputs (slots 1..) are consumer-less graph outputs bound to a
+        // growing device cache. Expose them to the kernel at the binding's
+        // physical capacity so the kernel can append the new token into a fixed
+        // per-head slot (constant stride, no per-step restride) instead of
+        // repacking the whole cache densely. The valid attended length is still
+        // derived from the logical past+current extent, so this only widens the
+        // *storage* stride and never changes what the kernel attends over. Only
+        // present slots that are bound sub-shape (logical != physical) capacity
+        // buffers are widened; a dense/unbound present keeps its inferred shape.
+        {
+            let node = self.graph.node(node_id);
+            if node.is_default_domain() && node.op_type == "Attention" {
+                for (oi, &ovid) in outputs.iter().enumerate() {
+                    if oi == 0 {
+                        continue;
+                    }
+                    if let Some(value) = external.outputs.get(&ovid)
+                        && value.accepts_subshape
+                        && value.shape.len() == output_shapes[oi].len()
+                        && value.shape.iter().zip(&output_shapes[oi]).enumerate().all(
+                            |(axis, (&physical, &logical))| axis == 2 || physical == logical,
+                        )
+                        && value.shape.get(2).zip(output_shapes[oi].get(2)).is_some_and(
+                            |(&physical, &logical)| physical >= logical,
+                        )
+                    {
+                        output_shapes[oi] = value.shape.clone();
+                    }
+                }
+            }
+        }
         let capabilities = self.ep.capabilities();
         let accepts_lazy_weights =
             LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type);
