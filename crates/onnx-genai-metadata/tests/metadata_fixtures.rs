@@ -350,6 +350,63 @@ fn pipeline_validation_accepts_iterative_denoiser_self_edge() {
 }
 
 #[test]
+fn pipeline_validation_accepts_full_diffusion_txt2img_contract() {
+    // The hardest generality case: a NON-autoregressive text-to-image latent
+    // diffusion pipeline (condition encoder -> scheduler-driven iterative
+    // denoiser -> VAE decoder) must parse AND validate through the crate. This
+    // is the committed example under `examples/diffusion-metadata/`.
+    let spec = load_pipeline_spec(&crate_fixture("pipeline_diffusion_txt2img.yaml"))
+        .expect("full diffusion txt2img pipeline parses and validates");
+
+    // Three components: condition encoder, iterative denoiser, VAE decoder.
+    assert_eq!(spec.models.len(), 3);
+    assert_eq!(spec.models["text_encoder"].role, "encoder");
+    assert_eq!(spec.models["denoiser"].role, "denoiser");
+    assert_eq!(spec.models["vae_decoder"].role, "vae");
+
+    // Scheduler-driven iterative (diffusion) strategy over N steps.
+    let strategy = &spec.strategy;
+    assert!(matches!(strategy.kind, PipelineStrategyKind::Iterative));
+    assert_eq!(strategy.denoiser.as_deref(), Some("denoiser"));
+    assert_eq!(strategy.num_steps, Some(25));
+    assert_eq!(strategy.timestep_input.as_deref(), Some("timestep"));
+
+    // Classifier-free guidance is expressible: scale + conditioning port.
+    assert_eq!(strategy.guidance_scale, Some(7.5));
+    assert_eq!(
+        strategy.cfg_conditioning_input.as_deref(),
+        Some("encoder_hidden_states")
+    );
+
+    // The diffusion scheduler loop contract: sampler kind, noise schedule,
+    // prediction parameterization, and Karras sigma spacing.
+    let scheduler = strategy
+        .scheduler_config
+        .as_ref()
+        .expect("scheduler_config present");
+    assert_eq!(scheduler.kind, "euler");
+    assert_eq!(scheduler.num_train_timesteps, Some(1000));
+    assert_eq!(scheduler.beta_schedule.as_deref(), Some("scaled_linear"));
+    assert_eq!(scheduler.prediction_type.as_deref(), Some("epsilon"));
+    assert_eq!(scheduler.use_karras_sigmas, Some(true));
+
+    // The loop-carried latent self-edge and the encoder->denoiser->VAE dataflow
+    // are all present and validated (no dangling ports, no same-step cycle).
+    assert!(
+        spec.dataflow
+            .iter()
+            .any(|edge| edge.from == "denoiser.out_sample" && edge.to == "denoiser.sample"),
+        "loop-carried latent self-edge must be declared"
+    );
+    assert!(
+        spec.dataflow
+            .iter()
+            .any(|edge| edge.from == "denoiser.sample" && edge.to == "vae_decoder.latent_sample"),
+        "final latent must route to the VAE decoder"
+    );
+}
+
+#[test]
 fn pipeline_validation_rejects_self_edge_outside_iterative_denoiser() {
     // A self-edge on a component that is NOT an iterative denoiser has no loop
     // semantics and must be rejected as a cycle.
