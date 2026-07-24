@@ -1,95 +1,42 @@
-# DeepSeek MLA capture-enablement — implementation attempt, empirical findings, and honest status
+# DeepSeek MLA CUDA-graph capture — turnkey implementation blueprint + scoping decision
 
-**Author:** Rachael (worker) · 2026-07-24
-**Branch:** `perf/deepseek-mla-capture-enable` @ `de5188c` (stacked on correctness fix `621936f`, off main `24531c4`) — **pushed, NOT merged**
-**Bottom line:** Full CUDA-graph capture for the default-domain `Attention` decode step is a **large, correctness-critical, multi-crate rework** and is **NOT safely landable in one stacked pass**. I landed the one **safely-separable, verified** brick (stream-ordered capture-safe copy-back) and I am **reporting the rest with empirical evidence** rather than forcing an unsafe change — per your fallback instruction. **No capture numbers are fabricated: capture is still off.**
+**Author:** Rachael (worker)
+**Base:** `perf/deepseek-mla-capture` reset to stack on `perf/deepseek-mla-fixedcap` @ `53afab0` (correctness fix `621936f` + eager fixedcap).
+**Status:** BLUEPRINT + honest scoping decision. **No capture code pushed** — see decision. All blockers verified against source this session.
 
-## What I landed (safe, verified, on the branch)
-Convert the KV-growth **copy-back** (introduced by the correctness fix) from
-synchronous `dtod` (full `synchronize()` + `cuMemcpyDtoD`, capture-illegal) to
-`dtod_async` (`cuMemcpyDtoDAsync`) on the EP compute stream. `build_kv`
-(producer) and the next step's `build_kv` (consumer) run on that same stream, so
-the copy is stream-ordered without a full sync; the execute-exit `synchronize()`
-still drains it (eager blocking semantics preserved). This is scope item 3's
-"copy-back is async/stream-ordered" and a prerequisite for capture.
-- Determinism preserved (blk32 & blk128, 3× identical: `[8913,13,185,549,19305,280,7239,317,254,28071,13,185]`, " Paris.\n…").
-- tok/s ~unchanged (blk32 23.9, blk128 25.3) — the per-op syncs dominate, so this alone is not the perf lever.
-- Gate: `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` → **204/0**; clippy `--lib -D warnings` clean.
-- Qwen (GQA) unaffected: captures intact, coherent.
+## Decision (why no partial capture landed)
+The ~2.4x prize (Pris: eager 40.5 ms/tok, only 15.5 ms real GPU; ~60% is per-op orchestration) is reachable **purely in-engine** — I re-confirmed the mask island (below) and that the IR has the graph-mutation API to do it. BUT capture is **all-or-nothing**: it only engages when `DeviceBinding::has_dynamic_logical_input_shape()` (tensor.rs:308) is false for EVERY bound input, which requires removing FIVE coupled blockers at once. **Any partial state breaks real-weight decode** (e.g. fixing bindings to fixed-capacity without the device valid-length scalar makes `total_seq = key_past_seq + k_cur.seq` resolve to `max_len` → attention reads padding → garbage/nondeterminism). Per Justin's mandate (real-weight decode MUST stay deterministic + coherent) and the user's explicit "land safely-separable and report, don't force it", I will not push a rushed, unverifiable partial capture stack. This should be built as a dedicated, GPU-iterated, reviewed effort using the blueprint below.
 
-## Why full capture is not a one-pass stacked change (EMPIRICAL evidence)
-I probed scope item 1 directly: taught `kernel_input_uses_physical_capacity`
-(executor.rs:1122) to recognize the default-domain `('' , Attention)` KV inputs
-(4,5) as physical-capacity (mirroring GQA), then ran the real model. Result —
-hard error (probe reverted):
-```
-external output 'present.0.key' has Float16 [1, 16, 4096, 192] (25165824 bytes),
-kernel requires Float16 [1, 16, 4101, 192] (25196544 bytes)
-```
-This is decisive: exposing the KV at capacity makes `StandardAttentionKernel`
-derive `past_seq` from the **capacity extent (4096)** instead of the **valid
-length (5)** — it then wants `total_seq=4101` and mismatches the 4096 buffer.
-**Capacity recognition alone breaks correctness; the kernel MUST receive the
-valid length on-device.** GQA avoids this because it has a `seqlens_k` input
-(produced on-device by an attn-mask subgraph); the default-domain Attention
-decode path has **no such device valid-length signal** — it derives length
-purely from the (growing) KV tensor extent.
+## The five coupled capture blockers (verified file:line, on `53afab0`)
+1. **Mask binding grows.** native_decode.rs:1960-1961 `extend_mask` sets `bindings[0]` logical `[1, end]` (physical `[1, max_len]`) → dynamic → capture gate (native_decode.rs:1919-1922) declines.
+2. **KV bindings grow.** native_decode.rs:1965-1972 `set_logical_len` grows KV logical axis-2 each step → dynamic. (My fixedcap exposed the *present output* at capacity but left the *input* logical, deliberately, to avoid shape-inference poisoning — see rachael-mla-fixedcap.md.)
+3. **Valid length is host/shape-derived.** standard_attention.rs:846 `total_seq = key_past_seq + k_cur.seq` (from the growing past_key input shape) and :785 `key_past_seq = past_key.seq`. Frozen at capture-time → stale on replay. **This is the pivot (a').**
+4. **Growing mask island feeds Attention.** Graph subgraph `attention_mask → Shape/Unsqueeze/CumSum → Slice → GreaterOrEqual(causal) → And(key-valid) → Where{0,-65504} → Unsqueeze_18 [B,1,cur,total]` (grows with total). If bindings are fixed-cap without pruning this, `Shape/CumSum(attention_mask)` read `[1,max_len]` and mark padding valid → wrong mask. **This is (c).**
+5. **Sync + per-op scratch on the kernel path.** standard_attention.rs:738 entry `synchronize()`, :1250 exit `synchronize()`, :1029 per-call `alloc_raw`/`free_raw` for scores/staging/offsets/pad_limits, and per-step htod of offsets/pad_limits (:1093-1103). All capture-illegal. capture_support() = Unsupported (:1267). **This is (d).**
 
-## The real, coupled blockers (all must land together for capture)
-Note: for M=1 decode the **launch grid geometry is already fixed**
-(`total_rows = batch*q_heads*q_seq = q_heads`, standard_attention.rs:1112) — so
-geometry is NOT the blocker. The blockers are per-step *varying values/shapes*:
-1. **No device valid-length ABI.** The kernel needs `past_seq`/`total_seq`/causal
-   offset/pad frontier from **device memory** (updated out-of-band between
-   replays), not from the host-known tensor extent nor host-computed
-   `offsets`/`pad_limits` uploaded via `htod` each step (standard_attention.rs:
-   971–1052 — the `htod` is the root capture-illegal op). Requires a new
-   device valid-length input plumbed native_decode → executor binding → kernel
-   (analogous to GQA `seqlens_k`), OR deriving it from the mask's last dim.
-2. **`total_seq` passed as a by-value kernel arg** (line ~1147) is baked at
-   capture time → stale on replay. Must become a device read.
-3. **Fixed-capacity KV + fixed-slot append.** With capacity layout the kernel
-   must append the new token at slot `[valid_len]` (device-read) at fixed head
-   stride `max_len`, not restride the dense cache each step. This also removes
-   the copy-back entirely — but requires (1).
-4. **Growing internal mask tensor.** The Attention `attn_mask` input
-   (`v_model.Unsqueeze_18`) is a graph-internal tensor of length `total_seq`
-   produced each step from `attention_mask`; its size **grows per step**. Under
-   capture, intermediate buffers are fixed-size, so the mask subgraph must be
-   made **capacity-length** (padded), which is an **executor
-   `kernel_input_uses_padded_capacity` extension across the mask-reformat ops
-   and/or an export-side change** — the hardest and least-localized blocker,
-   likely needing Mobius/export or a broader executor effort.
-5. Per-step scratch alloc (scores) + entry/exit `synchronize()`
-   (standard_attention.rs:717, 1173) must be pre-allocated/removed for the
-   captured region.
+## Re-confirmed: the mask is a prunable island (both exports)
+`attention_mask` consumers = ONLY `{Shape, Unsqueeze, CumSum}`; `v_model.Unsqueeze_18` consumers = ONLY the 27 `Attention` nodes (verified on blk32; blk128 identical export topology). Semantics = standard causal + padding in cumsum space (left-pad robust), a pure function of `(past_len, cur_len, attention_mask[1,max_len])`. Fully reconstructible in-kernel from a device valid-length scalar; **no Mobius/export change**.
 
-## Recommendation (sequencing)
-Full capture ≈ reimplementing the standard-Attention decode as a **fixed-capacity,
-device-valid-length, masked** kernel (what GQA/flash already do) PLUS making the
-DeepSeek attn-mask subgraph capacity-length. This is a **dedicated multi-crate
-feature** (kernel + executor binding + native_decode device scalar + mask-subgraph
-capacity), not a stacked one-pass change, and it is **correctness-sensitive**
-(getting masking of the uninitialized capacity tail wrong reintroduces exactly
-the class of garbage the correctness fix eliminated). Recommend scoping it as its
-own tracked effort with staged, separately-verified commits:
-(a) device valid-length ABI + kernel reads it (keep eager, verify correctness),
-(b) fixed-capacity KV + fixed-slot append (verify correctness, removes restride —
-    a real eager perf win independent of capture),
-(c) capacity-length mask subgraph (executor/export),
-(d) flip `capture_support()` → Supported + remove per-op sync/htod/alloc, verify capture.
-Correctness (`621936f`) is already delivered and independent. This branch adds
-the safe async copy-back brick; it does not claim capture.
+## Turnkey plan — stage as 3 reviewable commits
 
-## Verify (this branch, GPU 3, clean rebuild)
-- blk32: 3× identical tokens, coherent, 23.94 tok/s, `captures=0`.
-- blk128: 2× identical tokens, coherent, 25.31 tok/s, `captures=0`.
-- Qwen2.5-0.5b (GQA): coherent, `captures=3 replays=39 fallbacks=0` — no regression.
-- Gate: lib 204/0, clippy `--lib -D warnings` clean.
+### (a') Device valid-length scalar ABI  [do first; verify eager-correct in isolation]
+- **native_decode.rs:** add a fixed-capacity device binding `__attn_valid_len` (int32 `[batch]` or scalar `[1]`), written each step (H2D via `write_bytes`, OUTSIDE any captured region) with the current `total_len` (or `past_len`; pick one convention). Owns + updates alongside `extend_mask`/`set_logical_len`.
+- **Graph transform (IR API exists):** `create_named_value` + `add_input` for `__attn_valid_len`; append it as a new optional trailing input to every default-domain `Attention` node via `node_mut`. (Alternative: thread it through the executor's existing default-Attention hook in exec_kernel_node — but a real graph input mirrors GQA's `seqlens_k` and is cleaner for binding.)
+- **executor.rs:** bind `__attn_valid_len` at fixed capacity; ensure it is NOT flagged dynamic.
+- **standard_attention.rs:** bump `check_arity` max inputs 7→8; read the device scalar pointer (new slot); the CUDA kernels (`build_kv`, `attention_row`) take `const int* valid_len` and compute `total = valid_len[b]` / `past = valid_len[b] - q_seq` **on-device** (mirror GQA group_query_attention.rs:61,80 `total = seqlens_k[b] + 1`). Keep HOST sizing (scratch/grid) from shapes for now (eager) — capacity-fixed sizing lands in (d).
+- **Verify eager:** blk32+blk128 3× identical + coherent (8913 ' Paris'); Qwen non-regression; gate ≥205/0. Capture still OFF (bindings still grow). Add a unit test asserting the kernel derives length from the device scalar (feed a scalar != shape extent → output tracks the scalar).
 
-## Owner
-The staged capture feature spans kernel (standard_attention.rs) + executor
-(binding/capacity recognition) + native_decode (device valid-length) + mask
-subgraph (executor/export/Mobius). Needs coordinator sequencing given the
-cross-crate/export surface. Rachael can own (a)+(b) (kernel/engine); (c) likely
-needs export/executor collaboration.
+### (c) On-device fixed-capacity mask synthesis + prune the island
+- **native_decode.rs:** make mask + KV bindings **fixed-capacity** (logical == physical == max_len; stop growing in `extend_mask`/`set_logical_len`) so blockers (1)(2) clear. Keep `attention_mask[1,max_len]` contents (1s for valid, 0 beyond) for padding.
+- **Graph transform:** `remove_nodes` the `Unsqueeze_18` island (Attention nodes drop input 3); DCE reclaims `attention_mask` subgraph. Attention now masks purely from the device scalar (a') + causal, synthesized in `attention_row` (kernel already applies causal via offsets/pad_limits — replace host offsets/pad_limits with on-device derivation from `valid_len`). Keep it GENERAL (any default-domain Attention decode).
+- **Verify:** same correctness sweep; capture gate now OPEN (no dynamic bindings) but capture_support still Unsupported → still eager. Confirm determinism/coherence unchanged.
+
+### (d) Flip capture_support + kill sync/scratch
+- **standard_attention.rs:** remove entry/exit `synchronize()` (rely on same-stream ordering — reuse the 24531c4 stream-ordered pattern for any copy-back); replace per-call scratch with fixed module-global/persistent arena (mirror gqa_decode.rs:18 "fixed module-global scratch allocated when NVRTC loads"); fixed launch geometry (grid from capacity, internal loop bound from `valid_len`); `capture_support()` → `Supported`.
+- **Verify (headline):** DeepSeek MLA CAPTURES: captures>=1, replays=N, fallbacks=0 both exports; tok/s ~25 → target ~57-61 (idle GPU, nvidia-smi first); 3× determinism + coherence; Qwen/Phi still capture + no regression; gate ≥205/0 + a capture-eligibility regression test; clippy --lib clean.
+
+## Environment / verification refs
+`source /home/justinchu/onnx-genai/.cudaenv.sh`; idle GPU via nvidia-smi (CPU-perf team shares box); blk32 `/home/justinchu/ds-e2e-artifacts/deepseek-v2-lite-real-int4-blk32/`, blk128 `.../deepseek-v2-lite-real-int4/`, Qwen `/home/justinchu/qwen2.5-0.5b-int4-onnx-native/`. Correct tokens `[8913,13,185,549,19305,280,7239,317,254,28071,13,185]`. GQA capture-safe reference kernel: `crates/onnx-runtime-ep-cuda/src/kernels/gqa_decode.rs` + `group_query_attention.rs` (seqlens_k device pointer, fixed scratch, no sync). Gate: `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` (205/0 on 53afab0).
+
+## Recommendation
+Green-lit and in-engine feasible, but it is a substantial coupled change (kernel rewrite + graph transform + binding/ABI + fixed scratch) that must be built with staged GPU verification under the determinism mandate — not rushed. Recommend sequencing it as a dedicated focused effort (my next session or a pairing) using this blueprint. (a') is the separable first commit; (c)+(d) must land together to flip capture.
