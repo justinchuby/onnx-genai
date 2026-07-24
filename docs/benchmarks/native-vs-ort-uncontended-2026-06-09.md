@@ -38,7 +38,7 @@
 | Qwen2.5-7B int4 | 274.98 | 240.41 | **1.144×** | 1024 | No |
 | Phi-4-mini int4/int8 | 320.78 | 230.70 | **1.390×** | 128 | No |
 | Phi-4-mini int4/int8 | 289.47 | 203.58 | **1.422×** | 1024 | No |
-| Qwen3-0.6B int4 (`qwen3-0.6b-int4-cuda-postfix`)† | 530.68 | 443.54 | **1.197×** | 128 | Shared host; CPU load |
+| Qwen3-0.6B int4 (`qwen3-0.6b-int4-cuda-postfix`)† | 530.68 | 443.54 | **1.196×** | 128 | Shared host; CPU load |
 | Qwen3-0.6B int4 (`qwen3-0.6b-int4-cuda-postfix`)† | 479.42 | 384.05 | **1.248×** | 1024 | Shared host; CPU load |
 | DeepSeek-Coder-1.3B int4 | 796.26 | 635.59 | **1.253×** | 128 | No |
 | DeepSeek-Coder-1.3B int4 | 627.39 | 512.59 | **1.224×** | 1024 | No |
@@ -49,7 +49,7 @@
 
 **Verdict:** native CUDA beat ORT CUDA in every comparable original
 uncontended row, by 1.103–1.600×; GLM-4-9B ran coherently natively but ORT
-could not load it. The post-fix Qwen3 ratio is 1.197× at 128 tokens and 1.248×
+could not load it. The post-fix Qwen3 ratio is 1.196× at 128 tokens and 1.248×
 at 1024 tokens on a shared host, so it is not included in that uncontended
 range.
 
