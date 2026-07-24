@@ -6376,7 +6376,43 @@ mod tests {
         bytes
     }
 
+    /// Portable, deterministic decode-worker count for the SPMD parity children.
+    ///
+    /// The invariant this test exercises is that persistent-SPMD row-sharding is
+    /// byte-identical to the flat path across an **odd** worker count (an uneven
+    /// remainder split), for every sequential int4 op. The worker count itself is
+    /// otherwise semantically irrelevant, so it must be chosen to keep that
+    /// invariant true on *every* platform while never oversubscribing the host:
+    ///
+    /// * **Odd** and `>= 3` on any host with `>= 3` logical CPUs, so the uneven
+    ///   sharding path (`worker_row_segments` remainder) is always covered.
+    /// * **Never greater than the host's logical CPU count**, so the children do
+    ///   not spawn more busy-waiting decode/rayon threads than there are cores.
+    ///   The previous hard-coded `31` grossly oversubscribed constrained CI
+    ///   runners; on the native Windows ARM64 runner that intermittently faulted
+    ///   the whole test binary with `STATUS_ACCESS_VIOLATION` (0xC0000005) — a
+    ///   flaky, environment-level crash (ThreadSanitizer finds no data race, and
+    ///   macOS arm64 / Windows x64 / Linux never reproduce it).
+    /// * **Capped at 15** so even a many-core host keeps the thread pressure
+    ///   bounded and the sub-second parity run fast.
+    ///
+    /// Because the value never exceeds `available_parallelism()`, the pool's
+    /// worker count is *not* clamped down (unlike the old `min(31, cores)`, whose
+    /// effective parity depended on the runner's core-count parity), so the
+    /// odd-worker coverage is deterministic per host instead of luck-of-the-draw.
+    fn parity_worker_count() -> usize {
+        let available = available_parallelism().max(1);
+        // Largest odd count that does not exceed the host core count.
+        let host_odd = if available.is_multiple_of(2) {
+            available.saturating_sub(1)
+        } else {
+            available
+        };
+        host_odd.clamp(1, 15)
+    }
+
     fn parity_child_output(persistent: bool) -> Vec<u8> {
+        let workers = parity_worker_count().to_string();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
@@ -6384,8 +6420,8 @@ mod tests {
             .arg("--nocapture")
             .arg("--test-threads=1")
             .env(SPMD_PARITY_CHILD_ENV, if persistent { "on" } else { "off" })
-            .env(DECODE_THREADS_ENV, "31")
-            .env("RAYON_NUM_THREADS", "31")
+            .env(DECODE_THREADS_ENV, &workers)
+            .env("RAYON_NUM_THREADS", &workers)
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
         if persistent {
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
@@ -6438,6 +6474,28 @@ mod tests {
                 SPMD_TEST_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed) >= 6,
                 "persistent parity child did not route every real int4 op through SPMD"
             );
+            // Self-verify the odd-worker coverage. On a single-node host the
+            // requested (odd) worker count is used verbatim, so the uneven
+            // remainder sharding path is genuinely exercised; assert that
+            // explicitly to guard against a future clamp silently degrading it.
+            // A multi-node host may rebalance/cap the split per node
+            // (`split_workers`), so there we rely on the SPMD-routing assert
+            // above plus the outer byte-parity check rather than a fixed count.
+            let pool = crate::decode_spmd::pools().expect("ON child built the persistent pool");
+            if pool.node_count() == 1 {
+                let workers = pool.total_workers();
+                assert_eq!(
+                    workers,
+                    parity_worker_count(),
+                    "single-node persistent pool must use the requested (unclamped) worker count"
+                );
+                if workers > 1 {
+                    assert!(
+                        !workers.is_multiple_of(2),
+                        "parity must run at an odd worker count to cover uneven row sharding"
+                    );
+                }
+            }
         }
         let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         println!("{SPMD_PARITY_MARKER}{encoded}");
@@ -6449,7 +6507,7 @@ mod tests {
         let persistent = parity_child_output(true);
         assert_eq!(
             persistent, baseline,
-            "31-worker persistent SPMD output must be byte-identical to flag-OFF \
+            "odd-worker persistent SPMD output must be byte-identical to flag-OFF \
              across every sequential packed-int4 MatMulNBits op"
         );
     }
