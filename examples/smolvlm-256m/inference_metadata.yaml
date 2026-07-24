@@ -1,0 +1,134 @@
+# Real-model VLM contract probe for HuggingFaceTB/SmolVLM-256M-Instruct.
+# Provenance, exact graph hashes/I/O, and known contract gaps are documented in README.md.
+#
+# This document is intentionally schema-valid but not advertised as end-to-end executable:
+# the upstream ONNX package performs image/text embedding fusion in host Python, and the
+# current typed metadata schema has no component kind for that scatter/replacement program.
+schema_version: v1
+required_capabilities:
+  - kv_cache
+  - grouped_query_attention
+model:
+  attention:
+    type: grouped_query
+    num_kv_heads: 3
+    num_attention_heads: 9
+    head_dim: 64
+  max_sequence_length: 8192
+  vocab_size: 49280
+kv_cache:
+  native_dtype: fp16
+tokens:
+  pad_token_id: 2
+  bos_token_id: 1
+  eos_token_id: [2]
+  image_token_id: 49190
+preprocessing:
+  image:
+    transforms:
+      - op: decode
+        outputs: [decoded]
+      - op: convert_rgb
+        inputs: [decoded]
+        outputs: [rgb]
+      - op: resize
+        inputs: [rgb]
+        outputs: [resized]
+        size: 2048
+        mode: longest_edge
+        interpolation: lanczos
+      - op: rescale
+        inputs: [resized]
+        outputs: [rescaled]
+        scale: 0.00392156862745098
+      - op: normalize
+        inputs: [rescaled]
+        outputs: [normalized]
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+      - op: tile
+        inputs: [normalized]
+        outputs: [tiles]
+        tile_size: 512
+        max_tiles: 16
+        include_thumbnail: true
+        thumbnail_order: append
+      - op: emit_validity_mask
+        inputs: [tiles]
+        outputs: [pixel_attention_mask]
+        mask_patch_size: 1
+    outputs:
+      - source: tiles
+        name: vision_encoder.pixel_values
+        content: pixels
+        dtype: float32
+      - source: pixel_attention_mask
+        name: vision_encoder.pixel_attention_mask
+        content: validity_mask
+        dtype: bool
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder_q4f16.onnx
+      type: vision_encoder
+    token_embedding:
+      filename: embed_tokens_fp16.onnx
+      type: encoder
+      io:
+        sequence_source: token_ids
+        kv_ownership: owned
+        token_input: input_ids
+        hidden_output: inputs_embeds
+    decoder:
+      filename: decoder_model_merged_q4f16.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        sequence_source: inputs_embeds
+        kv_ownership: owned
+        inputs_embeds_input: inputs_embeds
+        attention_mask_input: attention_mask
+        position_ids_input: position_ids
+        logits_output: logits
+        kv_inputs: [past_key_values.0.key, past_key_values.0.value, past_key_values.1.key, past_key_values.1.value, past_key_values.2.key, past_key_values.2.value, past_key_values.3.key, past_key_values.3.value, past_key_values.4.key, past_key_values.4.value, past_key_values.5.key, past_key_values.5.value, past_key_values.6.key, past_key_values.6.value, past_key_values.7.key, past_key_values.7.value, past_key_values.8.key, past_key_values.8.value, past_key_values.9.key, past_key_values.9.value, past_key_values.10.key, past_key_values.10.value, past_key_values.11.key, past_key_values.11.value, past_key_values.12.key, past_key_values.12.value, past_key_values.13.key, past_key_values.13.value, past_key_values.14.key, past_key_values.14.value, past_key_values.15.key, past_key_values.15.value, past_key_values.16.key, past_key_values.16.value, past_key_values.17.key, past_key_values.17.value, past_key_values.18.key, past_key_values.18.value, past_key_values.19.key, past_key_values.19.value, past_key_values.20.key, past_key_values.20.value, past_key_values.21.key, past_key_values.21.value, past_key_values.22.key, past_key_values.22.value, past_key_values.23.key, past_key_values.23.value, past_key_values.24.key, past_key_values.24.value, past_key_values.25.key, past_key_values.25.value, past_key_values.26.key, past_key_values.26.value, past_key_values.27.key, past_key_values.27.value, past_key_values.28.key, past_key_values.28.value, past_key_values.29.key, past_key_values.29.value]
+        kv_outputs: [present.0.key, present.0.value, present.1.key, present.1.value, present.2.key, present.2.value, present.3.key, present.3.value, present.4.key, present.4.value, present.5.key, present.5.value, present.6.key, present.6.value, present.7.key, present.7.value, present.8.key, present.8.value, present.9.key, present.9.value, present.10.key, present.10.value, present.11.key, present.11.value, present.12.key, present.12.value, present.13.key, present.13.value, present.14.key, present.14.value, present.15.key, present.15.value, present.16.key, present.16.value, present.17.key, present.17.value, present.18.key, present.18.value, present.19.key, present.19.value, present.20.key, present.20.value, present.21.key, present.21.value, present.22.key, present.22.value, present.23.key, present.23.value, present.24.key, present.24.value, present.25.key, present.25.value, present.26.key, present.26.value, present.27.key, present.27.value, present.28.key, present.28.value, present.29.key, present.29.value]
+        kv_update: append
+  dataflow:
+    # Upstream mutates this tensor with vision features before decoder invocation.
+    # The mutation itself is the principal schema gap described in README.md.
+    - from: token_embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: float32
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_vision
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: embed_tokens
+        strategy:
+          kind: single_pass
+          model: token_embedding
+        run_on: every_step
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    token_embedding:
+      run_on: every_step
+    decoder:
+      run_on: every_step
+  vision:
+    image_placeholder_token_id: 49190
+    image_token_id: 49190
+    tokens_per_tile: 64
+    token_count_source: per_tile
+    placeholder_per_image: true
+    image_correspondence: prompt_order
+    thumbnail_order: append
