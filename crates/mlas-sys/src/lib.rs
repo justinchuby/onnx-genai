@@ -1197,12 +1197,38 @@ mod tests {
     }
 
     #[test]
-    fn avx512_kernel_is_selected() {
-        // Proves parity-by-construction: on this AVX-512 host MLAS's runtime
-        // dispatch must pick the AVX-512F SGEMM microkernel.
+    fn best_available_float_kernel_is_selected() {
+        // Proves parity-by-construction: MLAS's runtime dispatch must pick the
+        // best SGEMM microkernel the *host* actually supports, not a fixed one.
+        // CI runners are AVX2-class (not AVX-512), while our dev hosts are
+        // AVX-512, so this asserts per-ISA instead of hard-coding 512.
+        //   selected_float_kernel(): 512 = AVX-512F, 3 = FMA3/AVX2, 1 = AVX,
+        //   -1 = other/unknown x86, 0 = non-x86 (see `selected_float_kernel`).
         let id = selected_float_kernel();
-        eprintln!("selected f32 GEMM kernel id = {id} (512 = AVX-512F)");
-        assert_eq!(id, 512, "expected AVX-512F SGEMM kernel to be selected");
+        eprintln!("selected f32 GEMM kernel id = {id} (512=AVX-512F, 3=AVX2/FMA3, 1=AVX)");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let expected = if std::arch::is_x86_feature_detected!("avx512f") {
+                512
+            } else if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+            {
+                3
+            } else if std::arch::is_x86_feature_detected!("avx") {
+                1
+            } else {
+                // Baseline SSE2 x86-64: MLAS reports "other/unknown x86".
+                -1
+            };
+            assert_eq!(
+                id, expected,
+                "MLAS should dispatch the best SGEMM kernel this host supports"
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert_eq!(id, 0, "non-x86 host should report the scalar/other kernel");
+        }
     }
 
     /// Single-thread performance probe for the medium f32 MatMul shape
@@ -1558,9 +1584,44 @@ mod tests {
     #[test]
     fn sqnbit_int4_compint8_matches_reference() {
         // int8-activation compute quantizes A, so tolerances are looser.
+        //
+        // Cross-CPU caveat: MLAS's *AVX2* M=1 CompInt8 SQNBit microkernel with a
+        // zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes) is
+        // numerically broken -- it disagrees with the dequantized reference by
+        // ~46% (mlas=6.09 vs ref=11.29), far beyond int8 quantization tolerance.
+        // The AVX-512 M=1 kernel and every AVX2 M>1 kernel (which apply the zero
+        // point via the precomputed block-sum correction) are correct. Verified
+        // under Intel SDE (`sde64 -hsw` fails, `-skx` passes); see
+        // .squad/decisions/inbox/ripley-mlas-cross-cpu.md and the upstream issue
+        // draft ripley-ort-issue-draft.md. Production never hits this path: int4
+        // MatMulNBits with m=1 always routes to the hand int8 decode kernel (the
+        // `sqnbit_decode_min() >= 2` crossover), and `try_mlas_sqnbit` additionally
+        // refuses M=1 asymmetric CompInt8 on non-AVX-512 hosts. So the M=1
+        // asymmetric case only exercises an MLAS capability we deliberately avoid;
+        // gate it to AVX-512 hosts (where it is correct) rather than asserting a
+        // value MLAS computes wrong on AVX2.
+        // MLAS installs its correct AVX-512 SQNBit dispatch only when the host
+        // has AVX512F *and* the core trio BW+DQ+VL (vendored platform.cpp:572,
+        // under the AVX512F check at :547); AVX512F alone falls back to the
+        // Avx2/Avx2vnni dispatch, i.e. the broken kernel. Mirror that exact gate
+        // so the skip condition matches production's `host_has_mlas_sqnbit_avx512`.
+        #[cfg(target_arch = "x86_64")]
+        let host_has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        #[cfg(not(target_arch = "x86_64"))]
+        let host_has_avx512 = false;
         for &blk in &[32usize, 64, 128] {
             for &m in &[1usize, 8] {
                 for &asym in &[false, true] {
+                    if m == 1 && asym && !host_has_avx512 {
+                        eprintln!(
+                            "skipping MLAS-broken AVX2 M=1 asymmetric CompInt8 blk{blk} \
+                             (production uses the hand int8 kernel here)"
+                        );
+                        continue;
+                    }
                     check_sqnbit(SQNBitComputeType::Int8, m, 96, 256, blk, asym, false);
                 }
             }

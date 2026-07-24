@@ -679,6 +679,24 @@ impl MatMulNBitsKernel {
             mlas_sys::SQNBitComputeType::Fp32
         };
 
+        // Cross-CPU correctness guard: MLAS's AVX2 M=1 CompInt8 SQNBit kernel
+        // with a zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes)
+        // is numerically broken -- it disagrees with the reference by ~46% on
+        // asymmetric int4 (verified under Intel SDE `-hsw`; the AVX-512 M=1 and
+        // every AVX2 M>1 kernel are correct). The `sqnbit_decode_min() >= 2`
+        // crossover above already keeps the default M=1 decode on the hand int8
+        // kernel, but an operator lowering `NXRT_SQNBIT_DECODE_MIN` to <= 1 would
+        // otherwise expose the broken kernel, so refuse it explicitly here and
+        // fall back to the (correct) hand int8 path. Asymmetric = zero points
+        // present; only M=1 and only non-AVX-512 hosts are affected.
+        if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
+            && m == 1
+            && zero_points.is_some()
+            && !host_has_mlas_sqnbit_avx512()
+        {
+            return Ok(None);
+        }
+
         // Constant weights (the decode hot path) are packed once into per-N-shard
         // MLAS weights and cached. This lets each M=1 decode projection fan its
         // output columns across the *persistent SPMD decode workers* (each worker
@@ -1760,6 +1778,30 @@ fn selected_dot_kernel() -> DotKernel {
         }
     }
     DotKernel::Scalar
+}
+
+/// Whether the running host selects MLAS's *AVX-512* SQNBit dispatch
+/// (`MlasSQNBitGemmDispatchAvx512`). MLAS only installs it when the CPU has
+/// AVX512F **and** the AVX-512 core trio BW+DQ+VL (vendored MLAS
+/// `platform.cpp:572`, nested under the AVX512F check at `:547`); AVX512F alone
+/// leaves `QNBitGemmDispatch` at the Avx2/Avx2vnni path (`:504`/`:537`), i.e. the
+/// broken AVX2 M=1 asymmetric CompInt8 kernel. So we must mirror MLAS's exact
+/// gate (F+BW+DQ+VL) here, not just AVX512F, or the guard leaks on AVX512F-only
+/// hosts (Xeon Phi KNL/KNM). On non-x86-64 targets no such kernel exists so this
+/// is always `false`.
+#[cfg(feature = "mlas")]
+fn host_has_mlas_sqnbit_avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Symmetric int8 activation quantization, per K-block, matching ORT/MLAS's
@@ -3230,6 +3272,63 @@ mod tests {
     #[test]
     fn matmulnbits_accuracy4_block128_partial_k_batched_matches_fp32_reference() {
         run_accuracy4_case(3, 141, 7, 128);
+    }
+
+    /// Cross-CPU regression: an m=1 **asymmetric** int4 `accuracy_level=4`
+    /// MatMulNBits must match its dequantized-f32 reference on every host. MLAS's
+    /// AVX2 M=1 CompInt8 SQNBit kernel with a zero point is numerically broken
+    /// (~46% error; see `try_mlas_sqnbit`'s guard and
+    /// .squad/decisions/inbox/ripley-mlas-cross-cpu.md), so the routing must keep
+    /// this case on the correct hand int8 decode path. Without the decode-min
+    /// crossover *and* the explicit `try_mlas_sqnbit` guard this would produce
+    /// garbage on AVX2 CI runners while passing on our AVX-512 dev hosts.
+    #[test]
+    fn matmulnbits_accuracy4_m1_asymmetric_matches_fp32_reference() {
+        for &(k, n, block_size) in &[(256usize, 96usize, 32usize), (256, 64, 64), (128, 8, 128)] {
+            let m = 1;
+            let a_values: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+                .collect();
+            let (packed, scales, zps, _) = quantize(&weights, n, k, block_size, true);
+            let zps = zps.expect("asymmetric quantization must emit zero points");
+            let dequantized = dequantize_reference(&packed, &scales, Some(&zps), n, k, block_size);
+            let expected = reference(&a_values, &dequantized, m, k, n);
+
+            let blocks = k.div_ceil(block_size);
+            let (mut graph, node) = model_node(
+                &[m, k],
+                &[n, blocks, block_size / 2],
+                &[n, blocks],
+                Some(&[n, blocks.div_ceil(2)]),
+                &[m, n],
+                k,
+                n,
+                block_size,
+            );
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("accuracy_level".into(), Attribute::Int(4));
+            let model = Model::new(&graph);
+            let kernel = CpuExecutionProvider::new()
+                .get_kernel(model.graph.node(node), &[], 1)
+                .unwrap();
+            let a = Owned::f32(&[m, k], &a_values);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_owned = Owned::f32(&[n, blocks], &scales);
+            let zero_points = Owned::u8(&[n, blocks.div_ceil(2)], &zps);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales_owned.view(), zero_points.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            assert_int8_close(&y.to_f32(), &expected);
+        }
     }
 
     #[test]
