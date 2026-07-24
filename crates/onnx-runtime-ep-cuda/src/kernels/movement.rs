@@ -496,19 +496,47 @@ impl KernelFactory for UnsqueezeFactory {
                 .attr("axes")
                 .and_then(Attribute::as_ints)
                 .map(<[i64]>::to_vec),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnsqueezeCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    axes_len: usize,
 }
 #[derive(Debug)]
 struct UnsqueezeKernel {
     runtime: Arc<CudaRuntime>,
     axes: Option<Vec<i64>>,
+    warmed_signature: Mutex<Option<UnsqueezeCaptureSignature>>,
 }
 impl Kernel for UnsqueezeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         arity("Unsqueeze", inputs, outputs, 1, 2, 1)?;
         require_dense("Unsqueeze", inputs, outputs)?;
-        let axes_len = if inputs.get(1).is_some_and(|v| !v.is_absent()) {
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Unsqueeze: capture signature lock was poisoned".into())
+        })?;
+        let axes_len = if capturing {
+            let signature = warmed_signature.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep Unsqueeze: capture started before the fixed shape was warmed".into(),
+                )
+            })?;
+            if signature.dtype != inputs[0].dtype
+                || signature.input_shape != inputs[0].shape
+                || signature.output_shape != outputs[0].shape
+            {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Unsqueeze: shape or dtype changed during CUDA graph capture".into(),
+                ));
+            }
+            signature.axes_len
+        } else if inputs.get(1).is_some_and(|v| !v.is_absent()) {
             host_ints(&self.runtime, &inputs[1], "Unsqueeze")?.len()
         } else {
             self.axes
@@ -525,15 +553,30 @@ impl Kernel for UnsqueezeKernel {
                 "cuda_ep Unsqueeze: output rank mismatch".into(),
             ));
         }
-        copy_reshape(&self.runtime, "Unsqueeze", &inputs[0], &mut outputs[0])
+        copy_reshape(&self.runtime, "Unsqueeze", &inputs[0], &mut outputs[0])?;
+        if !capturing {
+            *warmed_signature = Some(UnsqueezeCaptureSignature {
+                dtype: inputs[0].dtype,
+                input_shape: inputs[0].shape.to_vec(),
+                output_shape: outputs[0].shape.to_vec(),
+                axes_len,
+            });
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Unsqueeze reads runtime axes on the host and uses a non-validated copy path",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Unsqueeze must warm its fixed axes/shape signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Unsqueeze capture signature lock was poisoned",
+            ),
+        }
     }
 }
 
@@ -713,7 +756,7 @@ impl Kernel for TransposeKernel {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SlicePlan {
     start: i64,
     step: i64,
@@ -799,12 +842,25 @@ impl KernelFactory for SliceFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(SliceKernel {
             runtime: self.runtime.clone(),
+            dims: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            strides: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SliceCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
+    plan: Vec<SlicePlan>,
 }
 #[derive(Debug)]
 struct SliceKernel {
     runtime: Arc<CudaRuntime>,
+    dims: Mutex<PersistentMetadata>,
+    strides: Mutex<PersistentMetadata>,
+    warmed_signature: Mutex<Option<SliceCaptureSignature>>,
 }
 impl Kernel for SliceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -815,19 +871,40 @@ impl Kernel for SliceKernel {
                 "cuda_ep Slice: output dtype must match data".into(),
             ));
         }
-        let starts = host_ints(&self.runtime, &inputs[1], "Slice")?;
-        let ends = host_ints(&self.runtime, &inputs[2], "Slice")?;
-        let axes = if inputs.get(3).is_some_and(|v| !v.is_absent()) {
-            host_ints(&self.runtime, &inputs[3], "Slice")?
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Slice: capture signature lock was poisoned".into())
+        })?;
+        let plan = if capturing {
+            let signature = warmed_signature.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep Slice: capture started before the fixed bounds were warmed".into(),
+                )
+            })?;
+            if signature.dtype != inputs[0].dtype
+                || signature.input_shape != inputs[0].shape
+                || signature.output_shape != outputs[0].shape
+            {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Slice: shape or dtype changed during CUDA graph capture".into(),
+                ));
+            }
+            signature.plan.clone()
         } else {
-            (0..starts.len() as i64).collect()
+            let starts = host_ints(&self.runtime, &inputs[1], "Slice")?;
+            let ends = host_ints(&self.runtime, &inputs[2], "Slice")?;
+            let axes = if inputs.get(3).is_some_and(|v| !v.is_absent()) {
+                host_ints(&self.runtime, &inputs[3], "Slice")?
+            } else {
+                (0..starts.len() as i64).collect()
+            };
+            let steps = if inputs.get(4).is_some_and(|v| !v.is_absent()) {
+                host_ints(&self.runtime, &inputs[4], "Slice")?
+            } else {
+                vec![1; starts.len()]
+            };
+            slice_plan(inputs[0].shape, &starts, &ends, &axes, &steps)?
         };
-        let steps = if inputs.get(4).is_some_and(|v| !v.is_absent()) {
-            host_ints(&self.runtime, &inputs[4], "Slice")?
-        } else {
-            vec![1; starts.len()]
-        };
-        let plan = slice_plan(inputs[0].shape, &starts, &ends, &axes, &steps)?;
         let expected = plan.iter().map(|p| p.count).collect::<Vec<_>>();
         if outputs[0].shape != expected {
             return Err(EpError::KernelFailed(format!(
@@ -836,10 +913,27 @@ impl Kernel for SliceKernel {
             )));
         }
         if outputs[0].numel() == 0 {
+            if !capturing {
+                *warmed_signature = Some(SliceCaptureSignature {
+                    dtype: inputs[0].dtype,
+                    input_shape: inputs[0].shape.to_vec(),
+                    output_shape: outputs[0].shape.to_vec(),
+                    plan,
+                });
+            }
             return Ok(());
         }
         if expected.is_empty() {
-            return copy_reshape(&self.runtime, "Slice", &inputs[0], &mut outputs[0]);
+            copy_reshape(&self.runtime, "Slice", &inputs[0], &mut outputs[0])?;
+            if !capturing {
+                *warmed_signature = Some(SliceCaptureSignature {
+                    dtype: inputs[0].dtype,
+                    input_shape: inputs[0].shape.to_vec(),
+                    output_shape: outputs[0].shape.to_vec(),
+                    plan,
+                });
+            }
+            return Ok(());
         }
         let contiguous = compute_contiguous_strides(inputs[0].shape);
         let dims = expected.iter().map(|&v| v as u64).collect::<Vec<_>>();
@@ -857,31 +951,19 @@ impl Kernel for SliceKernel {
             .runtime
             .nvrtc_function("movement_ops", MOVEMENT_SOURCE, "slice_bytes")?;
         let dims_ptr = self
-            .runtime
-            .alloc_raw(std::mem::size_of_val(dims.as_slice()))?;
-        let strides_bytes = unsafe {
-            std::slice::from_raw_parts(
-                strides.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(strides.as_slice()),
-            )
-        };
-        let strides_ptr = match self.runtime.alloc_raw(strides_bytes.len()) {
-            Ok(ptr) => ptr,
-            Err(error) => {
-                let _ = unsafe { self.runtime.free_raw(dims_ptr) };
-                return Err(error);
-            }
-        };
-        if let Err(error) = unsafe { self.runtime.htod(u64_bytes(&dims), dims_ptr) } {
-            let _ = unsafe { self.runtime.free_raw(dims_ptr) };
-            let _ = unsafe { self.runtime.free_raw(strides_ptr) };
-            return Err(error);
-        }
-        if let Err(error) = unsafe { self.runtime.htod(strides_bytes, strides_ptr) } {
-            let _ = unsafe { self.runtime.free_raw(dims_ptr) };
-            let _ = unsafe { self.runtime.free_raw(strides_ptr) };
-            return Err(error);
-        }
+            .dims
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: dims lock was poisoned".into()))?
+            .prepare(&dims, "Slice")?;
+        let stride_bits = strides
+            .iter()
+            .map(|&value| value as u64)
+            .collect::<Vec<_>>();
+        let strides_ptr = self
+            .strides
+            .lock()
+            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: strides lock was poisoned".into()))?
+            .prepare(&stride_bits, "Slice")?;
         let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let rank = expected.len() as i32;
@@ -897,26 +979,37 @@ impl Kernel for SliceKernel {
             .arg(&rank)
             .arg(&elem_bytes)
             .arg(&elements);
-        let launch = unsafe {
+        unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (grid(outputs[0].numel()), 1, 1),
                 block_dim: (BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|e| driver_err("launch slice_bytes", e));
-        let sync = launch.and_then(|_| self.runtime.synchronize());
-        let free_dims = unsafe { self.runtime.free_raw(dims_ptr) };
-        let free_strides = unsafe { self.runtime.free_raw(strides_ptr) };
-        sync.and(free_dims).and(free_strides)
+        .map_err(|e| driver_err("launch slice_bytes", e))?;
+        if !capturing {
+            *warmed_signature = Some(SliceCaptureSignature {
+                dtype: inputs[0].dtype,
+                input_shape: inputs[0].shape.to_vec(),
+                output_shape: outputs[0].shape.to_vec(),
+                plan,
+            });
+        }
+        Ok(())
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Slice reads runtime bounds on the host, allocates per-call metadata, and synchronizes the stream",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Slice must warm its fixed bounds/shape signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Slice capture signature lock was poisoned",
+            ),
+        }
     }
 }
 
