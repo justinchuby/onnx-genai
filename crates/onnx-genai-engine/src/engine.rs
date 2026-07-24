@@ -1006,6 +1006,7 @@ impl Engine {
                 native_device,
                 governor.weight_offload_host_cache(),
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                config.decode_precision,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
         let (native_shared_kv_proposer, speculative_mode) =

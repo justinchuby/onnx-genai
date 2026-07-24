@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest,
+    NativeDecodeDevice,
 };
 
 #[allow(dead_code)]
@@ -17,6 +18,7 @@ pub fn assert_native_matches_ort_greedy(
         &model_dir,
         EngineDecodeBackend::Ort,
         None,
+        DecodePrecision::Model,
         prompt,
         expected_tokens.len(),
     )?;
@@ -29,6 +31,7 @@ pub fn assert_native_matches_ort_greedy(
         &model_dir,
         EngineDecodeBackend::Native,
         Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
         prompt,
         expected_tokens.len(),
     )?;
@@ -39,6 +42,52 @@ pub fn assert_native_matches_ort_greedy(
     assert_eq!(
         native, ort,
         "{model_dir_env} native and ORT CUDA greedy sequences diverged"
+    );
+    Ok(())
+}
+
+/// Assert that native CUDA decode with [`DecodePrecision::Fp16`] (the opt-in
+/// fp32→fp16 decoder rewrite) reproduces the trusted ORT fp32 CUDA greedy stream
+/// token-for-token. This locks the fp16-fused decode path for an fp32-activation
+/// int4/block-32 (`accuracy_level=4`) model against its fp32 reference: any
+/// divergence fails the test (no silent pass).
+#[allow(dead_code)]
+pub fn assert_native_fp16_matches_ort_greedy(
+    model_dir_env: &str,
+    prompt: &str,
+    expected_tokens: &[u32],
+) -> anyhow::Result<()> {
+    let Some(model_dir) = cuda_model_dir(model_dir_env) else {
+        return Ok(());
+    };
+    let ort = generate(
+        &model_dir,
+        EngineDecodeBackend::Ort,
+        None,
+        DecodePrecision::Model,
+        prompt,
+        expected_tokens.len(),
+    )?;
+    assert_eq!(
+        ort, expected_tokens,
+        "{model_dir_env} ORT CUDA fp32 greedy reference drifted"
+    );
+
+    let native_fp16 = generate(
+        &model_dir,
+        EngineDecodeBackend::Native,
+        Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Fp16,
+        prompt,
+        expected_tokens.len(),
+    )?;
+    assert_eq!(
+        native_fp16, expected_tokens,
+        "{model_dir_env} native CUDA fp16-fused greedy sequence drifted from the locked stream"
+    );
+    assert_eq!(
+        native_fp16, ort,
+        "{model_dir_env} native CUDA fp16-fused decode diverged from the ORT fp32 reference"
     );
     Ok(())
 }
@@ -56,6 +105,7 @@ pub fn assert_native_matches_golden(
         &model_dir,
         EngineDecodeBackend::Native,
         Some(NativeDecodeDevice::Cuda { index: Some(0) }),
+        DecodePrecision::Model,
         prompt,
         expected_tokens.len(),
     )?;
@@ -92,6 +142,7 @@ fn generate(
     model_dir: &std::path::Path,
     backend: EngineDecodeBackend,
     native_device: Option<NativeDecodeDevice>,
+    decode_precision: DecodePrecision,
     prompt: &str,
     token_count: usize,
 ) -> anyhow::Result<Vec<u32>> {
@@ -100,6 +151,7 @@ fn generate(
         EngineConfig {
             decode_backend: backend,
             native_device,
+            decode_precision,
             ..EngineConfig::default()
         },
     )?;
