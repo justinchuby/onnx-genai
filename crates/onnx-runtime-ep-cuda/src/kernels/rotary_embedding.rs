@@ -44,9 +44,10 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 pub const ROTARY_EMBEDDING_CAPTURE_ERROR_POSITION: u32 = 256;
-const ROTARY_EMBEDDING_MODULE: &str = "rotary_embedding_f16_v1";
+const ROTARY_EMBEDDING_MODULE: &str = "rotary_embedding_bf16_v2";
 const ROTARY_EMBEDDING_SOURCE: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 extern "C" __global__ void rotary_embedding_f32(
     const float* x, const float* cos_cache, const float* sin_cache,
@@ -191,18 +192,94 @@ extern "C" __global__ void rotary_embedding_f16(
     y[i] = __float2half_rn(output);
   }
 }
+
+extern "C" __global__ void rotary_embedding_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache, const long long* position_ids,
+    __nv_bfloat16* y, unsigned long long batch, unsigned long long seq,
+    unsigned long long heads, unsigned long long head_size,
+    unsigned long long rotary_dim, unsigned long long cache_rows,
+    int is_4d, int interleaved, int has_position_ids,
+    unsigned long long elements, unsigned int* capture_error) {
+  for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < elements;
+       i += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long b, h, s, d;
+    if (is_4d) {
+      d = i % head_size;
+      unsigned long long rem = i / head_size;
+      s = rem % seq;
+      rem /= seq;
+      h = rem % heads;
+      b = rem / heads;
+    } else {
+      d = i % head_size;
+      unsigned long long rem = i / head_size;
+      h = rem % heads;
+      rem /= heads;
+      s = rem % seq;
+      b = rem / seq;
+    }
+
+    if (d >= rotary_dim) {
+      y[i] = x[i];
+      continue;
+    }
+
+    const unsigned long long half = rotary_dim / 2;
+    const long long cache_row = has_position_ids
+        ? position_ids[b * seq + s]
+        : (long long)(b * seq + s);
+    if (cache_row < 0 || (unsigned long long)cache_row >= cache_rows) {
+      if (capture_error) atomicOr(capture_error, 256u);
+      y[i] = x[i];
+      continue;
+    }
+
+    unsigned long long k, partner;
+    if (interleaved) {
+      k = d / 2;
+      partner = d ^ 1ULL;
+    } else if (d < half) {
+      k = d;
+      partner = d + half;
+    } else {
+      k = d - half;
+      partner = d - half;
+    }
+    const float cos =
+        __bfloat162float(cos_cache[(unsigned long long)cache_row * half + k]);
+    const float sin =
+        __bfloat162float(sin_cache[(unsigned long long)cache_row * half + k]);
+    const float current = __bfloat162float(x[i]);
+    const float paired = __bfloat162float(x[partner + i - d]);
+    float output;
+    if (interleaved) {
+      output = (d & 1ULL) == 0
+          ? __fsub_rn(__fmul_rn(cos, current), __fmul_rn(sin, paired))
+          : __fadd_rn(__fmul_rn(sin, paired), __fmul_rn(cos, current));
+    } else if (d < half) {
+      output = __fsub_rn(__fmul_rn(cos, current), __fmul_rn(sin, paired));
+    } else {
+      output = __fadd_rn(__fmul_rn(sin, paired), __fmul_rn(cos, current));
+    }
+    y[i] = __float2bfloat16_rn(output);
+  }
+}
 "#;
 
 /// Return the claim-time dtype denial for RoPE's floating-point inputs.
 pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
     let &dtype = input_dtypes.first()?;
-    if !matches!(dtype, DataType::Float16 | DataType::Float32) {
+    if !matches!(
+        dtype,
+        DataType::Float16 | DataType::Float32 | DataType::BFloat16
+    ) {
         let dtype = match dtype {
             DataType::BFloat16 => "bf16".into(),
             other => format!("{other:?}"),
         };
         return Some(Cow::Owned(format!(
-            "RotaryEmbedding: dtype {dtype} not supported on CUDA (expected f16 or f32)"
+            "RotaryEmbedding: dtype {dtype} not supported on CUDA (expected f16, bf16, or f32)"
         )));
     }
     if input_dtypes
@@ -211,7 +288,7 @@ pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'stati
         .any(|&input_dtype| input_dtype != dtype)
     {
         return Some(Cow::Borrowed(
-            "RotaryEmbedding: X, cos_cache, and sin_cache must have the same f16/f32 dtype",
+            "RotaryEmbedding: X, cos_cache, and sin_cache must have the same f16/bf16/f32 dtype",
         ));
     }
     None
@@ -232,7 +309,17 @@ fn check_arity(
     }
     Ok(())
 }
-/// f32/f16 RotaryEmbedding kernel carrying the resolved attributes.
+
+fn rotary_entry(dtype: DataType) -> &'static str {
+    match dtype {
+        DataType::Float16 => "rotary_embedding_f16",
+        DataType::BFloat16 => "rotary_embedding_bf16",
+        DataType::Float32 => "rotary_embedding_f32",
+        _ => unreachable!("RotaryEmbedding dtype must be validated before dispatch"),
+    }
+}
+
+/// f32/f16/bf16 RotaryEmbedding kernel carrying the resolved attributes.
 pub struct RotaryEmbeddingKernel {
     runtime: Arc<CudaRuntime>,
     interleaved: bool,
@@ -299,11 +386,14 @@ impl Kernel for RotaryEmbeddingKernel {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         check_arity("RotaryEmbedding", inputs, outputs, 3, 4, 1)?;
         let dtype = inputs[0].dtype;
-        if !matches!(dtype, DataType::Float16 | DataType::Float32)
-            || inputs[..3].iter().any(|input| input.dtype != dtype)
+        if !matches!(
+            dtype,
+            DataType::Float16 | DataType::Float32 | DataType::BFloat16
+        ) || inputs[..3].iter().any(|input| input.dtype != dtype)
         {
             return Err(EpError::KernelFailed(
-                "RotaryEmbedding: X/cos_cache/sin_cache must have the same f16 or f32 dtype".into(),
+                "RotaryEmbedding: X/cos_cache/sin_cache must have the same f16, bf16, or f32 dtype"
+                    .into(),
             ));
         }
         if inputs.iter().any(|input| !input.is_contiguous()) || !outputs[0].is_contiguous() {
@@ -441,11 +531,7 @@ impl Kernel for RotaryEmbeddingKernel {
             ));
         }
 
-        let entry = if dtype == DataType::Float16 {
-            "rotary_embedding_f16"
-        } else {
-            "rotary_embedding_f32"
-        };
+        let entry = rotary_entry(dtype);
         let func =
             self.runtime
                 .nvrtc_function(ROTARY_EMBEDDING_MODULE, ROTARY_EMBEDDING_SOURCE, entry)?;
@@ -514,8 +600,185 @@ impl Kernel for RotaryEmbeddingKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed exact f16/f32 shape signature",
+                "requires a warmed exact f16/bf16/f32 shape signature",
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider};
+    use onnx_runtime_ir::compute_contiguous_strides;
+
+    use super::*;
+    use crate::CudaExecutionProvider;
+
+    fn bf16_bytes(values: &[bf16]) -> &[u8] {
+        // SAFETY: bf16 is plain two-byte data and the byte slice retains the input lifetime.
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn run_bf16_rope(ep: &CudaExecutionProvider, interleaved: bool) -> (Vec<bf16>, Vec<bf16>) {
+        let shape = [2, 2, 3, 7];
+        let strides = compute_contiguous_strides(&shape);
+        let cache_shape = [shape[0] * shape[2], 3];
+        let cache_strides = compute_contiguous_strides(&cache_shape);
+        let input = (0..shape.iter().product())
+            .map(|index| bf16::from_f32(((index * 17 % 97) as f32 - 48.0) / 23.0))
+            .collect::<Vec<_>>();
+        let cos = (0..cache_shape.iter().product())
+            .map(|index| bf16::from_f32((index as f32 * 0.071).cos()))
+            .collect::<Vec<_>>();
+        let sin = (0..cache_shape.iter().product())
+            .map(|index| bf16::from_f32((index as f32 * 0.071).sin()))
+            .collect::<Vec<_>>();
+        let bytes = std::mem::size_of_val(input.as_slice());
+        let cache_bytes = std::mem::size_of_val(cos.as_slice());
+        let input_buffer = ep.allocate(bytes, 256).unwrap();
+        let cos_buffer = ep.allocate(cache_bytes, 256).unwrap();
+        let sin_buffer = ep.allocate(cache_bytes, 256).unwrap();
+        let mut output_buffer = ep.allocate(bytes, 256).unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(bf16_bytes(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(bf16_bytes(&cos), cuptr(cos_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(bf16_bytes(&sin), cuptr(sin_buffer.as_ptr()))
+                .unwrap();
+        }
+        let inputs = [
+            TensorView::new(
+                DevicePtr(input_buffer.as_ptr()),
+                DataType::BFloat16,
+                &shape,
+                &strides,
+                ep.device_id(),
+            ),
+            TensorView::new(
+                DevicePtr(cos_buffer.as_ptr()),
+                DataType::BFloat16,
+                &cache_shape,
+                &cache_strides,
+                ep.device_id(),
+            ),
+            TensorView::new(
+                DevicePtr(sin_buffer.as_ptr()),
+                DataType::BFloat16,
+                &cache_shape,
+                &cache_strides,
+                ep.device_id(),
+            ),
+        ];
+        let output = TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        RotaryEmbeddingKernel {
+            runtime: runtime.clone(),
+            interleaved,
+            num_heads: 0,
+            rotary_embedding_dim: 6,
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
+        }
+        .execute(&inputs, &mut [output])
+        .unwrap();
+
+        let mut output_bytes = vec![0u8; bytes];
+        unsafe {
+            runtime
+                .dtoh(&mut output_bytes, cuptr(output_buffer.as_ptr()))
+                .unwrap();
+        }
+        let output = output_bytes
+            .chunks_exact(2)
+            .map(|raw| bf16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+        ep.deallocate(input_buffer).unwrap();
+        ep.deallocate(cos_buffer).unwrap();
+        ep.deallocate(sin_buffer).unwrap();
+        ep.deallocate(output_buffer).unwrap();
+
+        let mut reference = input.clone();
+        let head_size = shape[3];
+        let rotary_dim = 6;
+        let half = rotary_dim / 2;
+        for b in 0..shape[0] {
+            for h in 0..shape[1] {
+                for s in 0..shape[2] {
+                    let cache_row = b * shape[2] + s;
+                    for d in 0..rotary_dim {
+                        let index = ((b * shape[1] + h) * shape[2] + s) * head_size + d;
+                        let (k, partner) = if interleaved {
+                            (d / 2, d ^ 1)
+                        } else if d < half {
+                            (d, d + half)
+                        } else {
+                            (d - half, d - half)
+                        };
+                        let paired_index = index + partner - d;
+                        let cos_value = cos[cache_row * half + k].to_f32();
+                        let sin_value = sin[cache_row * half + k].to_f32();
+                        let current = input[index].to_f32();
+                        let paired = input[paired_index].to_f32();
+                        let value = if (interleaved && d % 2 == 0) || (!interleaved && d < half) {
+                            cos_value * current - sin_value * paired
+                        } else {
+                            sin_value * paired + cos_value * current
+                        };
+                        reference[index] = bf16::from_f32(value);
+                    }
+                }
+            }
+        }
+        (output, reference)
+    }
+
+    #[test]
+    fn rotary_dispatch_preserves_existing_entries_and_adds_bf16() {
+        assert_eq!(rotary_entry(DataType::Float16), "rotary_embedding_f16");
+        assert_eq!(rotary_entry(DataType::Float32), "rotary_embedding_f32");
+        assert_eq!(rotary_entry(DataType::BFloat16), "rotary_embedding_bf16");
+    }
+
+    #[test]
+    fn bf16_rope_matches_fp32_reference_for_both_layouts_and_odd_head_size() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        for interleaved in [false, true] {
+            let (output, reference) = run_bf16_rope(&ep, interleaved);
+            let max_error = output
+                .iter()
+                .zip(&reference)
+                .map(|(actual, expected)| (actual.to_f32() - expected.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 0.015625,
+                "interleaved={interleaved} max bf16 error {max_error}"
+            );
+            for index in (6..output.len()).step_by(7) {
+                assert_eq!(
+                    output[index].to_bits(),
+                    reference[index].to_bits(),
+                    "unrotated odd head tail changed at element {index}"
+                );
+            }
         }
     }
 }

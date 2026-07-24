@@ -113,17 +113,23 @@ fn rms_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
     require_one_of(
         input_dtypes,
         0,
-        &[DataType::Float16, DataType::Float32],
+        &[DataType::Float16, DataType::BFloat16, DataType::Float32],
         "X",
     )?;
     require_one_of(
         input_dtypes,
         1,
-        &[DataType::Float16, DataType::Float32],
+        &[DataType::Float16, DataType::BFloat16, DataType::Float32],
         "scale",
     )?;
     if input_dtypes[0] == DataType::Float32 && input_dtypes[1] != DataType::Float32 {
         return Err("f32 X requires f32 scale".into());
+    }
+    if input_dtypes[0] != DataType::Float32
+        && input_dtypes[1] != DataType::Float32
+        && input_dtypes[1] != input_dtypes[0]
+    {
+        return Err("f16/bf16 X requires matching storage dtype or f32 scale".into());
     }
     match node.attr("stash_type") {
         None => Ok(()),
@@ -147,7 +153,7 @@ fn rotary_embedding(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
     require_one_of(
         input_dtypes,
         0,
-        &[DataType::Float16, DataType::Float32],
+        &[DataType::Float16, DataType::BFloat16, DataType::Float32],
         "X",
     )?;
     for (index, name) in [(1, "cos_cache"), (2, "sin_cache")] {
