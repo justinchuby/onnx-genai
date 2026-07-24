@@ -120,6 +120,39 @@ __device__ __forceinline__ void store_float(void* data, unsigned long long index
 }
 
 // Gather a K/V input into a contiguous [batch, heads, total_seq, dim] present
+// Derive the valid attended length on-device by scanning the additive attention
+// mask bias for its first masked (large-negative) entry. At fixed capacity the
+// mask row is [.., max_len] with 0 bias for valid keys [0,total) and a
+// large-negative bias for padding [total,max_len); the frontier index is the
+// valid length `total`. This lets the decode step read its growing length from
+// device memory (the mask the kernel already consumes) instead of host shape
+// metadata, so the launch geometry stays fixed and capture-safe. Assumes a
+// single contiguous right-aligned valid run (greedy decode, no interior pads).
+extern "C" __global__ void derive_len(
+    const void* mask, int mask_kind, unsigned long long max_len, int* out_len) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int total = (int)max_len;
+  for (unsigned long long j = 0; j < max_len; ++j) {
+    float v;
+    if (mask_kind == 1) {
+      v = ((const float*)mask)[j];
+    } else if (mask_kind == 3) {
+      v = __half2float(((const __half*)mask)[j]);
+    } else if (mask_kind == 4) {
+      v = __bfloat162float(((const __nv_bfloat16*)mask)[j]);
+    } else {
+      v = ((const unsigned char*)mask)[j] != 0 ? 0.0f : NEG_INF;
+    }
+    if (v < -1000.0f) {
+      total = (int)j;
+      break;
+    }
+  }
+  out_len[0] = total;
+}
+
 // buffer, applying the 3D->4D head reshape and the past ++ current concat.
 extern "C" __global__ void build_kv(
     const void* past, const void* cur, void* out, int dtype,
@@ -128,7 +161,18 @@ extern "C" __global__ void build_kv(
     unsigned long long past_seq, unsigned long long cur_seq,
     unsigned long long total_seq, unsigned long long dim,
     unsigned long long out_cap, unsigned long long past_cap,
-    unsigned long long write_start, unsigned long long elements) {
+    unsigned long long write_start, unsigned long long elements,
+    const int* dev_len) {
+  // Capture-safe path: when `dev_len` is provided the valid length (and hence
+  // the append slot) is read from device memory rather than the host-provided
+  // `total_seq`/`write_start`/`past_seq`. `cur_seq` (=1 at decode) and the
+  // per-head capacities stay host-constant, so grid geometry never changes.
+  if (dev_len != nullptr) {
+    const int total = dev_len[0];
+    past_seq = (unsigned long long)(total - (long long)cur_seq);
+    total_seq = (unsigned long long)total;
+    write_start = past_seq;
+  }
   // `out_cap`/`past_cap` are the per-head seq strides of the destination and
   // (4D) source caches. When they exceed the valid length the cache is stored
   // at a fixed physical capacity, so head h occupies a constant slot and the
@@ -209,7 +253,7 @@ extern "C" __global__ void attention_row(
     const void* mask, float* scores, void* y, void* qk_out,
     const long long* offsets, const long long* pad_limits,
     unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
-    unsigned long long kv_heads, unsigned long long total_seq,
+    unsigned long long kv_heads, unsigned long long total_seq_arg,
     unsigned long long cap,
     unsigned long long head_size, unsigned long long v_head_size,
     unsigned long long group,
@@ -218,12 +262,19 @@ extern "C" __global__ void attention_row(
     int mask_kind, int mask_rank,
     unsigned long long md0, unsigned long long md1,
     unsigned long long md2, unsigned long long md3,
-    int qk_mode, int want_qk) {
+    int qk_mode, int want_qk, const int* dev_len) {
   const unsigned long long row = blockIdx.x;
   const unsigned long long total_rows = batch * q_heads * q_seq;
   if (row >= total_rows) {
     return;
   }
+  // Capture-safe path: read the growing valid length from device memory (the
+  // frontier `derive_len` scanned from the mask) instead of the host-provided
+  // extent, so the launch geometry stays fixed. The per-head key/value stride
+  // (`cap`) is the fixed physical capacity, and the score scratch is sized for
+  // `total_rows * cap`, so a device length <= cap indexes within bounds.
+  const unsigned long long total_seq =
+      (dev_len != nullptr) ? (unsigned long long)dev_len[0] : total_seq_arg;
   const unsigned long long i = row % q_seq;
   unsigned long long rem = row / q_seq;
   const unsigned long long qh = rem % q_heads;
@@ -675,8 +726,16 @@ impl StandardAttentionKernel {
         out_cap: usize,
         past_cap: usize,
         write_start: usize,
+        dev_len: CUdeviceptr,
     ) -> Result<()> {
-        let span = total_seq.saturating_sub(write_start);
+        // With a device length the append rebuilds exactly `cur_seq` rows into
+        // their fixed slot, so the element count (and thus grid geometry) is
+        // host-constant regardless of the growing valid length.
+        let span = if dev_len != 0 {
+            cur_seq
+        } else {
+            total_seq.saturating_sub(write_start)
+        };
         let elements = (batch * heads * span * dim) as u64;
         if elements == 0 {
             return Ok(());
@@ -714,7 +773,8 @@ impl StandardAttentionKernel {
             .arg(&out_cap)
             .arg(&past_cap)
             .arg(&write_start)
-            .arg(&elements);
+            .arg(&elements)
+            .arg(&dev_len);
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (
@@ -727,6 +787,37 @@ impl StandardAttentionKernel {
             })
         }
         .map_err(|error| driver_err("launch build_kv", error))
+        .map(|_| ())
+    }
+
+    /// Scan the additive attention-mask bias for its valid-length frontier and
+    /// write it to `out_len` (a device `i32`). One launch of a single thread;
+    /// used by the capture-safe decode path so the growing length is read from
+    /// device memory rather than host shape metadata.
+    fn launch_derive_len(
+        &self,
+        mask_ptr: CUdeviceptr,
+        mask_kind: i32,
+        max_len: u64,
+        out_len: CUdeviceptr,
+    ) -> Result<()> {
+        let func =
+            self.runtime
+                .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, "derive_len")?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&mask_ptr)
+            .arg(&mask_kind)
+            .arg(&max_len)
+            .arg(&out_len);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch derive_len", error))
         .map(|_| ())
     }
 }
@@ -1090,6 +1181,32 @@ impl Kernel for StandardAttentionKernel {
             };
             let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
+            // On-device valid length for the capture-safe decode path: derive
+            // the growing length from the attention-mask frontier so the kernel
+            // reads it from device memory instead of host shape metadata (whose
+            // extent is frozen when a CUDA graph is captured). Eligible only for
+            // the fixed-capacity, mask-masked (non-causal) single-query decode
+            // step; every other path passes a null pointer and keeps the
+            // host-derived length, so eager/prefill/dense/GQA are unchanged.
+            let dev_length_eligible = has_past_key
+                && has_past_value
+                && q_seq == 1
+                && k_cur.seq == 1
+                && v_cur.seq == 1
+                && !self.is_causal
+                && mask.kind != 0
+                && capacity_key
+                && capacity_value
+                && alias_key
+                && alias_value;
+            let dev_len_ptr = if dev_length_eligible {
+                let ptr = alloc(&self.runtime, &mut owned, std::mem::size_of::<i32>())?;
+                self.launch_derive_len(mask.ptr, mask.kind, mask.dims[3], ptr)?;
+                ptr
+            } else {
+                0
+            };
+
             // Upload the per-batch control arrays.
             let offsets_ptr = alloc(&self.runtime, &mut owned, offsets.len() * 8)?;
             let pad_limits_ptr = alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?;
@@ -1138,6 +1255,7 @@ impl Kernel for StandardAttentionKernel {
                 key_cap,
                 key_past_cap,
                 key_write_start,
+                dev_len_ptr,
             )?;
             self.launch_build_kv(
                 past_value_ptr,
@@ -1156,6 +1274,7 @@ impl Kernel for StandardAttentionKernel {
                 value_cap,
                 value_past_cap,
                 value_write_start,
+                dev_len_ptr,
             )?;
 
             // When staged, publish the freshly-built dense cache back into the
@@ -1237,7 +1356,8 @@ impl Kernel for StandardAttentionKernel {
                     .arg(&md2)
                     .arg(&md3)
                     .arg(&qk_mode)
-                    .arg(&want_qk_i);
+                    .arg(&want_qk_i)
+                    .arg(&dev_len_ptr);
                 unsafe {
                     builder.launch(LaunchConfig {
                         grid_dim: (total_rows.min(u32::MAX as u64).max(1) as u32, 1, 1),
