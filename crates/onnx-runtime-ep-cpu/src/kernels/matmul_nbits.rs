@@ -7276,6 +7276,17 @@ mod tests {
     }
 
     fn run_affinity_defer_child(scenario: &str, affinity: &str, forced: bool) {
+        // Worker/Rayon thread count for the child. The `forced` scenario builds
+        // the persistent SPMD pool, spinning up this many busy-waiting workers
+        // *inside* an already-spawned child test binary; a hard-coded value
+        // (previously `8`) oversubscribes the constrained native Windows ARM64 CI
+        // runner and intermittently faults the whole child with an empty-stderr
+        // `STATUS_ACCESS_VIOLATION` (0xC0000005) — the same environment-level
+        // flaky class PR #111 fixed for `parity_worker_count`. Reuse that helper
+        // (largest odd count <= `available_parallelism()`, capped at 15) so the
+        // pressure is bounded on small runners while every host still forces a
+        // real (>= 1 worker) pool, keeping the affinity-defer assertion meaningful.
+        let workers = parity_worker_count().to_string();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
@@ -7284,8 +7295,8 @@ mod tests {
             .arg("--test-threads=1")
             .env(AFFINITY_DEFER_CHILD_ENV, scenario)
             .env(crate::decode_affinity::DECODE_AFFINITY_ENV, affinity)
-            .env(DECODE_THREADS_ENV, "8")
-            .env("RAYON_NUM_THREADS", "8");
+            .env(DECODE_THREADS_ENV, &workers)
+            .env("RAYON_NUM_THREADS", &workers);
         if forced {
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
         } else {
