@@ -427,8 +427,8 @@ fn build_capacity_present(
     let cap_row = dims.cache_seq * dims.head_size;
     let current_row = dims.current_seq * dims.head_size;
     let mut present = vec![0.0f32; dims.batch * dims.kv_heads * cap_row];
-    for b in 0..dims.batch {
-        let write_pos = valid_lens[b].saturating_sub(dims.current_seq);
+    for (b, &valid_len) in valid_lens.iter().enumerate() {
+        let write_pos = valid_len.saturating_sub(dims.current_seq);
         for h in 0..dims.kv_heads {
             let dst = (b * dims.kv_heads + h) * cap_row;
             present[dst..dst + cap_row].copy_from_slice(&past[dst..dst + cap_row]);
@@ -442,8 +442,7 @@ fn build_capacity_present(
 }
 
 fn validate_indices(indices: &[i64], dims: Dims, per_batch_bound: &[usize]) -> Result<()> {
-    for b in 0..dims.batch {
-        let bound = per_batch_bound[b];
+    for (b, &bound) in per_batch_bound.iter().enumerate() {
         for h in 0..dims.index_heads {
             for q in 0..dims.q_seq {
                 let row = ((b * dims.index_heads + h) * dims.q_seq + q) * dims.selected_width;
