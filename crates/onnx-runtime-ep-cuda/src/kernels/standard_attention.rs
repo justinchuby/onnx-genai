@@ -1011,6 +1011,32 @@ impl Kernel for StandardAttentionKernel {
                     present_value_expected * element_bytes,
                 )?,
             };
+
+            // In-place KV growth: the decode graph binds the present K/V output
+            // onto the same buffer as the past K/V input. `build_kv` rewrites the
+            // whole cache with a *wider* per-head stride (total_seq > past_seq),
+            // so writing directly into that buffer makes head h's current-token
+            // store overlap head h+1's past load across unordered threads — a
+            // data race that leaves every head beyond head 0 nondeterministic.
+            // Stage the rebuild in a disjoint scratch buffer (reads the pristine
+            // past), then copy the fully-formed dense cache back. General: any
+            // model whose default-domain Attention grows an aliased KV cache.
+            let stage_key = has_past_key && present_key_out == Some(past_key_ptr);
+            let stage_value = has_past_value && present_value_out == Some(past_value_ptr);
+            let key_kv_ptr = if stage_key {
+                alloc(&self.runtime, &mut owned, present_key_expected * element_bytes)?
+            } else {
+                present_key_ptr
+            };
+            let value_kv_ptr = if stage_value {
+                alloc(
+                    &self.runtime,
+                    &mut owned,
+                    present_value_expected * element_bytes,
+                )?
+            } else {
+                present_value_ptr
+            };
             let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
             // Upload the per-batch control arrays.
@@ -1029,7 +1055,7 @@ impl Kernel for StandardAttentionKernel {
             self.launch_build_kv(
                 past_key_ptr,
                 k_cur_ptr,
-                present_key_ptr,
+                key_kv_ptr,
                 has_past_key,
                 k_cur.is_3d,
                 past_key.as_ref().map(|p| p.is_3d).unwrap_or(false),
@@ -1044,7 +1070,7 @@ impl Kernel for StandardAttentionKernel {
             self.launch_build_kv(
                 past_value_ptr,
                 v_cur_ptr,
-                present_value_ptr,
+                value_kv_ptr,
                 has_past_value,
                 v_cur.is_3d,
                 past_value.as_ref().map(|p| p.is_3d).unwrap_or(false),
@@ -1056,6 +1082,28 @@ impl Kernel for StandardAttentionKernel {
                 value_total_seq,
                 v_head_size,
             )?;
+
+            // When staged, publish the freshly-built dense cache back into the
+            // aliased present/past buffer for the next step. Source and
+            // destination are disjoint, so this copy is race-free.
+            if stage_key {
+                unsafe {
+                    self.runtime.dtod(
+                        key_kv_ptr,
+                        present_key_ptr,
+                        present_key_expected * element_bytes,
+                    )?;
+                }
+            }
+            if stage_value {
+                unsafe {
+                    self.runtime.dtod(
+                        value_kv_ptr,
+                        present_value_ptr,
+                        present_value_expected * element_bytes,
+                    )?;
+                }
+            }
 
             // Launch the main attention kernel: one block per query row.
             let func =
@@ -1083,8 +1131,8 @@ impl Kernel for StandardAttentionKernel {
                 let mut builder = self.runtime.stream().launch_builder(&func);
                 builder
                     .arg(&q_ptr)
-                    .arg(&present_key_ptr)
-                    .arg(&present_value_ptr)
+                    .arg(&key_kv_ptr)
+                    .arg(&value_kv_ptr)
                     .arg(&mask.ptr)
                     .arg(&scores_ptr)
                     .arg(&y_ptr)
@@ -1143,5 +1191,187 @@ impl Kernel for StandardAttentionKernel {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
             "setup synchronously uploads per-batch control arrays and reads nonpad_kv_seqlen D2H",
         )
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    //! Regression tests for in-place KV-cache growth in the default-domain
+    //! `Attention` kernel. DeepSeek-V2-Lite (MLA) binds the `present_key` /
+    //! `present_value` outputs onto the SAME device buffer as the `past_key` /
+    //! `past_value` inputs. `build_kv` re-lays-out the whole cache at a WIDER
+    //! per-head stride (`total_seq` vs `past_seq`) in that shared buffer, so a
+    //! head's current-token write collides with the next head's past read across
+    //! unordered CUDA threads — nondeterministic for every head > 0. The fix
+    //! stages the rebuild into a disjoint scratch buffer and copies it back, so
+    //! the aliased result must equal a non-aliased reference and be stable across
+    //! repeated runs.
+    use super::*;
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
+    use std::ffi::c_void;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        CudaRuntime::new(0).ok().map(Arc::new)
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn bytes_f32(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    // Deterministic pseudo-random fill in [-1, 1).
+    fn fill(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9e3779b97f4a7c15);
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Reproduces the DeepSeek MLA decode step: multi-head KV cache grown by one
+    /// token, with `present` optionally aliasing `past` in one device buffer.
+    #[test]
+    fn decode_kv_growth_alias_matches_reference_and_is_deterministic() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let device = DeviceId::cuda(0);
+
+        // MLA-flavoured shape: multi-head, asymmetric K (192-style) vs V head size.
+        let heads = 4usize;
+        let past = 3usize;
+        let qlen = 1usize;
+        let total = past + qlen;
+        let kdim = 6usize; // key/query head size
+        let vdim = 4usize; // value head size
+
+        // Fixed inputs.
+        let q = fill(heads * qlen * kdim, 1);
+        let k_cur = fill(heads * qlen * kdim, 2);
+        let v_cur = fill(heads * qlen * vdim, 3);
+        let past_k = fill(heads * past * kdim, 4);
+        let past_v = fill(heads * past * vdim, 5);
+
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: true,
+            q_num_heads: Some(heads),
+            kv_num_heads: Some(heads),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+        };
+
+        // Runs one decode step; when `alias` the present KV outputs share the
+        // past KV buffers. Returns the attention output Y as f32.
+        let run = |alias: bool| -> Vec<f32> {
+            let q_sh = [1usize, heads, qlen, kdim];
+            let kcur_sh = [1usize, heads, qlen, kdim];
+            let vcur_sh = [1usize, heads, qlen, vdim];
+            let pastk_sh = [1usize, heads, past, kdim];
+            let pastv_sh = [1usize, heads, past, vdim];
+            let presk_sh = [1usize, heads, total, kdim];
+            let presv_sh = [1usize, heads, total, vdim];
+            let y_sh = [1usize, heads, qlen, vdim];
+
+            let q_st = compute_contiguous_strides(&q_sh);
+            let kcur_st = compute_contiguous_strides(&kcur_sh);
+            let vcur_st = compute_contiguous_strides(&vcur_sh);
+            let pastk_st = compute_contiguous_strides(&pastk_sh);
+            let pastv_st = compute_contiguous_strides(&pastv_sh);
+            let presk_st = compute_contiguous_strides(&presk_sh);
+            let presv_st = compute_contiguous_strides(&presv_sh);
+            let y_st = compute_contiguous_strides(&y_sh);
+
+            // Cache buffers sized for the grown (total) length.
+            let key_cap = heads * total * kdim * 4;
+            let val_cap = heads * total * vdim * 4;
+            let q_bytes = f32_bytes(&q);
+            let kcur_bytes = f32_bytes(&k_cur);
+            let vcur_bytes = f32_bytes(&v_cur);
+
+            unsafe {
+                let key_buf = rt.alloc_raw(key_cap).unwrap();
+                let val_buf = rt.alloc_raw(val_cap).unwrap();
+                let q_buf = rt.alloc_raw(q_bytes.len()).unwrap();
+                let kcur_buf = rt.alloc_raw(kcur_bytes.len()).unwrap();
+                let vcur_buf = rt.alloc_raw(vcur_bytes.len()).unwrap();
+                // Past occupies the dense [heads, past, dim] prefix of the cache buffer.
+                rt.htod(&f32_bytes(&past_k), key_buf).unwrap();
+                rt.htod(&f32_bytes(&past_v), val_buf).unwrap();
+                rt.htod(&q_bytes, q_buf).unwrap();
+                rt.htod(&kcur_bytes, kcur_buf).unwrap();
+                rt.htod(&vcur_bytes, vcur_buf).unwrap();
+
+                let (presk_buf, presv_buf) = if alias {
+                    (key_buf, val_buf)
+                } else {
+                    (rt.alloc_raw(key_cap).unwrap(), rt.alloc_raw(val_cap).unwrap())
+                };
+                let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
+
+                let dp = |p: CUdeviceptr| DevicePtr(p as *const c_void);
+                let dpm = |p: CUdeviceptr| DevicePtrMut(p as *mut c_void);
+
+                let inputs = [
+                    TensorView::new(dp(q_buf), DataType::Float32, &q_sh, &q_st, device),
+                    TensorView::new(dp(kcur_buf), DataType::Float32, &kcur_sh, &kcur_st, device),
+                    TensorView::new(dp(vcur_buf), DataType::Float32, &vcur_sh, &vcur_st, device),
+                    TensorView::absent(DataType::Float32),
+                    TensorView::new(dp(key_buf), DataType::Float32, &pastk_sh, &pastk_st, device),
+                    TensorView::new(dp(val_buf), DataType::Float32, &pastv_sh, &pastv_st, device),
+                ];
+                let mut outputs = [
+                    TensorMut::new(dpm(y_buf), DataType::Float32, &y_sh, &y_st, device),
+                    TensorMut::new(dpm(presk_buf), DataType::Float32, &presk_sh, &presk_st, device),
+                    TensorMut::new(dpm(presv_buf), DataType::Float32, &presv_sh, &presv_st, device),
+                ];
+
+                kernel.execute(&inputs, &mut outputs).unwrap();
+
+                let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
+                rt.dtoh(&mut y_bytes, y_buf).unwrap();
+
+                rt.free_raw(key_buf).unwrap();
+                rt.free_raw(val_buf).unwrap();
+                rt.free_raw(q_buf).unwrap();
+                rt.free_raw(kcur_buf).unwrap();
+                rt.free_raw(vcur_buf).unwrap();
+                rt.free_raw(y_buf).unwrap();
+                if !alias {
+                    rt.free_raw(presk_buf).unwrap();
+                    rt.free_raw(presv_buf).unwrap();
+                }
+                bytes_f32(&y_bytes)
+            }
+        };
+
+        // Non-aliased present/past buffers give the race-free ground truth.
+        let reference = run(false);
+        // In-place growth must reproduce it exactly and be stable across runs.
+        let aliased = run(true);
+        assert_eq!(
+            aliased, reference,
+            "in-place KV-cache growth (present aliases past) must match the non-aliased reference"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                run(true),
+                aliased,
+                "aliased KV-cache growth must be deterministic across runs (iteration {i})"
+            );
+        }
     }
 }
