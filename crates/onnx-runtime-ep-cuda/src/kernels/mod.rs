@@ -38,6 +38,7 @@ pub mod elementwise;
 mod flash_attention;
 pub mod fused_gemm;
 pub mod gather;
+pub mod gather_block_quantized;
 pub mod gemm;
 mod gqa_decode;
 mod gqa_decode_fp16;
@@ -350,6 +351,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
+        Box::new(gather_block_quantized::GatherBlockQuantizedFactory {
             runtime: runtime.clone(),
         }),
     );

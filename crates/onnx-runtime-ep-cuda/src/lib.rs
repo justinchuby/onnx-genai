@@ -72,6 +72,7 @@ pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };
 pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
+pub use kernels::gather_block_quantized::GATHER_BLOCK_QUANTIZED_CAPTURE_ERROR_INDEX;
 pub use kernels::group_query_attention::{
     GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE, GQA_CAPTURE_ERROR_POSITION,
     GQA_CAPTURE_ERROR_PRESENT_CAPACITY, GQA_CAPTURE_ERROR_QUERY_NEGATIVE,
