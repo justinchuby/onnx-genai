@@ -350,6 +350,13 @@ fn nemotron_audio_pipeline_example_parses_and_validates() {
             .map(Vec::len),
         Some(2)
     );
+    assert_eq!(pipeline.dataflow.len(), 3);
+    assert!(
+        !pipeline.dataflow.iter().any(|edge| {
+            edge.from == "prediction_network.decoder_output" && edge.to == "joiner.decoder_output"
+        }),
+        "the schema cannot express the required decoder-output transpose"
+    );
     assert!(matches!(
         pipeline.strategy.kind,
         PipelineStrategyKind::Composite

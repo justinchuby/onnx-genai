@@ -34,8 +34,9 @@ PY
 ## Inspected package contract
 
 `audio_processor_config.json` specifies 16-kHz PCM, a 512-point FFT, 400-sample
-Hann window, 160-sample hop, 128 mel bins, pre-emphasis 0.97, and 8,960 samples
-per streaming chunk. It produces `audio_signal` float32 `[1, 65, 128]`.
+Hann window, 160-sample hop, 128 mel bins, and pre-emphasis 0.97.
+`genai_config.json` specifies the 8,960-sample streaming chunk. The processor
+produces `audio_signal` float32 `[1, 65, 128]`.
 
 | Component | Inputs | Outputs |
 |---|---|---|
@@ -53,18 +54,22 @@ reported approximately `1e-2` LSTM/encoder parity difference.
 ## Fit and gaps
 
 **Fits cleanly:** `audio_encoder` component role; `audio_features`-named
-front-end output; explicit component filenames; typed dataflow boundaries;
-audio-presence and `PhaseRunOn::EveryStep` gates; and fixed, zero-initialized
-recurrent state pairs for both encoder caches and LSTM state.
+front-end output; explicit component filenames; dtype-compatible dataflow
+boundaries; audio-presence and `PhaseRunOn::EveryStep` gates; and fixed,
+zero-initialized recurrent state pairs for both encoder caches and LSTM state.
 
 **Gaps:** the current component `io` schema has semantic bindings for decoder
 ports and state pairs, but no generic typed port inventory. The table above is
 therefore documentation for required terminal ports such as `lang_id`,
 `encoded_lengths`, and VAD state rather than machine-actionable metadata.
-There is also no native audio preprocessing program (FFT/mel/pre-emphasis), no
-streaming chunk/window scheduling contract, no transducer blank/symbol loop
-contract (`blank_id=13087`, `max_symbols_per_step=10`), and no way to state
-that joiner argmax conditionally feeds the next LSTM token. The composite stages
-describe their execution phases but do not make that conditional feedback edge
-executable. A full E2E runner requires these additions; this example validates
-only the metadata parse/schema/pipeline-DAG contract.
+The decoder-to-joiner link is deliberately not declared: `decoder_output` is
+`[B,640,T]`, while the joiner requires `[B,T,640]`. That transpose is required,
+but metadata dataflow edges carry only endpoints, dtype, and device transfer;
+the contract cannot express the layout adaptation. There is also no native audio
+preprocessing program (FFT/mel/pre-emphasis), streaming chunk/window scheduling
+contract, transducer blank/symbol loop contract (`blank_id=13087`,
+`max_symbols_per_step=10`), or way to state that joiner argmax conditionally
+feeds the next LSTM token. The composite stages describe their execution phases
+but do not make that conditional feedback edge executable. A full E2E runner
+requires these additions; this example validates only the metadata
+parse/schema/pipeline-DAG contract.

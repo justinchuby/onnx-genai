@@ -69,10 +69,6 @@ pipeline:
       to: joiner.encoder_output
       dtype: fp32
       device_transfer: false
-    - from: prediction_network.decoder_output
-      to: joiner.decoder_output
-      dtype: fp32
-      device_transfer: false
   strategy:
     kind: composite
     stages:
