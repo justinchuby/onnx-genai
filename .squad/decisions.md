@@ -3322,3 +3322,11 @@ Worktree left pristine (no scratch files).
 **Why safe:** row-sharded GEMV is exactly associative (each output row = independent full-K dot); per-node shard concat is bit-for-bit identical, no cross-node reduction. Locked by ..._matches_flat_gemv_bit_for_bit (to_bits) test.
 **Test non-vacuity PROVEN:** perturbing dispatch partition 3:10→4:9 → "row 3 dispatched on node 0 but placed on node 1" FAIL; revert → PASS. Closes Ferro's earlier vacuous-test rejection.
 **Gates:** 884 lib + 10 regression green; clippy w/ + w/o mlas -D warnings; fmt; aarch64 check.
+
+### Zero-copy f32 activation borrow in M>1 prefill (landed on PR #105)
+**Commit cherry-picked:** 710e18f (apone). Reviewer: Drake (opus) 🟢 APPROVED (non-author).
+**What:** M>1 prefill MatMulNBits previously called to_dense_compute_f32, always allocating+memcpy'ing the activation into an owned f32 Vec every execute(). New compute_activations_cow returns Cow<[f32]>: BORROWS in place when dtype==Float32 && is_contiguous() && device.is_host_accessible(); still OWNS/widens for f16/bf16/strided/device. qwen3-0.6b & phi3.5-mini carry f32 activations → widen phase 161ms→~0/prefill, warm wall-clock ~+3-4%.
+**Why safe:** old to_dense_f32 already had a contiguous fast path using the identical from_raw_parts(data_ptr::<f32>(), numel(shape)); the borrow returns that same slice instead of copying → bit-identical. strided/transposed/broadcast (is_contiguous strict), non-zero offset (data_ptr applies byte_offset), device (is_host_accessible) all excluded → owned path. Token-EXACT.
+**Test non-vacuity PROVEN:** perturb borrow branch v[0]+=1.0 → "borrowed vs copied activation diverged" FAIL; revert → PASS (m=1 and m=4).
+**Residual warm prefill gap** (~2.9x qwen / ~1.4x phi) now dominated by MLAS over-sharding the small prefill GEMM → separate work-proportional thread-cap in mlas-sys (perf/mlas-sqnbit-threads, apone).
+**Gates:** 883 lib green; clippy w/ + w/o mlas -D warnings; fmt; aarch64 check.

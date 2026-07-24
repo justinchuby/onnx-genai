@@ -13,6 +13,7 @@
 //! including its SIMD backend. The 8-bit correctness path uses the same affine
 //! dequantization with one uint8 weight and optional uint8 zero point per block.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::OnceLock;
 
@@ -361,7 +362,7 @@ impl Kernel for MatMulNBitsKernel {
             && self.constant_inputs[2]
             && zero_points.is_none_or(|_| self.constant_inputs[3])
             && group_indices.is_none_or(|_| self.constant_inputs[4]);
-        let activations = mm_profile::time_widen(|| to_dense_compute_f32(&inputs[0]))?;
+        let activations = mm_profile::time_widen(|| compute_activations_cow(&inputs[0]))?;
         let m = numel(&a_shape[..a_shape.len() - 1]);
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
@@ -3165,6 +3166,32 @@ fn to_dense_compute_f32(view: &TensorView) -> Result<Vec<f32>> {
     }
 }
 
+/// Materialize the activation operand as a contiguous `f32` slice for the GEMV /
+/// MLAS SQNBit kernels, **borrowing** it in place when it is already a
+/// contiguous, host-resident `f32` tensor (the common case: these int4 decoder
+/// graphs carry `float32` activations). All downstream kernels only *read* the
+/// activations, so borrowing skips a redundant per-call `m*k` copy that
+/// `to_dense_compute_f32` would otherwise allocate on every `MatMulNBits`
+/// invocation. Strided or lower-precision (`f16`/`bf16`) inputs still widen into
+/// an owned buffer, preserving the previous behaviour bit-for-bit.
+fn compute_activations_cow<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+    if view.dtype == DataType::Float32 && view.is_contiguous() && view.device.is_host_accessible() {
+        view.validate()?;
+        let n = numel(view.shape);
+        if n == 0 {
+            return Ok(Cow::Borrowed(&[]));
+        }
+        // SAFETY: the validated, host-accessible, contiguous `f32` view describes
+        // `n` consecutive readable `f32` from its element origin, bounds-checked
+        // against the backing allocation by the owning EP (ep-api safety
+        // invariant #1). `f32` has no invalid bit patterns and the borrow is tied
+        // to the view's lifetime, which outlives this kernel call.
+        let slice = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), n) };
+        return Ok(Cow::Borrowed(slice));
+    }
+    Ok(Cow::Owned(to_dense_compute_f32(view)?))
+}
+
 /// Preserve the original f32 writer exactly; f16/bf16 outputs reuse the shared
 /// narrowing path, which has portable scalar conversion on every processor.
 fn write_compute_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
@@ -3538,6 +3565,75 @@ mod tests {
     #[test]
     fn matmulnbits_accuracy4_block128_partial_k_batched_matches_fp32_reference() {
         run_accuracy4_case(3, 141, 7, 128);
+    }
+
+    /// Regression for the zero-copy activation borrow (`compute_activations_cow`):
+    /// a contiguous host `f32` activation is passed straight through to the GEMV /
+    /// MLAS kernels without the old per-call `to_dense_compute_f32` copy. A
+    /// strided (non-contiguous) `f32` view of the *same* logical values still
+    /// takes the owned-materialization path. The kernel output MUST be
+    /// byte-for-byte identical between the borrowed and copied activation for both
+    /// the `m == 1` decode and `m > 1` batched/prefill routes; otherwise the
+    /// borrow shortcut changed numerics.
+    #[test]
+    fn matmulnbits_activation_borrow_matches_strided_copy_bit_exact() {
+        for &(m, k, n, block_size) in &[(1usize, 128usize, 16usize, 32usize), (4, 96, 8, 32)] {
+            let a_values: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+                .collect();
+            let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+            let (graph, node) = accuracy4_model(m, k, n, block_size);
+            let model = Model::new(&graph);
+            let blocks = k.div_ceil(block_size);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+
+            // Contiguous f32 activation -> zero-copy borrow path.
+            let a_contig = Owned::f32(&[m, k], &a_values);
+            let kernel = CpuExecutionProvider::new()
+                .get_kernel(model.graph.node(node), &[], 1)
+                .unwrap();
+            let mut y_borrow = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(
+                    &[a_contig.view(), b.view(), scales_t.view()],
+                    &mut [y_borrow.view_mut()],
+                )
+                .unwrap();
+
+            // Same values exposed as a NON-contiguous view (padded row stride) ->
+            // forces the owned `to_dense_compute_f32` materialization path.
+            let pad = 3usize;
+            let mut padded = vec![0.0f32; m * (k + pad)];
+            for r in 0..m {
+                padded[r * (k + pad)..r * (k + pad) + k]
+                    .copy_from_slice(&a_values[r * k..r * k + k]);
+            }
+            let a_strided =
+                Owned::f32(&[m, k + pad], &padded).with_view(&[m, k], &[(k + pad) as i64, 1]);
+            assert!(
+                !a_strided.view().is_contiguous(),
+                "strided activation must be non-contiguous to exercise the copy path"
+            );
+            let kernel = CpuExecutionProvider::new()
+                .get_kernel(model.graph.node(node), &[], 1)
+                .unwrap();
+            let mut y_copy = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(
+                    &[a_strided.view(), b.view(), scales_t.view()],
+                    &mut [y_copy.view_mut()],
+                )
+                .unwrap();
+
+            assert_eq!(
+                y_borrow.bytes, y_copy.bytes,
+                "borrowed vs copied activation diverged (m={m}, k={k}, n={n}, block={block_size})"
+            );
+        }
     }
 
     /// Cross-CPU regression: an m=1 **asymmetric** int4 `accuracy_level=4`
