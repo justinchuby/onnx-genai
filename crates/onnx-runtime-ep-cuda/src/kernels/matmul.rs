@@ -14,18 +14,21 @@
 //! * mismatched inner dims / dtypes → a plain kernel error (a real mistake, not
 //!   a missing feature)
 
-use std::sync::Arc;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use cudarc::cublaslt::{result as cublaslt, sys as cublaslt_sys};
+use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
-use crate::error::{driver_err, not_implemented};
+use crate::error::{cublas_err, driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
-/// NVRTC module/entry for the dense fp16 decode GEMV (see [`GEMV_F16_SRC`]).
+/// NVRTC module/entry for the dense decode GEMVs.
 const GEMV_F16_MODULE: &str = "matmul_dense_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_dense_gemv_f16";
 /// Threads per block for the dense fp16 GEMV. One thread owns one output
@@ -87,20 +90,162 @@ impl KernelFactory for MatMulFactory {
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(MatMulKernel {
             runtime: self.runtime.clone(),
+            f32_gemv: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
 }
 
-/// cuBLASLt-backed f32/f16/bf16 MatMul kernel with a capturable dense fp16 GEMV
-/// fast path for the M==1 decode step.
+/// cuBLASLt-backed f32/f16/bf16 MatMul kernel with capturable dense f32/fp16
+/// GEMV fast paths for the M==1 decode step.
 pub struct MatMulKernel {
     runtime: Arc<CudaRuntime>,
+    /// cuBLASLt objects and workspace preselected during the f32 M==1 warmup.
+    /// Reusing the exact algorithm preserves bitwise parity with the old path
+    /// while eliminating all capture-time setup and device allocation.
+    f32_gemv: Mutex<Option<F32GemvPlan>>,
     /// Set after every [`execute`](Kernel::execute) to record whether the call
     /// took the allocation- and sync-free GEMV fast path (capture-safe) or the
     /// cuBLASLt path (per-call workspace + heuristic, not capturable). Mirrors
     /// the `MatMulNBits` decode GEMV capture contract.
     last_call_capture_safe: AtomicBool,
+}
+
+struct F32GemvPlan {
+    runtime: Arc<CudaRuntime>,
+    k: usize,
+    n: usize,
+    handle: cublaslt_sys::cublasLtHandle_t,
+    desc: cublaslt_sys::cublasLtMatmulDesc_t,
+    a_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    b_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    c_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    algo: cublaslt_sys::cublasLtMatmulAlgo_t,
+    workspace: CUdeviceptr,
+    workspace_bytes: usize,
+}
+
+// SAFETY: cuBLASLt handles/descriptors are context-independent host objects.
+// Calls through a plan are serialized by `MatMulKernel::f32_gemv`.
+unsafe impl Send for F32GemvPlan {}
+
+impl Drop for F32GemvPlan {
+    fn drop(&mut self) {
+        // SAFETY: every object was created once by `F32GemvPlan::new` and is
+        // destroyed exactly once after the plan can no longer be launched.
+        unsafe {
+            if self.workspace != 0 {
+                let _ = self.runtime.free_raw(self.workspace);
+            }
+            if !self.c_layout.is_null() {
+                let _ = cublaslt::destroy_matrix_layout(self.c_layout);
+            }
+            if !self.b_layout.is_null() {
+                let _ = cublaslt::destroy_matrix_layout(self.b_layout);
+            }
+            if !self.a_layout.is_null() {
+                let _ = cublaslt::destroy_matrix_layout(self.a_layout);
+            }
+            if !self.desc.is_null() {
+                let _ = cublaslt::destroy_matmul_desc(self.desc);
+            }
+            if !self.handle.is_null() {
+                let _ = cublaslt::destroy_handle(self.handle);
+            }
+        }
+    }
+}
+
+impl F32GemvPlan {
+    fn new(runtime: Arc<CudaRuntime>, k: usize, n: usize) -> Result<Self> {
+        let mut plan = Self {
+            runtime,
+            k,
+            n,
+            handle: std::ptr::null_mut(),
+            desc: std::ptr::null_mut(),
+            a_layout: std::ptr::null_mut(),
+            b_layout: std::ptr::null_mut(),
+            c_layout: std::ptr::null_mut(),
+            // SAFETY: the algorithm is not read until the heuristic initializes it.
+            algo: unsafe { std::mem::zeroed() },
+            workspace: 0,
+            workspace_bytes: 0,
+        };
+        plan.handle = cublaslt::create_handle().map_err(|e| cublas_err("cublasLtCreate", e))?;
+        let dt = cublaslt_sys::cudaDataType_t::CUDA_R_32F;
+        plan.a_layout = cublaslt::create_matrix_layout(dt, n as u64, k as u64, n as i64)
+            .map_err(|e| cublas_err("cublasLtMatrixLayoutCreate(B)", e))?;
+        plan.b_layout = cublaslt::create_matrix_layout(dt, k as u64, 1, k as i64)
+            .map_err(|e| cublas_err("cublasLtMatrixLayoutCreate(A)", e))?;
+        plan.c_layout = cublaslt::create_matrix_layout(dt, n as u64, 1, n as i64)
+            .map_err(|e| cublas_err("cublasLtMatrixLayoutCreate(C)", e))?;
+        plan.desc =
+            cublaslt::create_matmul_desc(cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, dt)
+                .map_err(|e| cublas_err("cublasLtMatmulDescCreate", e))?;
+        let pref = cublaslt::create_matmul_pref()
+            .map_err(|e| cublas_err("cublasLtMatmulPreferenceCreate", e))?;
+        let heuristic_result = (|| {
+            unsafe {
+                cublaslt::set_matmul_pref_attribute(
+                    pref,
+                    cublaslt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    (&WORKSPACE_BYTES) as *const usize as *const c_void,
+                    std::mem::size_of::<usize>(),
+                )
+            }
+            .map_err(|e| cublas_err("set MAX_WORKSPACE_BYTES", e))?;
+            unsafe {
+                cublaslt::get_matmul_algo_heuristic(
+                    plan.handle,
+                    plan.desc,
+                    plan.a_layout,
+                    plan.b_layout,
+                    plan.c_layout,
+                    plan.c_layout,
+                    pref,
+                )
+            }
+            .map_err(|e| cublas_err("select f32 M==1 MatMul algorithm", e))
+        })();
+        // SAFETY: `pref` is live and is never retained by the selected algorithm.
+        unsafe {
+            let _ = cublaslt::destroy_matmul_pref(pref);
+        }
+        let heuristic = heuristic_result?;
+        plan.algo = heuristic.algo;
+        plan.workspace_bytes = heuristic.workspaceSize;
+        if plan.workspace_bytes > 0 {
+            plan.workspace = plan.runtime.alloc_raw(plan.workspace_bytes)?;
+        }
+        Ok(plan)
+    }
+
+    fn launch(&self, stream: cudarc::driver::sys::CUstream, a: u64, b: u64, c: u64) -> Result<()> {
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        unsafe {
+            cublaslt::matmul(
+                self.handle,
+                self.desc,
+                (&alpha) as *const f32 as *const c_void,
+                (&beta) as *const f32 as *const c_void,
+                b as *const c_void,
+                self.a_layout,
+                a as *const c_void,
+                self.b_layout,
+                c as *const c_void,
+                self.c_layout,
+                c as *mut c_void,
+                self.c_layout,
+                (&self.algo) as *const cublaslt_sys::cublasLtMatmulAlgo_t,
+                self.workspace as *mut c_void,
+                self.workspace_bytes,
+                stream as cublaslt_sys::cudaStream_t,
+            )
+        }
+        .map_err(|e| cublas_err("cublasLtMatmul f32 M==1", e))
+    }
 }
 
 /// Map an ONNX element type to a cuBLASLt GEMM dtype.
@@ -285,16 +430,25 @@ impl MatMulKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const std::ffi::c_void);
         let c_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const std::ffi::c_void);
 
-        // Bandwidth-bound decode fast path: a single fp16 `y[1, N] = a[1, K] *
-        // B[K, N]` (no batching). cuBLASLt's M==1 GEMV leaves HBM idle *and* is
-        // non-capturable (per-call workspace + heuristic query). The dedicated
-        // GEMV kernel streams `B` once, coalesced, with no allocation or sync,
-        // so it approaches roofline and folds into the decode CUDA graph. The
-        // gate is purely structural (dtype + M==1 + single matrix), never a
-        // model dimension.
-        if dtype == GemmDtype::F16 && plan.m == 1 && plan.batch_shape.iter().product::<usize>() == 1
-        {
-            self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?;
+        // Decode fast path: a single f32/fp16 `y[1, N] = a[1, K] * B[K, N]`.
+        // fp16 uses the dedicated GEMV; f32 reuses a cuBLASLt algorithm and
+        // workspace selected once at warmup. Neither path allocates, queries a
+        // heuristic, or synchronizes while capturing. The gate is purely
+        // structural, never tied to a model dimension.
+        let single_gemv = plan.m == 1
+            && plan.k > 0
+            && plan.n > 0
+            && plan.batch_shape.iter().product::<usize>() == 1;
+        if single_gemv && matches!(dtype, GemmDtype::F16 | GemmDtype::F32) {
+            match dtype {
+                GemmDtype::F16 => {
+                    self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?
+                }
+                GemmDtype::F32 => {
+                    self.launch_dense_gemv_f32(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?
+                }
+                GemmDtype::Bf16 => unreachable!("bf16 excluded by GEMV gate"),
+            }
             self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
         }
@@ -335,7 +489,13 @@ impl MatMulKernel {
                     )
                 }
             })
-            .and_then(|()| self.runtime.synchronize());
+            .and_then(|()| {
+                if self.runtime.is_capturing()? {
+                    Ok(())
+                } else {
+                    self.runtime.synchronize()
+                }
+            });
 
         // Always release the workspace, even on failure.
         // SAFETY: `workspace` came from the `alloc_raw` above and is freed once.
@@ -387,6 +547,51 @@ impl MatMulKernel {
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMul fp16 GEMV", err))
     }
+
+    /// Launch the dense true-fp32 GEMV on the runtime stream.
+    ///
+    /// Warmup selects and retains the cuBLASLt algorithm and its required
+    /// workspace. Subsequent launches perform no allocation, host
+    /// synchronization, or heuristic query.
+    fn launch_dense_gemv_f32(
+        &self,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        k: usize,
+        n: usize,
+    ) -> Result<()> {
+        let capturing = self.runtime.is_capturing()?;
+        let mut cached = self.f32_gemv.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep MatMul: f32 GEMV plan lock poisoned".into())
+        })?;
+        if cached
+            .as_ref()
+            .is_some_and(|candidate| candidate.k != k || candidate.n != n)
+        {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep MatMul: f32 GEMV signature changed during capture \
+                     (warmed K={}, N={}; current K={k}, N={n})",
+                    cached.as_ref().unwrap().k,
+                    cached.as_ref().unwrap().n,
+                )));
+            }
+            *cached = None;
+        }
+        if cached.is_none() {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep MatMul: f32 GEMV K={k}, N={n} was not warmed before capture"
+                )));
+            }
+            *cached = Some(F32GemvPlan::new(self.runtime.clone(), k, n)?);
+        }
+        cached
+            .as_ref()
+            .unwrap()
+            .launch(self.runtime.stream_ptr(), a_ptr, b_ptr, c_ptr)
+    }
 }
 
 impl Kernel for MatMulKernel {
@@ -400,15 +605,14 @@ impl Kernel for MatMulKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // The dense fp16 M==1 GEMV fast path uses only launch-time shared memory
-        // and fixed geometry — no per-call allocation, D2H, or synchronization —
-        // so it is capture-safe. The cuBLASLt path (per-call workspace + heuristic
-        // query) is not; advertise capture only when the last call took the GEMV.
+        // The dense f32/fp16 M==1 fast paths perform no per-call allocation,
+        // D2H, heuristic query, or synchronization. Advertise capture only after
+        // such a call has warmed any required persistent state.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires the dense fp16 M==1 GEMV fast path; the cuBLASLt path's \
+                "requires a dense f32/fp16 M==1 GEMV fast path; the cuBLASLt path's \
                  per-call workspace allocation/free and heuristic query are not capturable",
             )
         }
