@@ -428,15 +428,11 @@ impl Engine {
             );
         }
 
-        // Auto-enable CUDA graph capture for models that will run the shared-KV
-        // (SharedBuffer) decode path. Capturing the fixed-shape decode step
-        // removes per-kernel launch overhead and makes per-token cost flat
-        // across context length — the single largest CUDA decode speedup (on
-        // Qwen2.5-0.5B it lifts decode from ~150 to ~365 tok/s at 512 tokens).
-        // It is skipped for non-shared-KV models, where ORT cannot capture the
-        // graph, and always yields to an explicit `ONNX_GENAI_CUDA_GRAPH`.
+        // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
+        // outputs on some Foundry exports. SessionOptions still honors an explicit
+        // ONNX_GENAI_CUDA_GRAPH=1 request; native whole-step capture is separate.
         let mut session_options = session_options;
-        maybe_enable_cuda_graph(&mut session_options, &model_directory);
+        configure_ort_cuda_graph(&mut session_options, &model_directory.model_path);
 
         let environment = Environment::new("onnx-genai-engine")
             .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
@@ -2725,37 +2721,12 @@ fn graph_dtype_name(dtype: DataType) -> &'static str {
     }
 }
 
-/// Turn on CUDA graph capture when the model will run the shared-KV
-/// (SharedBuffer) decode path and the user has not overridden
-/// `ONNX_GENAI_CUDA_GRAPH`.
-///
-/// The decision is made from on-disk metadata *before* the session is created,
-/// because ORT's `enable_cuda_graph` provider option must be set at session
-/// construction. Enabling it for a non-shared-KV (growing rebind) model would
-/// only trip ORT's "cannot use the graph capture feature" path, so it is gated
-/// on shared-KV eligibility. An explicit `ONNX_GENAI_CUDA_GRAPH=0` is always
-/// honored; an explicit `=1` has already turned `graph_capture` on.
-///
-/// Even a shared-KV model is left uncaptured when its graph contains control-flow
-/// nodes (`If`/`Loop`/`Scan`, e.g. Phi-4-mini's long-context RoPE branch): ORT
-/// cannot capture such graphs, and forcing `enable_cuda_graph` on them triggers a
-/// pathological ~6× slower per-Run path.
-fn maybe_enable_cuda_graph(options: &mut SessionOptions, model_directory: &ModelDirectory) {
-    let cfg = onnx_genai_runtime_config::runtime_config();
-    if !options.selects_cuda() || options.graph_capture || cfg.cuda_graph_explicit {
-        return;
-    }
-    if model_prefers_shared_kv_decode(model_directory) {
-        if model_has_control_flow_nodes(&model_directory.model_path) {
-            tracing::info!(
-                "skipping CUDA graph capture: model '{}' contains control-flow nodes (If/Loop/Scan), which ORT cannot capture — enabling capture would force a much slower per-Run path",
-                model_directory.model_path.display()
-            );
-            return;
-        }
-        options.graph_capture = true;
-        tracing::info!(
-            "auto-enabling CUDA graph capture for the shared-KV GQA decode path (set ONNX_GENAI_CUDA_GRAPH=0 to disable)"
+/// Preserve explicit ORT graph settings and warn about known-unsafe opt-ins.
+fn configure_ort_cuda_graph(options: &mut SessionOptions, model_path: &Path) {
+    if options.selects_cuda() && options.graph_capture && model_has_control_flow_nodes(model_path) {
+        tracing::warn!(
+            "ORT CUDA graph capture was explicitly enabled for model '{}', but it contains control-flow nodes (If/Loop/Scan); capture may fail or run substantially slower",
+            model_path.display()
         );
     }
 }
@@ -2844,24 +2815,6 @@ fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
         matches!(node.domain.as_str(), "" | "ai.onnx")
             && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
     }))
-}
-
-/// Whether the model at `model_directory` declares the shared-KV (SharedBuffer)
-/// decode contract, read from on-disk metadata without an ORT session.
-///
-/// Native `inference_metadata.yaml` takes precedence (it carries the KV dtype);
-/// otherwise an onnxruntime-genai `genai_config.json` is consulted for its
-/// `past_present_share_buffer` + GQA + max-length declaration.
-fn model_prefers_shared_kv_decode(model_directory: &ModelDirectory) -> bool {
-    if let Some(metadata_path) = &model_directory.metadata_path {
-        return onnx_genai_metadata::load_metadata(metadata_path)
-            .ok()
-            .and_then(|metadata| crate::decode::shared_kv_buffer_len_from_metadata(&metadata))
-            .is_some();
-    }
-    onnx_genai_genai_config::find_in_dir(&model_directory.root)
-        .and_then(|path| onnx_genai_genai_config::load(&path).ok())
-        .is_some_and(|config| config.shared_kv_buffer_supported())
 }
 
 fn read_f32_weights(path: &Path) -> anyhow::Result<Vec<f32>> {
@@ -3202,6 +3155,28 @@ mod tests {
         let plain = write_scan_model(&[("", "MatMul"), ("", "Add"), ("", "GroupQueryAttention")]);
         assert!(!model_has_control_flow_nodes(&plain));
         std::fs::remove_file(&plain).ok();
+    }
+
+    #[test]
+    fn ort_cuda_graph_configuration_is_opt_in() {
+        let model = write_scan_model(&[("", "MatMul")]);
+        let mut options =
+            SessionOptions::with_execution_provider(onnx_genai_ort::ep_selection("cuda"));
+
+        options.graph_capture = false;
+        configure_ort_cuda_graph(&mut options, &model);
+        assert!(
+            !options.graph_capture,
+            "ORT capture must stay off by default"
+        );
+
+        options.graph_capture = true;
+        configure_ort_cuda_graph(&mut options, &model);
+        assert!(
+            options.graph_capture,
+            "an explicit ORT capture opt-in must be preserved"
+        );
+        std::fs::remove_file(&model).ok();
     }
 
     #[test]

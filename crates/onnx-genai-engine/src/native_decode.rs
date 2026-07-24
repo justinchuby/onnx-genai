@@ -1850,10 +1850,28 @@ impl DecodeCudaState {
 
         // A graph records launch geometry, so replay is unsafe when a persistent
         // binding exposes a growing logical prefix instead of fixed capacity.
-        let graph_enabled = graph_enabled
-            && !bindings
-                .iter()
-                .any(|binding| binding.has_dynamic_logical_input_shape());
+        // Surfacing *which* bindings force the eager fallback (previously a
+        // silent `graph_enabled = false`) is essential for capture bring-up of
+        // new architectures — enable with `RUST_LOG=onnx_genai_engine=debug`.
+        let dynamic_logical: Vec<String> = bindings
+            .iter()
+            .filter(|binding| binding.has_dynamic_logical_input_shape())
+            .map(|binding| {
+                format!(
+                    "{} (physical {:?} vs logical {:?})",
+                    binding.input_name(),
+                    binding.physical_shape(),
+                    binding.logical_shape()
+                )
+            })
+            .collect();
+        if graph_enabled && !dynamic_logical.is_empty() {
+            tracing::debug!(
+                "native CUDA decode graph capture disabled: input binding(s) {} expose a growing logical prefix instead of fixed capacity (their consumers are not capacity-aware kernels); decode continues eagerly",
+                dynamic_logical.join(", ")
+            );
+        }
+        let graph_enabled = graph_enabled && dynamic_logical.is_empty();
 
         Ok(Self {
             logical_len: 0,
