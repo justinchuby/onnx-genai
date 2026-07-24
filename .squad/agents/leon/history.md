@@ -103,3 +103,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 2026-07-21T23:55Z — VLM WP2 native image processor landed via Sapper revision after Chew rejection; living VLM scope artifact preserved in inbox.
 
 - 2026-07-22T00:00:00Z — Reviewed Batty CUDA-graph auto-enable 🟢 GREEN: 7/7 criteria passed, no model-name gating, correct env/metadata precedence, and capture-safety fallback intact.
+
+## 2026-07-24T15:10:00Z — Phi decode-correctness lock
+
+Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. Following Holden's review, Pris environment-gated and generalized shared `common/decode_lock.rs`; Leon co-owns this Qwen/Phi helper with Batty and Pris.

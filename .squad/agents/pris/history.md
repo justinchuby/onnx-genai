@@ -122,3 +122,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
+
+## 2026-07-24T15:10:00Z — Shared decode-lock helper revision
+
+Revised the Phi decode lock after Holden's rejection: environment-gated real-model coverage and generalized `common/decode_lock.rs` across Phi and Qwen. Holden approved; Pris co-owns the shared helper with Batty and Leon.

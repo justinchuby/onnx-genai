@@ -51,3 +51,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 2026-07-21T23:55Z — Native CUDA opset-24 ConstantOfShape/Gelu/OneHot landed; WP4 revision is the active correction after Zhora/Gaff lockout; clippy hygiene folded.
 
 - 2026-07-22T00:00:00Z — CUDA graph auto-enable in native decode merged to main as `610bde0`; H200 Qwen2.5-0.5B improved 441.49→828.54 tok/s and Phi-4-mini 67.32→94.91 tok/s, token-exact with zero fallbacks. Leon reviewed 🟢.
+
+## 2026-07-24T15:10:00Z — Qwen decode-correctness locks
+
+Authored bit-exact native-CUDA-versus-ORT 64-token decode locks for Qwen2.5-0.5B and 7B. Chew approved; the shared `common/decode_lock.rs` helper is now co-owned with Leon and Pris for Qwen/Phi coverage.

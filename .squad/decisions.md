@@ -361,3 +361,335 @@ regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
 - **Qwen2.5-0.5B O(seq) decode collapse fixed (`798d430`, Irmgard; landed by Sadik; reviewed 🟢 Borogrove/re-benched Marsten).** Root cause: f32 KV graph selected the single-warp-per-row f32 GQA decode kernel that serially walked full context. Fix: capture-safe 1/2/4/8/16-way split-K online-softmax kernel + merge, selected purely by dtype/shape. Qwen 313→460 tok/s @128, 84→448 @1024; Llama Q4KM flat; generic (no model-name), capture-safe, SM-portable. Marsten H200 re-bench: Qwen0.5B 459/446, 1.5B 486/460, 7B 230/223, Llama-1B Q4KM 450/439 tok/s.
 - **CPU MoE Phase 2 landed (`dc0cc18`, Sloat) + MOE_SUPPORT.md §6.2 honesty fix (Sapper; Voight 🔴→🟢).** Route-first int4 QMoE (peak-1-expert residency via RAII guard), grouped-expert GEMM (4.12x decode / 1.83x prefill), doc now correctly states CPU MoE/QMoE/BlockQuantizedMoE implemented + registered, CUDA incomplete. 648 CPU unit tests pass.
 - **Mobius PR #423 (DeepSeek MoE Phase 1 conformance) CI remediation (Abdul).** Ruff lint + codecov fixed; Integration/L4/L5 jobs fail on infra (`libcudart.so.13` missing on runner, identical on main). PR remains OPEN/UNMERGED for Justin.
+
+
+<!-- scribe-merge-2026-07-24T15-10-00Z-decode-locks-and-date-cleanup -->
+## 2026-07-24 — Decision inbox reconciliation
+
+<!-- merged from deckard-phi-capture-seams.md -->
+### 2026-07-23: Eliminate Phi decode CUDA-graph capture seams (Greater + invariant If)
+**By:** Deckard
+**Branch:** `perf/phi-capture-seams` (off `origin/main` @ `1073404`) — commit `54cc02f`. **Needs review before merge; not merged to main.**
+
+**Scope:** CUDA-graph capture-seam elimination in the executor / CUDA EP. This is NOT a GEMV micro-opt — `matmul_nbits.rs` kernels untouched.
+
+#### Root cause — confirmed
+Marsten's Nsight finding reproduced exactly via `ONNX_GENAI_LOG_CAPTURE_SEGMENTS=1`. Phi-4-mini decode splits into **3 captured graphs across 2 per-token seams**, both inside the LongRoPE `rotemb_caches_subgraph`:
+- `Greater` node 8 = `Greater(attn_mask_gather_len, 4096)` → **rank-0 scalar bool**. An **eager device seam**: the CUDA binary-predicate kernel (`BinaryPredKernel`) allocated + uploaded + freed broadcast metadata and `synchronize()`d the stream every call, and hard-declined capture.
+- `If` node 13 = `If(Greater.out) → (cos_cache, sin_cache)`. A **host seam**: both branches are just two `Constant`s emitting the *full* rotary caches (else/steady = `[4096,48]` fp16 ≈ 393 KB each). Control flow reads `cond` to the host and re-runs the taken branch — re-materializing and re-copying ~786 KB host→device — **every decode step**.
+
+The `If` executor-timer cost Marsten saw is dominated by this per-step branch re-materialization + child-executor overhead, not GPU compute.
+
+#### Fixes (both capture-safe, byte-identical)
+1. **`Greater` capturable** (`kernels/pointwise.rs`, `kernels/elementwise.rs`). Persist broadcast metadata in a `BroadcastMetadataCache` (reused across steps — no per-step alloc/upload/free/sync) and advertise `CaptureSupport::Supported` for a stable dtype/shape signature, exactly mirroring the elementwise `BinaryKernel`. Generalized the eligibility gate so a **rank-0 scalar / single-element** predicate output (the LongRoPE `Greater` shape, which `is_fixed_decode_shape` rejected) qualifies. Result: `Greater` folds into the graph → **3 → 2 graphs**.
+2. **Loop-invariant `If` specialization** (`executor.rs::exec_if`). General mechanism, not a Phi hardcode: an `If` whose *taken branch has no outer captures* (`required_outer_names(body).is_empty()`) produces outputs that depend only on its own constants, so once taken with a predicate its outputs are already resident in their persistent buffers. The predicate is **still read every step (the correctness guard)**; only the redundant branch re-execution + its host→device cache copies are skipped. Correctness rails:
+   - A branch that reads loop-varying captures is **never** memoized (`taken_branch_is_invariant` gate) → no stale/wrong output. Regression test `if_never_memoizes_branch_that_reads_changing_captures`.
+   - A predicate flip re-runs the branch; an output-shape change (LongRoPE short↔long at seq 4096) retires the installed graph via the existing `control_flow_seam_invalidated`. Regression test `if_memoizes_invariant_branch_but_reruns_on_predicate_flip`.
+   - The memo is cleared before every capture so freshly reallocated buffers are always repopulated during the capture pass.
+
+#### Results (H200, idle GPU, `--steady --warmups 2 --runs 9 --tokens 120`)
+- **Graph count: 3 → 2** (`Greater` seam removed; `If` remains a *cheap, memoized* seam).
+- **Throughput: ~193 → ~213 tok/s (+~10%, ~0.47 ms/token)**, matched interleaved before/after runs (baseline binary from `origin/main` vs after; e.g. 193.45→211.12, 197.34→213.63, 195.76→215.61). Absolute numbers drift with thermal state, so the *interleaved* delta is the reliable figure. Recovers roughly half the gap to ORT's 229.62 (native was 193.90); remaining ~ -7% is not from these seams.
+- **Correctness: byte-identical generated token ids** before vs after over 150 tokens (`diff` clean).
+- **Gate:** `CUDA_VISIBLE_DEVICES=N cargo test -p onnx-runtime-ep-cuda --features cuda --lib` → **192 passed / 0 failed**. Full `onnx-runtime-session --features cuda` suite green (incl. `cuda_control_flow_safety`, `control_flow` 21/21 with 2 new tests).
+- **Clippy:** lib targets of both touched crates clean under `-D warnings`. Pre-existing repo-wide clippy debt in unrelated GPU **test** files and `executor.rs` (`let mut input_axes`, `manual_is_multiple_of`, `too_many_arguments`) fails `--all-targets` on `origin/main` *before* my changes too — not introduced here.
+
+#### Attribution / honesty
+- The **`Greater` fix alone yields ~0 throughput** (a Greater-only build measured at baseline). It is a device seam with no host sync, so removing it doesn't remove a per-token stall — but it is a correct capture-safety improvement and a prerequisite (3→2 graphs). Essentially all of the +10% is the **`If` memoization** removing the per-token ~786 KB cache re-materialization + child-executor dispatch.
+- **Partial vs the "collapse 3→1" goal:** I did **not** capture the `If` branch inline into a single graph. Reaching 1 graph would still require reading `cond` each step for the guard (the flip at seq 4096 changes the rotary cache and *must* be caught — skipping the read entirely, which an early ceiling experiment did, is exactly the wrong-branch corruption we must avoid, and was only "correct" because a 120-token window never crosses 4096). Fully removing the per-step `cond` read would need on-device branch selection (a device `Where`/select graph rewrite keeping both caches resident, or a CUDA device-conditional graph node) — a structural, higher-risk change out of scope for this correctness-critical pass. The memoization already captures the dominant recoverable cost with zero correctness risk, so the single-graph rewrite is deferred as a separate, reviewable follow-up rather than rushed.
+
+**Files changed:** `crates/onnx-runtime-ep-cuda/src/kernels/pointwise.rs`, `crates/onnx-runtime-ep-cuda/src/kernels/elementwise.rs` (expose `BroadcastMetadataCache` + helpers `pub(crate)`), `crates/onnx-runtime-session/src/executor.rs`, `crates/onnx-runtime-session/tests/control_flow.rs` (+2 tests).
+
+
+<!-- merged from deckard-phi-ondevice-rope.md -->
+# Deckard — On-device LongRoPE select: de-hosting the `If` capture seam
+
+Branch: `perf/phi-ondevice-rope` off `origin/main` (`8793ea9`)
+Status: **needs review before merge (correctness-sensitive)** — do NOT self-merge.
+Requested by: Justin Chu. Worker: Deckard.
+
+## The seam (reconfirmed)
+
+Phi-4-mini's LongRoPE selector is `Greater(gather_len, 4096)` → host `If`
+(`/model/rotemb_caches_subgraph/If`) choosing between two pure `Constant`
+cos/sin caches:
+- `then_branch` (predicate TRUE / long-context): cos,sin `[131072, 48]` fp16
+- `else_branch` (predicate FALSE / short-context): cos,sin `[4096, 48]` fp16
+
+`If` is a control-flow op, so `plan_capture_segments` (executor.rs) *always*
+makes it an eager seam: every decode step the cond scalar is read back to the
+host, the captured CUDA graph is split into **2 segments / 1 seam**, and CPU/GPU
+serialize at the split. The predicate is loop-invariant during steady decode but
+paid every step (~1.9 ms/token, the dominant non-GPU cost per Marsten's Nsight).
+
+The merged memo fix (`719d2fe`) removed the *cheap* part (branch re-exec + ~786 KB
+cache copies) but left the seam itself. This change removes the seam.
+
+## The rewrite (general, not Phi-hardcoded)
+
+Two parts, both topology-driven:
+
+**Part A — capture-safe `Where` kernel** (`kernels/where_op.rs`).
+Rewrote the CUDA `Where` to mirror the merged capture-safe Binary/Greater pattern:
+a persistent `WhereMetadataCache` (device metadata buffer, alloc/free/sync
+discipline copied from `elementwise.rs::BroadcastMetadataCache`), no per-call
+alloc/upload/free, no per-call `synchronize()`. `capture_support()` advertises
+`Supported` **only** for an *invariant scalar-predicate select*
+(`cond.numel()==1 && x.shape==y.shape==out.shape`), recorded as a capture
+signature guarded by `require_matching_capture_signature`. The general
+broadcasting `Where` stays an eager seam — no regression.
+
+**Part B — `CudaOnDeviceConstantSelect` optimizer pass** (`optimizer.rs`,
+registered in `cuda_optimization_passes()`).
+Generalized as: *"a loop-invariant scalar-predicate `If` whose branches are
+pure, side-effect-free constant selections can be lowered to on-device
+`Where(cond, then_const, else_const)` per output."* Fires only when BOTH branches
+contain ONLY `Constant` nodes (zero formal inputs, one output each, `value`
+tensor attr — no outer captures).
+- **Equal-shape branches** → direct `Where`, unconditionally byte-exact.
+- **Differing leading dim** (Phi's `[131072,48]` vs `[4096,48]`): requires
+  `cond = Greater/GreaterOrEqual(_, T)` with scalar-int `T`; the TRUE branch must
+  be the LARGER table; trailing dims equal; and `else_lead == T` (crisp tie). The
+  smaller (FALSE) constant is zero-padded along axis 0 up to the large leading
+  dim. **Output shape is fixed at the large shape `[131072,48]` forever** → no
+  per-step shape change → single captured graph even across the boundary.
+
+## Correctness argument (airtight) + guards
+
+Padding APPENDS rows at indices `[else_lead, then_lead)` that the original short
+table never had. When the predicate is false (`seq ≤ T = else_lead = 4096`), every
+position the model indexes is `< T`, i.e. within the original valid extent — the
+appended rows are provably never read. When true, the full large table is selected
+unchanged. `Where` recomputes the selection from the *live* predicate each step,
+so the boundary flip is exact with no stale memo. GQA derives rotary_dim from
+`cos.shape[1]` (=48) and indexes by position; `shape[0]` is only a bound, so the
+larger `[131072,48]` output is safe. Byte-preservation of the original
+`[0, else_lead)` rows is asserted in a unit test.
+
+## Validation (idle GPU 0, `.cudaenv.sh` sourced)
+
+**Captured-region count (the target):**
+| build    | segments | eager seams |
+|----------|----------|-------------|
+| baseline (`8793ea9`) | **2** | **1** |
+| ondevice | **1** | **0** |
+Collapse achieved. Verified via `ONNX_GENAI_LOG_CAPTURE_SEGMENTS=1`.
+
+**Per-op trace (`profile_native --trace`, 60 tokens):**
+| op      | baseline                        | ondevice                     |
+|---------|---------------------------------|------------------------------|
+| `If`    | 60 exec, **59 rejected (eager)** | **0** (gone)                 |
+| `Where` | 0                                | 4 exec, **2 captured** (cos+sin) |
+| `Greater`| captured                        | captured                     |
+| total rejected/eager ops | **59** | **0** |
+The 1.9 ms/token host `If` seam is eliminated; nothing is rejected from capture.
+
+**Perf — interleaved native-only, idle GPU 0, `--steady --warmups 2 --runs 9
+--tokens 120`, 5 interleaved iterations (baseline↔ondevice back-to-back):**
+| build    | tok/s per iter                          | median   | range          |
+|----------|-----------------------------------------|----------|----------------|
+| baseline | 198.95, 203.90, 202.85, 203.50, 204.37  | **203.50** | 198.95–204.37 |
+| ondevice | 322.15, 322.31, 322.56, 321.73, 321.58  | **322.15** | 321.58–322.56 |
+
+**+58.3% (203.50 → 322.15 tok/s)**, i.e. **1.810 ms/token** saved
+(4.914 → 3.104 ms/token) — matches the predicted ~1.935 ms `If`-seam cost almost
+exactly, and pushes Phi **well past the ORT native reference (229.62 tok/s)**.
+
+Honesty note: this is far larger than the +1.8% Marsten re-measured for the
+*memo* fix (`719d2fe`), because that fix kept the seam; this change *removes* it
+(2→1 graphs, no per-step host cond read). The numbers are tightly reproducible on
+an idle GPU (ondevice spread <1 tok/s across 5 interleaved iters). The `Where`
+runs over `[131072,48]×2` fp16 each step (~17 µs, captured, no host sync) —
+negligible (~0.3% of ~5 ms/token) vs the seam removed.
+
+**Correctness:**
+- 160-token greedy decode: `generated_text` **byte-identical** to baseline.
+- **Boundary-crossing (seq crosses 4096):** 4200-token greedy decode
+  (`ONNX_GENAI_CUDA_KV_MAX_LEN=5000`, 4192 decode tokens). Both builds:
+  sha256 `b76a17085739788d8c644fc01453582b045b6f3adaf47d3223466e30fb30629a`
+  — **byte-identical**, and ondevice stays **1 captured segment** across the
+  boundary (fixed large output shape, no re-plan). The short→long cos/sin cache
+  switch is exact.
+
+**Gate:**
+- `cargo test -p onnx-runtime-ep-cuda --features cuda --lib`: **201 passed / 0
+  failed** (192 baseline + 6 new pass tests + 3 new Where capture-safety tests).
+- `cargo test -p onnx-runtime-session --features cuda`: green, incl.
+  `control_flow` (21) and `cuda_control_flow_safety` (1).
+- `cargo clippy -p onnx-runtime-ep-cuda --features cuda --lib -- -D warnings`:
+  clean. (The 42 `-D warnings` errors under `--tests` are pre-existing on
+  `origin/main` in unrelated `tests/*.rs` integration harnesses — newer clippy
+  toolchain lints, not touched by this change.)
+
+## Files changed
+- `crates/onnx-runtime-ep-cuda/src/kernels/where_op.rs` (+261 / capture-safe
+  Where + 3 unit tests)
+- `crates/onnx-runtime-ep-cuda/src/optimizer.rs` (+598 / `CudaOnDeviceConstantSelect`
+  pass + registration + 6 unit tests)
+
+## No-gos / caveats
+- The differing-shape lowering deliberately requires the crisp tie
+  `else_lead == T` and TRUE = larger table; anything else is skipped (stays an
+  `If` seam) rather than risk an out-of-extent read. This keeps it correct and
+  general without special-casing LongRoPE by name.
+- Reviewer focus: the zero-padding correctness argument (appended rows never
+  indexed when predicate false) and the `Where` capture-signature gating.
+
+
+<!-- merged from marsten-glm4-static-split.md -->
+### 2026-07-23: GLM-4 static Split capture result
+**By:** Marsten
+**What:** Generic EP-side static single-input Split capture reduces GLM-4-9B GPTQ from 41 captured segments and 40 eager seams to one captured segment and zero fallbacks. The seams are the fused-MLP gate/up activation Split (one per layer), `Split(axis=-1, num_outputs=2)` on `gate_up_proj`, named `model/layers.N/mlp/Split_node_*`; they are not RoPE splits. Throughput improves from 110.34 to 118.85 tok/s (+7.71%), or +38.99% over forced eager execution at 85.51 tok/s.
+**Why:** Capturing these static Split nodes removes host-reading, stream-synchronizing seams without requiring a model-specific graph rewrite. Separately, ORT GenAI 0.14.1 still cannot load GLM-4 because its GQA attention schema rejects the required partial-RoPE `rotary_embedding_dim` attribute; that schema issue is unrelated to the fused-MLP Split seams.
+
+
+<!-- merged from marsten-phi-postfix-nongpu-profile.md -->
+### 2026-07-23: Target the remaining Phi LongRoPE host If
+**By:** Marsten
+**What:** On fixed main with `719d2fe`, Phi has two captured graph regions
+(`cuStreamBeginCapture=4` across two 128-token generations; 508 graph
+launches = two per 254 decode forwards), 236.0 GPU kernels/decode-forward,
+and zero graph fallbacks. Nsight reports 2.948 ms GPU kernels/token versus
+5.150 ms/token uninstrumented wall time. The native op trace attributes a
+1.935 ms median to the still-eager LongRoPE `If`; replayed `Greater` is only
+1.28 us GPU/token and GQA is captured (0.406 ms GPU/token).
+**Why:** Fully moving the branch select on-device is the highest-value
+non-GEMV follow-up: its ~1.94 ms/token budget is about 88% of the ~2.20 ms
+non-GPU remainder, with a 5.15 to ~3.2 ms/token theoretical ceiling. Kernel
+launch batching is not first: the 236 kernels already arrive in two graph
+launches per decode forward.
+
+
+<!-- merged from marsten-phi-stacked-rebench.md -->
+### 2026-07-23: Record cumulative Phi prefetch and standalone int8 split-K frontier
+**By:** Marsten
+**What:** At `4e774ee`, Phi-4-mini reaches 193.32 tok/s (median of 7, 121.21--194.67 spread under shared-host contention), 15.81% behind the canonical ORT 0.14.1 reference, with zero fallbacks and coherent output. Qwen2.5-1.5B and DeepSeek-R1-Distill-Qwen-1.5B remain within noise at 617.90 and 622.66 tok/s.
+**Why:** This is the honest cumulative frontier after stacking fused gate-up int4 software-prefetch and standalone int8-zp split-K; the median, full spread, and contention caveat prevent host variance from being misclassified as a regression.
+
+
+<!-- merged from marsten-scoreboard.md -->
+### 2026-07-23: Native CUDA versus ORT real-weight baseline
+**By:** Marsten
+**What:** On `origin/main` revision `1073404`, native CUDA beat ORT GenAI CUDA
+for all runnable dense Qwen exports: Qwen2.5-0.5B (+62.73%), 1.5B (+36.77%),
+and 7B (+10.82%). Phi-4-mini remains behind: the standing clean mandate
+reference is 193.89 versus 229.62 tok/s (-15.56%); this live nine-run snapshot
+was 186.19 versus 236.48 tok/s (-21.27%).
+**Why:** This records the real-weight baseline before Deckard's Phi
+`executor.rs` capture-seam work. GPU 5 was idle before/after testing, but the
+shared host produced a wide Phi range, so reserved-host confirmation is needed
+before treating the live shortfall versus the clean reference as a regression.
+
+
+<!-- merged from rachael-mask-island-closure.md -->
+### 2026-07-24: Fixed-signature CUDA capture closes the DeepSeek mask island
+**By:** Rachael
+**What:** CUDA `CumSum`, `Unsqueeze`, and `Slice` now warm and retain their exact fixed decode signature, skip runtime metadata D2H during graph recording, and avoid capture-time synchronization/allocation. `Slice` retains its device metadata buffers. General broadcasting `Where` now captures after its dtype/broadcast geometry has warmed because its condition and metadata are already device-resident.
+**Why:** DeepSeek-V2-Lite fixed-capacity decode keeps mask geometry stable while mask values remain device-sourced. On both block-32 and block-128 exports, the mask-island seams fell from `Unsqueeze=4, Slice=1, CumSum=1, Where=1` to zero. Listed seam nodes fell 275→268 (the remaining 268 are Reshape work owned separately); segmented eager boundaries fell 246→241 as adjacent captured regions merged.
+
+Verification:
+- Both DeepSeek exports produced `[8913, 13, 185, 549, 19305, 280, 7239, 317, 254, 28071, 13, 185]` three independent times (`" Paris.\nThe currency of France is the Euro.\n"`).
+- Both exports reported measured CUDA graphs `captures=1, replays=9, fallbacks=0`.
+- Qwen2.5-0.5B remained coherent and capture-clean: one segment, zero seams, measured `captures=1, replays=13, fallbacks=0`.
+- Phi-4-mini on idle GPU 1 produced the same 16-token sequence three times and reported `captures=2, replays=26, fallbacks=0`.
+- CUDA EP lib tests: 205 passed; session MLAS lib tests: 65 passed; CUDA clippy with warnings denied passed; construction GPU tests: 18 passed; targeted CumSum GPU test passed.
+
+The implementation necessarily changes generic CUDA movement/elementwise kernels rather than model-specific Attention code. Leon/Sebastian should review the warmed fixed-signature contract, especially the established assumption (shared with Reshape) that runtime shape/axis/bound metadata stays invariant across captured replays.
+
+
+<!-- merged from sebastian-moe-routing-capture.md -->
+# MoE routing capture safety
+
+- Branch: `perf/capture-moe-routing`.
+- TopK now folds its eagerly-read scalar K into an exact warmed signature; replay does not perform D2H or synchronize.
+- GatherElements now retains shape metadata and validates capture-time indices on device through the shared capture-error word.
+- Softmax skips its trailing synchronization while the EP stream is being captured; the cuDNN handle is already created on that stream.
+- `indexing_gpu::warmed_moe_routing_ops_capture_without_allocations` verifies warmed TopK (K=6/64), GatherElements, and Softmax graph replay parity without allocation growth.
+- Bench/ORT-vs-native-CUDA: deferred to integration because Stage-0 executor shape seeding is required to engage all decode seams.
+
+
+<!-- merged from sebastian-qmoe-64expert.md -->
+### 2026-07-23: Add 64-expert top-6 CUDA QMoE parity coverage
+**By:** Sebastian
+**What:** Added parameterized synthetic 64-expert/top-6 QMoE GPU parity tests for fp16 decode (M=1) and prefill (M=8), bf16 decode/prefill, hot-expert plus empty-expert routing, capture warm/replay with changed routes, and a 64-row worst-case route-scratch allocation. Each uses the existing CPU QMoE oracle, except replay additionally compares against an uncaptured CUDA reference.
+**Why:** DeepSeek-V2-Lite routing requires 64 experts and top-6, while the previous GPU tests only exercised 4 experts/top-2. GPU 5 results: qmoe_gpu 27 passed/0 failed; CUDA lib gate 192 passed/0 failed; clippy passed. No 64/top-6 kernel scale bug was found.
+
+
+<!-- merged from sebastian-qmoe-test-fix.md -->
+### 2026-07-23: Serialize QMoE GPU capture tests and verify live replay routing
+**By:** Sebastian
+**What:** QMoE integration tests now hold a process-wide GPU mutex for each test body. The capture test also changes `router_probs` after capture and compares replay against an uncaptured eager run using the new expert routes.
+**Why:** Concurrent CUDA allocation can invalidate thread-local graph capture, while changed-routing parity proves expert selection is recomputed from live replay inputs rather than baked into the graph.
+
+
+<!-- merged from sebastian-static-split-test.md -->
+### 2026-07-23: Static Split capture/replay test coverage
+**By:** Sebastian
+**What:** Reworked the static even `Split` byte-parity integration test to build with concrete input shapes, execute the static kernel, capture it, replay it with changed input, and compare replayed outputs with eager output bytes.
+**Why:** The generic `run()` helper supplies empty input shapes and therefore exercises only Split's dynamic path; successful CUDA graph capture is a regression guard for the static no-synchronize path.
+
+
+<!-- merged from tyrell-executor-shape-seeding.md -->
+### 2026-07-24: Seed warm JIT decode shapes + capture-recording quarantine (Stage 0 of DeepSeek whole-step capture)
+
+**By:** Tyrell
+**Branch:** `perf/capture-executor-shape-seeding` (off `perf/deepseek-mla-capture` @ `25dbb60` — the Attention capture foundation, currently in review). **Needs review before merge; not merged.** Rebase onto the merged MLA foundation when it lands. Headline tok/s bench is deferred to the integration pass on `bench/ort-vs-native-cuda` (GPU contention here makes the ~2 ms/token direct gain unmeasurable; the structural seam-count drop is the acceptance criterion).
+
+**Scope:** `crates/onnx-runtime-session/src/executor.rs` ONLY. No kernel files, no `provider.rs`, no `standard_attention.rs`/`native_decode.rs`. This makes the executor *admit* already-capture-safe ops; it does not add/alter kernels.
+
+#### Root cause (confirmed, Pris's finding reproduced exactly)
+The executor rejects a node as an eager seam **before** consulting its kernel whenever any input/output shape is absent from `resolved` (EP `plan_capture_region` default policy declines on unresolved shapes). `resolve_soft` deliberately omits data-dependent (JIT) decode shapes, and only external/control-flow shapes were seeded for capture. So DeepSeek-V2-Lite decode ops that are ALREADY capture-safe (Cast, Mul, QMoE, ScatterElements — all advertise `Supported`, skip sync, pool scratch during capture) still fragmented into eager seams purely because their JIT output shapes weren't seeded. Measured: **727 distinct eager seam nodes** per decode step (matches Pris exactly).
+
+#### Fix
+1. **Warm decode shape seeding** (`seed_warm_decode_capture_shapes`). After an eager warmup step, snapshot the full resolved shape map (`capture_warm_shapes`) together with the persistent-binding signature it ran under (`ExternalBindings::capture_signature()` = sorted (vid, is_input, dtype, shape, ptr, len) of every persistent binding). On a later capture-mode run presenting the **identical** signature, seed each still-unresolved (non-external, non-initializer, non-sequence) value from the warm snapshot so its already-capture-safe consumers fold into captured segments. Guardrails, all honored:
+   - Shapes are derived from a real eager warmup, never hardcoded/assumed.
+   - A changed persistent pointer/capacity/shape → signature mismatch → **all seeds withheld** (nodes stay eager); `replay_device_graph`'s independent `binding_signature` check also retires the installed graph. Never replays a stale graph against changed shapes.
+   - The capture pass re-resolves each node's true shape; any divergence from a seeded value retires the graph and declines (recapture) rather than baking a stale shape.
+   - No per-step allocation when the signature matches; view/bounds validation untouched.
+   - Seeding is valid ONLY for the exact warmed signature — anything varying across steps forces recapture or stays eager.
+
+2. **Capture-recording quarantine + retry** (in the `RunMode::Capture` arm + `node_capture_reason`). Seeding surfaced a latent problem: a kernel can advertise `CaptureSupport::Supported` yet abort device-graph *recording* (e.g. `ai.onnx::Softmax`, the MoE gate — softmax.rs declares `Supported` but calls `synchronize()` unconditionally, which CUDA rejects mid-capture). Admitting one such node aborted the **entire** segmented capture → full eager fallback (0 captures). Fix: when `run_plan_segmented` (Capture) errors at a node, record it (`last_capture_failed_node`), reset the device graph, quarantine its `(domain, op_type)` (`capture_quarantine_ops`), and re-plan/re-record treating quarantined ops as forced `CaptureRecordingFailed` eager seams. Re-recording a fixed-capacity decode step is idempotent (same position/token → same values into the same slots), so retry is safe; bounded by node count; quarantine grows monotonically (a kernel that breaks recording breaks it every time), so recaptures converge immediately. New `SeamReason::CaptureRecordingFailed`.
+
+#### Results — proof of effect (`ONNX_GENAI_LOG_CAPTURE_SEGMENTS=1`, `--steady --decode-skip 8 --warmups 1 --runs 1 --tokens 12`, GPU 1)
+Distinct eager seam nodes per decode step, **identical for both exports** (blk32 `deepseek-v2-lite-real-int4-blk32` and blk128 `deepseek-v2-lite-real-int4`):
+
+| | seeding OFF (baseline) | seeding ON + quarantine |
+|---|---|---|
+| **distinct eager seam nodes** | **727** | **541** (−186, −25.6%) |
+| eager node executions across run | 1454 | 1082 (−26%) |
+| "data-dependent shape unresolved" seam class | 692 occ (Cast 106, Mul 104, QMoE 52, ScatterElements 52, MatMul 52, TopK 52, GatherElements 52, Softmax 52, …) | **0** — class eliminated |
+| segmented-capture status | succeeds (191 seg / 190 seam) | **succeeds** (193 seg / 192 seam) |
+
+**Cast, Mul, QMoE, ScatterElements stopped being seams** (fully folded into captured segments). The nodes still eager after seeding now report their **real kernel-capability decline** (not a spurious missing-shape rejection), which is exactly the signal kernel owners need — see below.
+
+#### Correctness / determinism (HARD GATE — PASS, both exports)
+Prompt "The capital of France is", 3× identical each export:
+`[8913, 13, 185, 549, 19305, 280, 7239, 317, 254, 28071, 13, 185]` = pos0 8913 ' Paris' → matches expected exactly. Capture engaged and clean: `cuda_graph: captures=2 replays=18 fallbacks=0` (no stale-graph corruption — the main risk of this change is disproven).
+
+#### Dense non-regression (PASS)
+Qwen2.5-0.5B int4 (`qwen2.5-0.5b-int4-onnx-native`): 3× identical, coherent (" Paris. It is the largest city in the country and the"), `captures=2 replays=18 fallbacks=0`. Dense graphs have statically-resolved decode shapes, so warm seeding is a no-op for them (nothing unresolved to seed) — no behavior change, no regression.
+
+#### Ops that I EXPECTED to fold but did NOT (for the kernel-owner agents)
+These now surface their true kernel decline (they were previously hidden as unresolved-shape seams). They stay eager until their kernel is made capture-safe:
+- **`ai.onnx::Softmax` (MoE gate) — KERNEL BUG:** declares `CaptureSupport::Supported` but `run`/`run_nvrtc_f32` call `self.runtime.synchronize()` unconditionally (`crates/onnx-runtime-ep-cuda/src/kernels/softmax.rs:271,323`; `capture_support()` at :343). This aborts recording; my quarantine keeps capture working but Softmax stays a seam (52/step). **Fix the kernel to skip the sync during capture (mirror the Cast/Mul pattern) and it will fold for free.**
+- `ai.onnx::Reshape` — copy path not a capture-validated zero-copy view.
+- `ai.onnx::Split` — reads runtime split sizes on host + trailing stream sync.
+- `ai.onnx::Concat` — trailing host stream sync.
+- `ai.onnx::Expand` — per-call broadcast metadata alloc/upload/free + sync.
+- `ai.onnx::TopK` — reads K D2H + host sync.
+- `ai.onnx::GatherElements` — per-call indexing metadata + sync.
+- `ai.onnx::MatMul` (M==1 GEMV) — cuBLASLt per-call workspace alloc/free + heuristic query not capturable.
+- `ai.onnx::Where` — capture-safe only for invariant scalar-predicate select over equal-shaped operands; broadcast/non-scalar condition launches stay eager.
+- `ai.onnx::Unsqueeze` / `Slice` / `CumSum` — host-side runtime axes/bounds + sync (structural host seams; not shape-gated).
+
+#### Gates
+- `cargo test -p onnx-runtime-session --features mlas --lib` → **65 / 0** (63 baseline + 2 new tests).
+- `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` (GPU 1) → **208 / 0** (≥207, no regression).
+- `cargo clippy -p onnx-runtime-session --features mlas --lib -- -D warnings` → clean. (Pre-existing repo test-only debt `let mut input_axes` in an unrelated executor test is not introduced here — same item Deckard noted.)
+- `cargo build --release -p onnx-genai-bench --features bench-native,cuda --bin profile_native` → ok.
+
+#### Tests added (non-tautological)
+- `warm_decode_seeding_admits_previously_unresolved_capture_safe_node`: a `Range`(runtime start/limit/delta)→`Cast` graph is an unresolved-shape seam before warmup; after one eager warmup the identical signature seeds the exact extent `[4]` and clears the unresolved-shape seam; a changed persistent-binding signature withholds the seed.
+- `quarantined_op_type_is_forced_to_a_capture_recording_failed_seam`: a statically-shaped `Cast` is not a recording-failed seam until its `(domain, op_type)` is quarantined, after which `node_capture_reason` forces it to `CaptureRecordingFailed` regardless of resolved shapes/kernel capability.
+
+**Files changed:** `crates/onnx-runtime-session/src/executor.rs` (+ 2 tests in-module).
