@@ -477,6 +477,15 @@ pub struct EngineConfig {
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     #[cfg(feature = "native-backend")]
     pub native_device: Option<NativeDecodeDevice>,
+    /// Decoder-wide numeric precision for the native decode session
+    /// (see [`onnx_runtime_session::DecodePrecision`]). Defaults to
+    /// [`DecodePrecision::Model`](onnx_runtime_session::DecodePrecision::Model)
+    /// (graph as authored); selecting
+    /// [`Fp16`](onnx_runtime_session::DecodePrecision::Fp16) opts an
+    /// fp32-activation int4/block-32 GPU decoder onto the fp16-fused kernels.
+    /// A strict no-op for every other model, so the default path is unchanged.
+    #[cfg(feature = "native-backend")]
+    pub decode_precision: onnx_runtime_session::DecodePrecision,
     /// Number of GPU pages for KV cache.
     pub num_gpu_pages: usize,
     /// Tokens per KV page.
@@ -512,6 +521,8 @@ impl Default for EngineConfig {
             decode_backend: EngineDecodeBackend::Auto,
             #[cfg(feature = "native-backend")]
             native_device: None,
+            #[cfg(feature = "native-backend")]
+            decode_precision: onnx_runtime_session::DecodePrecision::Model,
             num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),

@@ -10,7 +10,7 @@ use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvG
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
-    CaptureDeclineReport, DeviceAllocationCounts, DeviceBindingTransferStats,
+    CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
@@ -606,12 +606,16 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
         io: Option<&ModelIoSpec>,
+        decode_precision: DecodePrecision,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
         };
-        let mut builder = InferenceSession::builder().model(path).device(preference);
+        let mut builder = InferenceSession::builder()
+            .model(path)
+            .device(preference)
+            .decode_precision(decode_precision);
         if device == NativeDecodeDevice::Cpu {
             let ep =
                 onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(

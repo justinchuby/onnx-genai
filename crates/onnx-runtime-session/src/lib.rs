@@ -41,6 +41,7 @@ pub use tensor::{DeviceBindingTransferStats, DeviceIoBinding, Tensor, cpu_alloca
 
 mod epcontext;
 mod executor;
+mod fp16_decode;
 pub mod sequence;
 mod tensor;
 
@@ -344,6 +345,29 @@ pub struct WarmupShape {
     pub shape: Vec<usize>,
 }
 
+/// Decoder-wide numeric precision for the session's decode graph.
+///
+/// This is a generic, model-agnostic knob selected via
+/// [`SessionBuilder::decode_precision`]. The default,
+/// [`DecodePrecision::Model`], runs the graph exactly as authored, so default
+/// runtime behaviour is byte-identical to a build with no precision knob at all.
+///
+/// [`DecodePrecision::Fp16`] requests a whole-decoder fp32→fp16 rewrite (see
+/// [`fp16_decode`]). It only takes effect on a GPU device and only for an
+/// fp32-activation int4/block-32 quantized decoder (fp32-scale `MatMulNBits`);
+/// for every other model — including native fp16-activation models — it is a
+/// strict no-op, leaving the graph bit-identical.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecodePrecision {
+    /// Run the decoder at the precision authored in the model graph (default).
+    #[default]
+    Model,
+    /// Cast an fp32-activation int4/block-32 decoder to a fully fp16 graph so a
+    /// GPU backend runs it through the fp16-fused decode kernels. No-op unless
+    /// the session targets a GPU and the graph is fp32-activation quantized.
+    Fp16,
+}
+
 /// Graph-optimization level for the session's `optimize` pipeline stage
 /// (`docs/ORT2.md` §18). Selected via the generic `"optimization"` session
 /// option (see [`SessionBuilder::option`]).
@@ -408,6 +432,7 @@ pub struct SessionBuilder {
     memory_limit: Option<usize>,
     enable_profiling: bool,
     warmup_shapes: Vec<WarmupShape>,
+    decode_precision: DecodePrecision,
     options: HashMap<String, String>,
 }
 
@@ -452,6 +477,15 @@ impl SessionBuilder {
 
     pub fn warmup(mut self, shapes: Vec<WarmupShape>) -> Self {
         self.warmup_shapes = shapes;
+        self
+    }
+
+    /// Select the decoder-wide numeric precision (see [`DecodePrecision`]).
+    /// Defaults to [`DecodePrecision::Model`] (graph as authored); selecting
+    /// [`DecodePrecision::Fp16`] opts into the fp32→fp16 decode rewrite, which
+    /// only takes effect on a GPU fp32-activation quantized decoder.
+    pub fn decode_precision(mut self, precision: DecodePrecision) -> Self {
+        self.decode_precision = precision;
         self
     }
 
@@ -583,6 +617,20 @@ impl SessionBuilder {
                 (None, None) => return Err(SessionError::NoModelSource),
             };
 
+        // Decoder precision rewrite (opt-in). Applied here — on the freshly
+        // loaded graph, before the I/O signature (`IoMeta`) is computed and
+        // before EP optimization — so the KV/logits buffers and the executor
+        // graph agree on the rewritten dtype. A strict no-op for the default
+        // `DecodePrecision::Model`, for non-GPU devices, and for any graph that
+        // is not an fp32-activation quantized decoder, so the default path and
+        // native fp16 models stay bit-identical.
+        fp16_decode::maybe_convert_decode_fp16(
+            &mut graph,
+            &weights,
+            self.decode_precision,
+            device_preference_is_gpu(&self.device),
+        );
+
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
         let ep = match self.execution_provider {
@@ -602,6 +650,16 @@ impl SessionBuilder {
             session.warmup(&self.warmup_shapes)?;
         }
         Ok(session)
+    }
+}
+
+/// Whether a [`DevicePreference`] targets a GPU / accelerator (non-host) device.
+/// Used to gate GPU-only graph rewrites such as the fp16 decode precision mode.
+fn device_preference_is_gpu(preference: &DevicePreference) -> bool {
+    match preference {
+        DevicePreference::Gpu { .. } => true,
+        DevicePreference::Explicit { device_type, .. } => !device_type.is_host_accessible(),
+        DevicePreference::Auto | DevicePreference::Cpu => false,
     }
 }
 

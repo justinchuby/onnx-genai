@@ -53,6 +53,8 @@ pub use native_decode::{
     CudaGraphDebugStats, CudaKvDebugStats, NativeDecodeCudaOptions, NativeDecodeDevice,
     NativeDecodeSession,
 };
+#[cfg(feature = "native-backend")]
+pub use onnx_runtime_session::DecodePrecision;
 pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
 pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
