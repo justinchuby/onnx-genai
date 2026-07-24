@@ -46,6 +46,31 @@ pub fn sparse_kv_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
+/// `pkg.nxrt::IndexShare`: selected-token attention. Output 0 mirrors the query
+/// `[B, num_heads, S_q, H]`. When the present KV cache is also returned (3
+/// outputs), outputs 1/2 are `[B, kv_num_heads, S_past + S_cur, H]`.
+pub fn index_share(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(query) = rank_shape(ctx, 0, 4)? else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    ctx.set_output(0, dtype, query.clone());
+    if ctx.num_outputs() == 3 {
+        let Some(key) = rank_shape(ctx, 1, 4)? else {
+            return Ok(());
+        };
+        let total = match ctx.input_shape(3) {
+            Some(past) if past.len() == 4 => past[2].add(&key[2]),
+            _ => key[2].clone(),
+        };
+        let kv_dtype = ctx.input_dtype(1).unwrap_or(dtype);
+        let present = vec![key[0].clone(), key[1].clone(), total, key[3].clone()];
+        ctx.set_output(1, kv_dtype, present.clone());
+        ctx.set_output(2, kv_dtype, present);
+    }
+    Ok(())
+}
+
 /// Frozen stateful `CompressedSparseAttention` v1 output shapes.
 pub fn compressed_sparse_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(query) = rank_shape(ctx, 0, 4)? else {
@@ -299,6 +324,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "QMoE", 1, moe);
     reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
+    reg.register("pkg.nxrt", "IndexShare", 1, index_share);
     reg.register(
         "pkg.nxrt",
         "CompressedSparseAttention",

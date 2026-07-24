@@ -2331,6 +2331,51 @@ fn sparse_kv_gather_emits_selected_kv_shape() {
 }
 
 #[test]
+fn index_share_mirrors_query_and_present_kv() {
+    // Exporter emission: 6 inputs (q, key, value, past_key, past_value,
+    // selected_indices), single attn_output that mirrors the query.
+    let n = with_domain(node("IndexShare", 6, 1), "pkg.nxrt");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(4), c(3), c(24)]),
+            f32in(vec![sym(0), c(4), c(3), c(24)]),
+            f32in(vec![sym(0), c(4), c(3), c(24)]),
+            NodeIo::default(),
+            NodeIo::default(),
+            tin(DataType::Int64, vec![sym(0), c(1), c(3), c(3)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(4), c(3), c(24)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+
+    // With 3 outputs, present K/V are `[B, kv, S_past + S_cur, H]`.
+    let n = with_domain(node("IndexShare", 6, 3), "pkg.nxrt");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(4), c(1), c(24)]),
+            f32in(vec![sym(0), c(2), c(1), c(24)]),
+            f32in(vec![sym(0), c(2), c(1), c(24)]),
+            f32in(vec![sym(0), c(2), c(7), c(24)]),
+            f32in(vec![sym(0), c(2), c(7), c(24)]),
+            tin(DataType::Int64, vec![sym(0), c(1), c(1), c(8)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(4), c(1), c(24)]);
+    assert_eq!(
+        outs[1].type_info.as_ref().unwrap().shape,
+        vec![sym(0), c(2), c(8), c(24)]
+    );
+    assert_eq!(
+        outs[2].type_info.as_ref().unwrap().shape,
+        vec![sym(0), c(2), c(8), c(24)]
+    );
+}
+
+#[test]
 fn custom_ops_validate_arity_rank_and_compression_contracts() {
     assert!(
         try_run(
