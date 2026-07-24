@@ -4,9 +4,17 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-23T14:45Z — Phi stacked prefetch + standalone int8 split-K re-benchmark._
+_Last updated: 2026-06-09T00:00:00Z_
 
-**Current `origin/main` implementation HEAD:** `4e774ee` (standalone Phi int8-zp split-K on the cumulative CUDA stack).
+**Current `origin/main` implementation HEAD:** `2ead1cdd` (rustfmt hygiene for the CI formatting gate).
+
+## 2026-06-09 — GLM-5.2 native-e2e + DeepSeek breadth + CI hardening
+
+- **GLM-5.2 fixed-capacity foundation + native eager E2E ✅ (`bd9bd60c`, `6600cd7d`, `7c212bc7`, `ec4b62bf`):** CUDA now has the fixed-capacity `pkg.nxrt::IndexShare` present path and executor capacity recognition (`bd9bd60c`); `6600cd7d` supplies its CI-clippy cleanup. The reproducible synthetic tiny-QMoE fixture (about 378 KB of ONNX weights) is locked by `glm_tiny_qmoe_native_cuda_e2e.rs`, gated with `required-features = ["cuda", "native-backend"]` (`ec4b62bf`). It asserts native CPU/CUDA greedy-ID parity at the anchor IDs and confirms current concat-form exports stay eager (`captures=0`); the S3 exporter capacity-form rewrite remains deferred. This is a synthetic native capability milestone, **not** a real-checkpoint quality or performance claim: real GLM-5.2 weights are 217 GB+ and were not benchmarked here.
+- **DeepSeek breadth + accuracy adjudication ✅ (`30ab9c7f`):** decisions record real DeepSeek-Coder-1.3B at **824 vs 618 tok/s (1.333×)** and DeepSeek-R1-Distill-Qwen-1.5B at **648 vs 431 tok/s (1.505×)**, both native-over-ORT with healthy capture. At the R1 generated-token split, native CUDA token `374` matches the fp32 CPU oracle while ORT CUDA selects `315` through its int8-activation path; the ignored real-model regression locks that native-more-accurate result (`30ab9c7f`).
+- **Model-independent accuracy guard ✅ (`3d48f57b`):** CPU CI now includes `matmulnbits_fp32_activation_is_more_accurate_than_accuracy4`, guarding the fp32-activation versus accuracy-4/int8-activation property without a GPU or large checkpoint.
+- **CI formatting gate ✅ (`2ead1cdd`):** rustfmt-only hygiene restores the blocking `cargo fmt --all -- --check` gate after the capacity work.
+- **Qwen3-0.6B native CUDA validation:** in progress in a separate agent; no results are recorded yet.
 
 ## 2026-07-23 — Post-int8-fused native CUDA milestone
 
@@ -16,9 +24,9 @@ _Last updated: 2026-07-23T14:45Z — Phi stacked prefetch + standalone int8 spli
 - **Current Phi bottleneck:** the latest captured-decode allocation predates the two final kernel levers; refresh profiling before selecting the next optimization target.
 - **GLM/DeepSeek model support:** GLM-4-9B runs coherently at **120.80 tok/s**, one captured segment, zero fallbacks; ORT GenAI 0.14.1 cannot load its partial-RoPE GQA schema. GLM-5.2 tiny dense (**70.63 tok/s**), q4 (**148.58 tok/s**), and fused QMoE (**174.41 tok/s**) now execute DSA indexing and decode end-to-end on native CUDA with zero fallbacks. QMoE is graph-capturable, while whole-model capture is safely auto-disabled for these exports because of their growing logical-prefix bindings. This is a synthetic capability milestone, not a real-checkpoint quality or ORT-performance claim. Real-scale DeepSeek-V2/V3 packing/export remains follow-up work. Full status: `docs/glm-deepseek-enablement.md`.
 
-### ⚠️ Open correctness finding (2026-07-23): Qwen2.5-1.5B native decode diverges from ORT
+### ✅ Resolved correctness finding (2026-07-23): Qwen2.5-1.5B native decode near-tie
 
-Native CUDA greedy decode of Qwen2.5-1.5B (int4) emits degenerate repetition ("The capital of France is in the country of France…" loops) while onnxruntime-genai-cuda 0.14.1 is coherent on the same model+settings. Proven **NOT** the SwiGLU-RMS fusion: fusion ON vs OFF is byte-identical native output. This is a **pre-existing native numerical/logit divergence** (gate/up MatMulNBits K=1536, N=8960, 4-bit block-32); 0.5B/7B appear coherent. Under root-cause on `fix/qwen15b-native-divergence` (Deckard). Perf numbers for 1.5B are provisional until output quality is fixed.
+The reported native/ORT difference was characterized as a benign numerical near-tie, in the same class as the DeepSeek-R1-Distill-Qwen-1.5B adjudication: native's argmax is defensible rather than an output-quality defect. Native 1.5B decode is validated on main by the Qwen native-CUDA near-tie lock (`c4690bf7`) and the exact production-dimension MatMulNBits parity lock for gate/up `K=1536, N=8960` and down `K=8960, N=1536`, block-32 (`ba51dd88`). The merged single-split direct-output GQA decode path is independently bit-identical to its prior two-step path (`af49fc27`). The previous raw-`Hello` repetition observation is specifically documented by `ba51dd88` as behavior both runtimes exhibit, so this entry claims the merged parity/near-tie locks and validated native decode—not a broader diagnosis of that base-model symptom.
 
 ## 2026-07-23 — CUDA perf wave 2 (SwiGLU-RMS fusion flips 7B positive; native beats ORT on 0.5B/1.5B/7B)
 
