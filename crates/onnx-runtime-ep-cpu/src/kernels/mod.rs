@@ -109,9 +109,6 @@ pub mod unsqueeze;
 pub mod where_op;
 pub mod window;
 
-#[cfg(test)]
-mod qwen35_goldens;
-
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
     "MatMul",
