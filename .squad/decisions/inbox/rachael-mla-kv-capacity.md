@@ -2,7 +2,7 @@
 
 **Author:** Rachael (worker)
 **Date:** 2026-07-23
-**Branch:** `fix/deepseek-mla-kv-capacity` @ `897e53f` (off clean origin/main `1fe314f`) — **pushed, NOT merged**
+**Branch:** `fix/deepseek-mla-kv-capacity` @ `621936f` (rebased onto current origin/main `24531c4`, which has Gaff's merged capture-safe copy_reshape) — **pushed, NOT merged**
 **Priority:** CORRECTNESS (Justin's "token divergence must be fixed" mandate). Capture/perf enablement is a deferred follow-up (see bottom).
 
 ## Root cause (PINNED, with evidence)
@@ -83,7 +83,7 @@ runs. Skips gracefully with no CUDA. General (guards the aliased-KV-growth class
 not DeepSeek).
 
 ## Gate (source .cudaenv.sh; CUDA_VISIBLE_DEVICES=3; worktree off 1fe314f)
-- `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` → **203 passed / 0 failed** (was 202/0 baseline + 1 new).
+- `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` → **204 passed / 0 failed** (post-rebase baseline 203 + 1 new regression test).
 - `cargo clippy -p onnx-runtime-ep-cuda --features cuda --lib -- -D warnings` → **clean**.
   (Pre-existing `--tests` clippy nits in matmul_nbits.rs / normalization.rs are not from this change and outside the `--lib` gate.)
 
