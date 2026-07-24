@@ -4,9 +4,32 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-24T00:00:00Z_
+_Last updated: 2026-07-24T23:15:00Z_
 
-**Current `origin/main` implementation HEAD:** `2ead1cdd` (rustfmt hygiene for the CI formatting gate).
+**Current `origin/main` implementation HEAD:** `9271c881` (opt-in fp16-fused decode precision mode).
+
+## 2026-07-24 — Accuracy-level-4 correctness and opt-in fp16 decode payoff
+
+- **Native CUDA accuracy-level-4 correctness fixed (#123, `0536db39`):** MatMulNBits
+  now applies the required per-K-block int8 activation quantization for
+  accuracy-level-4 execution. Phi-3.5-mini and Qwen2.5-Coder-7B native CUDA
+  decode correctly against the locked references instead of taking the prior
+  broken activation-quantization path.
+- **Opt-in fp16 decode mode landed (#127, `9271c881`):**
+  `EngineConfig::decode_precision` / `SessionBuilder::decode_precision()` default
+  to `DecodePrecision::Model`; selecting `Fp16` on a GPU rewrites eligible
+  fp32-scale MatMulNBits decoder graphs to fp16 and reaches the fused fp16
+  kernels. Existing callers are unchanged unless they opt in.
+- **Measured end-to-end payoff:** on the shared H200 host, native fp16/model
+  steady-decode ratios were **1.96×** for Phi-3.5-mini (378.35/193.27 tok/s)
+  and **1.89×** for Qwen2.5-Coder-7B (300.70/159.26 tok/s), using two warmups
+  and three 128-token runs pinned to GPU 4. Output was coherent; the Qwen streams
+  were identical across all three paths, and Phi native fp16 matched ORT.
+  Absolute rates remain shared-host measurements. The requested ORT runs on the
+  only available `generic-cpu-*` artifacts inserted 67/57 memcpy nodes and had
+  partial EP assignment, so their 7.69/29.09 tok/s results and resulting
+  fp16/ORT ratios are **⚠️ inconclusive**, not headline speedups. Full commands,
+  run ranges, and caveats: `docs/benchmarks/2026-07-24-fp16-decode-payoff.md`.
 
 ## 2026-07-24 — Decode-correctness regression-lock coverage milestone
 
