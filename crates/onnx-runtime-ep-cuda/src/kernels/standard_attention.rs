@@ -120,30 +120,37 @@ __device__ __forceinline__ void store_float(void* data, unsigned long long index
 }
 
 // Gather a K/V input into a contiguous [batch, heads, total_seq, dim] present
-// Derive the valid attended length on-device by scanning the additive attention
-// mask bias for its first masked (large-negative) entry. At fixed capacity the
-// mask row is [.., max_len] with 0 bias for valid keys [0,total) and a
-// large-negative bias for padding [total,max_len); the frontier index is the
-// valid length `total`. This lets the decode step read its growing length from
-// device memory (the mask the kernel already consumes) instead of host shape
-// metadata, so the launch geometry stays fixed and capture-safe. Assumes a
-// single contiguous right-aligned valid run (greedy decode, no interior pads).
+// Derive the valid attended length on-device by scanning ONE row of the additive
+// attention mask bias for its first masked (large-negative) entry. The scanned
+// row is the LAST query row (`row_base` = the element offset of query i=q_seq-1
+// within the broadcast [.., q_seq, key_len] mask); at the final query position
+// the causal+padding frontier equals the total valid key length, so this returns
+// `total_seq` for a single-token decode AND `prompt_len` for a multi-token
+// prefill (row 0 would wrongly report 1 under a causal mask — hence the last
+// row). At fixed capacity the row is [.., max_len] with 0 bias for valid keys
+// [0,total) and a large-negative bias for padding [total,max_len); the frontier
+// index is the valid length. This lets both phases read their length from device
+// memory (the mask the kernel already consumes) instead of host shape metadata,
+// so the launch geometry stays fixed and capture-safe. Assumes a single
+// contiguous right-aligned valid run (greedy decode, no interior pads).
 extern "C" __global__ void derive_len(
-    const void* mask, int mask_kind, unsigned long long max_len, int* out_len) {
+    const void* mask, int mask_kind, unsigned long long key_len,
+    unsigned long long row_base, int* out_len) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-  int total = (int)max_len;
-  for (unsigned long long j = 0; j < max_len; ++j) {
+  int total = (int)key_len;
+  for (unsigned long long j = 0; j < key_len; ++j) {
+    const unsigned long long idx = row_base + j;
     float v;
     if (mask_kind == 1) {
-      v = ((const float*)mask)[j];
+      v = ((const float*)mask)[idx];
     } else if (mask_kind == 3) {
-      v = __half2float(((const __half*)mask)[j]);
+      v = __half2float(((const __half*)mask)[idx]);
     } else if (mask_kind == 4) {
-      v = __bfloat162float(((const __nv_bfloat16*)mask)[j]);
+      v = __bfloat162float(((const __nv_bfloat16*)mask)[idx]);
     } else {
-      v = ((const unsigned char*)mask)[j] != 0 ? 0.0f : NEG_INF;
+      v = ((const unsigned char*)mask)[idx] != 0 ? 0.0f : NEG_INF;
     }
     if (v < -1000.0f) {
       total = (int)j;
@@ -798,7 +805,8 @@ impl StandardAttentionKernel {
         &self,
         mask_ptr: CUdeviceptr,
         mask_kind: i32,
-        max_len: u64,
+        key_len: u64,
+        row_base: u64,
         out_len: CUdeviceptr,
     ) -> Result<()> {
         let func =
@@ -808,7 +816,8 @@ impl StandardAttentionKernel {
         builder
             .arg(&mask_ptr)
             .arg(&mask_kind)
-            .arg(&max_len)
+            .arg(&key_len)
+            .arg(&row_base)
             .arg(&out_len);
         unsafe {
             builder.launch(LaunchConfig {
@@ -1181,18 +1190,18 @@ impl Kernel for StandardAttentionKernel {
             };
             let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
-            // On-device valid length for the capture-safe decode path: derive
-            // the growing length from the attention-mask frontier so the kernel
-            // reads it from device memory instead of host shape metadata (whose
-            // extent is frozen when a CUDA graph is captured). Eligible only for
-            // the fixed-capacity, mask-masked (non-causal) single-query decode
-            // step; every other path passes a null pointer and keeps the
-            // host-derived length, so eager/prefill/dense/GQA are unchanged.
+            // On-device valid length ABI for default-domain Attention: derive
+            // the valid attended length from the attention-mask frontier so the
+            // kernel reads it from device memory instead of host shape metadata
+            // (whose extent is frozen when a CUDA graph is captured). Scanning
+            // the LAST query row makes it correct for BOTH phases — prefill
+            // returns prompt_len, decode returns total_seq (row 0 would report 1
+            // under a causal prefill mask). Eligible only for the fixed-capacity,
+            // mask-masked (non-causal) fixed-slot-append path; every other path
+            // passes a null pointer and keeps the host-derived length, so
+            // eager/dense/GQA are bit-for-bit unchanged.
             let dev_length_eligible = has_past_key
                 && has_past_value
-                && q_seq == 1
-                && k_cur.seq == 1
-                && v_cur.seq == 1
                 && !self.is_causal
                 && mask.kind != 0
                 && capacity_key
@@ -1201,7 +1210,11 @@ impl Kernel for StandardAttentionKernel {
                 && alias_value;
             let dev_len_ptr = if dev_length_eligible {
                 let ptr = alloc(&self.runtime, &mut owned, std::mem::size_of::<i32>())?;
-                self.launch_derive_len(mask.ptr, mask.kind, mask.dims[3], ptr)?;
+                let key_len = mask.dims[3];
+                let mask_q = mask.dims[2];
+                let last_row = mask_q.saturating_sub(1);
+                let row_base = last_row * key_len;
+                self.launch_derive_len(mask.ptr, mask.kind, key_len, row_base, ptr)?;
                 ptr
             } else {
                 0
@@ -1744,5 +1757,81 @@ mod alias_tests {
                 "capacity KV append must be deterministic across runs (iteration {i})"
             );
         }
+    }
+
+    /// The on-device valid-length ABI must be correct for BOTH decode and
+    /// prefill: scanning the LAST query row of the additive mask returns
+    /// `total_seq` for a single-token decode and `prompt_len` for a multi-token
+    /// causal prefill. This locks the last-row behavior — a row-0 (decode-only)
+    /// scan would wrongly report 1 for a causal prefill mask, so this test fails
+    /// if the kernel reverts to scanning row 0 or to host shape metadata.
+    #[test]
+    fn derive_len_reads_valid_length_from_device_for_prefill_and_decode() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: false,
+            q_num_heads: Some(1),
+            kv_num_heads: Some(1),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+        };
+        const NEG: f32 = -65504.0;
+        let mask_kind = 1i32; // f32 additive bias
+
+        // Launch derive_len over `mask` scanning the row at `row_base` and read
+        // the device-written i32 back to the host.
+        let derive = |mask: &[f32], key_len: u64, row_base: u64| -> i32 {
+            let mask_buf = rt.alloc_raw(mask.len() * 4).unwrap();
+            unsafe { rt.htod(&f32_bytes(mask), mask_buf).unwrap() };
+            let out_buf = rt.alloc_raw(std::mem::size_of::<i32>()).unwrap();
+            kernel
+                .launch_derive_len(mask_buf, mask_kind, key_len, row_base, out_buf)
+                .unwrap();
+            rt.synchronize().unwrap();
+            let mut out = [0u8; 4];
+            unsafe { rt.dtoh(&mut out, out_buf).unwrap() };
+            unsafe { rt.free_raw(mask_buf).unwrap() };
+            unsafe { rt.free_raw(out_buf).unwrap() };
+            i32::from_le_bytes(out)
+        };
+
+        // Decode: mask row [1,1,1,cap] with `total` valid then padding.
+        let cap = 8u64;
+        let total = 5i32;
+        let mut decode = vec![0.0f32; total as usize];
+        decode.extend(std::iter::repeat(NEG).take(cap as usize - total as usize));
+        assert_eq!(
+            derive(&decode, cap, 0),
+            total,
+            "decode: device valid length must equal total_seq"
+        );
+
+        // Prefill: causal mask [1,1,prompt_len,cap], row i valid for keys [0,i].
+        let prompt_len = 4usize;
+        let mut prefill = Vec::with_capacity(prompt_len * cap as usize);
+        for i in 0..prompt_len {
+            for j in 0..cap as usize {
+                prefill.push(if j <= i { 0.0 } else { NEG });
+            }
+        }
+        let last_row_base = (prompt_len as u64 - 1) * cap;
+        assert_eq!(
+            derive(&prefill, cap, last_row_base),
+            prompt_len as i32,
+            "prefill: last-row scan must return prompt_len"
+        );
+        // Row 0 (the decode-only bug) reports 1 for a causal prefill mask, which
+        // is why the ABI scans the last query row.
+        assert_eq!(
+            derive(&prefill, cap, 0),
+            1,
+            "row-0 scan reports 1 for a causal prefill mask (decode-only bug guard)"
+        );
     }
 }
