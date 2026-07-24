@@ -3661,3 +3661,10 @@ These now surface their true kernel decline (they were previously hidden as unre
 - `quarantined_op_type_is_forced_to_a_capture_recording_failed_seam`: a statically-shaped `Cast` is not a recording-failed seam until its `(domain, op_type)` is quarantined, after which `node_capture_reason` forces it to `CaptureRecordingFailed` regardless of resolved shapes/kernel capability.
 
 **Files changed:** `crates/onnx-runtime-session/src/executor.rs` (+ 2 tests in-module).
+
+<!-- scribe-merge-2026-07-24T16-04-31Z-bilecki-dlpack-arm64 -->
+<!-- merged from .squad/decisions/inbox/bilecki-dlpack-arm64.md -->
+### 2026-07-24: Use per-test counters for DLPack import deleter tests
+**By:** Bilecki
+**What:** Store an `Arc<AtomicUsize>` in each fake producer context and have its foreign deleter increment that test-local counter; remove the shared import counters and serialization lock.
+**Why:** The shared static counter allowed unrelated deferred deleters to contaminate another test's assertion, observed as a Windows ARM64-only failure. Per-test ownership makes the deleter assertions hermetic while leaving production idempotency behavior unchanged.

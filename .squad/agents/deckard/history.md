@@ -88,3 +88,4 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default classification but was superseded by Sapper's v3 raw signature fix.
+- 2026-07-24T16:04:31Z: Freshly reviewed Keaton's GLM-4-9B native decode-coherence lock: two deterministic GPU-4 golden runs, perturbed-output rejection, native-only comparison semantics, and documentation all verified. 🟢 APPROVE; landed as `13af95d7`.
