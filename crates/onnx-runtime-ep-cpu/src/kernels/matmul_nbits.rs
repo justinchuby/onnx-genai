@@ -573,14 +573,40 @@ impl Kernel for MatMulNBitsKernel {
                 gemv_nk(&activations, weight_nk, result, self.k, self.n);
             })?;
         } else {
-            let weight_kn = self.dequantize_weight(
+            // Prefill / batched (m > 1) fallback for cases not owned by the
+            // 4-bit int8 path above (notably 8-bit weights, and generic
+            // accuracy levels or grouped quantization). Dequantizing straight
+            // into the transposed `Kn` layout the dense GEMM wants is a
+            // strided-scatter transpose (each K step writes at stride N), which
+            // thrashes cache and dominated prefill wall time (~95% of the
+            // MatMulNBits cost, measured ~45 ms/node on Qwen3-0.6B). Instead,
+            // on the MLAS backend dequantize once into the natural, contiguous
+            // `Nk` layout -- cached in the same `weight_nk` slot the m==1
+            // generic path uses, so constant weights pay the dequant once -- and
+            // let MLAS's cache-tiled `sgemm` consume it transposed (`trans_b`,
+            // `ldb = k`). MLAS then streams each weight row once and reuses it
+            // across all m activation rows, the amortization a per-row GEMV
+            // lacks. Non-MLAS hosts keep the previous direct-`Kn` dense path.
+            let used_fast_nt = self.try_prefill_mlas_nt(
                 &inputs[1],
                 &inputs[2],
                 zero_points,
                 group_indices,
-                WeightLayout::Kn,
+                can_prepack,
+                &activations,
+                m,
+                result,
             )?;
-            gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+            if !used_fast_nt {
+                let weight_kn = self.dequantize_weight(
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    group_indices,
+                    WeightLayout::Kn,
+                )?;
+                gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
+            }
         }
         if let Some(bias) = bias {
             for row in result.chunks_exact_mut(self.n) {
@@ -736,6 +762,104 @@ impl MatMulNBitsKernel {
             mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
         });
         Ok(Some(()))
+    }
+
+    /// Prefill / batched (`m > 1`) fast path for the dense-dequantize fallback:
+    /// dequantize the constant weight once into the natural, contiguous `Nk`
+    /// (`[n, k]`) layout, cache it, and run MLAS's cache-tiled `sgemm` with
+    /// `trans_b` so each weight row is streamed once and reused across all `m`
+    /// activation rows. Returns `Ok(true)` when it handled the GEMM, `Ok(false)`
+    /// when the host GEMM backend is not MLAS (the caller then uses the previous
+    /// direct-`Kn` dense path). Bit-identical to a no-transpose dense GEMM: MLAS
+    /// with `trans_b` computes `C = A * B_nk^T` where `B_nk[n, k]` is the same
+    /// weight the `Kn` path stores transposed.
+    #[cfg(feature = "mlas")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_prefill_mlas_nt(
+        &self,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        group_indices: Option<&TensorView>,
+        can_prepack: bool,
+        activations: &[f32],
+        m: usize,
+        result: &mut [f32],
+    ) -> Result<bool> {
+        use crate::backend::CpuBackend;
+
+        if CpuBackend::auto_detect() != CpuBackend::Mlas {
+            return Ok(false);
+        }
+
+        let owned_weight;
+        let weight_nk: &[f32] = if can_prepack {
+            if let Some(weight) = self.weight_nk.get() {
+                weight
+            } else {
+                let weight = self.dequantize_weight(
+                    packed,
+                    scales,
+                    zero_points,
+                    group_indices,
+                    WeightLayout::Nk,
+                )?;
+                let weight = numa_place_nk(weight, self.n);
+                let _ = self.weight_nk.set(weight);
+                self.weight_nk
+                    .get()
+                    .expect("constant MatMulNBits Nk prepack was just initialized")
+            }
+        } else {
+            let built = self.dequantize_weight(
+                packed,
+                scales,
+                zero_points,
+                group_indices,
+                WeightLayout::Nk,
+            )?;
+            owned_weight = numa_place_nk(built, self.n);
+            &owned_weight
+        };
+
+        // C[m, n] = A[m, k] * B_nk[n, k]^T. `trans_b` with `ldb = k` reads the
+        // Nk weight as the transposed operand without materializing a Kn copy.
+        mm_profile::time_gemv(|| {
+            mlas_sys::sgemm(
+                false,
+                true,
+                m,
+                self.n,
+                self.k,
+                1.0,
+                activations,
+                self.k,
+                weight_nk,
+                self.k,
+                0.0,
+                result,
+                self.n,
+            );
+        });
+        Ok(true)
+    }
+
+    /// Non-MLAS builds have no cache-tiled dense GEMM here, so the batched
+    /// fallback always uses the direct-`Kn` dense path.
+    #[cfg(not(feature = "mlas"))]
+    #[allow(clippy::too_many_arguments)]
+    fn try_prefill_mlas_nt(
+        &self,
+        _packed: &TensorView,
+        _scales: &TensorView,
+        _zero_points: Option<&TensorView>,
+        _group_indices: Option<&TensorView>,
+        _can_prepack: bool,
+        _activations: &[f32],
+        _m: usize,
+        _result: &mut [f32],
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Run a pre-partitioned MLAS SQNBit GEMV (`self.n` split into contiguous
@@ -1019,6 +1143,42 @@ impl MatMulNBitsKernel {
         };
         let default_zero_point = 1u8 << (self.bits - 1);
         let mut weight_kn = vec![0.0f32; self.k * self.n];
+
+        // Fast path: the natural `Nk` ([n, k]) layout with no per-column group
+        // indices writes each output row contiguously and independently, so it
+        // parallelizes cleanly across the pool. This is the layout the batched
+        // prefill GEMM consumes (via `trans_b`), and dequantizing the whole
+        // weight was previously a single-threaded scalar loop that dominated the
+        // first (cache-cold) prefill. Each `par_chunks_mut(k)` chunk is one
+        // output row; the row-major `Kn` transpose and the grouped path keep the
+        // original serial scatter below.
+        if matches!(layout, WeightLayout::Nk) && group_indices.is_none() {
+            let bits = self.bits;
+            let block_size = self.block_size;
+            weight_kn
+                .par_chunks_mut(self.k)
+                .enumerate()
+                .for_each(|(output, row)| {
+                    let packed_start = output * k_blocks * blob_size;
+                    let scale_start = output * k_blocks;
+                    let zero_point_start = output * zp_row_bytes;
+                    let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
+                    let scale_row = &scales[scale_start..scale_start + k_blocks];
+                    let zero_point_row = packed_zero_points
+                        .as_ref()
+                        .map(|points| &points[zero_point_start..zero_point_start + zp_row_bytes]);
+                    dequantize_nbits_row(
+                        packed_row,
+                        scale_row,
+                        zero_point_row,
+                        row,
+                        bits,
+                        block_size,
+                    );
+                });
+            return Ok(weight_kn);
+        }
+
         for output in 0..self.n {
             if group_indices.is_none() {
                 let packed_start = output * k_blocks * blob_size;
@@ -3943,6 +4103,49 @@ mod tests {
                         winner(&out),
                         winner(&oracle),
                         "asymmetric={asymmetric} m={m} row={row}: 8-bit execute argmax != f32 oracle",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Batched prefill regression for the 8-bit `execute` path across realistic
+    /// prompt lengths (`m` = 16/32/100). On the MLAS backend these `m > 1` calls
+    /// take the cache-tiled `Nk` + `sgemm(trans_b)` prefill route added to close
+    /// the ~10x native-vs-ORT prefill gap (previously a strided-`Kn` transpose
+    /// dequant plus dense GEMM). It must reconstruct the same values as an
+    /// independent dequantize-to-f32 GEMM to float precision AND pick the same
+    /// greedy argmax in every row, so a future kernel/layout regression that
+    /// silently changes prefill outputs is caught here.
+    #[test]
+    fn matmulnbits_8bit_prefill_batched_matches_dequant_f32_oracle() {
+        let (n, k, block_size) = (96usize, 384usize, 128usize);
+        let weights_nk: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.011).sin() * 1.1 + (i as f32 * 0.0005).cos() * 0.5)
+            .collect();
+        for &asymmetric in &[false, true] {
+            for &m in &[16usize, 32, 100] {
+                let activations: Vec<f32> = (0..m * k)
+                    .map(|i| (i as f32 * 0.017 + 0.2).cos() * 0.8)
+                    .collect();
+                let (out, oracle) =
+                    run_8bit_execute(n, k, block_size, m, asymmetric, &activations, &weights_nk);
+                let oracle_rms = rmse(&oracle, &vec![0.0; oracle.len()]).max(1e-6);
+                let rel = rmse(&out, &oracle) / oracle_rms;
+                assert!(
+                    rel <= 1e-5,
+                    "asymmetric={asymmetric} m={m}: 8-bit prefill relative RMSE {rel} exceeds 1e-5",
+                );
+                for row in 0..m {
+                    let winner = |v: &[f32]| {
+                        (0..n)
+                            .max_by(|&a, &b| v[row * n + a].total_cmp(&v[row * n + b]))
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        winner(&out),
+                        winner(&oracle),
+                        "asymmetric={asymmetric} m={m} row={row}: 8-bit prefill argmax != f32 oracle",
                     );
                 }
             }
