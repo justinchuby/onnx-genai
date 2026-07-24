@@ -729,6 +729,36 @@ fn attention_opset24_nonpad_external_cache_no_past_concat() {
 }
 
 #[test]
+fn multi_head_attention_infers_present_cache_and_qk_shapes() {
+    // Whisper decoder self-attention: query/key/value are [B,S,H], and the
+    // cached K/V inputs add their sequence axis to the newly projected key.
+    let n = with_attr(
+        with_domain(node("MultiHeadAttention", 8, 4), "com.microsoft"),
+        "num_heads",
+        Attribute::Int(6),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(1), c(384)]),
+            f32in(vec![c(1), c(1), c(384)]),
+            f32in(vec![c(1), c(1), c(384)]),
+            NodeIo::default(),
+            NodeIo::default(),
+            NodeIo::default(),
+            f32in(vec![c(1), c(6), c(224), c(64)]),
+            f32in(vec![c(1), c(6), c(224), c(64)]),
+        ],
+        1,
+    );
+    let shape_i = |i: usize| outs[i].type_info.as_ref().unwrap().shape.clone();
+    assert_eq!(shape_i(0), vec![c(1), c(1), c(384)]);
+    assert_eq!(shape_i(1), vec![c(1), c(6), c(225), c(64)]);
+    assert_eq!(shape_i(2), vec![c(1), c(6), c(225), c(64)]);
+    assert_eq!(shape_i(3), vec![c(1), c(6), c(1), c(225)]);
+}
+
+#[test]
 fn add_broadcast_concrete() {
     let n = node("Add", 2, 1);
     let outs = run(

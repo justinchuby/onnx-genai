@@ -371,6 +371,89 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `com.microsoft::MultiHeadAttention` accepts separate query/key/value inputs,
+/// unlike the packed-QKV `com.microsoft::Attention` operator. Its optional
+/// present-cache outputs are always `[batch, heads, total_sequence, head_size]`.
+pub fn multi_head_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let query = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let key = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let value = ctx.input_shape(2).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(query), Some(key), Some(value), Some(dtype)) = (query, key, value, dtype) else {
+        return Ok(());
+    };
+    if query.len() != 3 || !(key.len() == 3 || key.len() == 4) || value.len() != key.len() {
+        return Err(ShapeInferError::Invalid {
+            op: "MultiHeadAttention".into(),
+            detail: format!(
+                "query must be rank 3 and key/value must both be rank 3 or 4 (got query={}, key={}, value={})",
+                query.len(),
+                key.len(),
+                value.len()
+            ),
+        });
+    }
+
+    let heads = ctx
+        .node
+        .attr("num_heads")
+        .and_then(Attribute::as_int)
+        .map(DimExpr::constant)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: "MultiHeadAttention".into(),
+            detail: "missing required `num_heads` attribute".into(),
+        })?;
+    let batch = query[0].clone();
+    let query_sequence = query[1].clone();
+    let hidden = query[2].clone();
+    let head_size = hidden
+        .checked_div(&heads)
+        .unwrap_or_else(|| ctx.fresh_dim());
+    let key_sequence = if key.len() == 3 {
+        key[1].clone()
+    } else {
+        key[2].clone()
+    };
+    let total_sequence = match ctx.input_shape(6) {
+        Some(past_key) if past_key.len() == 4 => past_key[2].add(&key_sequence),
+        _ => key_sequence.clone(),
+    };
+
+    ctx.set_output(
+        0,
+        dtype,
+        vec![batch.clone(), query_sequence.clone(), hidden],
+    );
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(
+            1,
+            dtype,
+            vec![
+                batch.clone(),
+                heads.clone(),
+                total_sequence.clone(),
+                head_size.clone(),
+            ],
+        );
+    }
+    if ctx.num_outputs() > 2 {
+        ctx.set_output(
+            2,
+            dtype,
+            vec![
+                batch.clone(),
+                heads.clone(),
+                total_sequence.clone(),
+                head_size,
+            ],
+        );
+    }
+    if ctx.num_outputs() > 3 {
+        ctx.set_output(3, dtype, vec![batch, heads, query_sequence, total_sequence]);
+    }
+    Ok(())
+}
+
 /// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -426,4 +509,10 @@ pub fn register(reg: &mut InferenceRegistry) {
     // cache — total_seq stays kv_seq). The registry resolves the highest
     // `min_opset <= version`, so this single rule serves opsets 23–26.
     reg.register("", "Attention", 23, attention);
+    reg.register(
+        "com.microsoft",
+        "MultiHeadAttention",
+        1,
+        multi_head_attention,
+    );
 }
