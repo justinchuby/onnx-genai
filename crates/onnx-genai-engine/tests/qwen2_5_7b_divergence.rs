@@ -11,9 +11,10 @@
 //! ```
 #![cfg(all(feature = "native-backend", feature = "cuda"))]
 
-#[path = "common/qwen_decode_lock.rs"]
-mod qwen_decode_lock;
+#[path = "common/decode_lock.rs"]
+mod decode_lock;
 
+const PROMPT: &str = "The capital of France is";
 const EXPECTED_TOKENS: &[u32] = &[
     12095, 13, 1084, 374, 7407, 304, 279, 18172, 8622, 949, 315, 279, 3146, 13, 576, 3283, 374,
     279, 7772, 304, 9625, 323, 374, 279, 4746, 315, 279, 59108, 273, 6810, 7276, 34106, 5537, 13,
@@ -24,9 +25,9 @@ const EXPECTED_TOKENS: &[u32] = &[
 #[test]
 #[ignore = "requires the deployed Qwen2.5-7B int4 model and a CUDA device"]
 fn qwen2_5_7b_native_cuda_matches_ort_cuda() -> anyhow::Result<()> {
-    qwen_decode_lock::assert_native_cuda_matches_ort_cuda(
-        "Qwen2.5-7B",
+    decode_lock::assert_native_matches_ort_greedy(
         "ONNX_GENAI_QWEN7B_CUDA_DIR",
+        PROMPT,
         EXPECTED_TOKENS,
     )
 }
