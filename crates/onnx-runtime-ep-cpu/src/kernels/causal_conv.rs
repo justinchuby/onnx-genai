@@ -3,7 +3,7 @@
 //!
 //! Faithful CPU port of ONNX Runtime's contrib kernel
 //! (`contrib_ops/cpu/bert/causal_conv_with_state.cc`), verified to fp32 epsilon
-//! against ORT 1.26 (see `kernels::qwen35_goldens`). The op keeps the trailing
+//! against ORT 1.26 (see `tests/qwen35_ort_parity.rs`). The op keeps the trailing
 //! `K-1` input frames from the previous step in `conv_state` so that decode
 //! (`seq == 1`) stays causal across autoregressive steps.
 //!
@@ -286,13 +286,8 @@ impl Kernel for CausalConvWithStateKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::qwen35_goldens::conv as g;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
-
-    fn bits(a: &[u32]) -> Vec<f32> {
-        a.iter().map(|&b| f32::from_bits(b)).collect()
-    }
 
     fn kernel(silu: bool) -> Box<dyn Kernel> {
         let mut node = Node::new(NodeId(0), "CausalConvWithState", vec![], vec![]);
@@ -310,29 +305,6 @@ mod tests {
         CausalConvWithStateFactory.create(&node, &[]).unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_case(
-        dims: [usize; 4],
-        silu: bool,
-        x: &[u32],
-        w: &[u32],
-        b: &[u32],
-        st: &[u32],
-    ) -> (Vec<f32>, Vec<f32>) {
-        let [batch, c, k, s] = dims;
-        let pad = k - 1;
-        let x = Owned::f32(&[batch, c, s], &bits(x));
-        let w = Owned::f32(&[c, 1, k], &bits(w));
-        let bias = Owned::f32(&[c], &bits(b));
-        let state = Owned::f32(&[batch, c, pad], &bits(st));
-        let mut y = Owned::zeros_f32(&[batch, c, s]);
-        let mut present = Owned::zeros_f32(&[batch, c, pad]);
-        let ins = [x.view(), w.view(), bias.view(), state.view()];
-        let mut outs = [y.view_mut(), present.view_mut()];
-        kernel(silu).execute(&ins, &mut outs).unwrap();
-        (y.to_f32(), present.to_f32())
-    }
-
     fn assert_close(got: &[f32], want: &[f32], tag: &str) {
         assert_eq!(got.len(), want.len(), "{tag} length");
         for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
@@ -343,49 +315,6 @@ mod tests {
                 "{tag}[{i}]: got {a}, want {b} (abs {diff}, rel {rel})"
             );
         }
-    }
-
-    #[test]
-    fn ort_parity_prefill_silu() {
-        let (y, p) = run_case(
-            g::CONVA_DIMS,
-            g::CONVA_SILU,
-            &g::CONVA_X,
-            &g::CONVA_W,
-            &g::CONVA_B,
-            &g::CONVA_STATE,
-        );
-        assert_close(&y, &bits(&g::CONVA_Y), "CONVA y");
-        assert_close(&p, &bits(&g::CONVA_PRESENT), "CONVA present");
-    }
-
-    #[test]
-    fn ort_parity_decode_silu() {
-        // S=1 decode: present_state mixes trailing past-state frames with x.
-        let (y, p) = run_case(
-            g::CONVB_DIMS,
-            g::CONVB_SILU,
-            &g::CONVB_X,
-            &g::CONVB_W,
-            &g::CONVB_B,
-            &g::CONVB_STATE,
-        );
-        assert_close(&y, &bits(&g::CONVB_Y), "CONVB y");
-        assert_close(&p, &bits(&g::CONVB_PRESENT), "CONVB present");
-    }
-
-    #[test]
-    fn ort_parity_no_activation_k3() {
-        let (y, p) = run_case(
-            g::CONVC_DIMS,
-            g::CONVC_SILU,
-            &g::CONVC_X,
-            &g::CONVC_W,
-            &g::CONVC_B,
-            &g::CONVC_STATE,
-        );
-        assert_close(&y, &bits(&g::CONVC_Y), "CONVC y");
-        assert_close(&p, &bits(&g::CONVC_PRESENT), "CONVC present");
     }
 
     #[test]
@@ -423,51 +352,6 @@ mod tests {
             Attribute::String(b"gelu".to_vec()),
         );
         assert!(CausalConvWithStateFactory.create(&node, &[]).is_err());
-    }
-
-    #[test]
-    fn bf16_activations_widen_and_narrow() {
-        // Same math as CONVC but with bf16 in/out; bf16 rounding tolerance.
-        let [batch, c, k, s] = g::CONVC_DIMS;
-        let pad = k - 1;
-        let x = Owned::bf16(&[batch, c, s], &bits(&g::CONVC_X));
-        let w = Owned::bf16(&[c, 1, k], &bits(&g::CONVC_W));
-        let bias = Owned::bf16(&[c], &bits(&g::CONVC_B));
-        let state = Owned::bf16(&[batch, c, pad], &bits(&g::CONVC_STATE));
-        let mut y = Owned::zeros(DataType::BFloat16, &[batch, c, s]);
-        let mut present = Owned::zeros(DataType::BFloat16, &[batch, c, pad]);
-        let ins = [x.view(), w.view(), bias.view(), state.view()];
-        let mut outs = [y.view_mut(), present.view_mut()];
-        kernel(false).execute(&ins, &mut outs).unwrap();
-        let got = y.to_bf16_as_f32();
-        let want = bits(&g::CONVC_Y);
-        for (i, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
-            assert!(
-                (a - b).abs() <= 0.05 * b.abs().max(1.0) + 0.05,
-                "bf16 y[{i}]: got {a}, want {b}"
-            );
-        }
-    }
-
-    #[test]
-    fn f16_activations_widen_and_narrow() {
-        // Same math as CONVC but with f16 in/out; tolerance loosened for half.
-        let [batch, c, k, s] = g::CONVC_DIMS;
-        let pad = k - 1;
-        let x = Owned::f16(&[batch, c, s], &bits(&g::CONVC_X));
-        let w = Owned::f16(&[c, 1, k], &bits(&g::CONVC_W));
-        let bias = Owned::f16(&[c], &bits(&g::CONVC_B));
-        let state = Owned::f16(&[batch, c, pad], &bits(&g::CONVC_STATE));
-        let mut y = Owned::zeros(DataType::Float16, &[batch, c, s]);
-        let mut present = Owned::zeros(DataType::Float16, &[batch, c, pad]);
-        let ins = [x.view(), w.view(), bias.view(), state.view()];
-        let mut outs = [y.view_mut(), present.view_mut()];
-        kernel(false).execute(&ins, &mut outs).unwrap();
-        let got = y.to_f16_as_f32();
-        let want = bits(&g::CONVC_Y);
-        for (i, (&a, &b)) in got.iter().zip(&want).enumerate() {
-            assert!((a - b).abs() <= 2e-2, "f16 y[{i}]: got {a}, want {b}");
-        }
     }
 
     /// Persistent DeviceIoBindings may bind an input buffer onto an output

@@ -1,8 +1,7 @@
-//! Auto-generated ORT-1.26 golden fixtures for the Qwen3.5 hybrid linear-attention
-//! kernels (CausalConvWithState, LinearAttention). Values are bit-exact f32
-//! (`f32::from_bits`). Regenerate with scripts/gen_qwen35_goldens.py. DO NOT EDIT.
-#![allow(clippy::all)]
-
+// Auto-generated ORT-1.26 golden fixtures for the Qwen3.5 hybrid linear-attention
+// kernels (CausalConvWithState, LinearAttention). Values are bit-exact f32
+// (`f32::from_bits`). Regenerate with tests/qwen35_parity/generate.py. DO NOT EDIT.
+#[allow(clippy::all)]
 pub mod conv {
     /// (name, C, K, S, B, activation_is_silu)
     // case CONVA: C=3 K=4 S=5 B=1 act=silu
@@ -68,6 +67,7 @@ pub mod conv {
     pub const CONVC_PRESENT: [u32; 4] = [0x3e4612a8, 0xbf554a47, 0x40071167, 0xbf80d35b];
 }
 
+#[allow(clippy::all)]
 pub mod la {
     // case LAA: H=2 Dk=4 Dv=4 S=3 B=1 scale=1.0
     pub const LAA_DIMS: [usize; 5] = [1, 2, 4, 4, 3];
