@@ -372,6 +372,45 @@ impl SpmdDecodePools {
         segments
     }
 
+    /// [`Self::worker_row_segments`] with every interior boundary snapped to a
+    /// multiple of `align`. The per-worker split is computed exactly as the
+    /// unaligned version (so node-major ordering and weight placement still line
+    /// up), then each cumulative boundary except the final `n` is rounded to the
+    /// nearest multiple of `align`, kept monotonic and in `[0, n]`. The result
+    /// still covers `0..n` exactly once; a boundary collision can leave a worker
+    /// with a zero-length segment (it simply runs no work), which the dispatch
+    /// and shard-build paths already tolerate.
+    ///
+    /// `align <= 1` is the identity (returns the unaligned segments): callers
+    /// whose per-column arithmetic is partition-independent pass `1`.
+    fn worker_row_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        let base = self.worker_row_segments(n);
+        if align <= 1 {
+            return base;
+        }
+        let mut segments = Vec::with_capacity(base.len());
+        let mut prev_boundary = 0;
+        let mut cumulative = 0;
+        let last = base.len().saturating_sub(1);
+        for (index, &(_, len)) in base.iter().enumerate() {
+            cumulative += len;
+            let boundary = if index == last {
+                // The final boundary is always `n`, even when `n` is not a
+                // multiple of `align`: the last shard's start is aligned, so its
+                // trailing partial N-tile matches the full-width call's tail.
+                n
+            } else {
+                // Round the ideal cumulative boundary to the nearest multiple of
+                // `align`, staying monotonic and within bounds.
+                let rounded = ((cumulative + align / 2) / align) * align;
+                rounded.clamp(prev_boundary, n)
+            };
+            segments.push((prev_boundary, boundary - prev_boundary));
+            prev_boundary = boundary;
+        }
+        segments
+    }
+
     /// Shard `result`'s output rows across the workers and run `compute` on each
     /// worker's contiguous slice under one lightweight barrier.
     ///
@@ -397,8 +436,21 @@ impl SpmdDecodePools {
     /// pool. Callers that pre-partition a weight along N (e.g. one MLAS SQNBit
     /// packed shard per worker) use this to build shards that line up exactly
     /// with [`Self::dispatch_output_rows_indexed`].
-    pub fn output_column_segments(&self, n: usize) -> Vec<(usize, usize)> {
-        self.worker_row_segments(n)
+    ///
+    /// Every segment boundary is snapped to a multiple of `align` (the last,
+    /// `n`-terminated segment excepted). This matters for kernels whose SIMD
+    /// column-tiling is *not* bit-stable across an arbitrary N-partition: MLAS's
+    /// SQNBit GEMV processes output columns in fixed-width N-tiles, so a shard
+    /// boundary that falls *mid-tile* forces MLAS's remainder path to reduce a
+    /// block-sum in a different order than the full-width call, shifting that
+    /// column by ~1 ULP. Aligning every interior boundary to the N-tile width
+    /// keeps every tile whole inside a single shard, so each shard reproduces
+    /// the full-width tiling exactly and the concatenated output is
+    /// bit-identical to the unsharded call (verified `max_ulp = 0`). Pass
+    /// `align = 1` for kernels whose per-column result is already
+    /// partition-independent (e.g. the hand int4/int8 GEMV).
+    pub fn output_column_segments(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
+        self.worker_row_segments_aligned(n, align)
     }
 
     /// Like [`Self::dispatch_output_rows`], but hands each worker its global
@@ -406,14 +458,16 @@ impl SpmdDecodePools {
     /// (no serial-threshold short-circuit), so a caller can select the matching
     /// pre-partitioned weight shard (`compute(global_index, output_start,
     /// outputs)`). `result.len()` must equal `n` passed to
-    /// [`Self::output_column_segments`]; each worker writes only its own segment,
-    /// so the concatenated result is bit-identical to the single-worker path.
-    pub fn dispatch_output_rows_indexed<F>(&self, result: &mut [f32], compute: &F)
+    /// [`Self::output_column_segments`], and `align` must match so the dispatch
+    /// segments line up byte-for-byte with the caller's pre-built shards; each
+    /// worker writes only its own segment, so the concatenated result is
+    /// bit-identical to the single-worker path.
+    pub fn dispatch_output_rows_indexed<F>(&self, result: &mut [f32], align: usize, compute: &F)
     where
         F: Fn(usize, usize, &mut [f32]) + Sync,
     {
         let n = result.len();
-        let segments = self.worker_row_segments(n);
+        let segments = self.worker_row_segments_aligned(n, align);
         let table = RowTable {
             base: result.as_mut_ptr(),
             segments: &segments,
@@ -904,6 +958,46 @@ mod tests {
             expected_start += len;
         }
         assert_eq!(expected_start, n);
+    }
+
+    #[test]
+    fn worker_row_segments_aligned_snaps_interior_boundaries_and_covers_every_row() {
+        // Every interior boundary must be a multiple of `align`; the segments
+        // must still be contiguous, disjoint, and cover exactly 0..n. This is
+        // the invariant the MLAS SQNBit decode shard path relies on to keep each
+        // N-tile whole (and thus bit-identical to the full-width call).
+        let pool = single_group_pool(3);
+        for &align in &[4usize, 16] {
+            for &n in &[97usize, 128, 151936, 1, 0, 5, 17] {
+                let segments = pool.worker_row_segments_aligned(n, align);
+                assert_eq!(segments.len(), pool.total_workers());
+                let mut expected_start = 0;
+                for (index, &(start, len)) in segments.iter().enumerate() {
+                    assert_eq!(start, expected_start, "n={n} align={align} seg {index}");
+                    // Interior boundaries (every start past the first) must be
+                    // align-aligned; the final segment may end at an unaligned n.
+                    assert_eq!(
+                        start % align,
+                        0,
+                        "n={n} align={align}: segment start {start} not aligned"
+                    );
+                    expected_start += len;
+                }
+                assert_eq!(expected_start, n, "n={n} align={align}: must cover 0..n");
+            }
+        }
+    }
+
+    #[test]
+    fn worker_row_segments_aligned_is_identity_for_align_one() {
+        let pool = two_group_pool();
+        for &n in &[0usize, 1, 37, 100, 101] {
+            assert_eq!(
+                pool.worker_row_segments_aligned(n, 1),
+                pool.worker_row_segments(n),
+                "align=1 must reproduce the unaligned split (n={n})"
+            );
+        }
     }
 
     #[test]

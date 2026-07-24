@@ -1564,6 +1564,124 @@ mod tests {
         }
     }
 
+    /// Regression lock for the persistent-pool decode fix: when contiguous N
+    /// shards are cut on **N-tile-aligned** boundaries, the concatenated SQNBit
+    /// CompFp32 GEMV is *bit-identical* (`to_bits`) to the full-width call --
+    /// MLAS processes each whole N-tile the same way regardless of how many
+    /// columns the shard holds. A boundary that splits an N-tile (odd column)
+    /// instead forces MLAS's narrower remainder path and drifts by >= 1 ULP.
+    ///
+    /// The ep-cpu decode path snaps every interior shard boundary to a multiple
+    /// of 16 (`MLAS_SQNBIT_DECODE_SHARD_ALIGN`) for exactly this reason; this
+    /// test is the model-free proof that alignment is load-bearing (the
+    /// mid-tile split below is asserted to actually differ, so the aligned
+    /// assertion cannot pass vacuously).
+    #[test]
+    fn sqnbit_int4_tile_aligned_shards_are_bit_exact() {
+        // qwen3-0.6b-flavoured widths: N not a multiple of the tile, block-128.
+        let n = 176usize;
+        let mut any_mid_tile_drift = false;
+        for &(k, block_size) in &[(256usize, 128usize), (512, 32), (256, 64)] {
+            for &asym in &[false, true] {
+                let weights: Vec<f32> =
+                    (0..n * k).map(|i| (i as f32 * 0.017 + 0.3).sin()).collect();
+                let (packed_b, scales, zps, _) = quantize_int4(&weights, n, k, block_size, asym);
+                let a: Vec<f32> = (0..k)
+                    .map(|i| ((i as f32 * 0.011 + 0.7).cos()) * 0.5)
+                    .collect();
+
+                let full = match SQNBitPackedB::new(
+                    n,
+                    k,
+                    4,
+                    block_size,
+                    SQNBitComputeType::Fp32,
+                    &packed_b,
+                    &scales,
+                    zps.as_deref(),
+                ) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("SQNBit blk={block_size} unavailable; skipping");
+                        return;
+                    }
+                };
+                let mut c_full = vec![0.0f32; n];
+                sqnbit_gemm(&full, 1, &a, None, &mut c_full, false);
+
+                let blocks = k.div_ceil(block_size);
+                let blob = block_size / 2;
+                let zp_row = blocks.div_ceil(2);
+                let run_shards = |shards: &[(usize, usize)]| -> Vec<f32> {
+                    let mut c = vec![0.0f32; n];
+                    for &(start, len) in shards {
+                        let pb = &packed_b[start * blocks * blob..(start + len) * blocks * blob];
+                        let sc = &scales[start * blocks..(start + len) * blocks];
+                        let zp = zps
+                            .as_deref()
+                            .map(|z| &z[start * zp_row..(start + len) * zp_row]);
+                        let packed = SQNBitPackedB::new(
+                            len,
+                            k,
+                            4,
+                            block_size,
+                            SQNBitComputeType::Fp32,
+                            pb,
+                            sc,
+                            zp,
+                        )
+                        .expect("shard packs when the full weight packs");
+                        // SAFETY: disjoint contiguous column ranges; start+len <= n.
+                        unsafe {
+                            sqnbit_gemm_into(
+                                &packed,
+                                1,
+                                &a,
+                                None,
+                                c.as_mut_ptr().add(start),
+                                n,
+                                false,
+                            );
+                        }
+                    }
+                    c
+                };
+
+                // Tile-aligned (multiple-of-16) interior boundaries: bit-exact.
+                let aligned: &[(usize, usize)] = &[(0, 16), (16, 48), (64, 64), (128, 48)];
+                assert_eq!(aligned.iter().map(|&(_, l)| l).sum::<usize>(), n);
+                let c_aligned = run_shards(aligned);
+                let aligned_bits_match = c_aligned
+                    .iter()
+                    .zip(&c_full)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(
+                    aligned_bits_match,
+                    "k{k} blk{block_size} asym{asym}: 16-aligned N shards must be \
+                     bit-identical to full-width, but differ"
+                );
+
+                // Mid-tile boundaries (odd columns split an N-tile) drift from
+                // the full-width call. The drift is data-dependent, so require it
+                // to appear in at least one case overall (asserted after the loop)
+                // rather than every case -- enough to prove the aligned assertion
+                // above is non-vacuous.
+                let mid_tile: &[(usize, usize)] = &[(0, 17), (17, 30), (47, 1), (48, 128)];
+                assert_eq!(mid_tile.iter().map(|&(_, l)| l).sum::<usize>(), n);
+                let c_mid = run_shards(mid_tile);
+                any_mid_tile_drift |= c_mid
+                    .iter()
+                    .zip(&c_full)
+                    .any(|(a, b)| a.to_bits() != b.to_bits());
+            }
+        }
+        assert!(
+            any_mid_tile_drift,
+            "expected at least one mid-tile-split N shard layout to drift from full-width \
+             (non-vacuous guard); none did, so the 16-alignment fix is untested on this host"
+        );
+    }
+
     #[test]
     fn sqnbit_int4_compint8_matches_reference() {
         // Portability guard pending microsoft/onnxruntime#29853: only the AVX2
