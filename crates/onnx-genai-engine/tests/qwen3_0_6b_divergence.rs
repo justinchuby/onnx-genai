@@ -47,9 +47,7 @@
 //!   -- --ignored --nocapture
 //! ```
 
-use onnx_genai_engine::{
-    GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain,
-};
+use onnx_genai_engine::{GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain};
 use onnx_genai_ort::Tokenizer;
 
 /// Raw teacher-forced prefix: the 14 prompt tokens plus the four generated
@@ -85,8 +83,7 @@ fn qwen3_0_6b_int4_native_decode_keeps_high_precision_argmax() -> anyhow::Result
         return Ok(());
     }
 
-    let mut session =
-        NativeDecodeSession::load(dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
+    let mut session = NativeDecodeSession::load(dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
     // Teacher-forced single greedy step: feed the exact agreed prefix, emit one
