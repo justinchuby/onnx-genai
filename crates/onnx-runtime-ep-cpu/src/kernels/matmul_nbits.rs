@@ -3506,6 +3506,46 @@ mod tests {
         }
     }
 
+    fn run_decode_case(
+        activations: &[f32],
+        packed: &[u8],
+        scales: &[f32],
+        n: usize,
+        block_size: usize,
+        accuracy_level: Option<i64>,
+    ) -> Vec<f32> {
+        let k = activations.len();
+        let blocks = k.div_ceil(block_size);
+        let (mut graph, node) = model_node(
+            &[1, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            None,
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        if let Some(level) = accuracy_level {
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("accuracy_level".into(), Attribute::Int(level));
+        }
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .unwrap();
+        let a = Owned::f32(&[1, k], activations);
+        let b = Owned::u8(&[n, blocks, block_size / 2], packed);
+        let scales = Owned::f32(&[n, blocks], scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+        y.to_f32()
+    }
+
     fn accuracy4_model(m: usize, k: usize, n: usize, block_size: usize) -> (Graph, NodeId) {
         let blocks = k.div_ceil(block_size);
         let (mut graph, node) = model_node(
@@ -3691,6 +3731,68 @@ mod tests {
                 .unwrap();
             assert_int8_close(&y.to_f32(), &expected);
         }
+    }
+
+    #[test]
+    fn matmulnbits_fp32_activation_is_more_accurate_than_accuracy4() {
+        let (k, n, block_size) = (128, 2, 128);
+        let mut weights_nk = vec![0i8; n * k];
+        weights_nk[0] = 1;
+        weights_nk[1] = 7;
+        weights_nk[2] = -6;
+        weights_nk[k] = 1;
+        let mut packed = vec![0x88u8; n * block_size / 2];
+        for (output, weights) in weights_nk.chunks_exact(k).enumerate() {
+            for (depth, &weight) in weights.iter().enumerate() {
+                let q = (weight + 8) as u8;
+                let byte = &mut packed[output * block_size / 2 + depth / 2];
+                if depth.is_multiple_of(2) {
+                    *byte = (*byte & 0xf0) | q;
+                } else {
+                    *byte = (*byte & 0x0f) | (q << 4);
+                }
+            }
+        }
+        let scales = vec![1.0; n];
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+
+        // max_abs=127 makes the accuracy-4 activation scale exactly 1.0. Thus
+        // 0.49 rounds to 0 and 0.51 rounds to 1: the exact margin
+        // 7*0.49 - 6*0.51 = +0.37 becomes -6 after activation quantization.
+        let mut activations = vec![0.0; k];
+        activations[..3].copy_from_slice(&[127.0, 0.49, 0.51]);
+        let expected = reference(&activations, &dequantized, 1, k, n);
+        let absent = run_decode_case(&activations, &packed, &scales, n, block_size, None);
+        let level1 = run_decode_case(&activations, &packed, &scales, n, block_size, Some(1));
+        let level4 = run_decode_case(&activations, &packed, &scales, n, block_size, Some(4));
+
+        assert_close(&absent, &expected);
+        assert_close(&level1, &expected);
+        assert!(absent[0].total_cmp(&absent[1]).is_gt());
+        assert!(level1[0].total_cmp(&level1[1]).is_gt());
+        assert!(level4[1].total_cmp(&level4[0]).is_gt());
+        let fp32_error = absent
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f32::max);
+        let accuracy4_error = level4
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            accuracy4_error > fp32_error + 1.0,
+            "accuracy-4 error {accuracy4_error} must materially exceed fp32 error {fp32_error}"
+        );
+
+        let mut on_grid = vec![0.0; k];
+        on_grid[..3].copy_from_slice(&[127.0, 1.0, 1.0]);
+        let on_grid_expected = reference(&on_grid, &dequantized, 1, k, n);
+        assert_close(
+            &run_decode_case(&on_grid, &packed, &scales, n, block_size, Some(4)),
+            &on_grid_expected,
+        );
     }
 
     #[test]

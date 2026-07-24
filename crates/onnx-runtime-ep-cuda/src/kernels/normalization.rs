@@ -1003,6 +1003,39 @@ struct NormCaptureSignature {
     output_dtypes_and_shapes: Vec<(DataType, Vec<usize>)>,
 }
 
+impl NormCaptureSignature {
+    /// Build the exact-shape capture signature for a normalization launch.
+    ///
+    /// CUDA graph replay re-runs the recorded kernel verbatim, so the launch
+    /// geometry — fixed by `num_groups` (`prod(input_shape[..axis])`) and the
+    /// normalization size — together with every activation/scale/bias dtype and
+    /// output dtype/shape must be byte-for-byte identical between the eager
+    /// warmup and the captured step. Encoding all of them here lets the
+    /// warmed-signature drift check reject any change during capture, so a
+    /// fixed multi-group shape (e.g. Qwen3's per-head Q/K RMSNorm, 16 or 8
+    /// groups per layer) is exactly as replayable as a single-group token norm:
+    /// both resolve a deterministic launch config from the fixed shape with no
+    /// host-side runtime-value branching or per-op allocation.
+    fn build(
+        activation_dtype: DataType,
+        scale_dtype: DataType,
+        bias_dtype: Option<DataType>,
+        input_shape: &[usize],
+        outputs: &[TensorMut],
+    ) -> Self {
+        Self {
+            activation_dtype,
+            scale_dtype,
+            bias_dtype,
+            input_shape: input_shape.to_vec(),
+            output_dtypes_and_shapes: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+        }
+    }
+}
+
 impl LayerNormKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
@@ -1093,24 +1126,21 @@ impl LayerNormKernel {
         let has_bias: i32 = i32::from(bias_ptr != 0);
         let eps = self.epsilon;
         let groups_i = groups_u_i32(groups_u);
-        let signature = (num_groups == 1).then(|| NormCaptureSignature {
-            activation_dtype: x.dtype,
-            scale_dtype: scale.dtype,
-            bias_dtype: bias.map(|bias| bias.dtype),
-            input_shape: x.shape.to_vec(),
-            output_dtypes_and_shapes: outputs
-                .iter()
-                .map(|output| (output.dtype, output.shape.to_vec()))
-                .collect(),
-        });
+        let signature = NormCaptureSignature::build(
+            x.dtype,
+            scale.dtype,
+            bias.map(|bias| bias.dtype),
+            x.shape,
+            outputs,
+        );
         let capturing = self.runtime.is_capturing()?;
         let mut warmed_signature = self
             .warmed_signature
             .lock()
             .expect("cuda_ep LayerNormalization capture signature poisoned");
-        if capturing && warmed_signature.as_ref() != signature.as_ref() {
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
             return Err(EpError::KernelFailed(
-                "cuda_ep LayerNormalization: dtype or shape changed during CUDA graph capture; warm the exact single-group signature before capture"
+                "cuda_ep LayerNormalization: dtype or shape changed during CUDA graph capture; warm the exact fixed-shape signature before capture"
                     .into(),
             ));
         }
@@ -1166,10 +1196,9 @@ impl LayerNormKernel {
         // scale/bias: norm_size; mean/invstd: num_groups).
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         if !capturing {
-            *warmed_signature = signature.clone();
+            *warmed_signature = Some(signature.clone());
         }
-        self.last_call_capture_safe
-            .store(signature.is_some(), Ordering::Relaxed);
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1186,7 +1215,7 @@ impl Kernel for LayerNormKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "LayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+                "LayerNormalization shape/dtype signature does not match the warmed fixed-shape capture signature",
             )
         }
     }
@@ -1312,24 +1341,15 @@ impl RmsNormKernel {
             i32::try_from(norm_size).map_err(|_| dim_overflow(op, "norm_size", norm_size))?,
         );
         let eps = self.epsilon;
-        let signature = (num_groups == 1).then(|| NormCaptureSignature {
-            activation_dtype: x.dtype,
-            scale_dtype: scale.dtype,
-            bias_dtype: None,
-            input_shape: x.shape.to_vec(),
-            output_dtypes_and_shapes: outputs
-                .iter()
-                .map(|output| (output.dtype, output.shape.to_vec()))
-                .collect(),
-        });
+        let signature = NormCaptureSignature::build(x.dtype, scale.dtype, None, x.shape, outputs);
         let capturing = self.runtime.is_capturing()?;
         let mut warmed_signature = self
             .warmed_signature
             .lock()
             .expect("cuda_ep RMSNormalization capture signature poisoned");
-        if capturing && warmed_signature.as_ref() != signature.as_ref() {
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
             return Err(EpError::KernelFailed(
-                "cuda_ep RMSNormalization: dtype or shape changed during CUDA graph capture; warm the exact single-group signature before capture"
+                "cuda_ep RMSNormalization: dtype or shape changed during CUDA graph capture; warm the exact fixed-shape signature before capture"
                     .into(),
             ));
         }
@@ -1372,10 +1392,9 @@ impl RmsNormKernel {
         // match; pointers are live device allocations sized as validated.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         if !capturing {
-            *warmed_signature = signature.clone();
+            *warmed_signature = Some(signature.clone());
         }
-        self.last_call_capture_safe
-            .store(signature.is_some(), Ordering::Relaxed);
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1392,7 +1411,7 @@ impl Kernel for RmsNormKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "SimplifiedLayerNormalization/RMSNorm shape/dtype signature does not match the warmed single-group capture signature",
+                "SimplifiedLayerNormalization/RMSNorm shape/dtype signature does not match the warmed fixed-shape capture signature",
             )
         }
     }
@@ -1698,6 +1717,15 @@ impl SkipSimplifiedLayerNormKernel {
         };
         unsafe { builder.launch(cfg) }
             .map_err(|e| driver_err(&format!("launch {}", selection.entry), e))?;
+        // Unlike the plain RMS/LayerNorm kernels, this fused residual norm is
+        // kept single-group for capture on purpose. It normalizes the hidden
+        // (last) axis per token, so decode — the only phase that captures — is
+        // always num_groups == 1; a fixed multi-group shape would only ever
+        // arise in the uncaptured prefill. Its capture drift is guarded by the
+        // shape-keyed `SkipBroadcastMetadataCache` (which rejects a shape change
+        // mid-capture) rather than a dtype-encoding `NormCaptureSignature`, so
+        // admitting multi-group here would broaden capture with no decode
+        // benefit and weaker drift detection. Left conservative by design.
         self.last_call_capture_safe
             .store(num_groups == 1, Ordering::Relaxed);
         Ok(())
@@ -1884,6 +1912,13 @@ impl SkipLayerNormKernel {
         // validated (input/skip/output/sum: num_groups·norm_size; gamma/beta/
         // bias: norm_size; mean/invstd: num_groups).
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_layernorm_f32", e))?;
+        // Kept single-group for capture on purpose: SkipLayerNorm normalizes the
+        // hidden (last) axis per token, so the only captured phase (decode) is
+        // always num_groups == 1 and a multi-group shape arises solely in the
+        // uncaptured prefill. This kernel also carries no `NormCaptureSignature`
+        // drift guard at all, so generalizing it would admit multi-group capture
+        // with neither a decode benefit nor dtype/shape drift detection. Left
+        // conservative by design.
         self.last_call_capture_safe
             .store(num_groups == 1, Ordering::Relaxed);
         Ok(())

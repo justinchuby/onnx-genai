@@ -9,3 +9,6 @@
 # schema_sync compares this generated file byte-for-byte; force LF so the check
 # passes on Windows checkouts (autocrlf would otherwise convert it to CRLF).
 schema/inference_metadata.schema.json text eol=lf
+
+# Serialized ONNX protobufs must remain byte-identical across checkouts.
+*.onnx binary

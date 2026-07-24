@@ -1411,6 +1411,23 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
             .and_then(|attr| attr.as_int())
             .unwrap_or(0)
             == 0
+        || (
+            // `pkg.nxrt::IndexShare` mirrors the mask-driven Attention treatment.
+            // Its capacity form emits the 3-output present that ALIASES the
+            // fixed-capacity past bindings in place (past_key=input 3, past_value=
+            // input 4) instead of a growing `past ⧺ current`, and carries the valid
+            // length via the additive attention_bias (input 6) frontier — which the
+            // kernel scans on-device to place the current token and bound the gather.
+            // Binding those caches at physical capacity is what keeps whole-step
+            // capture shape-static. Gated on the 3-output present + present bias so
+            // the growing-concat form (1 output, or bias-less) still reads the cache
+            // extent as the valid length.
+            node.domain == "pkg.nxrt"
+                && node.op_type == "IndexShare"
+                && matches!(input_index, 3 | 4)
+                && node.outputs.len() == 3
+                && node.inputs.get(6).is_some_and(Option::is_some)
+        )
 }
 
 fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {

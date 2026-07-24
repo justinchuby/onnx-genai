@@ -1,0 +1,10 @@
+required_capabilities:
+- kv_cache
+- multi_head_attention
+model:
+  attention:
+    type: multi_head
+    num_attention_heads: 4
+    num_kv_heads: 4
+    head_dim: 16
+  max_sequence_length: 128

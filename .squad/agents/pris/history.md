@@ -124,3 +124,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
 
 - 2026-07-22T23:20:00Z — Authored the persistent SPMD decode-pool profile/implementation; the default-off lever advanced native M=1 int4 decode to about 17.3 tok/s with bit parity, then entered review and revision.
+## 2026-07-24T15:10:00Z — Shared decode-lock helper revision
+
+Revised the Phi decode lock after Holden's rejection: environment-gated real-model coverage and generalized `common/decode_lock.rs` across Phi and Qwen. Holden approved; Pris co-owns the shared helper with Batty and Leon.

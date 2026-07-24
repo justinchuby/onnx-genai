@@ -8,6 +8,14 @@ repository.workspace = true
 keywords = ["onnx", "llm", "inference", "genai"]
 categories = ["science", "text-processing"]
 
+[[test]]
+name = "glm_tiny_qmoe_native_cuda_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "qwen3_0_6b_native_cuda_e2e"
+required-features = ["cuda", "native-backend"]
+
 [features]
 default = []
 native-backend = [

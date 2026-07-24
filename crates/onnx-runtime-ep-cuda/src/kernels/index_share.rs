@@ -225,6 +225,76 @@ __device__ __forceinline__ float bias_at(
   return load_float(bias, off, dtype);
 }
 
+// Recover the logical valid length that the fixed-capacity present drops from
+// its shape (present aliases past at capacity, so its sequence extent no longer
+// encodes the logical length) from the causal/padding bias frontier:
+// valid_len = 1 + max{k : bias(b,.,.,k) finite}; write_pos = valid_len - current_seq.
+// One thread owns one batch. Mirrors the CPU oracle's `capacity_valid_lens`
+// (max over finite columns) and `build_capacity_present` write position exactly.
+// Runs on the capturing path too -- the frontier is recomputed from the live
+// bias every replay -- so it stays fully on-device with no host round-trip,
+// which is what keeps the capacity present capture-safe.
+extern "C" __global__ void capacity_write_pos(
+    const void* bias, int dtype, int rank,
+    unsigned long long bd0, unsigned long long bd1,
+    unsigned long long bd2, unsigned long long bd3,
+    unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
+    unsigned long long cache_seq, unsigned long long current_seq,
+    long long* valid_len, long long* write_pos) {
+  const unsigned long long b =
+      (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= batch) {
+    return;
+  }
+  unsigned long long valid = 0;
+  for (unsigned long long h = 0; h < q_heads; ++h) {
+    for (unsigned long long qi = 0; qi < q_seq; ++qi) {
+      for (unsigned long long k = 0; k < cache_seq; ++k) {
+        const float v =
+            bias_at(bias, dtype, rank, bd0, bd1, bd2, bd3, b, h, qi, k);
+        if (isfinite(v) && k + 1 > valid) {
+          valid = k + 1;
+        }
+      }
+    }
+  }
+  valid_len[b] = (long long)valid;
+  write_pos[b] = (long long)(valid >= current_seq ? valid - current_seq : 0);
+}
+
+// Build the fixed-capacity ("in-place") present that ALIASES past at
+// `cache_seq` positions: every capacity row is copied from past, then the
+// current token(s) overwrite `[write_pos, write_pos + cur_seq)`. Positions at or
+// beyond valid_len are never gathered (the selected indices only name positions
+// < valid_len), so attention over this layout is byte-identical to the growing
+// concat present. `write_pos` is the per-batch device array produced by
+// `capacity_write_pos`. Mirrors the CPU oracle's `build_capacity_present`.
+extern "C" __global__ void build_present_capacity(
+    const void* past, const void* cur, void* out, int dtype,
+    const long long* write_pos,
+    unsigned long long batch, unsigned long long heads,
+    unsigned long long cache_seq, unsigned long long cur_seq,
+    unsigned long long dim, unsigned long long elements) {
+  for (unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+       idx < elements; idx += (unsigned long long)gridDim.x * blockDim.x) {
+    unsigned long long d = idx % dim;
+    unsigned long long rem = idx / dim;
+    unsigned long long t = rem % cache_seq;
+    rem /= cache_seq;
+    unsigned long long h = rem % heads;
+    unsigned long long b = rem / heads;
+    const unsigned long long wp = (unsigned long long)write_pos[b];
+    float val;
+    if (t >= wp && t < wp + cur_seq) {
+      const unsigned long long c = t - wp;
+      val = load_float(cur, ((b * heads + h) * cur_seq + c) * dim + d, dtype);
+    } else {
+      val = load_float(past, ((b * heads + h) * cache_seq + t) * dim + d, dtype);
+    }
+    store_float(out, idx, val, dtype);
+  }
+}
+
 __device__ __forceinline__ long long load_index(
     const void* indices, unsigned long long offset, int index_is_i64) {
   return index_is_i64
@@ -434,6 +504,12 @@ struct Dims {
     head_size: usize,
     index_heads: usize,
     selected_width: usize,
+    /// Present row stride: `total_seq` for the growing concat present, or the
+    /// fixed `past_seq` capacity when the present aliases past in place.
+    cache_seq: usize,
+    /// The 3-output present aliases the fixed-capacity past bindings in place
+    /// (no growing `past ++ current`); the valid length is carried by the bias.
+    capacity_mode: bool,
 }
 
 /// Right-aligned broadcast metadata for the optional additive bias.
@@ -457,6 +533,10 @@ struct ScratchPool {
     present_value_capacity: usize,
     scores: CUdeviceptr,
     scores_capacity: usize,
+    /// Per-batch `[valid_len; write_pos]` (2 * batch i64) recovered on-device
+    /// from the bias frontier for the fixed-capacity present path.
+    frontier: CUdeviceptr,
+    frontier_capacity: usize,
 }
 
 impl ScratchPool {
@@ -505,6 +585,22 @@ impl ScratchPool {
             bytes,
             capturing,
             "scores",
+        )
+    }
+
+    fn ensure_frontier(
+        &mut self,
+        runtime: &CudaRuntime,
+        bytes: usize,
+        capturing: bool,
+    ) -> Result<CUdeviceptr> {
+        ensure_scratch(
+            runtime,
+            &mut self.frontier,
+            &mut self.frontier_capacity,
+            bytes,
+            capturing,
+            "frontier",
         )
     }
 }
@@ -602,7 +698,12 @@ impl Drop for IndexShareKernel {
             .scratch
             .get_mut()
             .expect("cuda_ep IndexShare scratch pool poisoned");
-        for ptr in [pool.present_key, pool.present_value, pool.scores] {
+        for ptr in [
+            pool.present_key,
+            pool.present_value,
+            pool.scores,
+            pool.frontier,
+        ] {
             if ptr != 0 {
                 // SAFETY: every non-zero pointer came from this runtime's
                 // `alloc_raw` in `ScratchPool::ensure` and is freed exactly once.
@@ -709,14 +810,26 @@ impl Kernel for IndexShareKernel {
 
         let dims = self.validate_shapes(inputs, outputs)?;
 
+        // The capacity present aliases the fixed-capacity past bindings in place,
+        // so its shape no longer encodes the logical length; the causal/padding
+        // attention_bias frontier carries it (mirrors default-domain Attention at
+        // fixed capacity). Reject the mode when that signal is absent.
+        if dims.capacity_mode && optional_input(inputs, 6).is_none() {
+            return Err(error(
+                "capacity-mode IndexShare (present aliases fixed-capacity past) requires attention_bias to carry the valid length",
+            ));
+        }
+
         // Eager (non-capturing) execution mirrors the CPU oracle: copy the small
         // index tensor D2H and reject any malformed row synchronously. Capturing
         // execution cannot round-trip to the host, so this is skipped and the
         // device-side `validate_index_rows` latch (checked outside the captured
-        // region) enforces the same contract instead.
-        if !capturing {
+        // region) enforces the same contract instead. The capacity path validates
+        // against the bias-derived per-batch valid length recovered on-device
+        // below, so it defers this to inside the launch sequence.
+        if !capturing && !dims.capacity_mode {
             let indices = self.read_indices(&inputs[5], dims)?;
-            validate_indices(&indices, dims)?;
+            validate_indices(&indices, dims, &vec![dims.total_seq; dims.batch])?;
         }
 
         let bias = self.bias_meta(inputs, dims)?;
@@ -733,8 +846,10 @@ impl Kernel for IndexShareKernel {
         let indices_ptr = cuptr(inputs[5].data_ptr::<u8>() as *const c_void);
         let index_is_i64 = i32::from(inputs[5].dtype == DataType::Int64);
 
-        // Present K/V element counts and the output element count.
-        let present_elements = dims.batch * dims.kv_heads * dims.total_seq * dims.head_size;
+        // Present K/V element counts and the output element count. `cache_seq`
+        // is `total_seq` for the growing concat present and the fixed capacity
+        // when the present aliases past in place.
+        let present_elements = dims.batch * dims.kv_heads * dims.cache_seq * dims.head_size;
         let output_elements = dims.batch * dims.q_heads * dims.q_seq * dims.head_size;
         let scores_elements = dims.batch * dims.q_heads * dims.q_seq * dims.selected_width;
 
@@ -781,26 +896,82 @@ impl Kernel for IndexShareKernel {
             };
             let scores_ptr = pool.ensure_scores(&self.runtime, scores_elements * 4, capturing)?;
 
-            self.build_present(
-                past_key_ptr,
-                key_ptr,
-                present_key_ptr,
-                has_past_key,
-                dims,
-                dtype_code(dtype)?,
-            )?;
-            self.build_present(
-                past_value_ptr,
-                value_ptr,
-                present_value_ptr,
-                has_past_value,
-                dims,
-                dtype_code(dtype)?,
-            )?;
+            if dims.capacity_mode {
+                // Recover the per-batch valid length + current-token write
+                // position from the bias frontier on-device (capture-safe), then
+                // build the fixed-capacity present that aliases past in place.
+                let frontier_ptr = pool.ensure_frontier(
+                    &self.runtime,
+                    2 * dims.batch * std::mem::size_of::<i64>(),
+                    capturing,
+                )?;
+                let valid_len_ptr = frontier_ptr;
+                let write_pos_ptr = frontier_ptr + (dims.batch * std::mem::size_of::<i64>()) as u64;
+                self.launch_capacity_write_pos(
+                    &bias,
+                    dims,
+                    dtype_code(dtype)?,
+                    valid_len_ptr,
+                    write_pos_ptr,
+                )?;
+                self.build_present_capacity(
+                    past_key_ptr,
+                    key_ptr,
+                    present_key_ptr,
+                    write_pos_ptr,
+                    dims,
+                    dtype_code(dtype)?,
+                )?;
+                self.build_present_capacity(
+                    past_value_ptr,
+                    value_ptr,
+                    present_value_ptr,
+                    write_pos_ptr,
+                    dims,
+                    dtype_code(dtype)?,
+                )?;
+                // Eager: validate the selected indices against the bias-derived
+                // per-batch valid length, matching the CPU oracle exactly.
+                if !capturing {
+                    self.runtime.synchronize()?;
+                    let mut valid_raw = vec![0u8; dims.batch * std::mem::size_of::<i64>()];
+                    // SAFETY: `valid_len_ptr` is a live pooled allocation of at
+                    // least `batch` i64 written by `capacity_write_pos` above.
+                    unsafe {
+                        self.runtime.dtoh(&mut valid_raw, valid_len_ptr)?;
+                    }
+                    let valid_lens: Vec<usize> = valid_raw
+                        .chunks_exact(std::mem::size_of::<i64>())
+                        .map(|raw| i64::from_ne_bytes(raw.try_into().unwrap()).max(0) as usize)
+                        .collect();
+                    let indices = self.read_indices(&inputs[5], dims)?;
+                    validate_indices(&indices, dims, &valid_lens)?;
+                }
+            } else {
+                self.build_present(
+                    past_key_ptr,
+                    key_ptr,
+                    present_key_ptr,
+                    has_past_key,
+                    dims,
+                    dtype_code(dtype)?,
+                )?;
+                self.build_present(
+                    past_value_ptr,
+                    value_ptr,
+                    present_value_ptr,
+                    has_past_value,
+                    dims,
+                    dtype_code(dtype)?,
+                )?;
+            }
 
             // On the capturing path record the device-side index validation so a
             // poisoned replay latches the shared capture-error word (read by the
-            // host at the per-step logits sync, outside the captured region).
+            // host at the per-step logits sync, outside the captured region). The
+            // bound is the `cache_seq` capacity (a safe superset of the per-batch
+            // valid length for the capacity path; identical to `total_seq` for
+            // the concat path).
             if capturing {
                 self.launch_index_validation(indices_ptr, dims, index_is_i64)?;
             }
@@ -917,22 +1088,37 @@ impl IndexShareKernel {
         if selected[3] == 0 {
             return Err(error("selected_indices K dimension must be nonzero"));
         }
-        if let Some(bias) = optional_input(inputs, 6) {
-            validate_bias_shape(bias.shape, [batch, q_heads, q_seq, total_seq])?;
-        }
         if outputs[0].shape != q {
             return Err(error(format!(
                 "output shape {:?} must equal query shape {q:?}",
                 outputs[0].shape
             )));
         }
+        let mut cache_seq = total_seq;
+        let mut capacity_mode = false;
         if outputs.len() == 3 {
-            let expected = [batch, self.kv_num_heads, total_seq, head_size];
-            if outputs[1].shape != expected || outputs[2].shape != expected {
+            let concat = [batch, self.kv_num_heads, total_seq, head_size];
+            let capacity = [batch, self.kv_num_heads, past_seq, head_size];
+            // The present may either grow (`past ++ current`, sequence ==
+            // total_seq) or alias the fixed-capacity `past` in place (sequence
+            // == past_seq, requires a past cache). `past_seq < total_seq` always
+            // (current_seq >= 1), so the two shapes are unambiguous and no
+            // existing concat caller trips the capacity branch.
+            if outputs[1].shape == concat && outputs[2].shape == concat {
+                // Growing concat present.
+            } else if past_seq > 0 && outputs[1].shape == capacity && outputs[2].shape == capacity {
+                capacity_mode = true;
+                cache_seq = past_seq;
+            } else {
                 return Err(error(format!(
-                    "present_key and present_value shapes must be {expected:?}"
+                    "present_key and present_value shapes must be {concat:?} (growing) or {capacity:?} (fixed capacity)"
                 )));
             }
+        }
+        // The bias spans the gathered cache: `total_seq` for the concat present,
+        // or the fixed `cache_seq` capacity when the present aliases past.
+        if let Some(bias) = optional_input(inputs, 6) {
+            validate_bias_shape(bias.shape, [batch, q_heads, q_seq, cache_seq])?;
         }
         Ok(Dims {
             batch,
@@ -945,6 +1131,8 @@ impl IndexShareKernel {
             head_size,
             index_heads,
             selected_width: selected[3],
+            cache_seq,
+            capacity_mode,
         })
     }
 
@@ -1027,7 +1215,7 @@ impl IndexShareKernel {
         let index_heads = dims.index_heads as u64;
         let q_seq = dims.q_seq as u64;
         let selected_width = dims.selected_width as u64;
-        let total_seq = dims.total_seq as u64;
+        let total_seq = dims.cache_seq as u64;
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder
             .arg(&indices_ptr)
@@ -1106,6 +1294,121 @@ impl IndexShareKernel {
         .map(|_| ())
     }
 
+    /// Recover the per-batch valid length and current-token write position from
+    /// the bias frontier on-device (capture-safe: no host round-trip), writing
+    /// `valid_len` and `write_pos` (each `batch` i64) into pooled scratch.
+    fn launch_capacity_write_pos(
+        &self,
+        bias: &BiasMeta,
+        dims: Dims,
+        dtype: i32,
+        valid_len_ptr: CUdeviceptr,
+        write_pos_ptr: CUdeviceptr,
+    ) -> Result<()> {
+        if !bias.present {
+            return Err(error(
+                "capacity-mode IndexShare requires attention_bias to derive the valid length",
+            ));
+        }
+        let batch = dims.batch as u64;
+        if batch == 0 {
+            return Ok(());
+        }
+        let func = self
+            .runtime
+            .nvrtc_function(MODULE, SOURCE, "capacity_write_pos")?;
+        let rank = bias.rank;
+        let (bd0, bd1, bd2, bd3) = (bias.dims[0], bias.dims[1], bias.dims[2], bias.dims[3]);
+        let q_heads = dims.q_heads as u64;
+        let q_seq = dims.q_seq as u64;
+        let cache_seq = dims.cache_seq as u64;
+        let current_seq = dims.current_seq as u64;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&bias.ptr)
+            .arg(&dtype)
+            .arg(&rank)
+            .arg(&bd0)
+            .arg(&bd1)
+            .arg(&bd2)
+            .arg(&bd3)
+            .arg(&batch)
+            .arg(&q_heads)
+            .arg(&q_seq)
+            .arg(&cache_seq)
+            .arg(&current_seq)
+            .arg(&valid_len_ptr)
+            .arg(&write_pos_ptr);
+        // SAFETY: argument types/order match `capacity_write_pos`; the bias is a
+        // live contiguous device allocation and the two output pointers are the
+        // pooled `batch`-i64 halves of the frontier scratch.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (batch.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| driver_err("launch capacity_write_pos", e))
+        .map(|_| ())
+    }
+
+    /// Build the fixed-capacity present that aliases `past` at `cache_seq`
+    /// positions, overwriting the current token(s) at the per-batch `write_pos`
+    /// produced by [`Self::launch_capacity_write_pos`]. Byte-identical to the CPU
+    /// oracle's `build_capacity_present`.
+    fn build_present_capacity(
+        &self,
+        past_ptr: CUdeviceptr,
+        current_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        write_pos_ptr: CUdeviceptr,
+        dims: Dims,
+        dtype: i32,
+    ) -> Result<()> {
+        let elements = (dims.batch * dims.kv_heads * dims.cache_seq * dims.head_size) as u64;
+        if elements == 0 {
+            return Ok(());
+        }
+        let func = self
+            .runtime
+            .nvrtc_function(MODULE, SOURCE, "build_present_capacity")?;
+        let batch = dims.batch as u64;
+        let heads = dims.kv_heads as u64;
+        let cache_seq = dims.cache_seq as u64;
+        let cur_seq = dims.current_seq as u64;
+        let head_size = dims.head_size as u64;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&past_ptr)
+            .arg(&current_ptr)
+            .arg(&out_ptr)
+            .arg(&dtype)
+            .arg(&write_pos_ptr)
+            .arg(&batch)
+            .arg(&heads)
+            .arg(&cache_seq)
+            .arg(&cur_seq)
+            .arg(&head_size)
+            .arg(&elements);
+        // SAFETY: argument types/order match `build_present_capacity`; all
+        // pointers refer to live contiguous device allocations and `write_pos`
+        // holds `batch` i64 written by `capacity_write_pos`.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (
+                    elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| driver_err("launch build_present_capacity", e))
+        .map(|_| ())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_rows(
         &self,
@@ -1137,7 +1440,9 @@ impl IndexShareKernel {
         let q_heads = dims.q_heads as u64;
         let kv_heads = dims.kv_heads as u64;
         let q_seq = dims.q_seq as u64;
-        let total_seq = dims.total_seq as u64;
+        // Present row stride/gather bound: `cache_seq` (== total_seq for the
+        // concat present, the fixed capacity when present aliases past).
+        let total_seq = dims.cache_seq as u64;
         let head_size = dims.head_size as u64;
         let index_heads = dims.index_heads as u64;
         let selected_width = dims.selected_width as u64;
@@ -1187,8 +1492,8 @@ impl IndexShareKernel {
     }
 }
 
-fn validate_indices(indices: &[i64], dims: Dims) -> Result<()> {
-    for b in 0..dims.batch {
+fn validate_indices(indices: &[i64], dims: Dims, per_batch_bound: &[usize]) -> Result<()> {
+    for (b, &bound) in per_batch_bound.iter().enumerate() {
         for h in 0..dims.index_heads {
             for q in 0..dims.q_seq {
                 let row = ((b * dims.index_heads + h) * dims.q_seq + q) * dims.selected_width;
@@ -1218,16 +1523,13 @@ fn validate_indices(indices: &[i64], dims: Dims) -> Result<()> {
                             format!("index {index} follows trailing -1 padding"),
                         ));
                     }
-                    if index as usize >= dims.total_seq {
+                    if index as usize >= bound {
                         return Err(index_error(
                             b,
                             h,
                             q,
                             column,
-                            format!(
-                                "index {index} is out of range for cache length {}",
-                                dims.total_seq
-                            ),
+                            format!("index {index} is out of range for cache length {bound}"),
                         ));
                     }
                     if let Some(previous) = previous
