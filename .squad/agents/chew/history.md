@@ -120,3 +120,8 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 
 - Rejected Deckard-10 until it preserved the native header byte-for-byte and tested invalid `--backend` input; Rachael-2's `d03261c7` correction met both requirements and was approved 🟢 GREEN.
 - The subsequent foundry-local same-harness result is bounded: native captured Qwen2.5-0.5B 902 vs eager ORT 584 tok/s (1.55×), and Phi-4-mini 322 vs 238 (1.35×); ORT CUDA capture failed with `ort_value must contain a constructed tensor`.
+
+## 2026-07-24T06:14:01+0000 — Qwen1.5B regression green review
+
+- Approved Rachael-3's Qwen1.5B native decode regression 🟢: it is model-gated, skips cleanly without the CUDA package, and locks the higher-precision native token 1909 at index 26.
+- The coverage merged as `c4690bf7`.

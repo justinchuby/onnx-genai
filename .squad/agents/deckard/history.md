@@ -114,3 +114,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - `profile_native --backend native|ort|auto` landed as `d03261c7` after the reviewer-required restoration of the byte-identical native header and invalid-value parser coverage.
 - The flag enabled the definitive foundry-local CUDA A/B: native whole-step capture reached 902 vs ORT 584 tok/s on Qwen2.5-0.5B (1.55×) and 322 vs 238 on Phi-4-mini (1.35×), with exact token parity. ORT capture currently fails (`ort_value must contain a constructed tensor`), so ORT was eager.
+
+## 2026-07-24T06:14:01+0000 — Bit-exact down-GEMV optimization
+
+- Removed redundant activation shared-memory staging in the int4 down-projection GEMV, using direct register loads while preserving reduction order.
+- NVRTC staged-reference bytes are exact; Gaff reviewed 🟢 and the change merged as `720fa032`. Independent 7B perf confirmation is pending.

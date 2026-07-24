@@ -133,3 +133,8 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 - As the designated lockout-safe fixer, landed `d03261c7`: restored the native header byte-for-byte, added a separate ORT/auto `backend=` line, and covered invalid backend arguments.
 - Chew approved the correction. The resulting same-harness foundry-local A/B records working native capture at 1.55× (Qwen2.5-0.5B) and 1.35× (Phi-4-mini) over eager ORT; ORT capture errors with `ort_value must contain a constructed tensor`.
+
+## 2026-07-24T06:14:01+0000 — Qwen1.5B accuracy regression
+
+- Added the model-gated native decode regression locking greedy “Hello” token 1909 at index 26, the higher-precision result against ORT-CUDA's fp16 near-tie flip.
+- Chew-18 reviewed 🟢 and the test merged as `c4690bf7`.

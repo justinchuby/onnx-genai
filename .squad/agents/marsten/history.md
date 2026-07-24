@@ -12,3 +12,8 @@
 
 - On GPU 1, same harness and exact token parity: native whole-step capture measured Qwen2.5-0.5B **902 vs 584 tok/s** for ORT (1.55×) and Phi-4-mini **322 vs 238 tok/s** (1.35×).
 - DeepSeek-V2-Lite native capture versus eager native was **79.2 vs 44.5 tok/s** at block-32 (1.78×) and **84.6 vs 46.8 tok/s** at block-128 (1.81×). ORT capture could not be enabled for the two A/B models (`ort_value must contain a constructed tensor`), so the ORT side is explicitly eager.
+
+## 2026-07-24T06:14:01+0000 — Down-GEMV performance confirmation pending
+
+- Assigned independent Qwen-7B end-to-end measurement for the merged, bit-exact int4 down-GEMV shared-staging removal (`720fa032`).
+- No performance result is yet available; retain the change's validation evidence but do not claim a throughput delta.

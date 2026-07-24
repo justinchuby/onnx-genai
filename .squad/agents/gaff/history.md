@@ -150,3 +150,8 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 
 - DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
 - Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
+
+## 2026-07-24T06:14:01+0000 — Down-GEMV green review
+
+- Cleared the int4 down-projection GEMV shared-staging removal 🟢 after proving the direct-register offset algebra and exact-byte staged-reference parity.
+- Qwen-7B greedy decoding was deterministic; CUDA gate 206/0 and clippy were clean. Merged as `720fa032`; perf delta remains independently pending.

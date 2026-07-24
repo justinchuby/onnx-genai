@@ -452,3 +452,15 @@ captured/eager fragmentation toward a small number of stable replay graphs.
 **By:** Marsten; implementation by Deckard and Rachael; reviewed by Chew
 **What:** With the same decode harness and exact token parity on foundry-local CUDA packages, native CUDA EP with whole-step graph capture measured **902 tok/s versus 584 tok/s** for Qwen2.5-0.5B (**1.55×**) and **322 tok/s versus 238 tok/s** for Phi-4-mini (**1.35×**). On DeepSeek-V2-Lite, native whole-step capture measured **79.2 versus 44.5 tok/s** at block-32 (**1.78×**) and **84.6 versus 46.8 tok/s** at block-128 (**1.81×**) against eager native execution. `profile_native` now accepts `--backend native|ort|auto` (commit `d03261c7`), preserving the byte-identical native header while emitting a separate backend line for ORT/auto.
 **Why:** This is a controlled same-harness comparison and demonstrates working native capture. It must not be read as a captured-ORT comparison: ORT's own CUDA-graph capture fails on both tested models with `ort_value must contain a constructed tensor`, so its reported runs are eager.
+
+## 2026-07-24 — Qwen1.5B numerical accuracy and int4 down-GEMV
+
+### Qwen1.5B native-vs-ORT divergence is native-more-accurate and locked
+**By:** Holden; regression coverage by Rachael; reviewed by Chew
+**What:** At decode index 26, native selects token 1909 while ORT CUDA selects 821. Native is correct: its fp32 GEMV accumulation agrees with both a fp32 dequantization of the deployed int4 weights and a fp32 unquantized Transformers reference, which rank 1909 above 821. ORT CUDA's fp16 accumulation inflates the competing logits and flips a near-tie. `qwen15b_native_decode_locks_accurate_near_tie_token` locks the native greedy result when `ONNX_GENAI_QWEN15B_CUDA_DIR` is available.
+**Why:** Do not “fix” native toward ORT output. The divergence is expected fp32-versus-fp16 accumulation behavior, and native has the higher-precision reference evidence.
+
+### Bit-exact int4 down-GEMV removes redundant activation shared-memory staging
+**By:** Deckard; reviewed by Gaff
+**What:** `matmul_nbits_gemv_f16_scales_f16_down` now loads activations directly into registers instead of staging them in dynamic shared memory. This removes a synchronization and dynamic shared allocation while preserving reduction order; an NVRTC staged-reference test proves exact-byte parity. The change merged as `720fa032`.
+**Why:** The int4 down projection had avoidable Short-Scoreboard stalls. This is a bit-exact performance lever; independent 7B end-to-end perf-delta confirmation remains pending.

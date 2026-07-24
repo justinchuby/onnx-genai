@@ -139,3 +139,8 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 - DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
 - Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
+
+## 2026-07-24T06:14:01+0000 — Qwen1.5B near-tie investigation
+
+- Root-caused native token 1909 versus ORT-CUDA 821 at decode index 26: native fp32 GEMV agrees with deployed-int4 fp32 dequantization and fp32 unquantized Transformers references; ORT fp16 accumulation flips the near-tie.
+- Durable conclusion: native is more accurate; do not change native to match ORT. `profile_native --backend ort` has a separate CUDA-graph-on decode defect to follow up.
