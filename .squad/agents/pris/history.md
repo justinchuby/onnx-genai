@@ -122,3 +122,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
+
+## 2026-07-24T00:00:00Z — Capture-seam scope reconciled
+- Pris-1 established 727 eager seams caused by the executor rejecting unresolved data-dependent shapes before consulting capture-safe kernels.
+- `25dbb60` is the Attention foundation (25.87→27.71 tok/s). The active order is Stage 0 warmed shape seeding, then f32 M=1 MatMul (~7.7 ms/token), movement (~430 seams), and MoE routing; QMoE remains instruction/dequant-ALU bound.

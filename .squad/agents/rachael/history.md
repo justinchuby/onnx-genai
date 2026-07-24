@@ -120,3 +120,7 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 - `e14d7df` on `perf/deepseek-mla-capture` landed the device valid-length ABI for fixed-capacity default-domain Attention decode; it is verified but not merged to main.
 - The c1 continuation is extending the ABI to explicit prefill+decode device lengths, then fixed-cap switching and capture-safe control/scratch work before enabling capture.
+
+## 2026-07-24T00:00:00Z — Capture foundation merged
+- Rachael's c1/c2/d capture foundation reached `origin/main` as `25dbb60`: MLA Attention decode is capture-eligible with zero Attention-path fallbacks, and captured throughput rose 25.87→27.71 tok/s.
+- The full 2.4× now depends on the re-sequenced non-Attention fan-out: executor shape seeding, f32 MatMul, movement, and MoE routing. Tyrell, Deckard, and Leon scopes remain in flight.
