@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Args, Parser, Subcommand};
 use onnx_genai::metadata::load_metadata;
-use onnx_genai::ort::{ChatMessage, ChatTemplate, ModelDirectory};
+use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory};
 use onnx_genai::{
     Engine, EngineConfig, GenerateOptions, GenerateRequest, GenerateToken, StopSequence,
 };
@@ -162,6 +162,71 @@ fn run_generation_turn(
     GENERATING.store(false, Ordering::SeqCst);
     result?;
     Ok(output)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplCommand {
+    Help,
+    Reset,
+    ToggleRaw,
+    System(Option<String>),
+    Image {
+        path: Option<String>,
+        prompt: Option<String>,
+    },
+    Audio {
+        path: Option<String>,
+        prompt: Option<String>,
+    },
+    Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReplLine {
+    Command(ReplCommand),
+    Prompt(String),
+    Empty,
+}
+
+fn parse_repl_line(line: &str) -> ReplLine {
+    if line.trim().is_empty() {
+        return ReplLine::Empty;
+    }
+    let Some(command_line) = line.strip_prefix('/') else {
+        return ReplLine::Prompt(line.to_string());
+    };
+
+    let mut parts = command_line.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or_default();
+    let arguments = parts.next().unwrap_or_default().trim();
+    let attachment_command = |is_image| {
+        let mut attachment_parts = arguments.splitn(2, char::is_whitespace);
+        let path = attachment_parts
+            .next()
+            .filter(|path| !path.is_empty())
+            .map(ToString::to_string);
+        let prompt = attachment_parts
+            .next()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .map(ToString::to_string);
+        if is_image {
+            ReplCommand::Image { path, prompt }
+        } else {
+            ReplCommand::Audio { path, prompt }
+        }
+    };
+
+    let command = match command {
+        "help" => ReplCommand::Help,
+        "reset" => ReplCommand::Reset,
+        "raw" => ReplCommand::ToggleRaw,
+        "system" => ReplCommand::System((!arguments.is_empty()).then(|| arguments.to_string())),
+        "image" => attachment_command(true),
+        "audio" => attachment_command(false),
+        _ => ReplCommand::Unknown(format!("/{command}")),
+    };
+    ReplLine::Command(command)
 }
 
 #[derive(Debug, Parser)]
@@ -364,7 +429,8 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
     let mut engine = Engine::from_dir(&model_dir, EngineConfig::default())?;
-    let template = load_chat_template(&model_dir, args.sampling.raw);
+    let mut raw_mode = args.sampling.raw;
+    let mut template = load_chat_template(&model_dir, raw_mode);
 
     eprintln!(
         "onnx-genai interactive session. Enter a prompt, or an empty line / Ctrl-D to exit.\n\
@@ -376,6 +442,8 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
     // reply is appended so later turns retain context. In raw mode there is no
     // template so only the latest user message is sent.
     let mut history: Vec<ChatMessage> = Vec::new();
+    let mut image_attachments: Vec<PathBuf> = Vec::new();
+    let mut audio_attachments: Vec<PathBuf> = Vec::new();
     let stdin = io::stdin();
     loop {
         print!(">>> ");
@@ -386,12 +454,105 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
             eprintln!();
             break;
         }
-        let prompt = line.trim_end_matches(['\n', '\r']);
-        if prompt.is_empty() {
-            break;
-        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        let prompt = match parse_repl_line(line) {
+            ReplLine::Empty => break,
+            ReplLine::Prompt(prompt) => Some(prompt),
+            ReplLine::Command(ReplCommand::Help) => {
+                println!(
+                    "/help\n/reset\n/raw\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+                );
+                None
+            }
+            ReplLine::Command(ReplCommand::Reset) => {
+                history.clear();
+                image_attachments.clear();
+                audio_attachments.clear();
+                println!("conversation history and pending attachments cleared");
+                None
+            }
+            ReplLine::Command(ReplCommand::ToggleRaw) => {
+                raw_mode = !raw_mode;
+                template = load_chat_template(&model_dir, raw_mode);
+                println!("raw mode {}", if raw_mode { "enabled" } else { "disabled" });
+                None
+            }
+            ReplLine::Command(ReplCommand::System(system_message)) => {
+                if history
+                    .first()
+                    .is_some_and(|message| matches!(message.role, ChatRole::System))
+                {
+                    history.remove(0);
+                }
+                match system_message {
+                    Some(system_message) => {
+                        history.insert(0, ChatMessage::system(system_message));
+                        println!("system message set");
+                    }
+                    None => println!("system message cleared"),
+                }
+                None
+            }
+            ReplLine::Command(ReplCommand::Image { path, prompt }) => {
+                if let Some(path) = path {
+                    let path = PathBuf::from(path);
+                    if path.exists() {
+                        image_attachments.push(path);
+                    } else {
+                        eprintln!("warning: image path does not exist: {}", path.display());
+                    }
+                } else {
+                    eprintln!("usage: /image <path> [prompt text]");
+                }
+                prompt
+            }
+            ReplLine::Command(ReplCommand::Audio { path, prompt }) => {
+                if let Some(path) = path {
+                    let path = PathBuf::from(path);
+                    if path.exists() {
+                        audio_attachments.push(path);
+                    } else {
+                        eprintln!("warning: audio path does not exist: {}", path.display());
+                    }
+                } else {
+                    eprintln!("usage: /audio <path> [prompt text]");
+                }
+                prompt
+            }
+            ReplLine::Command(ReplCommand::Unknown(command)) => {
+                eprintln!("unknown command: {command} (try /help)");
+                None
+            }
+        };
+        let Some(prompt) = prompt else {
+            continue;
+        };
 
         history.push(ChatMessage::user(prompt));
+        let staged_images = std::mem::take(&mut image_attachments);
+        let staged_audio = std::mem::take(&mut audio_attachments);
+        if !staged_images.is_empty() {
+            let paths = staged_images
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "⚠ image input staged ({}) but multimodal execution is not yet wired — sending text only for now.",
+                paths
+            );
+        }
+        if !staged_audio.is_empty() {
+            let paths = staged_audio
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "⚠ audio input staged ({}) but multimodal execution is not yet wired — sending text only for now.",
+                paths
+            );
+        }
         let rendered = build_turn_prompt(template.as_ref(), &history)?;
         let request = GenerateRequest {
             prompt: rendered.into(),
@@ -524,6 +685,84 @@ mod tests {
         assert!(should_continue(Ok(())).unwrap());
         assert!(should_continue(Err(anyhow::Error::new(Interrupted))).unwrap());
         assert!(should_continue(Err(anyhow::anyhow!("boom"))).is_err());
+    }
+
+    #[test]
+    fn parse_repl_line_recognizes_control_commands() {
+        assert_eq!(
+            parse_repl_line("/help"),
+            ReplLine::Command(ReplCommand::Help)
+        );
+        assert_eq!(
+            parse_repl_line("/reset"),
+            ReplLine::Command(ReplCommand::Reset)
+        );
+        assert_eq!(
+            parse_repl_line("/raw"),
+            ReplLine::Command(ReplCommand::ToggleRaw)
+        );
+    }
+
+    #[test]
+    fn parse_repl_line_recognizes_system_commands() {
+        assert_eq!(
+            parse_repl_line("/system keep answers short"),
+            ReplLine::Command(ReplCommand::System(Some("keep answers short".to_string())))
+        );
+        assert_eq!(
+            parse_repl_line("/system   "),
+            ReplLine::Command(ReplCommand::System(None))
+        );
+    }
+
+    #[test]
+    fn parse_repl_line_recognizes_image_and_audio_attachments() {
+        assert_eq!(
+            parse_repl_line("/image cat.png"),
+            ReplLine::Command(ReplCommand::Image {
+                path: Some("cat.png".to_string()),
+                prompt: None,
+            })
+        );
+        assert_eq!(
+            parse_repl_line("/image cat.png describe this"),
+            ReplLine::Command(ReplCommand::Image {
+                path: Some("cat.png".to_string()),
+                prompt: Some("describe this".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_repl_line("/audio speech.wav summarize it"),
+            ReplLine::Command(ReplCommand::Audio {
+                path: Some("speech.wav".to_string()),
+                prompt: Some("summarize it".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_repl_line("/audio"),
+            ReplLine::Command(ReplCommand::Audio {
+                path: None,
+                prompt: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_repl_line_preserves_prompts_and_rejects_unknown_commands() {
+        assert_eq!(
+            parse_repl_line("  explain this"),
+            ReplLine::Prompt("  explain this".to_string())
+        );
+        assert_eq!(
+            parse_repl_line("/unsupported extra"),
+            ReplLine::Command(ReplCommand::Unknown("/unsupported".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_repl_line_treats_empty_and_whitespace_lines_as_empty() {
+        assert_eq!(parse_repl_line(""), ReplLine::Empty);
+        assert_eq!(parse_repl_line(" \t "), ReplLine::Empty);
     }
 
     #[test]
