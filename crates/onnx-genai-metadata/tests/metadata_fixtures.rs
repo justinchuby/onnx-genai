@@ -19,6 +19,14 @@ fn crate_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn example_model(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples")
+        .join(name)
+        .join("inference_metadata.yaml")
+}
+
 #[test]
 fn parses_valid_yaml_fixture() {
     let metadata =
@@ -574,6 +582,7 @@ fn vlm_packed_fixture_deserializes_and_validates_against_schema() {
             "packed fixture must declare generic operation {required_op}"
         );
     }
+
     // Exactly two packed image outputs, bound to arbitrary endpoint names.
     assert_eq!(image.outputs.len(), 2);
     assert_eq!(image.outputs[0].source.as_deref(), Some("padded_patches"));
@@ -606,6 +615,62 @@ fn vlm_packed_fixture_deserializes_and_validates_against_schema() {
     let instance = fixture_json("vlm_packed_valid.yaml");
     if let Err(error) = validator.validate(&instance) {
         panic!("packed VLM fixture failed JSON-schema validation: {error}");
+    }
+}
+
+#[test]
+fn real_smolvlm_256m_example_parses_and_validates() {
+    let path = example_model("smolvlm-256m");
+    let metadata = load_metadata(&path).expect("real SmolVLM metadata parses");
+    validate(&metadata, &RuntimeCapabilities::default())
+        .expect("default runtime advertises the required capabilities");
+
+    let vision = metadata
+        .pipeline
+        .as_ref()
+        .and_then(|pipeline| pipeline.vision.as_ref())
+        .expect("vision expansion contract");
+    assert_eq!(vision.image_placeholder_token_id, Some(49_190));
+    assert_eq!(vision.tokens_per_tile, Some(64));
+    assert_eq!(
+        metadata.tokens.as_ref().unwrap().vision_start_token_id,
+        None
+    );
+    let image_outputs = &metadata
+        .preprocessing
+        .as_ref()
+        .and_then(|preprocessing| preprocessing.image.as_ref())
+        .expect("image preprocessing")
+        .outputs;
+    assert_eq!(image_outputs[0].name, "vision_encoder.pixel_values");
+    assert_eq!(image_outputs[1].name, "vision_encoder.pixel_attention_mask");
+
+    let pipeline = metadata.pipeline.as_ref().expect("pipeline");
+    validate_pipeline_spec(pipeline).expect("real SmolVLM pipeline is structurally valid");
+    let embedding_io = pipeline.models["token_embedding"]
+        .io
+        .as_ref()
+        .expect("embedding I/O");
+    assert_eq!(embedding_io.token_input.as_deref(), Some("input_ids"));
+    assert_eq!(embedding_io.hidden_output.as_deref(), Some("inputs_embeds"));
+    let decoder_io = pipeline.models["decoder"].io.as_ref().expect("decoder I/O");
+    assert_eq!(
+        decoder_io.sequence_source,
+        Some(onnx_genai_metadata::SequenceInputKind::InputsEmbeds)
+    );
+    assert_eq!(
+        decoder_io.kv_ownership,
+        Some(onnx_genai_metadata::KvOwnership::Owned)
+    );
+    assert_eq!(decoder_io.kv_inputs.as_ref().unwrap().len(), 60);
+    assert_eq!(decoder_io.kv_outputs.as_ref().unwrap().len(), 60);
+
+    let schema_validator = schema_validator();
+    let instance: serde_json::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(path).expect("read example"))
+            .expect("example converts to JSON");
+    if let Err(error) = schema_validator.validate(&instance) {
+        panic!("real SmolVLM example failed JSON-schema validation: {error}");
     }
 }
 
