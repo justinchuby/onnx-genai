@@ -1,4 +1,4 @@
-//! Native nxrt token-generation profiler using the engine's shared decode loop.
+//! Native/ORT token-generation profiler using the engine's shared decode loop.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
+use onnx_genai_engine::logits::{MinPProcessor, RepetitionPenaltyProcessor};
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
     ProcessorChain,
 };
-use onnx_genai_engine::logits::{MinPProcessor, RepetitionPenaltyProcessor};
 use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
@@ -21,7 +21,7 @@ enum ExecutionProvider {
     Cuda,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DecodeBackend {
     Native,
     Ort,
@@ -29,7 +29,7 @@ enum DecodeBackend {
 }
 
 impl DecodeBackend {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
             Self::Ort => "ort",
@@ -39,8 +39,8 @@ impl DecodeBackend {
 }
 
 impl From<DecodeBackend> for EngineDecodeBackend {
-    fn from(value: DecodeBackend) -> Self {
-        match value {
+    fn from(backend: DecodeBackend) -> Self {
+        match backend {
             DecodeBackend::Native => Self::Native,
             DecodeBackend::Ort => Self::Ort,
             DecodeBackend::Auto => Self::Auto,
@@ -49,7 +49,7 @@ impl From<DecodeBackend> for EngineDecodeBackend {
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "Profile native nxrt token generation through the engine decode loop")]
+#[command(about = "Profile token generation through the shared engine decode loop")]
 struct Args {
     /// ONNX model file, or a directory containing model.onnx and tokenizer.json.
     #[arg(long)]
@@ -77,6 +77,8 @@ struct Args {
     decode_skip: usize,
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
     ep: ExecutionProvider,
+    /// Decoder backend used by the engine timing path. ORT and auto require
+    /// --features bench-native,bench-ort (plus cuda for --ep cuda).
     #[arg(long, value_enum, default_value_t = DecodeBackend::Native)]
     backend: DecodeBackend,
     #[arg(long, default_value = "Hello")]
@@ -221,6 +223,56 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+fn validate_backend(args: &Args) -> Result<()> {
+    #[cfg(not(feature = "bench-ort"))]
+    if matches!(args.backend, DecodeBackend::Ort | DecodeBackend::Auto) {
+        bail!(
+            "ORT backend requires building profile_native with \
+             `--features bench-native,bench-ort,cuda` for CUDA \
+             (omit `,cuda` for CPU)"
+        );
+    }
+
+    if !args.steady && !args.pipeline && args.backend != DecodeBackend::Native {
+        bail!("--backend {} requires --steady", args.backend.as_str());
+    }
+    Ok(())
+}
+
+fn print_backend_label(backend: DecodeBackend) {
+    if backend != DecodeBackend::Native {
+        println!("profile_native: backend={}", backend.as_str());
+    }
+}
+
+fn configure_ort_provider(args: &Args) -> Result<()> {
+    let requested_provider = match args.ep {
+        ExecutionProvider::Cpu => "cpu",
+        ExecutionProvider::Cuda => "cuda",
+    };
+    // This single-threaded CLI sets provider selection before the process-wide
+    // runtime configuration is first read while constructing ORT sessions.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", requested_provider);
+    }
+    let available_providers =
+        available_execution_providers().context("query linked ONNX Runtime providers")?;
+    println!("ort_available_execution_providers: {available_providers:?}");
+    if matches!(args.ep, ExecutionProvider::Cuda)
+        && !available_providers
+            .iter()
+            .any(|provider| provider.eq_ignore_ascii_case("CUDAExecutionProvider"))
+    {
+        bail!(
+            "--backend {} --ep cuda requested, but the linked ONNX Runtime does not expose \
+             CUDAExecutionProvider (available: {available_providers:?}); put the CUDA-enabled \
+             ONNX Runtime library directory first in LD_LIBRARY_PATH",
+            args.backend.as_str()
+        );
+    }
+    Ok(())
+}
+
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
     if args.synthetic {
         bail!("--steady requires a real model directory");
@@ -228,7 +280,11 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
     }
+    print_backend_label(args.backend);
     println!("profile_native: {}", describe_sampling(args));
+    if matches!(args.backend, DecodeBackend::Ort | DecodeBackend::Auto) {
+        configure_ort_provider(args)?;
+    }
 
     if !matches!(args.backend, DecodeBackend::Native) {
         let requested_provider = match args.ep {
@@ -259,6 +315,16 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         args.ep,
         args.backend.as_str()
     );
+    if args.backend != DecodeBackend::Native {
+        println!(
+            "profile_native: resolved_backend={}",
+            match engine.decode_backend() {
+                EngineDecodeBackend::Native => "native",
+                EngineDecodeBackend::Ort => "ort",
+                EngineDecodeBackend::Auto => "auto",
+            }
+        );
+    }
 
     for _ in 0..args.warmups {
         std::hint::black_box(
@@ -344,31 +410,28 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     if args.steady && args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
     }
-    let requested_provider = match args.ep {
-        ExecutionProvider::Cpu => "cpu",
-        ExecutionProvider::Cuda => "cuda",
-    };
-    // This single-threaded CLI sets provider selection before the process-wide
-    // runtime configuration is first read while constructing pipeline sessions.
-    unsafe {
-        std::env::set_var("ONNX_GENAI_EP", requested_provider);
-    }
-    let available_providers =
-        available_execution_providers().context("query linked ONNX Runtime providers")?;
-    println!("ort_available_execution_providers: {available_providers:?}");
-    if matches!(args.ep, ExecutionProvider::Cuda)
-        && !available_providers
-            .iter()
-            .any(|provider| provider.eq_ignore_ascii_case("CUDAExecutionProvider"))
-    {
-        bail!(
-            "--ep cuda requested for a pipeline, but the linked ONNX Runtime does not expose \
-             CUDAExecutionProvider (available: {available_providers:?}); put the CUDA-enabled \
-             ONNX Runtime library directory first in LD_LIBRARY_PATH"
-        );
+    println!(
+        "profile_native: pipeline={} ep={:?} tokens={} warmups={} runs={}",
+        model_dir.display(),
+        args.ep,
+        args.tokens,
+        args.warmups,
+        args.runs
+    );
+    print_backend_label(args.backend);
+    if matches!(args.backend, DecodeBackend::Ort | DecodeBackend::Auto) {
+        configure_ort_provider(args)?;
     }
 
-    let mut engine = PipelineEngine::from_dir(model_dir)
+    let mut config = EngineConfig {
+        decode_backend: args.backend.into(),
+        ..EngineConfig::default()
+    };
+    config.native_device = Some(match args.ep {
+        ExecutionProvider::Cpu => NativeDecodeDevice::Cpu,
+        ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
+    });
+    let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     for _ in 0..args.warmups {
         std::hint::black_box(
@@ -392,10 +455,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 Ok(())
             };
             let result = engine
-                .generate_with_callback(
-                    pipeline_request(args, args.tokens),
-                    Some(&mut callback),
-                )
+                .generate_with_callback(pipeline_request(args, args.tokens), Some(&mut callback))
                 .context("steady pipeline measured generation")?;
             if token_times.len() <= args.decode_skip {
                 bail!(
@@ -479,14 +539,6 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     let tok_per_s = generated as f64 / elapsed.as_secs_f64();
     let ms_per_step = elapsed.as_secs_f64() * 1_000.0 / generated as f64;
     println!(
-        "profile_native: pipeline={} ep={:?} tokens={} warmups={} runs={}",
-        model_dir.display(),
-        args.ep,
-        args.tokens,
-        args.warmups,
-        args.runs
-    );
-    println!(
         "throughput: {tok_per_s:.2} tok/s, {ms_per_step:.3} ms/step \
          ({generated} generated tokens in {:.3} ms)",
         elapsed.as_secs_f64() * 1_000.0
@@ -502,6 +554,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    validate_backend(&args)?;
     if args.tokens == 0 || args.runs == 0 {
         bail!("--tokens and --runs must be greater than zero");
     }
@@ -593,8 +646,12 @@ fn main() -> Result<()> {
             top_logprobs: Some(args.logprobs_k),
             ..GenerateOptions::default()
         };
-        let result =
-            session.generate(&dump_prompt_tokens, &options, &ProcessorChain::new(), &tokenizer)?;
+        let result = session.generate(
+            &dump_prompt_tokens,
+            &options,
+            &ProcessorChain::new(),
+            &tokenizer,
+        )?;
         let logprobs = result
             .logprobs
             .and_then(|entries| entries.into_iter().next())
@@ -724,4 +781,48 @@ fn main() -> Result<()> {
         println!("{}", profile::report(generated as u64));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_backend_values_and_preserves_native_default() {
+        let default = Args::try_parse_from(["profile_native", "--synthetic"]).unwrap();
+        assert_eq!(default.backend, DecodeBackend::Native);
+
+        for (value, expected) in [
+            ("native", DecodeBackend::Native),
+            ("ort", DecodeBackend::Ort),
+            ("auto", DecodeBackend::Auto),
+        ] {
+            let args = Args::try_parse_from(["profile_native", "--synthetic", "--backend", value])
+                .unwrap();
+            assert_eq!(args.backend, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_backend_value() {
+        let error = Args::try_parse_from(["profile_native", "--synthetic", "--backend", "bogus"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[cfg(not(feature = "bench-ort"))]
+    #[test]
+    fn rejects_ort_without_bench_ort_feature() {
+        let args = Args::try_parse_from([
+            "profile_native",
+            "--model",
+            "unused",
+            "--steady",
+            "--backend",
+            "ort",
+        ])
+        .unwrap();
+        let error = validate_backend(&args).unwrap_err().to_string();
+        assert!(error.contains("bench-native,bench-ort,cuda"), "{error}");
+    }
 }

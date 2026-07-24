@@ -35,6 +35,14 @@ fn native_cpu_synthetic_profile_reports_throughput() {
         throughput.is_some_and(|value| value > 0.0) && stdout.contains("tok/s"),
         "missing throughput number:\n{stdout}"
     );
+    let header = stdout
+        .lines()
+        .find(|line| line.starts_with("profile_native: model="))
+        .expect("profile header");
+    assert!(
+        !header.contains("backend="),
+        "default native header changed:\n{header}"
+    );
 }
 
 #[test]
