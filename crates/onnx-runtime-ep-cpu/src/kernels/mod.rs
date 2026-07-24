@@ -215,6 +215,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "ArgMin",
     "TopK",
     "NonZero",
+    "NonMaxSuppression",
     // GEMM.
     "Gemm",
     "QuantizeLinear",
@@ -926,6 +927,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         Box::new(selection::ArgMinFactory),
     );
     reg.register(OpKey::new("TopK", "", 10), Box::new(selection::TopKFactory));
+    reg.register(
+        OpKey::new("NonMaxSuppression", "", 10),
+        Box::new(selection::NonMaxSuppressionFactory),
+    );
     reg.register(
         OpKey::new("NonZero", "", 9),
         Box::new(selection::NonZeroFactory),

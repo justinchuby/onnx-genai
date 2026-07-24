@@ -1369,17 +1369,13 @@ fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
         .is_some_and(|count| count <= MAX_SHAPE_DATA_ELEMS)
 }
 
-/// Whether a node reads the *float* runtime value of input `input_index` as
-/// shape-propagation data. Only default-domain `Resize` derives its output
-/// extent from a float `scales` input; every other op ignores float input
-/// values during shape inference. Restricting the float-value materialization to
-/// exactly these inputs keeps shape propagation from downloading an unrelated
-/// float input to host — a wasted copy that would also violate the contract that
-/// an invalid shape input is rejected *before* any host materialization.
+/// Whether a node needs a float runtime input to resolve a data-dependent
+/// output extent. The list is deliberately explicit, so shape propagation never
+/// copies unrelated tensor data to host.
 fn reads_float_shape_input(node: &Node, input_index: usize, opset: u64) -> bool {
     node.is_default_domain()
-        && node.op_type == "Resize"
-        && input_index == if opset == 10 { 1 } else { 2 }
+        && ((node.op_type == "Resize" && input_index == if opset == 10 { 1 } else { 2 })
+            || (node.op_type == "NonMaxSuppression" && matches!(input_index, 0 | 1 | 3 | 4)))
 }
 
 fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool {
@@ -1617,6 +1613,48 @@ fn dynamic_output_shapes(
                 onnx_runtime_ep_cpu::slice_plan(data_shape, starts, ends, &axes, &steps).ok()?;
             let count: Vec<usize> = plan.iter().map(|p| p.count).collect();
             Some(vec![count])
+        }
+        "NonMaxSuppression" if node.is_default_domain() => {
+            let boxes_shape = input_shapes.first()?;
+            let scores_shape = input_shapes.get(1)?;
+            let boxes = input_float_values.first()?.as_ref()?;
+            let scores = input_float_values.get(1)?.as_ref()?;
+            let max_output_boxes_per_class = input_values
+                .get(2)
+                .and_then(|value| value.as_ref())
+                .filter(|value| value.len() == 1)
+                .map(|value| value[0])
+                .unwrap_or(0);
+            let iou_threshold = input_float_values
+                .get(3)
+                .and_then(|value| value.as_ref())
+                .filter(|value| value.len() == 1)
+                .map(|value| value[0] as f32)
+                .unwrap_or(0.0);
+            let score_threshold = input_float_values
+                .get(4)
+                .and_then(|value| value.as_ref())
+                .filter(|value| value.len() == 1)
+                .map(|value| value[0] as f32)
+                .unwrap_or(f32::NEG_INFINITY);
+            let center_point_box = node
+                .attr("center_point_box")
+                .and_then(Attribute::as_int)
+                .unwrap_or(0);
+            let boxes = boxes.iter().map(|&value| value as f32).collect::<Vec<_>>();
+            let scores = scores.iter().map(|&value| value as f32).collect::<Vec<_>>();
+            let selected = onnx_runtime_ep_cpu::non_max_suppression(
+                &boxes,
+                boxes_shape,
+                &scores,
+                scores_shape,
+                max_output_boxes_per_class,
+                iou_threshold,
+                score_threshold,
+                center_point_box,
+            )
+            .ok()?;
+            Some(vec![vec![selected.len(), 3]])
         }
         "GroupQueryAttention" if node.domain == "com.microsoft" => {
             let query = input_shapes.first()?;
@@ -4016,7 +4054,13 @@ impl Executor {
                     if !reads_float_shape_input(node, i, opset) {
                         return None;
                     }
-                    v.and_then(|vid| self.shape_input_f64(vid, &input_shapes[i], input_dtypes[i]))
+                    v.and_then(|vid| {
+                        if node.is_default_domain() && node.op_type == "NonMaxSuppression" {
+                            self.nms_input_f64(vid, &input_shapes[i], input_dtypes[i])
+                        } else {
+                            self.shape_input_f64(vid, &input_shapes[i], input_dtypes[i])
+                        }
+                    })
                 })
                 .collect();
             let out_shapes = dynamic_output_shapes(
@@ -4657,6 +4701,18 @@ impl Executor {
             .get(&vid)
             .is_some_and(|elem| elem.root_len() > max_bytes)
         {
+            return None;
+        }
+        let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
+        bytes_as_f64(&bytes, dtype)
+    }
+
+    /// `NonMaxSuppression` needs its boxes and scores to determine the exact
+    /// data-dependent output extent. Unlike ordinary shape tensors these inputs
+    /// are rank 3 and may exceed `MAX_SHAPE_DATA_ELEMS`; materialize them only
+    /// for this operator, immediately before its output allocation.
+    fn nms_input_f64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<f64>> {
+        if dtype != DataType::Float32 {
             return None;
         }
         let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
@@ -8455,6 +8511,36 @@ mod tests {
                 11,
             ),
             Some(vec![vec![1, 128, 26, 26]])
+        );
+    }
+
+    #[test]
+    fn dynamic_output_shapes_non_max_suppression_counts_selected_boxes() {
+        let node = Node::new(
+            NodeId(0),
+            "NonMaxSuppression",
+            (0..5).map(|index| Some(ValueId(index))).collect(),
+            vec![ValueId(5)],
+        );
+        let shapes = vec![vec![1, 3, 4], vec![1, 1, 3], vec![], vec![], vec![]];
+        let dtypes = vec![
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float32,
+        ];
+        let ints = vec![None, None, Some(vec![2]), None, None];
+        let floats = vec![
+            Some(vec![0., 0., 1., 1., 0., 0., 0.9, 0.9, 2., 2., 3., 3.]),
+            Some(vec![0.9, 0.8, 0.7]),
+            None,
+            Some(vec![0.5]),
+            Some(vec![0.0]),
+        ];
+        assert_eq!(
+            dynamic_output_shapes(&node, &shapes, &dtypes, &ints, &floats, 11),
+            Some(vec![vec![2, 3]])
         );
     }
 
