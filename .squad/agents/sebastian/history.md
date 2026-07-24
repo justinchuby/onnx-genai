@@ -83,3 +83,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-21T11:15:00Z — Wave-3 long-context GQA
 - Raised capture-safe fp16 GQA `MAX_SPLITS` 8→16; Holden approved and `3b972bf` merged. Independent H200 review measured about 647→693 tok/s at 1024 tokens (+7.1%), flat at 256, with identical tokens and zero fallbacks.
+## 2026-07-24T05:11:20+0000 — Whole-step DeepSeek CUDA-graph capture
+
+- DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
+- Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.

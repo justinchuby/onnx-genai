@@ -124,3 +124,7 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 ## 2026-07-24T00:00:00Z — Capture foundation merged
 - Rachael's c1/c2/d capture foundation reached `origin/main` as `25dbb60`: MLA Attention decode is capture-eligible with zero Attention-path fallbacks, and captured throughput rose 25.87→27.71 tok/s.
 - The full 2.4× now depends on the re-sequenced non-Attention fan-out: executor shape seeding, f32 MatMul, movement, and MoE routing. Tyrell, Deckard, and Leon scopes remain in flight.
+## 2026-07-24T05:11:20+0000 — Whole-step DeepSeek CUDA-graph capture
+
+- DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
+- Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.

@@ -105,3 +105,7 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - Vectorized int4 unpack plus compile-time quant-layout specialization landed on `origin/main` as `53f9df6`.
 - QMoE linear time fell 6.36→2.51 ms/token (-60.5%); real DeepSeek E2E rose +11.9% (block-32) and +13.8% (block-128), with dense behavior unchanged.
+## 2026-07-24T05:11:20+0000 — Whole-step DeepSeek CUDA-graph capture
+
+- DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
+- Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.

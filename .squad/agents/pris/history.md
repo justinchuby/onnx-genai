@@ -126,3 +126,7 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 ## 2026-07-24T00:00:00Z — Capture-seam scope reconciled
 - Pris-1 established 727 eager seams caused by the executor rejecting unresolved data-dependent shapes before consulting capture-safe kernels.
 - `25dbb60` is the Attention foundation (25.87→27.71 tok/s). The active order is Stage 0 warmed shape seeding, then f32 M=1 MatMul (~7.7 ms/token), movement (~430 seams), and MoE routing; QMoE remains instruction/dequant-ALU bound.
+## 2026-07-24T05:11:20+0000 — Whole-step DeepSeek CUDA-graph capture
+
+- DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
+- Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
