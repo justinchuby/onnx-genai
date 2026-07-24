@@ -7668,7 +7668,7 @@ mod tests {
     fn dynamic_output_shapes_unsqueeze_supports_input_and_attribute_axes() {
         use onnx_runtime_ir::Attribute;
 
-        let mut input_axes = Node::new(
+        let input_axes = Node::new(
             NodeId(0),
             "Unsqueeze",
             vec![Some(ValueId(0)), Some(ValueId(1))],
