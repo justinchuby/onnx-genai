@@ -503,6 +503,24 @@ impl Kernel for MatMulNBitsKernel {
                 &owned_weight
             };
             with_decode_pool(|| {
+                if eight_bit_int16_activation() {
+                    // int16-activation fast path: quantize the activation to
+                    // int16 per K-block and reduce against the u8 weight with a
+                    // SIMD int16 dot product. int16 keeps enough precision to
+                    // match the fp32 result (unlike int8-activation, which is
+                    // ORT's fast-but-wrong path), while replacing the widening
+                    // u8->f32 FMA with a denser int16 madd.
+                    gemv_nk_u8_i16(
+                        &activations,
+                        &weight_u8.values,
+                        &weight_u8.scales,
+                        &weight_u8.scaled_zero_points,
+                        result,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                    );
+                } else {
                     gemv_nk_u8(
                         &activations,
                         &weight_u8.values,
@@ -513,6 +531,7 @@ impl Kernel for MatMulNBitsKernel {
                         self.n,
                         self.block_size,
                     );
+                }
             })?;
         } else if m == 1 {
             let owned_weight;
@@ -2248,6 +2267,266 @@ fn gemv_nk_u8(
         compute(0, result);
     }
 }
+
+/// Whether the 8-bit decode GEMV uses the int16-activation fast path.
+///
+/// Default **on**. Opt out (restore the fp32-activation [`gemv_nk_u8`]) with
+/// `ONNX_GENAI_CPU_8BIT_ACT=fp32` (also accepts `f32`, `0`, `off`), used for
+/// A/B before/after measurement. This never enables int8-activation, which is
+/// ORT's fast-but-wrong path (it flips qwen3's near-tie token 1479 -> 3988).
+fn eight_bit_int16_activation() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ONNX_GENAI_CPU_8BIT_ACT") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "fp32" | "f32" | "0" | "off" | "false")
+        }
+        Err(_) => true,
+    })
+}
+
+/// Quantize one K-block of `f32` activations to symmetric int16 with a single
+/// per-block scale, returning that scale.
+///
+/// int16 (15 usable magnitude bits per block) preserves qwen3's massive
+/// activation channels far better than int8 (7 bits), which is what keeps the
+/// correct fp32 token. The scale is `amax / 32767`; a block of all zeros maps to
+/// scale 0 and all-zero codes.
+fn quantize_block_i16(activation: &[f32], out: &mut [i16]) -> f32 {
+    debug_assert_eq!(activation.len(), out.len());
+    let mut amax = 0.0f32;
+    for &value in activation {
+        amax = amax.max(value.abs());
+    }
+    if amax == 0.0 {
+        out.fill(0);
+        return 0.0;
+    }
+    let scale = amax / 32767.0;
+    let inv_scale = 32767.0 / amax;
+    for (code, &value) in out.iter_mut().zip(activation) {
+        // amax is the block max, so value * inv_scale is in [-32767, 32767];
+        // round-half-away and clamp defensively against fp rounding at the edge.
+        let scaled = (value * inv_scale).round();
+        *code = scaled.clamp(-32767.0, 32767.0) as i16;
+    }
+    scale
+}
+
+/// Activation quantization granularity (elements per int16 scale) for the 8-bit
+/// int16-activation decode path.
+///
+/// A *massive activation channel* forces a large per-group scale that coarsens
+/// its group-mates; a finer group confines that loss to fewer neighbors, so a
+/// razor-thin logit stays on the fp32 side. 32 (finer than the typical 128
+/// weight block) keeps qwen3-0.6b byte-identical to the fp32 oracle. Overridable
+/// with `ONNX_GENAI_CPU_8BIT_ACT_QGROUP` (rounded up to a multiple of 16, min
+/// 16) for tuning. Groups nest inside the weight block (a divisor when both are
+/// powers of two), so each group carries exactly one weight scale.
+fn activation_quant_group() -> usize {
+    static GROUP: OnceLock<usize> = OnceLock::new();
+    *GROUP.get_or_init(|| {
+        let requested = std::env::var("ONNX_GENAI_CPU_8BIT_ACT_QGROUP")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(32);
+        requested.max(16).div_ceil(16) * 16
+    })
+}
+
+/// 8-bit decode GEMV with an int16-quantized activation (fast path).
+///
+/// Quantizes the activation to int16 in groups of [`activation_quant_group`]
+/// (nested inside each weight block), then for each output row/block computes
+/// `weight_scale * sum_group act_scale * (w_i16 . a_i16) - (weight_scale*zp) *
+/// sum(a)`. The `w . a` term uses a SIMD grouped block dot ([`block_dot_u8_i16`],
+/// one horizontal reduction per weight block); the zero-point term keeps the
+/// exact `f32` block activation sum, so only the weight*activation product
+/// carries int16 rounding (well within the fp32 token's margin). Algebraically
+/// the same affine dequant as [`gemv_nk_u8`], with int16 activations.
+#[allow(clippy::too_many_arguments)]
+fn gemv_nk_u8_i16(
+    activation: &[f32],
+    values: &[u8],
+    scales: &[f32],
+    scaled_zero_points: &[f32],
+    result: &mut [f32],
+    k: usize,
+    n: usize,
+    block_size: usize,
+) {
+    debug_assert_eq!(activation.len(), k);
+    debug_assert_eq!(values.len(), n * k);
+    debug_assert_eq!(result.len(), n);
+    let k_blocks = k.div_ceil(block_size);
+    debug_assert_eq!(scales.len(), n * k_blocks);
+    debug_assert_eq!(scaled_zero_points.len(), n * k_blocks);
+    let group = activation_quant_group().min(block_size.max(1));
+    let k_groups = k.div_ceil(group);
+
+    // Quantize the activation once (shared across every output row): per-group
+    // int16 codes + scales for the product term, plus the exact f32 per-block
+    // sum for the zero-point term.
+    let mut quantized = vec![0i16; k];
+    let mut group_scales = vec![0.0f32; k_groups];
+    let mut block_activation_sums = vec![0.0f32; k_blocks];
+    for grp in 0..k_groups {
+        let start = grp * group;
+        let end = (start + group).min(k);
+        group_scales[grp] =
+            quantize_block_i16(&activation[start..end], &mut quantized[start..end]);
+    }
+    for block in 0..k_blocks {
+        let start = block * block_size;
+        let end = (start + block_size).min(k);
+        block_activation_sums[block] = activation[start..end].iter().sum();
+    }
+
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        for (index, output) in outputs.iter_mut().enumerate() {
+            let row = output_start + index;
+            let weights = &values[row * k..row * k + k];
+            let scale_row = &scales[row * k_blocks..row * k_blocks + k_blocks];
+            let zp_row = &scaled_zero_points[row * k_blocks..row * k_blocks + k_blocks];
+            let mut acc = 0.0f32;
+            for block in 0..k_blocks {
+                let block_start = block * block_size;
+                let block_end = (block_start + block_size).min(k);
+                let first_group = block_start / group;
+                let last_group = (block_end - 1) / group;
+                let block_partial = block_dot_u8_i16(
+                    &weights[block_start..block_end],
+                    &quantized[block_start..block_end],
+                    &group_scales[first_group..=last_group],
+                    group,
+                );
+                acc += scale_row[block] * block_partial
+                    - zp_row[block] * block_activation_sums[block];
+            }
+            *output = acc;
+        }
+    };
+    let chunk = output_chunk_len(n, k);
+    if chunk < n {
+        parallel_output_rows(result, k, compute);
+    } else {
+        compute(0, result);
+    }
+}
+
+/// Weighted sum over activation-quant groups of a single weight block:
+/// `sum_group group_scale * (w_u8 . a_i16)`.
+///
+/// The caller multiplies the result by the block's weight scale (constant across
+/// the block) and applies the zero-point term. Each group carries its own int16
+/// activation scale (finer than the weight block to confine massive-activation
+/// coarsening), but the products accumulate into a single running sum with **one**
+/// horizontal reduction per block -- so a fine group costs only an extra cheap
+/// vector scale-add, not an extra reduction.
+#[inline]
+fn block_dot_u8_i16(weights: &[u8], activation: &[i16], group_scales: &[f32], group: usize) -> f32 {
+    debug_assert_eq!(weights.len(), activation.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if have_avx2() {
+            // SAFETY: have_avx2 confirmed AVX2 support at runtime.
+            return unsafe { block_dot_u8_i16_avx2(weights, activation, group_scales, group) };
+        }
+    }
+    block_dot_u8_i16_scalar(weights, activation, group_scales, group)
+}
+
+fn block_dot_u8_i16_scalar(
+    weights: &[u8],
+    activation: &[i16],
+    group_scales: &[f32],
+    group: usize,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for (group_index, chunk) in weights.chunks(group).enumerate() {
+        let start = group_index * group;
+        let dot: i32 = chunk
+            .iter()
+            .zip(&activation[start..start + chunk.len()])
+            .map(|(&w, &a)| w as i32 * a as i32)
+            .sum();
+        acc += group_scales[group_index] * dot as f32;
+    }
+    acc
+}
+
+/// AVX2 grouped block dot: `u8 x i16 -> i32` via `_mm256_madd_epi16`, converted
+/// to f32 and scaled per group into one f32x8 accumulator (single reduction).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn block_dot_u8_i16_avx2(
+    weights: &[u8],
+    activation: &[i16],
+    group_scales: &[f32],
+    group: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = weights.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut scalar_tail = 0.0f32;
+    let mut position = 0usize;
+    let mut group_index = 0usize;
+    while position < len {
+        let group_end = (position + group).min(len);
+        let group_scale = group_scales[group_index];
+        let mut group_acc = _mm256_setzero_si256();
+        let mut inner = position;
+        while inner + 16 <= group_end {
+            // SAFETY: inner + 16 <= group_end <= len; loadu permits unaligned loads.
+            let weight_bytes = unsafe { _mm_loadu_si128(weights.as_ptr().add(inner).cast()) };
+            let weight_i16 = _mm256_cvtepu8_epi16(weight_bytes);
+            // SAFETY: 16 i16 = 32 bytes within the equal-length activation slice.
+            let activation_i16 =
+                unsafe { _mm256_loadu_si256(activation.as_ptr().add(inner).cast()) };
+            group_acc =
+                _mm256_add_epi32(group_acc, _mm256_madd_epi16(weight_i16, activation_i16));
+            inner += 16;
+        }
+        // Scale this group's partial into the block f32 accumulator (mul+add,
+        // mirroring the int4 path -- no FMA feature dependency).
+        acc = _mm256_add_ps(
+            acc,
+            _mm256_mul_ps(_mm256_cvtepi32_ps(group_acc), _mm256_set1_ps(group_scale)),
+        );
+        // Non-multiple-of-16 remainder (only the final partial K block/group).
+        if inner < group_end {
+            let dot = dot_u8_i16_scalar(&weights[inner..group_end], &activation[inner..group_end]);
+            scalar_tail += group_scale * dot as f32;
+        }
+        position = group_end;
+        group_index += 1;
+    }
+    horizontal_sum_f32_256(acc) + scalar_tail
+}
+
+/// Dot product of a `u8` weight block with an int16-quantized activation block,
+/// accumulating in `i32`. Backs the scalar remainder of the grouped block dot.
+///
+/// A block is at most `block_size` (<= a few hundred) elements with weights in
+/// `0..=255` and activations in `-32767..=32767`, so the widest partial sum
+/// (`block_size * 255 * 32767`) stays well inside `i32`.
+fn dot_u8_i16_scalar(weight: &[u8], activation: &[i16]) -> i32 {
+    debug_assert_eq!(weight.len(), activation.len());
+    weight
+        .iter()
+        .zip(activation)
+        .map(|(&w, &a)| w as i32 * a as i32)
+        .sum()
+}
+
+/// Runtime AVX2 detection cached for the int16 decode dot product.
+#[cfg(target_arch = "x86_64")]
+fn have_avx2() -> bool {
+    static AVX2: OnceLock<bool> = OnceLock::new();
+    *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
 const MIN_PARALLEL_DOT_PRODUCTS_PER_TASK: usize = 32 * 1024;
 const MIN_PARALLEL_DOT_PRODUCTS_PER_THREAD: usize = 8 * 1024;
 const MANY_THREAD_DOT_PRODUCTS_PER_THREAD: usize = 64 * 1024;
@@ -3442,6 +3721,186 @@ mod tests {
                 "asymmetric={asymmetric}: gemv_nk_u8 relative RMSE {rel} exceeds 1e-5",
             );
         }
+    }
+
+    /// `dot_u8_i16_scalar` (the exact `i32` reduction backing the grouped block
+    /// dot's remainder) and the SIMD grouped `block_dot_u8_i16` must both agree
+    /// with an independent reference, including a non-multiple-of-16 tail.
+    #[test]
+    fn dot_u8_i16_matches_serial_reference() {
+        for len in [0usize, 1, 7, 15, 16, 17, 31, 128, 130] {
+            let weight: Vec<u8> = (0..len).map(|i| ((i * 53 + 11) % 256) as u8).collect();
+            let activation: Vec<i16> = (0..len)
+                .map(|i| (((i * 1103) % 65535) as i32 - 32767) as i16)
+                .collect();
+            let expected: i32 = weight
+                .iter()
+                .zip(&activation)
+                .map(|(&w, &a)| w as i32 * a as i32)
+                .sum();
+            assert_eq!(
+                dot_u8_i16_scalar(&weight, &activation),
+                expected,
+                "len={len}: dot_u8_i16_scalar mismatch",
+            );
+            // Single group covering the whole slice, scale 1 -> block_dot == dot.
+            let got = block_dot_u8_i16(&weight, &activation, &[1.0], len.max(1));
+            assert!(
+                (got - expected as f32).abs() <= 1.0 + expected.unsigned_abs() as f32 * 1e-6,
+                "len={len}: block_dot_u8_i16={got} != reference {expected}",
+            );
+        }
+    }
+
+    /// The grouped block dot must apply a distinct per-group activation scale and
+    /// still reduce once, matching a scalar per-group reference.
+    #[test]
+    fn block_dot_u8_i16_applies_per_group_scales() {
+        let group = 16usize;
+        let len = 3 * group + 5; // three full groups + a partial tail group
+        let weight: Vec<u8> = (0..len).map(|i| ((i * 17 + 3) % 256) as u8).collect();
+        let activation: Vec<i16> =
+            (0..len).map(|i| ((i as i32 * 211) % 4001 - 2000) as i16).collect();
+        let n_groups = len.div_ceil(group);
+        let group_scales: Vec<f32> =
+            (0..n_groups).map(|g| 0.01 * (g as f32 + 1.0)).collect();
+        let expected: f32 = (0..n_groups)
+            .map(|g| {
+                let start = g * group;
+                let end = (start + group).min(len);
+                let dot: i32 = (start..end)
+                    .map(|i| weight[i] as i32 * activation[i] as i32)
+                    .sum();
+                group_scales[g] * dot as f32
+            })
+            .sum();
+        let got = block_dot_u8_i16(&weight, &activation, &group_scales, group);
+        assert!(
+            (got - expected).abs() <= 1e-3 * expected.abs().max(1.0),
+            "block_dot_u8_i16={got} != per-group reference {expected}",
+        );
+    }
+
+    /// The int16-activation 8-bit GEMV ([`gemv_nk_u8_i16`]) must reconstruct the
+    /// dequantize-to-f32 result for symmetric and asymmetric zero points and a
+    /// partial trailing K block. int16 activations keep the product accurate to
+    /// well under a greedy token's margin, so a tight relative RMSE bound holds.
+    #[test]
+    fn gemv_nk_u8_i16_matches_dequant_f32_reference() {
+        let (n, k, block_size) = (40usize, 200usize, 128usize);
+        let k_blocks = k.div_ceil(block_size);
+        let weights_nk: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.017).sin() * 1.1 + (i as f32 * 0.0009).cos() * 0.5)
+            .collect();
+        let activation: Vec<f32> =
+            (0..k).map(|i| (i as f32 * 0.023 + 0.2).cos() * 0.8).collect();
+        for &asymmetric in &[false, true] {
+            let (packed, scales, zps, dequantized) =
+                quantize_8bit(&weights_nk, n, k, block_size, asymmetric);
+            let mut values = vec![0u8; n * k];
+            let mut scaled_zero_points = vec![0.0f32; n * k_blocks];
+            for output in 0..n {
+                for block in 0..k_blocks {
+                    let start = block * block_size;
+                    let valid = k.saturating_sub(start).min(block_size);
+                    let zp = zps.as_ref().map_or(128u8, |z| z[output * k_blocks + block]);
+                    scaled_zero_points[output * k_blocks + block] =
+                        scales[output * k_blocks + block] * zp as f32;
+                    for offset in 0..valid {
+                        values[output * k + start + offset] =
+                            packed[(output * k_blocks + block) * block_size + offset];
+                    }
+                }
+            }
+            let mut out = vec![0.0f32; n];
+            gemv_nk_u8_i16(
+                &activation,
+                &values,
+                &scales,
+                &scaled_zero_points,
+                &mut out,
+                k,
+                n,
+                block_size,
+            );
+            let oracle = reference(&activation, &dequantized, 1, k, n);
+            let oracle_rms = rmse(&oracle, &vec![0.0; n]).max(1e-6);
+            let rel = rmse(&out, &oracle) / oracle_rms;
+            assert!(
+                rel <= 1e-3,
+                "asymmetric={asymmetric}: gemv_nk_u8_i16 relative RMSE {rel} exceeds 1e-3",
+            );
+        }
+    }
+
+    /// Regression for the qwen3 "massive activation channel" failure mode: a
+    /// near-tie between two output rows decided by many small activation
+    /// channels, alongside one huge channel. int8-activation quantization
+    /// (ORT's `accuracy_level=4`) crushes the small channels to zero and FLIPS
+    /// the argmax; the int16-activation path must keep the fp32 winner.
+    #[test]
+    fn gemv_nk_u8_i16_preserves_argmax_on_massive_activation_channel() {
+        let (n, k, block_size) = (2usize, 128usize, 128usize);
+        // Symmetric weights, scale 1, zero-point 128 -> effective w = value - 128.
+        // Row0: massive-channel weight 0, small channels +4. Row1: massive 1, 0.
+        let mut values = vec![128u8; n * k];
+        for j in 1..k {
+            values[j] = 132; // row0 small channels -> +4
+        }
+        values[k] = 129; // row1 massive channel -> +1
+        let scales = vec![1.0f32; n]; // one block per row
+        let scaled_zero_points = vec![128.0f32; n]; // scale * zp
+        // Massive channel 0 = 300, all others = 1.
+        let mut activation = vec![1.0f32; k];
+        activation[0] = 300.0;
+
+        // fp32 oracle from the same effective (dequantized) weights.
+        let dequantized: Vec<f32> =
+            values.iter().map(|&v| v as f32 - 128.0).collect();
+        let oracle = reference(&activation, &dequantized, 1, k, n);
+        let oracle_argmax = argmax(&oracle);
+
+        // int8-activation simulation (per-block symmetric) MUST flip the argmax,
+        // proving this case actually exercises the real failure mode.
+        let amax = activation.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let i8_scale = amax / 127.0;
+        let a_int8: Vec<f32> = activation
+            .iter()
+            .map(|&v| (v / i8_scale).round().clamp(-127.0, 127.0) * i8_scale)
+            .collect();
+        let int8_out = reference(&a_int8, &dequantized, 1, k, n);
+        assert_ne!(
+            argmax(&int8_out),
+            oracle_argmax,
+            "test is vacuous: int8-activation did not flip the argmax",
+        );
+
+        // int16-activation path must match the fp32 oracle argmax.
+        let mut out = vec![0.0f32; n];
+        gemv_nk_u8_i16(
+            &activation,
+            &values,
+            &scales,
+            &scaled_zero_points,
+            &mut out,
+            k,
+            n,
+            block_size,
+        );
+        assert_eq!(
+            argmax(&out),
+            oracle_argmax,
+            "int16-activation flipped the argmax (oracle={oracle:?}, got={out:?})",
+        );
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
     }
 
     #[test]
