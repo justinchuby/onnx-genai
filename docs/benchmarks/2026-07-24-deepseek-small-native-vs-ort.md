@@ -1,4 +1,4 @@
-# Small DeepSeek native CUDA vs. ORT CUDA — 2026-06-09
+# Small DeepSeek native CUDA vs. ORT CUDA — 2026-07-24
 
 This controlled steady-decode comparison covers real CUDA-int4
 DeepSeek-Coder-1.3B and DeepSeek-R1-Distill-Qwen-1.5B artifacts on an

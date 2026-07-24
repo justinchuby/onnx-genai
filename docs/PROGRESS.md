@@ -4,14 +4,14 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-06-09T00:00:00Z_
+_Last updated: 2026-07-24T00:00:00Z_
 
 **Current `origin/main` implementation HEAD:** `2ead1cdd` (rustfmt hygiene for the CI formatting gate).
 
-## 2026-06-09 — GLM-5.2 native-e2e + DeepSeek breadth + CI hardening
+## 2026-07-24 — GLM-5.2 native-e2e + DeepSeek breadth + CI hardening
 
 - **GLM-5.2 fixed-capacity foundation + native eager E2E ✅ (`bd9bd60c`, `6600cd7d`, `7c212bc7`, `ec4b62bf`):** CUDA now has the fixed-capacity `pkg.nxrt::IndexShare` present path and executor capacity recognition (`bd9bd60c`); `6600cd7d` supplies its CI-clippy cleanup. The reproducible synthetic tiny-QMoE fixture (about 378 KB of ONNX weights) is locked by `glm_tiny_qmoe_native_cuda_e2e.rs`, gated with `required-features = ["cuda", "native-backend"]` (`ec4b62bf`). It asserts native CPU/CUDA greedy-ID parity at the anchor IDs and confirms current concat-form exports stay eager (`captures=0`); the S3 exporter capacity-form rewrite remains deferred. This is a synthetic native capability milestone, **not** a real-checkpoint quality or performance claim: real GLM-5.2 weights are 217 GB+ and were not benchmarked here.
-- **DeepSeek breadth + accuracy adjudication ✅ (`30ab9c7f`):** real DeepSeek-Coder-1.3B measured **824.08 vs 618.02 tok/s (1.333×)** and DeepSeek-R1-Distill-Qwen-1.5B **647.73 vs 430.51 tok/s (1.505×)**, native/ORT; see `docs/benchmarks/deepseek-small-native-vs-ort-2026-06-09.md` for medians, run ranges, and capture context. At the R1 generated-token split, native CUDA token `374` matches the fp32 CPU oracle while ORT CUDA selects `315` through its int8-activation path; the ignored real-model regression locks that native-more-accurate result (`30ab9c7f`).
+- **DeepSeek breadth + accuracy adjudication ✅ (`30ab9c7f`):** real DeepSeek-Coder-1.3B measured **824.08 vs 618.02 tok/s (1.333×)** and DeepSeek-R1-Distill-Qwen-1.5B **647.73 vs 430.51 tok/s (1.505×)**, native/ORT; see `docs/benchmarks/2026-07-24-deepseek-small-native-vs-ort.md` for medians, run ranges, and capture context. At the R1 generated-token split, native CUDA token `374` matches the fp32 CPU oracle while ORT CUDA selects `315` through its int8-activation path; the ignored real-model regression locks that native-more-accurate result (`30ab9c7f`).
 - **Model-independent accuracy guard ✅ (`3d48f57b`):** CPU CI now includes `matmulnbits_fp32_activation_is_more_accurate_than_accuracy4`, guarding the fp32-activation versus accuracy-4/int8-activation property without a GPU or large checkpoint.
 - **CI formatting gate ✅ (`2ead1cdd`):** rustfmt-only hygiene restores the blocking `cargo fmt --all -- --check` gate after the capacity work.
 - **Qwen3-0.6B native CUDA validation:** in progress in a separate agent; no results are recorded yet.
@@ -45,7 +45,7 @@ Standing native vs onnxruntime-genai-cuda 0.14.1 (8×H200, foundry cuda-gpu int4
 
 ## 2026-07-23 — CUDA perf + smoothness wave 1 (native vs ORT baseline + 4 landings)
 
-Five parallel worktree agents, each independently reviewed before fast-forward merge (main enforces `required_linear_history`). Historical net vs onnxruntime-genai-cuda 0.14.1 on 8×H200 (foundry cuda-gpu int4, greedy, 3-run median @128): Qwen0.5B **821 vs 732 (native +12%)**, 1.5B 481 vs 483 (parity), 7B 231→**254 vs 280 (−18%→~−9% after fusion)**, Phi-4-mini 93 vs 237 (−58%, then a top remaining target). The Phi comparison is superseded by `ecb6331c` (native 322.0 tok/s vs ORT 225–237 tok/s, +36–43%). Full table: `docs/benchmarks/ort-vs-native-cuda-2026-07-23.md`.
+Five parallel worktree agents, each independently reviewed before fast-forward merge (main enforces `required_linear_history`). Historical net vs onnxruntime-genai-cuda 0.14.1 on 8×H200 (foundry cuda-gpu int4, greedy, 3-run median @128): Qwen0.5B **821 vs 732 (native +12%)**, 1.5B 481 vs 483 (parity), 7B 231→**254 vs 280 (−18%→~−9% after fusion)**, Phi-4-mini 93 vs 237 (−58%, then a top remaining target). The Phi comparison is superseded by `ecb6331c` (native 322.0 tok/s vs ORT 225–237 tok/s, +36–43%). Full table: `docs/benchmarks/2026-07-23-ort-vs-native-cuda.md`.
 
 - **Generic GQA scalar `seqlens_k` ✅ (`d2582df`, Irmgard; Chew 🟢):** batch-1 rank-0→`[1]` promotion for `com.microsoft::GroupQueryAttention` on CPU+CUDA (validated int32/contiguous/non-negative/capacity; scalar rejected for batch>1); removed the metadata opt-in policy. Model-agnostic. Unblocks a scalar-seqlens export.
 - **IndexShare CUDA-graph capture ✅ (`3ff0f12`, Keaton; Chew 🟢):** device-resident `validate_index_rows` NVRTC kernel + capture-error latch (`0x200`) replaces the D2H `selected_indices` validation; pooled stable-address scratch; `cuda_graph_compatible()` now true after a warmed eager pass. 10/10 GPU tests (captured replay byte-identical to eager).
@@ -65,7 +65,7 @@ Five parallel worktree agents, each independently reviewed before fast-forward m
   1. `CudaFoldConstantTranspose` — any Transpose of a producer-less constant initializer (whole-byte dtype) is materialized once at claim time into a pre-transposed inline initializer (byte-wise permutation, any rank/perm; sub-byte + non-constant skipped; tied weights preserved).
   2. Dense fp16 M==1 GEMV fast path in `MatMulKernel` — portable NVRTC GEMV (one thread/column, coalesced, fp32 accumulate), no workspace/sync → capture-safe, folds into the decode CUDA graph.
 - H200, greedy byte-identical: Llama-3.2-1B **97→449 tok/s @128 (4.6×), 438 @1024**. Qwen2.5-0.5B no regression (quantized head → passes inert). Reviewed 🟢 by independent reviewer; genericity (RULES §2/§2.1), capture-safety, byte-permutation correctness all verified.
-- Bench doc: `docs/benchmarks/llama-3.2-1b-lmhead-fusion-2026-07-23.md`.
+- Bench doc: `docs/benchmarks/2026-07-22-llama-3.2-1b-lmhead-fusion.md`.
 
 ## 2026-07-23 — Qwen3 fast-path fix, Native GAP 2, DeepSeek MoE Phase 1, and model generality
 
@@ -83,7 +83,7 @@ Five parallel worktree agents, each independently reviewed before fast-forward m
 
 ## 2026-07-22 — Qwen2.5-1.5B/7B H200 decode roofline ladder
 
-- **Qwen2.5 H200 decode ladder ✅ (`c9190c6`):** native CUDA device-KV + whole-step CUDA graph replay, with **0 fallbacks / 0 transfers**, now has the merged 1.5B/7B report at `docs/benchmarks/qwen-1.5b-7b-h200-2026-07-22.md`: Qwen2.5-1.5B int4 reached **487.66 tok/s** at 128 tokens (**2.051 ms/token**) and **457.88 tok/s** at 1024 (**2.184 ms/token**), while Qwen2.5-7B int4 reached **230.47 tok/s** at 128 (**4.339 ms/token**) and **223.38 tok/s** at 1024 (**4.477 ms/token**). Against the explicit streamed-weight + fp16-KV HBM roofline model at **3.35 TB/s** effective bandwidth, the ceilings are ~**3,811 tok/s** for 1.5B (**12.8%/12.2%**) and ~**840 tok/s** for 7B (**27.5%/26.8%**). This extends the existing 0.5B (~810/778 tok/s) and Phi-4-mini (94.5/93.2 tok/s) ladder; 7B lands at the higher roofline fraction because decode is more compute-bound (int4 dequant dominates), making fixed per-token launch overhead a smaller share.
+- **Qwen2.5 H200 decode ladder ✅ (`c9190c6`):** native CUDA device-KV + whole-step CUDA graph replay, with **0 fallbacks / 0 transfers**, now has the merged 1.5B/7B report at `docs/benchmarks/2026-07-22-qwen-1.5b-7b-h200.md`: Qwen2.5-1.5B int4 reached **487.66 tok/s** at 128 tokens (**2.051 ms/token**) and **457.88 tok/s** at 1024 (**2.184 ms/token**), while Qwen2.5-7B int4 reached **230.47 tok/s** at 128 (**4.339 ms/token**) and **223.38 tok/s** at 1024 (**4.477 ms/token**). Against the explicit streamed-weight + fp16-KV HBM roofline model at **3.35 TB/s** effective bandwidth, the ceilings are ~**3,811 tok/s** for 1.5B (**12.8%/12.2%**) and ~**840 tok/s** for 7B (**27.5%/26.8%**). This extends the existing 0.5B (~810/778 tok/s) and Phi-4-mini (94.5/93.2 tok/s) ladder; 7B lands at the higher roofline fraction because decode is more compute-bound (int4 dequant dominates), making fixed per-token launch overhead a smaller share.
 
 ## 2026-07-22 — VLM metadata/runtime/admission landings + Gemma4 E2B validation
 
@@ -97,11 +97,11 @@ Five parallel worktree agents, each independently reviewed before fast-forward m
 
 ## 2026-07-22 — H200 native CUDA decode benchmark report
 
-- **Qwen2.5-0.5B H200 graph decode ✅:** Native CUDA device-KV with whole-step graph replay reached **820.65 tok/s** at 128 tokens and **781.20 tok/s** at 1024 tokens, or **92.6%/88.2%** of the supplied 886 tok/s roofline and **2.16x/2.06x** vs the 380 tok/s RTX 4060 baseline. Graph-off token-identical runs were 434.14/427.65 tok/s; Phi-4-mini graph-on held **94.50/93.19 tok/s**. Full report: `docs/benchmarks/h200-native-decode-2026-07-22.md`.
+- **Qwen2.5-0.5B H200 graph decode ✅:** Native CUDA device-KV with whole-step graph replay reached **820.65 tok/s** at 128 tokens and **781.20 tok/s** at 1024 tokens, or **92.6%/88.2%** of the supplied 886 tok/s roofline and **2.16x/2.06x** vs the 380 tok/s RTX 4060 baseline. Graph-off token-identical runs were 434.14/427.65 tok/s; Phi-4-mini graph-on held **94.50/93.19 tok/s**. Full report: `docs/benchmarks/2026-07-22-h200-native-decode.md`.
 
 ## 2026-07-22 — Gemma4 E2B native-package text E2E on H200
 
-- **Coherent four-model text decode ✅ (ORT CUDA pipeline):** the Mobius E2B package executed the metadata-declared every-step `embedding -> decoder` chain, refreshing both `inputs_embeds` and `per_layer_inputs`, and generated `"The capital of France is **Paris**."` at **140.09 tok/s median** (**7.138 ms/token**, 5 runs, 2 warmups, skip 8). A generic metadata overlay supplied absent image/audio zero tensors and presence gates because the package predates Mobius optional-modality PR #419. `profile_native` now supports pipeline profiling/steady windows and refuses false CUDA measurements when linked ORT lacks `CUDAExecutionProvider`. Pure-Rust multi-model execution remains blocked by the explicit native-pipeline rejection in `pipeline.rs`; ORT 1.27 also needs its optimized attention paths disabled for this valid fp16 GQA graph. Full report: `docs/benchmarks/gemma4-e2b-native-2026-07-22.md`.
+- **Coherent four-model text decode ✅ (ORT CUDA pipeline):** the Mobius E2B package executed the metadata-declared every-step `embedding -> decoder` chain, refreshing both `inputs_embeds` and `per_layer_inputs`, and generated `"The capital of France is **Paris**."` at **140.09 tok/s median** (**7.138 ms/token**, 5 runs, 2 warmups, skip 8). A generic metadata overlay supplied absent image/audio zero tensors and presence gates because the package predates Mobius optional-modality PR #419. `profile_native` now supports pipeline profiling/steady windows and refuses false CUDA measurements when linked ORT lacks `CUDAExecutionProvider`. Pure-Rust multi-model execution remains blocked by the explicit native-pipeline rejection in `pipeline.rs`; ORT 1.27 also needs its optimized attention paths disabled for this valid fp16 GQA graph. Full report: `docs/benchmarks/2026-07-22-gemma4-e2b-native.md`.
 
 ## 2026-07-22 — WP-B optional-modality contract landings
 

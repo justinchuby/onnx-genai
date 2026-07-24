@@ -1,4 +1,4 @@
-# Native CUDA vs. ORT CUDA uncontended ladder — 2026-06-09
+# Native CUDA vs. ORT CUDA uncontended ladder — 2026-07-24
 
 ## Method
 
