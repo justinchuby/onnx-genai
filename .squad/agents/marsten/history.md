@@ -7,3 +7,8 @@
 ## 2026-07-23T22-29-16Z — GLM-4-9b native support smoke
 - Confirmed real GLM-4-9b int4 native CUDA decode is coherent on both baseline `569507c` and DeepSeek dtod fix `1fe314f`, byte-identical with cuda-graph active (`captures=1`, `replays=61`, `fallbacks=0`). ORT-genai cannot load this export without `genai_config.json`, so evidence is native-only.
 - 2026-07-24: Validated real-model coverage after DeepSeek fixes: DeepSeek-V2-Lite MoE coherent, GLM-4-9b dense native coherent, and R1-Distill-Qwen-1.5B native exactly matches ORT-genai for 32 tokens.
+
+## 2026-07-24T05:48:20+0000 — Definitive foundry-local native/ORT A/B
+
+- On GPU 1, same harness and exact token parity: native whole-step capture measured Qwen2.5-0.5B **902 vs 584 tok/s** for ORT (1.55×) and Phi-4-mini **322 vs 238 tok/s** (1.35×).
+- DeepSeek-V2-Lite native capture versus eager native was **79.2 vs 44.5 tok/s** at block-32 (1.78×) and **84.6 vs 46.8 tok/s** at block-128 (1.81×). ORT capture could not be enabled for the two A/B models (`ort_value must contain a constructed tensor`), so the ORT side is explicitly eager.

@@ -115,3 +115,8 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 ## 2026-07-23T14:55:00Z — QMoE emitter packing review
 
 - Approved Batty's Mobius int4 QMoE emitter/packer with caveat: packing ABI correct in every dimension, with one Ruff syntax regression still being fixed.
+
+## 2026-07-24T05:48:20+0000 — profile_native backend-flag review
+
+- Rejected Deckard-10 until it preserved the native header byte-for-byte and tested invalid `--backend` input; Rachael-2's `d03261c7` correction met both requirements and was approved 🟢 GREEN.
+- The subsequent foundry-local same-harness result is bounded: native captured Qwen2.5-0.5B 902 vs eager ORT 584 tok/s (1.55×), and Phi-4-mini 322 vs 238 (1.35×); ORT CUDA capture failed with `ort_value must contain a constructed tensor`.

@@ -109,3 +109,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
 - Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
+
+## 2026-07-24T05:48:20+0000 — Same-harness native/ORT backend flag landed
+
+- `profile_native --backend native|ort|auto` landed as `d03261c7` after the reviewer-required restoration of the byte-identical native header and invalid-value parser coverage.
+- The flag enabled the definitive foundry-local CUDA A/B: native whole-step capture reached 902 vs ORT 584 tok/s on Qwen2.5-0.5B (1.55×) and 322 vs 238 on Phi-4-mini (1.35×), with exact token parity. ORT capture currently fails (`ort_value must contain a constructed tensor`), so ORT was eager.

@@ -444,3 +444,11 @@ captured/eager fragmentation toward a small number of stable replay graphs.
   estimates from current-main per-op and nsys measurements.
 - The report does not assume every data-dependent value is safe to freeze.
   Exact warmed signature validation and recapture are mandatory.
+
+<!-- scribe-merge-2026-07-24T05-48-20+0000-native-vs-ort-headline -->
+## 2026-07-24 — Native CUDA EP versus onnxruntime-genai foundry-local benchmark
+
+### Native CUDA EP beats onnxruntime-genai on foundry-local models (1.35–1.55x)
+**By:** Marsten; implementation by Deckard and Rachael; reviewed by Chew
+**What:** With the same decode harness and exact token parity on foundry-local CUDA packages, native CUDA EP with whole-step graph capture measured **902 tok/s versus 584 tok/s** for Qwen2.5-0.5B (**1.55×**) and **322 tok/s versus 238 tok/s** for Phi-4-mini (**1.35×**). On DeepSeek-V2-Lite, native whole-step capture measured **79.2 versus 44.5 tok/s** at block-32 (**1.78×**) and **84.6 versus 46.8 tok/s** at block-128 (**1.81×**) against eager native execution. `profile_native` now accepts `--backend native|ort|auto` (commit `d03261c7`), preserving the byte-identical native header while emitting a separate backend line for ORT/auto.
+**Why:** This is a controlled same-harness comparison and demonstrates working native capture. It must not be read as a captured-ORT comparison: ORT's own CUDA-graph capture fails on both tested models with `ort_value must contain a constructed tensor`, so its reported runs are eager.

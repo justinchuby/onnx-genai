@@ -128,3 +128,8 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 - DeepSeek-V2-Lite int4 decode reached one captured segment and **0 eager seams** (727→0) on main after Leon's Reshape fold (`661618b8`) and Rachael's mask-island closure (`3dc0843b`).
 - Integration retained deterministic coherent output (` Paris.\nThe currency of France is the Euro.`); CUDA library gate: 205/0.
+
+## 2026-07-24T05:48:20+0000 — Backend-flag compatibility correction
+
+- As the designated lockout-safe fixer, landed `d03261c7`: restored the native header byte-for-byte, added a separate ORT/auto `backend=` line, and covered invalid backend arguments.
+- Chew approved the correction. The resulting same-harness foundry-local A/B records working native capture at 1.55× (Qwen2.5-0.5B) and 1.35× (Phi-4-mini) over eager ORT; ORT capture errors with `ort_value must contain a constructed tensor`.
