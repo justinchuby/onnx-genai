@@ -1,11 +1,12 @@
-//! Additional unary f32 elementwise math kernels (`docs/ORT2.md` §4.4).
+//! Additional unary floating-point elementwise math kernels (`docs/ORT2.md` §4.4).
 //!
 //! These mirror the [`elementwise`](super::elementwise) unary family (a straight
-//! per-element `f32 -> f32` map through [`to_dense_f32`]/[`write_dense_f32`]) but
+//! per-element map through [`to_dense_f32_widen`]/[`write_dense_f32_narrow`]) but
 //! live in their own module to keep the shared `elementwise.rs` low-conflict
 //! while the dtype-coverage pass proceeds there in parallel.
 //!
-//! Every op targets ONNX/NumPy numerics on `f32`:
+//! Every op widens `f16`/`bf16` to `f32`, computes using ONNX/NumPy numerics,
+//! and narrows back to the requested output float type:
 //!
 //! * `Abs`, `Neg`, `Reciprocal` — trivial arithmetic.
 //! * `Exp`, `Log`, `Sin`, `Cos` — `std` intrinsics.
@@ -366,16 +367,61 @@ mod tests {
     }
     #[test]
     fn unary_math_bf16_matches_widened_f32_reference() {
-        let x = Owned::bf16(&[5], &[-80., -1., 0., 1., 80.]);
-        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[5]);
+        let x = Owned::bf16(&[4], &[-1., 0., 1., 80.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[4]);
         run(MathOp::Softplus, &x, &mut out);
-        let expected: Vec<_> = x
-            .to_bf16_as_f32()
-            .into_iter()
-            .map(softplus)
-            .map(half::bf16::from_f32)
-            .map(half::bf16::to_f32)
-            .collect();
-        assert_eq!(out.to_bf16_as_f32(), expected);
+        // Golden BF16 values generated independently from log(1 + exp(x)) in
+        // f64, then rounded to nearest-even BF16.
+        assert_eq!(out.to_u16_bits(), vec![0x3ea0, 0x3f31, 0x3fa8, 0x42a0]);
+    }
+
+    #[test]
+    fn every_unary_math_op_bf16_handles_special_values() {
+        const NAN: u16 = 0x7fc0;
+        // Inputs are [-inf, -0, +0, +inf, NaN]. Expected values below follow
+        // each ONNX operation's definition, not MathOp::apply.
+        let cases: &[(MathOp, [u16; 5])] = &[
+            (MathOp::Abs, [0x7f80, 0, 0, 0x7f80, NAN]),
+            (MathOp::Neg, [0x7f80, 0, 0x8000, 0xff80, NAN]),
+            (MathOp::Reciprocal, [0x8000, 0xff80, 0x7f80, 0, NAN]),
+            (MathOp::Exp, [0, 0x3f80, 0x3f80, 0x7f80, NAN]),
+            (MathOp::Log, [NAN, 0xff80, 0xff80, 0x7f80, NAN]),
+            (MathOp::Sign, [0xbf80, 0, 0, 0x3f80, NAN]),
+            (MathOp::Floor, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Ceil, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Round, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Sin, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Cos, [NAN, 0x3f80, 0x3f80, NAN, NAN]),
+            (MathOp::Sigmoid, [0, 0x3f00, 0x3f00, 0x3f80, NAN]),
+            (MathOp::Softplus, [0, 0x3f31, 0x3f31, 0x7f80, NAN]),
+            (MathOp::Softsign, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Acos, [NAN, 0x3fc9, 0x3fc9, NAN, NAN]),
+            (MathOp::Acosh, [NAN, NAN, NAN, 0x7f80, NAN]),
+            (MathOp::Asin, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Asinh, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Atan, [0xbfc9, 0x8000, 0, 0x3fc9, NAN]),
+            (MathOp::Atanh, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Cosh, [0x7f80, 0x3f80, 0x3f80, 0x7f80, NAN]),
+            (MathOp::Sinh, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Tan, [NAN, 0x8000, 0, NAN, NAN]),
+        ];
+        let values = [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN];
+
+        for &(op, expected) in cases {
+            let input = Owned::bf16(&[values.len()], &values);
+            let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
+            run(op, &input, &mut output);
+            for (got, expected) in output.to_u16_bits().into_iter().zip(expected) {
+                if expected == NAN {
+                    assert!(
+                        got & 0x7f80 == 0x7f80 && got & 0x007f != 0,
+                        "{}: expected NaN, got 0x{got:04x}",
+                        op.name()
+                    );
+                } else {
+                    assert_eq!(got, expected, "{}: expected 0x{expected:04x}", op.name());
+                }
+            }
+        }
     }
 }
