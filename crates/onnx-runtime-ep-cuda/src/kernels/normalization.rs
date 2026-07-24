@@ -26,7 +26,7 @@
 //!
 //! ## Limits (actionable errors, never panics — RULES.md #1)
 //!
-//! * activation dtype other than f32/f16 → deferred (names the dtype + op).
+//! * activation dtype other than f32/f16/bf16 → deferred (names the dtype + op).
 //! * `axis`/last-dim size 0, or a `scale`/`bias`/`gamma`/`beta` length that does
 //!   not match the normalized size → rejected, naming the offending length.
 //! * non-contiguous (strided) operands → "materialise first" error.
@@ -53,6 +53,7 @@ use super::softmax::resolve_axis;
 /// are written when the pointers are non-null.
 const LAYERNORM_SRC: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 __device__ __forceinline__ float load_layernorm_param(
     const void* values, const int is_half, const int index) {
@@ -182,6 +183,74 @@ extern "C" __global__ void layernorm_f16(
         y[base + j] = __float2half_rn(o);
     }
 }
+
+__device__ __forceinline__ float load_layernorm_bf16_param(
+    const void* values, const int is_bf16, const int index) {
+    return is_bf16
+        ? __bfloat162float(((const __nv_bfloat16*)values)[index])
+        : ((const float*)values)[index];
+}
+
+extern "C" __global__ void layernorm_bf16(
+    const __nv_bfloat16* x,
+    const void*          scale,
+    const void*          bias,
+    __nv_bfloat16*       y,
+    float*               mean_out,
+    float*               invstd_out,
+    const int            num_groups,
+    const int            norm_size,
+    const int            scale_is_bf16,
+    const int            bias_is_bf16,
+    const int            has_bias,
+    const float          epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    float s = 0.0f;
+    for (int j = tid; j < norm_size; j += nt)
+        s += __bfloat162float(x[base + j]);
+    red[tid] = s;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float mean = red[0] / (float)norm_size;
+    __syncthreads();
+
+    float v = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        const float d = __bfloat162float(x[base + j]) - mean;
+        v += d * d;
+    }
+    red[tid] = v;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std =
+        1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) mean_out[g] = mean;
+        if (invstd_out) invstd_out[g] = inv_std;
+    }
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const float xhat = (__bfloat162float(x[base + j]) - mean) * inv_std;
+        float o = xhat * load_layernorm_bf16_param(scale, scale_is_bf16, j);
+        if (has_bias)
+            o += load_layernorm_bf16_param(bias, bias_is_bf16, j);
+        y[base + j] = __float2bfloat16_rn(o);
+    }
+}
 "#;
 
 /// NVRTC source for the fused f32 `RMSNormalization` /
@@ -189,6 +258,7 @@ extern "C" __global__ void layernorm_f16(
 /// root-mean-square.
 const RMSNORM_SRC: &str = r#"
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 __device__ __forceinline__ float load_rmsnorm_scale(
     const void* values, const int is_half, const int index) {
@@ -273,6 +343,53 @@ extern "C" __global__ void rmsnorm_f16(
         const float o = __half2float(x[base + j]) * inv_std
             * load_rmsnorm_scale(scale, scale_is_half, j);
         y[base + j] = __float2half_rn(o);
+    }
+}
+
+__device__ __forceinline__ float load_rmsnorm_bf16_scale(
+    const void* values, const int is_bf16, const int index) {
+    return is_bf16
+        ? __bfloat162float(((const __nv_bfloat16*)values)[index])
+        : ((const float*)values)[index];
+}
+
+extern "C" __global__ void rmsnorm_bf16(
+    const __nv_bfloat16* x,
+    const void*          scale,
+    __nv_bfloat16*       y,
+    float*               invstd_out,
+    const int            num_groups,
+    const int            norm_size,
+    const int            scale_is_bf16,
+    const float          epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+
+    float ss = 0.0f;
+    for (int j = tid; j < norm_size; j += nt) {
+        const float xv = __bfloat162float(x[base + j]);
+        ss += xv * xv;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    const float inv_std =
+        1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0 && invstd_out) invstd_out[g] = inv_std;
+
+    for (int j = tid; j < norm_size; j += nt) {
+        const float o = __bfloat162float(x[base + j]) * inv_std
+            * load_rmsnorm_bf16_scale(scale, scale_is_bf16, j);
+        y[base + j] = __float2bfloat16_rn(o);
     }
 }
 "#;
@@ -682,8 +799,8 @@ extern "C" __global__ void skip_layernorm_f32(
 }
 "#;
 
-const LAYERNORM_MODULE: &str = "layernorm_f16_v1";
-const RMSNORM_MODULE: &str = "rmsnorm_f16_v1";
+const LAYERNORM_MODULE: &str = "layernorm_bf16_v2";
+const RMSNORM_MODULE: &str = "rmsnorm_bf16_v2";
 const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v5";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
@@ -772,6 +889,33 @@ fn require_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
     Ok(())
 }
 
+fn require_float_storage(op: &str, name: &str, dt: DataType) -> Result<()> {
+    if !matches!(
+        dt,
+        DataType::Float16 | DataType::BFloat16 | DataType::Float32
+    ) {
+        return Err(not_implemented(format!(
+            "{op} with {name} dtype {dt:?} (expected f16, bf16, or f32)"
+        )));
+    }
+    Ok(())
+}
+
+fn require_param_for_activation(
+    op: &str,
+    name: &str,
+    activation: DataType,
+    parameter: DataType,
+) -> Result<()> {
+    if parameter != DataType::Float32 && parameter != activation {
+        return Err(not_implemented(format!(
+            "{op} with {name} dtype {parameter:?} for {activation:?} activations \
+             (expected matching storage dtype or f32)"
+        )));
+    }
+    Ok(())
+}
+
 fn require_f16_or_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
     if !matches!(dt, DataType::Float16 | DataType::Float32) {
         return Err(not_implemented(format!(
@@ -779,6 +923,24 @@ fn require_f16_or_f32(op: &str, name: &str, dt: DataType) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn layernorm_entry(dtype: DataType) -> &'static str {
+    match dtype {
+        DataType::Float16 => "layernorm_f16",
+        DataType::BFloat16 => "layernorm_bf16",
+        DataType::Float32 => "layernorm_f32",
+        _ => unreachable!("LayerNormalization dtype must be validated before dispatch"),
+    }
+}
+
+fn rmsnorm_entry(dtype: DataType) -> &'static str {
+    match dtype {
+        DataType::Float16 => "rmsnorm_f16",
+        DataType::BFloat16 => "rmsnorm_bf16",
+        DataType::Float32 => "rmsnorm_f32",
+        _ => unreachable!("RMSNormalization dtype must be validated before dispatch"),
+    }
 }
 
 /// Reject a strided view with a "materialise first" error.
@@ -855,11 +1017,11 @@ impl LayerNormKernel {
         let x = &inputs[0];
         let scale = &inputs[1];
         let bias = inputs.get(2);
-        require_f16_or_f32("LayerNormalization", "X", x.dtype)?;
+        require_float_storage("LayerNormalization", "X", x.dtype)?;
         if x.dtype == DataType::Float32 {
             require_f32("LayerNormalization", "Scale", scale.dtype)?;
         } else {
-            require_f16_or_f32("LayerNormalization", "Scale", scale.dtype)?;
+            require_param_for_activation("LayerNormalization", "Scale", x.dtype, scale.dtype)?;
         }
         if outputs[0].dtype != x.dtype {
             return Err(EpError::KernelFailed(format!(
@@ -893,7 +1055,7 @@ impl LayerNormKernel {
                 if x.dtype == DataType::Float32 {
                     require_f32("LayerNormalization", "B", b.dtype)?;
                 } else {
-                    require_f16_or_f32("LayerNormalization", "B", b.dtype)?;
+                    require_param_for_activation("LayerNormalization", "B", x.dtype, b.dtype)?;
                 }
                 require_contiguous("LayerNormalization", "B", b.is_contiguous())?;
                 if b.numel() != norm_size {
@@ -953,11 +1115,7 @@ impl LayerNormKernel {
             ));
         }
 
-        let entry = if x.dtype == DataType::Float16 {
-            "layernorm_f16"
-        } else {
-            "layernorm_f32"
-        };
+        let entry = layernorm_entry(x.dtype);
         let func = self
             .runtime
             .nvrtc_function(LAYERNORM_MODULE, LAYERNORM_SRC, entry)?;
@@ -971,6 +1129,8 @@ impl LayerNormKernel {
         let mut builder = stream.launch_builder(&func);
         let scale_is_half = i32::from(scale.dtype == DataType::Float16);
         let bias_is_half = i32::from(bias.is_some_and(|bias| bias.dtype == DataType::Float16));
+        let scale_is_bf16 = i32::from(scale.dtype == DataType::BFloat16);
+        let bias_is_bf16 = i32::from(bias.is_some_and(|bias| bias.dtype == DataType::BFloat16));
         builder
             .arg(&x_ptr)
             .arg(&scale_ptr)
@@ -980,14 +1140,25 @@ impl LayerNormKernel {
             .arg(&invstd_ptr)
             .arg(&groups_i)
             .arg(&norm_i);
-        if x.dtype == DataType::Float16 {
-            builder
-                .arg(&scale_is_half)
-                .arg(&bias_is_half)
-                .arg(&has_bias)
-                .arg(&eps);
-        } else {
-            builder.arg(&has_bias).arg(&eps);
+        match x.dtype {
+            DataType::Float16 => {
+                builder
+                    .arg(&scale_is_half)
+                    .arg(&bias_is_half)
+                    .arg(&has_bias)
+                    .arg(&eps);
+            }
+            DataType::BFloat16 => {
+                builder
+                    .arg(&scale_is_bf16)
+                    .arg(&bias_is_bf16)
+                    .arg(&has_bias)
+                    .arg(&eps);
+            }
+            DataType::Float32 => {
+                builder.arg(&has_bias).arg(&eps);
+            }
+            _ => unreachable!("LayerNormalization dtype validated above"),
         }
         // SAFETY: `func` is the compiled layernorm entry; the argument list and
         // ABI match its signature; every non-null pointer is a live device
@@ -1077,11 +1248,11 @@ impl RmsNormKernel {
         }
         let x = &inputs[0];
         let scale = &inputs[1];
-        require_f16_or_f32(op, "X", x.dtype)?;
+        require_float_storage(op, "X", x.dtype)?;
         if x.dtype == DataType::Float32 {
             require_f32(op, "Scale", scale.dtype)?;
         } else {
-            require_f16_or_f32(op, "Scale", scale.dtype)?;
+            require_param_for_activation(op, "Scale", x.dtype, scale.dtype)?;
         }
         if outputs[0].dtype != x.dtype {
             return Err(EpError::KernelFailed(format!(
@@ -1163,11 +1334,7 @@ impl RmsNormKernel {
             ));
         }
 
-        let entry = if x.dtype == DataType::Float16 {
-            "rmsnorm_f16"
-        } else {
-            "rmsnorm_f32"
-        };
+        let entry = rmsnorm_entry(x.dtype);
         let func = self
             .runtime
             .nvrtc_function(RMSNORM_MODULE, RMSNORM_SRC, entry)?;
@@ -1181,6 +1348,7 @@ impl RmsNormKernel {
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
         let scale_is_half = i32::from(scale.dtype == DataType::Float16);
+        let scale_is_bf16 = i32::from(scale.dtype == DataType::BFloat16);
         builder
             .arg(&x_ptr)
             .arg(&scale_ptr)
@@ -1188,10 +1356,17 @@ impl RmsNormKernel {
             .arg(&invstd_ptr)
             .arg(&groups_i)
             .arg(&norm_i);
-        if x.dtype == DataType::Float16 {
-            builder.arg(&scale_is_half).arg(&eps);
-        } else {
-            builder.arg(&eps);
+        match x.dtype {
+            DataType::Float16 => {
+                builder.arg(&scale_is_half).arg(&eps);
+            }
+            DataType::BFloat16 => {
+                builder.arg(&scale_is_bf16).arg(&eps);
+            }
+            DataType::Float32 => {
+                builder.arg(&eps);
+            }
+            _ => unreachable!("RMSNormalization dtype validated above"),
         }
         // SAFETY: `func` is the compiled rmsnorm entry; the argument list/ABI
         // match; pointers are live device allocations sized as validated.
@@ -1875,7 +2050,7 @@ fn optional_half_stat_ptr(
 
 #[cfg(test)]
 mod tests {
-    use half::f16;
+    use half::{bf16, f16};
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider};
     use onnx_runtime_ir::compute_contiguous_strides;
 
@@ -1886,12 +2061,24 @@ mod tests {
     fn sources_expose_their_entry_points() {
         assert!(LAYERNORM_SRC.contains("layernorm_f32"));
         assert!(LAYERNORM_SRC.contains("layernorm_f16"));
+        assert!(LAYERNORM_SRC.contains("layernorm_bf16"));
         assert!(RMSNORM_SRC.contains("rmsnorm_f32"));
         assert!(RMSNORM_SRC.contains("rmsnorm_f16"));
+        assert!(RMSNORM_SRC.contains("rmsnorm_bf16"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_half4"));
+    }
+
+    #[test]
+    fn norm_dispatch_preserves_existing_entries_and_adds_bf16() {
+        assert_eq!(layernorm_entry(DataType::Float16), "layernorm_f16");
+        assert_eq!(layernorm_entry(DataType::Float32), "layernorm_f32");
+        assert_eq!(layernorm_entry(DataType::BFloat16), "layernorm_bf16");
+        assert_eq!(rmsnorm_entry(DataType::Float16), "rmsnorm_f16");
+        assert_eq!(rmsnorm_entry(DataType::Float32), "rmsnorm_f32");
+        assert_eq!(rmsnorm_entry(DataType::BFloat16), "rmsnorm_bf16");
     }
 
     fn skip_rmsnorm_residuals(hidden: usize) -> (Vec<f16>, Vec<f16>) {
@@ -2218,6 +2405,150 @@ mod tests {
         }
     }
 
+    fn bf16_bytes(values: &[bf16]) -> &[u8] {
+        // SAFETY: bf16 is plain two-byte data and the byte slice retains the input lifetime.
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn run_bf16_norm_gpu(ep: &CudaExecutionProvider, layer_norm: bool) -> Vec<bf16> {
+        let shape = [2, 5];
+        let strides = compute_contiguous_strides(&shape);
+        let param_shape = [shape[1]];
+        let param_strides = compute_contiguous_strides(&param_shape);
+        let input = (0..shape.iter().product())
+            .map(|index| bf16::from_f32((index as f32 - 4.5) / 3.0))
+            .collect::<Vec<_>>();
+        let scale = (0..shape[1])
+            .map(|index| bf16::from_f32(0.75 + index as f32 * 0.125))
+            .collect::<Vec<_>>();
+        let bias = (0..shape[1])
+            .map(|index| bf16::from_f32((index as f32 - 2.0) / 16.0))
+            .collect::<Vec<_>>();
+        let bytes = std::mem::size_of_val(input.as_slice());
+        let param_bytes = std::mem::size_of_val(scale.as_slice());
+        let input_buffer = ep.allocate(bytes, 256).unwrap();
+        let scale_buffer = ep.allocate(param_bytes, 256).unwrap();
+        let bias_buffer = ep.allocate(param_bytes, 256).unwrap();
+        let mut output_buffer = ep.allocate(bytes, 256).unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(bf16_bytes(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(bf16_bytes(&scale), cuptr(scale_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(bf16_bytes(&bias), cuptr(bias_buffer.as_ptr()))
+                .unwrap();
+        }
+
+        let x = TensorView::new(
+            DevicePtr(input_buffer.as_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        let scale_view = TensorView::new(
+            DevicePtr(scale_buffer.as_ptr()),
+            DataType::BFloat16,
+            &param_shape,
+            &param_strides,
+            ep.device_id(),
+        );
+        let output = TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        if layer_norm {
+            let bias_view = TensorView::new(
+                DevicePtr(bias_buffer.as_ptr()),
+                DataType::BFloat16,
+                &param_shape,
+                &param_strides,
+                ep.device_id(),
+            );
+            LayerNormKernel {
+                axis: -1,
+                epsilon: 1e-5,
+                runtime: runtime.clone(),
+                warmed_signature: Mutex::new(None),
+                last_call_capture_safe: AtomicBool::new(false),
+            }
+            .run(&[x, scale_view, bias_view], &mut [output])
+            .unwrap();
+        } else {
+            RmsNormKernel {
+                axis: -1,
+                epsilon: 1e-5,
+                runtime: runtime.clone(),
+                warmed_signature: Mutex::new(None),
+                last_call_capture_safe: AtomicBool::new(false),
+            }
+            .run(&[x, scale_view], &mut [output])
+            .unwrap();
+        }
+
+        let mut output_bytes = vec![0u8; bytes];
+        unsafe {
+            runtime
+                .dtoh(&mut output_bytes, cuptr(output_buffer.as_ptr()))
+                .unwrap();
+        }
+        let output = output_bytes
+            .chunks_exact(2)
+            .map(|raw| bf16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+        ep.deallocate(input_buffer).unwrap();
+        ep.deallocate(scale_buffer).unwrap();
+        ep.deallocate(bias_buffer).unwrap();
+        ep.deallocate(output_buffer).unwrap();
+        output
+    }
+
+    fn bf16_norm_reference(layer_norm: bool) -> Vec<bf16> {
+        let groups = 2;
+        let hidden = 5;
+        let input = (0..groups * hidden)
+            .map(|index| bf16::from_f32((index as f32 - 4.5) / 3.0).to_f32())
+            .collect::<Vec<_>>();
+        let scale = (0..hidden)
+            .map(|index| bf16::from_f32(0.75 + index as f32 * 0.125).to_f32())
+            .collect::<Vec<_>>();
+        let bias = (0..hidden)
+            .map(|index| bf16::from_f32((index as f32 - 2.0) / 16.0).to_f32())
+            .collect::<Vec<_>>();
+        let mut output = Vec::with_capacity(input.len());
+        for group in input.chunks_exact(hidden) {
+            if layer_norm {
+                let mean = group.iter().sum::<f32>() / hidden as f32;
+                let variance = group
+                    .iter()
+                    .map(|value| (value - mean) * (value - mean))
+                    .sum::<f32>()
+                    / hidden as f32;
+                let inv_std = 1.0 / (variance + 1e-5).sqrt();
+                output.extend((0..hidden).map(|index| {
+                    bf16::from_f32((group[index] - mean) * inv_std * scale[index] + bias[index])
+                }));
+            } else {
+                let mean_square =
+                    group.iter().map(|value| value * value).sum::<f32>() / hidden as f32;
+                let inv_std = 1.0 / (mean_square + 1e-5).sqrt();
+                output.extend(
+                    (0..hidden).map(|index| bf16::from_f32(group[index] * inv_std * scale[index])),
+                );
+            }
+        }
+        output
+    }
+
     /// Run `SkipSimplifiedLayerNormalization` on the GPU with fp16 activations
     /// but an **fp32 gamma** (the shape Phi's cast-fold leaves behind), returning
     /// `(output, residual, gamma_f32)`.
@@ -2515,5 +2846,34 @@ mod tests {
         let norm_size: usize = shape[axis..].iter().product();
         let groups: usize = shape[..axis].iter().product();
         assert_eq!((groups, norm_size), (4, 8));
+    }
+
+    #[test]
+    fn bf16_layernorm_and_rmsnorm_match_fp32_references() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        for layer_norm in [false, true] {
+            let output = run_bf16_norm_gpu(&ep, layer_norm);
+            let reference = bf16_norm_reference(layer_norm);
+            let max_error = output
+                .iter()
+                .zip(&reference)
+                .map(|(actual, expected)| (actual.to_f32() - expected.to_f32()).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 0.015625,
+                "{} max bf16 error {max_error}",
+                if layer_norm {
+                    "LayerNormalization"
+                } else {
+                    "RMSNormalization"
+                }
+            );
+        }
     }
 }
