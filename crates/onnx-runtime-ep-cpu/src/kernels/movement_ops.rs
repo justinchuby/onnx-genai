@@ -216,6 +216,19 @@ mod tests {
     }
 
     #[test]
+    fn flatten_bf16_preserves_element_bits() {
+        let a = Owned::bf16(&[2, 3], &[1.5, -2.25, 3.75, -4.0, 5.5, 6.0]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        FlattenKernel
+            .execute(&[a.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_bf16_as_f32(),
+            vec![1.5, -2.25, 3.75, -4.0, 5.5, 6.0]
+        );
+    }
+
+    #[test]
     fn flatten_copies_row_major() {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
         let mut out = Owned::zeros_f32(&[2, 3]);

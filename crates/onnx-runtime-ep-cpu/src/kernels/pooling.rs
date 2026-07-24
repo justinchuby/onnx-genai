@@ -642,6 +642,29 @@ mod tests {
     }
 
     #[test]
+    fn pool_bf16_matches_widened_f32_reference() {
+        let vals: Vec<f32> = (1..=16).map(|v| v as f32).collect();
+        let base = PoolKernel {
+            params: params(&[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1]),
+            auto_pad: AutoPad::NotSet,
+            ceil_mode: false,
+            kind: PoolKind::Average { include_pad: false },
+        };
+        let x = Owned::f32(&[1, 1, 4, 4], &vals);
+        let reference = average(&base, &x, &[1, 1, 2, 2]);
+
+        let x = Owned::bf16(&[1, 1, 4, 4], &vals);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 1, 2, 2]);
+        base.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        for (&r, &g) in reference.iter().zip(out.to_bf16_as_f32().iter()) {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "pool bf16 {g} vs f32 {r}"
+            );
+        }
+    }
+
+    #[test]
     fn average_pool_stride_padding_and_ceil_mode() {
         let x = Owned::f32(
             &[1, 1, 4, 4],

@@ -19,7 +19,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::check_arity;
-use crate::dtype::to_dense_f32_widen;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 #[derive(Clone, Copy)]
@@ -736,15 +736,22 @@ impl ConvKernel {
 impl Kernel for ConvKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Conv", inputs, outputs, 2, 3, 1)?;
-        if inputs[0].dtype != DataType::Float32
-            || inputs[1].dtype != DataType::Float32
+        let out_dtype = outputs[0].dtype;
+        // ORT `Conv` supports f32/f16/bf16 with a single shared tensor type `T`.
+        // The MLAS microkernels compute in f32, so non-f32 dtypes are widened on
+        // read (already done via `to_dense_f32_widen`) and narrowed on store.
+        if !matches!(
+            out_dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || inputs[0].dtype != out_dtype
+            || inputs[1].dtype != out_dtype
             || inputs
                 .get(2)
-                .is_some_and(|bias| bias.dtype != DataType::Float32)
-            || outputs[0].dtype != DataType::Float32
+                .is_some_and(|bias| bias.dtype != out_dtype)
         {
             return Err(EpError::KernelFailed(
-                "Conv: MLAS kernel requires Float32 X, W, optional B, and Y".into(),
+                "Conv: requires X, W, optional B, and Y to share one float dtype (f32/f16/bf16)"
+                    .into(),
             ));
         }
         if inputs[0].shape != self.runtime_input_shape
@@ -780,10 +787,18 @@ impl Kernel for ConvKernel {
         }
 
         let output_elements = numel(&self.expected_output_shape);
-        // SAFETY: the executor validated this contiguous Float32 output view,
-        // and `output_elements` is exactly the product of its checked shape.
-        let output = unsafe {
-            std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), output_elements)
+        // For f32 output, compute directly into the output storage. For f16/bf16
+        // output, compute into an f32 scratch buffer and narrow on store.
+        let mut narrow_scratch: Vec<f32>;
+        let output: &mut [f32] = if out_dtype == DataType::Float32 {
+            // SAFETY: the executor validated this contiguous Float32 output view,
+            // and `output_elements` is exactly the product of its checked shape.
+            unsafe {
+                std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), output_elements)
+            }
+        } else {
+            narrow_scratch = vec![0.0f32; output_elements];
+            &mut narrow_scratch
         };
 
         match &self.imp {
@@ -804,6 +819,10 @@ impl Kernel for ConvKernel {
                     .run(&x, &weights, bias.as_deref(), &mut scratch, output);
                 self.apply_fallback_activation(output);
             }
+        }
+
+        if out_dtype != DataType::Float32 {
+            write_dense_f32_narrow("Conv", &mut outputs[0], output)?;
         }
 
         crate::trace::record_kernel_metrics(inputs, outputs, || {
@@ -865,6 +884,52 @@ mod tests {
         }
         kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
         output.to_f32()
+    }
+
+    #[test]
+    fn conv_bf16_matches_widened_f32_reference() {
+        let x_shape = [1usize, 1, 3, 3];
+        let x_vals = [1.0f32, 2., 3., 4., 5., 6., 7., 8., 9.];
+        let w_shape = [1usize, 1, 2, 2];
+        let w_vals = [1.0f32, 0., 0., 1.];
+        let bias_vals = [1.0f32];
+        let out_shape = [1usize, 1, 2, 2];
+        let attrs = &[("strides", Attribute::Ints(vec![1, 1]))];
+
+        let reference = run_conv(
+            &x_shape,
+            &x_vals,
+            &w_shape,
+            &w_vals,
+            Some(&bias_vals),
+            &out_shape,
+            attrs,
+        );
+
+        let mut node = Node::new(NodeId(0), "Conv", vec![], vec![]);
+        for (name, value) in attrs {
+            node.attributes.insert((*name).into(), value.clone());
+        }
+        let kernel = ConvFactory
+            .create(&node, &[x_shape.to_vec(), w_shape.to_vec()])
+            .unwrap();
+        let x = Owned::bf16(&x_shape, &x_vals);
+        let w = Owned::bf16(&w_shape, &w_vals);
+        let bias = Owned::bf16(&[1], &bias_vals);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &out_shape);
+        kernel
+            .execute(
+                &[x.view(), w.view(), bias.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+
+        for (&r, &g) in reference.iter().zip(out.to_bf16_as_f32().iter()) {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "conv bf16 {g} vs f32 {r}"
+            );
+        }
     }
 
     #[test]

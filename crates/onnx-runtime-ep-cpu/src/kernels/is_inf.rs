@@ -129,6 +129,19 @@ mod tests {
     }
 
     #[test]
+    fn supports_bf16_inputs() {
+        let node = Node::new(NodeId(0), "IsInf", vec![], vec![]);
+        let x = Owned::bf16(&[4], &[f32::INFINITY, f32::NEG_INFINITY, 1.0, f32::NAN]);
+        let mut out = Owned::zeros(DataType::Bool, &[4]);
+        IsInfFactory
+            .create(&node, &[])
+            .unwrap()
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_bool(), vec![true, true, false, false]);
+    }
+
+    #[test]
     fn supports_half_and_double_inputs() {
         let node = Node::new(NodeId(0), "IsInf", vec![], vec![]);
         let half = Owned::f16(&[2], &[f32::INFINITY, f32::NEG_INFINITY]);

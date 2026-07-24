@@ -515,6 +515,164 @@ mod tests {
         }
     }
 
+    /// Run a norm op with the given inputs and dtype, returning widened f32.
+    fn run_norm(
+        op: &str,
+        opset: u64,
+        input_shapes: &[&[usize]],
+        output_shape: &[usize],
+        attrs: &[(&str, Attribute)],
+        dtype: DataType,
+        inputs: &[&[f32]],
+    ) -> Vec<f32> {
+        let (graph, node) = model_node(op, opset, input_shapes, output_shape, attrs);
+        let model = Model::new(&graph);
+        let owned: Vec<Owned> = input_shapes
+            .iter()
+            .zip(inputs)
+            .map(|(shape, data)| match dtype {
+                DataType::BFloat16 => Owned::bf16(shape, data),
+                _ => Owned::f32(shape, data),
+            })
+            .collect();
+        let views: Vec<_> = owned.iter().map(|o| o.view()).collect();
+        let mut y = Owned::zeros(dtype, output_shape);
+        CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], opset)
+            .unwrap()
+            .execute(&views, &mut [y.view_mut()])
+            .unwrap();
+        match dtype {
+            DataType::BFloat16 => y.to_bf16_as_f32(),
+            _ => y.to_f32(),
+        }
+    }
+
+    fn assert_bf16_close(got: &[f32], reference: &[f32]) {
+        assert_eq!(got.len(), reference.len());
+        for (i, (&g, &r)) in got.iter().zip(reference).enumerate() {
+            assert!(
+                (g - r).abs() <= 0.05 * r.abs().max(1.0),
+                "index {i}: bf16 {g} vs f32 {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_normalization_bf16_matches_widened_f32_reference() {
+        let shapes: &[&[usize]] = &[&[1, 2, 2], &[2], &[2], &[2], &[2]];
+        let inputs: &[&[f32]] = &[
+            &[1.0, 3.0, 10.0, 14.0],
+            &[2.0, 0.5],
+            &[1.0, -1.0],
+            &[2.0, 12.0],
+            &[1.0, 4.0],
+        ];
+        let attrs = &[("epsilon", Attribute::Float(0.0))];
+        let reference = run_norm(
+            "BatchNormalization",
+            15,
+            shapes,
+            &[1, 2, 2],
+            attrs,
+            DataType::Float32,
+            inputs,
+        );
+        let bf16 = run_norm(
+            "BatchNormalization",
+            15,
+            shapes,
+            &[1, 2, 2],
+            attrs,
+            DataType::BFloat16,
+            inputs,
+        );
+        assert_bf16_close(&bf16, &reference);
+    }
+
+    #[test]
+    fn instance_normalization_bf16_matches_widened_f32_reference() {
+        let shapes: &[&[usize]] = &[&[1, 2, 2], &[2], &[2]];
+        let inputs: &[&[f32]] = &[&[1.0, 3.0, 2.0, 6.0], &[2.0, 0.5], &[1.0, -1.0]];
+        let attrs = &[("epsilon", Attribute::Float(0.0))];
+        let reference = run_norm(
+            "InstanceNormalization",
+            6,
+            shapes,
+            &[1, 2, 2],
+            attrs,
+            DataType::Float32,
+            inputs,
+        );
+        let bf16 = run_norm(
+            "InstanceNormalization",
+            6,
+            shapes,
+            &[1, 2, 2],
+            attrs,
+            DataType::BFloat16,
+            inputs,
+        );
+        assert_bf16_close(&bf16, &reference);
+    }
+
+    #[test]
+    fn group_normalization_bf16_matches_widened_f32_reference() {
+        let shapes: &[&[usize]] = &[&[1, 4, 1], &[2], &[2]];
+        let inputs: &[&[f32]] = &[&[1.0, 3.0, 10.0, 14.0], &[2.0, 0.5], &[1.0, -1.0]];
+        let attrs = &[
+            ("num_groups", Attribute::Int(2)),
+            ("epsilon", Attribute::Float(0.0)),
+        ];
+        let reference = run_norm(
+            "GroupNormalization",
+            18,
+            shapes,
+            &[1, 4, 1],
+            attrs,
+            DataType::Float32,
+            inputs,
+        );
+        let bf16 = run_norm(
+            "GroupNormalization",
+            18,
+            shapes,
+            &[1, 4, 1],
+            attrs,
+            DataType::BFloat16,
+            inputs,
+        );
+        assert_bf16_close(&bf16, &reference);
+    }
+
+    #[test]
+    fn prelu_bf16_matches_widened_f32_reference() {
+        let shapes: &[&[usize]] = &[&[1, 2, 2, 2], &[2, 1, 1]];
+        let inputs: &[&[f32]] = &[
+            &[-1.0, 2.0, -3.0, 4.0, -1.0, 2.0, -3.0, 4.0],
+            &[0.1, 0.5],
+        ];
+        let reference = run_norm(
+            "PRelu",
+            16,
+            shapes,
+            &[1, 2, 2, 2],
+            &[],
+            DataType::Float32,
+            inputs,
+        );
+        let bf16 = run_norm(
+            "PRelu",
+            16,
+            shapes,
+            &[1, 2, 2, 2],
+            &[],
+            DataType::BFloat16,
+            inputs,
+        );
+        assert_bf16_close(&bf16, &reference);
+    }
+
     #[test]
     fn batch_normalization_inference_matches_reference() {
         let (graph, node) = model_node(

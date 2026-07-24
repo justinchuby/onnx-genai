@@ -426,6 +426,30 @@ mod tests {
     }
 
     #[test]
+    fn bf16_activations_widen_and_narrow() {
+        // Same math as CONVC but with bf16 in/out; bf16 rounding tolerance.
+        let [batch, c, k, s] = g::CONVC_DIMS;
+        let pad = k - 1;
+        let x = Owned::bf16(&[batch, c, s], &bits(&g::CONVC_X));
+        let w = Owned::bf16(&[c, 1, k], &bits(&g::CONVC_W));
+        let bias = Owned::bf16(&[c], &bits(&g::CONVC_B));
+        let state = Owned::bf16(&[batch, c, pad], &bits(&g::CONVC_STATE));
+        let mut y = Owned::zeros(DataType::BFloat16, &[batch, c, s]);
+        let mut present = Owned::zeros(DataType::BFloat16, &[batch, c, pad]);
+        let ins = [x.view(), w.view(), bias.view(), state.view()];
+        let mut outs = [y.view_mut(), present.view_mut()];
+        kernel(false).execute(&ins, &mut outs).unwrap();
+        let got = y.to_bf16_as_f32();
+        let want = bits(&g::CONVC_Y);
+        for (i, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 0.05 * b.abs().max(1.0) + 0.05,
+                "bf16 y[{i}]: got {a}, want {b}"
+            );
+        }
+    }
+
+    #[test]
     fn f16_activations_widen_and_narrow() {
         // Same math as CONVC but with f16 in/out; tolerance loosened for half.
         let [batch, c, k, s] = g::CONVC_DIMS;

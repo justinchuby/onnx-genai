@@ -165,6 +165,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn window_bf16_matches_widened_f32_reference() {
+        let size = Owned::i64(&[], &[5]);
+        let mut ref_out = Owned::zeros_f32(&[5]);
+        WindowKernel {
+            kind: WindowKind::Hann,
+            periodic: true,
+            output_dtype: Some(DataType::Float32),
+        }
+        .execute(&[size.view()], &mut [ref_out.view_mut()])
+        .unwrap();
+
+        let mut bf16_out = Owned::zeros(DataType::BFloat16, &[5]);
+        WindowKernel {
+            kind: WindowKind::Hann,
+            periodic: true,
+            output_dtype: Some(DataType::BFloat16),
+        }
+        .execute(&[size.view()], &mut [bf16_out.view_mut()])
+        .unwrap();
+        for (&r, &g) in ref_out.to_f32().iter().zip(bf16_out.to_bf16_as_f32().iter()) {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "window bf16 {g} vs f32 {r}"
+            );
+        }
+    }
+
     fn run(kind: WindowKind, periodic: bool) -> Vec<f32> {
         let size = Owned::i64(&[], &[5]);
         let mut output = Owned::zeros_f32(&[5]);

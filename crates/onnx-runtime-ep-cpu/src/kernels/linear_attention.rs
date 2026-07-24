@@ -640,6 +640,75 @@ mod tests {
         (out.to_f32(), present.to_f32())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_case_bf16(
+        dims: [usize; 5],
+        scale: f32,
+        q: &[u32],
+        k: &[u32],
+        v: &[u32],
+        st: &[u32],
+        gg: &[u32],
+        be: &[u32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let [batch, h, dk, dv, s] = dims;
+        let q = Owned::bf16(&[batch, s, h * dk], &bits(q));
+        let k = Owned::bf16(&[batch, s, h * dk], &bits(k));
+        let v = Owned::bf16(&[batch, s, h * dv], &bits(v));
+        let st = Owned::bf16(&[batch, h, dk, dv], &bits(st));
+        let gd = Owned::bf16(&[batch, s, h], &bits(gg));
+        let bd = Owned::bf16(&[batch, s, h], &bits(be));
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[batch, s, h * dv]);
+        let mut present = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[batch, h, dk, dv]);
+        let ins = [
+            q.view(),
+            k.view(),
+            v.view(),
+            st.view(),
+            gd.view(),
+            bd.view(),
+        ];
+        let mut outs = [out.view_mut(), present.view_mut()];
+        kernel(h as i64, scale).execute(&ins, &mut outs).unwrap();
+        (out.to_bf16_as_f32(), present.to_bf16_as_f32())
+    }
+
+    #[test]
+    fn linear_attention_bf16_matches_widened_f32_reference() {
+        let (o_ref, p_ref) = run_case(
+            g::LAA_DIMS,
+            g::LAA_SCALE,
+            &g::LAA_Q,
+            &g::LAA_K,
+            &g::LAA_V,
+            &g::LAA_STATE,
+            &g::LAA_G,
+            &g::LAA_BETA,
+        );
+        let (o_bf16, p_bf16) = run_case_bf16(
+            g::LAA_DIMS,
+            g::LAA_SCALE,
+            &g::LAA_Q,
+            &g::LAA_K,
+            &g::LAA_V,
+            &g::LAA_STATE,
+            &g::LAA_G,
+            &g::LAA_BETA,
+        );
+        for (&r, &b) in o_ref.iter().zip(o_bf16.iter()) {
+            assert!(
+                (r - b).abs() <= 0.06 * r.abs().max(1.0) + 0.02,
+                "linear_attention out bf16 {b} vs f32 {r}"
+            );
+        }
+        for (&r, &b) in p_ref.iter().zip(p_bf16.iter()) {
+            assert!(
+                (r - b).abs() <= 0.06 * r.abs().max(1.0) + 0.02,
+                "linear_attention present bf16 {b} vs f32 {r}"
+            );
+        }
+    }
+
     #[test]
     fn ort_parity_prefill() {
         let (o, p) = run_case(
