@@ -7,9 +7,10 @@
 //! sharding are intentionally deferred.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -31,6 +32,16 @@ const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
 
 const CUDA_SRC: &str = r#"
+#ifndef QMOE_BITS
+#define QMOE_BITS 4
+#endif
+#ifndef QMOE_BLOCK_SIZE
+#define QMOE_BLOCK_SIZE 16
+#endif
+#ifndef QMOE_HAS_ZERO_POINTS
+#define QMOE_HAS_ZERO_POINTS 0
+#endif
+
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
 #define QMOE_HAS_HALF 1
 #include <cuda_fp16.h>
@@ -155,6 +166,7 @@ __device__ __forceinline__ float block_sum(float value)
     return value;
 }
 
+template <int Bits, int BlockSize, bool HasZeroPoints>
 __device__ __forceinline__ float decode_affine_weight(
     const unsigned char* packed,
     const float* scales,
@@ -163,34 +175,68 @@ __device__ __forceinline__ float decode_affine_weight(
     const int output,
     const int depth,
     const int out_features,
-    const int in_features,
     const int packed_in,
     const int blocks,
-    const int zero_point_bytes,
-    const int bits,
-    const int block_size)
+    const int zero_point_bytes)
 {
-    const int pack_size = 8 / bits;
+    constexpr int PackSize = 8 / Bits;
     const unsigned long long expert_row =
         (unsigned long long)expert * out_features + output;
     const unsigned char byte =
-        packed[expert_row * packed_in + depth / pack_size];
-    const int mask = bits == 8 ? 255 : ((1 << bits) - 1);
-    const int quantized = (byte >> ((depth % pack_size) * bits)) & mask;
-    const int block = depth / block_size;
-    int zero_point = 1 << (bits - 1);
-    if (zero_points) {
+        packed[expert_row * packed_in + depth / PackSize];
+    constexpr int Mask = Bits == 8 ? 255 : ((1 << Bits) - 1);
+    const int quantized = (byte >> ((depth % PackSize) * Bits)) & Mask;
+    const int block = depth / BlockSize;
+    int zero_point = 1 << (Bits - 1);
+    if (HasZeroPoints) {
         const unsigned char packed_zero =
-            zero_points[expert_row * zero_point_bytes + block / pack_size];
+            zero_points[expert_row * zero_point_bytes + block / PackSize];
         zero_point =
-            (packed_zero >> ((block % pack_size) * bits)) & mask;
+            (packed_zero >> ((block % PackSize) * Bits)) & Mask;
     }
     return ((float)quantized - (float)zero_point)
         * scales[expert_row * blocks + block];
 }
 
 template <typename Input>
-__device__ __forceinline__ float qmoe_load(const Input* input, unsigned long long index);
+__device__ __forceinline__ float qmoe_load(
+    const Input* input, unsigned long long index);
+
+template <typename Input, int BlockSize, bool HasZeroPoints>
+__device__ __forceinline__ float qmoe_int4_chunk(
+    const Input* input,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const unsigned long long input_base,
+    const unsigned long long expert_row,
+    const int depth,
+    const int packed_in,
+    const int blocks,
+    const int zero_point_bytes)
+{
+    // Int4 rows are multiples of eight packed bytes because block sizes are
+    // powers of two >= 16, and chunk depths advance by eight values.
+    const unsigned int packed_values =
+        *reinterpret_cast<const unsigned int*>(
+            packed + expert_row * packed_in + depth / 2);
+    const int block = depth / BlockSize;
+    int zero_point = 8;
+    if (HasZeroPoints) {
+        const unsigned char packed_zero =
+            zero_points[expert_row * zero_point_bytes + block / 2];
+        zero_point = (packed_zero >> ((block & 1) * 4)) & 15;
+    }
+    const float scale = scales[expert_row * blocks + block];
+    float value = 0.0f;
+#pragma unroll
+    for (int offset = 0; offset < 8; ++offset) {
+        const int quantized = (packed_values >> (offset * 4)) & 15;
+        const float weight = ((float)quantized - (float)zero_point) * scale;
+        value += qmoe_load(input, input_base + depth + offset) * weight;
+    }
+    return value;
+}
 
 template <>
 __device__ __forceinline__ float qmoe_load<float>(
@@ -215,7 +261,7 @@ __device__ __forceinline__ float qmoe_load<__nv_bfloat16>(
 }
 #endif
 
-template <typename Input>
+template <typename Input, int Bits, int BlockSize, bool HasZeroPoints>
 __device__ void qmoe_linear_impl(
     const Input* input,
     const int* selected_experts,
@@ -233,9 +279,7 @@ __device__ void qmoe_linear_impl(
     const int in_features,
     const int packed_in,
     const int blocks,
-    const int zero_point_bytes,
-    const int bits,
-    const int block_size)
+    const int zero_point_bytes)
 {
     const unsigned long long tasks =
         routes * (unsigned long long)out_features;
@@ -252,16 +296,28 @@ __device__ void qmoe_linear_impl(
         const unsigned long long input_row =
             input_rows_are_routes ? route : route / (unsigned long long)top_k;
         float value = 0.0f;
-        for (int depth = (int)threadIdx.x;
-             depth < in_features;
-             depth += (int)blockDim.x) {
-            value += qmoe_load(
-                    input,
-                    input_row * (unsigned long long)in_features + depth)
-                * decode_affine_weight(
-                    packed, scales, zero_points, expert, output_feature, depth,
-                    out_features, in_features, packed_in, blocks,
-                    zero_point_bytes, bits, block_size);
+        const unsigned long long input_base =
+            input_row * (unsigned long long)in_features;
+        const unsigned long long expert_row =
+            (unsigned long long)expert * out_features + output_feature;
+        if (Bits == 4) {
+            const int chunks = in_features / 8;
+            for (int chunk = (int)threadIdx.x;
+                 chunk < chunks;
+                 chunk += (int)blockDim.x) {
+                value += qmoe_int4_chunk<Input, BlockSize, HasZeroPoints>(
+                    input, packed, scales, zero_points, input_base, expert_row,
+                    chunk * 8, packed_in, blocks, zero_point_bytes);
+            }
+        } else {
+            for (int depth = (int)threadIdx.x;
+                 depth < in_features;
+                 depth += (int)blockDim.x) {
+                value += qmoe_load(input, input_base + depth)
+                    * decode_affine_weight<Bits, BlockSize, HasZeroPoints>(
+                        packed, scales, zero_points, expert, output_feature, depth,
+                        out_features, packed_in, blocks, zero_point_bytes);
+            }
         }
         value = block_sum(value);
         if (threadIdx.x == 0) {
@@ -290,14 +346,12 @@ extern "C" __global__ void qmoe_linear_f32(
     const int in_features,
     const int packed_in,
     const int blocks,
-    const int zero_point_bytes,
-    const int bits,
-    const int block_size)
+    const int zero_point_bytes)
 {
-    qmoe_linear_impl(
+    qmoe_linear_impl<float, QMOE_BITS, QMOE_BLOCK_SIZE, QMOE_HAS_ZERO_POINTS != 0>(
         input, selected_experts, expert_counts, packed, scales, zero_points, bias,
         output, routes, gemm_min_tokens, input_rows_are_routes, top_k, out_features, in_features,
-        packed_in, blocks, zero_point_bytes, bits, block_size);
+        packed_in, blocks, zero_point_bytes);
 }
 
 #ifdef QMOE_HAS_HALF
@@ -318,14 +372,12 @@ extern "C" __global__ void qmoe_linear_f16(
     const int in_features,
     const int packed_in,
     const int blocks,
-    const int zero_point_bytes,
-    const int bits,
-    const int block_size)
+    const int zero_point_bytes)
 {
-    qmoe_linear_impl(
+    qmoe_linear_impl<__half, QMOE_BITS, QMOE_BLOCK_SIZE, QMOE_HAS_ZERO_POINTS != 0>(
         input, selected_experts, expert_counts, packed, scales, zero_points, bias,
         output, routes, gemm_min_tokens, input_rows_are_routes, top_k, out_features, in_features,
-        packed_in, blocks, zero_point_bytes, bits, block_size);
+        packed_in, blocks, zero_point_bytes);
 }
 
 extern "C" __global__ void qmoe_linear_bf16(
@@ -345,14 +397,12 @@ extern "C" __global__ void qmoe_linear_bf16(
     const int in_features,
     const int packed_in,
     const int blocks,
-    const int zero_point_bytes,
-    const int bits,
-    const int block_size)
+    const int zero_point_bytes)
 {
-    qmoe_linear_impl(
+    qmoe_linear_impl<__nv_bfloat16, QMOE_BITS, QMOE_BLOCK_SIZE, QMOE_HAS_ZERO_POINTS != 0>(
         input, selected_experts, expert_counts, packed, scales, zero_points, bias,
         output, routes, gemm_min_tokens, input_rows_are_routes, top_k, out_features, in_features,
-        packed_in, blocks, zero_point_bytes, bits, block_size);
+        packed_in, blocks, zero_point_bytes);
 }
 #endif
 
@@ -528,6 +578,42 @@ extern "C" __global__ void qmoe_combine_bf16(
 }
 #endif
 "#;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct QuantLayout {
+    bits: usize,
+    block_size: usize,
+    has_zero_points: bool,
+}
+
+fn linear_module_source(layout: QuantLayout) -> (&'static str, &'static str) {
+    static SOURCES: OnceLock<Mutex<HashMap<QuantLayout, (&'static str, &'static str)>>> =
+        OnceLock::new();
+    let sources = SOURCES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut sources = sources.lock().expect("QMoE source cache poisoned");
+    if let Some(source) = sources.get(&layout) {
+        return *source;
+    }
+
+    let zero_points = usize::from(layout.has_zero_points);
+    let module = Box::leak(
+        format!(
+            "qmoe_affine_linear_v2_bits{}_block{}_zero_points{}",
+            layout.bits, layout.block_size, zero_points
+        )
+        .into_boxed_str(),
+    );
+    let source = Box::leak(
+        format!(
+            "#define QMOE_BITS {}\n#define QMOE_BLOCK_SIZE {}\n\
+             #define QMOE_HAS_ZERO_POINTS {}\n{}",
+            layout.bits, layout.block_size, zero_points, CUDA_SRC
+        )
+        .into_boxed_str(),
+    );
+    sources.insert(layout, (module, source));
+    (module, source)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Activation {
@@ -1577,9 +1663,15 @@ impl QMoEKernel {
         routes: usize,
         input_rows_are_routes: bool,
     ) -> Result<()> {
+        let layout = QuantLayout {
+            bits: self.bits,
+            block_size: self.block_size,
+            has_zero_points: weights.zero_points.is_some(),
+        };
+        let (module, source) = linear_module_source(layout);
         let function = self
             .runtime
-            .nvrtc_function(MODULE, CUDA_SRC, dtype.linear_entry())?;
+            .nvrtc_function(module, source, dtype.linear_entry())?;
         let packed = tensor_ptr(weights.packed);
         let expert_counts = expert_counts.unwrap_or(0);
         let scales = tensor_ptr(weights.scales);
@@ -1605,8 +1697,6 @@ impl QMoEKernel {
         let packed_in = as_i32("packed input width", weights.packed_in)?;
         let blocks = as_i32("block count", weights.blocks)?;
         let zero_point_bytes = as_i32("zero-point row byte count", weights.zero_point_bytes)?;
-        let bits = as_i32("expert weight bits", self.bits)?;
-        let block_size = as_i32("block size", self.block_size)?;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&input_ptr)
@@ -1625,9 +1715,7 @@ impl QMoEKernel {
             .arg(&in_features)
             .arg(&packed_in)
             .arg(&blocks)
-            .arg(&zero_point_bytes)
-            .arg(&bits)
-            .arg(&block_size);
+            .arg(&zero_point_bytes);
         // SAFETY: all packed tensors and scratch buffers cover the validated
         // expert-major ranges, and the scalar ABI matches `qmoe_linear_*`.
         unsafe { builder.launch(config) }
@@ -2020,5 +2108,48 @@ mod tests {
         assert!(CUDA_SRC.contains("gridDim.x"));
         assert!(!CUDA_SRC.contains("sm_90"));
         assert!(!CUDA_SRC.contains("__CUDA_ARCH__ >= 900"));
+    }
+
+    #[test]
+    fn linear_sources_specialize_every_quant_layout_dimension() {
+        let symmetric = QuantLayout {
+            bits: 4,
+            block_size: 32,
+            has_zero_points: false,
+        };
+        let affine = QuantLayout {
+            has_zero_points: true,
+            ..symmetric
+        };
+        let block_128 = QuantLayout {
+            block_size: 128,
+            ..affine
+        };
+        let int8 = QuantLayout {
+            bits: 8,
+            ..block_128
+        };
+
+        let variants = [symmetric, affine, block_128, int8].map(linear_module_source);
+        assert_eq!(
+            variants
+                .map(|variant| variant.0)
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            variants.len()
+        );
+        for (layout, (_, source)) in [symmetric, affine, block_128, int8]
+            .into_iter()
+            .zip(variants)
+        {
+            assert!(source.contains(&format!("#define QMOE_BITS {}", layout.bits)));
+            assert!(source.contains(&format!("#define QMOE_BLOCK_SIZE {}", layout.block_size)));
+            assert!(source.contains(&format!(
+                "#define QMOE_HAS_ZERO_POINTS {}",
+                usize::from(layout.has_zero_points)
+            )));
+        }
+        assert!(variants[0].1.contains("qmoe_int4_chunk"));
     }
 }
