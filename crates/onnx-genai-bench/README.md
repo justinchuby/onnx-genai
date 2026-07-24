@@ -50,18 +50,20 @@ The opt-in profiling binaries measure different layers:
 - `bench-native` / `profile_native` measures token generation through the
   native nxrt decoder-with-past adapter and the same engine decode loop as ORT,
   with forward passes through `onnx-runtime-session::InferenceSession::run`.
+  For an identical steady-window native-vs-ORT comparison, build with
+  `--features bench-native,bench-ort,cuda` and run the same command with
+  `--backend native` and `--backend ort`.
 
-These results are **not yet comparable head-to-head**. The ORT path has a
-generation loop, I/O binding, and KV-cache decode flow. The native session
-currently exposes only `run`, so it reports runs/s and ms/run rather than tok/s.
-For CLI consistency, `--tokens` is the number of repeated inference calls per
-measured run; it does not mean generated tokens.
+The `--steady` path is directly comparable head-to-head: both backends use the
+same engine callbacks, warmups, token IDs, and `--decode-skip` timing window.
+The non-steady path retains native-only tracing and logit-dump diagnostics.
 
 ```bash
-cargo run --release -p onnx-genai-bench --features bench-native \
+cargo run --release -p onnx-genai-bench \
+  --features bench-native,bench-ort,cuda \
   --bin profile_native -- \
-  --model crates/onnx-runtime-session/tests/fixtures/bert_toy \
-  --tokens 8 --warmups 1 --runs 3 --ep cpu
+  --model /path/to/model --ep cuda --backend ort --steady \
+  --tokens 128 --warmups 1 --runs 3 --decode-skip 8
 ```
 
 CUDA kernels expose per-op `cuda_graph_compatible()` predicates, aggregated by

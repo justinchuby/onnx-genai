@@ -35,4 +35,8 @@ fn native_cpu_synthetic_profile_reports_throughput() {
         throughput.is_some_and(|value| value > 0.0) && stdout.contains("tok/s"),
         "missing throughput number:\n{stdout}"
     );
+    assert!(
+        stdout.contains("backend=native"),
+        "missing default backend label:\n{stdout}"
+    );
 }
