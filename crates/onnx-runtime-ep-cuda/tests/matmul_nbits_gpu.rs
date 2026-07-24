@@ -137,46 +137,22 @@ fn accuracy4_reference(
     n: usize,
     block_size: usize,
 ) -> Vec<f32> {
-    let blocks = k.div_ceil(block_size);
-    let blob_size = block_size / 2;
-    let max_abs = activations
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0, f32::max);
-    if max_abs == 0.0 {
-        return vec![0.0; n];
-    }
-    let activation_scale = max_abs / 127.0;
-    let inverse_scale = activation_scale.recip();
-    let quantized_activations: Vec<i32> = activations
-        .iter()
-        .map(|value| (value * inverse_scale).round().clamp(-127.0, 127.0) as i32)
-        .collect();
-    let mut output = vec![0.0; n];
-    for column in 0..n {
-        let mut value = 0.0;
-        for block in 0..blocks {
-            let begin = block * block_size;
-            let end = (begin + block_size).min(k);
-            let packed_start = (column * blocks + block) * blob_size;
-            let mut dot = 0i32;
-            for depth in begin..end {
-                let within = depth - begin;
-                let byte = packed[packed_start + within / 2];
-                let quantized_weight = if within % 2 == 0 {
-                    byte & 0x0f
-                } else {
-                    byte >> 4
-                };
-                dot += quantized_activations[depth] * (i32::from(quantized_weight) - 8);
-            }
-            value += dot as f32 * scales[column * blocks + block];
-        }
-        output[column] = value * activation_scale;
-    }
-    output
+    accuracy4_reference_columns(
+        activations,
+        packed,
+        scales,
+        k,
+        n,
+        block_size,
+        &(0..n).collect::<Vec<_>>(),
+    )
 }
 
+/// Per-K-block int8 activation quantization reference (ORT/MLAS CompInt8): each
+/// block-`block_size` slice of the activation row carries its own int8 scale,
+/// matching the corrected CUDA `accuracy_level=4` kernels. A single per-row scale
+/// is dominated by activation outliers and rounds small in-block magnitudes to
+/// zero, which flips argmaxes on outlier-heavy models.
 fn accuracy4_reference_columns(
     activations: &[f32],
     packed: &[u8],
@@ -188,19 +164,6 @@ fn accuracy4_reference_columns(
 ) -> Vec<f32> {
     let blocks = k.div_ceil(block_size);
     let blob_size = block_size / 2;
-    let max_abs = activations
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0, f32::max);
-    if max_abs == 0.0 {
-        return vec![0.0; columns.len()];
-    }
-    let activation_scale = max_abs / 127.0;
-    let inverse_scale = activation_scale.recip();
-    let quantized_activations: Vec<i32> = activations
-        .iter()
-        .map(|value| (value * inverse_scale).round().clamp(-127.0, 127.0) as i32)
-        .collect();
     columns
         .iter()
         .map(|&column| {
@@ -209,21 +172,33 @@ fn accuracy4_reference_columns(
             for block in 0..blocks {
                 let begin = block * block_size;
                 let end = (begin + block_size).min(k);
+                let block_max = activations[begin..end]
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0, f32::max);
+                if block_max == 0.0 {
+                    continue;
+                }
+                let activation_scale = block_max / 127.0;
+                let inverse_scale = activation_scale.recip();
                 let packed_start = (column * blocks + block) * blob_size;
                 let mut dot = 0i32;
                 for depth in begin..end {
                     let within = depth - begin;
+                    let quantized_activation = (activations[depth] * inverse_scale)
+                        .round()
+                        .clamp(-127.0, 127.0) as i32;
                     let byte = packed[packed_start + within / 2];
                     let quantized_weight = if within % 2 == 0 {
                         byte & 0x0f
                     } else {
                         byte >> 4
                     };
-                    dot += quantized_activations[depth] * (i32::from(quantized_weight) - 8);
+                    dot += quantized_activation * (i32::from(quantized_weight) - 8);
                 }
-                value += dot as f32 * scales[column * blocks + block];
+                value += dot as f32 * activation_scale * scales[column * blocks + block];
             }
-            value * activation_scale
+            value
         })
         .collect()
 }

@@ -293,6 +293,11 @@ extern "C" __global__ void matmul_nbits_gemv_int8_f32(
     }
 }
 
+// Per-K-block (block-32) int8 activation quantization. One warp (CUDA block) owns
+// one K-block and emits that block's own int8 scale, matching ORT/MLAS CompInt8
+// and the CPU native path. A single per-row scale is dominated by activation
+// outliers and rounds small in-block magnitudes to zero, flipping argmaxes on
+// outlier-heavy models (e.g. Phi-3.5); per-block scales track fp32 faithfully.
 extern "C" __global__ void matmul_nbits_quantize_accuracy4_block32(
     const float* activation,
     signed char* quantized_activation,
@@ -300,11 +305,13 @@ extern "C" __global__ void matmul_nbits_quantize_accuracy4_block32(
     const int k,
     const int padded_k)
 {
+    (void)padded_k;
+    const int block = (int)blockIdx.x;
     const int lane = (int)threadIdx.x;
-    float max_abs = 0.0f;
-    for (int depth = lane; depth < k; depth += 32) {
-        max_abs = fmaxf(max_abs, fabsf(activation[depth]));
-    }
+    const int depth = block * 32 + lane;
+    const float value = (depth < k) ? activation[depth] : 0.0f;
+
+    float max_abs = fabsf(value);
     for (int offset = 16; offset > 0; offset >>= 1) {
         max_abs = fmaxf(max_abs,
             __shfl_down_sync(0xffffffffu, max_abs, offset));
@@ -315,16 +322,14 @@ extern "C" __global__ void matmul_nbits_quantize_accuracy4_block32(
     const float inverse_scale =
         activation_scale == 0.0f ? 0.0f : 1.0f / activation_scale;
     if (lane == 0) {
-        *activation_scale_out = activation_scale;
+        activation_scale_out[block] = activation_scale;
     }
-    for (int depth = lane; depth < padded_k; depth += 32) {
-        int quantized = 0;
-        if (depth < k && activation_scale != 0.0f) {
-            quantized = (int)roundf(fminf(127.0f, fmaxf(-127.0f,
-                activation[depth] * inverse_scale)));
-        }
-        quantized_activation[depth] = (signed char)quantized;
+    int quantized = 0;
+    if (depth < k && activation_scale != 0.0f) {
+        quantized = (int)roundf(fminf(127.0f, fmaxf(-127.0f,
+            value * inverse_scale)));
     }
+    quantized_activation[depth] = (signed char)quantized;
 }
 
 __device__ __forceinline__ int unpack_int4x4(unsigned int packed, int offset)
@@ -353,13 +358,6 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int column = (int)blockIdx.x * 8 + warp;
-    const float activation_scale = *activation_scale_ptr;
-    if (activation_scale == 0.0f) {
-        if (lane == 0 && column < n) {
-            output[column] = bias ? bias[column] : 0.0f;
-        }
-        return;
-    }
 
     float value = 0.0f;
     for (int tile_block = 0; tile_block < k_blocks; tile_block += 32) {
@@ -390,14 +388,16 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
                 dot = __dp4a(activation0, unpack_int4x4(words[word], 0), dot);
                 dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
             }
-            const float scaled =
-                __fmul_rn((float)dot, scales[(long)column * k_blocks + block]);
-            value = __fadd_rn(value, scaled);
+            // Per-block int8 activation scale times the per-block weight scale.
+            const float block_scale = __fmul_rn(
+                activation_scale_ptr[block],
+                scales[(long)column * k_blocks + block]);
+            value = __fadd_rn(value, __fmul_rn((float)dot, block_scale));
         }
         __syncthreads();
     }
 
-    value = __fmul_rn(warp_sum(value), activation_scale);
+    value = warp_sum(value);
     if (lane == 0 && column < n) {
         output[column] = bias ? __fadd_rn(value, bias[column]) : value;
     }
@@ -427,28 +427,31 @@ extern "C" __global__ void matmul_nbits_accuracy4(
         const int output = (int)(idx % n);
         const float* activation = a + (long)row * k;
 
-        float max_abs = 0.0f;
-        for (int depth = 0; depth < k; ++depth) {
-            max_abs = fmaxf(max_abs, fabsf(activation[depth]));
-        }
-        if (max_abs == 0.0f) {
-            y[idx] = bias ? bias[output] : 0.0f;
-            continue;
-        }
-
-        const float activation_scale = max_abs / 127.0f;
-        const float inverse_scale = 1.0f / activation_scale;
+        // Per-K-block int8 activation quantization (block scale == the weight
+        // block granularity), matching ORT/MLAS CompInt8 and the CPU native
+        // path. A single per-row scale is dominated by activation outliers and
+        // collapses small in-block magnitudes to zero, which flips argmaxes on
+        // outlier-heavy models (e.g. Phi-3.5); per-block scales avoid that.
         float value = 0.0f;
         for (int block = 0; block < k_blocks; ++block) {
-            int dot = 0;
             const int begin = block * block_size;
             const int end = min(begin + block_size, k);
+            float block_max = 0.0f;
+            for (int depth = begin; depth < end; ++depth) {
+                block_max = fmaxf(block_max, fabsf(activation[depth]));
+            }
+            if (block_max == 0.0f) {
+                continue;
+            }
+            const float activation_scale = block_max / 127.0f;
+            const float inverse_scale = 1.0f / activation_scale;
             int zero_point = 8;
             if (zero_points) {
                 const unsigned char zp =
                     zero_points[(long)output * zp_row_bytes + block / 2];
                 zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
             }
+            int dot = 0;
             for (int depth = begin; depth < end; ++depth) {
                 int quantized_activation =
                     (int)roundf(fminf(127.0f, fmaxf(-127.0f,
@@ -460,19 +463,10 @@ extern "C" __global__ void matmul_nbits_accuracy4(
                     (within & 1) ? (byte >> 4) : (byte & 15);
                 dot += quantized_activation * (quantized_weight - zero_point);
             }
-            if (m == 1 && block_size == 32 && !zero_points) {
-                const float scaled =
-                    __fmul_rn((float)dot, scales[(long)output * k_blocks + block]);
-                value = __fadd_rn(value, scaled);
-            } else {
-                const float combined_scale = __fmul_rn(
-                    activation_scale,
-                    scales[(long)output * k_blocks + block]);
-                value = __fadd_rn(value, __fmul_rn((float)dot, combined_scale));
-            }
-        }
-        if (m == 1 && block_size == 32 && !zero_points) {
-            value = __fmul_rn(value, activation_scale);
+            const float combined_scale = __fmul_rn(
+                activation_scale,
+                scales[(long)output * k_blocks + block]);
+            value = __fadd_rn(value, __fmul_rn((float)dot, combined_scale));
         }
         y[idx] = bias ? __fadd_rn(value, bias[output]) : value;
     }
@@ -2815,7 +2809,10 @@ struct Accuracy4Workspace {
 impl Accuracy4Workspace {
     fn new(runtime: Arc<CudaRuntime>, k: usize) -> Result<Self> {
         let padded_k = k.div_ceil(32) * 32;
-        let quantized_activation = runtime.alloc_raw(padded_k + std::mem::size_of::<f32>())?;
+        // Per-K-block int8 activation scales: one f32 per block-32.
+        let k_blocks = padded_k / 32;
+        let scale_bytes = k_blocks * std::mem::size_of::<f32>();
+        let quantized_activation = runtime.alloc_raw(padded_k + scale_bytes)?;
         Ok(Self {
             runtime,
             quantized_activation,
@@ -4773,11 +4770,12 @@ impl MatMulNBitsKernel {
             .arg(&workspace.activation_scale)
             .arg(&k)
             .arg(&padded_k);
-        // SAFETY: the persistent workspace covers padded_k int8 values plus the
-        // f32 scale, and the scalar ABI matches the quantization entry point.
+        // SAFETY: the persistent workspace covers padded_k int8 values plus one
+        // f32 scale per block-32, and the scalar ABI matches the quantization
+        // entry point. One warp (CUDA block) quantizes one K-block.
         unsafe {
             quantize_builder.launch(LaunchConfig {
-                grid_dim: (1, 1, 1),
+                grid_dim: ((workspace.padded_k / 32) as u32, 1, 1),
                 block_dim: (32, 1, 1),
                 shared_mem_bytes: 0,
             })
