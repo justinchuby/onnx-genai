@@ -1453,6 +1453,9 @@ fn capacity_present_aliases_past_matches_cpu() {
     assert_bit_exact(&gpu[1], &cpu[1], "capacity present_key");
     assert_bit_exact(&gpu[2], &cpu[2], "capacity present_value");
     // The present must have the fixed-capacity shape (aliases past), not grow.
-    assert_eq!(specs[1].shape[2], capacity, "present must be capacity-sized");
+    assert_eq!(
+        specs[1].shape[2], capacity,
+        "present must be capacity-sized"
+    );
     eprintln!("capacity_present: Y max|Δ|={delta}");
 }

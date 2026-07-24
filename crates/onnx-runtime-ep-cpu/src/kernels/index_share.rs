@@ -1460,8 +1460,14 @@ mod tests {
             &[case.batch, case.kv_heads, case.current_seq, case.head_size],
             current_v,
         );
-        let past_k = Owned::f32(&[case.batch, case.kv_heads, capacity, case.head_size], past_k);
-        let past_v = Owned::f32(&[case.batch, case.kv_heads, capacity, case.head_size], past_v);
+        let past_k = Owned::f32(
+            &[case.batch, case.kv_heads, capacity, case.head_size],
+            past_k,
+        );
+        let past_v = Owned::f32(
+            &[case.batch, case.kv_heads, capacity, case.head_size],
+            past_v,
+        );
         let indices = Owned::i64(
             &[case.batch, case.index_heads, case.q_seq, case.width],
             indices,
@@ -1512,13 +1518,26 @@ mod tests {
             scale: 0.25,
         };
         let total = case.past_seq + case.current_seq;
-        let q = sequence(case.batch * case.q_heads * case.q_seq * case.head_size, 0.25);
-        let past_k = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, -0.5);
-        let past_v = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, 0.75);
-        let current_k =
-            sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, 0.125);
-        let current_v =
-            sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, -1.25);
+        let q = sequence(
+            case.batch * case.q_heads * case.q_seq * case.head_size,
+            0.25,
+        );
+        let past_k = sequence(
+            case.batch * case.kv_heads * case.past_seq * case.head_size,
+            -0.5,
+        );
+        let past_v = sequence(
+            case.batch * case.kv_heads * case.past_seq * case.head_size,
+            0.75,
+        );
+        let current_k = sequence(
+            case.batch * case.kv_heads * case.current_seq * case.head_size,
+            0.125,
+        );
+        let current_v = sequence(
+            case.batch * case.kv_heads * case.current_seq * case.head_size,
+            -1.25,
+        );
         // Strictly-increasing causal indices per (index-head, query).
         let mut indices = vec![-1i64; case.batch * case.index_heads * case.q_seq * case.width];
         for ih in 0..case.index_heads {
@@ -1543,10 +1562,8 @@ mod tests {
 
         for capacity in [total, total + 3, total + 9] {
             // Capacity past: valid [0, past_seq) from past, garbage after.
-            let mut cap_k =
-                vec![987.0f32; case.batch * case.kv_heads * capacity * case.head_size];
-            let mut cap_v =
-                vec![-654.0f32; case.batch * case.kv_heads * capacity * case.head_size];
+            let mut cap_k = vec![987.0f32; case.batch * case.kv_heads * capacity * case.head_size];
+            let mut cap_v = vec![-654.0f32; case.batch * case.kv_heads * capacity * case.head_size];
             let past_row = case.past_seq * case.head_size;
             let cap_row = capacity * case.head_size;
             for bh in 0..case.batch * case.kv_heads {

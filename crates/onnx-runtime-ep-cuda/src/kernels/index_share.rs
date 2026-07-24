@@ -698,7 +698,12 @@ impl Drop for IndexShareKernel {
             .scratch
             .get_mut()
             .expect("cuda_ep IndexShare scratch pool poisoned");
-        for ptr in [pool.present_key, pool.present_value, pool.scores, pool.frontier] {
+        for ptr in [
+            pool.present_key,
+            pool.present_value,
+            pool.scores,
+            pool.frontier,
+        ] {
             if ptr != 0 {
                 // SAFETY: every non-zero pointer came from this runtime's
                 // `alloc_raw` in `ScratchPool::ensure` and is freed exactly once.
@@ -902,7 +907,13 @@ impl Kernel for IndexShareKernel {
                 )?;
                 let valid_len_ptr = frontier_ptr;
                 let write_pos_ptr = frontier_ptr + (dims.batch * std::mem::size_of::<i64>()) as u64;
-                self.launch_capacity_write_pos(&bias, dims, dtype_code(dtype)?, valid_len_ptr, write_pos_ptr)?;
+                self.launch_capacity_write_pos(
+                    &bias,
+                    dims,
+                    dtype_code(dtype)?,
+                    valid_len_ptr,
+                    write_pos_ptr,
+                )?;
                 self.build_present_capacity(
                     past_key_ptr,
                     key_ptr,
@@ -1518,9 +1529,7 @@ fn validate_indices(indices: &[i64], dims: Dims, per_batch_bound: &[usize]) -> R
                             h,
                             q,
                             column,
-                            format!(
-                                "index {index} is out of range for cache length {bound}"
-                            ),
+                            format!("index {index} is out of range for cache length {bound}"),
                         ));
                     }
                     if let Some(previous) = previous
