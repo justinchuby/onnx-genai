@@ -1369,6 +1369,19 @@ fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
         .is_some_and(|count| count <= MAX_SHAPE_DATA_ELEMS)
 }
 
+/// Whether a node reads the *float* runtime value of input `input_index` as
+/// shape-propagation data. Only default-domain `Resize` derives its output
+/// extent from a float `scales` input; every other op ignores float input
+/// values during shape inference. Restricting the float-value materialization to
+/// exactly these inputs keeps shape propagation from downloading an unrelated
+/// float input to host — a wasted copy that would also violate the contract that
+/// an invalid shape input is rejected *before* any host materialization.
+fn reads_float_shape_input(node: &Node, input_index: usize, opset: u64) -> bool {
+    node.is_default_domain()
+        && node.op_type == "Resize"
+        && input_index == if opset == 10 { 1 } else { 2 }
+}
+
 fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool {
     // GQA treats the cache tensor extent as capacity and obtains the valid past
     // length from seqlens_k. Standard Attention instead derives past length from
@@ -1780,9 +1793,23 @@ fn run_ep_scoped_passes(
     let context = onnx_runtime_optimizer::PassContext::new().with_initializer_resolver(resolver);
     onnx_runtime_optimizer::run_passes(graph, &passes, &context)?;
 
+    // Best-effort shape refresh: the passes may have rewritten nodes whose
+    // output shapes downstream reads. A *data-dependent* invalidity (e.g. a
+    // `Slice` with step 0) is the runtime kernel's contract to reject, not a
+    // load-time error — before EP passes existed this re-inference did not run,
+    // so the graph built and the actionable diagnostic surfaced at `run`.
+    // Re-infer on a clone and adopt the refreshed shapes only on success so such
+    // a failure neither aborts the build nor leaves the graph partially updated;
+    // the executor's own resolution still validates shapes at run time.
     let registry = InferenceRegistry::default_registry();
     let opset_imports = graph.opset_imports.clone();
-    registry.infer_graph(graph, &opset_imports, MergePolicy::Permissive)?;
+    let mut refreshed = graph.clone();
+    if registry
+        .infer_graph(&mut refreshed, &opset_imports, MergePolicy::Permissive)
+        .is_ok()
+    {
+        *graph = refreshed;
+    }
     Ok(())
 }
 
@@ -1848,6 +1875,70 @@ fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
     }
     for subgraph in graph.subgraphs.values() {
         validate_control_flow_signatures(subgraph)?;
+    }
+    Ok(())
+}
+
+/// Reject operators no execution provider can run, before EP optimizer passes
+/// run. An optimizer pass's postcondition validation walks the whole graph and
+/// would otherwise surface a less actionable structural error (e.g. an
+/// opset-import invariant) instead of the actionable unsupported-operator
+/// diagnostic callers rely on.
+///
+/// A CUDA graph may legitimately delegate unsupported nodes to a CPU fallback
+/// (see [`cuda_fallback_report`]), so an unsupported op is not fatal there; the
+/// check is limited to the terminal (non-CUDA) EP. Only nodes with fully static
+/// declared input shapes are pre-validated: a symbolic/data-dependent shape is
+/// resolved and validated at run time, so pre-checking a contrib op whose
+/// support is shape-conditional would change behavior for valid graphs.
+fn reject_unsupported_operators(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+    if ep.device_type() == DeviceType::Cuda {
+        return Ok(());
+    }
+    for (node_id, node) in graph.nodes.iter() {
+        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+            || is_control_flow_op(&node.op_type, &node.domain)
+            || is_sequence_op(&node.op_type, &node.domain)
+        {
+            continue;
+        }
+
+        let shapes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        // Defer nodes with any non-static declared input shape to the run-time
+        // kernel gate, which sees concrete shapes.
+        if !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
+            continue;
+        }
+        let input_dtypes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        let layouts = vec![TensorLayout::contiguous(); shapes.len()];
+        let opset = effective_opset(graph, node);
+        if let KernelMatch::Unsupported { reason } =
+            ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
+        {
+            return Err(SessionError::unsupported_op(
+                node,
+                node_id,
+                opset,
+                ep.name(),
+                reason,
+            ));
+        }
     }
     Ok(())
 }
@@ -2098,6 +2189,14 @@ impl Executor {
         // otherwise obscure the actionable If diagnostic with a structural
         // error from a malformed branch.
         validate_control_flow_signatures(&graph)?;
+        // Reject structurally invalid graphs (a non-DAG) and operators no EP can
+        // run *before* EP optimizers run. An optimizer pass's postcondition
+        // validation would otherwise obscure the actionable load-time diagnostic
+        // (a wrapped `CycleDetected`, or an opset-import invariant instead of the
+        // unsupported-operator error) with a structural error. Mirrors the
+        // control-flow signature check above.
+        graph.topological_order()?;
+        reject_unsupported_operators(&graph, ep.as_ref())?;
         fuse_silu_patterns(&mut graph);
         let graph_before_ep_passes = graph.clone();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
@@ -3330,11 +3429,9 @@ impl Executor {
             // zero-copy when safe (the KV-cache round-trip the decode hot path
             // otherwise pays every step). Child (subgraph) outputs are copied
             // back into the parent scope, so keep them on the copy path.
-            if !nested {
-                if let Some(tensor) = self.try_move_host_output(vid, &shape, dtype)? {
-                    results.push(Some(SessionOutput::Tensor(tensor)));
-                    continue;
-                }
+            if !nested && let Some(tensor) = self.try_move_host_output(vid, &shape, dtype)? {
+                results.push(Some(SessionOutput::Tensor(tensor)));
+                continue;
             }
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
             host_output_bytes += bytes.len();
@@ -3880,6 +3977,7 @@ impl Executor {
         // of this node's integer inputs. Buffers are NOT sized here — a view
         // output needs none, and the compute path sizes them just below.
         if outputs.iter().any(|v| !resolved.contains_key(v)) {
+            let opset = effective_opset(&self.graph, node);
             let input_values: Vec<Option<Vec<i64>>> = inputs
                 .iter()
                 .enumerate()
@@ -3887,10 +3985,20 @@ impl Executor {
                     v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
+            // Only materialize a *float* input value for the specific inputs an
+            // op actually reads as float shape data (today: `Resize` scales).
+            // Downloading any other float input here would both waste a host copy
+            // and break the "reject an invalid shape input before any host
+            // materialization" contract — e.g. a data tensor feeding an
+            // `Unsqueeze` whose integer axes is invalid must never be copied to
+            // host just to reach the unresolved-shape rejection.
             let input_float_values: Vec<Option<Vec<f64>>> = inputs
                 .iter()
                 .enumerate()
                 .map(|(i, v)| {
+                    if !reads_float_shape_input(node, i, opset) {
+                        return None;
+                    }
                     v.and_then(|vid| self.shape_input_f64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
@@ -3900,7 +4008,7 @@ impl Executor {
                 &input_dtypes,
                 &input_values,
                 &input_float_values,
-                effective_opset(&self.graph, node),
+                opset,
             )
             .ok_or_else(|| {
                 let vid = outputs
