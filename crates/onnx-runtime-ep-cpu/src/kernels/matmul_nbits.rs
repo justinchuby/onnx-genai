@@ -3000,6 +3000,101 @@ mod tests {
         );
     }
 
+    /// Divergence-class guard for the Phi-3.5-mini int4 (block-32, acc-level-4)
+    /// native-vs-ORT greedy split at decode index 65 (native picks token 263, ORT
+    /// picks 6455). An independent fp32/fp16/bf16 oracle (the same `model.onnx`
+    /// run through ONNX Runtime with every `MatMulNBits` `accuracy_level`
+    /// rewritten to 1/2/3) selects 263 by a +0.0128 logit margin (~0.02% of the
+    /// ~59.7 logit); ONLY `accuracy_level=4` (int8 *activation* quantization)
+    /// flips the winner to 6455. Native matches the high-precision oracle, so per
+    /// project policy native is KEPT as the more-accurate backend.
+    ///
+    /// The end-to-end flip is a whole-graph accumulation effect, but its root
+    /// mechanism is int8 activation quantization tipping a razor-thin logit race
+    /// -- the same class Ridley proved on qwen3-0.6b. This pins that mechanism at
+    /// the kernel level, model-independently: on genuine near-ties, the loose
+    /// per-ROW int8 activation scale (one cross-block outlier crushes the smaller
+    /// blocks' int8 codes) reverses the fp32-reference argmax, while native's
+    /// decode kernel -- which quantizes activations per BLOCK -- must preserve the
+    /// fp32-reference winner on EVERY near-tie. A regression that reverted native
+    /// to a per-row (or otherwise looser) activation scale would reintroduce
+    /// exactly this greedy-token divergence, and this test would catch it.
+    #[test]
+    fn int4_decode_preserves_f32_argmax_where_per_row_int8_activation_flips() {
+        let (k, n, block_size) = (128usize, 2usize, 32usize);
+        let mut near_ties = 0usize;
+        let mut per_row_flips = 0usize;
+        for seed in 1..=4000u32 {
+            let s = seed as f32;
+            // Anti-correlated magnitude spread: block 0 pairs a large activation
+            // outlier with tiny weights (it pins any per-row activation scale and
+            // crushes every other block to a few int8 codes) while the remaining
+            // blocks pair small activations with large weights (they carry the
+            // output signal). This is the CompInt8 failure geometry from the real
+            // Qwen/Phi divergences.
+            let activations: Vec<f32> = (0..k)
+                .map(|i| {
+                    let amp = if i / block_size == 0 { 3.0 } else { 0.05 };
+                    (i as f32 * 0.017 + s * 0.013).sin() * amp
+                })
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| {
+                    let amp = if (i % k) / block_size == 0 { 0.03 } else { 1.5 };
+                    (i as f32 * 0.011 + s * 0.019).cos() * amp
+                })
+                .collect();
+            let (packed, scales, _, dequantized) = quantize(&weights, n, k, block_size, false);
+            let oracle = reference(&activations, &dequantized, 1, k, n);
+            let oracle_rms = rmse(&oracle, &vec![0.0; n]).max(1e-6);
+            let margin_rel = (oracle[1] - oracle[0]).abs() / oracle_rms;
+            // Genuine near-ties only. The upper bound keeps the race tight; the
+            // lower bound stays above native's per-block int8 error so a passing
+            // argmax is a real accuracy result, not luck.
+            if !(0.005..=0.08).contains(&margin_rel) {
+                continue;
+            }
+            near_ties += 1;
+            let oracle_argmax = usize::from(oracle[1] > oracle[0]);
+
+            // The loose per-row int8 activation scale (the failure mode): it may
+            // flip the greedy winner. We only *witness* that it happens on this
+            // family; native must never do the same.
+            let per_row = activation_quant_oracle(&activations, &dequantized, k, n, block_size, false);
+            if usize::from(per_row[1] > per_row[0]) != oracle_argmax {
+                per_row_flips += 1;
+            }
+
+            // Native's real int4 block-32 decode kernel (per-block int8
+            // activation). It must keep the fp32-reference argmax on every
+            // near-tie -- both scalar and the host-selected SIMD kernel.
+            let packed_weight = PackedInt4Weight {
+                values: packed.clone(),
+                scales: scales.clone(),
+            };
+            for kernel in [DotKernel::Scalar, selected_dot_kernel()] {
+                let mut native = vec![0.0; n];
+                int4_matmul_m1(&activations, &packed_weight, &mut native, k, n, kernel);
+                assert_eq!(
+                    usize::from(native[1] > native[0]),
+                    oracle_argmax,
+                    "seed {seed} ({kernel:?}): native per-block int4 decode flipped the fp32 \
+                     argmax at a near-tie (margin_rel {margin_rel}, native {native:?}, \
+                     oracle {oracle:?}) -- this is the Phi-3.5 index-65 divergence class",
+                );
+            }
+        }
+        assert!(
+            near_ties >= 20,
+            "deterministic search must exercise many near-ties (got {near_ties})",
+        );
+        assert!(
+            per_row_flips >= 3,
+            "the per-row int8 activation failure mode must actually flip some near-ties \
+             (got {per_row_flips}); otherwise this test does not witness the divergence class",
+        );
+    }
+
     /// Round-trip quantize `weights_nk` ([N, K], row-major) to 8-bit blocks the
     /// way ORT's `MatMulNBits` stores them (LSB-first, one byte per weight, one
     /// scale per K block, an optional one-byte-per-block uint8 zero point).
