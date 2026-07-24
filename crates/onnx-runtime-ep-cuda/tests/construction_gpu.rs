@@ -4,10 +4,10 @@ use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Kernel, TensorMut,
     TensorView,
 };
-use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    compute_contiguous_strides, static_shape, Attribute, DataType, Graph, Node, NodeId,
+    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -616,4 +616,431 @@ fn split_static_even_num_outputs_matches_eager_bytes() {
     for buffer in output_buffers {
         ep.deallocate(buffer).unwrap();
     }
+}
+
+#[test]
+fn split_constant_input_warms_and_captures() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // DeepSeek-V2-Lite decode: [B,S,16,192] -> [B,S,16,128] + [B,S,16,64].
+    let data_shape = [1, 1, 16, 192];
+    let split_shape = [2];
+    let output_shapes = [vec![1, 1, 16, 128], vec![1, 1, 16, 64]];
+    let data = (0..16 * 192).map(|value| value as f32).collect::<Vec<_>>();
+    let data_bytes = raw(&data);
+    let split_bytes = raw(&[128_i64, 64]);
+    let mut kernel = build_split_kernel(
+        &ep,
+        &data_shape,
+        &output_shapes,
+        &[("axis", Attribute::Int(-1))],
+        Some(&split_shape),
+    );
+    kernel.set_constant_inputs(&[false, true]);
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let split_buffer = ep.allocate(split_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&split_bytes, cuptr(split_buffer.as_ptr()))
+            .unwrap();
+    }
+    let data_strides = compute_contiguous_strides(&data_shape);
+    let split_strides = compute_contiguous_strides(&split_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &data_shape,
+            &data_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(split_buffer.as_ptr()),
+            DataType::Int64,
+            &split_shape,
+            &split_strides,
+            device,
+        ),
+    ];
+    let mut output_buffers = output_shapes
+        .iter()
+        .map(|shape| {
+            ep.allocate(DataType::Float32.storage_bytes(shape.iter().product()), 256)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let output_strides = output_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+
+    let mut execute = || {
+        let mut outputs = output_buffers
+            .iter_mut()
+            .zip(&output_shapes)
+            .zip(&output_strides)
+            .map(|((buffer, shape), strides)| {
+                TensorMut::new(
+                    DevicePtrMut(buffer.as_mut_ptr()),
+                    DataType::Float32,
+                    shape,
+                    strides,
+                    device,
+                )
+            })
+            .collect::<Vec<_>>();
+        kernel.execute(&inputs, &mut outputs).unwrap();
+    };
+    execute();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+
+    let mut first = vec![0; 16 * 128 * std::mem::size_of::<f32>()];
+    let mut second = vec![0; 16 * 64 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut first, cuptr(output_buffers[0].as_ptr()))
+            .unwrap();
+        runtime
+            .dtoh(&mut second, cuptr(output_buffers[1].as_ptr()))
+            .unwrap();
+    }
+    let expected_first = data
+        .chunks_exact(192)
+        .flat_map(|head| &head[..128])
+        .copied()
+        .collect::<Vec<_>>();
+    let expected_second = data
+        .chunks_exact(192)
+        .flat_map(|head| &head[128..])
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(first, raw(&expected_first));
+    assert_eq!(second, raw(&expected_second));
+    assert!(runtime.reset_graph().unwrap());
+
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(split_buffer).unwrap();
+    for buffer in output_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
+fn build_movement_kernel(
+    ep: &CudaExecutionProvider,
+    op: &str,
+    input_shapes: &[Vec<usize>],
+    output_shapes: &[Vec<usize>],
+    attrs: &[(&str, Attribute)],
+) -> Box<dyn Kernel> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 13);
+    let inputs = input_shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| {
+            graph.create_named_value(
+                format!("input_{index}"),
+                if index == 1 && matches!(op, "Expand" | "Reshape") {
+                    DataType::Int64
+                } else {
+                    DataType::Float32
+                },
+                static_shape(shape.iter().copied()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let outputs = output_shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| {
+            graph.create_named_value(
+                format!("output_{index}"),
+                DataType::Float32,
+                static_shape(shape.iter().copied()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut node = Node::new(
+        NodeId(0),
+        op,
+        inputs.iter().copied().map(Some).collect(),
+        outputs,
+    );
+    for (name, value) in attrs {
+        node.attributes.insert((*name).into(), value.clone());
+    }
+    let node_id = graph.insert_node(node);
+    let model = Model::new(&graph);
+    ep.get_kernel(model.graph.node(node_id), input_shapes, 13)
+        .unwrap()
+}
+
+#[test]
+fn concat_fixed_shape_captures_and_matches_eager() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // DeepSeek-V2-Lite decode: concatenate per-head q_nope and q_rope.
+    let input_shapes = [vec![1, 1, 16, 128], vec![1, 1, 16, 64]];
+    let output_shape = [1, 1, 16, 192];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Concat",
+        &input_shapes,
+        &[output_shape.to_vec()],
+        &[("axis", Attribute::Int(-1))],
+    );
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+
+    let first = (0..16 * 128).map(|value| value as f32).collect::<Vec<_>>();
+    let second = (0..16 * 64)
+        .map(|value| 10_000.0 + value as f32)
+        .collect::<Vec<_>>();
+    let input_bytes = [raw(&first), raw(&second)];
+    let input_buffers = input_bytes
+        .iter()
+        .map(|bytes| {
+            let buffer = ep.allocate(bytes.len(), 256).unwrap();
+            unsafe { runtime.htod(bytes, cuptr(buffer.as_ptr())).unwrap() };
+            buffer
+        })
+        .collect::<Vec<_>>();
+    let input_strides = input_shapes
+        .iter()
+        .map(|shape| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let inputs = input_buffers
+        .iter()
+        .zip(&input_shapes)
+        .zip(&input_strides)
+        .map(|((buffer, shape), strides)| {
+            TensorView::new(
+                DevicePtr(buffer.as_ptr()),
+                DataType::Float32,
+                shape,
+                strides,
+                device,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut output_buffer = ep
+        .allocate(16 * 192 * std::mem::size_of::<f32>(), 256)
+        .unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut execute = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )];
+        kernel.execute(&inputs, &mut output).unwrap();
+    };
+    execute();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+
+    let mut actual = vec![0; 16 * 192 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    let mut expected = Vec::with_capacity(16 * 192);
+    for head in 0..16 {
+        expected.extend_from_slice(&first[head * 128..(head + 1) * 128]);
+        expected.extend_from_slice(&second[head * 64..(head + 1) * 64]);
+    }
+    assert_eq!(actual, raw(&expected));
+    assert!(runtime.reset_graph().unwrap());
+    for buffer in input_buffers {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(output_buffer).unwrap();
+}
+
+#[test]
+fn reshape_constant_shape_warms_zero_copy_view() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // DeepSeek-V2-Lite decode projection reshape.
+    let input_shape = [1, 1, 3072];
+    let shape_shape = [4];
+    let output_shape = [1, 1, 16, 192];
+    let mut kernel = build_movement_kernel(
+        &ep,
+        "Reshape",
+        &[input_shape.to_vec(), shape_shape.to_vec()],
+        &[output_shape.to_vec()],
+        &[],
+    );
+    kernel.set_constant_inputs(&[false, true]);
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+
+    let data = (0..3072).map(|value| value as f32).collect::<Vec<_>>();
+    let data_bytes = raw(&data);
+    let shape_bytes = raw(&[0_i64, 0, 16, 192]);
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let shape_buffer = ep.allocate(shape_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&shape_bytes, cuptr(shape_buffer.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let shape_strides = compute_contiguous_strides(&shape_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &input_shape,
+            &input_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(shape_buffer.as_ptr()),
+            DataType::Int64,
+            &shape_shape,
+            &shape_strides,
+            device,
+        ),
+    ];
+    assert!(kernel.view_outputs(&inputs, 1).is_none());
+
+    let mut output_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut outputs = [TensorMut::new(
+        DevicePtrMut(output_buffer.as_mut_ptr()),
+        DataType::Float32,
+        &output_shape,
+        &output_strides,
+        device,
+    )];
+    kernel.execute(&inputs, &mut outputs).unwrap();
+    let mut copied = vec![0; data_bytes.len()];
+    unsafe {
+        runtime
+            .dtoh(&mut copied, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(copied, data_bytes);
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    let views = kernel.view_outputs(&inputs, 1).unwrap();
+    assert_eq!(views[0].input_index, 0);
+    assert_eq!(views[0].shape, output_shape);
+    assert_eq!(views[0].strides, vec![3072, 3072, 192, 1]);
+    assert_eq!(views[0].byte_offset, 0);
+
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(shape_buffer).unwrap();
+    ep.deallocate(output_buffer).unwrap();
+}
+
+#[test]
+fn expand_warmed_metadata_captures_and_matches_eager() {
+    let ep = gpu();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    // DeepSeek-V2-Lite decode broadcasts one rotary-key head across 16 heads.
+    let input_shape = [1, 1, 1, 64];
+    let shape_shape = [4];
+    let output_shape = [1, 1, 16, 64];
+    let kernel = build_movement_kernel(
+        &ep,
+        "Expand",
+        &[input_shape.to_vec(), shape_shape.to_vec()],
+        &[output_shape.to_vec()],
+        &[],
+    );
+
+    let data = (0..64).map(|value| value as f32).collect::<Vec<_>>();
+    let data_bytes = raw(&data);
+    let shape_bytes = raw(&[1_i64, 1, 16, 1]);
+    let data_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
+    let shape_buffer = ep.allocate(shape_bytes.len(), 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&shape_bytes, cuptr(shape_buffer.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let shape_strides = compute_contiguous_strides(&shape_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(data_buffer.as_ptr()),
+            DataType::Float32,
+            &input_shape,
+            &input_strides,
+            device,
+        ),
+        TensorView::new(
+            DevicePtr(shape_buffer.as_ptr()),
+            DataType::Int64,
+            &shape_shape,
+            &shape_strides,
+            device,
+        ),
+    ];
+    let mut output_buffer = ep
+        .allocate(16 * 64 * std::mem::size_of::<f32>(), 256)
+        .unwrap();
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let mut execute = || {
+        let mut output = [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )];
+        kernel.execute(&inputs, &mut output).unwrap();
+    };
+    assert!(matches!(
+        kernel.capture_support(),
+        CaptureSupport::Unsupported { .. }
+    ));
+    execute();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+    runtime.replay_graph().unwrap();
+
+    let mut actual = vec![0; 16 * 64 * std::mem::size_of::<f32>()];
+    unsafe {
+        runtime
+            .dtoh(&mut actual, cuptr(output_buffer.as_ptr()))
+            .unwrap()
+    };
+    assert_eq!(actual, raw(&data.repeat(16)));
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(data_buffer).unwrap();
+    ep.deallocate(shape_buffer).unwrap();
+    ep.deallocate(output_buffer).unwrap();
 }
