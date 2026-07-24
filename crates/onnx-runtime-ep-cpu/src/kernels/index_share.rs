@@ -1300,13 +1300,26 @@ mod tests {
             let dims = dims_of(case);
             let sqrt_scale = case.scale.sqrt();
             let total = dims.total_seq;
-            let q = sequence(case.batch * case.q_heads * case.q_seq * case.head_size, 0.25);
-            let past_k = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, -0.5);
-            let past_v = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, 0.75);
-            let current_k =
-                sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, 0.125);
-            let current_v =
-                sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, -1.25);
+            let q = sequence(
+                case.batch * case.q_heads * case.q_seq * case.head_size,
+                0.25,
+            );
+            let past_k = sequence(
+                case.batch * case.kv_heads * case.past_seq * case.head_size,
+                -0.5,
+            );
+            let past_v = sequence(
+                case.batch * case.kv_heads * case.past_seq * case.head_size,
+                0.75,
+            );
+            let current_k = sequence(
+                case.batch * case.kv_heads * case.current_seq * case.head_size,
+                0.125,
+            );
+            let current_v = sequence(
+                case.batch * case.kv_heads * case.current_seq * case.head_size,
+                -1.25,
+            );
             // Ascending, unique, causal indices per (batch, index-head, query).
             let mut indices = vec![-1i64; case.batch * case.index_heads * case.q_seq * case.width];
             for b in 0..case.batch {
