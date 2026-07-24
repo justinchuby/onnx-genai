@@ -162,3 +162,105 @@ fn qwen3_0_6b_int4_native_decode_keeps_high_precision_argmax() -> anyhow::Result
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Fresh native-vs-ORT scoreboard case (commit f5c6753, `--tokens 128 --steady`,
+// prompt "Hello"): the FIRST generated token (prefill argmax of the single
+// prompt token 9707) already differs — native picks 1479, ORT picks 3988.
+//
+// ## Verdict: native is correct (more accurate) — KEEP native.
+//
+// Because this is token 0 there is no KV history: both backends see the exact
+// same single-token input, so the split is a pure forward-precision difference,
+// not accumulated drift. An independent oracle rewrote every MatMulNBits
+// `accuracy_level` in the SAME model.onnx and ran the one-token forward:
+//
+// | MatMulNBits compute | token-0 argmax | logit(1479) − logit(3988) |
+// |---------------------|----------------|---------------------------|
+// | acc-level-1 (fp32)  | **1479**       | **+0.870**                |
+// | acc-level-2 (fp16)  | **1479**       | +0.870                    |
+// | acc-level-3 (bf16)  | **1479**       | +0.870                    |
+// | acc-level-4 (int8)  | 3988           | −0.533 (3988 5.722 > 1479 5.189) |
+//
+// Every higher-precision compute (fp32/fp16/bf16) selects 1479 by a wide
+// +0.87-logit margin; ONLY int8 *activation* quantization (`accuracy_level=4`,
+// ORT's default here) flips the winner to 3988. Native uses fp32 activations in
+// its non-int8 path and lands on the fp32-correct 1479. Same class Ridley/Brass
+// locked for the qwen3/Phi decode divergences: int8 activation tips a race, and
+// native stays on the fp32-correct side.
+
+/// Single prompt token for "Hello" (qwen3 tokenizer) — the fresh scoreboard's
+/// default prompt. Token 0 is this token's prefill argmax.
+const HELLO_PROMPT_IDS: [u32; 1] = [9707];
+/// Native's (fp32-oracle-correct) token-0 choice.
+const HELLO_NATIVE_TOKEN: u32 = 1479;
+/// ORT's (int8-activation, lower-precision) token-0 choice.
+const HELLO_ORT_TOKEN: u32 = 3988;
+
+#[test]
+#[ignore = "requires the real qwen3-0.6b int4 model via QWEN3_0_6B_E2E_DIR (or the default foundry cache path)"]
+fn qwen3_0_6b_int4_native_token0_keeps_high_precision_argmax() -> anyhow::Result<()> {
+    let dir = std::env::var_os("QWEN3_0_6B_E2E_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_MODEL_DIR));
+    if !dir.is_dir() {
+        eprintln!(
+            "skipping qwen3-0.6b token-0 lock: model directory absent: {}",
+            dir.display()
+        );
+        return Ok(());
+    }
+
+    let mut session = NativeDecodeSession::load(dir.join("model.onnx"), NativeDecodeDevice::Cpu)?;
+    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+
+    let options = GenerateOptions {
+        max_new_tokens: 1,
+        temperature: 0.0,
+        greedy: true,
+        stop_on_eos: false,
+        top_logprobs: Some(8),
+        ..GenerateOptions::default()
+    };
+    let result = session.generate(
+        &HELLO_PROMPT_IDS,
+        &options,
+        &ProcessorChain::new(),
+        &tokenizer,
+    )?;
+
+    let selected = *result
+        .token_ids
+        .first()
+        .expect("native generation produced no token");
+    assert_eq!(
+        selected, HELLO_NATIVE_TOKEN,
+        "native must keep the fp32-oracle-correct token {HELLO_NATIVE_TOKEN} at token 0; got \
+         {selected}. ORT's int8-activation path selects {HELLO_ORT_TOKEN}.",
+    );
+    assert_ne!(
+        selected, HELLO_ORT_TOKEN,
+        "native emitted ORT's lower-precision int8-activation token {HELLO_ORT_TOKEN}; the fp32 \
+         oracle selects {HELLO_NATIVE_TOKEN}",
+    );
+
+    // This split is a wide fp32 margin (~0.87 logit), not a razor-thin tie: the
+    // int8-activation flip is what makes ORT wrong, so native's winner should be
+    // comfortably ahead of ORT's alternative in native's own distribution.
+    let logprobs = result
+        .logprobs
+        .as_ref()
+        .and_then(|entries| entries.first())
+        .expect("top_logprobs requested but none returned");
+    assert_eq!(
+        logprobs.top.first().map(|(id, _)| *id),
+        Some(HELLO_NATIVE_TOKEN),
+        "top-ranked logprob token is not {HELLO_NATIVE_TOKEN}: {:?}",
+        logprobs.top,
+    );
+    eprintln!(
+        "qwen3-0.6b token-0 lock OK: native token = {HELLO_NATIVE_TOKEN} (fp32-oracle-correct; \
+         ORT = {HELLO_ORT_TOKEN})",
+    );
+    Ok(())
+}
