@@ -21,6 +21,9 @@ const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// error function are computed in `f64` (as the `Erf` kernel does) and the
 /// result rounded to `f32`.
 pub(crate) fn exact_gelu(x: f32) -> f32 {
+    if x == f32::NEG_INFINITY {
+        return 0.0;
+    }
     let xf = x as f64;
     (0.5 * xf * (1.0 + erf(xf * FRAC_1_SQRT_2))) as f32
 }
@@ -32,6 +35,9 @@ const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// `approximate="tanh"` path): `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
 /// Computed in `f64` and rounded to `f32` to mirror the exact path's precision.
 pub(crate) fn tanh_gelu(x: f32) -> f32 {
+    if x == f32::NEG_INFINITY {
+        return 0.0;
+    }
     let xf = x as f64;
     let inner = SQRT_2_OVER_PI * (xf + 0.044_715 * xf * xf * xf);
     (0.5 * xf * (1.0 + inner.tanh())) as f32

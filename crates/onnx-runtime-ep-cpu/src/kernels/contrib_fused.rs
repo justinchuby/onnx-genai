@@ -134,6 +134,9 @@ impl Kernel for QuickGeluKernel {
         let y = to_dense_f32_widen("QuickGelu", &inputs[0])?
             .iter()
             .map(|&x| {
+                if x == f32::NEG_INFINITY {
+                    return 0.0;
+                }
                 let z = self.alpha * x;
                 let sigmoid = if z >= 0.0 {
                     1.0 / (1.0 + (-z).exp())
@@ -360,75 +363,75 @@ mod tests {
     }
 
     #[test]
-    fn fused_gelu_activations_bf16_match_widened_f32_reference() {
-        let x_values = [-2.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN];
-        let bias_values = [0.25, -0.5, 0.0];
-        let x = Owned::bf16(&[2, 3], &x_values);
-        let bias = Owned::bf16(&[3], &bias_values);
-        let widened_x = x.to_bf16_as_f32();
-        let widened_bias = bias.to_bf16_as_f32();
+    fn fused_gelu_activations_bf16_handle_special_values() {
+        const NAN: u16 = 0x7fc0;
+        let values = [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN];
+        let x = Owned::bf16(&[values.len()], &values);
+        let zero_bias = Owned::bf16(&[values.len()], &[0.0; 5]);
 
-        let reference_x = Owned::f32(&[2, 3], &widened_x);
-        let reference_bias = Owned::f32(&[3], &widened_bias);
-        let mut reference = Owned::zeros_f32(&[2, 3]);
+        // GELU(-inf) = +0 and GELU(+inf) = +inf. Adding the +0 Bias changes
+        // -0 to +0 before BiasGelu/FastGelu; QuickGelu preserves its -0.
+        // NaN payloads are intentionally not prescribed.
+        let biased_expected = [0, 0, 0, 0x7f80, NAN];
+        let quick_expected = [0, 0x8000, 0, 0x7f80, NAN];
+        let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
         BiasGeluKernel
-            .execute(
-                &[reference_x.view(), reference_bias.view()],
-                &mut [reference.view_mut()],
-            )
+            .execute(&[x.view(), zero_bias.view()], &mut [output.view_mut()])
             .unwrap();
-        let mut output = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        assert_bf16_special_values("BiasGelu", &output.to_u16_bits(), &biased_expected);
+
+        let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
+        FastGeluKernel
+            .execute(&[x.view(), zero_bias.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_bf16_special_values("FastGelu", &output.to_u16_bits(), &biased_expected);
+
+        let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
+        QuickGeluKernel { alpha: 1.702 }
+            .execute(&[x.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_bf16_special_values("QuickGelu", &output.to_u16_bits(), &quick_expected);
+    }
+
+    #[test]
+    fn fused_gelu_activations_bf16_match_independent_finite_goldens() {
+        // Generated out-of-band from the ORT formulas in f64 and rounded to
+        // nearest-even BF16. Exact and Fast GELU happen to have the same
+        // rounded values for these inputs.
+        let values = [-1.25, -0.5, 0.75, 1.5];
+        let x = Owned::bf16(&[values.len()], &values);
+        let bias = Owned::bf16(&[values.len()], &[0.0; 4]);
+        let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
         BiasGeluKernel
             .execute(&[x.view(), bias.view()], &mut [output.view_mut()])
             .unwrap();
-        assert_eq!(
-            output.to_u16_bits(),
-            reference
-                .to_f32()
-                .into_iter()
-                .map(|value| half::bf16::from_f32(value).to_bits())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(output.to_u16_bits(), vec![0xbe07, 0xbe1e, 0x3f14, 0x3fb3]);
 
-        let mut reference = Owned::zeros_f32(&[2, 3]);
-        FastGeluKernel
-            .execute(
-                &[reference_x.view(), reference_bias.view()],
-                &mut [reference.view_mut()],
-            )
-            .unwrap();
-        let mut output = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
         FastGeluKernel
             .execute(&[x.view(), bias.view()], &mut [output.view_mut()])
             .unwrap();
-        assert_eq!(
-            output.to_u16_bits(),
-            reference
-                .to_f32()
-                .into_iter()
-                .map(|value| half::bf16::from_f32(value).to_bits())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(output.to_u16_bits(), vec![0xbe07, 0xbe1e, 0x3f14, 0x3fb3]);
 
-        let quick_values = [-2.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN];
-        let quick = Owned::bf16(&[quick_values.len()], &quick_values);
-        let reference_quick = Owned::f32(&[quick_values.len()], &quick.to_bf16_as_f32());
-        let mut reference = Owned::zeros_f32(&[quick_values.len()]);
+        let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
         QuickGeluKernel { alpha: 1.702 }
-            .execute(&[reference_quick.view()], &mut [reference.view_mut()])
+            .execute(&[x.view()], &mut [output.view_mut()])
             .unwrap();
-        let mut output = Owned::zeros(DataType::BFloat16, &[quick_values.len()]);
-        QuickGeluKernel { alpha: 1.702 }
-            .execute(&[quick.view()], &mut [output.view_mut()])
-            .unwrap();
-        assert_eq!(
-            output.to_u16_bits(),
-            reference
-                .to_f32()
-                .into_iter()
-                .map(|value| half::bf16::from_f32(value).to_bits())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(output.to_u16_bits(), vec![0xbe08, 0xbe19, 0x3f16, 0x3fb2]);
+    }
+
+    fn assert_bf16_special_values(op: &str, got: &[u16], expected: &[u16]) {
+        const NAN: u16 = 0x7fc0;
+        for (&got, &expected) in got.iter().zip(expected) {
+            if expected == NAN {
+                assert!(
+                    got & 0x7f80 == 0x7f80 && got & 0x007f != 0,
+                    "{op}: expected NaN, got 0x{got:04x}"
+                );
+            } else {
+                assert_eq!(got, expected, "{op}: expected 0x{expected:04x}");
+            }
+        }
     }
 
     #[test]

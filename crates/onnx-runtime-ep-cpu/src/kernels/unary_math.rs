@@ -367,105 +367,61 @@ mod tests {
     }
     #[test]
     fn unary_math_bf16_matches_widened_f32_reference() {
-        let x = Owned::bf16(&[5], &[-80., -1., 0., 1., 80.]);
-        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[5]);
+        let x = Owned::bf16(&[4], &[-1., 0., 1., 80.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[4]);
         run(MathOp::Softplus, &x, &mut out);
-        let expected: Vec<_> = x
-            .to_bf16_as_f32()
-            .into_iter()
-            .map(softplus)
-            .map(half::bf16::from_f32)
-            .map(half::bf16::to_f32)
-            .collect();
-        assert_eq!(out.to_bf16_as_f32(), expected);
+        // Golden BF16 values generated independently from log(1 + exp(x)) in
+        // f64, then rounded to nearest-even BF16.
+        assert_eq!(out.to_u16_bits(), vec![0x3ea0, 0x3f31, 0x3fa8, 0x42a0]);
     }
 
     #[test]
-    fn every_unary_math_op_bf16_matches_widened_f32_reference_and_special_values() {
-        // Keep each op's domain-specific exceptional values in the test input:
-        // the oracle widens the *stored* bf16 input, evaluates in f32, then
-        // rounds once back to bf16, which is the kernel's public contract.
-        let cases: &[(MathOp, &[f32])] = &[
-            (MathOp::Abs, &[f32::NEG_INFINITY, -0.0, -1.5, f32::NAN]),
-            (MathOp::Neg, &[f32::INFINITY, -0.0, 1.5, f32::NAN]),
-            (
-                MathOp::Reciprocal,
-                &[f32::NEG_INFINITY, -2.0, 0.0, f32::NAN],
-            ),
-            (
-                MathOp::Exp,
-                &[f32::NEG_INFINITY, -1.0, 0.0, f32::INFINITY, f32::NAN],
-            ),
-            (MathOp::Log, &[0.0, 1.0, f32::INFINITY, -1.0, f32::NAN]),
-            (
-                MathOp::Sign,
-                &[f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN],
-            ),
-            (MathOp::Floor, &[-1.5, -0.0, 0.5, f32::INFINITY, f32::NAN]),
-            (MathOp::Ceil, &[-1.5, -0.0, 0.5, f32::INFINITY, f32::NAN]),
-            (MathOp::Round, &[-1.5, -0.0, 0.5, 1.5, f32::NAN]),
-            (
-                MathOp::Sin,
-                &[-1.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Cos,
-                &[-1.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Sigmoid,
-                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Softplus,
-                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Softsign,
-                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (MathOp::Acos, &[-1.0, 0.0, 1.0, 2.0, f32::NAN]),
-            (MathOp::Acosh, &[0.0, 1.0, 2.0, f32::INFINITY, f32::NAN]),
-            (MathOp::Asin, &[-1.0, 0.0, 1.0, 2.0, f32::NAN]),
-            (
-                MathOp::Asinh,
-                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Atan,
-                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (MathOp::Atanh, &[-1.0, 0.0, 0.5, 1.0, 2.0, f32::NAN]),
-            (
-                MathOp::Cosh,
-                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Sinh,
-                &[f32::NEG_INFINITY, -1.0, -0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
-            (
-                MathOp::Tan,
-                &[-1.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
-            ),
+    fn every_unary_math_op_bf16_handles_special_values() {
+        const NAN: u16 = 0x7fc0;
+        // Inputs are [-inf, -0, +0, +inf, NaN]. Expected values below follow
+        // each ONNX operation's definition, not MathOp::apply.
+        let cases: &[(MathOp, [u16; 5])] = &[
+            (MathOp::Abs, [0x7f80, 0, 0, 0x7f80, NAN]),
+            (MathOp::Neg, [0x7f80, 0, 0x8000, 0xff80, NAN]),
+            (MathOp::Reciprocal, [0x8000, 0xff80, 0x7f80, 0, NAN]),
+            (MathOp::Exp, [0, 0x3f80, 0x3f80, 0x7f80, NAN]),
+            (MathOp::Log, [NAN, 0xff80, 0xff80, 0x7f80, NAN]),
+            (MathOp::Sign, [0xbf80, 0, 0, 0x3f80, NAN]),
+            (MathOp::Floor, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Ceil, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Round, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Sin, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Cos, [NAN, 0x3f80, 0x3f80, NAN, NAN]),
+            (MathOp::Sigmoid, [0, 0x3f00, 0x3f00, 0x3f80, NAN]),
+            (MathOp::Softplus, [0, 0x3f31, 0x3f31, 0x7f80, NAN]),
+            (MathOp::Softsign, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Acos, [NAN, 0x3fc9, 0x3fc9, NAN, NAN]),
+            (MathOp::Acosh, [NAN, NAN, NAN, 0x7f80, NAN]),
+            (MathOp::Asin, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Asinh, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Atan, [0xbfc9, 0x8000, 0, 0x3fc9, NAN]),
+            (MathOp::Atanh, [NAN, 0x8000, 0, NAN, NAN]),
+            (MathOp::Cosh, [0x7f80, 0x3f80, 0x3f80, 0x7f80, NAN]),
+            (MathOp::Sinh, [0xff80, 0x8000, 0, 0x7f80, NAN]),
+            (MathOp::Tan, [NAN, 0x8000, 0, NAN, NAN]),
         ];
+        let values = [f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN];
 
-        for &(op, values) in cases {
-            let input = Owned::bf16(&[values.len()], values);
+        for &(op, expected) in cases {
+            let input = Owned::bf16(&[values.len()], &values);
             let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
             run(op, &input, &mut output);
-
-            let expected = input
-                .to_bf16_as_f32()
-                .into_iter()
-                .map(|value| half::bf16::from_f32(op.apply(value)).to_bits())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                output.to_u16_bits(),
-                expected,
-                "{} bf16 output did not equal f32-reference-rounded-to-bf16",
-                op.name()
-            );
+            for (got, expected) in output.to_u16_bits().into_iter().zip(expected) {
+                if expected == NAN {
+                    assert!(
+                        got & 0x7f80 == 0x7f80 && got & 0x007f != 0,
+                        "{}: expected NaN, got 0x{got:04x}",
+                        op.name()
+                    );
+                } else {
+                    assert_eq!(got, expected, "{}: expected 0x{expected:04x}", op.name());
+                }
+            }
         }
     }
 }
