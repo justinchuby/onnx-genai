@@ -36,7 +36,7 @@ fixtures) and driven for real by `crates/onnx-genai/src/bin/render_sd.rs`.
 
 ## Validation
 
-The same document is committed as
+The same metadata values and structure (with fewer explanatory comments) are committed as
 `crates/onnx-genai-metadata/tests/fixtures/pipeline_diffusion_txt2img.yaml` and
 validated by `pipeline_validation_accepts_full_diffusion_txt2img_contract` in
 `crates/onnx-genai-metadata/tests/metadata_fixtures.rs`:
