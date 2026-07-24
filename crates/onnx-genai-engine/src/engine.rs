@@ -1195,6 +1195,14 @@ impl Engine {
         self.last_speculative_stats
     }
 
+    /// Native CUDA decode diagnostics from the engine-owned session.
+    #[cfg(feature = "native-backend")]
+    pub fn native_cuda_debug_stats(&self) -> Option<crate::native_decode::CudaKvDebugStats> {
+        self.native_session
+            .as_ref()
+            .and_then(crate::native_decode::NativeDecodeSession::cuda_kv_debug_stats)
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
         &self.governor
