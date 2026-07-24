@@ -56,3 +56,42 @@ Capacity detection uses `key_cap > total_seq`. At the exact context-full boundar
 
 ## Sequencing note
 This branch is off `621936f` (Holden's correctness review target). If 621936f changes in review, rebase this onto updated main. My earlier `de5188c` async copy-back is **subsumed** by fixed-slot append (folded in / not carried separately).
+
+---
+
+## Assessment: can (c) the growing attention mask be done ENGINE-SIDE (no Mobius/export)?
+
+**Read: YES — (c) is achievable purely in-engine (on-device fixed-capacity mask synthesis from a device valid-length scalar). No export/Mobius change is required for DeepSeek-V2-Lite.** The full 2.4x capture win is reachable in-engine. Evidence below.
+
+### What the growing mask actually is (traced from the real blk32 ONNX)
+The Attention mask input `v_model.Unsqueeze_18` is a standard **causal + padding additive bias** built in cumsum space, shared by all 27 Attention layers:
+```
+CumSum_5   = cumsum(attention_mask, axis=1)              # per-token valid-position index (left-pad robust)
+Sub_9      = shape(attention_mask) - shape(input_ids)    # past_len
+Slice_10   = CumSum_5[past_len:]                         # query positions
+GreaterOrEqual_12 = query_cumpos >= key_cumpos           # causal triangle
+And_15     = causal AND cast(attention_mask)             # + key validity (padding)
+Where_16   = And ? 0.0 : -65504.0                        # additive bias
+Unsqueeze_18 = [B, 1, cur, total]                        # grows with total  <-- the capture blocker
+```
+It is a **pure function of `(past_len, cur_len, attention_mask)`** — nothing model-weight- or data-value-dependent.
+
+### Why it's engine-synthesizable at fixed capacity (no export change)
+1. **The mask subgraph is a self-contained island.** `attention_mask` feeds only `Shape/Unsqueeze/CumSum`; `Unsqueeze_18` is consumed **only** by the 27 Attention nodes (verified). Nothing else depends on it → the engine can bypass/prune it from the captured region and substitute an on-device fixed-capacity equivalent with zero side effects.
+2. **The raw `attention_mask` input is already fixed-capacity** on device (`[1, max_len]`, logical grows; native_decode.rs:1681-1688). The padding info is already there.
+3. **The StandardAttentionKernel already applies causal masking and bounds the attention to a valid length internally** (attention_row loops `[0,total_seq)` + pad_limits) — it does NOT fundamentally need the precomputed `[B,1,cur,total]` bias for the standard causal+pad case; that bias is redundant with the kernel's own logic. So the kernel can synthesize the mask from `(valid_len, past_len)` + the fixed-cap attention_mask, and stop consuming the growing graph tensor.
+
+### The pivotal prerequisite (and an honest caveat on my current (a))
+My (a) as landed derives the **valid length from the mask TENSOR SHAPE** (`total_seq = mask.dims[3]`, host-side metadata read each step). **That is capture-unsafe**: under capture the shape is frozen at capture-time, so the replayed graph would use a stale length. For capture, (a) MUST become a true **on-device valid-length scalar** the kernel reads from device memory (updated per step by a tiny device-side increment or a single H2D of one int), mirroring how GQA gets `seqlens_k` on-device. This is THE foundational change; capture needs it regardless of the mask. (For the current eager deliverable the shape-derived length is correct and sufficient — capture is off.)
+
+### The in-engine work for (c)+(d) (all executor/kernel, no Mobius)
+1. Device valid-length scalar ABI = (a) done right (device scalar, not mask-shape) — foundational.
+2. Kernel-internal causal+pad mask synthesis from that scalar + the fixed-cap attention_mask buffer (reuses existing attention_row causal logic; drop the growing-mask dependency). [Option B — cheaper than materializing a fixed-cap bias tensor.]
+3. Executor graph-transform: prune/bypass the `Unsqueeze_18` mask island from the captured region so there is no data-dependent intermediate shape.
+4. Replace per-step D2H (`nonpad_kv_seqlen`) + htod control arrays with the device scalar; make any copy-back async/stream-ordered (reuse the 24531c4 pattern).
+5. Flip `StandardAttentionKernel::capture_support()` -> Supported.
+
+### Where export WOULD be needed (not our case)
+Only exotic mask semantics the kernel can't reconstruct from a valid-length scalar — ALiBi / sliding-window / custom learned bias / bidirectional segments. DeepSeek-V2-Lite is plain causal+pad, and the cumsum construction already handles left-padding, so even batched/left-padded serving stays engine-synthesizable (per-batch valid-length from an on-device cumsum — a small fixed-capacity vector, still no export change).
+
+**Bottom line for sequencing:** the 2.4x capture prize is in-engine reachable. Recommend the follow-up land in this order: (1) device valid-length scalar ABI (replaces my shape-derived length), (2) kernel-side mask synthesis + prune Unsqueeze_18 island, (3) device-side control (kill per-step D2H/htod), (4) capture_support flip. No Mobius dependency.
