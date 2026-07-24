@@ -125,14 +125,6 @@ const GEMV_F16_SMALL_N_MAX: usize = 1152;
 /// block, and it has **no** partial-block tail. So the variant is only correct
 /// when `block_size == 32` and `K` is a whole multiple of 32.
 const GEMV_F16_DOWN_BLOCK_SIZE: usize = 32;
-/// Static shared memory the down kernel always reserves (`float warp_sums[8][8]`).
-const GEMV_F16_DOWN_STATIC_SMEM_BYTES: usize = 8 * 8 * std::mem::size_of::<f32>();
-/// Portable dynamic-shared-memory ceiling. The down variant stages the whole
-/// activation (`K * sizeof(f16)` bytes) in shared memory; 48 KiB is the on-chip
-/// smem budget guaranteed on every supported SM (sm_53+) without a per-arch
-/// `cudaFuncAttributeMaxDynamicSharedMemorySize` opt-in, so the tiling only
-/// applies while the staged activation plus the static reservation fit under it.
-const GEMV_F16_DOWN_MAX_SMEM_BYTES: usize = 48 * 1024;
 const GEMV_F16_DOWN_THREADS: u32 = 256;
 const GEMV_F16_DOWN_COLUMNS_PER_BLOCK: usize = 8;
 const GATE_UP_SWIGLU_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu";
@@ -2388,8 +2380,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
 }
 
 // Down projection specialization: a 256-thread CTA computes eight columns and
-// parallelizes over block-32 K tiles. The activation is staged once in the
-// permuted half2 layout, then reused by all eight columns.
+// parallelizes over block-32 K tiles. Each thread loads its assigned activation
+// block directly into registers and reuses it across all eight columns.
 extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -2410,7 +2402,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     (void)zero_points;
     (void)zp_row_bytes;
     (void)scales_fp16;
-    extern __shared__ uint4 activation_shared[];
     __shared__ float warp_sums[8][8];
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
@@ -2419,18 +2410,13 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     const int warp = tid >> 5;
     const int column_base = (int)blockIdx.x * 8;
 
-    for (int vector = tid; vector * 8 < k; vector += (int)blockDim.x) {
-        activation_shared[vector] =
-            permute_activation_f16x8(activation + vector * 8);
-    }
-    __syncthreads();
-
     float values[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (int block = tid; block < k_blocks; block += (int)blockDim.x) {
-        const uint4 activation0 = activation_shared[block * 4];
-        const uint4 activation1 = activation_shared[block * 4 + 1];
-        const uint4 activation2 = activation_shared[block * 4 + 2];
-        const uint4 activation3 = activation_shared[block * 4 + 3];
+        const __half* activation_block = activation + block * 32;
+        const uint4 activation0 = permute_activation_f16x8(activation_block);
+        const uint4 activation1 = permute_activation_f16x8(activation_block + 8);
+        const uint4 activation2 = permute_activation_f16x8(activation_block + 16);
+        const uint4 activation3 = permute_activation_f16x8(activation_block + 24);
 #pragma unroll
         for (int tile_column = 0; tile_column < 8; ++tile_column) {
             const int column = column_base + tile_column;
@@ -2668,21 +2654,20 @@ struct F16GemvSelection {
 /// 256-thread block cooperatively reduces along `K`. That wins on the
 /// **tall-skinny** class — a `K > N` GEMV (reduction depth exceeds output width,
 /// e.g. an MLP down-projection or attention output-projection) — where the long
-/// reduction benefits from block-parallel accumulation and the staged activation
-/// is reused across the CTA's columns. It is only *correct* under the tiling's
+/// reduction benefits from block-parallel accumulation and each thread reuses
+/// its register-held activation block across the CTA's columns. It is only
+/// *correct* under the tiling's
 /// hard constraints, all derived from the kernel body:
 ///
 /// * `scales_fp16` and 4-bit weights (this fp16 GEMV path is always 4-bit),
 /// * no explicit zero-points (the specialized half2/down kernels encode zp=8),
 /// * `block_size == 32` and `K % 32 == 0` (full K-blocks; the kernel has no
-///   partial-block tail),
-/// * the staged activation (`K * sizeof(f16)` bytes) plus the static
-///   `warp_sums` reservation fits the portable 48 KiB smem budget.
+///   partial-block tail).
 ///
-/// Every other shape (wide `N >= K` projections, oversized `K`, non-block-32,
-/// non-multiple-of-32 `K`) falls back to the general per-warp GEMV. Selection is
-/// thus generic across models: any architecture's down/output projection that
-/// fits the class is accelerated, and nothing keys on a magic `K`/`N`.
+/// Every other shape (wide `N >= K` projections, non-block-32, non-multiple-of-32
+/// `K`) falls back to the general per-warp GEMV. Selection is thus generic across
+/// models: any architecture's down/output projection that fits the class is
+/// accelerated, and nothing keys on a magic `K`/`N`.
 fn select_f16_gemv_variant(
     k: usize,
     n: usize,
@@ -2690,18 +2675,16 @@ fn select_f16_gemv_variant(
     scales_fp16: bool,
     has_zero_points: bool,
 ) -> F16GemvSelection {
-    let staged_smem = k * std::mem::size_of::<half::f16>() + GEMV_F16_DOWN_STATIC_SMEM_BYTES;
     let down_eligible = !has_zero_points
         && scales_fp16
         && block_size == GEMV_F16_DOWN_BLOCK_SIZE
         && k.is_multiple_of(GEMV_F16_DOWN_BLOCK_SIZE)
-        && staged_smem <= GEMV_F16_DOWN_MAX_SMEM_BYTES
         && k > n;
     if down_eligible {
         F16GemvSelection {
             variant: F16GemvVariant::DownProjection,
             reason: "variant=down_projection;class=tall_skinny(K>N);block_size=32;\
-                     scales=fp16;K%32==0;activation_smem<=48KiB",
+                     scales=fp16;K%32==0",
         }
     } else {
         F16GemvSelection {
@@ -2710,7 +2693,7 @@ fn select_f16_gemv_variant(
                 "variant=general;zero_points=explicit;down_projection requires symmetric zp=8"
             } else {
                 "variant=general;class=not(tall_skinny K>N & block_size=32 & \
-                 scales=fp16 & K%32==0 & activation_smem<=48KiB)"
+                 scales=fp16 & K%32==0)"
             },
         }
     }
@@ -4403,7 +4386,7 @@ impl MatMulNBitsKernel {
             F16GemvVariant::DownProjection => (
                 GEMV_F16_DOWN_THREADS,
                 GEMV_F16_DOWN_COLUMNS_PER_BLOCK,
-                (self.k * std::mem::size_of::<half::f16>()) as u32,
+                0,
             ),
             F16GemvVariant::General => {
                 let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
@@ -5013,6 +4996,93 @@ mod tests {
     // gate/up shape — the runtime code never keys on these values.
     const QWEN_DOWN_K: usize = 4864;
     const QWEN_DOWN_N: usize = 896;
+    const STAGED_DOWN_REFERENCE_ENTRY: &str =
+        "matmul_nbits_gemv_f16_scales_f16_down_staged_reference";
+    const STAGED_DOWN_REFERENCE_SRC: &str = r#"
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_reference(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    (void)block_size;
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)scales_fp16;
+    extern __shared__ uint4 activation_shared[];
+    __shared__ float warp_sums[8][8];
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int column_base = (int)blockIdx.x * 8;
+
+    for (int vector = tid; vector * 8 < k; vector += (int)blockDim.x) {
+        activation_shared[vector] =
+            permute_activation_f16x8(activation + vector * 8);
+    }
+    __syncthreads();
+
+    float values[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int block = tid; block < k_blocks; block += (int)blockDim.x) {
+        const uint4 activation0 = activation_shared[block * 4];
+        const uint4 activation1 = activation_shared[block * 4 + 1];
+        const uint4 activation2 = activation_shared[block * 4 + 2];
+        const uint4 activation3 = activation_shared[block * 4 + 3];
+#pragma unroll
+        for (int tile_column = 0; tile_column < 8; ++tile_column) {
+            const int column = column_base + tile_column;
+            if (column < n) {
+                const long packed_start =
+                    ((long)column * k_blocks + block) * blob_size;
+                const uint4 packed_weights =
+                    *reinterpret_cast<const uint4*>(packed + packed_start);
+                const __half scale = scales[(long)column * k_blocks + block];
+                values[tile_column] += dot_int4x32_f16_permuted_scaled(
+                    packed_weights,
+                    activation0,
+                    activation1,
+                    activation2,
+                    activation3,
+                    scale);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int tile_column = 0; tile_column < 8; ++tile_column) {
+        const float value = warp_sum(values[tile_column]);
+        if (lane == 0) {
+            warp_sums[warp][tile_column] = value;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane < 8) {
+        const int column = column_base + lane;
+        float value = warp_sums[0][lane];
+        value += warp_sums[1][lane];
+        value += warp_sums[2][lane];
+        value += warp_sums[3][lane];
+        value += warp_sums[4][lane];
+        value += warp_sums[5][lane];
+        value += warp_sums[6][lane];
+        value += warp_sums[7][lane];
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+"#;
 
     fn runtime() -> Option<Arc<CudaRuntime>> {
         let previous_hook = std::panic::take_hook();
@@ -5657,7 +5727,7 @@ mod tests {
     }
 
     #[test]
-    fn fp16_down_projection_matches_general_gemv() {
+    fn fp16_down_projection_is_bit_exact_to_staged_kernel() {
         let Some(runtime) = runtime() else {
             eprintln!("skipping down-projection GEMV parity test: CUDA runtime unavailable");
             return;
@@ -5696,7 +5766,7 @@ mod tests {
             let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
             let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
             let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
-            let general_output_dev = runtime.alloc_raw(n * 2).unwrap();
+            let staged_output_dev = runtime.alloc_raw(n * 2).unwrap();
             let down_output_dev = runtime.alloc_raw(n * 2).unwrap();
             // SAFETY: device buffers exactly cover their source slices.
             unsafe {
@@ -5735,13 +5805,6 @@ mod tests {
                 &scales_strides,
                 device,
             );
-            let mut general_output = TensorMut::new(
-                device_ptr_mut(general_output_dev),
-                DataType::Float16,
-                &y_shape,
-                &y_strides,
-                device,
-            );
             let mut down_output = TensorMut::new(
                 device_ptr_mut(down_output_dev),
                 DataType::Float16,
@@ -5763,24 +5826,55 @@ mod tests {
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
             };
-            kernel
-                .launch_f16_gemv_variant(
-                    &activation_view,
-                    &packed_view,
-                    &scales_view,
-                    true,
-                    None,
-                    None,
-                    &mut general_output,
-                    k_blocks,
-                    blob_size,
-                    k_blocks.div_ceil(2),
-                    F16GemvSelection {
-                        variant: F16GemvVariant::General,
-                        reason: "variant=general;test=forced_reference",
-                    },
+            let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
+            let staged_function = runtime
+                .nvrtc_function(
+                    "matmul_nbits_gemv_f16_down_staged_reference",
+                    &staged_source,
+                    STAGED_DOWN_REFERENCE_ENTRY,
                 )
                 .unwrap();
+            let activation_ptr = cuptr(activation_view.data_ptr::<u8>() as *const c_void);
+            let packed_ptr = cuptr(packed_view.data_ptr::<u8>() as *const c_void);
+            let scales_ptr = cuptr(scales_view.data_ptr::<u8>() as *const c_void);
+            let zero_points_ptr: CUdeviceptr = 0;
+            let bias_ptr: CUdeviceptr = 0;
+            let staged_output_ptr = staged_output_dev;
+            let k_i32 = as_i32("K", k).unwrap();
+            let n_i32 = as_i32("N", n).unwrap();
+            let block_size_i32 = as_i32("block_size", block_size).unwrap();
+            let k_blocks_i32 = as_i32("K block count", k_blocks).unwrap();
+            let blob_size_i32 = as_i32("block blob size", blob_size).unwrap();
+            let zp_row_bytes_i32 = as_i32("zero-point row byte count", k_blocks.div_ceil(2)).unwrap();
+            let scales_fp16_flag = 1i32;
+            let bias_post_round_flag = 0i32;
+            let mut staged_builder = runtime.stream().launch_builder(&staged_function);
+            staged_builder
+                .arg(&activation_ptr)
+                .arg(&packed_ptr)
+                .arg(&scales_ptr)
+                .arg(&zero_points_ptr)
+                .arg(&bias_ptr)
+                .arg(&staged_output_ptr)
+                .arg(&k_i32)
+                .arg(&n_i32)
+                .arg(&block_size_i32)
+                .arg(&k_blocks_i32)
+                .arg(&blob_size_i32)
+                .arg(&zp_row_bytes_i32)
+                .arg(&scales_fp16_flag)
+                .arg(&bias_post_round_flag);
+            // SAFETY: this launches the exact pre-change down-projection entry
+            // over the same validated buffers used by the replacement below.
+            unsafe {
+                staged_builder
+                    .launch(LaunchConfig {
+                        grid_dim: (n.div_ceil(GEMV_F16_DOWN_COLUMNS_PER_BLOCK) as u32, 1, 1),
+                        block_dim: (GEMV_F16_DOWN_THREADS, 1, 1),
+                        shared_mem_bytes: (k * std::mem::size_of::<f16>()) as u32,
+                    })
+                    .unwrap();
+            }
             kernel
                 .launch_f16_gemv_variant(
                     &activation_view,
@@ -5798,12 +5892,12 @@ mod tests {
                 .unwrap();
             runtime.synchronize().unwrap();
 
-            let mut general = vec![f16::ZERO; n];
+            let mut staged = vec![f16::ZERO; n];
             let mut down = vec![f16::ZERO; n];
             // SAFETY: both output allocations hold `n` fp16 values.
             unsafe {
                 runtime
-                    .dtoh(as_bytes_mut(&mut general), general_output_dev)
+                    .dtoh(as_bytes_mut(&mut staged), staged_output_dev)
                     .unwrap();
                 runtime
                     .dtoh(as_bytes_mut(&mut down), down_output_dev)
@@ -5811,25 +5905,15 @@ mod tests {
                 runtime.free_raw(activation_dev).unwrap();
                 runtime.free_raw(packed_dev).unwrap();
                 runtime.free_raw(scales_dev).unwrap();
-                runtime.free_raw(general_output_dev).unwrap();
+                runtime.free_raw(staged_output_dev).unwrap();
                 runtime.free_raw(down_output_dev).unwrap();
             }
 
-            let mut max_abs = 0.0f32;
-            let mut max_rel = 0.0f32;
-            for (reference, specialized) in general.iter().zip(&down) {
-                let reference = reference.to_f32();
-                let specialized = specialized.to_f32();
-                let abs = (reference - specialized).abs();
-                max_abs = max_abs.max(abs);
-                max_rel = max_rel.max(abs / reference.abs().max(1.0));
-            }
-            eprintln!(
-                "down-projection specialized/general parity: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
-            );
-            assert!(
-                max_abs <= 0.02 && max_rel <= 1e-2,
-                "down-projection specialization diverged: max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+            assert_eq!(
+                as_bytes(&staged),
+                as_bytes(&down),
+                "register-loaded down projection must be bit-exact to the pre-change staged kernel \
+                 at K={k}, N={n}"
             );
         }
     }
@@ -5843,11 +5927,18 @@ mod tests {
         assert_eq!(
             qwen.reason,
             "variant=down_projection;class=tall_skinny(K>N);block_size=32;\
-             scales=fp16;K%32==0;activation_smem<=48KiB"
+             scales=fp16;K%32==0"
         );
 
-        // Non-Qwen tall-skinny down/output projections must also select it.
-        for (k, n) in [(5632, 2048), (11008, 4096), (2048, 512), (4096, 4096 - 32)] {
+        // Non-Qwen tall-skinny down/output projections, including contractions
+        // larger than the former activation-staging limit, must also select it.
+        for (k, n) in [
+            (5632, 2048),
+            (11008, 4096),
+            (2048, 512),
+            (4096, 4096 - 32),
+            (32_768, 4096),
+        ] {
             let selection = select_f16_gemv_variant(k, n, 32, true, false);
             assert_eq!(
                 selection.variant,
@@ -5856,13 +5947,12 @@ mod tests {
             );
         }
 
-        // Wide (N>=K) projections, oversized-K (activation exceeds the 48 KiB
-        // smem budget), non-multiple-of-32 K, and non-block-32 all fall back.
+        // Wide (N>=K) projections, non-multiple-of-32 K, and non-block-32 all
+        // fall back.
         let general_cases = [
             (896, 4864, 32, true),    // gate/up: N > K
             (896, 896, 32, true),     // square: K == N is not tall-skinny
             (896, 151_936, 32, true), // lm_head: N >> K
-            (32_768, 4096, 32, true), // K*2 = 64 KiB > 48 KiB budget
             (4880, 896, 32, true),    // 4880 % 32 != 0
             (4864, 896, 64, true),    // block_size != 32
         ];
@@ -5887,6 +5977,34 @@ mod tests {
             asymmetric.reason,
             "variant=general;zero_points=explicit;down_projection requires symmetric zp=8"
         );
+    }
+
+    #[test]
+    fn fp16_down_projection_loads_activation_directly_into_registers() {
+        let start = GEMV_F16_SRC
+            .find("extern \"C\" __global__ void matmul_nbits_gemv_f16_scales_f16_down")
+            .expect("down-projection entry must exist");
+        let body = &GEMV_F16_SRC[start..];
+        let end = body
+            .find("\n}\n\n// Model-agnostic fp16 int4 decode GEMV")
+            .expect("down-projection entry must have a bounded body");
+        let body = &body[..end];
+
+        assert!(
+            !body.contains("activation_shared"),
+            "down projection must not round-trip activations through shared memory"
+        );
+        for offset in [
+            "activation_block);",
+            "activation_block + 8);",
+            "activation_block + 16);",
+            "activation_block + 24);",
+        ] {
+            assert!(
+                body.contains(offset),
+                "down projection must directly load the block-32 activation at {offset}"
+            );
+        }
     }
 
     #[test]
