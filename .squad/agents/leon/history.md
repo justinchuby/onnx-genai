@@ -107,3 +107,4 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-23T14:55:00Z — Mobius PR #404 non-MoE fixes
 
 - Addressed eleven non-MoE PR #404 comments at `958f2eb`, including INT64 TopK indices, finite mask minima, indexer schedule length, export hygiene, and MTP option-a. Gaff reviewed DSA correctness green.
+- 2026-07-24: Added DeepSeek-Coder-1.3B int4 native smoke coverage: coherent output, ~611 tok/s, CUDA graph capture working.

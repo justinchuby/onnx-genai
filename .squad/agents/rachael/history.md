@@ -110,3 +110,4 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 ## 2026-07-23T22-29-16Z — DeepSeek dtod stream-ordering race learned
 - Root-cause correction: the DeepSeek MLA garbage decode was not RoPE/attention math; it was `CudaRuntime::dtod` copying on the legacy default stream before EP non-blocking-stream producers finished.
 - Durable lesson: when a CUDA copy bridges graph movement (`copy_reshape`) and EP kernels, verify stream ordering before localizing numerical bugs to model-specific kernels.
+- 2026-07-24: Shipped DeepSeek MLA correctness work: async `copy_reshape` merged as `24531c4`, KV-aliasing RAW race fixed as `621936f`, and capture-enablement plan opened for `perf/deepseek-mla-capture-enable`.

@@ -145,3 +145,4 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 ## 2026-07-23T20:30:00Z — Native/ORT parity harness review
 - 🟡 Approved Roy's harness: deployed Qwen artifacts meet its symmetric block-32 Q4 dequantization contract, and fixed-fixture goldens/oracle checks are sound.
 - Future artifact expansion must guard or generalize the block size, zero-point, `g_idx`, and initializer-shape assumptions.
+- 2026-07-24: Fresh-reviewed stream-ordered async `copy_reshape` (`24531c4`) as 🟢 merge-ready; confirmed same-stream CUDA EP ordering preserves correctness and removes many stream drains.

@@ -47,3 +47,26 @@
 **By:** Marsten
 **What:** Real GLM-4-9b int4 native CUDA decode was coherent on both baseline `569507c` and fixed `1fe314f`, byte-identical, roughly 101→102 tok/s noise, with CUDA graph active (`captures=1`, `replays=61`, `fallbacks=0`). ORT-genai could not load this export because `genai_config.json` is absent, so the evidence is native-only.
 **Why:** GLM dense native support remains valid, and the DeepSeek dtod fix is a broader CUDA correctness win without regressing dense cuda-graph decode.
+
+## 2026-07-24 — DeepSeek MLA determinism fixed on main
+
+### Stream-ordered async copy_reshape is merged
+**By:** Gaff; authored by Rachael; merged by Coordinator
+**What:** Commit `24531c4` replaced the Reshape/Squeeze `copy_reshape` D2D copy path with stream-ordered `dtod_async` on the EP compute stream. Gaff's fresh review marked it merge-ready: the CUDA EP is single-stream, so same-stream async ordering preserves the prior race fix while removing roughly 200+ stream drains per token. CUDA gate was `203/0`.
+**Why:** This is a low-risk eager performance and capture-readiness improvement. It does not by itself enable DeepSeek MLA graph capture; the structural Attention capture blockers remain.
+
+### DeepSeek greedy decode nondeterminism root-caused and fixed
+**By:** Rachael; reviewed by Holden; merged by Coordinator
+**What:** Commit `621936f` fixed DeepSeek-V2-Lite greedy decode nondeterminism in default-domain `Attention` decode. Root cause was an in-place KV-aliasing RAW race in `build_kv`: aliased `present` wrote the grown cache at `total_seq` stride while reading `past` at `past_seq` stride, corrupting heads greater than 0. The fix stages aliased KV growth into disjoint scratch, runs attention from scratch, then copies the completed cache back. A regression test now proves aliased decode KV growth matches a non-aliased reference and is deterministic.
+**Why:** Greedy decode must be deterministic. The fix is general for default-domain `Attention` aliased KV growth and leaves GQA unchanged.
+
+### DeepSeek-V2-Lite MLA decode is now deterministic and coherent on main
+**By:** Squad
+**What:** DeepSeek-V2-Lite MLA decode is now **DETERMINISTIC + coherent** on `origin/main` via `621936f`, with stream-ordered async `copy_reshape` from `24531c4`. Validated coverage now includes DeepSeek-V2-Lite MoE, DeepSeek-Coder-1.3B, GLM-4-9b, and DeepSeek-R1-Distill-Qwen-1.5B exact native/ORT-genai token parity.
+**Why:** The prior DeepSeek incoherence/nondeterminism is resolved. Remaining performance lever is MLA graph-capture enablement, now in progress on `perf/deepseek-mla-capture-enable`.
+
+### MLA graph-capture enablement remains a separate in-progress performance project
+**By:** Rachael
+**What:** Rachael's capture-enablement plan identified five blockers: host-derived per-step control arrays, growing logical KV/mask extents, per-step synchronizations, synchronous copy-back needing `dtod_async` under capture, and ensuring D2H `nonpad_kv_seqlen` stays off decode-with-past. Proposed direction is fixed-capacity default-domain Attention KV, a device-side valid-length scalar, no per-step host sync, async copy-back, and eventually supported capture once shapes and setup are capture-safe.
+**Why:** Correctness is already merged independently. Capture enablement is medium-large engine/kernel work and must be reviewed separately.
+

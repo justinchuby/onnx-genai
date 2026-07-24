@@ -6,3 +6,4 @@
 - 2026-07-23T20:30:00Z: Real DeepSeek-V2-Lite semantic execution is blocked before token 1: all dense MatMulNBits nodes are block-128, while native fp16 CUDA currently supports block-32. Strict CUDA placement had zero fallbacks; QMoE/MLA were not reached, so no semantic conclusion is warranted.
 ## 2026-07-23T22-29-16Z — GLM-4-9b native support smoke
 - Confirmed real GLM-4-9b int4 native CUDA decode is coherent on both baseline `569507c` and DeepSeek dtod fix `1fe314f`, byte-identical with cuda-graph active (`captures=1`, `replays=61`, `fallbacks=0`). ORT-genai cannot load this export without `genai_config.json`, so evidence is native-only.
+- 2026-07-24: Validated real-model coverage after DeepSeek fixes: DeepSeek-V2-Lite MoE coherent, GLM-4-9b dense native coherent, and R1-Distill-Qwen-1.5B native exactly matches ORT-genai for 32 tokens.

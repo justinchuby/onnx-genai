@@ -130,3 +130,4 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - Validation evidence: 6/6 unit tests and 18/18 `matmul_nbits_gpu` integration tests passed; Sapper's fix merged to main as `48de993`.
 ## 2026-07-23T22-29-16Z — DeepSeek dtod fix review
 - 🟢 Cleared Rachael's `1fe314f` dtod synchronization fix after verifying the non-blocking/default-stream race, regression failure without the fix, CUDA gate `202/0`, clippy clean, capture safety, and no meaningful Qwen/Phi perf regression.
+- 2026-07-24: Fresh-reviewed KV-race determinism fix `621936f` as 🟢 merge-ready; reproduced pre-fix nondeterminism and post-fix determinism, with Qwen capture non-regression.
