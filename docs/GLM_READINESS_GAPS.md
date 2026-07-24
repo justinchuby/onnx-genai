@@ -95,7 +95,7 @@ operator is registered but has a material dtype/layout or capture restriction.
 
 | Required op | CUDA status | Evidence / constraint |
 |---|---:|---|
-| `Attention` (23/24) | ✅ native, constrained | GPU-native NVRTC kernels keep Q/K/V, masks, scores, and outputs on device; f32-only and not capture-compatible because small control arrays/nonpad lengths synchronize with the host ([header](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L27-L46), [dtype contract](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L69-L75), [capture](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L1040-L1047)). |
+| `Attention` (23/24) | ✅ native, constrained | GPU-native NVRTC kernels keep Q/K/V, masks, scores, and outputs on device; f32/f16/bf16 inputs, cache, additive mask, and outputs use fp32 accumulation. It is not capture-compatible because small control arrays/nonpad lengths synchronize with the host ([header](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L27-L46), [dtype contract](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L69-L75), [capture](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L1040-L1047)). |
 | `RotaryEmbedding` (23) | ✅ native, constrained | Device NVRTC rotation plus device-side `position_ids` bounds validation; f32 X/cos/sin and int64 positions ([device source](../crates/onnx-runtime-ep-cuda/src/kernels/rotary_embedding.rs#L43-L127), [claim gate](../crates/onnx-runtime-ep-cuda/src/kernels/rotary_embedding.rs#L129-L144)). |
 | `RMSNormalization` | ⚠️ constrained | Registered; contiguous f32 X/Scale/Y. |
 | `TopK` | ⚠️ constrained | Registered; f32 values and int64 scalar K. |
@@ -107,9 +107,11 @@ operator is registered but has a material dtype/layout or capture restriction.
 | comparisons and arithmetic | ✅ / constrained | GLM's integer comparisons and f32 arithmetic are covered; individual dtype matrices still apply. |
 | `Cast`, `CastLike`, `Shape`, `Constant` | ✅ native | Registered CUDA graph-construction core. |
 
-The checked floating inputs of Attention and RoPE remain f32-only. A uniform
-f32 activation graph is the simplest conservative export profile, while casts
-can satisfy those operators inside an otherwise mixed-precision graph.
+Attention now supports f32/f16/bf16 activations, cache tensors, and additive
+masks; RoPE remains f32-only. A uniform f32 activation graph is the simplest
+conservative export profile, while f16/bf16 Attention can avoid its cast/bandwidth
+cost in otherwise mixed-precision graphs — bf16 in particular matches the native
+export dtype of GLM/DeepSeek/Gemma.
 
 ## Optional-input claim contract is fixed
 
@@ -123,8 +125,8 @@ supplied f32 tensor.
 
 CUDA Attention's claim gate consumes that contract explicitly: absent
 `attn_mask`, `past_key`, `past_value`, and `nonpad_kv_seqlen` slots are
-`Undefined`; present masks must be bool/f32, present cache tensors must be paired
-f32 values, and present nonpad lengths must be int64 with the opset/cache
+`Undefined`; present masks must be bool/f32/f16/bf16, present cache tensors must be paired
+f32, f16, or bf16 values matching Q/K/V, and present nonpad lengths must be int64 with the opset/cache
 restrictions enforced
 ([claim gate](../crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs#L311-L387)).
 Valid GLM/Mobius prefill without past KV is therefore claimed correctly without

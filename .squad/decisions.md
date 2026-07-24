@@ -1,9 +1,8 @@
 # Decisions
 
-> Current decision ledger. Full prior history through 2026-07-20T13:35Z is preserved in
-> `.squad/decisions/archive/2026-07-20T13-35-00Z-decisions-pre-multistream.md`.
+> Current decision ledger. Older ledgers are under `.squad/decisions/archive/`.
 
-> Entries older than 2026-06-21T23:55Z are archived in `.squad/decisions/archive/2026-Q2.md` when present.
+> Scribe archive policy: when this file exceeds the hard gate, keep only the current active reconciliation here and move older active ledger content into `.squad/decisions/archive/`.
 
 <!-- scribe-merge-2026-07-23T02-50-00Z-persistent-default-shipped -->
 ## 2026-07-23 — Persistent SPMD is the default CPU decode path
@@ -113,1265 +112,222 @@ No data races, no deadlock/hang, no reentrancy, no regression. Approved.
 <!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation -->
 ## 2026-07-22 — VLM WP1/WP2/WP3 reconciliation and ORT CUDA attention review
 
-Decision archive gate checked at 2026-07-22T21-35-00Z: active ledger was 155203 bytes; no entries older than 2026-07-15T21:35Z were present to archive.
+<!-- scribe-merge-2026-07-23T09-10-00Z-cuda-perf-wave2-3 -->
+## 2026-07-23 — CUDA performance wave 2/3 reconciliation
 
-<!-- source: .squad/decisions/inbox/badger-gemma4-text-closure.md -->
-### Gemma4 text-only image-modality closure
-**By:** Badger
-**Decision:** Mobius Gemma4 packages declare `embedding.image_features` as optional with `[0, hidden_size]` zero fallback under the opaque `image` presence key and gate `vision_encoder` on the same key.
-**Rationale:** Text-only requests skip vision execution while still providing a valid embedding input, matching the generic optional-audio contract without model-specific runtime logic.
+- **Keaton — IndexShare f16/bf16 storage (`69ee4e4`):** CUDA `IndexShare` now supports homogeneous f16/bf16 KV/cache storage with fp32 score, softmax, and value accumulation, avoiding cache widening.
+- **Irmgard — native engine and MoE fixture (`64238b5`):** Fixed the CUDA native-engine build path and added MoE fixture coverage.
+- **Irmgard — CUDA lib-test expectations (`de831fd`):** Updated hardcoded CUDA unit-test expectations: covered ops **87→88** and the GQA unsupported-reason substring.
+- **Marsten — native post-fusion ladder (`16e434d`):** Consolidated the post-fusion benchmark ladder from `marsten-post-fusion-ladder.md` and `marsten-native-post-fusion-ladder.md`.
+- **Deckard — fusion follow-ups (`05e1fd1`):** Landed SwiGLU-RMS fusion and its size-floor gate; the 7B result improved **23.5%**.
+- **Marsten — SwiGLU fusion ladder (`749170a`):** Native decode now beats ORT on the measured 7B fusion-ladder case.
+- **Batty — Phi graph capture (`17ac19f`):** `CudaDropNormalizationCasts` cast folding enabled Phi graph capture; eager decode improved about **25%** while captured performance was flat.
+- **Marsten — smoothness sweep:** This host has only Qwen2.5 and Phi CUDA-GPU models available; remaining benchmark gaps are Qwen2.5-0.5B batch-size-128 failure and Qwen2.5-1.5B repeated-text output.
+- **Open investigation — Qwen2.5-1.5B:** Native decode diverges from coherent ORT through degenerate repetition. SwiGLU-RMS fusion is proven not causal (fusion enabled/disabled is byte-identical); this is a pre-existing native numerical bug under root cause on `fix/qwen15b-native-divergence`.
+- **Review requirement — CUDA EP lib tests:** Reviewers must run `cargo test -p onnx-runtime-ep-cuda --features cuda --lib`; it contains hardcoded-expectation tests (including covered-op count and GQA error substrings) missed by targeted GPU tests.
 
-<!-- source: .squad/decisions/inbox/cambodia-vlm-wp3-stepexec.md -->
-### Land metadata-driven VLM WP3 step execution
-**By:** Cambodia
-**Decision:** Branch `squad/cambodia-wp3-step-exec` commit `7c82127` executes every `every_step` component topologically from declared metadata, publishes all outputs to the shared pool, re-reads decoder dataflow inputs each step, and keeps `prompt_only`/`final_only` phase behavior distinct.
-**Rationale:** Replaces one-output embedding-specific behavior with a generic component contract; engine tests, Clippy, fmt, VLM E2E tests, IR fixture validation, and architecture-name grep passed. Follow-up: remove transitional decode-side name fallbacks once packages provide complete `ModelIoSpec`.
 
-<!-- source: .squad/decisions/inbox/dave-pr421-review.md -->
-### Approve and merge Mobius PR #421 Gemma4 image optionality
+<!-- scribe-merge-2026-07-23T11-40-00Z-cpu-moe-h200-mobius-lmhead -->
+## 2026-07-23 — CPU MoE review, H200 survey, Mobius #422, and lm_head fusion
+
+Decision archive gate checked at 2026-07-23T11:40Z: active ledger was 310698 bytes before merge, so the prior active ledger was moved to `.squad/decisions/archive/2026-07-23T11-40-00Z-decisions-active-ledger.md` before merging the current inbox. Processed 9 inbox notes; any `deckard-*` or `irmgard-*` notes are intentionally left in flight.
+
+<!-- source: .squad/decisions/inbox/buster-roy-fusion-review.md -->
+# Review: Roy's fp16 tied-head fusion (`squad/roy-lmhead-fusion`)
+
+- **Reviewer:** Buster (independent, non-author; opus-4.8)
+- **Author:** Roy
+- **Date:** 2026-07-23
+- **Branch:** `squad/roy-lmhead-fusion`
+- **Reviewed SHA:** `71ab809` → cleanly rebased onto `origin/main` (`cd7dfcf`) as **`0a2422d`** (pushed force-with-lease)
+- **Device:** NVIDIA H200, CUDA EP, native decode
+
+## VERDICT: 🟢 APPROVE
+
+All claims independently reproduced. Both optimizations are genuinely generic
+(topology + dtype + shape), correct, and capture-safe. Build/test/clippy/fmt all
+clean. No regression. No blocking defects found.
+
+## Measurements (independent reproduction, this machine)
+
+| model | metric | Roy claims | Buster measured | verdict |
+|-------|--------|-----------:|----------------:|---------|
+| Llama-3.2-1B (fp16 tied head) | @128 tok/s | 449.1 | **450.97** | ✅ match, coherent |
+| Llama-3.2-1B | @1024 tok/s | 438.3 | **438.99** | ✅ match |
+| Qwen2.5-0.5B (int4 MatMulNBits head) | @128 tok/s | 313.5 (base 314) | **313.04** | ✅ no regression, coherent |
+
+- Llama greedy output is coherent (emits valid code/text). 97→451 tok/s @128 (4.6×) confirmed.
+- Qwen: passes are structurally inert (quantized head, no `Transpose`, no dense fp16 `MatMul`); 313 ≈ 314 baseline = within noise → **no regression**. (Model: `/home/justinchu/qwen2.5-0.5b-int4-onnx-native`.)
+
+## Checklist results
+
+1. **Genericity (RULES §2/§2.1): PASS.** `grep -rniE "gemma|qwen|phi|llama|mistral|deepseek"` over the changed crate's `src` returns only test-shape constants (`QWEN_*`), comments, and docstrings — **zero** matches in added *logic* lines (`git diff ...HEAD | grep '^+' | grep -i <models>` is empty). Both gates are purely structural:
+   - Transpose fold trigger = `op=="Transpose"` + default/`ai.onnx` domain + 1-in/1-out + **producer-less initializer** + **whole-byte dtype** (`optimizer.rs:107-155`).
+   - GEMV trigger = `dtype==F16 && plan.m==1 && batch product==1` (`matmul.rs:293-294`). No model dimensions, no names.
+2. **Byte-wise permutation correctness: PASS.** Odometer in `permute_bytes` (`optimizer.rs:229-268`) verified by hand for 2-D `[1,0]` and rank-3 `[2,0,1]`; matches the 5 unit tests. Sub-byte (`is_sub_byte`/`byte_size==0`) and non-constant inputs correctly skipped (`optimizer.rs:143-152`). Original initializer left intact → tied-weight `Gather` stays valid (only the surviving Transpose-output value is retyped/backed).
+3. **Capture-safety of GEMV: PASS.** Kernel uses only launch-time shared memory (`blockDim.x` floats) + fixed grid geometry, no per-call alloc/D2H/sync (`matmul.rs:346-390`). NVRTC module is cached (`runtime.rs:515-548`) so compilation happens once during warmup, not inside the captured region. `capture_support()` advertises `Supported` only after a GEMV call (`last_call_capture_safe`), mirroring the existing `MatMulNBits` decode-GEMV contract. Contiguity of A/B/output is enforced *before* the gate (`matmul.rs:261-269`), and ONNX `MatMul` has no transpose attribute, so B is guaranteed row-major `[K,N]` — the kernel's layout assumption holds.
+4. **Build (CUDA release): PASS.** `cargo build --release -p onnx-runtime-ep-cuda --features cuda` and `profile_native` bin compile clean.
+5. **Tests: PASS.** 5 new optimizer unit tests (`folds_constant_transpose_into_initializer`, `folds_constant_transpose_default_perm`, `folds_rank3_constant_transpose`, `leaves_transpose_of_non_constant`, `leaves_sub_byte_constant_transpose`) + GPU `matmul_f16_gemv_on_gpu_matches_cpu_reference` (K=259, N=300 non-square, tail-exercising) all pass. Full changed-crate suite green (no failures).
+6. **Re-bench: PASS** (see table above).
+7. **clippy: PASS.** `cargo clippy --release -p onnx-runtime-ep-cuda --features cuda` — no warnings/errors. (Pre-existing `--all-targets` debt in unrelated GPU test files noted by Roy, not touched here.)
+8. **fmt: PASS.** `cargo fmt -p onnx-runtime-ep-cuda -- --check` clean (changed crate only).
+
+## Non-blocking observations (informational, no action required)
+
+- The `capture_support()` stateful flag relies on `execute()` being called before `capture_support()` on the same kernel instance during the capture probe. This matches the established `MatMulNBits` contract and is exercised by the GPU test, so it is acceptable; just noting the coupling for future maintainers.
+- The Transpose-fold materializes the permuted constant on the host at claim time (one-time O(bytes) pass over the ~525 MB weight). This is a compile-time cost, not per-step, and is the intended trade — fine.
+
+## Rebase note
+
+Rebase of `71ab809` onto `origin/main` (`cd7dfcf`) was clean — no real code conflicts (only trivial replay of the single perf commit). New SHA **`0a2422d`** pushed with `--force-with-lease`. Ready for cherry-pick/merge by the designated merge agent (I did not self-merge / FF main).
+
+---
+**Plain-text summary:** 🟢 APPROVE. Independently reproduced Llama-3.2-1B **451 tok/s @128 / 439 @1024** (coherent, 4.6× over 97 baseline) and Qwen2.5-0.5B **313 tok/s @128 (no regression)**. Genericity grep clean (no model-name logic). Build + 5 new unit tests + GPU GEMV test + clippy + fmt all pass. Byte-wise Transpose fold is correct for any rank/perm and skips sub-byte/non-constant; fp16 M==1 GEMV is capture-safe and folds into the decode graph. No blocking defects. Branch rebased to `0a2422d` and pushed.
+
+<!-- source: .squad/decisions/inbox/coordinator-mobius-merge-policy.md -->
+### 2026-07-22: Mobius PRs must be merged by Justin, not by Squad
+**By:** Squad (Coordinator), requested by Justin Chu
+**What:** Squad and its agents must NEVER self-merge mobius PRs. All mobius changes go into a single PR for Justin to review and merge himself. Already-merged mobius PRs are fine as-is.
+**Why:** User directive: "mobius的PR你不能自己merge，必须让我merge！你的所有更改可以放在同一个mobius pr里，我来审查。已经merge的就算了". Distinct from onnx-genai repo, where FF-merge-to-main by a non-author merge agent is permitted.
+
+<!-- source: .squad/decisions/inbox/dave-mobius-metadata-consolidation.md -->
+### 2026-07-22: Mobius decoder metadata consolidation
 **By:** Dave
-**Decision:** APPROVE+merged PR #421 as `38cb789a51e68b5907d82fa67704a73fdef80902`.
-**Rationale:** Emitted metadata remains generic, graph declarations produce the `image` presence gate and optional zero-shaped `image_features`, text-only execution skips vision and preserves decoder routing, Ruff and targeted tests passed, and substantive CI passed except a queued infrastructure integration job.
 
-<!-- source: .squad/decisions/inbox/dave-vlm-wp1-emission.md -->
-### Land native VLM package emission
-**By:** Dave
-**Decision:** Branch `dave-wp1-vlm-emission` commit `a56e26b` emits VLM components with graph-derived typed I/O, topological dataflow, phases, embedding-to-decoder routes, sparse KV/fixed state pairs, preprocessing, expansion, position programs, runtime assets, schema v1, and WP0 capability names.
-**Rationale:** Processor selection is structural/config-driven, decoder state and positions use explicit registries, no model-family string controls pipeline structure, and Tiny IR acceptance packages validate for Gemma4 E2B, Qwen VL, and Phi4MM. Server grid-derived expansion remains runtime follow-up.
-
-<!-- source: .squad/decisions/inbox/eldon-hodge-wp2-review.md -->
-### Reject initial VLM WP2 named image processor
-**By:** Eldon
-**Verdict:** 🔴 REJECT commit `4c49b86f44807b3f8f964e093db120c3bdcc4237`; Sapper must revise and Hodge is locked out for this revision cycle.
-**Rationale:** The implementation validated `ImageOutputBinding::source` but discarded it by collapsing all transforms into one global `value_ops` sequence, so branch-selected outputs executed unrelated transforms. Scope, model-family grep, fmt, Clippy, and 44 offline tests passed, but a half-vs-quarter mutation regression proved the source binding was ignored.
-
-<!-- source: .squad/decisions/inbox/eldon-wp2-verdict.md -->
-### Approve and fast-forward merge VLM WP2 image processor revision
-**By:** Eldon
-**Verdict:** 🟢 APPROVE Sapper revision `386e083`, fast-forward merged as `2af64f55424860d8507cfea2eaaefaff23b104d8`.
-**Rationale:** Each output preserves and resolves its declared `source`, divergent half/quarter branches produce independent values, unsupported divergent structural branches fail explicitly, runtime logic has no model-family matches, fmt/Clippy/tests passed, and merge scope is only `crates/onnx-genai-preprocess/src/image.rs`.
-
-<!-- source: .squad/decisions/inbox/gaff-ort-review.md -->
-### Reject ORT CUDA attention branch pending RuntimeConfig registry integration
-**By:** Gaff
-**Verdict:** 🔴 REJECT Howie commit `7ff33496bda2`; Howie is locked out of this artifact and Deckard is the reviser.
-**Rationale:** `session.rs` reads `ONNX_GENAI_CUDA_ATTENTION` directly with `std::env::var_os`, violating the 2026-07-14 runtime-config decision that new runtime flags must be declared, parsed, documented, and tested in `onnx-genai-runtime-config::RuntimeConfig`, with call sites consuming only `runtime_config()`. CUDA-missing behavior, ORT option mapping evidence, model-family grep, fmt, Clippy, and tests otherwise passed.
-
-<!-- source: .squad/decisions/inbox/hodge-vlm-wp2-image.md -->
-### Implement initial WP2 named image preprocessing descriptors
-**By:** Hodge
-**Decision:** Branch `squad/hodge-wp2-image-processor` commit `4c49b86` preserved/validated WP0 transform inputs/outputs and output sources, executed generic image value operations, and retained typed named bundle outputs without model identity dispatch.
-**Rationale:** The work consumed the WP0 named operation graph and added runtime tests with pinned references and architecture-neutral fixtures, but Eldon later rejected it because branch source bindings were validated but not actually executed independently.
-
-<!-- source: .squad/decisions/inbox/howie-ort-cuda-attention.md -->
-### Record rejected ORT CUDA attention artifact context
-**By:** Howie
-**Decision:** Branch `squad/howie-ort-cuda-attention` commit `7ff3349` made explicit CUDA EP requests fail actionably when CUDA ORT providers are unavailable and exposed unfused ORT CUDA attention through a session/provider option and `ONNX_GENAI_CUDA_ATTENTION=unfused`.
-**Rationale:** The correctness workaround is generic and H200 reproduced coherent Qwen output with a 146.71 tok/s median, but Gaff rejected the artifact because the environment flag bypassed the required typed `RuntimeConfig` registry.
-
-<!-- source: .squad/decisions/inbox/nandez-wp3-review.md -->
-### Approve and merge VLM WP3 step-component execution
-**By:** Nandez
-**Verdict:** 🟢 APPROVED and fast-forward merged to main at `7c821278db17d66aef0672eb0decbb6b9c669da3`.
-**Rationale:** Scope is exactly the authorized files, `decode.rs` is untouched, pipeline model-name grep is empty, execution is metadata-driven/topological/generic with no `EmbedsStepBinding` special case, and fmt, Clippy, and engine tests passed.
-
-<!-- source: .squad/decisions/inbox/rachael-joi-verdict.md -->
-### Approve Gemma4 E2B native profiling report
-**By:** Rachael
-**Verdict:** 🟢 APPROVE Joi's `profile_native` pipeline/steady-window additions and Gemma4 E2B benchmark documentation; rebased merge commit `39b2add`.
-**Rationale:** Static review found metadata-driven pipeline selection without model-architecture assumptions; the 140.09 tok/s median is internally consistent, and fmt, package check, bench-native profile check, and Clippy passed. No GPU benchmark was run.
-
-<!-- source: .squad/decisions/inbox/resch-dave-wp1-review.md -->
-### Approve and merge Dave WP1 native VLM emission
-**By:** Resch
-**Verdict:** 🟢 APPROVED Dave's `dave-wp1-vlm-emission` work and squash-merged Mobius PR #420, advancing Mobius main to `38616311ed38db79b7ce0e6d5b2071f14f8da5b8`.
-**Rationale:** Production VLM dispatch is structural/config-driven with no model-identity branch, targeted tests and Ruff passed, and emitted position/dataflow/capability/enum values match onnx-genai Rust and JSON schemas.
-
-<!-- source: .squad/decisions/inbox/sapper-wp2-image-processor-rev.md -->
-### Revise WP2 image values into independent dataflow branches
-**By:** Sapper
-**Decision:** Revised `image.rs` so each `OutputSpec` retains its declared source, named rescale/normalize values compile from their own declared input lineage, outputs pack the selected branch, and unsupported structural branches are rejected explicitly.
-**Rationale:** Fixes Eldon's rejection of the collapsed global value-op chain; the half-vs-quarter regression proves independent branch selection.
-
-**Inbox:** Merged and cleared `badger-gemma4-text-closure.md`, `cambodia-vlm-wp3-stepexec.md`, `dave-pr421-review.md`, `dave-vlm-wp1-emission.md`, `eldon-hodge-wp2-review.md`, `eldon-wp2-verdict.md`, `gaff-ort-review.md`, `hodge-vlm-wp2-image.md`, `howie-ort-cuda-attention.md`, `nandez-wp3-review.md`, `rachael-joi-verdict.md`, `resch-dave-wp1-review.md`, `sapper-wp2-image-processor-rev.md`. Preserved living scope docs `keaton-native-specdecode-design.md`, `leon-vlm-scope.md`, `zhora-deepseek-scope.md`, and `joi-gemma4-e2b-gaps.md`.
-<!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation-end -->
-<!-- scribe-merge-2026-07-22T16-01-00Z-vlm-wp0-landed -->
-## 2026-07-22 — VLM WP0 revision, DS-1 shape unblock, and inbox reconciliation
-
-<!-- source: .squad/decisions/inbox/deckard-vlm-wp0-revision.md -->
-### VLM WP0 revised and merged
-**By:** Deckard
-**Decision:** Landed `156853c58e74deaf1e29a3f6da4ac552447e3bbf` after generalizing four doc-comments, rebasing onto `ea2c0b9260eaebcb83358463da351ab426e64958`, and fast-forward merging to main.
-**Rationale:** RULES.md §2 model-name gate is now empty; metadata tests, clippy, and fmt are green.
-
-<!-- source: .squad/decisions/inbox/eldon-vlm-wp0-review.md -->
-### Reject original VLM WP0 metadata contract
-**By:** Eldon
-**Decision:** 🔴 Rejected `61dfc4ca209afd19ceaf7fcea695b86abb688ebd`; Stelline was locked out for this revision cycle and Deckard was named reviser.
-**Rationale:** The required whole-file RULES.md §2 gate still reported model-family references in `schema.rs`, even though the branch otherwise passed metadata test, clippy, and fmt and preserved the frozen WP-B1 optional-modality fields.
-
-<!-- source: .squad/decisions/inbox/kowalski-ds1-shape-unblock.md -->
-### Validate DS-1 native dynamic shape-chain propagation
-**By:** Kowalski
-**Decision:** Native execution now resolves data-dependent standard-domain `Slice` shapes from runtime integer inputs and reuses ONNX shape inference through `Unsqueeze` and broadcast consumers; the focused regression covers `Shape/Sub -> Slice -> Unsqueeze -> Less` and the DeepSeek-V2 tiny CPU E2E generated eight tokens.
-**Rationale:** `cargo fmt -p onnx-runtime-session`, combined session/shape-inference clippy, `cargo test -p onnx-runtime-session`, `cargo test -p onnx-runtime-shape-inference`, and native CPU DS-1 E2E passed; no next native blocker was found.
-
-<!-- source: .squad/decisions/inbox/morton-ds1-review.md -->
-### Approve DS-1 dynamic Slice shape regression
-**By:** Morton
-**Decision:** 🟢 Approved rebased commit `ed8b58e` for merge.
-**Rationale:** The regression executes the intended dynamic path without constant folding, uses generic shape-driven ONNX operators, has correct broadcast assertions, and passed fmt, clippy, and the targeted locked test.
-
-<!-- source: .squad/decisions/inbox/niander-h200-bench.md -->
-### Record H200 native decode roofline check
-**By:** Niander
-**Decision:** On main `3d84b9b`, Qwen2.5-0.5B native CUDA with device KV and whole-step graph replay measured 820.65 tok/s at length 128 and 781.20 tok/s at 1024, exceeding the RTX 4060 baseline by roughly 2.1x; eager remained much slower and graph smoke tests had zero fallbacks/KV transfers.
-**Rationale:** Qwen stayed near the supplied 886 tok/s roofline, Phi-4-mini remained lower utilization, and ORT profiler comparison was excluded because request setup dominated rather than steady decode.
-
-<!-- source: .squad/decisions/inbox/rachael-wp-b-optional-modality-design.md -->
-### Preserve WP-B optional-modality typed contract design
-**By:** Rachael
-**Decision:** WP-B should use opaque request presence keys, `phases.<component>.when_present`, and `io.optional_inputs.<port>.absent` zero fallbacks keyed by real ONNX input ports; tensor presence consistency is explicit and fallbacks are materialized at destination endpoints.
-**Rationale:** The design rejects conditional-edge and runtime rank-adapter scope for WP-B, keeps semantic adaptation in exporter-emitted ONNX graphs, defines WP-B1/B2/B3/B4 ordering, and requires Python ONNX fixtures to use the `onnx_ir` IR API.
-
-<!-- source: .squad/decisions/inbox/stelline-vlm-wp0-metadata.md -->
-### Record original VLM WP0 metadata contract attempt
-**By:** Stelline
-**Decision:** Commit `61dfc4c` added a model-agnostic VLM declaration surface for image preprocessing transforms/outputs, vision prompt expansion, multimodal positions, sparse KV/fixed state pairs, and required capabilities while leaving frozen WP-B optional-modality fields unchanged.
-**Rationale:** This was superseded by Eldon's rejection and Deckard's revision because the whole-file RULES.md §2 model-name gate was not clean until the comments were generalized.
-
-**Inbox:** Merged and cleared `deckard-vlm-wp0-revision.md`, `eldon-vlm-wp0-review.md`, `kowalski-ds1-shape-unblock.md`, `morton-ds1-review.md`, `niander-h200-bench.md`, `rachael-wp-b-optional-modality-design.md`, `stelline-vlm-wp0-metadata.md`. Preserved canonical inbox files `keaton-native-specdecode-design.md`, `leon-vlm-scope.md`, and `zhora-deepseek-scope.md`.
-<!-- scribe-merge-2026-07-22T16-01-00Z-vlm-wp0-landed-end -->
-
-<!-- scribe-merge-2026-07-22T14-59-36+0000-wp-b-landed -->
-## 2026-07-22 — WP-B optional-modality epic landed and clippy cleanup reconciled
-
-<!-- source: .squad/decisions/inbox/rutger-clippy-cleanup.md -->
-### Clear runtime-entry Clippy gates
-**By:** Rutger
-**Decision:** Landed `6f217a4` clears `-D warnings` for `onnx-genai`, `onnx-runtime-capi`, and `onnx-runtime-python`; tests now resolve the Cargo binary path at runtime, C API maps `RuntimeBroadcastIncompatible` exhaustively to `InvalidArgument`, and Python bindings keep the keyword API with narrow `too_many_arguments` allowances.
-
-<!-- source: .squad/decisions/inbox/zhora-rutger-clippy-review.md -->
-### Review clippy cleanup
-**By:** Zhora
-**Verdict:** 🟢 APPROVE
-**Rationale:** Required Clippy and targeted test gates passed; the C-API mapping is covered without a catch-all, runtime binary lookup preserves Cargo profile/target selection, `GenerateOptions` construction keeps defaults, and the scoped Python allowances avoid public API churn.
-
-<!-- source: .squad/decisions/inbox/sapper-wp-b3-revision.md -->
-### Land WP-B3 v3 optional-modality admission
-**By:** Sapper
-**Decision:** Landed `3d84b9b` makes retained raw `GraphProto.input` authoritative for optional-port membership, dtype, rank, and dimensions; raw initializer names only classify graph-default closure, loader behavior stays unchanged, and admission tests cover missing optional ports, fallback mismatches, gated producers, required inputs, and raw symbolic shapes.
-
-<!-- source: .squad/decisions/inbox/bryant-wp-b3-v3-review.md -->
-### Review WP-B3 v3 optional-modality admission
-**By:** Bryant
-**Verdict:** 🟢 APPROVE
-**Rationale:** Raw protobuf signatures, initializer/default separation, loader unchanged proof, architecture neutrality, mutation proof, fmt, clippy, and full `onnx-genai-ort` tests all passed; unrelated `tiny-qwen35-mtp` fixture naming was ignored as directed.
-
-<!-- source: .squad/decisions/inbox/chew-wp-b3-review.md -->
-### Preserve WP-B3 v2 rejection rationale
-**By:** Chew
-**Verdict:** 🔴 REJECT for Deckard's prior revision
-**Rationale:** Membership/default classification had moved to raw graph inputs, but dtype/rank/static shape still came from loader IR values, so initializer-backed graph inputs could be falsely constrained by initializer shape. Sapper's landed v3 fixed this by deriving signatures directly from raw `ValueInfoProto`.
-
-<!-- source: .squad/decisions/inbox/freysa-wp-b3-review.md -->
-### Preserve WP-B3 initial rejection rationale
-**By:** Freysa
-**Verdict:** 🔴 REJECT for Coco's initial admission work
-**Rationale:** Optional-port existence and fallback-shape checks used loader-projected `model.graph.inputs`; initializer-backed raw graph inputs were therefore falsely rejected and graph-default closure was lost. Later revisions moved validation to retained raw protobuf.
-
-<!-- source: .squad/decisions/inbox/deckard-wp-b3-revision.md -->
-### Record WP-B3 intermediate revision
-**By:** Deckard
-**Decision:** Deckard's revision fixed raw graph-input membership and graph-default classification while leaving `graph_builder.rs` unchanged, but review found rank/static shape still sourced from loader IR; it remains historical context, not the landed artifact.
-
-<!-- source: .squad/decisions/inbox/coco-wp-b3.md -->
-### Record WP-B3 initial implementation context
-**By:** Coco
-**Decision:** Coco added optional-port admission coverage for presence keys, fallback rank/static dimensions, mutually exclusive fallback/routed binding, gated producers, and required-input closure. The initial approach was superseded after raw-protobuf authority reviews.
-
-<!-- source: .squad/decisions/inbox/cotton-wp-b2-review.md -->
-### Review WP-B2 optional-modality engine runtime
-**By:** Cotton
-**Verdict:** 🟢 APPROVE
-**Rationale:** `PipelineGenerateRequest.present`, absent-modality zero fallback, `when_present` plan gating, destination-key fallback caching, initialized zeros, backward compatibility, and 8 CPU E2E tests passed. Engine behavior stays metadata-only with no model or architecture dispatch.
-
-<!-- source: .squad/decisions/inbox/mariette-wp-b2.md -->
-### Land WP-B2 optional-modality engine runtime
-**By:** Mariette
-**Decision:** Engine runtime landed request presence sets, consistency validation, fixed/symbolic zero fallback creation, gated component/route skipping across plan families, and destination-endpoint fallback pooling. `cargo clippy -p onnx-genai-engine --tests -- -D warnings`, `cargo test -p onnx-genai-engine`, and `cargo build -p onnx-genai-ort` passed; crate fmt failure was baseline-only in unrelated files.
-
-<!-- source: .squad/decisions/inbox/wallace-wp-b4-review.md -->
-### Review WP-B4 Mobius optional-audio exporter
-**By:** Wallace
-**Verdict:** 🟡 APPROVE-WITH-NOTES
-**Rationale:** Frozen optional-modality contract, generic emitter, rank adapter, absent shape, and Rust-schema compatibility passed. The only note was missing committed BF16 adapter regression coverage, which Joshi subsequently added.
-
-<!-- source: .squad/decisions/inbox/joshi-wp-b4.md -->
-### Land WP-B4 Gemma4 optional-audio export
-**By:** Joshi
-**Decision:** Mobius PR #419 emits `audio` presence, `embedding.io.optional_inputs.audio_features` with zero fallback `[0, config.hidden_size]`, `audio_encoder.when_present: audio`, and rank-2 masked audio features via a generic metadata emitter. Ruff, metadata, Gemma4 graph/adapter, dtype, and width-probe validations passed.
-
-<!-- source: .squad/decisions/inbox/joshi-wp-b4-bf16.md -->
-### Add WP-B4 BF16 adapter regression
-**By:** Joshi
-**Decision:** Added BF16 coverage for `test_gemma4_audio_encoder_strips_padding_in_graph`, including output dtype verification, closing Wallace's non-blocking note.
-
-<!-- source: .squad/decisions/inbox/tyrell-wp-b-progress.md -->
-### Update WP-B progress documentation
-**By:** Tyrell
-**Decision:** `docs/PROGRESS.md` now records WP-B1, WP-B2, and WP-B4 landings and originally marked WP-B3 as still in review; after `3d84b9b`, WP-B is fully landed and future docs should reflect WP-B3 closure.
-
-<!-- source: .squad/decisions/inbox/taffey-fmt-fix.md -->
-### Restore workspace rustfmt gate on main
-**By:** Taffey
-**Decision:** Reformatted the 89 files reported by workspace `cargo fmt --check` across 25 crates, restoring the formatting gate without logic changes and setting up the later Clippy cleanup.
-
-<!-- scribe-merge-2026-07-22T14-59-36+0000-wp-b-landed-end -->
-
-<!-- scribe-merge-2026-07-22T15-05-00Z-wp-b1-landed-inbox -->
-## 2026-07-22 — WP-B1 optional-modality schema landing and inbox reconciliation
-
-<!-- source: .squad/decisions/inbox/bryant-wp-b1-review.md -->
-### 2026-07-22: WP-B1 optional-modality schema review
-**By:** Bryant
-**Verdict:** 🟢 APPROVE
-**What:** The generic optional-input fallback and phase-presence schema is backward-compatible, architecture-neutral, fully covered, regenerated, and limited to WP-B1 mechanical schema integration.
-**Evidence:**
-1. **Schema correctness/backward compatibility:** `ModelIoSpec.optional_inputs` uses `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]` (`schema.rs:626-630`), and `PhaseConfig.when_present` uses `default` plus `skip_serializing_if = "Option::is_none"` (`schema.rs:1363-1370`). The legacy branch of `optional_modality_schema_round_trips` (`schema.rs:2418-2431`) parses a document lacking both fields, observes empty/`None`, and compares the serialized YAML value to the original without emitted defaults. The full-document branch round-trips the new fields exactly (`schema.rs:2433-2465`).
-2. **Generic/explicit contract:** Presence values are documented as opaque and validated through non-empty-string deserializers (`schema.rs:8-34, 632-641, 1363-1370`); no model/architecture dispatch or port-name inference was added. `TensorDimension` is explicitly either `Fixed(i64)` or `Symbol(String)`; deserialization rejects fixed values below zero and empty symbols (`schema.rs:662-694`). The only absent kind is explicit `Zeros`, serialized in snake case. Searches found no new model/vendor/architecture special case.
-3. **Test non-vacuity:** The test exercises a legacy document, exact full-document round-trip, `Zeros` → `"zeros"`, and a parsed shape containing both `Fixed(0)` and `Symbol("sequence_len")`; it rejects `-1` and empty presence. Mutation proof: I temporarily changed the fixed-dimension guard from `value >= 0` to `value >= -1` and ran the exact test. It failed at `schema.rs:2471` with `negative fixed dimensions must be rejected` (`0 passed; 1 failed`, exit 101). I reverted the mutation and confirmed the review worktree was clean before gates.
-4. **Exhaustive construction sites:** `rg 'ModelIoSpec\s*\{' crates` found only the type plus literals in `metadata/src/parser.rs:247` and `engine/src/native_decode.rs:2629`; both add only an empty `BTreeMap`. `rg 'PhaseConfig\s*\{' crates` found only the type plus two literals in `engine/src/pipeline.rs:4703,4710`; both add only `when_present: None`. No runtime behavior was introduced.
-5. **Generated schema:** The committed root `schema/inference_metadata.schema.json` contains `AbsentInputKind`, `AbsentInputSpec`, `OptionalInputSpec`, `optional_inputs`, `when_present`, and `TensorDimension` with integer minimum 0/string minimum length 1. `committed_inference_metadata_schema_is_current` passed.
-6. **Gate tails:**
-   - `cargo fmt -p onnx-genai-metadata --check`: no output; exit 0.
-   - `cargo clippy -p onnx-genai-metadata --tests -- -D warnings`: `Checking onnx-genai-metadata ...`; `Checking jsonschema v0.48.2`; `Finished dev profile ... in 5.25s`; exit 0.
-   - `cargo test -p onnx-genai-metadata`: `test result: ok. 24 passed; 0 failed`; schema sync `committed_inference_metadata_schema_is_current ... ok`; `test result: ok. 1 passed; 0 failed`; doc tests 0/0; exit 0.
-   - `cargo build -p onnx-genai-engine`: tail compiled `onnx-genai-ort` and `onnx-genai-engine`; `Finished dev profile ... in 13.17s`; exit 0.
-7. **Scope discipline:** Merge-base diff changes only metadata `schema.rs`/`parser.rs`, mechanical engine construction sites, and the generated JSON schema. It does not modify `onnx-genai-ort` or `onnx-runtime-loader`, and searches show no engine consumption of `optional_inputs`/`when_present`; WP-B2/WP-C behavior remains out of scope. `git diff --check` passed.
-**Why:** Every requested contract, compatibility, validation, construction-site, schema-sync, gate, and scope check passed. The mutation test demonstrates the key rejection assertion is effective rather than vacuous.
-
-<!-- source: .squad/decisions/inbox/deckard-wp-c-rereview.md -->
-### 2026-07-22: WP-C admission gate re-review (v2)
-**By:** Deckard
-
-**Verdict:** 🔴 REJECT
-
-**Per-finding status**
-1. **Resolved.** Temporal shape/name inference and stale-input rejection were removed. Unknown refresh semantics now fail open; the schema-blocker deferral is justified.
-2. **Resolved.** External provenance is evaluated per port. The mixed routed plus request-supplied component regression passes.
-3. **Resolved.** Admission no longer classifies generated inputs by tensor-name conventions. The `decoder.past_noise` regression rejects with the component-qualified port.
-4. **Resolved.** `cargo fmt -p onnx-genai-ort --check` passes.
-5. **Partially resolved.** Read, textproto parse, and binary model-load failures preserve the model path and underlying cause. However, unnamed graph input/output failures at `crates/onnx-genai-ort/src/pipeline_admission.rs:87-113` still omit the model path, contrary to the RULES §1 requirement that inspection errors include path and cause.
-
-**Verification run by Deckard**
-- `cargo test -p onnx-genai-ort --tests` — PASS
-- `cargo test -p onnx-genai-ort --test pipeline_admission` — PASS (9/9)
-- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — PASS
-- `cargo fmt -p onnx-genai-ort --check` — PASS
-
-**New defects / gate failures**
-- The mandated architecture-name grep is not clean: the authoritative diff contains `tiny-qwen35-mtp` in `crates/onnx-genai-ort/tests/mtp_session.rs:12`. This is a formatting-only test-fixture reference, not architecture-specific admission logic, but it still fails the explicit clean-diff gate.
-- Add path-preserving diagnostics (and a regression) for unnamed graph inputs and outputs.
-
-The fail-open temporal/schema deferral is otherwise sound for WP-C: no unsupported name/shape inference remains, and unknown bindings are left to loud runtime diagnostics where the current schema cannot prove invalidity.
-
-**Fix owner:** Gaff
-
-<!-- source: .squad/decisions/inbox/deckard-wp-c-review.md -->
-### 2026-07-22: WP-C load-time VLM admission review
-**By:** Deckard
-**Verdict:** 🔴 REJECT
-**Revision owner:** Sapper must own the revision. Leon is locked out as the rejected artifact's author; Deckard is the reviewer and must not revise it.
-
-## Findings
-
-### 1. BLOCKER — stale-input classification is unsound and violates the explicit-metadata rule
-**What:** `refresh_required_decoder_inputs` infers temporal semantics from symbolic-dimension intersections and fallback port names (`pipeline_admission.rs:420-475,784-790`) instead of declared metadata.
-
-**Why:** This can both reject valid packages and miss the defect it claims to catch:
-- If any decoder input omits the batch symbol, `batch` becomes a supposed sequence symbol. A valid prompt-cached conditioning tensor shaped `[batch, image_sequence, hidden]` is then rejected when fed by a `prompt_only` producer, although the engine explicitly supports cached prompt-only conditioning (`onnx-genai-engine/src/pipeline.rs:1561-1568,1869-1878`).
-- If all non-scalar inputs share the primary sequence symbol, that symbol is removed as “common”; a secondary per-token input can remain stale without rejection. The test avoids this by giving `attention_mask` a different `total_sequence` symbol.
-- Shape/name inference is not the explicit, inspectable metadata required by RULES.md §2.
-
-**How:** Add explicit per-decoder-input temporal/binding semantics (for example, refreshed-every-step versus fixed prompt conditioning) and validate producer phase against those declarations. Add regressions for valid fixed conditioning plus an unbatched position input, and for a stale secondary sequence input when all relevant ports share the same sequence symbol.
-
-### 2. BLOCKER — valid mixed external/routed components are rejected
-**What:** Input closure treats an unbound port as externally supplied only when its entire component has no incoming cross-component edge (`pipeline_admission.rs:485-517`).
-
-**Why:** The runtime accepts direct request tensors keyed by any `component.input_name`, and `component_inputs` checks that direct endpoint before routed dataflow (`onnx-genai-engine/src/pipeline.rs:72-99,1475-1495`). A valid component with one routed input and one request-supplied input is therefore rejected at load time. The gate has invented a component-level provenance rule absent from the metadata and runtime contract.
-
-**How:** Declare external/generated/default/state/dataflow provenance per port and validate exactly one declared source. Add a valid test where a component consumes one edge-fed tensor and one external request tensor.
-
-### 3. BLOCKER — name heuristics let required unbound inputs pass
-**What:** When `model.io` is absent, `generated_inputs` classifies decoder inputs by names such as `input_ids`, `attention_mask`, `position_ids`, `past*`, and `cache_*` (`pipeline_admission.rs:577-588,784-808`).
-
-**Why:** An unrelated required input such as `past_noise` is accepted as generated/stateful despite having no KV/state declaration or dataflow source. This misses the required-input defect class and violates RULES.md §2's requirement that assumptions be explicit metadata. The requested model-name grep is clean—there are no Gemma/Qwen/Phi/Llama/model-type hits—but semantic port-name dispatch remains.
-
-**How:** Admission must rely only on `ModelIoSpec`, `positions`, KV/state pairs, strategy-generated ports, graph defaults, declared external inputs, and dataflow. Compatibility conversion must emit those facts or fail. Add negative tests for convention-looking but undeclared ports.
-
-### 4. BLOCKER — required formatting validation fails
-**What:** `cargo fmt -p onnx-genai-ort --check` exits 1. The changed `src/lib.rs` has a rustfmt ordering delta around `shared_kv_proposer`, `loader`, and `pipeline_admission`.
-
-**Why:** The review contract requires rejection on fmt failure. The branch's older baseline also contains unrelated crate formatting deltas, and current main is not crate-fmt-clean, but the touched `lib.rs` is itself not formatted.
-
-**How:** Format the touched integration and reconcile the required crate-level fmt check before re-review.
-
-### 5. Error-quality finding — graph inspection discards the useful cause
-**What:** `inspect_component_signature` maps every read/parse/load failure to the same message and drops the model path and parser/IO cause (`pipeline_admission.rs:66-83`).
-
-**Why:** RULES.md §1 requires preserving resource path and causal context. “Could not be inspected structurally” does not tell whether the file is missing, unreadable, invalid protobuf, invalid textproto, or otherwise malformed.
-
-**How:** Preserve the underlying error and component model path with contextual wrapping while avoiding URL/secret-bearing content. Other admission errors are generally component.port-named and actionable; no secret/URL leak was observed.
-
-## Test assessment
-
-The six new admission tests pass, use `onnx_std` IR builders, and assert meaningful endpoint/reason text for valid, unbound, stale, dtype, rank, and modality cases. They are tailored to the current heuristics and omit the false-positive/false-negative cases above. The compatibility suite no longer proves that any valid compatibility VLM package loads.
-
-## Validation
-
-- `cargo test -p onnx-genai-ort --tests`: PASS
-- `cargo test -p onnx-genai-ort --test pipeline_admission`: PASS (6/6)
-- `cargo clippy -p onnx-genai-ort --tests -- -D warnings`: PASS
-- `cargo fmt -p onnx-genai-ort --check`: FAIL
-- Existing valid VLM engine tests: PASS (3/3)
-- Existing VLM server bundle tests: PASS (9/9)
-
-<!-- source: .squad/decisions/inbox/deckard-wp-c-v3-review.md -->
-### 2026-07-22: WP-C v3 re-review (finding #5)
-**By:** Deckard
-
-**Verdict:** 🔴 REJECT
-
-## Per-item findings
-
-1. **The two diagnostic strings now satisfy RULES.md §1.** The unnamed-input and
-   unnamed-output errors include the component, the allowed filesystem model path,
-   the underlying cause, why binding/dataflow cannot proceed, and explicit graph
-   regeneration guidance (`crates/onnx-genai-ort/src/pipeline_admission.rs:87-94`,
-   `:109-116`). No secret or URL is added.
-
-2. **The fixtures are built through the requested IR API.** They use
-   `Graph`, `Node`, `Model`, and `Model::to_proto`, and explicitly verify that the
-   serialized graph port name is empty
-   (`crates/onnx-genai-ort/tests/pipeline_admission.rs:101-132`).
-
-3. **Blocking defect: the new tests are not regressions for the changed
-   diagnostics.** Both tests deliberately trigger the pre-existing generic
-   `"could not be loaded"` wrapper and assert only that unrelated error plus its
-   path (`crates/onnx-genai-ort/tests/pipeline_admission.rs:160-167`,
-   `:584-592`). Reverting the v3 changes at
-   `src/pipeline_admission.rs:87-94` and `:109-116` would leave both tests green.
-   Thus the tests are vacuous with respect to finding #5.
-
-4. **The documented loader limitation is real, but it exposes dead admission
-   branches rather than making the tests acceptable.** The loader silently skips
-   empty-name graph inputs and outputs before constructing the IR
-   (`crates/onnx-runtime-loader/src/graph_builder.rs:118-120`, `:143-146`).
-   Consequently admission cannot reach either dedicated unnamed-port rejection,
-   and a test-engineered `DataType::Undefined` on the named peer is what causes
-   the observed load failure. Handle empty names at the retained-protobuf/loader
-   boundary (or otherwise make the dedicated validation reachable), then assert
-   the actual unnamed-input/output message, model path, and fix guidance.
-
-5. **No new fmt, clippy, test, or architecture-name regression was found.**
-   Findings 1-4 from the earlier review were not reopened.
-
-## Verification
-
-- `cargo fmt -p onnx-genai-ort --check` — exit 0.
-  Tail: `EXIT_STATUS=0`
-- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — exit 0.
-  Tail: `Finished 'dev' profile ... in 0.17s`; `EXIT_STATUS=0`
-- `cargo test -p onnx-genai-ort --test pipeline_admission` — exit 0.
-  Tail: `test result: ok. 11 passed; 0 failed; ...`; `EXIT_STATUS=0`
-- `cargo test -p onnx-genai-ort --tests` — exit 0.
-  Tail: final `tokenizer` test passed; `test result: ok. 1 passed; 0 failed; ...`;
-  `EXIT_STATUS=0`
-- Admission-logic-only architecture grep — no matches (`grep` exit 1, expected
-  for a clean result).
-
-**Specific remaining defect:** the regressions at
-`crates/onnx-genai-ort/tests/pipeline_admission.rs:160-167` do not execute or
-verify the v3 diagnostics and mask the fact that those production branches are
-unreachable after loader projection.
-
-Gaff is locked out from revising this artifact after rejection. Since Leon,
-Sapper, and Gaff have now each owned a rejected revision, escalate to Justin or
-assign a new owner.
-
-<!-- source: .squad/decisions/inbox/deckard-wp-c-v4-review.md -->
-# 🟢 APPROVE — WP-C v4 load-time VLM pipeline admission gate
-
-**Reviewer:** Deckard  
-**Commit:** `f3fd686f12ac4b147154194a08fa54bc9fd1a05d`  
-**Date:** 2026-07-22
-
-## Findings
-
-1. **WHAT — The raw-protobuf unnamed-port checks are reachable.**  
-   **WHY —** `onnx_std::load_model` decodes the original `ModelProto` and stores it
-   unchanged in `Model::source_proto` (`crates/onnx-std/src/model.rs:180-197`);
-   `Model::to_proto()` returns a clone of that retained proto
-   (`crates/onnx-std/src/model.rs:121-135`). This occurs before the execution
-   projection drops empty graph input/output names in
-   `crates/onnx-runtime-loader/src/graph_builder.rs:118-121,143-147`. The passing
-   exact-message tests and mutation result empirically confirm that both new
-   branches at `pipeline_admission.rs:99-118` execute.  
-   **HOW —** No change required.
-
-2. **WHAT — The two regression tests are non-vacuous and isolate only the intended
-   malformed port.**  
-   **WHY —** The fixtures use `onnx_std::ir::{Graph, Node, NodeId, DataType}` plus
-   `Model`/`Model::to_proto`; all named peers are `Float32`. Each fixture adds
-   exactly one unnamed `Float32` top-level input or output and asserts that the
-   generated proto contains it (`tests/pipeline_admission.rs:101-145`). The tests
-   assert the exact cause, full model path, and matching regeneration guidance
-   (`:148-184,601-608`). Commenting out only the two raw-protobuf checks admitted
-   both malformed fixtures, producing exactly two failures; restoring them
-   returned all 11 tests to green.  
-   **HOW —** No change required.
-
-3. **WHAT — Both diagnostics comply with RULES.md §1.**  
-   **WHY —** Each message states what is wrong, why execution cannot proceed,
-   includes `path.display()`, and gives explicit graph/sidecar regeneration
-   guidance (`pipeline_admission.rs:99-118`).  
-   **HOW —** No change required.
-
-4. **WHAT — The implementation remains model-architecture agnostic under
-   RULES.md §2.**  
-   **WHY —** The required architecture-name grep returned no matches. Validation
-   is based only on ONNX graph structure.  
-   **HOW —** No change required.
-
-5. **WHAT — All requested gates pass on the reviewed commit.**  
-   **WHY —** Formatting, clippy with warnings denied, and the complete admission
-   integration test all succeeded. The worktree was restored to a clean
-   `f3fd686f12ac4b147154194a08fa54bc9fd1a05d` after mutation testing.  
-   **HOW —** No change required.
-
-6. **WHAT — The `to_proto()` clone is acceptable.**  
-   **WHY —** It is one bounded transient clone per component during model
-   admission, not a per-token or steady-state execution cost. I found no
-   correctness defect or demonstrated load-time regression that warrants
-   blocking this fix.  
-   **HOW —** No change required.
-
-## Exact command tails
-
-```text
-$ cargo fmt -p onnx-genai-ort --check
-FMT_EXIT_STATUS=0
-
-$ cargo clippy -p onnx-genai-ort --tests -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
-CLIPPY_EXIT_STATUS=0
-
-$ cargo test -p onnx-genai-ort --test pipeline_admission
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-TEST_EXIT_STATUS=0
-
-$ rg -n -i 'qwen|gemma|phi|llama|mistral|deepseek|glm' crates/onnx-genai-ort/src/pipeline_admission.rs
-RG_EXIT_STATUS=1
-
-$ cargo test -p onnx-genai-ort --test pipeline_admission  # raw checks commented out
-failures:
-    admission_rejects_unnamed_graph_input_from_retained_proto
-    admission_rejects_unnamed_graph_output_from_retained_proto
-test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-MUTATION_EXIT_STATUS=101
-
-$ cargo test -p onnx-genai-ort --test pipeline_admission  # checks restored
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-RESTORED_TEST_EXIT_STATUS=0
-
-$ git status --short && git rev-parse HEAD
-f3fd686f12ac4b147154194a08fa54bc9fd1a05d
-```
-
-**Verdict:** v4 genuinely fixes both fatal v3 issues: admission now observes the
-retained source protobuf before loader filtering, and the regressions fail when
-that validation is removed.
-
-<!-- source: .squad/decisions/inbox/gaff-wp-c-finding5-fix.md -->
-### 2026-07-22: WP-C finding #5 fix (unnamed graph-port diagnostics)
-**By:** Gaff
-**What:** Updated both unnamed ONNX graph-input and graph-output admission diagnostics to include `path.display()` and retain explicit graph-regeneration guidance. Added separate unnamed-input and unnamed-output regression cases in `crates/onnx-genai-ort/tests/pipeline_admission.rs`, constructing the models through the `onnx_std` IR (`Graph`, `Node`, `Model`, and `Model::to_proto`). Commit: `60e75ef1db831910b36b4b1f27aee22a37304cbf`.
-**Why:** RULES.md §1 requires inspection/admission failures to preserve the model path and underlying cause. The protobuf loader currently drops empty-name graph `ValueInfo` entries before the admission scanner can reach its dedicated unnamed-port branches, so the tests document that limitation and assert the model path on the closest reachable component-inspection rejection while verifying that the serialized input/output is genuinely unnamed.
-
-Verification:
-- `cargo fmt -p onnx-genai-ort --check` — PASS (exit 0, no output)
-- `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — PASS
-- `cargo test -p onnx-genai-ort --test pipeline_admission` — PASS (11 passed, 0 failed)
-- `cargo test -p onnx-genai-ort --tests` — PASS (81 passed, 0 failed)
-
-Architecture-name grep on the added admission-logic diff (`gemma|qwen|phi|llama|mistral|deepseek`) — clean.
-
-<!-- source: .squad/decisions/inbox/holden-wp-c-v4-fix.md -->
-### 2026-07-22: WP-C v4 root-cause fix
-**By:** Holden
-**What:** Chose direction **B**. Pipeline admission now validates top-level graph input/output names in the retained raw `ModelProto` before scanning the loader's execution IR. Replaced the vacuous unnamed-port fixtures with valid IR-built models whose only defect is an extra unnamed graph input or output, and asserted the precise cause, filesystem model path, and regeneration guidance.
-**Why:** `onnx_std::load_model` and `onnx_std::textproto::from_textproto` return `onnx_std::Model`, which retains the exact source protobuf and exposes it through `Model::to_proto()`. Admission therefore already has legitimate access to the raw graph without changing the loader contract. This is the smallest honest way to validate names before `onnx-runtime-loader/src/graph_builder.rs:118-121` and `:143-147` project empty-name ports out of the IR.
-
-**Code changes:**
-- `crates/onnx-genai-ort/src/pipeline_admission.rs:82-118` — obtain the retained `ModelProto`, require a graph, and reject empty top-level `GraphProto.input`/`output` names with component, model path, cause, execution impact, and fix guidance.
-- `crates/onnx-genai-ort/src/pipeline_admission.rs:120-153` — scan the loaded IR only after raw-name validation; removed the unreachable IR-level unnamed-port rejection closures and documented the loader projection seam.
-- `crates/onnx-genai-ort/tests/pipeline_admission.rs:101-184` — rebuilt unnamed-port fixtures exclusively with `ir::Graph`, `ir::Node`, `ir::Model`, and `Model::to_proto`; all named peers now use valid `Float32` types, eliminating the unrelated `DataType::Undefined` load failure.
-- `crates/onnx-genai-ort/tests/pipeline_admission.rs:601-608` — renamed the two regressions to state that they exercise retained-protobuf admission.
-
-**Non-vacuity proof:**
-- Both tests assert the exact unnamed-input/output cause, the exact filesystem model path, and the corresponding explicit-name regeneration guidance.
-- A mutation run removed only the new raw-protobuf input/output checks. Both fixtures were then admitted, so both tests failed at `expect_err`: `0 passed; 2 failed`, `MUTATION_EXIT_STATUS=101`. Restoring the production checks returned both tests to green. Thus reverting the claimed production behavior cannot leave either test passing.
-
-**Verification tails:**
-```text
-$ cargo fmt -p onnx-genai-ort --check
-EXIT_STATUS=0
-
-$ cargo clippy -p onnx-genai-ort --tests -- -D warnings
-    Checking onnx-genai-ort v0.1.0-dev.3 (...)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.87s
-EXIT_STATUS=0
-
-$ cargo test -p onnx-genai-ort --test pipeline_admission
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-EXIT_STATUS=0
-
-$ cargo test -p onnx-genai-ort --tests
-test tiny_tokenizer_round_trip ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-EXIT_STATUS=0
-
-$ rg -n -i 'qwen|gemma|phi[-_0-9a-z]*|llama|mistral|deepseek|glm[-_0-9a-z]*' crates/onnx-genai-ort/src/pipeline_admission.rs
-RG_EXIT_STATUS=1 (1 means clean)
-```
-
-**Commit:** `f3fd686f12ac4b147154194a08fa54bc9fd1a05d`
-
-**Residual risk:** `Model::to_proto()` clones the retained protobuf once per component during load-time admission, adding bounded transient load-time memory proportional to model protobuf size. No loader, runtime execution, or admission-name inference contract was expanded.
-
-<!-- source: .squad/decisions/inbox/keaton-phase1-seam.md -->
-### 2026-07-22: Split capture-region policy from kernel capture mechanism
-**By:** Keaton
-**What:** Phase 1 uses a per-node EP hook, `ExecutionProvider::plan_capture_region(node, shape_status) -> Option<StructuralCaptureDecline>`. The EP owns the ordered structural predicates: control-flow/sequence classification, then unresolved output shape, then unresolved input shape. The executor converts that structural result to the existing `CaptureDecline`, and only when the hook admits the node does it apply the existing kernel-cache checks in order: `KernelNotWarmed`, then the compiled kernel's `CaptureSupport` decline (`KernelCaptureUnsupported`). The executor continues to form maximal contiguous segments and enforce persistent graph-output bindings.
-**Why:** The executor alone owns the shape-keyed compiled-kernel cache, so kernel warmth and concrete-kernel capture support cannot move behind an EP-only graph hook without changing ownership or behavior. A per-node structural annotation is the clean EP↔executor seam: it passes only the node plus resolved-input/output presence, keeps structural policy model-agnostic and EP-owned, and leaves cache/kernel inspection as executor mechanism. The combined precedence is exactly the pre-refactor order—host/sequence, unresolved output, unresolved input, unwarmed kernel, kernel decline—so every node produces the same `Option<CaptureDecline>`, including identical `SeamReason` and reason text.
-
-<!-- source: .squad/decisions/inbox/leon-keaton-phase1-review.md -->
-### 2026-07-22: Phase 1 partial-CUDA-graph EP-capture-hook refactor — INDEPENDENT REVIEW 🟢 GREEN
-
-**By:** Leon (senior engine reviewer; independent — not the author)
-
-**What:** Reviewed Keaton's Phase 1 refactor on `squad/keaton-ep-capture-hook` @ 3390ba6
-(EP hook `plan_capture_region` + `StructuralCaptureDecline`/`CaptureRegionShapeStatus`;
-executor `node_capture_reason` refactor). Verdict: **🟢 GREEN — safe to merge.**
-
-Checklist results (all verified against merge-base e1eeae4, diff vs origin/main):
-
-1. **Byte-identical precedence ✅** — Combined EP-hook + executor evaluation reproduces the
-   pre-refactor `node_capture_reason` exactly. Short-circuit order preserved:
-   host/sequence → unresolved-output → unresolved-input → kernel-not-warmed →
-   kernel-capture-unsupported. The hook computes control-flow → output → input in that order;
-   executor eagerly computes both shape-status booleans but that has no ordering side effect
-   (hook returns by precedence). SeamReason mapping is 1:1 and reason STRINGS are character-for-
-   character identical to the originals (verified against `origin/main` lines 2650–2712).
-2. **Shape-status fidelity ✅** — `outputs_resolved = outputs.all(contains_key)` == old
-   `!outputs.any(!contains_key)`. `inputs_resolved` match{Some→contains_key, None→true} exactly
-   reproduces old `.map(...).unwrap_or(Some(vec![])).collect::<Option<Vec<_>>>()` (None input =
-   present/empty). KernelKey input_shapes reconstruction (`map_or_else(Vec::new, expect)`) yields
-   the identical shapes vector; the `.expect`/`assert!` are safe under the hook invariant.
-3. **Model-agnostic ✅** — No model-name/architecture branching in the hook, its default impl,
-   or `is_control_flow_or_sequence`. Classification is purely structural (op_type + ai.onnx domain).
-4. **Default impl vs overrides ✅** — Only the trait default impl exists (grep: zero overrides).
-   CPU and CUDA EPs both inherit it → stock EPs behave identically. New provider.rs
-   `is_control_flow_or_sequence` op set == old `is_control_flow_op ∪ is_sequence_op` (If/Loop/Scan
-   + 8 Sequence ops), same domain guard.
-5. **Exhaustiveness/types ✅** — `structural_capture_decline` and `reason()` matches are
-   exhaustive (no catch-all). New enum/struct are doc-commented and re-exported via lib.rs.
-6. **Build/test/clippy ✅** — All pass:
-   - `cargo build -p onnx-runtime-ep-api -p onnx-runtime-session` ✅
-   - `cargo build -p onnx-runtime-session --features cuda` ✅
-   - `cargo test -p onnx-runtime-session` ✅ (61 lib incl. new parity test + all integration)
-   - new `ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines` ✅ — GENUINE:
-     builds a 6-node graph and asserts refactored == an inlined copy of the legacy function AND
-     the exact SeamReason sequence [HostControlFlowOrSequence, UnresolvedOutputShape,
-     UnresolvedInputShape, KernelNotWarmed, KernelCaptureUnsupported, None]. Adversarially covers
-     output-before-input precedence (node1 has BOTH unresolved → asserts Output wins) and
-     control-flow-before-shape (node0 is `If` with unresolved shapes → asserts HostControlFlow wins).
-   - `cargo clippy … -D warnings` ✅ and `--features cuda` ✅ (both clean)
-   - `cargo test -p onnx-genai-engine --features native-backend --lib
-     capture_fallback_emits_each_structured_decline_to_tracer` ✅ (1 passed)
-7. **Segmentation unchanged ✅** — `plan_capture_segments` and the graph-output persistent-binding
-   precondition are untouched by the diff.
-
-**Advisory (non-blocking):** The refactor adds `assert!(inputs_resolved && outputs_resolved, …)`
-after the hook admits a node, plus an `.expect` in the KernelKey shape reconstruction. For all
-current EPs (default impl only) these never fire. They are an intentional seam-contract guard for
-future EP overrides that might admit unresolved shapes; behavior is unchanged for stock EPs. Fine
-to merge as-is; worth a doc note in the Phase 2 EP-override guidance.
-
-**Why:** The seam matches design intent (docs/design-ep-partial-cuda-graph.md §9 Phase 1 / Open
-Question #1 §10): structural policy moved into the EP hook, kernel mechanism (warmth + compiled
-CaptureSupport) stays executor-owned, and segmentation is byte-identical. No precedence reorder,
-no shape-status mismatch, no altered reason string, no model-name branching, all checks green.
-
-<!-- source: .squad/decisions/inbox/leon-wp-c-admission-gate.md -->
-### 2026-07-22: Add graph-structural pipeline admission before ORT session creation
-**By:** Leon
-**What:** PipelineModelDirectory now inspects every component's real ONNX input/output signature and rejects non-closed input bindings, prompt-only producers feeding sequence-dependent every-step decoder ports, dtype/rank-incompatible dataflow edges, and incomplete declared image preprocessing/vision construction before PipelineModels creates any ORT session. ONNX graph-input initializers count as defaults; declared KV/fixed state and runtime-generated sequence/mask/position/timestep inputs count as generated or stateful bindings.
-**Why:** Multi-model sidecars can be structurally valid metadata while still being non-executable. The gate is model-agnostic: it uses only pipeline components, phases, strategies, dataflow, typed preprocessing declarations, explicit model I/O, and graph-derived names/dtypes/ranks/symbolic dimensions, with no model-family names or fixed architecture counts.
-
-<!-- source: .squad/decisions/inbox/pris-wp-b1-schema.md -->
-### 2026-07-22: WP-B1 metadata schema (optional-modality contract)
-**By:** Pris
-**What:** Added the generic optional-input fallback and phase-presence schema, updated all exhaustive construction sites with mechanical defaults, regenerated the committed JSON schema, and added serde round-trip coverage.
-**Why:** Optional modalities require explicit metadata for absent tensors and conditional component execution without model-, architecture-, or port-name inference.
-
-## Exact schema additions
-
-- `ModelIoSpec.optional_inputs: BTreeMap<String, OptionalInputSpec>`
-  - `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
-- `OptionalInputSpec { presence: String, absent: AbsentInputSpec }`
-  - `presence` is enforced as a non-empty opaque string.
-- `AbsentInputSpec { kind: AbsentInputKind, shape: Vec<TensorDimension> }`
-- `AbsentInputKind::Zeros`
-  - `#[serde(rename_all = "snake_case")]`; serializes as `"zeros"`.
-- `TensorDimension::{Fixed(i64), Symbol(String)}`
-  - Untagged bare integer/string serde representation.
-  - Negative fixed dimensions and empty symbols are rejected.
-- `PhaseConfig.when_present: Option<String>`
-  - `#[serde(default, skip_serializing_if = "Option::is_none")]`
-  - Enforced as non-empty when present.
-
-Definitions: `crates/onnx-genai-metadata/src/schema.rs:518-695`,
-`crates/onnx-genai-metadata/src/schema.rs:1359-1420`.
-
-## Mechanical construction-site updates
-
-- `crates/onnx-genai-metadata/src/parser.rs:273`
-  - `optional_inputs: std::collections::BTreeMap::new()`
-- `crates/onnx-genai-engine/src/native_decode.rs:2650`
-  - `optional_inputs: BTreeMap::new()`
-- `crates/onnx-genai-engine/src/pipeline.rs:4705`
-  - `when_present: None`
-- `crates/onnx-genai-engine/src/pipeline.rs:4712`
-  - `when_present: None`
-
-Re-ran the requested exhaustive-literal grep across `crates/`; no other
-`ModelIoSpec` or `PhaseConfig` construction sites require updates.
-
-## Round-trip test
-
-`crates/onnx-genai-metadata/src/schema.rs:2417`
-(`optional_modality_schema_round_trips`) proves:
-
-1. A legacy document without either new field deserializes and serializes without emitting defaults.
-2. A document containing `optional_inputs` and `when_present` round-trips exactly.
-3. `AbsentInputKind::Zeros` serializes as `"zeros"`.
-4. `TensorDimension` accepts both `0` and `"sequence_len"`.
-5. Negative fixed dimensions and empty presence keys are rejected.
-
-The generated `schema/inference_metadata.schema.json` was refreshed and its
-schema-sync test passes.
-
-## Verification tails
-
-`cargo fmt -p onnx-genai-metadata --check`
-```text
-(no output; exit status 0)
-```
-
-`cargo clippy -p onnx-genai-metadata --tests -- -D warnings`
-```text
-    Checking onnx-genai-metadata v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-metadata)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.06s
-```
-
-`cargo test -p onnx-genai-metadata`
-```text
-test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
-
-     Running tests/schema_sync.rs (target/debug/deps/schema_sync-d71939150098efe1)
-
-running 1 test
-test committed_inference_metadata_schema_is_current ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
-
-   Doc-tests onnx_genai_metadata
-
-running 0 tests
-
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-```
-
-`cargo build -p onnx-genai-engine`
-```text
-   Compiling onnx-genai-metadata v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-metadata)
-   Compiling onnx-genai-preprocess v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-preprocess)
-   Compiling onnx-genai-kv v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-kv)
-   Compiling onnx-genai-scheduler v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-scheduler)
-   Compiling onnx-genai-genai-config v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-genai-config)
-   Compiling onnx-genai-ort v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-ort)
-   Compiling onnx-genai-engine v0.1.0-dev.3 (/home/justinchu/onnx-genai-pris-wp-b1/crates/onnx-genai-engine)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.73s
-```
-
-## Git
-
-- Branch: `squad/pris-wp-b1-schema`
-- Commit: `c18807440c79172e73ac73a7924193cb71f01c3d`
-- Pushed: `origin/squad/pris-wp-b1-schema`
-
-<!-- source: .squad/decisions/inbox/roy-gemma4-e2b-reexport.md -->
-### 2026-07-22: Gemma4 E2B corrected native-contract re-export
-**By:** Roy
-**What:** Re-exported `google/gemma-4-E2B-it` from Mobius `main` commit `640c1cb` using task `gemma4`, CPU-targeted optimization, fp16 weights, and `--runtime onnx-genai`. The emitted metadata closes over all four ONNX component graphs and passes all five requested contract checks.
-**Why:** PR #418 changed native VLM metadata emission from an incomplete prompt-only contract into a graph-derived executable contract. This re-export verifies the merged producer against the real cached E2B checkpoint.
-
-## Export
-
-- **Status:** PASS
-- **Mobius commit:** `640c1cb Emit executable native VLM contracts (#418)`
-- **Task:** `gemma4` (`gemma4_unified` was not used)
-- **Target:** CPU (`--ep cpu`)
-- **Package:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native`
-- **Package size:** 11G
-- **Metadata:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native/inference_metadata.yaml` (19,625 bytes, 948 lines)
-- **Export log:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native-export.log`
-- **Verification log:** `/home/justinchu/mobius/.scratch/gemma4-e2b-native-verification.txt`
-
-The execution environment disallowed the requested `/tmp` scratch location, so the persistent package was written to Mobius's repo-local `.scratch` directory instead.
-
-```bash
-cd /home/justinchu/mobius
-HF_HUB_OFFLINE=1 python3 -m mobius build \
-  --config /home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/70af34e20bd4b7a91f0de6b22675850c43922a03 \
-  --task gemma4 \
-  .scratch/gemma4-e2b-native \
-  --dtype f16 \
-  --runtime onnx-genai \
-  --ep cpu \
-  --optimize
-```
-
-The build exited 0 and reported:
-
-```text
-Saved decoder to .scratch/gemma4-e2b-native/decoder/model.onnx
-Saved vision_encoder to .scratch/gemma4-e2b-native/vision_encoder/model.onnx
-Saved audio_encoder to .scratch/gemma4-e2b-native/audio_encoder/model.onnx
-Saved embedding to .scratch/gemma4-e2b-native/embedding/model.onnx
-  inference_metadata: .scratch/gemma4-e2b-native/inference_metadata.yaml
-```
-
-No Mobius source files were modified.
-
-## Relevant exact metadata excerpts
-
-### Decoder sequence inputs
+## PR #422
+
+**Failure root cause:** The failing `Integration (fast)` check was not a metadata
+snapshot regression. Dependency resolution selected PyPI
+`onnxruntime-gpu==1.27.0`, which requires CUDA 13, while the runner installs
+PyTorch/CUDA 12.8. Test collection therefore failed importing ONNX Runtime with
+`libcudart.so.13: cannot open shared object file`. Mobius main was failing the
+same way.
+
+**Fixes:**
+
+- Pinned the fast-integration GPU runtime to `onnxruntime-gpu<1.27`, resolving to
+  the CUDA-12-compatible 1.26.0 wheel.
+- Updated the Qwen3.5 DeltaNet integration test for Transformers 5.14's
+  dictionary-backed recurrent state.
+- Trimmed user-provided attention-type aliases before canonicalization, resolving
+  review feedback that whitespace could bypass the GQA fast-path gate.
+
+Local validation included 25 metadata tests passing and the previously failing
+DeltaNet test passing. The final PR run was fully green, including
+`Integration (fast)` (9m33s). The self-authored PR remained `BLOCKED` only by the
+ruleset's external team-approval requirement; after every check passed and the
+review thread was resolved, Justin's authorized admin bypass was used to merge.
+
+**Merged to mobius main:** `44bbfe01d55b4d0559f6fd6d9e2550d3d78b6bdc`
+
+## Hassan branch disposition
+
+**Blocked; not merged.** The branch's own test passes (`16 passed`), and the
+change is model-name-independent, but it is not coherent with #422's common
+decoder emitter. `write_onnx_genai_config()` already delegates every decoder
+path to `decoder_metadata_from_config()`. Hassan's added preemption calls
+`_activation_dtype_tag()`, which only checks `.dtype` and defaults to `fp32`.
+For a generic config with `compute_dtype=BFLOAT16` and no `.dtype`, merged main
+correctly infers `bfloat16`; Hassan's change overrides that with `float32`.
+Its test also expects legacy `fp16`, whereas #422 canonicalizes the emitted value
+to `float16`.
+
+This is a real correctness defect, so no PR was opened or merged. Per reviewer
+lockout, Hassan must not revise this artifact; a different agent should own any
+follow-up. The common decoder inference merged in #422 already reaches the
+auto-export entrypoint without duplicating dtype logic.
+
+## End-to-end verification
+
+On mobius main, a generic 8-head/2-KV-head FLOAT16 decoder emitted:
 
 ```yaml
-- name: inputs_embeds
-  dtype: fp16
-  rank: 3
-  shape:
-  - batch
-  - sequence_len
-  - 1536
-  source:
-    kind: dataflow
-    from: embedding.inputs_embeds
-```
-
-```yaml
-- name: per_layer_inputs
-  dtype: fp16
-  rank: 3
-  shape:
-  - batch
-  - sequence_len
-  - 8960
-  source:
-    kind: dataflow
-    from: embedding.per_layer_inputs
-```
-
-### Dataflow and every-step phases
-
-```yaml
-dataflow:
-- from: embedding.inputs_embeds
-  to: decoder.inputs_embeds
-  dtype: fp16
-  rank: 3
-  device_transfer: false
-- from: embedding.per_layer_inputs
-  to: decoder.per_layer_inputs
-  dtype: fp16
-  rank: 3
-  device_transfer: false
-- from: vision_encoder.image_features
-  to: embedding.image_features
-  dtype: fp16
-  rank: 2
-  device_transfer: false
-strategy:
-  kind: composite
-  stages:
-  - name: run_vision_encoder
-    strategy:
-      kind: single_pass
-      model: vision_encoder
-    run_on: prompt_only
-  - name: run_audio_encoder
-    strategy:
-      kind: single_pass
-      model: audio_encoder
-    run_on: prompt_only
-  - name: run_embedding
-    strategy:
-      kind: single_pass
-      model: embedding
-    run_on: every_step
-  - name: run_decoder
-    strategy:
-      kind: autoregressive
-      decoder: decoder
-    run_on: every_step
-phases:
-  decoder:
-    run_on: every_step
-  vision_encoder:
-    run_on: prompt_only
-  audio_encoder:
-    run_on: prompt_only
-  embedding:
-    run_on: every_step
-```
-
-### Representative typed KV declarations
-
-The metadata contains the corresponding key and value declarations for layers 0 through 14. These exact excerpts show both trailing dimensions:
-
-```yaml
-- name: past_key_values.0.key
-  dtype: fp16
-  rank: 4
-  shape:
-  - batch
-  - 1
-  - past_sequence_len
-  - 256
-  source:
-    kind: stateful
-    from: decoder.present.0.key
-    update: append
-```
-
-```yaml
-- name: past_key_values.4.key
-  dtype: fp16
-  rank: 4
-  shape:
-  - batch
-  - 1
-  - past_sequence_len
-  - 512
-  source:
-    kind: stateful
-    from: decoder.present.4.key
-    update: append
-```
-
-The parsed per-layer K/V trailing dimensions were:
-
-```text
-layer:    0   1   2   3   4   5   6   7   8   9  10  11  12  13  14
-head_dim: 256 256 256 256 512 256 256 256 256 512 256 256 256 256 512
-```
-
-Every key and value input and output is `dtype: fp16`, `rank: 4`.
-
-### Vision endpoints
-
-```yaml
-vision_encoder:
-  filename: vision_encoder/model.onnx
-  type: vision_encoder
-  io:
-    inputs:
-    - name: pixel_values
-      dtype: fp16
-      rank: 3
-      shape:
-      - batch
-      - num_patches
-      - 768
-      source:
-        kind: generated
-        generator: image_preprocessing
-    - name: pixel_position_ids
-      dtype: int64
-      rank: 3
-      shape:
-      - batch
-      - num_patches
-      - 2
-      source:
-        kind: generated
-        generator: image_preprocessing
-```
-
-```yaml
-outputs:
-- name: vision_encoder.pixel_values
-  content: pixels
-  dtype: fp16
-- name: vision_encoder.pixel_position_ids
-  content: patch_coordinates
-  dtype: int64
-  pad_value: -1
-```
-
-## Requested verification
-
-### 1. Decoder consumes both every-step embedding outputs — PASS
-
-Evidence:
-
-- `embedding.inputs_embeds -> decoder.inputs_embeds`, `dtype: fp16`, `rank: 3`.
-- `embedding.per_layer_inputs -> decoder.per_layer_inputs`, `dtype: fp16`, `rank: 3`.
-- Both decoder inputs declare their source as the matching embedding endpoint.
-- Decoder phase is `run_on: every_step`.
-
-### 2. Embedding emits/runs every step — PASS
-
-Evidence:
-
-- Embedding declares both `inputs_embeds` and `per_layer_inputs` outputs.
-- `run_embedding` stage is `run_on: every_step`.
-- `pipeline.phases.embedding.run_on` is `every_step`.
-
-### 3. All 15 typed mixed-dimension K/V pairs — PASS
-
-Programmatic metadata inspection found:
-
-```text
-kv_input_tensors=30
-kv_output_tensors=30
-kv_layers=15
-layers=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-kv_head_dims=[256, 512]
-```
-
-All 30 state inputs and all 30 state outputs explicitly declare `dtype: fp16` and `rank: 4`. Layers 4, 9, and 14 retain head dimension 512; the other layers retain 256.
-
-### 4. Typed vision endpoints — PASS
-
-Evidence:
-
-- `pixel_values`: fp16, rank 3, `[batch, num_patches, 768]`.
-- `pixel_position_ids`: int64, rank 3, `[batch, num_patches, 2]`.
-- The image preprocessor emits the exact qualified endpoints `vision_encoder.pixel_values` and `vision_encoder.pixel_position_ids` with matching dtypes.
-
-### 5. No model-name/model-type hardcoded contract assumptions — PASS
-
-Metadata grep:
-
-```bash
-grep -Ein '(^|[[:space:]])(model_name|model_type)[[:space:]]*:|google/gemma|gemma-4|E2B' \
-  inference_metadata.yaml
-```
-
-Result: no matches.
-
-A broader identity grep has one descriptive architecture value:
-
-```text
-13:  architecture: gemma4_text
-```
-
-This is the standard top-level architecture descriptor, not a pipeline/preprocessing/IO dispatch condition. The native metadata emitter itself contains no `gemma`, checkpoint ID, or E2B branch. Its sole `model_type` identifier is a generic helper parameter used to write component roles such as `vision_encoder`; all emitted ports, edges, phases, dtypes, ranks, shapes, KV geometry, and image bindings are derived structurally.
-
-## Closure and consumer validation
-
-The emitted declarations exactly matched the saved ONNX graph ports:
-
-```text
-closure_decoder=inputs_match:true outputs_match:true graph_inputs:34 declared_inputs:34 graph_outputs:31 declared_outputs:31
-closure_vision_encoder=inputs_match:true outputs_match:true graph_inputs:2 declared_inputs:2 graph_outputs:1 declared_outputs:1
-closure_audio_encoder=inputs_match:true outputs_match:true graph_inputs:2 declared_inputs:2 graph_outputs:2 declared_outputs:2
-closure_embedding=inputs_match:true outputs_match:true graph_inputs:3 declared_inputs:3 graph_outputs:2 declared_outputs:2
-```
-
-The current onnx-genai native consumer also parsed and resolved the package:
-
-```text
-runtime_parse=PASS models=4 model_paths=4 metadata=/home/justinchu/mobius/.scratch/gemma4-e2b-native/inference_metadata.yaml
-```
-
-## Native E2E gap
-
-The corrected emission itself is complete for the requested checks, and the native runtime loader accepts it. A normal image-only generation E2E remains blocked by the known optional-audio contract gap: this four-model checkpoint's embedding graph requires external rank-2 fp16 `embedding.audio_features`, while the audio encoder produces rank-3 features and is therefore correctly not connected by an incompatible guessed edge. A caller must provide compatible external audio features, or WP-B must add typed audio flattening/optional-modality/default semantics. Full ORT token generation was not claimed or run.
-
-<!-- source: .squad/decisions/inbox/roy-gemma4-e2b-topology.md -->
-### 2026-07-22: Gemma4 E2B emitted ONNX runtime topology
-**By:** Roy
-**What:** Exported the cached `google/gemma-4-E2B-it` checkpoint through Mobius task `gemma4` with fp16 CUDA-targeted optimization and captured the exact emitted ONNX and metadata contract. The real package is a **four-model** vision+audio+embedding+decoder topology, not the assumed three-model VLM topology.
-**Why:** Runtime work must be driven by the actual graph ports, dtypes, ranks, phases, and dataflow, not by reading `_gemma4.py` or adding model-name branches. This artifact identifies which generic primitives already exist in onnx-genai and which producer/runtime contracts still block real E2B execution.
-
-## Export result
-
-- **Status:** succeeded; no Mobius source changes.
-- **Mobius task:** `gemma4` (`Gemma4Task`).
-- **Duration:** 86 seconds.
-- **Output:** `/home/justinchu/gemma4-e2b-onnx`, 11,272,112,857 bytes (`du -sh`: 11G).
-- **External data:** default ONNX external-data files (`model.onnx.data`).
-- **Topology correction:** four ONNX models were emitted because the cached source config contains an audio tower: `vision_encoder`, `audio_encoder`, `embedding`, `decoder`.
-- **Assistant note:** `google/gemma-4-E2B-it-assistant` remains cached at `/home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it-assistant` for a later speculative-decoding test; it was not exported here.
-
-Exact working command:
-
-```bash
-cd /home/justinchu/mobius
-HF_HUB_OFFLINE=1 python3 -m mobius build --config /home/justinchu/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/70af34e20bd4b7a91f0de6b22675850c43922a03 --task gemma4 /home/justinchu/gemma4-e2b-onnx --dtype f16 --runtime onnx-genai --ep cuda --optimize
-```
-
-The CLI accepts `f16`/`float16`, not `fp16`. The initially preferred `--model google/gemma-4-E2B-it` offline path could not resolve the cache because `refs/main` points to an incomplete snapshot; using the complete local snapshot through `--config` kept the build fully offline.
-
-## Emitted ONNX I/O contract
-
-| Model file | Direction | Tensor | Dtype | Shape |
-|---|---|---|---|---|
-| `audio_encoder/model.onnx` | input | `input_features` | `FLOAT16` | `[batch, time, 128]` |
-| `audio_encoder/model.onnx` | input | `input_features_mask` | `BOOL` | `[batch, time]` |
-| `audio_encoder/model.onnx` | output | `audio_features` | `FLOAT16` | `[batch, floor(floor(time/2 - 1/2)/2) + 1, 1536]` |
-| `audio_encoder/model.onnx` | output | `audio_features_mask` | `BOOL` | `[batch, _d1]` |
-| `decoder/model.onnx` | input | `inputs_embeds` | `FLOAT16` | `[batch, sequence_len, 1536]` |
-| `decoder/model.onnx` | input | `attention_mask` | `INT64` | `[batch, past_seq_len + seq_len]` |
-| `decoder/model.onnx` | input | `per_layer_inputs` | `FLOAT16` | `[batch, sequence_len, 8960]` |
-| `decoder/model.onnx` | input | `past_key_values.0.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.0.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.1.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.1.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.2.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.2.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.3.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.3.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.4.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
-| `decoder/model.onnx` | input | `past_key_values.4.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
-| `decoder/model.onnx` | input | `past_key_values.5.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.5.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.6.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.6.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.7.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.7.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.8.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.8.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.9.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
-| `decoder/model.onnx` | input | `past_key_values.9.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
-| `decoder/model.onnx` | input | `past_key_values.10.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.10.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.11.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.11.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.12.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.12.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.13.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.13.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 256]` |
-| `decoder/model.onnx` | input | `past_key_values.14.key` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
-| `decoder/model.onnx` | input | `past_key_values.14.value` | `FLOAT16` | `[batch, 1, past_sequence_len, 512]` |
-| `decoder/model.onnx` | output | `logits` | `FLOAT16` | `[batch, sequence_len, 262144]` |
-| `decoder/model.onnx` | output | `present.0.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.0.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.1.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.1.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.2.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.2.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.3.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.3.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.4.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
-| `decoder/model.onnx` | output | `present.4.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
-| `decoder/model.onnx` | output | `present.5.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.5.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.6.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.6.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.7.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.7.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.8.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.8.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.9.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
-| `decoder/model.onnx` | output | `present.9.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
-| `decoder/model.onnx` | output | `present.10.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.10.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.11.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.11.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.12.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.12.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.13.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.13.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 256]` |
-| `decoder/model.onnx` | output | `present.14.key` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
-| `decoder/model.onnx` | output | `present.14.value` | `FLOAT16` | `[batch, 1, past_sequence_len + sequence_len, 512]` |
-| `embedding/model.onnx` | input | `input_ids` | `INT64` | `[batch, sequence_len]` |
-| `embedding/model.onnx` | input | `image_features` | `FLOAT16` | `[num_image_tokens, 1536]` |
-| `embedding/model.onnx` | input | `audio_features` | `FLOAT16` | `[num_audio_tokens, 1536]` |
-| `embedding/model.onnx` | output | `inputs_embeds` | `FLOAT16` | `[batch, sequence_len, 1536]` |
-| `embedding/model.onnx` | output | `per_layer_inputs` | `FLOAT16` | `[batch, sequence_len, 8960]` |
-| `vision_encoder/model.onnx` | input | `pixel_values` | `FLOAT16` | `[batch, num_patches, 768]` |
-| `vision_encoder/model.onnx` | input | `pixel_position_ids` | `INT64` | `[batch, num_patches, 2]` |
-| `vision_encoder/model.onnx` | output | `image_features` | `FLOAT16` | `[_d0*batch, 1536]` |
-
-## Generated `inference_metadata.yaml` (verbatim)
-
-```yaml
-required_capabilities:
-- kv_cache
-- grouped_query_attention
 model:
   attention:
-    type: grouped_query
-    num_attention_heads: 8
-    num_kv_heads: 1
-    head_dim: 256
-    sliding_window: 512
-  architecture: gemma4_text
-  max_sequence_length: 131072
-pipeline:
-  models:
-    vision_encoder:
-      filename: vision_encoder/model.onnx
-      type: vision_encoder
-    audio_encoder:
-      filename: audio_encoder/model.onnx
-      type: audio_encoder
-    embedding:
-      filename: embedding/model.onnx
-      type: encoder
-    decoder:
-      filename: decoder/model.onnx
-      type: decoder
-      tokenizer: tokenizer.json
-  dataflow:
-  - from: vision_encoder.image_features
-    to: embedding.image_features
-    dtype: fp16
-    device_transfer: false
-  - from: audio_encoder.audio_features
-    to: embedding.audio_features
-    dtype: fp16
-    device_transfer: false
-  - from: embedding.inputs_embeds
-    to: decoder.inputs_embeds
-    dtype: fp16
-    device_transfer: false
-  strategy:
-    kind: composite
-    stages:
-    - name: encode_vision
-      strategy:
-        kind: single_pass
-        model: vision_encoder
-      run_on: prompt_only
-    - name: encode_audio
-      strategy:
-        kind: single_pass
-        model: audio_encoder
-      run_on: prompt_only
-    - name: fuse_embeddings
-      strategy:
-        kind: single_pass
-        model: embedding
-      run_on: prompt_only
-    - name: decode
-      strategy:
-        kind: autoregressive
-        decoder: decoder
-      run_on: every_step
-  phases:
-    vision_encoder:
-      run_on: prompt_only
-    audio_encoder:
-      run_on: prompt_only
-    embedding:
-      run_on: prompt_only
-    decoder:
-      run_on: every_step
+    type: grouped_query_attention
+kv_cache:
+  native_dtype: float16
 ```
 
-## Runtime gap analysis
+The merged `decoder_metadata_test.py` and `auto_export_test.py` suites passed:
+`25 passed`.
 
-### Contract facts that replace assumptions
+**Summary:** Merged PR #422 as
+`44bbfe01d55b4d0559f6fd6d9e2550d3d78b6bdc`; all PR CI checks green. Hassan's
+branch was blocked and not merged because it can overwrite a correctly inferred
+`bfloat16` KV dtype with `float32`; that is the remaining blocker.
 
-1. **The export is four-model, not three-model.** The embedding graph requires both `image_features` and `audio_features`. The audio encoder emits rank-3 `audio_features` plus `audio_features_mask`, while embedding expects rank-2 `audio_features`; the emitted metadata routes the former directly and ignores the mask. An image-only run therefore needs either a generically selected vision-only export or declared optional-modality/default/reshape semantics.
-2. **Vision has two typed endpoints:** fp16 `pixel_values [B,N,768]` and int64 `pixel_position_ids [B,N,2]`. The generated YAML declares neither `preprocessing.image` outputs nor `pipeline.vision` expansion, so the server cannot construct or bind either endpoint from an image request.
-3. **Embedding produces two sequence-dependent decoder inputs:** fp16 `inputs_embeds [B,S,1536]` and fp16 `per_layer_inputs [B,S,8960]`. The YAML routes only `inputs_embeds` and marks embedding `prompt_only`; `per_layer_inputs` is therefore absent at decoder binding and neither output is refreshed during decode.
-4. **The optimized decoder has no `input_ids` and no `position_ids` input.** Its non-KV inputs are `inputs_embeds`, `attention_mask`, and `per_layer_inputs`, followed by 15 K/V pairs. A Gemma-specific position-ID workaround would be wrong for this artifact.
-5. **Metadata is not an executable closure over graph inputs.** It omits explicit component `io`, the `per_layer_inputs` edge, image preprocessing/expansion, optional modality semantics, and exact graph-derived KV declarations. A producer-side contract validator should reject this sidecar before packaging.
+<!-- source: .squad/decisions/inbox/iran-merge-roy-fusion.md -->
+### 2026-07-23: Merge Roy's generic lm_head fusion
+**By:** Iran
+**What:** Fast-forward merged fusion commit `0a2422d` cleanly to `origin/main`, then added the required `docs/PROGRESS.md` entry in commit `a933ffe`.
+**Why:** The branch was independently approved, already rebased, and verified as exactly one commit ahead of `origin/main`.
 
-### Known Leon VLM gaps, checked against current source and this export
+<!-- source: .squad/decisions/inbox/luba-joi-gemma4-review.md -->
+### 2026-07-23: Review of joi-gemma4-e2b (Gemma4-E2B native bench)
+**By:** Luba
+**Verdict:** 🟡 APPROVE-WITH-NITS
+**What:** Rebased onto `origin/main`; resolved the `docs/PROGRESS.md` conflict by retaining main, which already contains Joi's Gemma4-E2B entry. The patch was already present upstream, so the rebased branch now equals main at `cd7dfcf`. CUDA release build and bench-native clippy passed; crate-scoped fmt was clean. RULES grep found only the existing synthetic tokenizer fixture name, with no model-family runtime branching. The report's timings are internally coherent and it clearly distinguishes an ORT CUDA pipeline from pure-Rust native execution.
+**Why:** The harness is generic, compiles, guards against falsely reported CUDA runs, and its 7.138 ms/token and 140.09 tok/s figures agree. Non-blocking documentation nits: the dated report does not provide an explicit HBM-roofline comparison, and its remaining-gap wording predates the landed backend-neutral component interface/Native GAP 2, though pure-Rust pipeline decode is still correctly described as incomplete.
 
-| Area | Current onnx-genai support | What still blocks this package |
-|---|---|---|
-| Multi-endpoint vision inputs | **Generic primitive now exists.** The typed image program/server bundle resolves arbitrary named outputs, declared dtypes, packed/rank-3 tensors, and auxiliary coordinates (`state.rs` typed binding path; preprocess packed tests include Gemma-shaped pixels + positions). | Mobius emitted no typed image program, no endpoint bindings, and no `pipeline.vision` placeholder/expansion contract. The runtime must not fall back to literal `pixel_values` discovery or rank-4 assumptions. |
-| Generic `every_step` upstream execution | **Generic primitive now exists.** The engine topologically runs declared `every_step` components and routes all outputs; `vlm_multibinding_pipeline_e2e` proves two refreshed outputs plus simultaneous raw IDs. | The sidecar incorrectly marks embedding `prompt_only` and emits only one of two embedding→decoder edges. Fix emission; do not reintroduce a one-output or model-name special case. |
-| Decoder position-id rank/shape | **Generic declared position programs now exist.** | This optimized E2B decoder exposes **no position input**, so position generation is not a blocker for this model. Keep rank/axes metadata-driven for other VLMs; do not add a Gemma branch or invent `[1,S]`. |
-| Optional modality/audio path | Server audio discovery is still literal and Float32-only, while this graph declares fp16 `input_features` plus a bool mask. Prompt component execution requires every graph input. | Either export a generic vision-only package, or add typed optional-modality execution/defaults and audio tensor bundles/transforms. Direct rank-3 audio→rank-2 embedding routing is not executable as emitted. |
+<!-- source: .squad/decisions/inbox/mercer-cpu-moe-phase2.md -->
+### 2026-07-23: CPU grouped MoE Phase 2 acceptance
+**By:** Mercer
+**What:** CPU `MoE`, `QMoE`, and `BlockQuantizedMoE` now route the full token batch, group rows by active expert, and execute one expert computation per group. Multi-row groups use the shared CPU GEMM backend; single-row decode groups use the scalar GEMV path. Resident and mmap QMoE dequantize each active expert once per execution group, never the full all-expert tensor. `docs/MOE_SUPPORT.md` now marks Phase 1 partial and the CPU portion of Phase 2 complete without making a CUDA claim.
+**Why:** The prior documentation said Phase 2 was unimplemented, while the kernels existed but float MoE and resident QMoE still computed per token. Grouping closes that implementation gap and makes the documented CPU gate accurate.
 
-All follow-up changes must obey `RULES.md` §2: derive behavior from metadata, graph I/O, shapes, dtypes, registries, and explicit configuration; no `gemma4`/model-name dispatch, fixed 35-layer/280-patch constants, or semantic port-name guessing.
+**Gate evidence:**
+- **(a) Grouped, not per-token GEMM:** routing builds an expert-to-token task map. Each active expert receives one `run_expert_grouped` call. `M>1` uses shared GEMM; `M=1` uses GEMV without a per-token GEMM launch.
+- **(b) No full-expert dequantization:** QMoE and BlockQuantizedMoE dequantize only experts present in the route map, one expert at a time. `route_first_bounds_dequantized_residency_when_all_experts_are_selected` confirms peak route-first dequantized residency is one expert.
+- **(c) Measured benefit:** release ignored test measured dense-vs-grouped at 8 experts/top-2/H=128/I=256: decode M=1 4.31x (14.859 ms vs 3.447 ms over 50 iterations); prefill M=64 1.71x (34.550 ms vs 20.200 ms over 2 iterations).
 
-## Ordered minimal generic follow-up work packages
+**Genericity:** The required grep found only `moe_silu_with_fc3_uses_ort_mixtral_gated_form`, a test fixture name describing ORT compatibility. No model name appears in kernel control-flow logic.
 
-1. **WP-A — Mobius executable-contract emission (small/medium, exporter owner).** Introspect every graph port and emit explicit model `io`, exact KV pairs, all dataflow edges (including `embedding.per_layer_inputs -> decoder.per_layer_inputs`), and phase `embedding: every_step`. Emit typed image transforms/outputs and token expansion from processor config. Add a closure validator: every required ONNX input must be external, generated, stateful, defaulted, or fed by exactly one edge; every declared edge must match dtype/rank.
-2. **WP-B — Generic modality selection or optional-component/default semantics (medium, exporter + metadata/runtime).** For a vision request, either build a graph-derived vision-only package whose embedding has no audio input, or declare optional audio components and a typed zero/empty/default path. If audio remains, declare both fp16 features and bool mask plus the generic flatten/strip-padding transform required to satisfy the embedding rank-2 input. No model-family conditionals.
-3. **WP-C — Package admission/load gate (small, runtime loader/server).** Fail before model loading when preprocessing/vision expansion is absent, a required component input is unbound, phase/dataflow leaves a decoder input stale, or an edge has incompatible dtype/rank. Errors must name the exact component.port and instruct regeneration with a corrected native sidecar.
-4. **WP-D — Real E2B parity ladder (medium, validation owner; depends A-C).** With one fixed image/prompt, compare vision outputs, both embedding outputs, prefill logits, and one decode step against a Mobius/ORT reference; then perform the OpenAI image-chat smoke test. Assert that both sequence outputs refresh at decode and keep the emitted 15-pair mixed-256/512-head-dimension KV contract.
+**Tests and fixtures:**
+- Added `grouped_moe_matches_per_token_dense_fallback_for_eight_experts_top2`.
+- Added `grouped_int4_qmoe_matches_per_token_dense_fallback_for_eight_experts_top2`.
+- Added ignored reproducible release performance characterization for decode and prefill.
+- Existing external QMoE fixture generator uses `onnxscript.ir.Value`, `ir.Node`, `ir.Graph`, `ir.Model`, and `ir.to_proto`; no `onnx.helper.make_*` APIs are used.
+- `cargo test -p onnx-runtime-ep-cpu`: pass (650 unit tests plus 10 numeric regression tests; performance characterization ignored by default).
+- `cargo clippy -p onnx-runtime-ep-cpu --all-targets -- -D warnings`: pass.
+- `cargo fmt -p onnx-runtime-ep-cpu -- --check`: pass.
+- Release performance characterization: pass.
 
-No new decoder position work is required for this emitted E2B graph. The architecture-neutral position-program implementation remains necessary for models whose ONNX graph actually declares higher-rank position inputs.
+**Remaining gaps:** CUDA is intentionally unassessed and unchanged. CPU expert weights are transposed into GEMM-ready scratch per active multi-row expert; persistent prepacking is a future optimization, not an acceptance blocker. Broader Phase 1 Mobius/source-framework/fused-ORT packing parity remains outside this CPU-only change.
 
-## WP-A corrected export verification
+**Branch:** `squad/mercer-cpu-moe-phase2`
+**SHA:** `cc25ec741b0c891db5a7ddd1479d61b6eaf4932c`
 
-Re-exported from Mobius branch `vlm-wp-a-executable-contract` to
-`/home/justinchu/gemma4-e2b-onnx-wp-a` with the same offline command and `--dtype f16`.
-The persisted sidecar was revalidated against all four saved ONNX graphs:
-`CLOSURE_VALIDATION=PASS`, 15 K/V layers (30 state inputs and 30 state outputs), mixed
-trailing dimensions `[256, 512]`, and typed fp16 pixels + int64 patch coordinates.
+<!-- source: .squad/decisions/inbox/polokov-h200-survey.md -->
+### 2026-07-23: H200 native decode model survey
+**By:** Polokov
+**What:** Qwen2.5-0.5B INT4 measured 312.87 tok/s at 128 tokens, so it did not exceed the 380 tok/s RTX 4060 baseline (67.13 tok/s short). Llama Q4KM with an FP16 tied head reached 450.61 tok/s, consistent with the expected head-fusion win. Fully FP16 Llama reached only 44.35 tok/s and had the worst HBM roofline efficiency at 3.29%.
+**Why:** Median native CUDA decode results used 2 warmups and 3 runs on H200. Qwen, Llama Q4KM, and Llama FP16 reached 8.09%, 14.86%, and 3.29% of the first-order weight-streaming roofline, respectively; dense FP16 matmul/fusion selection is the largest optimization gap.
 
-```yaml
-dataflow:
-- from: embedding.inputs_embeds
-  to: decoder.inputs_embeds
-  dtype: fp16
-  rank: 3
-  device_transfer: false
-- from: embedding.per_layer_inputs
-  to: decoder.per_layer_inputs
-  dtype: fp16
-  rank: 3
-  device_transfer: false
-- from: vision_encoder.image_features
-  to: embedding.image_features
-  dtype: fp16
-  rank: 2
-  device_transfer: false
-strategy:
-  kind: composite
-  stages:
-  - name: run_vision_encoder
-    strategy: {kind: single_pass, model: vision_encoder}
-    run_on: prompt_only
-  - name: run_audio_encoder
-    strategy: {kind: single_pass, model: audio_encoder}
-    run_on: prompt_only
-  - name: run_embedding
-    strategy: {kind: single_pass, model: embedding}
-    run_on: every_step
-  - name: run_decoder
-    strategy: {kind: autoregressive, decoder: decoder}
-    run_on: every_step
-phases:
-  decoder: {run_on: every_step}
-  vision_encoder: {run_on: prompt_only}
-  audio_encoder: {run_on: prompt_only}
-  embedding: {run_on: every_step}
+<!-- source: .squad/decisions/inbox/roy-lmhead-fusion.md -->
+# Decision: generic fp16 tied-head fusion for native decode (Roy)
+
+- **Author:** Roy (CUDA/EP performance engineer)
+- **Date:** 2026-07-23
+- **Branch:** `squad/roy-lmhead-fusion`
+- **Commit SHA:** `71ab809c2a1fdc3b62e05ec04a98d7528b1cc2c3`
+- **Base (branch point):** `0c7be31` (origin/main was `cd7dfcf` at push time)
+- **Device:** NVIDIA H200 (~3.35 TB/s HBM), CUDA EP, native decode
+- **Status:** pushed, awaiting non-author review + cherry-pick (do NOT self-merge)
+
+## Problem
+
+Llama-3.2-1B-Instruct native decode = **97 tok/s** vs ORT **589 tok/s** (~6×
+gap) despite the full fast path (device-KV, CUDA graph, GQA shared buffer). The
+model has a **tied embedding / fp16 output head**: the fp16 `[vocab, hidden]`
+embedding weight is both `Gather`-ed for input embeddings *and* `Transpose`-d to
+`[hidden, vocab]` then fed to a **dense fp16 `MatMul`** every decode step.
+Qwen2.5/Qwen3 avoid this because their lm_head is a quantized `MatMulNBits`.
+
+Confirmed graph pattern (Q4_K_M export):
+```
+Transpose(model.embed_tokens.weight[128256,2048], perm=[1,0]) -> [2048,128256]
+MatMul(norm_out[1,2048], transposed[2048,128256]) -> logits[1,128256]   (fp16)
 ```
 
 The old rank-3 `audio_encoder.audio_features` → rank-2 `embedding.audio_features` edge
@@ -3954,3 +2910,141 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - TESTS (+11, all green): ep-cpu 817→823 (6 new: gate-true-only-on-structural-aliasing, rejects-f16, in-place==copy at spare/exact capacity, +rotary/local-window, prefill→decode boundary); engine +5 (tiny_decoder_matches_across_inplace_env_toggle env ON==OFF parity, decode_cpu_kv_state_declines_non_gqa_model, cpu_inplace_kv_max_len_env_parsing, ...). Pre-existing unrelated: 17 engine fixture-protobuf + 0 remaining control_flow (Sidle fixed).
 - FOLLOW-UP (documented, not required for correctness): graceful capacity fallback when generation exceeds max_len (today errors like CUDA) — hook at decode_cpu_inplace capacity check.
 **Why:** General (structural gate, not model-name), parity-clean, well-tested closure of the input-side KV bandwidth bottleneck; the single biggest remaining CPU decode win. Merged to PR #105.
+## Root cause (profiled, native decode trace @32 tokens)
+
+| op | total | n | avg/step |
+|----|------:|--:|---------:|
+| **Transpose** | 311.3 ms | 32 | **9.73 ms** (re-transpose ~525 MB fp16 const every step) |
+| **MatMul** | 66.7 ms | 32 | **2.08 ms** (dense fp16 GEMV, cuBLASLt, non-capturable) |
+| GroupQueryAttention | 54.3 ms | 32 | 1.70 ms |
+| MatMulNBits ×14 | 27.4 ms | 224 | 0.12 ms |
+
+The per-step `Transpose` over a half-GB constant dominated; the dense fp16 GEMV
+was second. Both re-do work on a constant weight every token.
+
+## What I implemented (both generic, EP-internal, RULES §2/§2.1)
+
+Detected by **op topology + tensor roles + dtype/shape**, never by model name.
+Both live in `crates/onnx-runtime-ep-cuda`.
+
+### 1. Constant-`Transpose` folding — `CudaFoldConstantTranspose` (new EP pass)
+- Pattern: `Transpose` (domain `""`/`ai.onnx`, 1 in / 1 out) whose single input
+  is a **producer-less graph initializer** with a whole-byte element type.
+- Action: materialize the permuted bytes once at EP claim/compile time into a new
+  inline initializer (via `PassContext::initializer_bytes`, which resolves the
+  external mmap), rewire consumers, delete the node — mirroring the generic
+  `ConstantFolding` rewrite. Byte-wise permutation is exact for any rank / `perm`.
+- Guards (no magic dims): whole-byte dtype only (sub-byte int4/… skipped),
+  producer-less initializer only, valid `perm` (default = reversed axes).
+- Tied weights stay correct: the original initializer is untouched for its other
+  consumers (the `Gather`). New pass runs first in `cuda_optimization_passes()`.
+
+### 2. Dense fp16 M==1 GEMV fast path — in `MatMulKernel`
+- Pattern: dense **fp16**, **M==1**, single-matrix (no batch) MatMul.
+- Kernel `matmul_dense_gemv_f16` (NVRTC, compiled to the device's own SM →
+  portable across all architectures): one thread per output column, so a warp
+  reads consecutive `B[k, col]` fp16 values — fully coalesced, one streaming pass
+  over `B` at ≈ HBM roofline. Activation staged in shared memory per K-tile
+  (bounded to `blockDim.x` floats → any K); fp32 accumulate (matches cuBLASLt),
+  single fp16 round. `col < n` guard → any N.
+- Capture: needs no workspace/heuristic/sync, so it is **capture-safe** and folds
+  into the decode CUDA graph (verified `capture_status: captured`), unlike the
+  cuBLASLt path. The kernel advertises `CaptureSupport::Supported` only when the
+  last call took the GEMV (mirrors the `MatMulNBits` decode-GEMV contract).
+
+## Results — Llama-3.2-1B (Q4_K_M, fp16 tied head), H200, steady decode
+
+| stage | @128 tok/s | @1024 tok/s | ms/step @128 |
+|-------|-----------:|------------:|-------------:|
+| baseline (origin/main) | **97.5** | ~97 | 10.26 |
+| + Transpose fold | 409.4 | — | 2.44 |
+| + fp16 GEMV | **449.1** | **438.3** | 2.23 |
+
+**97 → 449 tok/s @128 (4.6×), 438 @1024.** Greedy token IDs byte-identical to
+baseline at every stage → coherent (emits valid code/text). Remaining gap to ORT
+(589) is now in GQA / MatMulNBits / norm, not the head.
+
+Post-fix op trace: `Transpose` gone; decode `MatMul` no longer appears as an
+eager op — it is captured into the graph.
+
+## No regression — Qwen2.5-0.5B (int4, quantized `MatMulNBits` head)
+
+Qwen's graph has **no `Transpose` and no dense `MatMul`** (verified by trace), so
+neither optimization can fire. Same command / same machine, baseline vs branch:
+
+| model | @128 (base → branch) | @1024 (base → branch) |
+|-------|---------------------:|----------------------:|
+| qwen2.5-0.5b-int4-onnx-native | 314.0 → 313.5 | 84.89 → 84.90 |
+
+Identical within run-to-run noise → no regression. (Machine's Qwen numbers differ
+from the ~577/498 cited in the brief; the invariant proven here is *no
+regression*, and the paths are structurally inert for Qwen.)
+
+## Tests added
+
+- `onnx-runtime-ep-cuda` lib (`src/optimizer.rs`) — pattern-level, model-agnostic:
+  `folds_constant_transpose_into_initializer`, `folds_constant_transpose_default_perm`,
+  `folds_rank3_constant_transpose`, `leaves_transpose_of_non_constant`,
+  `leaves_sub_byte_constant_transpose`. (20/20 optimizer unit tests pass.)
+- GPU integration (`tests/matmul_gpu.rs`): `matmul_f16_gemv_on_gpu_matches_cpu_reference`
+  (K=259, N=300 non-square GEMV vs CPU reference; asserts capture support). 3/3 pass.
+
+## Validation run
+
+- `cargo fmt -p onnx-runtime-ep-cuda` (changed crate only).
+- `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings`: **clean**
+  for the crate lib (my changed files have zero findings; baseline is also clean).
+  Note: `--all-targets` surfaces **pre-existing** clippy debt in unrelated GPU test
+  files (`group_query_attention_gpu.rs`, `compressed_sparse_attention_gpu.rs`,
+  `matmul_nbits_gpu.rs`, …) and `#[cfg(test)]` blocks in `gqa_decode*.rs` /
+  `normalization.rs` — not touched by this change.
+- Changed-crate unit tests + `matmul_gpu` integration tests: pass.
+
+## Files changed
+
+- `crates/onnx-runtime-ep-cuda/src/optimizer.rs` — new pass + 5 unit tests.
+- `crates/onnx-runtime-ep-cuda/src/kernels/matmul.rs` — GEMV kernel + M==1 dispatch + capture.
+- `crates/onnx-runtime-ep-cuda/tests/matmul_gpu.rs` — fp16 GEMV GPU test.
+- `docs/benchmarks/llama-3.2-1b-lmhead-fusion-2026-07-23.md` — bench doc.
+
+## Follow-ups (out of scope here)
+
+- The `Transpose`-fold is generic enough to consider promoting into the shared
+  optimizer for all EPs; kept EP-internal per RULES §2.1 for now.
+- Next native-decode bottlenecks are GQA and the stacked `MatMulNBits` GEMVs.
+
+---
+**Summary (plain text):** Llama-3.2-1B native decode **97 → 449 tok/s @128
+(438 @1024)**, byte-identical greedy tokens. Two generic, pattern-matched,
+EP-internal wins: (1) fold any `Transpose(constant-initializer)` into a
+pre-transposed constant at claim time; (2) route dense fp16 M==1 MatMul to a
+portable, capture-safe, roofline-oriented GEMV. Detected by topology + dtype +
+shape, **no model names**. Qwen2.5-0.5B (quantized head) unchanged → **no
+regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
+
+<!-- source: .squad/decisions/inbox/voight-mercer-moe-review.md -->
+### 2026-07-23: Review of mercer CPU grouped MoE Phase 2
+**By:** Voight
+**Verdict:** 🔴 REJECT
+**What:** CPU grouped execution and route-first dequantization are implemented and performant, but the support document contains contradictory, false implementation-status claims.
+**Evidence:** `cargo test -p onnx-runtime-ep-cpu` passed; both named grouped differential tests and the all-experts residency test passed and genuinely exercise grouped/reference paths. Code inspection confirms an expert→token `BTreeMap`, one `run_expert_grouped` call per active expert, shared GEMM for M>1, and scalar GEMV for M=1. QMoE and BlockQuantizedMoE slice/dequantize routed experts inside the expert loop; the zero-cache residency test reports one expert, though its metric is explicitly recorded as `1` rather than lifetime-derived. Genericity grep found no architecture-dependent kernel control flow (only a Mixtral test name and llama.cpp compatibility/test references). Clippy and crate-scoped fmt passed. Release ignored test passed with 3.81x decode and 1.90x prefill speedups. `docs/MOE_SUPPORT.md` lines 3-6 and 161-163 still say fused/grouped CPU MoE/QMoE are unimplemented/unregistered, contradicting lines 479 and 518-555 and the code; CUDA is not claimed complete in the Phase 2 section.
+**If REJECT:** Deckard should revise the contradictory status/architecture sections and strengthen residency accounting so the test observes actual concurrent dequantized-expert lifetime rather than a hard-coded window value; Mercer is locked out.
+
+<!-- scribe-merge-2026-07-23T04-08-59Z-cuda-indexshare-f16attention (merged manually by coordinator; Scribe agent stuck in canary loop) -->
+## 2026-07-23 — CUDA IndexShare + f16 Attention; plus prior-session backlog (Qwen split-K, CPU MoE docs, mobius #423)
+
+### This session (CUDA perf + GLM/DeepSeek)
+
+**f16 CUDA standard Attention — LANDED (`07e4c80`, main).** By Roy. CUDA standard `Attention` now accepts homogeneous f32 or f16 Q/K/V, paired cache tensors, and f16 additive masks (incl. -inf/-65504), writing Y/present-KV/optional-QK in the selected dtype. All score/softmax/value reductions retain fp32 accumulation. bf16 deliberately still rejected (follow-up). Closes the GLM/DeepSeek "Attention f32-only" dtype-coverage gap (`docs/GLM_READINESS_GAPS.md`) and halves activation/KV bandwidth for real fp16 exports. **Reviewer Gaff 🟡→addressed:** initial parity test tolerance (3e-3) too loose to guard fp32-accumulation; Roy hardened `standard_attention_fp16_gpu.rs` — exact f16-rounded CPU oracle, seq=32/head=64, checks Y+present-KV+QK, tolerance 3e-4; **mutation test confirms guard** (forcing f16 score accumulation → QK err 3.996e-4 > tol → FAIL). Merged max|Δ|: prefill Y 1.94e-4, decode Y 2.99e-5, caches bit-exact.
+
+**Device-resident CUDA IndexShare v1 — LANDED (`1304707`+`0828abb`, main).** By Keaton. New device-resident CUDA kernel for `pkg.nxrt::IndexShare` v1 (GLM-5.2 IndexShare / DeepSeek DSA selected-token attention); previously CPU-only. Two NVRTC kernels: `build_present` (device past⧺current KV concat, bit-identical to CPU) and `index_share_row` (per-`(batch,q_head,query)` selected-token gather, scaled QK, additive bias, stable fp32 softmax, prob·value sum). Only `selected_indices` goes D2H for deterministic ONNX validation (SparseKvGather precedent); Q/K/V/bias/present-cache/output stay device-resident. Claim gate delegates to CPU oracle's `unsupported_reason` (made `pub`) for identical cross-backend gating. `cuda_graph_compatible()==false` (D2H index sync; full capture is a follow-up needing device-resident index validation). **Reviewer Chew 🟡→addressed:** independently re-ran 6 parity tests green on H200 (max|Δ|≤2.4e-7), traced kernel vs oracle line-by-line (numerics/indexing/GQA grouping/KV threading/memory-safety/capture all correct). One contract bug fixed: rank-0 scalar `attention_bias` was claimed (CPU accepts) but hard-failed at CUDA execution — Keaton now accepts rank-0 as broadcast scalar, added `scalar_bias_broadcasts_and_matches_cpu` (bit-exact), CPU/CUDA claim parity aligned. **7 GPU parity tests pass.**
+
+**Integration verified on merged main:** index_share_gpu 7/7, standard_attention_fp16_gpu 1/1, standard_attention_gpu 23/23, `cargo clippy -p onnx-runtime-ep-cuda --features cuda -D warnings` clean.
+
+**Remaining GLM/DeepSeek follow-ups:** CUDA-graph capture for IndexShare (device-side index validation); f16/bf16 IndexShare storage variants (v1 CPU oracle f32-only); bf16 standard Attention; Mobius fused QMoE/BlockQuantizedMoE emitter; MTP state threading.
+
+### Prior-session backlog (already landed to main; merged for the record)
+
+- **Qwen2.5-0.5B O(seq) decode collapse fixed (`798d430`, Irmgard; landed by Sadik; reviewed 🟢 Borogrove/re-benched Marsten).** Root cause: f32 KV graph selected the single-warp-per-row f32 GQA decode kernel that serially walked full context. Fix: capture-safe 1/2/4/8/16-way split-K online-softmax kernel + merge, selected purely by dtype/shape. Qwen 313→460 tok/s @128, 84→448 @1024; Llama Q4KM flat; generic (no model-name), capture-safe, SM-portable. Marsten H200 re-bench: Qwen0.5B 459/446, 1.5B 486/460, 7B 230/223, Llama-1B Q4KM 450/439 tok/s.
+- **CPU MoE Phase 2 landed (`dc0cc18`, Sloat) + MOE_SUPPORT.md §6.2 honesty fix (Sapper; Voight 🔴→🟢).** Route-first int4 QMoE (peak-1-expert residency via RAII guard), grouped-expert GEMM (4.12x decode / 1.83x prefill), doc now correctly states CPU MoE/QMoE/BlockQuantizedMoE implemented + registered, CUDA incomplete. 648 CPU unit tests pass.
+- **Mobius PR #423 (DeepSeek MoE Phase 1 conformance) CI remediation (Abdul).** Ruff lint + codecov fixed; Integration/L4/L5 jobs fail on infra (`libcudart.so.13` missing on runner, identical on main). PR remains OPEN/UNMERGED for Justin.

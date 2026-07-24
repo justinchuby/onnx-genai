@@ -18,6 +18,8 @@ pub mod fim;
 pub(crate) mod kv_bridge;
 pub mod logits;
 #[cfg(feature = "native-backend")]
+pub mod native_component;
+#[cfg(feature = "native-backend")]
 pub mod native_decode;
 #[cfg(feature = "native-backend")]
 pub(crate) mod native_speculative;
@@ -44,6 +46,8 @@ pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
 };
+#[cfg(feature = "native-backend")]
+pub use native_component::NativeComponentSession;
 #[cfg(feature = "native-backend")]
 pub use native_decode::{
     CudaGraphDebugStats, CudaKvDebugStats, NativeDecodeCudaOptions, NativeDecodeDevice,

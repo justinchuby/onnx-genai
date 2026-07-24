@@ -19,7 +19,9 @@
 
 use std::fmt::Write as _;
 
-use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, NodeId, Shape, ValueId, WeightRef};
+use onnx_runtime_ir::{
+    Attribute, DataType, Dim, Graph, NodeId, Shape, ValueId, WeightRef, is_default_domain,
+};
 
 use crate::model::Model;
 
@@ -142,7 +144,7 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
         .join(", ");
 
     // Op name, qualified with a non-default domain.
-    let op = if node.domain.is_empty() || node.domain == "ai.onnx" {
+    let op = if is_default_domain(&node.domain) {
         node.op_type.clone()
     } else {
         format!("{}.{}", node.domain, node.op_type)

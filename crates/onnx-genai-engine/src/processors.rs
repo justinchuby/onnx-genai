@@ -22,6 +22,7 @@ pub(crate) fn build_processor_chain(
     if options.repetition_penalty != 1.0 {
         chain.add(Box::new(RepetitionPenaltyProcessor {
             penalty: options.repetition_penalty,
+            window: options.repetition_window,
         }));
     }
 

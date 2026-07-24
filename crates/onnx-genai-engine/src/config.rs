@@ -711,6 +711,9 @@ pub struct GenerateOptions {
     pub min_p: f32,
     /// Repetition penalty applied to prompt and generated tokens. Values <= 1 disable it.
     pub repetition_penalty: f32,
+    /// When `Some(n)`, the repetition penalty only considers the most recent `n`
+    /// tokens of the combined prompt+generated stream. `None` uses the whole history.
+    pub repetition_window: Option<usize>,
     /// OpenAI-style count penalty: logit[t] -= frequency_penalty * count(t).
     pub frequency_penalty: f32,
     /// OpenAI-style presence penalty: logit[t] -= presence_penalty once if seen.
@@ -751,6 +754,7 @@ impl Default for GenerateOptions {
             top_k: 0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            repetition_window: None,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             greedy: true,

@@ -140,6 +140,80 @@ model:
 }
 
 #[test]
+fn mixture_of_experts_contract_parses_structurally() {
+    let yaml = r#"
+model:
+  mixture_of_experts:
+    representation: dense_fallback
+    routed_expert_count: 8
+    shared_expert_count: 1
+    experts_per_token: 2
+    expert_intermediate_size: 256
+    shared_expert_intermediate_size: 256
+    activation: silu
+    router:
+      score_function: sigmoid
+      selection_method: grouped_top_k
+      normalize_weights: true
+      scaling_factor: 2.5
+      group_count: 4
+      groups_per_token: 2
+      group_score: top_2_sum
+"#;
+    let metadata: InferenceMetadata = serde_yaml::from_str(yaml).expect("MoE metadata parses");
+    let moe = metadata
+        .model
+        .expect("model section")
+        .mixture_of_experts
+        .expect("mixture_of_experts section");
+
+    assert_eq!(moe.representation, "dense_fallback");
+    assert_eq!(moe.routed_expert_count, 8);
+    assert_eq!(moe.shared_expert_count, 1);
+    assert_eq!(moe.experts_per_token, 2);
+    assert_eq!(moe.expert_intermediate_size, 256);
+    assert_eq!(moe.shared_expert_intermediate_size, 256);
+    assert_eq!(moe.router.score_function, "sigmoid");
+    assert_eq!(moe.router.selection_method, "grouped_top_k");
+    assert_eq!(moe.router.group_count, Some(4));
+    assert_eq!(moe.router.groups_per_token, Some(2));
+    assert_eq!(moe.router.group_score.as_deref(), Some("top_2_sum"));
+
+    let value: serde_json::Value = serde_yaml::from_str(yaml).expect("MoE YAML converts to JSON");
+    schema_validator()
+        .validate(&value)
+        .expect("complete grouped router validates against the schema");
+}
+
+#[test]
+fn mixture_of_experts_grouped_router_requires_group_contract() {
+    let value = serde_json::json!({
+        "model": {
+            "mixture_of_experts": {
+                "representation": "dense_fallback",
+                "routed_expert_count": 8,
+                "shared_expert_count": 0,
+                "experts_per_token": 2,
+                "expert_intermediate_size": 256,
+                "shared_expert_intermediate_size": 0,
+                "activation": "silu",
+                "router": {
+                    "score_function": "sigmoid",
+                    "selection_method": "grouped_top_k",
+                    "normalize_weights": true,
+                    "scaling_factor": 1.0
+                }
+            }
+        }
+    });
+
+    assert!(
+        schema_validator().validate(&value).is_err(),
+        "grouped_top_k without group dimensions must fail schema validation"
+    );
+}
+
+#[test]
 fn attention_key_sequence_lengths_rejects_unknown_scalar_broadcast() {
     let error = serde_yaml::from_str::<InferenceMetadata>(
         r#"

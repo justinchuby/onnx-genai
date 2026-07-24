@@ -868,6 +868,15 @@ pub(crate) struct Executor {
     /// for (a shape-varying loop body — rare).
     subgraph_execs: HashMap<(NodeId, String), ChildExecutor>,
     control_flow_stats: ControlFlowStats,
+    /// Per-`If` memo of the last observed branch predicate. During steady decode
+    /// a loop-invariant `If` (e.g. the LongRoPE cos/sin cache selector) keeps the
+    /// same predicate every step, so its branch outputs are already resident in
+    /// their persistent buffers. The predicate is still read each step (the
+    /// correctness guard); only the redundant branch re-execution — here two
+    /// `Constant` materializations plus their host→device cache copies — is
+    /// skipped. A predicate flip re-runs the branch (and, on an output-shape
+    /// change, retires the captured graph via the existing seam invalidation).
+    if_last_predicate: HashMap<NodeId, bool>,
     device_graph_signature: Option<Vec<DeviceBindingSignature>>,
     /// The captured-segment schedule from the most recent successful capture,
     /// reused to interleave segment replays with eager seam nodes on each
@@ -876,6 +885,23 @@ pub(crate) struct Executor {
     /// Structured segment-boundary reasons from the most recent capture, retained
     /// for diagnostics after `capture_schedule` is taken for replay.
     capture_segmentation: Vec<CaptureDecline>,
+    /// Output value ids of every control-flow (`If`/`Loop`/`Scan`) node. ONNX
+    /// shape inference cannot statically resolve a control-flow output whose
+    /// branches declare different shapes (e.g. LongRoPE's `If` selecting a short
+    /// vs. long RoPE cos/sin cache), so such outputs stay symbolic and any
+    /// downstream capturable kernel that reads one would form a per-consumer
+    /// eager seam. Within a decode generation the selected branch is stable, so
+    /// [`Self::seed_control_flow_capture_shapes`] seeds each output's concrete
+    /// shape from the prior run for capture planning, folding those consumers
+    /// back into captured segments. Computed once at build.
+    control_flow_output_values: HashSet<ValueId>,
+    /// Concrete control-flow output shapes the most recent capture assumed (a
+    /// snapshot of the seeded shapes from [`Self::control_flow_output_values`]).
+    /// On replay the control-flow seam re-executes eagerly; if it now produces a
+    /// different shape (a branch flip, e.g. LongRoPE short↔long at the context
+    /// threshold) the installed graph's baked device pointers are stale, so the
+    /// step falls back to eager and the graph is retired for re-capture.
+    capture_cf_shapes: HashMap<ValueId, Vec<usize>>,
     /// Run-scoped zero-copy **view** metadata (§5.4). A value id present here is
     /// a strided view aliasing another value's buffer (a layout/movement-op
     /// output such as `Slice`) rather than an owner in [`Self::buffers`]. Built
@@ -1174,23 +1200,13 @@ fn checked_storage_bytes(
 }
 
 /// The effective operator-set version governing `node` — the graph's imported
-/// opset for the node's domain. The default ONNX domain is spelled both `""`
-/// and `"ai.onnx"`; both map to the same import. Loader and programmatic session
-/// entry points validate this invariant before executor construction.
+/// opset for the node's domain. Loaded IR is canonical (the default domain is
+/// `""`, never `"ai.onnx"`; see [`onnx_runtime_ir::normalize_domain`]), so the
+/// node's domain keys directly into the opset-import map.
 fn effective_opset(graph: &Graph, node: &Node) -> u64 {
-    let domain = node.domain.as_str();
     graph
         .opset_imports
-        .get(domain)
-        .or_else(|| {
-            if domain.is_empty() {
-                graph.opset_imports.get("ai.onnx")
-            } else if domain == "ai.onnx" {
-                graph.opset_imports.get("")
-            } else {
-                None
-            }
-        })
+        .get(node.domain.as_str())
         .copied()
         .unwrap_or_else(|| {
             unreachable!(
@@ -1264,6 +1280,16 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
         && matches!(input_index, 3 | 4)
 }
 
+fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
+    // Persistent decode masks have a zero-filled suffix. Capacity-oriented
+    // graphs intentionally read Shape at the allocation extent and ReduceSum is
+    // unchanged by that suffix; prefix-sensitive transforms such as CumSum must
+    // instead see the logical valid length.
+    node.is_default_domain()
+        && input_index == 0
+        && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
+}
+
 /// Recompute the output shape of standard elementwise broadcasting ops from
 /// their concrete runtime inputs. Loader inference is only a prior: a
 /// data-dependent upstream value may acquire a different live shape.
@@ -1271,7 +1297,7 @@ fn runtime_elementwise_output_shape(
     node: &Node,
     input_shapes: &[Vec<usize>],
 ) -> Option<std::result::Result<Vec<usize>, onnx_runtime_ir::IrError>> {
-    if !(node.domain.is_empty() || node.domain == "ai.onnx") {
+    if !node.is_default_domain() {
         return None;
     }
 
@@ -1317,7 +1343,7 @@ fn dynamic_output_shapes(
         // per-axis element count mirrors the `Slice` kernel's clamp semantics
         // exactly (ONNX reference), so the buffer we size here matches what the
         // kernel writes.
-        "Slice" if node.domain.is_empty() || node.domain == "ai.onnx" => {
+        "Slice" if node.is_default_domain() => {
             let data_shape = input_shapes.first()?;
             let starts = input_values.get(1)?.as_ref()?;
             let ends = input_values.get(2)?.as_ref()?;
@@ -1419,12 +1445,7 @@ fn dynamic_output_shapes(
                 })
                 .collect::<Option<Vec<_>>>()?;
             let mut imports = HashMap::new();
-            let domain = if node.domain == "ai.onnx" {
-                String::new()
-            } else {
-                node.domain.clone()
-            };
-            imports.insert(domain, opset);
+            imports.insert(node.domain.clone(), opset);
             let mut interner = SymbolInterner::new(0x8000_0000);
             static REGISTRY: std::sync::OnceLock<InferenceRegistry> = std::sync::OnceLock::new();
             REGISTRY
@@ -1455,7 +1476,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         .iter()
         .filter_map(|(id, node)| {
             (node.op_type == "Sigmoid"
-                && (node.domain.is_empty() || node.domain == "ai.onnx")
+                && node.is_default_domain()
                 && node.inputs.len() == 1
                 && node.outputs.len() == 1)
                 .then_some(id)
@@ -1481,7 +1502,7 @@ fn fuse_silu_patterns(graph: &mut Graph) -> usize {
         let mul_id = consumers[0];
         let mul = graph.node(mul_id);
         if mul.op_type != "Mul"
-            || !(mul.domain.is_empty() || mul.domain == "ai.onnx")
+            || !mul.is_default_domain()
             || mul.inputs.len() != 2
             || mul.outputs.len() != 1
             || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
@@ -1974,6 +1995,19 @@ impl Executor {
             }
         }
 
+        // Output value ids of every control-flow node, used to seed their
+        // concrete (branch-selected) shapes into the capture plan so downstream
+        // capturable consumers do not each form an eager seam.
+        let mut control_flow_output_values: HashSet<ValueId> = HashSet::new();
+        for &nid in &order {
+            let node = graph.node(nid);
+            if is_control_flow_op(&node.op_type, &node.domain) {
+                for &out in &node.outputs {
+                    control_flow_output_values.insert(out);
+                }
+            }
+        }
+
         // 3) Build the structural per-node plan.
         let mut plan = Vec::with_capacity(order.len());
         for &nid in &order {
@@ -2052,9 +2086,12 @@ impl Executor {
             name_index,
             subgraph_execs: HashMap::new(),
             control_flow_stats: ControlFlowStats::default(),
+            if_last_predicate: HashMap::new(),
             device_graph_signature: None,
             capture_schedule: None,
             capture_segmentation: Vec::new(),
+            control_flow_output_values,
+            capture_cf_shapes: HashMap::new(),
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
@@ -2253,11 +2290,13 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
-        let expose_logical_input_shape = output_name.is_some()
-            && self
-                .input_index
-                .get(&input_name)
-                .is_none_or(|&vid| !self.binding_consumers_use_physical_capacity(vid));
+        let expose_logical_input_shape = self.input_index.get(&input_name).is_none_or(|&vid| {
+            if output_name.is_some() {
+                !self.binding_consumers_use_physical_capacity(vid)
+            } else {
+                !self.binding_consumers_use_padded_capacity(vid)
+            }
+        });
         DeviceIoBinding::allocate(
             self.ep.clone(),
             input_name,
@@ -2298,6 +2337,22 @@ impl Executor {
                 }
                 found = true;
                 if !kernel_input_uses_physical_capacity(self.graph.node(plan.node_id), slot) {
+                    return false;
+                }
+            }
+        }
+        found
+    }
+
+    fn binding_consumers_use_padded_capacity(&self, input: ValueId) -> bool {
+        let mut found = false;
+        for plan in &self.plan {
+            for (slot, value) in plan.inputs.iter().enumerate() {
+                if *value != Some(input) {
+                    continue;
+                }
+                found = true;
+                if !kernel_input_uses_padded_capacity(self.graph.node(plan.node_id), slot) {
                     return false;
                 }
             }
@@ -2515,7 +2570,14 @@ impl Executor {
         }
     }
 
-    pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<()> {
+    /// Replay the installed device graph for one decode step. Returns `true` when
+    /// the graph remains installed and valid for the next step, or `false` when a
+    /// control-flow branch flip retired it mid-step (the token was still produced
+    /// correctly via an eager fallback) and the caller must re-warm/re-capture.
+    pub(crate) fn replay_device_graph(
+        &mut self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<bool> {
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.device_graph_signature.as_ref() != Some(&signature) {
@@ -2536,10 +2598,12 @@ impl Executor {
             .is_none_or(CaptureSchedule::is_single_graph);
         if single_graph {
             self.ep.replay_device_graph()?;
-            return Ok(());
+            return Ok(true);
         }
         match self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay)? {
-            ScopedRunResult::Executed(_) => Ok(()),
+            // `run_scoped_mode` clears `capture_schedule` when a branch flip
+            // retired the graph this step; report that so the caller re-arms.
+            ScopedRunResult::Executed(_) => Ok(self.capture_schedule.is_some()),
             ScopedRunResult::NotCapturable(reason) => {
                 self.reset_device_graph()?;
                 Err(SessionError::Internal(format!(
@@ -2552,6 +2616,7 @@ impl Executor {
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
         self.device_graph_signature = None;
         self.capture_schedule = None;
+        self.capture_cf_shapes.clear();
         Ok(self.ep.reset_device_graph()?)
     }
 
@@ -2788,7 +2853,15 @@ impl Executor {
             let _s = phase_span!("run_scoped.resolve_soft");
             let mut resolved = self.resolve_soft(&bindings);
             if mode != RunMode::Eager {
+                // Persistent bindings seed the kernel-visible geometry selected by
+                // their input/output contracts. Seed only unresolved values:
+                // statically/symbolically resolved shapes remain authoritative.
                 external.seed_capture_shapes(&mut resolved);
+                // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
+                // shape inference but stable within a generation: seed their concrete
+                // prior-run shape so downstream capturable consumers fold into
+                // captured segments instead of forming per-consumer eager seams.
+                self.seed_control_flow_capture_shapes(&mut resolved);
             }
             resolved
         };
@@ -2835,6 +2908,12 @@ impl Executor {
                 self.run_plan_eager(&mut resolved, outer_scope, external)?;
             }
             RunMode::Capture => {
+                // A fresh capture may have resized/reallocated the `If` output
+                // buffers, so force every `If` to actually execute its branch
+                // this run (repopulating those buffers) rather than trusting the
+                // steady-decode memo. Cleared before segmentation so the branch
+                // runs as a normal eager seam during the capture pass.
+                self.if_last_predicate.clear();
                 // Partition the claimed subgraph into maximal capturable segments
                 // separated by non-capturable seam nodes. Only a graph-level hard
                 // decline (e.g. no persistent output binding, or nothing
@@ -2853,12 +2932,21 @@ impl Executor {
                     let _ = self.ep.reset_device_graph();
                     self.capture_schedule = None;
                     self.capture_segmentation.clear();
+                    self.capture_cf_shapes.clear();
                     return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
                         CaptureDecline::graph(format!(
                             "segmented CUDA graph capture failed: {error}"
                         )),
                     )));
                 }
+                // Snapshot the concrete control-flow output shapes this capture
+                // assumed so a later replay can detect a branch flip that changes
+                // them and retire the now-stale installed graph.
+                self.capture_cf_shapes = self
+                    .control_flow_output_values
+                    .iter()
+                    .filter_map(|vid| resolved.get(vid).map(|shape| (*vid, shape.clone())))
+                    .collect();
                 self.capture_segmentation = schedule.boundaries.clone();
                 if capture_segmentation_logging_enabled() {
                     log_capture_segmentation(&schedule);
@@ -2875,15 +2963,26 @@ impl Executor {
                         ),
                     )));
                 };
-                let result = self.run_plan_segmented(
+                let still_valid = self.run_plan_segmented(
                     &schedule,
                     RunMode::Replay,
                     &mut resolved,
                     outer_scope,
                     external,
-                );
-                self.capture_schedule = Some(schedule);
-                result?;
+                )?;
+                if still_valid {
+                    self.capture_schedule = Some(schedule);
+                } else {
+                    // A control-flow branch flip changed a seeded output shape:
+                    // the remaining plan already ran eagerly this step (correct
+                    // token), but the installed segments are stale. Retire the
+                    // device graph so the caller re-warms and re-captures for the
+                    // new branch. `capture_schedule` stays `None`.
+                    self.capture_segmentation.clear();
+                    self.capture_cf_shapes.clear();
+                    self.device_graph_signature = None;
+                    self.ep.reset_device_graph()?;
+                }
             }
         }
 
@@ -2948,6 +3047,56 @@ impl Executor {
     /// `None` when it is capturable. Mirrors the per-node predicates the
     /// all-or-nothing audit used, but returns the reason instead of aborting so
     /// the caller can form segments around each non-capturable seam node.
+    /// Seed the concrete shapes of control-flow (`If`/`Loop`/`Scan`) outputs from
+    /// the previous run's buffer allocation so downstream capturable kernels that
+    /// read them (e.g. GroupQueryAttention reading LongRoPE's `If`-selected
+    /// cos/sin caches) resolve their input shapes and fold into captured segments
+    /// instead of each forming an eager seam.
+    ///
+    /// ONNX shape inference cannot statically resolve a control-flow output whose
+    /// branches declare different shapes, so it stays symbolic. Within a decode
+    /// generation the selected branch — and thus the concrete output shape — is
+    /// stable across steps, so the prior run's shape is authoritative for capture
+    /// planning. A branch flip changes the shape and is detected on replay
+    /// ([`Self::control_flow_seam_invalidated`]), which retires the captured graph
+    /// for re-capture, so seeding never risks replaying against a stale shape.
+    ///
+    /// Only genuinely-unresolved outputs are seeded: a statically/symbolically
+    /// resolved shape stays authoritative, matching [`ExternalBindings::seed_capture_shapes`].
+    fn seed_control_flow_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
+        for &vid in &self.control_flow_output_values {
+            if resolved.contains_key(&vid) {
+                continue;
+            }
+            if let Some(shape) = self.buffer_shapes.get(&vid) {
+                resolved.insert(vid, shape.clone());
+            }
+        }
+    }
+
+    /// Whether the control-flow seam node at plan index `pi` produced a different
+    /// output shape than the most recent capture assumed. A change means a branch
+    /// flip (e.g. LongRoPE short↔long at the context threshold) reallocated an
+    /// output buffer a later captured segment reads, so that segment's baked
+    /// device pointer is now stale and the installed graph must be retired.
+    fn control_flow_seam_invalidated(
+        &self,
+        pi: usize,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> bool {
+        let node = self.graph.node(self.plan[pi].node_id);
+        if !is_control_flow_op(&node.op_type, &node.domain) {
+            return false;
+        }
+        self.plan[pi].outputs.iter().any(|out| {
+            match (self.capture_cf_shapes.get(out), resolved.get(out)) {
+                (Some(captured), Some(current)) => captured != current,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        })
+    }
+
     fn node_capture_reason(
         &self,
         plan: &NodePlan,
@@ -3201,9 +3350,28 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ep = Arc::clone(&self.ep);
+        // Set once a control-flow branch flip retires the installed graph mid
+        // replay: every remaining node then runs eagerly (its captured segment's
+        // baked device pointers are stale) so the step still produces a correct
+        // token. Only ever set in `RunMode::Replay`.
+        let mut invalidated = false;
         for seg in &schedule.segments {
+            if invalidated {
+                // Graph retired earlier this step: run this segment's nodes
+                // eagerly instead of replaying a stale installed graph.
+                for pi in seg.start..seg.end {
+                    self.exec_plan_node(
+                        pi,
+                        resolved,
+                        outer_scope,
+                        external,
+                        OpCaptureTrace::Eager,
+                    )?;
+                }
+                continue;
+            }
             if seg.captured {
                 match mode {
                     RunMode::Capture => {
@@ -3257,10 +3425,19 @@ impl Executor {
                         external,
                         OpCaptureTrace::Rejected(reason),
                     )?;
+                    // A control-flow seam (e.g. LongRoPE's `If`) that now selects
+                    // a different-shaped branch than capture assumed reallocated
+                    // an output a later captured segment reads: retire the graph
+                    // and finish this step eagerly.
+                    if mode == RunMode::Replay
+                        && self.control_flow_seam_invalidated(pi, resolved)
+                    {
+                        invalidated = true;
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(!invalidated)
     }
 
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
@@ -4485,7 +4662,7 @@ fn scan_list_attr(node: &Node, name: &str, count: usize, default: i64) -> Result
 /// domain). Kept in lock-step with the loader's `validate_no_control_flow`
 /// allow-list.
 fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
-    (domain.is_empty() || domain == "ai.onnx") && matches!(op_type, "If" | "Loop" | "Scan")
+    domain.is_empty() && matches!(op_type, "If" | "Loop" | "Scan")
 }
 
 /// Whether `(op_type, domain)` is an ONNX **Sequence** op the executor handles
@@ -4495,7 +4672,7 @@ fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
 /// runtime value. Kept as a small self-contained routing predicate (mirroring
 /// [`is_control_flow_op`]) so it never collides with the EP kernel registry.
 fn is_sequence_op(op_type: &str, domain: &str) -> bool {
-    (domain.is_empty() || domain == "ai.onnx")
+    domain.is_empty()
         && matches!(
             op_type,
             "SequenceEmpty"
@@ -4512,7 +4689,7 @@ fn is_sequence_op(op_type: &str, domain: &str) -> bool {
 /// Whether a Sequence op yields a *sequence* value (vs. a tensor). Used at build
 /// to mark sequence-typed values so they are excluded from tensor buffer sizing.
 fn produces_sequence_output(op_type: &str, domain: &str) -> bool {
-    (domain.is_empty() || domain == "ai.onnx")
+    domain.is_empty()
         && matches!(
             op_type,
             "SequenceEmpty"
@@ -4892,6 +5069,16 @@ impl Executor {
         {
             return Ok(None);
         }
+        // A value produced by a memoized loop-invariant `If` is served on later
+        // steps directly from its resident buffer (the branch is skipped, see
+        // `exec_if`). Moving that buffer out would leave the next memoized skip
+        // handing back freed/reallocated memory, so fall back to the copy path
+        // and keep the produced buffer resident for reuse.
+        if let Some(producer) = self.graph.try_value(vid).and_then(|value| value.producer)
+            && self.if_last_predicate.contains_key(&producer)
+        {
+            return Ok(None);
+        }
         // A value listed as a graph output more than once would be taken twice.
         if self.graph.outputs.iter().filter(|&&o| o == vid).count() != 1 {
             return Ok(None);
@@ -5204,7 +5391,31 @@ impl Executor {
             ),
         })?;
 
+        // Capture-safe loop-invariant control-flow specialization. The predicate
+        // is read every step (above) so a genuine branch flip is never missed.
+        // When it matches the last observed value AND that value was recorded
+        // only for a branch with *no outer captures* (so its outputs depend on
+        // nothing but its own constants/initializers and are therefore invariant
+        // across decode steps) AND those outputs are still resident in their
+        // persistent buffers, re-running the branch is pure waste — skip it. The
+        // downstream captured segment reads the unchanged buffers correctly. A
+        // branch that reads loop-varying outer values is never memoized, so a
+        // stale output is impossible.
+        if self.if_last_predicate.get(&node.id) == Some(&cond)
+            && node.outputs.iter().all(|v| resolved.contains_key(v))
+        {
+            return Ok(());
+        }
+
         let attr_key = if cond { "then_branch" } else { "else_branch" };
+        // A branch with outer captures may depend on values that change between
+        // steps, so its output is not loop-invariant and must never be memoized.
+        let taken_branch_is_invariant = self
+            .graph
+            .subgraphs
+            .get(&(node.id, attr_key.to_string()))
+            .map(|body| required_outer_names(body).is_empty())
+            .unwrap_or(false);
         let prepared = {
             let _s = phase_span!("execif.prepare_subgraph");
             self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?
@@ -5226,6 +5437,13 @@ impl Executor {
             for (vid, t) in node.outputs.iter().zip(outs.iter()) {
                 self.store_output_tensor(*vid, t, resolved)?;
             }
+        }
+        // Only enable future skips when the taken branch is loop-invariant.
+        // Otherwise drop any stale memo so this `If` always re-runs.
+        if taken_branch_is_invariant {
+            self.if_last_predicate.insert(node.id, cond);
+        } else {
+            self.if_last_predicate.remove(&node.id);
         }
         Ok(())
     }
@@ -6509,6 +6727,20 @@ mod tests {
         assert!(!kernel_input_uses_physical_capacity(&attention, 4));
     }
 
+    #[test]
+    fn only_capacity_aware_inputs_keep_physical_capacity() {
+        let shape = Node::new(NodeId(0), "Shape", vec![], vec![]);
+        let reduce_sum = Node::new(NodeId(1), "ReduceSum", vec![], vec![]);
+        let cumsum = Node::new(NodeId(2), "CumSum", vec![], vec![]);
+        let unsqueeze = Node::new(NodeId(3), "Unsqueeze", vec![], vec![]);
+
+        assert!(kernel_input_uses_padded_capacity(&shape, 0));
+        assert!(kernel_input_uses_padded_capacity(&reduce_sum, 0));
+        assert!(!kernel_input_uses_padded_capacity(&cumsum, 0));
+        assert!(!kernel_input_uses_padded_capacity(&unsqueeze, 0));
+        assert!(!kernel_input_uses_padded_capacity(&shape, 1));
+    }
+
     struct WeightDeliveryKernel {
         deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
@@ -6694,7 +6926,7 @@ mod tests {
                 ));
             }
             if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
-                || (op.domain.is_empty() && op.op_type == "Identity")
+                || (op.is_default_domain() && op.op_type == "Identity")
             {
                 KernelMatch::Supported {
                     cost: Cost::ZERO,
@@ -7556,6 +7788,48 @@ mod tests {
         assert!(
             dynamic_output_shapes(&other, &input_shapes, &input_dtypes, &input_values, 17)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn dynamic_output_shapes_unsqueeze_supports_input_and_attribute_axes() {
+        use onnx_runtime_ir::Attribute;
+
+        let mut input_axes = Node::new(
+            NodeId(0),
+            "Unsqueeze",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        assert_eq!(
+            dynamic_output_shapes(
+                &input_axes,
+                &[vec![2, 3], vec![2]],
+                &[DataType::Float32, DataType::Int64],
+                &[None, Some(vec![0, -1])],
+                17,
+            ),
+            Some(vec![vec![1, 2, 3, 1]])
+        );
+
+        let mut attribute_axes = Node::new(
+            NodeId(1),
+            "Unsqueeze",
+            vec![Some(ValueId(0))],
+            vec![ValueId(1)],
+        );
+        attribute_axes
+            .attributes
+            .insert("axes".into(), Attribute::Ints(vec![1, -1]));
+        assert_eq!(
+            dynamic_output_shapes(
+                &attribute_axes,
+                &[vec![2, 3]],
+                &[DataType::Float32],
+                &[None],
+                11,
+            ),
+            Some(vec![vec![2, 1, 3, 1]])
         );
     }
 

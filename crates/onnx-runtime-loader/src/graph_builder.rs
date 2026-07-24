@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, TypeProto, ValueId,
+    normalize_domain,
 };
 
 use crate::LoaderError;
@@ -58,7 +59,7 @@ pub(crate) fn build_graph(model: &ModelProto) -> Result<BuiltGraph, LoaderError>
         if opset.version > 0 {
             graph
                 .opset_imports
-                .insert(opset.domain.clone(), opset.version as u64);
+                .insert(normalize_domain(&opset.domain).to_string(), opset.version as u64);
         }
     }
 
@@ -183,7 +184,7 @@ fn build_graph_proto(
 
         let mut node = Node::new(NodeId(0), np.op_type.clone(), inputs, outputs);
         node.name = np.name.clone();
-        node.domain = np.domain.clone();
+        node.domain = normalize_domain(&np.domain).to_string();
         if !np.doc_string.is_empty() {
             node.doc_string = Some(np.doc_string.clone());
         }

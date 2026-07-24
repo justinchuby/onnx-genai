@@ -30,10 +30,14 @@ pub mod capabilities {
     pub const DUAL_SEQUENCE_INPUTS: &str = "dual_sequence_inputs";
 }
 
+pub mod component;
 pub mod parser;
 pub mod schema;
 pub mod validation;
 
+pub use component::{
+    ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
+};
 pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, load_metadata,
@@ -43,6 +47,33 @@ pub use schema::*;
 pub use validation::{
     PipelineValidationError, RuntimeCapabilities, validate, validate_pipeline_spec,
 };
+
+/// Generates the inference-metadata JSON Schema with deterministic object-key ordering.
+pub fn inference_metadata_schema_json() -> Result<String, serde_json::Error> {
+    let schema = schemars::generate::SchemaSettings::draft2020_12()
+        .into_generator()
+        .into_root_schema_for::<InferenceMetadata>();
+    let mut value = serde_json::to_value(schema)?;
+    sort_json_object_keys(&mut value);
+    serde_json::to_string_pretty(&value)
+}
+
+fn sort_json_object_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for value in object.values_mut() {
+                sort_json_object_keys(value);
+            }
+            object.sort_keys();
+        }
+        serde_json::Value::Array(array) => {
+            for value in array {
+                sort_json_object_keys(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Error type for metadata operations.
 #[derive(Debug, thiserror::Error)]

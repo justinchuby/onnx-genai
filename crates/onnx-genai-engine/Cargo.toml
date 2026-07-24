@@ -29,6 +29,7 @@ cuda = [
     "onnx-genai-ort/cuda-13000",
     "onnx-runtime-session?/cuda",
     "dep:onnx-runtime-ep-cuda",
+    "dep:onnx-runtime-ep-api",
 ]
 # ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
 # selection and the cudarc GPU sampler in `onnx-genai-ort`, WITHOUT pulling the
@@ -52,6 +53,7 @@ onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
+onnx-runtime-ep-api = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }

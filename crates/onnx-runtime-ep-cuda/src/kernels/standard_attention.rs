@@ -68,9 +68,10 @@
 //!
 //! ## Supported vs. unimplemented
 //!
-//! * dtype: **f32 only** for v1 (matches the crate's other reference kernels;
-//!   f16/bf16 is a follow-up — see the crate dtype-coverage effort). Non-f32
-//!   Q/K/V error actionably.
+//! * dtype: **f32, f16, and bf16** Q/K/V, cache, additive mask, and outputs.
+//!   All floating inputs must use the same dtype; a boolean attention mask is
+//!   exempt. Device f16/bf16 loads and stores are converted around fp32 score,
+//!   softmax, and value accumulators.
 //! * `qk_matmul_output_mode`: modes **0, 1, 2, 3** implemented per spec; any
 //!   other value errors.
 
@@ -89,14 +90,39 @@ use crate::runtime::{CudaRuntime, cuptr};
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
 const ROW_THREADS: u32 = 128;
-const ATTENTION_MODULE: &str = "standard_attention_f32_v1";
+const ATTENTION_MODULE: &str = "standard_attention_f32_f16_bf16_v3";
 const ATTENTION_SOURCE: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #define NEG_INF __int_as_float(0xff800000)
+
+// dtype is 0 for f32, 1 for f16, and 2 for bf16. Keep all computation in fp32;
+// only the externally visible activations and cache use the requested storage
+// type.
+__device__ __forceinline__ float load_float(const void* data, unsigned long long index, int dtype) {
+  if (dtype == 0) {
+    return ((const float*)data)[index];
+  }
+  if (dtype == 1) {
+    return __half2float(((const __half*)data)[index]);
+  }
+  return __bfloat162float(((const __nv_bfloat16*)data)[index]);
+}
+
+__device__ __forceinline__ void store_float(void* data, unsigned long long index, float value, int dtype) {
+  if (dtype == 0) {
+    ((float*)data)[index] = value;
+  } else if (dtype == 1) {
+    ((__half*)data)[index] = __float2half_rn(value);
+  } else {
+    ((__nv_bfloat16*)data)[index] = __float2bfloat16_rn(value);
+  }
+}
 
 // Gather a K/V input into a contiguous [batch, heads, total_seq, dim] present
 // buffer, applying the 3D->4D head reshape and the past ++ current concat.
 extern "C" __global__ void build_kv(
-    const float* past, const float* cur, float* out,
+    const void* past, const void* cur, void* out, int dtype,
     int has_past, int cur_is_3d, int past_is_3d,
     unsigned long long batch, unsigned long long heads,
     unsigned long long past_seq, unsigned long long cur_seq,
@@ -115,15 +141,15 @@ extern "C" __global__ void build_kv(
       unsigned long long off = past_is_3d
           ? (b * past_seq + t) * (heads * dim) + h * dim + d
           : ((b * heads + h) * past_seq + t) * dim + d;
-      val = past[off];
+      val = load_float(past, off, dtype);
     } else {
       unsigned long long c = has_past ? (t - past_seq) : t;
       unsigned long long off = cur_is_3d
           ? (b * cur_seq + c) * (heads * dim) + h * dim + d
           : ((b * heads + h) * cur_seq + c) * dim + d;
-      val = cur[off];
+      val = load_float(cur, off, dtype);
     }
-    out[idx] = val;
+    store_float(out, idx, val, dtype);
   }
 }
 
@@ -156,6 +182,12 @@ __device__ __forceinline__ float mask_bias(
   if (mask_kind == 1) {
     return ((const float*)mask)[off];
   }
+  if (mask_kind == 3) {
+    return __half2float(((const __half*)mask)[off]);
+  }
+  if (mask_kind == 4) {
+    return __bfloat162float(((const __nv_bfloat16*)mask)[off]);
+  }
   // Bool mask: nonzero keeps (bias 0), zero masks (-inf).
   return ((const unsigned char*)mask)[off] != 0 ? 0.0f : NEG_INF;
 }
@@ -163,14 +195,14 @@ __device__ __forceinline__ float mask_bias(
 // One block per (batch, q_head, query) row. Computes scaled QK scores, softcap,
 // the composed causal/pad/attn masks, a stable softmax, and probs*V.
 extern "C" __global__ void attention_row(
-    const float* q, const float* key, const float* value,
-    const void* mask, float* scores, float* y, float* qk_out,
+    const void* q, const void* key, const void* value,
+    const void* mask, float* scores, void* y, void* qk_out,
     const long long* offsets, const long long* pad_limits,
     unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
     unsigned long long kv_heads, unsigned long long total_seq,
     unsigned long long head_size, unsigned long long v_head_size,
     unsigned long long group,
-    int q_is_3d, int out_is_3d, int is_causal,
+    int dtype, int q_is_3d, int out_is_3d, int is_causal,
     float sqrt_scale, float softcap,
     int mask_kind, int mask_rank,
     unsigned long long md0, unsigned long long md1,
@@ -200,11 +232,12 @@ extern "C" __global__ void attention_row(
     const unsigned long long koff = ((b * kv_heads + kvh) * total_seq + j) * head_size;
     float acc = 0.0f;
     for (unsigned long long p = 0; p < head_size; ++p) {
-      acc += (q[qoff + p] * sqrt_scale) * (key[koff + p] * sqrt_scale);
+      acc += (load_float(q, qoff + p, dtype) * sqrt_scale)
+          * (load_float(key, koff + p, dtype) * sqrt_scale);
     }
     scores[srow + j] = acc;
     if (want_qk && qk_mode == 0) {
-      qk_out[srow + j] = acc;
+      store_float(qk_out, srow + j, acc, dtype);
     }
   }
   __syncthreads();
@@ -219,7 +252,7 @@ extern "C" __global__ void attention_row(
   }
   if (want_qk && qk_mode == 1) {
     for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-      qk_out[srow + j] = scores[srow + j];
+      store_float(qk_out, srow + j, scores[srow + j], dtype);
     }
     __syncthreads();
   }
@@ -244,7 +277,7 @@ extern "C" __global__ void attention_row(
   __syncthreads();
   if (want_qk && qk_mode == 2) {
     for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-      qk_out[srow + j] = scores[srow + j];
+      store_float(qk_out, srow + j, scores[srow + j], dtype);
     }
     __syncthreads();
   }
@@ -287,7 +320,7 @@ extern "C" __global__ void attention_row(
   __syncthreads();
   if (want_qk && qk_mode == 3) {
     for (unsigned long long j = tid; j < total_seq; j += nthreads) {
-      qk_out[srow + j] = scores[srow + j];
+      store_float(qk_out, srow + j, scores[srow + j], dtype);
     }
     __syncthreads();
   }
@@ -301,9 +334,9 @@ extern "C" __global__ void attention_row(
     float acc = 0.0f;
     for (unsigned long long j = 0; j < total_seq; ++j) {
       const unsigned long long voff = ((b * kv_heads + kvh) * total_seq + j) * v_head_size;
-      acc += scores[srow + j] * value[voff + c];
+      acc += scores[srow + j] * load_float(value, voff + c, dtype);
     }
-    y[ybase + c] = acc;
+    store_float(y, ybase + c, acc, dtype);
   }
 }
 "#;
@@ -323,39 +356,66 @@ pub(crate) fn unsupported_reason(
             .copied()
             .unwrap_or(DataType::Undefined)
     };
-    let f32_denial = |dtype| {
+    let floating_denial = |dtype| {
         let dtype = match dtype {
             DataType::Float16 => "f16".into(),
             DataType::BFloat16 => "bf16".into(),
             other => format!("{other:?}"),
         };
         Cow::Owned(format!(
-            "Attention: dtype {dtype} not supported on CUDA yet (f32 only; f16/bf16 follow-up)"
+            "Attention: dtype {dtype} not supported on CUDA (supported: f32, f16, bf16)"
         ))
     };
 
     for index in 0..3 {
         let dtype = dtype_at(index);
-        if dtype != DataType::Float32 {
-            return Some(f32_denial(dtype));
+        if !matches!(
+            dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
+            return Some(floating_denial(dtype));
         }
+    }
+    if dtype_at(1) != dtype_at(0) || dtype_at(2) != dtype_at(0) {
+        return Some(Cow::Borrowed(
+            "Attention: Q, K, and V must use the same floating dtype on CUDA",
+        ));
     }
 
     let mask_dtype = dtype_at(3);
     if !matches!(
         mask_dtype,
-        DataType::Undefined | DataType::Bool | DataType::Float32
+        DataType::Undefined
+            | DataType::Bool
+            | DataType::Float32
+            | DataType::Float16
+            | DataType::BFloat16
     ) {
         return Some(Cow::Owned(format!(
-            "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool or f32 when provided)"
+            "Attention: attn_mask dtype {mask_dtype:?} not supported (expected bool, f32, f16, or bf16 when provided)"
         )));
+    }
+    if !matches!(mask_dtype, DataType::Undefined | DataType::Bool) && mask_dtype != dtype_at(0) {
+        return Some(Cow::Borrowed(
+            "Attention: floating attn_mask must use the same dtype as Q, K, and V on CUDA",
+        ));
     }
 
     let past_key_dtype = dtype_at(4);
     let past_value_dtype = dtype_at(5);
     for dtype in [past_key_dtype, past_value_dtype] {
-        if dtype != DataType::Undefined && dtype != DataType::Float32 {
-            return Some(f32_denial(dtype));
+        if dtype != DataType::Undefined
+            && !matches!(
+                dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            )
+        {
+            return Some(floating_denial(dtype));
+        }
+        if dtype != DataType::Undefined && dtype != dtype_at(0) {
+            return Some(Cow::Borrowed(
+                "Attention: Q/K/V and past_key/past_value must use the same floating dtype on CUDA",
+            ));
         }
     }
     let has_past_key = past_key_dtype != DataType::Undefined;
@@ -387,7 +447,7 @@ pub(crate) fn unsupported_reason(
     None
 }
 
-/// f32 standard-`Attention` kernel carrying the resolved attributes.
+/// f32/f16/bf16 standard-`Attention` kernel carrying the resolved attributes.
 pub struct StandardAttentionKernel {
     runtime: Arc<CudaRuntime>,
     /// Explicit score scale; `None` → default `1/sqrt(head_size)`.
@@ -489,9 +549,12 @@ fn resolve_bhsd(view: &TensorView, name: &str, num_heads: Option<usize>) -> Resu
             "Attention: non-contiguous inputs are not supported".into(),
         ));
     }
-    if view.dtype != DataType::Float32 {
+    if !matches!(
+        view.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
         return Err(EpError::KernelFailed(format!(
-            "Attention: expected f32 input, got {:?}",
+            "Attention: expected f32, f16, or bf16 input, got {:?}",
             view.dtype
         )));
     }
@@ -558,12 +621,13 @@ fn dense_i64(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
         .collect())
 }
 
-/// Validate an output slot (contiguous f32 with the expected element count) and
+/// Validate an output slot (contiguous requested dtype with the expected element count) and
 /// return its device pointer.
-fn output_ptr(output: &mut TensorMut, expected: usize) -> Result<CUdeviceptr> {
-    if output.dtype != DataType::Float32 || !output.is_contiguous() || output.numel() != expected {
+fn output_ptr(output: &mut TensorMut, dtype: DataType, expected: usize) -> Result<CUdeviceptr> {
+    if output.dtype != dtype || !output.is_contiguous() || output.numel() != expected {
         return Err(EpError::KernelFailed(
-            "Attention: output must be contiguous f32 with the expected shape".into(),
+            "Attention: output must be contiguous and use the input dtype with the expected shape"
+                .into(),
         ));
     }
     Ok(cuptr(output.data_ptr_mut::<u8>() as *const c_void))
@@ -590,6 +654,7 @@ impl StandardAttentionKernel {
         has_past: bool,
         cur_is_3d: bool,
         past_is_3d: bool,
+        dtype: i32,
         batch: usize,
         heads: usize,
         past_seq: usize,
@@ -618,6 +683,7 @@ impl StandardAttentionKernel {
             .arg(&past_ptr)
             .arg(&cur_ptr)
             .arg(&out_ptr)
+            .arg(&dtype)
             .arg(&has_past_i)
             .arg(&cur_is_3d_i)
             .arg(&past_is_3d_i)
@@ -654,6 +720,18 @@ impl Kernel for StandardAttentionKernel {
         let q = resolve_bhsd(&inputs[0], "Q", self.q_num_heads)?;
         let k_cur = resolve_bhsd(&inputs[1], "K", self.kv_num_heads)?;
         let v_cur = resolve_bhsd(&inputs[2], "V", self.kv_num_heads)?;
+        let dtype = inputs[0].dtype;
+        if inputs[1].dtype != dtype || inputs[2].dtype != dtype {
+            return Err(EpError::KernelFailed(
+                "Attention: Q, K, and V must use the same floating dtype on CUDA".into(),
+            ));
+        }
+        let dtype_code = match dtype {
+            DataType::Float32 => 0,
+            DataType::Float16 => 1,
+            _ => 2,
+        };
+        let element_bytes = dtype.storage_bytes(1);
 
         // Optional past KV cache (inputs 4 and 5). They must be used together.
         // Presence is decided by input-slot binding (a null "absent" view for an
@@ -677,6 +755,12 @@ impl Kernel for StandardAttentionKernel {
         } else {
             None
         };
+        if has_past_key && (inputs[4].dtype != dtype || inputs[5].dtype != dtype) {
+            return Err(EpError::KernelFailed(
+                "Attention: Q/K/V and past_key/past_value must use the same floating dtype on CUDA"
+                    .into(),
+            ));
+        }
         let key_past_seq = past_key.as_ref().map(|p| p.seq).unwrap_or(0);
         let value_past_seq = past_value.as_ref().map(|p| p.seq).unwrap_or(0);
 
@@ -801,9 +885,11 @@ impl Kernel for StandardAttentionKernel {
             let kind = match m.dtype {
                 DataType::Bool => 2,
                 DataType::Float32 => 1,
+                DataType::Float16 => 3,
+                DataType::BFloat16 => 4,
                 other => {
                     return Err(EpError::KernelFailed(format!(
-                        "Attention: attn_mask dtype {other:?} not supported (expected bool or f32)"
+                        "Attention: attn_mask dtype {other:?} not supported (expected bool, f32, f16, or bf16)"
                     )));
                 }
             };
@@ -829,7 +915,7 @@ impl Kernel for StandardAttentionKernel {
         } else {
             batch * q_heads * q_seq * v_head_size
         };
-        let y_ptr = output_ptr(&mut outputs[0], y_expected)?;
+        let y_ptr = output_ptr(&mut outputs[0], dtype, y_expected)?;
         let want_present_key = outputs.len() >= 2;
         let want_present_value = outputs.len() >= 3;
         let want_qk = outputs.len() >= 4;
@@ -843,18 +929,21 @@ impl Kernel for StandardAttentionKernel {
         let _ = rest0;
         let (present_key_out, rest_after1) = if want_present_key {
             let (a, b) = rest1.split_at_mut(1);
-            (Some(output_ptr(&mut a[0], present_key_expected)?), b)
+            (Some(output_ptr(&mut a[0], dtype, present_key_expected)?), b)
         } else {
             (None, rest1)
         };
         let (present_value_out, rest_after2) = if want_present_value {
             let (a, b) = rest_after1.split_at_mut(1);
-            (Some(output_ptr(&mut a[0], present_value_expected)?), b)
+            (
+                Some(output_ptr(&mut a[0], dtype, present_value_expected)?),
+                b,
+            )
         } else {
             (None, rest_after1)
         };
         let qk_ptr = if want_qk {
-            output_ptr(&mut rest_after2[0], qk_expected)?
+            output_ptr(&mut rest_after2[0], dtype, qk_expected)?
         } else {
             0
         };
@@ -908,11 +997,45 @@ impl Kernel for StandardAttentionKernel {
             // into scratch (still needed as the attention kernel's K/V source).
             let present_key_ptr = match present_key_out {
                 Some(ptr) => ptr,
-                None => alloc(&self.runtime, &mut owned, present_key_expected * 4)?,
+                None => alloc(
+                    &self.runtime,
+                    &mut owned,
+                    present_key_expected * element_bytes,
+                )?,
             };
             let present_value_ptr = match present_value_out {
                 Some(ptr) => ptr,
-                None => alloc(&self.runtime, &mut owned, present_value_expected * 4)?,
+                None => alloc(
+                    &self.runtime,
+                    &mut owned,
+                    present_value_expected * element_bytes,
+                )?,
+            };
+
+            // In-place KV growth: the decode graph binds the present K/V output
+            // onto the same buffer as the past K/V input. `build_kv` rewrites the
+            // whole cache with a *wider* per-head stride (total_seq > past_seq),
+            // so writing directly into that buffer makes head h's current-token
+            // store overlap head h+1's past load across unordered threads — a
+            // data race that leaves every head beyond head 0 nondeterministic.
+            // Stage the rebuild in a disjoint scratch buffer (reads the pristine
+            // past), then copy the fully-formed dense cache back. General: any
+            // model whose default-domain Attention grows an aliased KV cache.
+            let stage_key = has_past_key && present_key_out == Some(past_key_ptr);
+            let stage_value = has_past_value && present_value_out == Some(past_value_ptr);
+            let key_kv_ptr = if stage_key {
+                alloc(&self.runtime, &mut owned, present_key_expected * element_bytes)?
+            } else {
+                present_key_ptr
+            };
+            let value_kv_ptr = if stage_value {
+                alloc(
+                    &self.runtime,
+                    &mut owned,
+                    present_value_expected * element_bytes,
+                )?
+            } else {
+                present_value_ptr
             };
             let scores_ptr = alloc(&self.runtime, &mut owned, qk_expected * 4)?;
 
@@ -932,10 +1055,11 @@ impl Kernel for StandardAttentionKernel {
             self.launch_build_kv(
                 past_key_ptr,
                 k_cur_ptr,
-                present_key_ptr,
+                key_kv_ptr,
                 has_past_key,
                 k_cur.is_3d,
                 past_key.as_ref().map(|p| p.is_3d).unwrap_or(false),
+                dtype_code,
                 batch,
                 kv_heads,
                 key_past_seq,
@@ -946,10 +1070,11 @@ impl Kernel for StandardAttentionKernel {
             self.launch_build_kv(
                 past_value_ptr,
                 v_cur_ptr,
-                present_value_ptr,
+                value_kv_ptr,
                 has_past_value,
                 v_cur.is_3d,
                 past_value.as_ref().map(|p| p.is_3d).unwrap_or(false),
+                dtype_code,
                 batch,
                 kv_heads,
                 value_past_seq,
@@ -957,6 +1082,28 @@ impl Kernel for StandardAttentionKernel {
                 value_total_seq,
                 v_head_size,
             )?;
+
+            // When staged, publish the freshly-built dense cache back into the
+            // aliased present/past buffer for the next step. Source and
+            // destination are disjoint, so this copy is race-free.
+            if stage_key {
+                unsafe {
+                    self.runtime.dtod(
+                        key_kv_ptr,
+                        present_key_ptr,
+                        present_key_expected * element_bytes,
+                    )?;
+                }
+            }
+            if stage_value {
+                unsafe {
+                    self.runtime.dtod(
+                        value_kv_ptr,
+                        present_value_ptr,
+                        present_value_expected * element_bytes,
+                    )?;
+                }
+            }
 
             // Launch the main attention kernel: one block per query row.
             let func =
@@ -984,8 +1131,8 @@ impl Kernel for StandardAttentionKernel {
                 let mut builder = self.runtime.stream().launch_builder(&func);
                 builder
                     .arg(&q_ptr)
-                    .arg(&present_key_ptr)
-                    .arg(&present_value_ptr)
+                    .arg(&key_kv_ptr)
+                    .arg(&value_kv_ptr)
                     .arg(&mask.ptr)
                     .arg(&scores_ptr)
                     .arg(&y_ptr)
@@ -1000,6 +1147,7 @@ impl Kernel for StandardAttentionKernel {
                     .arg(&head_size_u)
                     .arg(&v_head_size_u)
                     .arg(&group_u)
+                    .arg(&dtype_code)
                     .arg(&q_is_3d)
                     .arg(&out_is_3d)
                     .arg(&is_causal)
@@ -1043,5 +1191,187 @@ impl Kernel for StandardAttentionKernel {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
             "setup synchronously uploads per-batch control arrays and reads nonpad_kv_seqlen D2H",
         )
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    //! Regression tests for in-place KV-cache growth in the default-domain
+    //! `Attention` kernel. DeepSeek-V2-Lite (MLA) binds the `present_key` /
+    //! `present_value` outputs onto the SAME device buffer as the `past_key` /
+    //! `past_value` inputs. `build_kv` re-lays-out the whole cache at a WIDER
+    //! per-head stride (`total_seq` vs `past_seq`) in that shared buffer, so a
+    //! head's current-token write collides with the next head's past read across
+    //! unordered CUDA threads — nondeterministic for every head > 0. The fix
+    //! stages the rebuild into a disjoint scratch buffer and copies it back, so
+    //! the aliased result must equal a non-aliased reference and be stable across
+    //! repeated runs.
+    use super::*;
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
+    use std::ffi::c_void;
+
+    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+        CudaRuntime::new(0).ok().map(Arc::new)
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn bytes_f32(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    // Deterministic pseudo-random fill in [-1, 1).
+    fn fill(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9e3779b97f4a7c15);
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Reproduces the DeepSeek MLA decode step: multi-head KV cache grown by one
+    /// token, with `present` optionally aliasing `past` in one device buffer.
+    #[test]
+    fn decode_kv_growth_alias_matches_reference_and_is_deterministic() {
+        let Some(rt) = maybe_runtime() else {
+            eprintln!("skipping: no CUDA device available");
+            return;
+        };
+        let device = DeviceId::cuda(0);
+
+        // MLA-flavoured shape: multi-head, asymmetric K (192-style) vs V head size.
+        let heads = 4usize;
+        let past = 3usize;
+        let qlen = 1usize;
+        let total = past + qlen;
+        let kdim = 6usize; // key/query head size
+        let vdim = 4usize; // value head size
+
+        // Fixed inputs.
+        let q = fill(heads * qlen * kdim, 1);
+        let k_cur = fill(heads * qlen * kdim, 2);
+        let v_cur = fill(heads * qlen * vdim, 3);
+        let past_k = fill(heads * past * kdim, 4);
+        let past_v = fill(heads * past * vdim, 5);
+
+        let kernel = StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: true,
+            q_num_heads: Some(heads),
+            kv_num_heads: Some(heads),
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            since_version: 24,
+        };
+
+        // Runs one decode step; when `alias` the present KV outputs share the
+        // past KV buffers. Returns the attention output Y as f32.
+        let run = |alias: bool| -> Vec<f32> {
+            let q_sh = [1usize, heads, qlen, kdim];
+            let kcur_sh = [1usize, heads, qlen, kdim];
+            let vcur_sh = [1usize, heads, qlen, vdim];
+            let pastk_sh = [1usize, heads, past, kdim];
+            let pastv_sh = [1usize, heads, past, vdim];
+            let presk_sh = [1usize, heads, total, kdim];
+            let presv_sh = [1usize, heads, total, vdim];
+            let y_sh = [1usize, heads, qlen, vdim];
+
+            let q_st = compute_contiguous_strides(&q_sh);
+            let kcur_st = compute_contiguous_strides(&kcur_sh);
+            let vcur_st = compute_contiguous_strides(&vcur_sh);
+            let pastk_st = compute_contiguous_strides(&pastk_sh);
+            let pastv_st = compute_contiguous_strides(&pastv_sh);
+            let presk_st = compute_contiguous_strides(&presk_sh);
+            let presv_st = compute_contiguous_strides(&presv_sh);
+            let y_st = compute_contiguous_strides(&y_sh);
+
+            // Cache buffers sized for the grown (total) length.
+            let key_cap = heads * total * kdim * 4;
+            let val_cap = heads * total * vdim * 4;
+            let q_bytes = f32_bytes(&q);
+            let kcur_bytes = f32_bytes(&k_cur);
+            let vcur_bytes = f32_bytes(&v_cur);
+
+            unsafe {
+                let key_buf = rt.alloc_raw(key_cap).unwrap();
+                let val_buf = rt.alloc_raw(val_cap).unwrap();
+                let q_buf = rt.alloc_raw(q_bytes.len()).unwrap();
+                let kcur_buf = rt.alloc_raw(kcur_bytes.len()).unwrap();
+                let vcur_buf = rt.alloc_raw(vcur_bytes.len()).unwrap();
+                // Past occupies the dense [heads, past, dim] prefix of the cache buffer.
+                rt.htod(&f32_bytes(&past_k), key_buf).unwrap();
+                rt.htod(&f32_bytes(&past_v), val_buf).unwrap();
+                rt.htod(&q_bytes, q_buf).unwrap();
+                rt.htod(&kcur_bytes, kcur_buf).unwrap();
+                rt.htod(&vcur_bytes, vcur_buf).unwrap();
+
+                let (presk_buf, presv_buf) = if alias {
+                    (key_buf, val_buf)
+                } else {
+                    (rt.alloc_raw(key_cap).unwrap(), rt.alloc_raw(val_cap).unwrap())
+                };
+                let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
+
+                let dp = |p: CUdeviceptr| DevicePtr(p as *const c_void);
+                let dpm = |p: CUdeviceptr| DevicePtrMut(p as *mut c_void);
+
+                let inputs = [
+                    TensorView::new(dp(q_buf), DataType::Float32, &q_sh, &q_st, device),
+                    TensorView::new(dp(kcur_buf), DataType::Float32, &kcur_sh, &kcur_st, device),
+                    TensorView::new(dp(vcur_buf), DataType::Float32, &vcur_sh, &vcur_st, device),
+                    TensorView::absent(DataType::Float32),
+                    TensorView::new(dp(key_buf), DataType::Float32, &pastk_sh, &pastk_st, device),
+                    TensorView::new(dp(val_buf), DataType::Float32, &pastv_sh, &pastv_st, device),
+                ];
+                let mut outputs = [
+                    TensorMut::new(dpm(y_buf), DataType::Float32, &y_sh, &y_st, device),
+                    TensorMut::new(dpm(presk_buf), DataType::Float32, &presk_sh, &presk_st, device),
+                    TensorMut::new(dpm(presv_buf), DataType::Float32, &presv_sh, &presv_st, device),
+                ];
+
+                kernel.execute(&inputs, &mut outputs).unwrap();
+
+                let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
+                rt.dtoh(&mut y_bytes, y_buf).unwrap();
+
+                rt.free_raw(key_buf).unwrap();
+                rt.free_raw(val_buf).unwrap();
+                rt.free_raw(q_buf).unwrap();
+                rt.free_raw(kcur_buf).unwrap();
+                rt.free_raw(vcur_buf).unwrap();
+                rt.free_raw(y_buf).unwrap();
+                if !alias {
+                    rt.free_raw(presk_buf).unwrap();
+                    rt.free_raw(presv_buf).unwrap();
+                }
+                bytes_f32(&y_bytes)
+            }
+        };
+
+        // Non-aliased present/past buffers give the race-free ground truth.
+        let reference = run(false);
+        // In-place growth must reproduce it exactly and be stable across runs.
+        let aliased = run(true);
+        assert_eq!(
+            aliased, reference,
+            "in-place KV-cache growth (present aliases past) must match the non-aliased reference"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                run(true),
+                aliased,
+                "aliased KV-cache growth must be deterministic across runs (iteration {i})"
+            );
+        }
     }
 }

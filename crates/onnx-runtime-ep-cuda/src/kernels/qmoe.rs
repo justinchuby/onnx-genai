@@ -8,7 +8,8 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -725,6 +726,8 @@ impl KernelFactory for QMoEFactory {
             attributes,
             bits: bits as usize,
             block_size: block_size as usize,
+            scratch: Mutex::new(ScratchPool::default()),
+            warmed: AtomicBool::new(false),
         }))
     }
 }
@@ -790,6 +793,8 @@ pub struct QMoEKernel {
     attributes: MoeAttributes,
     bits: usize,
     block_size: usize,
+    scratch: Mutex<ScratchPool>,
+    warmed: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -1140,22 +1145,38 @@ impl Kernel for QMoEKernel {
             })
             .transpose()?;
 
-        let mut scratch = Scratch::new(&self.runtime);
-        let route_indices = scratch.alloc(route_index_bytes)?;
-        let route_weights = scratch.alloc(route_weight_bytes)?;
-        let fc1_output = scratch.alloc(fc1_bytes)?;
-        let fc3_output = fc3.map(|_| scratch.alloc(activated_bytes)).transpose()?;
-        let activated = scratch.alloc(activated_bytes)?;
-        let route_output = scratch.alloc(route_output_bytes)?;
+        let capturing = self.runtime.is_capturing()?;
+        let mut scratch = self
+            .scratch
+            .lock()
+            .map_err(|_| error("QMoE scratch pool mutex poisoned"))?;
+        let route_indices = scratch.ensure(&self.runtime, 0, route_index_bytes, capturing)?;
+        let route_weights = scratch.ensure(&self.runtime, 1, route_weight_bytes, capturing)?;
+        let fc1_output = scratch.ensure(&self.runtime, 2, fc1_bytes, capturing)?;
+        let fc3_output = fc3
+            .map(|_| scratch.ensure(&self.runtime, 3, activated_bytes, capturing))
+            .transpose()?;
+        let activated = scratch.ensure(&self.runtime, 4, activated_bytes, capturing)?;
+        let route_output = scratch.ensure(&self.runtime, 5, route_output_bytes, capturing)?;
         let grouping = grouping_sizes
             .map(
                 |(counts_bytes, offsets_bytes, grouped_routes_bytes, grouped_input_bytes)| {
                     Ok::<_, EpError>(ExpertGrouping {
-                        counts: scratch.alloc(counts_bytes)?,
-                        offsets: scratch.alloc(offsets_bytes)?,
-                        cursors: scratch.alloc(counts_bytes)?,
-                        grouped_routes: scratch.alloc(grouped_routes_bytes)?,
-                        grouped_input: scratch.alloc(grouped_input_bytes)?,
+                        counts: scratch.ensure(&self.runtime, 6, counts_bytes, capturing)?,
+                        offsets: scratch.ensure(&self.runtime, 7, offsets_bytes, capturing)?,
+                        cursors: scratch.ensure(&self.runtime, 8, counts_bytes, capturing)?,
+                        grouped_routes: scratch.ensure(
+                            &self.runtime,
+                            9,
+                            grouped_routes_bytes,
+                            capturing,
+                        )?,
+                        grouped_input: scratch.ensure(
+                            &self.runtime,
+                            10,
+                            grouped_input_bytes,
+                            capturing,
+                        )?,
                     })
                 },
             )
@@ -1268,7 +1289,15 @@ impl Kernel for QMoEKernel {
             rows,
             hidden,
         )?;
-        self.runtime.synchronize()
+        let result = if capturing {
+            Ok(())
+        } else {
+            self.runtime.synchronize()
+        };
+        if result.is_ok() && !capturing {
+            self.warmed.store(true, Ordering::Relaxed);
+        }
+        result
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -1276,9 +1305,14 @@ impl Kernel for QMoEKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "QMoE performs data-dependent expert routing and per-call workspace management",
-        )
+        if self.warmed.load(Ordering::Relaxed) {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-shape eager QMoE pass to size the pooled scratch and \
+                 compile every routed expert kernel",
+            )
+        }
     }
 }
 
@@ -1722,32 +1756,74 @@ impl QMoEKernel {
     }
 }
 
-struct Scratch<'a> {
-    runtime: &'a CudaRuntime,
-    allocations: Vec<CUdeviceptr>,
+const SCRATCH_SLOTS: usize = 11;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScratchSlot {
+    ptr: CUdeviceptr,
+    capacity: usize,
 }
 
-impl<'a> Scratch<'a> {
-    fn new(runtime: &'a CudaRuntime) -> Self {
+#[derive(Debug)]
+struct ScratchPool {
+    slots: [ScratchSlot; SCRATCH_SLOTS],
+}
+
+impl Default for ScratchPool {
+    fn default() -> Self {
         Self {
-            runtime,
-            allocations: Vec::new(),
+            slots: [ScratchSlot::default(); SCRATCH_SLOTS],
         }
     }
+}
 
-    fn alloc(&mut self, bytes: usize) -> Result<CUdeviceptr> {
-        let pointer = self.runtime.alloc_raw(bytes)?;
-        self.allocations.push(pointer);
-        Ok(pointer)
+impl ScratchPool {
+    fn ensure(
+        &mut self,
+        runtime: &CudaRuntime,
+        index: usize,
+        bytes: usize,
+        capturing: bool,
+    ) -> Result<CUdeviceptr> {
+        let slot = &mut self.slots[index];
+        let bytes = bytes.max(1);
+        if slot.ptr != 0 && slot.capacity >= bytes {
+            return Ok(slot.ptr);
+        }
+        if capturing {
+            return Err(error(format!(
+                "QMoE scratch slot {index} needs {bytes} bytes but the warmed capacity is {} bytes",
+                slot.capacity
+            )));
+        }
+        let fresh = runtime.alloc_raw(bytes)?;
+        if slot.ptr != 0 {
+            // SAFETY: the previous pointer came from this runtime and is replaced
+            // only after the new allocation succeeds.
+            unsafe {
+                let _ = runtime.free_raw(slot.ptr);
+            }
+        }
+        slot.ptr = fresh;
+        slot.capacity = bytes;
+        Ok(fresh)
     }
 }
 
-impl Drop for Scratch<'_> {
+impl Drop for QMoEKernel {
     fn drop(&mut self) {
-        for pointer in self.allocations.drain(..).rev() {
-            // SAFETY: every pointer was allocated once by this runtime and is
-            // removed from the list exactly once.
-            let _ = unsafe { self.runtime.free_raw(pointer) };
+        let scratch = self
+            .scratch
+            .get_mut()
+            .expect("cuda_ep QMoE scratch pool poisoned");
+        for slot in scratch.slots.iter_mut().rev() {
+            if slot.ptr != 0 {
+                // SAFETY: every non-zero pointer came from this runtime and is
+                // freed exactly once when the kernel is dropped.
+                let _ = unsafe { self.runtime.free_raw(slot.ptr) };
+                slot.ptr = 0;
+                slot.capacity = 0;
+            }
         }
     }
 }

@@ -304,6 +304,13 @@ impl DeviceIoBinding {
         }
     }
 
+    /// Whether kernels see a logical prefix whose shape can differ from capacity.
+    pub fn has_dynamic_logical_input_shape(&self) -> bool {
+        self.bind_input
+            && self.expose_logical_input_shape
+            && self.logical_shape != self.physical_shape
+    }
+
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
         validate_logical_shape(&self.physical_shape, &shape)?;
         self.logical_shape = shape;

@@ -1019,6 +1019,57 @@ mod tests {
         approx(&out.to_f32(), &want3, 1e-5);
     }
 
+    #[test]
+    fn mla_gqa_decode_with_asymmetric_head_dims_matches_hand_computed_result() {
+        let (batch, q_heads, kv_heads, seq, past_seq) = (1, 4, 2, 1, 2);
+        let (qk_head_dim, v_head_dim) = (2, 1);
+        let total_seq = past_seq + seq;
+
+        // Zero Q makes all three cache positions equiprobable. GQA maps query
+        // heads 0/1 to KV head 0 and 2/3 to KV head 1.
+        let q = [0.0; 8];
+        let k = [10.0, 20.0, 30.0, 40.0];
+        let v = [5.0, 8.0];
+        let past_key = [1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
+        let past_value = [1.0, 3.0, 2.0, 4.0];
+
+        let mut y = Owned::zeros_f32(&[batch, seq, q_heads * v_head_dim]);
+        let mut present_key = Owned::zeros_f32(&[batch, kv_heads, total_seq, qk_head_dim]);
+        let mut present_value = Owned::zeros_f32(&[batch, kv_heads, total_seq, v_head_dim]);
+        kernel(None, true, Some(q_heads), Some(kv_heads), 0, 0.0)
+            .execute(
+                &[
+                    Owned::f32(&[batch, seq, q_heads * qk_head_dim], &q).view(),
+                    Owned::f32(&[batch, seq, kv_heads * qk_head_dim], &k).view(),
+                    Owned::f32(&[batch, seq, kv_heads * v_head_dim], &v).view(),
+                    absent(),
+                    Owned::f32(&[batch, kv_heads, past_seq, qk_head_dim], &past_key).view(),
+                    Owned::f32(&[batch, kv_heads, past_seq, v_head_dim], &past_value).view(),
+                ],
+                &mut [
+                    y.view_mut(),
+                    present_key.view_mut(),
+                    present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(y.shape, [batch, seq, q_heads * v_head_dim]);
+        assert_eq!(present_key.shape, [batch, kv_heads, total_seq, qk_head_dim]);
+        assert_eq!(
+            present_value.shape,
+            [batch, kv_heads, total_seq, v_head_dim]
+        );
+        approx(&y.to_f32(), &[3.0, 3.0, 14.0 / 3.0, 14.0 / 3.0], 1e-6);
+        assert_eq!(
+            present_key.to_f32(),
+            [
+                1.0, 0.0, 0.0, 1.0, 10.0, 20.0, 2.0, 0.0, 0.0, 2.0, 30.0, 40.0
+            ]
+        );
+        assert_eq!(present_value.to_f32(), [1.0, 3.0, 5.0, 2.0, 4.0, 8.0]);
+    }
+
     fn asymmetric_3d_prefill_decode_case(kv_heads: usize) {
         let (batch, q_heads, prefill_seq, decode_seq) = (1usize, 4usize, 3usize, 1usize);
         let (qk_head_dim, v_head_dim) = (192usize, 128usize);

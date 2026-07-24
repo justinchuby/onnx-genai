@@ -44,7 +44,10 @@ impl KernelFactory for IndexShareFactory {
     }
 }
 
-pub(crate) fn unsupported_reason(
+/// Claim-time gate shared with the CUDA execution provider so the device kernel
+/// rejects exactly the dtype/layout/arity/shape combinations the CPU oracle
+/// does (keeping the two backends' `supports_op` contracts in lockstep).
+pub fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],

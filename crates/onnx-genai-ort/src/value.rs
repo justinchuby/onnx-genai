@@ -89,6 +89,10 @@ enum TensorBacking {
     F32(Vec<f32>),
     F16(Vec<u16>),
     I64(Vec<i64>),
+    /// Raw little-endian element bytes for a tensor of arbitrary dtype (used by
+    /// the backend-neutral component-session seam, which carries host tensors as
+    /// opaque bytes).
+    Bytes(Vec<u8>),
     Alias(Arc<Value>),
     None,
 }
@@ -262,6 +266,35 @@ impl Value {
         })
     }
 
+    /// Create a CPU tensor from raw little-endian element bytes of any dtype.
+    ///
+    /// This is the construction primitive for the backend-neutral
+    /// component-session seam, which carries host tensors as opaque bytes so any
+    /// dtype round-trips without a per-dtype host representation. `shape` must be
+    /// fully static and `data.len()` must equal `numel * dtype.size_of()`.
+    pub fn from_raw_bytes(mut data: Vec<u8>, shape: &[i64], dtype: DataType) -> Result<Self> {
+        validate_shape(shape, None)?;
+        let numel = shape.iter().fold(1usize, |acc, &dim| acc * dim as usize);
+        let expected = numel * dtype.size_of();
+        if data.len() != expected {
+            return Err(OrtError::InvalidArgument(format!(
+                "raw tensor byte length {} does not match a {:?} tensor of shape {:?} \
+                 (expected {} bytes)",
+                data.len(),
+                dtype,
+                shape,
+                expected
+            )));
+        }
+        let ptr = create_tensor_with_data(data.as_mut_ptr().cast(), data.len(), shape, dtype)?;
+        Ok(Self {
+            ptr,
+            shape: shape.to_vec(),
+            dtype,
+            backing: TensorBacking::Bytes(data),
+        })
+    }
+
     /// Get tensor shape.
     pub fn shape(&self) -> &[i64] {
         &self.shape
@@ -275,6 +308,21 @@ impl Value {
     /// Total number of elements.
     pub fn numel(&self) -> usize {
         self.shape.iter().product::<i64>() as usize
+    }
+
+    /// Copy the tensor's raw little-endian element bytes out of a CPU tensor.
+    ///
+    /// Counterpart to [`Value::from_raw_bytes`] used by the backend-neutral
+    /// component-session seam. The tensor must be host-resident (the pipeline
+    /// component path runs on CPU); the returned buffer is `numel *
+    /// dtype.size_of()` bytes in row-major order.
+    pub fn to_raw_bytes(&self) -> Result<Vec<u8>> {
+        let bytes = self.numel() * self.dtype.size_of();
+        let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
+        // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
+        // host-resident tensor's row-major allocation, kept alive by `self`.
+        let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), bytes) };
+        Ok(slice.to_vec())
     }
 
     /// Copy tensor data out as f32 values.
@@ -650,7 +698,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
                 return Err(OrtError::InvalidArgument(
                     "cannot zero row for non-owned or non-KV tensor".into(),
                 ));
@@ -730,7 +778,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
                 return Err(OrtError::InvalidArgument(
                     "cannot pack rows for non-owned or non-KV tensor".into(),
                 ));
@@ -792,6 +840,7 @@ impl Drop for Value {
             TensorBacking::F32(data) => data.len(),
             TensorBacking::F16(data) => data.len(),
             TensorBacking::I64(data) => data.len(),
+            TensorBacking::Bytes(data) => data.len(),
             TensorBacking::Alias(owner) => owner.numel(),
             TensorBacking::None => 0,
         };

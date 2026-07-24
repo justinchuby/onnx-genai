@@ -222,6 +222,36 @@ fn case_inputs(case: Case, dtype: DataType) -> Vec<Option<HostTensor>> {
     ]
 }
 
+fn router_with_top_experts(case: Case, first_expert: usize) -> HostTensor {
+    assert!(first_expert + case.top_k <= case.experts);
+    let values: Vec<f32> = (0..case.rows)
+        .flat_map(|_| {
+            (0..case.experts).map(move |expert| {
+                if (first_expert..first_expert + case.top_k).contains(&expert) {
+                    10.0 - (expert - first_expert) as f32
+                } else {
+                    -10.0
+                }
+            })
+        })
+        .collect();
+    HostTensor::f32(&[case.rows, case.experts], &values)
+}
+
+fn router_with_hot_expert(case: Case) -> HostTensor {
+    assert!(case.top_k >= 2);
+    let values: Vec<f32> = (0..case.rows)
+        .flat_map(|_| {
+            (0..case.experts).map(move |expert| match expert {
+                0 => 20.0,
+                expert if expert < case.top_k => 10.0 - expert as f32,
+                _ => -10.0,
+            })
+        })
+        .collect();
+    HostTensor::f32(&[case.rows, case.experts], &values)
+}
+
 fn model_node(
     inputs: &[Option<HostTensor>],
     output_dtype: DataType,
@@ -337,9 +367,37 @@ fn run_cpu(case: Case, inputs: &[Option<HostTensor>]) -> Vec<f32> {
         .collect()
 }
 
-fn gpu() -> Option<CudaExecutionProvider> {
+/// Serializes GPU test bodies within this binary. The capture/replay tests use
+/// `CU_STREAM_CAPTURE_MODE_GLOBAL`, under which any concurrent CUDA alloc/launch
+/// from another test thread in the same process/context errors out. Holding this
+/// lock for the whole test body (via [`GpuGuard`]) keeps capture from overlapping
+/// other CUDA work. Separate test binaries run in separate processes/contexts, so
+/// no cross-binary serialization is needed.
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A live CUDA EP plus the held [`GPU_SERIAL`] guard. Derefs to the EP so every
+/// existing `gpu()` call site is unchanged.
+struct GpuGuard {
+    ep: CudaExecutionProvider,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for GpuGuard {
+    type Target = CudaExecutionProvider;
+    fn deref(&self) -> &CudaExecutionProvider {
+        &self.ep
+    }
+}
+
+fn gpu() -> Option<GpuGuard> {
+    // Ignore poisoning: a panicking test still leaves the device usable, and we
+    // must not cascade one failure into spurious lock failures elsewhere.
+    let serial = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     match CudaExecutionProvider::new_default() {
-        Ok(ep) => Some(ep),
+        Ok(ep) => Some(GpuGuard {
+            ep,
+            _serial: serial,
+        }),
         Err(error) => {
             eprintln!("skip: no CUDA GPU available ({error})");
             None
@@ -353,7 +411,7 @@ fn run_gpu(
     inputs: &[Option<HostTensor>],
     dtype: DataType,
 ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
-    run_gpu_with_prefill_min_tokens(ep, case, inputs, dtype, None)
+    run_gpu_impl(ep, case, inputs, dtype, None, None, true)
 }
 
 fn run_gpu_with_prefill_min_tokens(
@@ -362,6 +420,18 @@ fn run_gpu_with_prefill_min_tokens(
     inputs: &[Option<HostTensor>],
     dtype: DataType,
     prefill_min_tokens: Option<usize>,
+) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+    run_gpu_impl(ep, case, inputs, dtype, prefill_min_tokens, None, true)
+}
+
+fn run_gpu_impl(
+    ep: &CudaExecutionProvider,
+    case: Case,
+    inputs: &[Option<HostTensor>],
+    dtype: DataType,
+    prefill_min_tokens: Option<usize>,
+    replay_router: Option<&HostTensor>,
+    capture: bool,
 ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
     let output_shape = [case.rows, case.hidden];
     let (mut graph, node) = model_node(inputs, dtype, &output_shape, case);
@@ -428,6 +498,39 @@ fn run_gpu_with_prefill_min_tokens(
             ep.device_id(),
         )],
     )?;
+    if capture {
+        assert!(
+            kernel.capture_support().is_supported(),
+            "successful eager QMoE execution must warm its capture workspace"
+        );
+        runtime.begin_graph_capture(&[kernel.as_ref()])?;
+        if let Err(error) = kernel.execute(
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                dtype,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        ) {
+            let _ = runtime.abort_graph_capture();
+            return Err(error);
+        }
+        runtime.end_graph_capture()?;
+        if let Some(router) = replay_router {
+            let router_buffer = buffers[1].as_ref().expect("router_probs must be present");
+            // SAFETY: router shape is unchanged and its byte length matches the allocation.
+            unsafe { runtime.htod(&router.bytes, cuptr(router_buffer.as_ptr()))? };
+        }
+        // SAFETY: the output allocation is exactly `output_bytes` bytes.
+        unsafe { runtime.htod(&vec![0u8; output_bytes], cuptr(output_buffer.as_ptr()))? };
+        runtime.replay_graph()?;
+    }
+    runtime.synchronize()?;
+    if capture {
+        runtime.reset_graph()?;
+    }
     let mut bytes = vec![0u8; output_bytes];
     // SAFETY: output allocation contains exactly the requested output tensor.
     unsafe { runtime.dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))? };
@@ -526,6 +629,30 @@ fn compare(case: Case, dtype: DataType) -> (f32, u32) {
     let actual = run_gpu(&ep, case, &gpu_inputs, dtype).unwrap();
     assert_conforms(&actual, &expected, case, dtype);
     error_metrics(&actual, &expected)
+}
+
+fn qmoe_64expert_case(rows: usize) -> Case {
+    Case {
+        experts: 64,
+        rows,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 6,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: false,
+        biases: true,
+        normalize: true,
+        router_weights: true,
+    }
+}
+
+fn compare_64expert_decode_and_prefill(dtype: DataType) {
+    for rows in [1, 8] {
+        compare(qmoe_64expert_case(rows), dtype);
+    }
 }
 
 fn compare_gemv_gemm_and_cpu(case: Case) {
@@ -701,6 +828,128 @@ fn qmoe_int4_top2_symmetric_matches_cpu() {
         DataType::Float32,
     );
     eprintln!("QMoE int4 top-2 CPU/CUDA max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}");
+}
+
+#[test]
+fn qmoe_64experts_top6_fp16_decode_and_prefill_match_cpu() {
+    compare_64expert_decode_and_prefill(DataType::Float16);
+}
+
+#[test]
+fn qmoe_64experts_top6_bf16_decode_and_prefill_match_cpu() {
+    compare_64expert_decode_and_prefill(DataType::BFloat16);
+}
+
+#[test]
+fn qmoe_64experts_top6_handles_empty_and_hot_experts() {
+    let Some(ep) = gpu() else { return };
+    let case = qmoe_64expert_case(16);
+    let mut inputs = case_inputs(case, DataType::Float16);
+    inputs[1] = Some(router_with_hot_expert(case));
+
+    let cpu_inputs = rounded_cpu_inputs(&inputs, DataType::Float16);
+    let expected = run_cpu(case, &cpu_inputs);
+    let actual = run_gpu(&ep, case, &inputs, DataType::Float16).unwrap();
+    assert_conforms(&actual, &expected, case, DataType::Float16);
+}
+
+#[test]
+fn qmoe_capture_replay_reresolves_changed_router_probs() {
+    let Some(ep) = gpu() else { return };
+    let case = Case {
+        experts: 4,
+        rows: 3,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "identity",
+        swiglu_fusion: 0,
+        affine: false,
+        fc3: false,
+        biases: false,
+        normalize: true,
+        router_weights: false,
+    };
+    let mut capture_inputs = case_inputs(case, DataType::Float32);
+    capture_inputs[1] = Some(HostTensor::f32(
+        &[case.rows, case.experts],
+        &[
+            9.0, 8.0, 0.0, -1.0, 9.0, 8.0, 0.0, -1.0, 9.0, 8.0, 0.0, -1.0,
+        ],
+    ));
+    let replay_router = HostTensor::f32(
+        &[case.rows, case.experts],
+        &[
+            -1.0, 0.0, 9.0, 8.0, -1.0, 0.0, 9.0, 8.0, -1.0, 0.0, 9.0, 8.0,
+        ],
+    );
+
+    let replay = run_gpu_impl(
+        &ep,
+        case,
+        &capture_inputs,
+        DataType::Float32,
+        None,
+        Some(&replay_router),
+        true,
+    )
+    .unwrap();
+    let mut eager_inputs = capture_inputs.clone();
+    eager_inputs[1] = Some(replay_router);
+    let eager = run_gpu_impl(
+        &ep,
+        case,
+        &eager_inputs,
+        DataType::Float32,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert_conforms(&replay, &eager, case, DataType::Float32);
+}
+
+#[test]
+fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
+    let Some(ep) = gpu() else { return };
+    let case = qmoe_64expert_case(8);
+    let mut capture_inputs = case_inputs(case, DataType::Float16);
+    capture_inputs[1] = Some(router_with_top_experts(case, 0));
+    let replay_router = router_with_top_experts(case, 32);
+
+    let replay = run_gpu_impl(
+        &ep,
+        case,
+        &capture_inputs,
+        DataType::Float16,
+        None,
+        Some(&replay_router),
+        true,
+    )
+    .unwrap();
+    let mut eager_inputs = capture_inputs;
+    eager_inputs[1] = Some(replay_router);
+    let eager = run_gpu_impl(
+        &ep,
+        case,
+        &eager_inputs,
+        DataType::Float16,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let expected = run_cpu(case, &rounded_cpu_inputs(&eager_inputs, DataType::Float16));
+
+    assert_conforms(&replay, &eager, case, DataType::Float16);
+    assert_conforms(&replay, &expected, case, DataType::Float16);
+}
+
+#[test]
+fn qmoe_64experts_top6_worst_case_scratch_sizing_matches_cpu() {
+    compare(qmoe_64expert_case(64), DataType::Float16);
 }
 
 #[test]

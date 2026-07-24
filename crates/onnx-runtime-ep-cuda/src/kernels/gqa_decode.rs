@@ -1,28 +1,24 @@
-//! Capture-safe, warp-parallel single-token (`Sq=1`) GQA decode attention.
+//! Capture-safe, split-K single-token (`Sq=1`) f32 GQA decode attention.
 //!
 //! The reference kernel `gqa_attention_reference_f32` computes decode attention
 //! serially on thread 0 (every QK dot + `exp`) and then has all threads rescan
-//! the full score row for the softmax denominator. That serialization dominates
-//! native CUDA decode. This module replaces it, for the captured f32 one-token
-//! path, with an online-softmax kernel that assigns **one warp per query row**
-//! and parallelizes the QK dot across the `head_dim` with warp-shuffle
-//! reductions. Nothing is materialized in global memory: the running softmax
-//! maximum, denominator, and the output accumulator all live in registers.
+//! the full score row for the softmax denominator. A single warp per query row
+//! fixes that serialization but still leaves small-head GQA models with only a
+//! handful of resident CTAs while every warp walks the complete context. This
+//! implementation mirrors the fp16 split-K kernel: up to sixteen CTAs divide
+//! each query row's KV range, then a second kernel merges their online-softmax
+//! states. That exposes enough parallelism to keep decode latency nearly flat
+//! over practical context lengths without changing the graph contract.
 //!
 //! ## Capture-safety
 //!
 //! The launch path is legal to record inside a CUDA graph and to replay with
 //! only device-buffer contents changing:
 //!   * No `stream.synchronize()` or any device sync on the launch path.
-//!   * No per-call `cudaMalloc`/`cudaFree` — the kernel needs **no** scratch
-//!     (no score buffer, not even shared memory), so nothing is allocated per
-//!     invocation.
-//!   * Fixed launch geometry: the grid/block are sized purely from the shape
-//!     signature (`batch * query_heads * query_seq`, all fixed for the captured
-//!     decode step), never from the runtime valid sequence length. The kernel
-//!     loops to the device-resident valid length read from `total_lengths` —
-//!     the same tensor the reference kernel reads — so replays see the updated
-//!     length without any relaunch or resize.
+//!   * No per-call `cudaMalloc`/`cudaFree`; partial states use fixed module-global
+//!     scratch allocated when NVRTC loads the module.
+//!   * Fixed maximum-split launch geometry. The device-resident valid length
+//!     chooses the active split count, so graph replay needs no update.
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -31,8 +27,9 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f32_v1";
+const MODULE_KEY: &str = "gqa_decode_attention_f32_v3";
 const ENTRY: &str = "gqa_decode_attention_f32";
+const MERGE_ENTRY: &str = "gqa_decode_attention_f32_merge";
 
 /// Largest `head_dim` this kernel supports. Each of the 32 warp lanes owns
 /// `ceil(head_dim / 32)` output dimensions in registers, capped at 4.
@@ -42,6 +39,7 @@ pub(super) const MAX_HEAD_DIM: usize = 128;
 /// across many SMs, large enough to amortize launch overhead.
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
+pub(super) const MAX_SPLITS: usize = 16;
 
 /// Whether the warp-parallel decode kernel handles this shape. Single query
 /// token (`Sq=1`) with `head_dim` within [`MAX_HEAD_DIM`].
@@ -49,9 +47,63 @@ pub(super) fn supported(query_seq: usize, head_dim: usize) -> bool {
     query_seq == 1 && (1..=MAX_HEAD_DIM).contains(&head_dim)
 }
 
+/// Env toggle for the single-split direct-output fast path (shared by the f32
+/// and fp16 split-K decode kernels). When a decode step's on-device valid length
+/// selects a single split, the sole active CTA already owns the complete flash
+/// state, so it writes the normalized output directly and the merge pass skips
+/// that row — bit-identical to the two-step path, strictly less work. Set
+/// `ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT=0` to force the original two-step
+/// path (A/B + rollback). The value is read once and cached; it is a scalar
+/// kernel argument fixed at graph-capture time.
+pub(super) fn single_split_direct_flag() -> i32 {
+    #[cfg(test)]
+    {
+        let override_value =
+            TEST_SINGLE_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if override_value >= 0 {
+            return override_value;
+        }
+    }
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<i32> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        match std::env::var("ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT") {
+            Ok(value) if value == "0" => 0,
+            _ => 1,
+        }
+    })
+}
+
+/// Test-only override for [`single_split_direct_flag`]: `-1` defers to the env
+/// var (default), `0`/`1` force the two-step / direct path so parity tests can
+/// A/B both branches within one process.
+#[cfg(test)]
+pub(super) static TEST_SINGLE_SPLIT_OVERRIDE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
+
+/// Serializes the f32/fp16 single-split parity tests so their overrides of
+/// [`TEST_SINGLE_SPLIT_OVERRIDE`] cannot interleave.
+#[cfg(test)]
+pub(super) static TEST_SINGLE_SPLIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const DECODE_SRC: &str = r#"
 #define GQA_WARP_SIZE 32
 #define GQA_MAX_DPL 4   // dims per lane; head_dim <= 32 * GQA_MAX_DPL == 128
+#define GQA_MAX_HEAD_SIZE 128
+#define GQA_MAX_SPLITS 16
+#define GQA_MAX_SCRATCH_ROWS 256
+#define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
+
+__device__ __align__(16) float gqa_split_scratch[
+    GQA_MAX_SCRATCH_ROWS * GQA_MAX_SPLITS * GQA_SCRATCH_STRIDE];
+
+__device__ __forceinline__ int gqa_active_splits(const int sequence_length) {
+    if (sequence_length <= 64) return 1;
+    if (sequence_length <= 128) return 2;
+    if (sequence_length <= 256) return 4;
+    if (sequence_length <= 512) return 8;
+    return GQA_MAX_SPLITS;
+}
 
 extern "C" __global__ void gqa_decode_attention_f32(
     const float* __restrict__ query,
@@ -68,15 +120,20 @@ extern "C" __global__ void gqa_decode_attention_f32(
     const int group_size,
     const float scale,
     const int local_window,
-    const float softcap)
+    const float softcap,
+    const int single_split_direct)
 {
+    extern __shared__ float smem[];
     const int warps_per_block = blockDim.x / GQA_WARP_SIZE;
+    float* warp_max = smem;
+    float* warp_sum = warp_max + warps_per_block;
+    float* warp_acc = warp_sum + warps_per_block;
+
     const int lane = threadIdx.x % GQA_WARP_SIZE;
     const int warp_in_block = threadIdx.x / GQA_WARP_SIZE;
-    const int row = blockIdx.x * warps_per_block + warp_in_block;
+    const int row = blockIdx.x / GQA_MAX_SPLITS;
+    const int split = blockIdx.x % GQA_MAX_SPLITS;
     const int rows = batch * query_heads * query_seq;
-    // Every lane of a warp shares `row`, so an out-of-range warp exits in full;
-    // the surviving warps keep a full 0xffffffff shuffle mask.
     if (row >= rows) return;
 
     const int query_pos = row % query_seq;
@@ -90,6 +147,14 @@ extern "C" __global__ void gqa_decode_attention_f32(
         (local_window > 0 && causal_limit + 1 > local_window)
             ? causal_limit + 1 - local_window
             : 0;
+    const int sequence_length = max(0, causal_limit + 1 - local_start);
+    const int active_splits =
+        (row < GQA_MAX_SCRATCH_ROWS) ? gqa_active_splits(sequence_length) : 1;
+    if (split >= active_splits) return;
+    const int keys_per_split =
+        (sequence_length + active_splits - 1) / active_splits;
+    const int split_start = local_start + split * keys_per_split;
+    const int split_end = min(causal_limit + 1, split_start + keys_per_split);
 
     const long q_base =
         ((long)(batch_index * query_heads + query_head) * query_seq + query_pos)
@@ -110,7 +175,8 @@ extern "C" __global__ void gqa_decode_attention_f32(
     float running_max = negative_infinity;
     float running_sum = 0.0f;
 
-    for (int key_pos = local_start; key_pos <= causal_limit; ++key_pos) {
+    for (int key_pos = split_start + warp_in_block; key_pos < split_end;
+         key_pos += warps_per_block) {
         const long k_base = kv_plane + (long)key_pos * (long)head_size;
         float partial = 0.0f;
 #pragma unroll
@@ -143,12 +209,116 @@ extern "C" __global__ void gqa_decode_attention_f32(
         running_max = new_max;
     }
 
-    const float inverse_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+    if (lane == 0) {
+        warp_max[warp_in_block] = running_max;
+        warp_sum[warp_in_block] = running_sum;
+    }
 #pragma unroll
     for (int i = 0; i < GQA_MAX_DPL; ++i) {
         const int d = lane + i * GQA_WARP_SIZE;
         if (d < head_size) {
-            output[q_base + d] = acc[i] * inverse_sum;
+            warp_acc[warp_in_block * head_size + d] = acc[i];
+        }
+    }
+    __syncthreads();
+
+    if (warp_in_block != 0) return;
+    float global_max = negative_infinity;
+    for (int w = 0; w < warps_per_block; ++w) {
+        global_max = fmaxf(global_max, warp_max[w]);
+    }
+    float denom = 0.0f;
+    for (int w = 0; w < warps_per_block; ++w) {
+        denom += warp_sum[w] * expf(warp_max[w] - global_max);
+    }
+    // When `single_split_direct` is enabled and the on-device length selects a
+    // single split, the sole active CTA already owns the complete flash state,
+    // so it normalizes and writes the final output directly, skipping the
+    // scratch round-trip and the merge pass. Bit-identical to the two-step path
+    // (the merge with one split multiplies by exp(0)==1 and the same 1/denom).
+    const bool direct_output =
+        (row >= GQA_MAX_SCRATCH_ROWS) || (single_split_direct != 0 && active_splits == 1);
+    float* split_state = direct_output
+        ? nullptr
+        : gqa_split_scratch
+            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+    if (lane == 0 && !direct_output) {
+        split_state[0] = global_max;
+        split_state[1] = denom;
+    }
+    const float inverse_sum =
+        (direct_output && denom > 0.0f) ? (1.0f / denom) : 0.0f;
+#pragma unroll
+    for (int i = 0; i < GQA_MAX_DPL; ++i) {
+        const int d = lane + i * GQA_WARP_SIZE;
+        if (d < head_size) {
+            float out = 0.0f;
+            for (int w = 0; w < warps_per_block; ++w) {
+                out += warp_acc[w * head_size + d]
+                    * expf(warp_max[w] - global_max);
+            }
+            if (direct_output) {
+                output[q_base + d] = out * inverse_sum;
+            } else {
+                split_state[2 + d] = out;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void gqa_decode_attention_f32_merge(
+    float* __restrict__ output,
+    const int* __restrict__ total_lengths,
+    const int batch,
+    const int query_heads,
+    const int query_seq,
+    const int head_size,
+    const int local_window,
+    const int single_split_direct)
+{
+    const int row = blockIdx.x;
+    const int rows = batch * query_heads * query_seq;
+    if (row >= rows || row >= GQA_MAX_SCRATCH_ROWS) return;
+
+    const int lane = threadIdx.x;
+    const int query_pos = row % query_seq;
+    const int batch_index = row / (query_heads * query_seq);
+    const int total = total_lengths[batch_index];
+    const int causal_limit = total - query_seq + query_pos;
+    const int local_start =
+        (local_window > 0 && causal_limit + 1 > local_window)
+            ? causal_limit + 1 - local_window
+            : 0;
+    const int sequence_length = max(0, causal_limit + 1 - local_start);
+    const int active_splits = gqa_active_splits(sequence_length);
+    // Single-split rows were finalized in-place by the decode kernel.
+    if (single_split_direct != 0 && active_splits <= 1) return;
+
+    float global_max = __int_as_float(0xff800000);
+    for (int split = 0; split < active_splits; ++split) {
+        const float* state = gqa_split_scratch
+            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        global_max = fmaxf(global_max, state[0]);
+    }
+    float denom = 0.0f;
+    for (int split = 0; split < active_splits; ++split) {
+        const float* state = gqa_split_scratch
+            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        denom += state[1] * expf(state[0] - global_max);
+    }
+    const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    const long q_base = (long)row * (long)head_size;
+#pragma unroll
+    for (int i = 0; i < GQA_MAX_DPL; ++i) {
+        const int d = lane + i * GQA_WARP_SIZE;
+        if (d < head_size) {
+            float out = 0.0f;
+            for (int split = 0; split < active_splits; ++split) {
+                const float* state = gqa_split_scratch
+                    + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+                out += state[2 + d] * expf(state[0] - global_max);
+            }
+            output[q_base + d] = out * inverse_sum;
         }
     }
 }
@@ -196,15 +366,31 @@ pub(super) fn run(
         .checked_mul(num_heads)
         .and_then(|value| value.checked_mul(query_seq))
         .ok_or_else(|| EpError::KernelFailed("cuda_ep GQA decode: row count overflow".into()))?;
-    let warps_per_block = WARPS_PER_BLOCK as usize;
-    let blocks = rows.div_ceil(warps_per_block).max(1);
-    let grid_x = u32::try_from(blocks).map_err(|_| {
+    let partial_blocks = rows
+        .checked_mul(MAX_SPLITS)
+        .ok_or_else(|| EpError::KernelFailed("cuda_ep GQA decode: split grid overflow".into()))?;
+    let grid_x = u32::try_from(partial_blocks.max(1)).map_err(|_| {
         EpError::KernelFailed(format!(
-            "cuda_ep GQA decode: {blocks} blocks exceed CUDA grid.x"
+            "cuda_ep GQA decode: {partial_blocks} split blocks exceed CUDA grid.x"
         ))
     })?;
+    let merge_grid_x = u32::try_from(rows.max(1)).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "cuda_ep GQA decode: {rows} rows exceed CUDA grid.x"
+        ))
+    })?;
+    let warps = WARPS_PER_BLOCK as usize;
+    let shared_floats = warps
+        .checked_mul(2)
+        .and_then(|base| warps.checked_mul(head_dim).map(|acc| base + acc))
+        .ok_or_else(|| EpError::KernelFailed("cuda_ep GQA decode: shared-mem overflow".into()))?;
+    let shared_mem_bytes =
+        u32::try_from(shared_floats * std::mem::size_of::<f32>()).map_err(|_| {
+            EpError::KernelFailed("cuda_ep GQA decode: shared-mem bytes exceed u32".into())
+        })?;
 
     let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, ENTRY)?;
+    let single_split_direct = single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
         .arg(&query)
@@ -221,19 +407,41 @@ pub(super) fn run(
         .arg(&group_i)
         .arg(&scale)
         .arg(&local_window)
-        .arg(&softcap);
+        .arg(&softcap)
+        .arg(&single_split_direct);
     // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
-    // caller (present K/V span `cache_capacity` rows, query/output span
-    // `query_seq` tokens). The kernel allocates no scratch and never syncs, so
-    // the launch is legal to record into and replay from a CUDA graph.
+    // caller. Fixed module-global and dynamic shared scratch make the launch
+    // legal to record into and replay from a CUDA graph.
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (grid_x, 1, 1),
             block_dim: (WARPS_PER_BLOCK * WARP_SIZE, 1, 1),
+            shared_mem_bytes,
+        })
+    }
+    .map_err(|error| driver_err("launch GQA f32 split-K attention", error))?;
+
+    let merge_function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, MERGE_ENTRY)?;
+    let mut merge_builder = runtime.stream().launch_builder(&merge_function);
+    merge_builder
+        .arg(&output)
+        .arg(&total_lengths)
+        .arg(&batch_i)
+        .arg(&heads_i)
+        .arg(&query_seq_i)
+        .arg(&dim_i)
+        .arg(&local_window)
+        .arg(&single_split_direct);
+    // SAFETY: the same-stream partial launch writes every active split state
+    // consumed here; both launches are graph-recordable.
+    unsafe {
+        merge_builder.launch(LaunchConfig {
+            grid_dim: (merge_grid_x, 1, 1),
+            block_dim: (WARP_SIZE, 1, 1),
             shared_mem_bytes: 0,
         })
     }
-    .map_err(|error| driver_err("launch GQA decode attention", error))?;
+    .map_err(|error| driver_err("launch GQA f32 split-K merge", error))?;
     Ok(())
 }
 
@@ -272,6 +480,7 @@ mod tests {
 
     /// Standard (non-online) softmax attention reference in f64, matching the
     /// exact math of `gqa_attention_reference_f32` for the decode shape.
+    #[allow(clippy::too_many_arguments)]
     fn cpu_reference(
         query: &[f32],
         key: &[f32],
@@ -328,7 +537,7 @@ mod tests {
         let num_heads = 14usize;
         let num_kv_heads = 2usize;
         let head_dim = 64usize;
-        let cache_capacity = 256usize;
+        let cache_capacity = 1024usize;
         let group = num_heads / num_kv_heads;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -364,7 +573,7 @@ mod tests {
 
         let mut worst_abs = 0.0f32;
         let mut worst_rel = 0.0f32;
-        for total in [1usize, 7, 64, 255] {
+        for total in [1usize, 7, 64, 255, 1023] {
             let totals = [total as i32];
             // SAFETY: `totals_dev` holds `batch` i32 values.
             unsafe {
@@ -444,5 +653,117 @@ mod tests {
         assert!(!supported(1, 129));
         assert!(!supported(2, 64));
         assert!(!supported(1, 0));
+    }
+
+    /// The single-split direct-output fast path (flag=1) must be bit-identical
+    /// to the original two-step decode+merge path (flag=0) across Phi's
+    /// head_dim (128) and Qwen's (64), for both single-split and multi-split
+    /// decode lengths.
+    #[test]
+    fn single_split_direct_output_is_bit_exact_to_two_step_path_f32() {
+        use std::sync::atomic::Ordering;
+
+        let _serial = TEST_SINGLE_SPLIT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping GQA f32 single-split parity test: CUDA runtime unavailable");
+            return;
+        };
+
+        let batch = 1usize;
+        let num_heads = 8usize;
+        let num_kv_heads = 2usize;
+        let cache_capacity = 1024usize;
+        let group = num_heads / num_kv_heads;
+
+        let mut state = 0x51A9_7C3Du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        for head_dim in [64usize, 128usize] {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q = vec![0.0f32; num_heads * head_dim];
+            for slot in q.iter_mut() {
+                *slot = next();
+            }
+            let kv_len = num_kv_heads * cache_capacity * head_dim;
+            let mut k = vec![0.0f32; kv_len];
+            let mut v = vec![0.0f32; kv_len];
+            for i in 0..kv_len {
+                k[i] = next();
+                v[i] = next();
+            }
+
+            let query_dev = runtime.alloc_raw(q.len() * 4).unwrap();
+            let key_dev = runtime.alloc_raw(k.len() * 4).unwrap();
+            let value_dev = runtime.alloc_raw(v.len() * 4).unwrap();
+            let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
+            let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            // SAFETY: device buffers were sized to hold each source slice.
+            unsafe {
+                runtime.htod(as_bytes(&q), query_dev).unwrap();
+                runtime.htod(as_bytes(&k), key_dev).unwrap();
+                runtime.htod(as_bytes(&v), value_dev).unwrap();
+            }
+
+            let launch = |flag: i32, total: usize| -> Vec<f32> {
+                TEST_SINGLE_SPLIT_OVERRIDE.store(flag, Ordering::Relaxed);
+                let totals = [total as i32];
+                // SAFETY: `totals_dev` holds `batch` i32 values.
+                unsafe {
+                    runtime.htod(as_bytes(&totals), totals_dev).unwrap();
+                }
+                run(
+                    &runtime,
+                    batch,
+                    num_heads,
+                    num_kv_heads,
+                    1,
+                    head_dim,
+                    cache_capacity,
+                    group,
+                    scale,
+                    query_dev,
+                    key_dev,
+                    value_dev,
+                    output_dev,
+                    totals_dev,
+                    0,
+                    0.0,
+                )
+                .unwrap();
+                let mut got = vec![0.0f32; num_heads * head_dim];
+                // SAFETY: `output_dev` holds `num_heads * head_dim` f32 values.
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+                }
+                got
+            };
+
+            for total in [1usize, 8, 33, 64, 65, 129, 300] {
+                let direct = launch(1, total);
+                let two_step = launch(0, total);
+                assert_eq!(
+                    direct.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    two_step.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "single-split fast path diverged from two-step path at head_dim={head_dim} total={total}"
+                );
+            }
+
+            TEST_SINGLE_SPLIT_OVERRIDE.store(-1, Ordering::Relaxed);
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(query_dev).unwrap();
+                runtime.free_raw(key_dev).unwrap();
+                runtime.free_raw(value_dev).unwrap();
+                runtime.free_raw(output_dev).unwrap();
+                runtime.free_raw(totals_dev).unwrap();
+            }
+        }
     }
 }

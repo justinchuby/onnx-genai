@@ -42,6 +42,7 @@ pub mod gemm;
 mod gqa_decode;
 mod gqa_decode_fp16;
 pub mod group_query_attention;
+pub mod index_share;
 pub mod indexing;
 pub mod matmul;
 pub mod matmul_nbits;
@@ -111,6 +112,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "BlockQuantizedMatMul",
     "SparseKvGather",
     "CompressedSparseAttention",
+    "IndexShare",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -199,11 +201,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
 /// The shared [`CudaRuntime`] (context + stream + cuBLASLt handle) is threaded
 /// into every factory so kernels submit onto the EP's single stream.
 pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
-    build_cuda_registry_with_metrics(
-        runtime,
-        Arc::new(csa_checkpoint::CsaMetrics::default()),
-        group_query_attention::GqaSequenceLengthsPolicy::default(),
-    )
+    build_cuda_registry_with_metrics(runtime, Arc::new(csa_checkpoint::CsaMetrics::default()))
 }
 
 /// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry
@@ -214,7 +212,6 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
 pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
-    gqa_sequence_lengths_policy: group_query_attention::GqaSequenceLengthsPolicy,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
@@ -384,6 +381,12 @@ pub fn build_cuda_registry_with_metrics(
         ),
     );
     reg.register(
+        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Gemm", "", 1),
         Box::new(gemm::GemmFactory {
             runtime: runtime.clone(),
@@ -510,7 +513,6 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
             runtime: runtime.clone(),
-            sequence_lengths_policy: gqa_sequence_lengths_policy,
         }),
     );
 
@@ -709,7 +711,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 87);
+        assert_eq!(CUDA_COVERED_OPS.len(), 88);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {

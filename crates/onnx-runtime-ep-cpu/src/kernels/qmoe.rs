@@ -31,7 +31,7 @@ use onnx_runtime_loader::{
 };
 
 use super::matmul_nbits::dequantize_nbits_row;
-use super::moe::{MoeAttributes, routing_weights, run_expert};
+use super::moe::{MoeAttributes, routing_weights, run_expert_grouped};
 use super::{
     check_arity, contiguous_f32_slice, contiguous_u8_slice, to_dense_bytes, to_dense_f32,
     write_dense_f32,
@@ -51,7 +51,7 @@ impl QMoEFactory {
     }
 }
 
-/// Per-row block-dequantizing integer QMoE reference kernel.
+/// Route-grouped, per-active-expert dequantizing integer QMoE kernel.
 pub struct QMoEKernel {
     layer_id: u32,
     attributes: MoeAttributes,
@@ -304,36 +304,43 @@ impl Kernel for QMoEKernel {
             )));
         }
         let mut output = vec![0.0f32; output_elements];
+        let mut routes = Vec::with_capacity(rows);
+        let mut token_counts = BTreeMap::new();
+        let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
+        let mut route_slots = 0usize;
+        for row in 0..rows {
+            let router_range = checked_range(row, experts, "router row")?;
+            let route = routing_weights(
+                &router[router_range.clone()],
+                aggregation.as_deref().map(|weights| &weights[router_range]),
+                self.attributes.k,
+                self.attributes.normalize_routing_weights,
+            );
+            for &(expert, route_weight) in &route {
+                *token_counts.entry(expert).or_insert(0usize) += 1;
+                tasks
+                    .entry(expert)
+                    .or_default()
+                    .push((row, route_slots, route_weight));
+                route_slots = route_slots
+                    .checked_add(1)
+                    .ok_or_else(|| error("routed contribution count overflow"))?;
+            }
+            routes.push(route);
+        }
+        let contribution_elements =
+            checked_product(&[route_slots, hidden], "routed contribution element count")?;
+        checked_byte_count(
+            contribution_elements,
+            std::mem::size_of::<f32>(),
+            "routed contribution byte count",
+        )?;
+        let mut contributions = vec![0.0f32; contribution_elements];
         let route_first = self.weight_offload.enabled
             && fc1.is_pageable()
             && fc2.is_pageable()
             && fc3.as_ref().is_none_or(QuantizedExperts::is_pageable);
         if route_first {
-            let mut routes = Vec::with_capacity(rows);
-            let mut token_counts = BTreeMap::new();
-            let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
-            let mut route_slots = 0usize;
-            for row in 0..rows {
-                let router_range = checked_range(row, experts, "router row")?;
-                let route = routing_weights(
-                    &router[router_range.clone()],
-                    aggregation.as_deref().map(|weights| &weights[router_range]),
-                    self.attributes.k,
-                    self.attributes.normalize_routing_weights,
-                );
-                for &(expert, route_weight) in &route {
-                    *token_counts.entry(expert).or_insert(0usize) += 1;
-                    tasks
-                        .entry(expert)
-                        .or_default()
-                        .push((row, route_slots, route_weight));
-                    route_slots = route_slots
-                        .checked_add(1)
-                        .ok_or_else(|| error("routed contribution count overflow"))?;
-                }
-                routes.push(route);
-            }
-
             let mut mapped_regions = Vec::new();
             mapped_regions.extend_from_slice(fc1.mapped_regions());
             mapped_regions.extend_from_slice(fc2.mapped_regions());
@@ -345,14 +352,6 @@ impl Kernel for QMoEKernel {
                 .map_err(error)?;
             metrics().record_routes(self.layer_id, &token_counts);
 
-            let contribution_elements =
-                checked_product(&[route_slots, hidden], "routed contribution element count")?;
-            checked_byte_count(
-                contribution_elements,
-                std::mem::size_of::<f32>(),
-                "routed contribution byte count",
-            )?;
-            let mut contributions = vec![0.0f32; contribution_elements];
             for (expert, expert_tasks) in tasks {
                 let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
                 let key = ExpertCacheKey::new(
@@ -365,9 +364,8 @@ impl Kernel for QMoEKernel {
                     fc3.as_ref(),
                 );
                 let weights = self.host_cache.lease(key, expanded_bytes, || {
-                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref())
+                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), true)
                 })?;
-                metrics().record_dequantized_window(1);
                 if weights.read_from_mmap {
                     let mut bytes_read = fc1
                         .expert_source_bytes(expert)?
@@ -380,87 +378,58 @@ impl Kernel for QMoEKernel {
                     }
                     metrics().record_bytes_read(bytes_read).map_err(error)?;
                 }
-                for (row, slot, route_weight) in expert_tasks {
-                    let input_range = checked_range(row, hidden, "input row")?;
-                    let contribution_range =
-                        checked_range(slot, hidden, "routed contribution row")?;
-                    accumulate_expert(
-                        &mut contributions[contribution_range],
-                        &x[input_range],
-                        expert,
-                        route_weight,
-                        &weights,
-                        fc1_bias.as_deref(),
-                        fc2_bias.as_deref(),
-                        fc3_bias.as_deref(),
-                        fc1_size,
-                        hidden,
-                        inter,
-                        &self.attributes,
-                    )?;
-                }
+                write_grouped_contributions(
+                    &mut contributions,
+                    &x,
+                    &expert_tasks,
+                    expert,
+                    &weights,
+                    fc1_bias.as_deref(),
+                    fc2_bias.as_deref(),
+                    fc3_bias.as_deref(),
+                    fc1_size,
+                    hidden,
+                    inter,
+                    &self.attributes,
+                )?;
             }
-
-            let mut slot = 0usize;
-            for (row, route) in routes.into_iter().enumerate() {
-                let output_range = checked_range(row, hidden, "output row")?;
-                let output_row = &mut output[output_range];
-                for _ in route {
-                    let contribution_range =
-                        checked_range(slot, hidden, "routed contribution row")?;
-                    for (output_value, contribution) in output_row
-                        .iter_mut()
-                        .zip(&contributions[contribution_range])
-                    {
-                        *output_value += contribution;
-                    }
-                    slot = slot
-                        .checked_add(1)
-                        .ok_or_else(|| error("routed contribution index overflow"))?;
-                }
-            }
-            debug_assert_eq!(slot, route_slots);
         } else {
-            for row in 0..rows {
-                let router_range = checked_range(row, experts, "router row")?;
-                let route = routing_weights(
-                    &router[router_range.clone()],
-                    aggregation
-                        .as_deref()
-                        .map(|weights| &weights[router_range.clone()]),
-                    self.attributes.k,
-                    self.attributes.normalize_routing_weights,
-                );
-                let input_range = checked_range(row, hidden, "input row")?;
-                let input_row = &x[input_range];
-                let output_range = checked_range(row, hidden, "output row")?;
-                let output_row = &mut output[output_range];
-                for (expert, route_weight) in route {
-                    let weights = DequantizedExpert {
-                        fc1: fc1.dequantize_expert(expert)?,
-                        fc2: fc2.dequantize_expert(expert)?,
-                        fc3: fc3
-                            .as_ref()
-                            .map(|weights| weights.dequantize_expert(expert))
-                            .transpose()?,
-                    };
-                    accumulate_expert(
-                        output_row,
-                        input_row,
-                        expert,
-                        route_weight,
-                        &weights,
-                        fc1_bias.as_deref(),
-                        fc2_bias.as_deref(),
-                        fc3_bias.as_deref(),
-                        fc1_size,
-                        hidden,
-                        inter,
-                        &self.attributes,
-                    )?;
-                }
+            for (expert, expert_tasks) in tasks {
+                let weights = DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), false)?;
+                write_grouped_contributions(
+                    &mut contributions,
+                    &x,
+                    &expert_tasks,
+                    expert,
+                    &weights,
+                    fc1_bias.as_deref(),
+                    fc2_bias.as_deref(),
+                    fc3_bias.as_deref(),
+                    fc1_size,
+                    hidden,
+                    inter,
+                    &self.attributes,
+                )?;
             }
         }
+        let mut slot = 0usize;
+        for (row, route) in routes.into_iter().enumerate() {
+            let output_range = checked_range(row, hidden, "output row")?;
+            let output_row = &mut output[output_range];
+            for _ in route {
+                let contribution_range = checked_range(slot, hidden, "routed contribution row")?;
+                for (output_value, contribution) in output_row
+                    .iter_mut()
+                    .zip(&contributions[contribution_range])
+                {
+                    *output_value += contribution;
+                }
+                slot = slot
+                    .checked_add(1)
+                    .ok_or_else(|| error("routed contribution index overflow"))?;
+            }
+        }
+        debug_assert_eq!(slot, route_slots);
         write_dense_f32(&mut outputs[0], &output)
     }
 
@@ -473,6 +442,7 @@ struct DequantizedExpert {
     fc1: Vec<f32>,
     fc2: Vec<f32>,
     fc3: Option<Vec<f32>>,
+    _residency: Option<DequantizedExpertResidency>,
 }
 
 impl DequantizedExpert {
@@ -481,6 +451,7 @@ impl DequantizedExpert {
         fc1: &QuantizedExperts<'_>,
         fc2: &QuantizedExperts<'_>,
         fc3: Option<&QuantizedExperts<'_>>,
+        track_residency: bool,
     ) -> Result<Self> {
         Ok(Self {
             fc1: fc1.dequantize_expert(expert)?,
@@ -488,6 +459,7 @@ impl DequantizedExpert {
             fc3: fc3
                 .map(|weights| weights.dequantize_expert(expert))
                 .transpose()?,
+            _residency: track_residency.then(DequantizedExpertResidency::new),
         })
     }
 
@@ -511,6 +483,21 @@ impl DequantizedExpert {
             ));
         }
         Ok(bytes)
+    }
+}
+
+struct DequantizedExpertResidency;
+
+impl DequantizedExpertResidency {
+    fn new() -> Self {
+        metrics().record_dequantized_expert_materialized();
+        Self
+    }
+}
+
+impl Drop for DequantizedExpertResidency {
+    fn drop(&mut self) {
+        metrics().record_dequantized_expert_released();
     }
 }
 
@@ -928,11 +915,11 @@ pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostC
 }
 
 #[allow(clippy::too_many_arguments)]
-fn accumulate_expert(
-    output_row: &mut [f32],
-    input_row: &[f32],
+fn write_grouped_contributions(
+    contributions: &mut [f32],
+    input: &[f32],
+    tasks: &[(usize, usize, f32)],
     expert: usize,
-    route_weight: f32,
     weights: &DequantizedExpert,
     fc1_bias: Option<&[f32]>,
     fc2_bias: Option<&[f32]>,
@@ -945,8 +932,13 @@ fn accumulate_expert(
     let fc1_bias_range = checked_range(expert, fc1_size, "fc1 bias expert row")?;
     let fc2_bias_range = checked_range(expert, hidden, "fc2 bias expert row")?;
     let fc3_bias_range = checked_range(expert, inter, "fc3 bias expert row")?;
-    let expert_out = run_expert(
-        input_row,
+    let mut grouped_input = Vec::with_capacity(tasks.len() * hidden);
+    for &(row, _, _) in tasks {
+        grouped_input.extend_from_slice(&input[checked_range(row, hidden, "input row")?]);
+    }
+    let expert_out = run_expert_grouped(
+        &grouped_input,
+        tasks.len(),
         &weights.fc1,
         fc1_bias.map(|bias| &bias[fc1_bias_range]),
         &weights.fc2,
@@ -957,9 +949,13 @@ fn accumulate_expert(
         hidden,
         inter,
         attributes,
-    );
-    for feature in 0..hidden {
-        output_row[feature] += route_weight * expert_out[feature];
+    )?;
+    for (grouped_row, &(_, slot, route_weight)) in tasks.iter().enumerate() {
+        let contribution =
+            &mut contributions[checked_range(slot, hidden, "routed contribution row")?];
+        for feature in 0..hidden {
+            contribution[feature] = route_weight * expert_out[grouped_row * hidden + feature];
+        }
     }
     Ok(())
 }
@@ -1865,14 +1861,29 @@ mod tests {
         normalize: bool,
         affine: bool,
     ) {
-        let experts = 2;
-        let rows = 2;
+        run_equivalence_shape(bits, hidden, inter, block_size, k, normalize, affine, 2, 2);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_equivalence_shape(
+        bits: usize,
+        hidden: usize,
+        inter: usize,
+        block_size: usize,
+        k: usize,
+        normalize: bool,
+        affine: bool,
+        experts: usize,
+        rows: usize,
+    ) {
         let fc1 = quantize(experts, inter, hidden, bits, block_size, affine);
         let fc2 = quantize(experts, hidden, inter, bits, block_size, affine);
         let input: Vec<f32> = (0..rows * hidden)
             .map(|index| (index % 5) as f32 * 0.25 - 0.5)
             .collect();
-        let router = vec![3.0, 1.0, 0.5, 2.5];
+        let router: Vec<f32> = (0..rows * experts)
+            .map(|index| ((index * 7 + index / experts * 5) % 17) as f32 - 8.0)
+            .collect();
         let pack_size = 8 / bits;
         let hidden_blocks = hidden / block_size;
         let inter_blocks = inter / block_size;
@@ -1912,6 +1923,35 @@ mod tests {
                 &mut [float_output.view_mut()],
             )
             .unwrap();
+        let moe_attributes =
+            crate::kernels::moe::MoeAttributes::from_node(float_graph.node(float_node)).unwrap();
+        let mut dense_fallback = vec![0.0f32; rows * hidden];
+        for row in 0..rows {
+            for (expert, route_weight) in crate::kernels::moe::routing_weights(
+                &router[row * experts..(row + 1) * experts],
+                None,
+                k,
+                normalize,
+            ) {
+                let expert_output = crate::kernels::moe::run_expert(
+                    &input[row * hidden..(row + 1) * hidden],
+                    &fc1.dequantized[expert * inter * hidden..(expert + 1) * inter * hidden],
+                    None,
+                    &fc2.dequantized[expert * hidden * inter..(expert + 1) * hidden * inter],
+                    None,
+                    None,
+                    None,
+                    inter,
+                    hidden,
+                    inter,
+                    &moe_attributes,
+                );
+                for feature in 0..hidden {
+                    dense_fallback[row * hidden + feature] += route_weight * expert_output[feature];
+                }
+            }
+        }
+        assert_close(&float_output.to_f32(), &dense_fallback);
 
         let fc1_zero_point_shape = [experts, inter, hidden_blocks.div_ceil(pack_size)];
         let fc2_zero_point_shape = [experts, hidden, inter_blocks.div_ceil(pack_size)];
@@ -1976,6 +2016,11 @@ mod tests {
     #[test]
     fn qmoe_int4_single_block_matches_float_moe() {
         run_equivalence(4, 16, 16, 16, 1, false, false);
+    }
+
+    #[test]
+    fn grouped_int4_qmoe_matches_per_token_dense_fallback_for_eight_experts_top2() {
+        run_equivalence_shape(4, 16, 32, 16, 2, true, true, 8, 12);
     }
 
     #[test]
@@ -2209,6 +2254,7 @@ mod tests {
             fc1: vec![value],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
 
         for cache in [&engine_a, &engine_b] {
@@ -2238,6 +2284,7 @@ mod tests {
             fc1: vec![value],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
 
         for expert in 0..2 {
@@ -2279,6 +2326,7 @@ mod tests {
             fc1: vec![1.0],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
 
         drop(cache.lease(cache_key(0), 4, 0, || Ok(weights())).unwrap());
@@ -2317,6 +2365,7 @@ mod tests {
             fc1: vec![value],
             fc2: Vec::new(),
             fc3: None,
+            _residency: None,
         };
         let mut cache = HostExpertCache::default();
 

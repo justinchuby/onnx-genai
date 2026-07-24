@@ -40,7 +40,10 @@ pub fn processor_context() -> ProcessorContext {
 
 pub fn logit_processor_chain() -> ProcessorChain {
     let mut chain = ProcessorChain::new();
-    chain.add(Box::new(RepetitionPenaltyProcessor { penalty: 1.1 }));
+    chain.add(Box::new(RepetitionPenaltyProcessor {
+        penalty: 1.1,
+        window: None,
+    }));
     chain.add(Box::new(FrequencyPenaltyProcessor {
         frequency_penalty: 0.2,
     }));

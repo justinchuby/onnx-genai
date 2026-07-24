@@ -267,8 +267,15 @@ fn copy_reshape(
     }
     let bytes = input.dtype.storage_bytes(input.numel());
     if bytes != 0 {
+        // Stream-ordered device copy on the EP's compute stream: the producer
+        // that wrote `input` and every downstream consumer of `output` are
+        // enqueued on the same stream, so the copy is implicitly ordered with
+        // both without a host-blocking `synchronize()`. This keeps Reshape/
+        // Squeeze off the default-stream `cuMemcpyDtoD` sync path (which drains
+        // the stream on every call and is illegal during CUDA-graph capture),
+        // while preserving the same-stream ordering that guarantees correctness.
         unsafe {
-            runtime.dtod(
+            runtime.dtod_async(
                 cuptr(input.data_ptr::<u8>() as *const c_void),
                 cuptr(output.data_ptr_mut::<u8>() as *const c_void),
                 bytes,
@@ -897,19 +904,102 @@ fn even_split(dim: usize, n: usize) -> Result<Vec<usize>> {
     Ok(sizes)
 }
 
+/// Resolve a (possibly negative) axis attribute against a concrete rank.
+fn resolve_split_axis(axis_attr: i64, rank: usize) -> Option<usize> {
+    let axis = if axis_attr < 0 {
+        axis_attr + rank as i64
+    } else {
+        axis_attr
+    };
+    if (0..rank as i64).contains(&axis) {
+        Some(axis as usize)
+    } else {
+        None
+    }
+}
+
+/// Per-output offsets/sizes that are fully known at build time for the static,
+/// single-data-input Split form. Precomputing these once lets the launch path
+/// avoid any host read of split sizes and, crucially, drop the trailing stream
+/// synchronization so the op is safe to record inside a CUDA graph capture.
+#[derive(Debug, Clone)]
+struct StaticSplitPlan {
+    axis: usize,
+    axis_extent: usize,
+    sizes: Vec<usize>,
+}
+
+/// Detect the CUDA-graph-capturable Split form at build time.
+///
+/// Capturable requires a single data input (no runtime split-size tensor),
+/// statically known split sizes (from the `split` attribute or an even split
+/// derived from `num_outputs`/output count), and an axis that resolves to a
+/// concrete in-range dimension. The two-input / data-dependent form returns
+/// `None` and keeps the host-read-plus-synchronize path.
+fn build_static_split_plan(
+    node: &Node,
+    input_shapes: &[Vec<usize>],
+    axis_attr: i64,
+    split: Option<&[i64]>,
+    num_outputs: Option<i64>,
+) -> Option<StaticSplitPlan> {
+    // A resolved data shape must be available; the test/introspection path that
+    // supplies no shapes cannot be planned statically.
+    let data_shape = input_shapes.first()?;
+    if data_shape.is_empty() {
+        return None;
+    }
+    // Reject the data-dependent form: any wired second input carries runtime
+    // split sizes that would require a host read.
+    if input_shapes.get(1).is_some_and(|shape| !shape.is_empty()) {
+        return None;
+    }
+    let axis = resolve_split_axis(axis_attr, data_shape.len())?;
+    let axis_extent = data_shape[axis];
+    let output_count = node.outputs.len();
+    if output_count == 0 {
+        return None;
+    }
+    let sizes: Vec<usize> = if let Some(split) = split {
+        split
+            .iter()
+            .map(|&value| usize::try_from(value).ok())
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        let count = num_outputs
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(output_count);
+        even_split(axis_extent, count).ok()?
+    };
+    if sizes.len() != output_count || sizes.iter().sum::<usize>() != axis_extent {
+        return None;
+    }
+    Some(StaticSplitPlan {
+        axis,
+        axis_extent,
+        sizes,
+    })
+}
+
 pub struct SplitFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 impl KernelFactory for SplitFactory {
-    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let axis = node.attr("axis").and_then(Attribute::as_int).unwrap_or(0);
+        let split = node
+            .attr("split")
+            .and_then(Attribute::as_ints)
+            .map(<[i64]>::to_vec);
+        let num_outputs = node.attr("num_outputs").and_then(Attribute::as_int);
+        let static_plan =
+            build_static_split_plan(node, input_shapes, axis, split.as_deref(), num_outputs);
         Ok(Box::new(SplitKernel {
             runtime: self.runtime.clone(),
-            axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
-            split: node
-                .attr("split")
-                .and_then(Attribute::as_ints)
-                .map(<[i64]>::to_vec),
-            num_outputs: node.attr("num_outputs").and_then(Attribute::as_int),
+            axis,
+            split,
+            num_outputs,
+            static_plan,
         }))
     }
 }
@@ -919,6 +1009,66 @@ struct SplitKernel {
     axis: i64,
     split: Option<Vec<i64>>,
     num_outputs: Option<i64>,
+    /// Precomputed capturable plan for the static, single-data-input form; the
+    /// dynamic (runtime split-size) form leaves this `None`.
+    static_plan: Option<StaticSplitPlan>,
+}
+impl SplitKernel {
+    /// Launch one copy kernel per output on the runtime stream. Validates each
+    /// output's dtype/shape against the chosen split. Does not synchronize:
+    /// the copies are ordered on the stream and callers add a host sync only
+    /// for the dynamic form.
+    fn launch_copies(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        axis: usize,
+        sizes: &[usize],
+    ) -> Result<()> {
+        let dtype = inputs[0].dtype;
+        let elem_bytes = fixed_width("Split", dtype)? as i32;
+        let inner = product(&inputs[0].shape[axis + 1..], "Split")? as u64;
+        let input_axis = inputs[0].shape[axis] as u64;
+        let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+        let func =
+            self.runtime
+                .nvrtc_function("movement_ops", MOVEMENT_SOURCE, "split_chunk_bytes")?;
+        let mut prefix = 0u64;
+        for (output, &size) in outputs.iter_mut().zip(sizes) {
+            let mut expected = inputs[0].shape.to_vec();
+            expected[axis] = size;
+            if output.dtype != dtype || output.shape != expected {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep Split: output dtype or shape mismatch".into(),
+                ));
+            }
+            let elements = output.numel() as u64;
+            if elements != 0 {
+                let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+                let output_axis = size as u64;
+                let mut builder = self.runtime.stream().launch_builder(&func);
+                builder
+                    .arg(&input_ptr)
+                    .arg(&output_ptr)
+                    .arg(&elements)
+                    .arg(&input_axis)
+                    .arg(&output_axis)
+                    .arg(&prefix)
+                    .arg(&inner)
+                    .arg(&elem_bytes);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (grid(output.numel()), 1, 1),
+                        block_dim: (BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|e| driver_err("launch split_chunk_bytes", e))?;
+            }
+            prefix += size as u64;
+        }
+        Ok(())
+    }
 }
 impl Kernel for SplitKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -928,6 +1078,20 @@ impl Kernel for SplitKernel {
         }
         require_dense("Split", inputs, outputs)?;
         let rank = inputs[0].shape.len();
+        // Capturable fast path: the static, single-data-input form was planned
+        // at build time, so no host read of split sizes and no trailing
+        // synchronization are needed. Copies are ordered on the stream, which is
+        // exactly what makes this recordable inside a CUDA graph capture.
+        if let Some(plan) = &self.static_plan {
+            let runtime_split_input = inputs.get(1).is_some_and(|v| !v.is_absent());
+            if !runtime_split_input
+                && plan.axis < rank
+                && inputs[0].shape[plan.axis] == plan.axis_extent
+                && plan.sizes.len() == outputs.len()
+            {
+                return self.launch_copies(inputs, outputs, plan.axis, &plan.sizes);
+            }
+        }
         let axis = if self.axis < 0 {
             self.axis + rank as i64
         } else {
@@ -965,56 +1129,19 @@ impl Kernel for SplitKernel {
                 "cuda_ep Split: split sizes do not match outputs/axis".into(),
             ));
         }
-        let dtype = inputs[0].dtype;
-        let elem_bytes = fixed_width("Split", dtype)? as i32;
-        let inner = product(&inputs[0].shape[axis + 1..], "Split")? as u64;
-        let input_axis = inputs[0].shape[axis] as u64;
-        let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
-        let func =
-            self.runtime
-                .nvrtc_function("movement_ops", MOVEMENT_SOURCE, "split_chunk_bytes")?;
-        let mut prefix = 0u64;
-        for (output, &size) in outputs.iter_mut().zip(&sizes) {
-            let mut expected = inputs[0].shape.to_vec();
-            expected[axis] = size;
-            if output.dtype != dtype || output.shape != expected {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep Split: output dtype or shape mismatch".into(),
-                ));
-            }
-            let elements = output.numel() as u64;
-            if elements != 0 {
-                let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-                let output_axis = size as u64;
-                let mut builder = self.runtime.stream().launch_builder(&func);
-                builder
-                    .arg(&input_ptr)
-                    .arg(&output_ptr)
-                    .arg(&elements)
-                    .arg(&input_axis)
-                    .arg(&output_axis)
-                    .arg(&prefix)
-                    .arg(&inner)
-                    .arg(&elem_bytes);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (grid(output.numel()), 1, 1),
-                        block_dim: (BLOCK, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(|e| driver_err("launch split_chunk_bytes", e))?;
-            }
-            prefix += size as u64;
-        }
+        self.launch_copies(inputs, outputs, axis, &sizes)?;
         self.runtime.synchronize()
     }
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Split reads runtime split sizes on the host and performs a trailing stream synchronization",
-        )
+        if self.static_plan.is_some() {
+            onnx_runtime_ep_api::CaptureSupport::Supported
+        } else {
+            onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "Split reads runtime split sizes on the host and performs a trailing stream synchronization",
+            )
+        }
     }
 }

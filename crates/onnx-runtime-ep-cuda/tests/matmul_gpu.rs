@@ -236,6 +236,134 @@ fn matmul_f32_on_gpu_matches_cpu_reference() {
     println!("all cuBLASLt MatMul cases passed on {:?}", ep.device_id());
 }
 
+/// Run one dense fp16 MatMul on the GPU and return the host result as f32.
+/// Exercises the M==1 decode GEMV fast path when `m == 1`.
+fn run_gpu_matmul_f16(
+    ep: &CudaExecutionProvider,
+    a: &[f32],
+    b: &[f32],
+    a_shape: &[usize],
+    b_shape: &[usize],
+    out_shape: &[usize],
+) -> Vec<f32> {
+    let dev: DeviceId = ep.device_id();
+    let rt = ep.runtime();
+
+    let a_h: Vec<half::f16> = a.iter().map(|&x| half::f16::from_f32(x)).collect();
+    let b_h: Vec<half::f16> = b.iter().map(|&x| half::f16::from_f32(x)).collect();
+    let a_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(a_h.as_ptr() as *const u8, std::mem::size_of_val(&a_h[..]))
+    };
+    let b_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(b_h.as_ptr() as *const u8, std::mem::size_of_val(&b_h[..]))
+    };
+
+    let a_buf = ep.allocate(a_bytes.len(), 256).unwrap();
+    let b_buf = ep.allocate(b_bytes.len(), 256).unwrap();
+    let out_len: usize = out_shape.iter().product();
+    let mut c_buf = ep.allocate(out_len * 2, 256).unwrap();
+
+    // SAFETY: device buffers are sized for the byte slices we copy in.
+    unsafe {
+        rt.htod(a_bytes, cuptr(a_buf.as_ptr())).unwrap();
+        rt.htod(b_bytes, cuptr(b_buf.as_ptr())).unwrap();
+    }
+
+    let a_strides = compute_contiguous_strides(a_shape);
+    let b_strides = compute_contiguous_strides(b_shape);
+    let out_strides = compute_contiguous_strides(out_shape);
+
+    let a_view = TensorView::new(
+        DevicePtr(a_buf.as_ptr()),
+        DataType::Float16,
+        a_shape,
+        &a_strides,
+        dev,
+    );
+    let b_view = TensorView::new(
+        DevicePtr(b_buf.as_ptr()),
+        DataType::Float16,
+        b_shape,
+        &b_strides,
+        dev,
+    );
+    let out_view = TensorMut::new(
+        DevicePtrMut(c_buf.as_mut_ptr()),
+        DataType::Float16,
+        out_shape,
+        &out_strides,
+        dev,
+    );
+
+    let node = Node::new(NodeId(0), "MatMul", vec![], vec![]);
+    let kernel = ep
+        .get_kernel(&node, &[a_shape.to_vec(), b_shape.to_vec()], 17)
+        .unwrap();
+    kernel.execute(&[a_view, b_view], &mut [out_view]).unwrap();
+    // The M==1 fp16 path takes the capturable GEMV; assert the kernel advertises it.
+    if a_shape[a_shape.len() - 2] == 1 {
+        assert!(
+            kernel.capture_support().is_supported(),
+            "dense fp16 M==1 GEMV must advertise capture support"
+        );
+    }
+
+    let mut out_bytes = vec![0u8; out_len * 2];
+    // SAFETY: c_buf holds `out_len` f16 = out_len*2 bytes.
+    unsafe {
+        rt.dtoh(&mut out_bytes, cuptr(c_buf.as_ptr())).unwrap();
+    }
+
+    ep.deallocate(a_buf).unwrap();
+    ep.deallocate(b_buf).unwrap();
+    ep.deallocate(c_buf).unwrap();
+
+    out_bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+/// The dense fp16 M==1 GEMV fast path (used by an fp16 language-model head)
+/// matches an independent CPU reference and is capture-eligible. Generic over
+/// `K`/`N`: nothing here is tied to a model dimension.
+#[test]
+fn matmul_f16_gemv_on_gpu_matches_cpu_reference() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    // A non-square GEMV that crosses several thread blocks (N=300 > 256) and a
+    // K that is not a multiple of the block width, exercising the tail path.
+    let (k, n) = (259usize, 300usize);
+    let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013 - 1.7).sin()).collect();
+    let b: Vec<f32> = (0..k * n)
+        .map(|i| (((i * 37) % 101) as f32 / 101.0) - 0.5)
+        .collect();
+
+    let got = run_gpu_matmul_f16(&ep, &a, &b, &[1, k], &[k, n], &[1, n]);
+    let expected = cpu_reference(&a, &b, 1, 1, k, n);
+
+    // fp16 storage of A/B/Y plus fp32 accumulation: a relative tolerance scaled
+    // by K is appropriate (each output sums K fp16 products).
+    assert_eq!(got.len(), n);
+    for (col, (g, e)) in got.iter().zip(&expected).enumerate() {
+        let tol = 1e-2 + 1e-2 * e.abs();
+        assert!(
+            (g - e).abs() <= tol,
+            "col {col}: gpu {g} vs cpu {e} (tol {tol})"
+        );
+    }
+    println!(
+        "dense fp16 GEMV matches CPU reference on {:?}",
+        ep.device_id()
+    );
+}
+
 #[test]
 fn matmul_rejects_unsupported_rank_and_dtype() {
     let ep = match CudaExecutionProvider::new_default() {

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{Node, normalize_domain};
 
 use crate::context::{InferenceContext, MergePolicy, NodeIo, SymbolInterner};
 use crate::error::ShapeInferError;
@@ -17,12 +17,6 @@ use crate::error::ShapeInferError;
 /// An operator inference rule: reads inputs from the [`InferenceContext`] and
 /// sets its outputs' types (and, where applicable, shape-data).
 pub type InferenceFn = fn(&mut InferenceContext) -> Result<(), ShapeInferError>;
-
-/// Normalise the default ONNX domain: the empty string and `"ai.onnx"` are the
-/// same domain.
-fn norm_domain(domain: &str) -> &str {
-    if domain == "ai.onnx" { "" } else { domain }
-}
 
 /// A registry mapping `(domain, op_type, opset)` to an [`InferenceFn`].
 #[derive(Default)]
@@ -48,7 +42,7 @@ impl InferenceRegistry {
     /// upward. A later registration at a higher `min_opset` supersedes this one
     /// for those versions.
     pub fn register(&mut self, domain: &str, op: &str, min_opset: u64, rule: InferenceFn) {
-        let key = (norm_domain(domain).to_string(), op.to_string());
+        let key = (normalize_domain(domain).to_string(), op.to_string());
         let entry = self.handlers.entry(key).or_default();
         match entry.binary_search_by_key(&min_opset, |(v, _)| *v) {
             Ok(idx) => entry[idx] = (min_opset, rule), // replace same-version rule
@@ -59,7 +53,7 @@ impl InferenceRegistry {
     /// Look up the rule for `(domain, op)` effective at opset `version`: the
     /// registration with the greatest `min_opset <= version`.
     pub fn get(&self, domain: &str, op: &str, version: u64) -> Option<InferenceFn> {
-        let key = (norm_domain(domain).to_string(), op.to_string());
+        let key = (normalize_domain(domain).to_string(), op.to_string());
         let entry = self.handlers.get(&key)?;
         let mut chosen = None;
         for &(min_opset, rule) in entry {
@@ -86,15 +80,12 @@ impl InferenceRegistry {
         interner: &mut SymbolInterner,
     ) -> Result<Vec<NodeIo>, ShapeInferError> {
         let version = {
-            let domain = norm_domain(&node.domain);
-            if domain.is_empty() {
-                opset_imports
-                    .get("")
-                    .or_else(|| opset_imports.get("ai.onnx"))
-                    .copied()
-                    .unwrap_or(1)
+            // Loaded IR is canonical (`normalize_domain` applied at load), so the
+            // default domain is `""` for both node domains and opset-import keys.
+            if node.is_default_domain() {
+                opset_imports.get("").copied().unwrap_or(1)
             } else {
-                opset_imports.get(domain).copied().unwrap_or(1)
+                opset_imports.get(&node.domain).copied().unwrap_or(1)
             }
         };
         let Some(rule) = self.get(&node.domain, &node.op_type, version) else {

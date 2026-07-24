@@ -46,6 +46,7 @@
 
 mod arena;
 mod device;
+mod domain;
 mod dtype;
 mod error;
 mod graph;
@@ -57,6 +58,7 @@ mod value;
 
 pub use arena::{Arena, ArenaKey};
 pub use device::{DeviceId, DeviceType};
+pub use domain::{AI_ONNX_DOMAIN, is_default_domain, normalize_domain};
 pub use dtype::DataType;
 pub use error::{GraphError, IrError, Result};
 pub use graph::Graph;

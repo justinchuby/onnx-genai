@@ -169,6 +169,8 @@ DEFINE_SILU_MUL(float, f32)
 DEFINE_BINARY_I64(add, a[ai] + b[bi])
 DEFINE_BINARY_I64(sub, a[ai] - b[bi])
 DEFINE_BINARY_I64(mul, a[ai] * b[bi])
+DEFINE_BINARY_I64(min, a[ai] < b[bi] ? a[ai] : b[bi])
+DEFINE_BINARY_I64(max, a[ai] > b[bi] ? a[ai] : b[bi])
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
 DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
@@ -577,10 +579,10 @@ pub struct BinaryKernel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BroadcastMetadataKey {
-    a_shape: Vec<usize>,
-    b_shape: Vec<usize>,
-    out_shape: Vec<usize>,
+pub(crate) struct BroadcastMetadataKey {
+    pub(crate) a_shape: Vec<usize>,
+    pub(crate) b_shape: Vec<usize>,
+    pub(crate) out_shape: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -589,15 +591,20 @@ struct BinaryCaptureSignature {
     shapes: BroadcastMetadataKey,
 }
 
+/// A persistent device buffer holding the right-aligned broadcast stride/shape
+/// metadata for a binary op. Reused across decode steps whenever the operand
+/// shapes are unchanged, so a captured kernel launch performs **no** per-step
+/// host allocation, upload, free, or synchronize — the prerequisite for the op
+/// to advertise [`CaptureSupport::Supported`].
 #[derive(Debug)]
-struct BroadcastMetadataCache {
+pub(crate) struct BroadcastMetadataCache {
     runtime: Arc<CudaRuntime>,
     key: Option<BroadcastMetadataKey>,
     ptr: CUdeviceptr,
 }
 
 impl BroadcastMetadataCache {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
+    pub(crate) fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
             key: None,
@@ -605,7 +612,7 @@ impl BroadcastMetadataCache {
         }
     }
 
-    fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         a_shape: &[usize],
         b_shape: &[usize],
@@ -682,8 +689,10 @@ impl BinaryKernel {
         let a = &inputs[0];
         let b = &inputs[1];
         let float_dtype = if a.dtype == DataType::Int64
-            && matches!(self.op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
-        {
+            && matches!(
+                self.op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Min | BinaryOp::Max
+            ) {
             None
         } else {
             Some(FloatDtype::from_onnx(op, "A", a.dtype)?)
@@ -909,7 +918,7 @@ impl Kernel for SiluMulKernel {
     }
 }
 
-fn require_matching_capture_signature<T: PartialEq>(
+pub(crate) fn require_matching_capture_signature<T: PartialEq>(
     runtime: &CudaRuntime,
     op: &str,
     warmed: Option<&T>,
@@ -923,7 +932,7 @@ fn require_matching_capture_signature<T: PartialEq>(
     Ok(())
 }
 
-fn is_fixed_decode_shape(shape: &[usize]) -> bool {
+pub(crate) fn is_fixed_decode_shape(shape: &[usize]) -> bool {
     !shape.is_empty() && shape[..shape.len() - 1].iter().product::<usize>() == 1
 }
 
@@ -1013,6 +1022,12 @@ mod tests {
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(float, f32)"));
         assert!(POINTWISE_SRC.contains("silu_mul_f16("));
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(__nv_bfloat16, bf16)"));
+        for op in ["add", "sub", "mul", "min", "max"] {
+            assert!(
+                POINTWISE_SRC.contains(&format!("DEFINE_BINARY_I64({op},")),
+                "missing int64 NVRTC generator for {op}"
+            );
+        }
     }
 
     #[test]

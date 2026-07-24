@@ -1780,7 +1780,11 @@ fn is_group_query_attention(attention_type: &str) -> bool {
     let normalized = attention_type.to_ascii_lowercase().replace(['-', ' '], "_");
     matches!(
         normalized.as_str(),
-        "group_query_attention" | "grouped_query_attention" | "gqa"
+        "group_query"
+            | "grouped_query"
+            | "group_query_attention"
+            | "grouped_query_attention"
+            | "gqa"
     )
 }
 
@@ -2842,14 +2846,31 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_group_query_attention_variants() {
-        assert!(is_group_query_attention("group_query_attention"));
-        assert!(is_group_query_attention("group-query-attention"));
-        assert!(is_group_query_attention("Group Query Attention"));
-        assert!(is_group_query_attention("GQA"));
-        assert!(is_group_query_attention("grouped_query_attention"));
-        assert!(!is_group_query_attention("multi_head_attention"));
-        assert!(!is_group_query_attention("attention"));
+    fn is_group_query_attention_recognizes_variants() {
+        for attention_type in [
+            "grouped_query",
+            "group_query",
+            "grouped_query_attention",
+            "group_query_attention",
+            "gqa",
+            "Grouped-Query",
+            "GROUPED QUERY",
+            "group-query-attention",
+            "Group Query Attention",
+            "GQA",
+        ] {
+            assert!(
+                is_group_query_attention(attention_type),
+                "{attention_type:?} should be recognized as GQA"
+            );
+        }
+
+        for attention_type in ["multi_head_attention", "mha", ""] {
+            assert!(
+                !is_group_query_attention(attention_type),
+                "{attention_type:?} should not be recognized as GQA"
+            );
+        }
     }
 
     #[test]
@@ -2938,17 +2959,26 @@ mod tests {
         }
     }
 
+    fn model_capabilities(
+        attention: AttentionConfig,
+        max_sequence_length: Option<usize>,
+        runtime_configurable: Option<RuntimeConfigurable>,
+    ) -> ModelCapabilities {
+        ModelCapabilities {
+            vocab_size: None,
+            io: None,
+            attention: Some(attention),
+            max_sequence_length,
+            speculative: None,
+            runtime_configurable,
+            mixture_of_experts: None,
+        }
+    }
+
     #[test]
     fn shared_kv_from_gqa_fp16_native_dtype() {
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(gqa_attention()),
-                max_sequence_length: Some(4096),
-                speculative: None,
-                runtime_configurable: None,
-            }),
+            model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("float16".to_string()),
                 quantization_tolerance: None,
@@ -3028,13 +3058,10 @@ mod tests {
     #[test]
     fn shared_kv_from_gqa_fp16_runtime_configurable_dtype() {
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(gqa_attention()),
-                max_sequence_length: Some(2048),
-                speculative: None,
-                runtime_configurable: Some(RuntimeConfigurable {
+            model: Some(model_capabilities(
+                gqa_attention(),
+                Some(2048),
+                Some(RuntimeConfigurable {
                     kv_cache: Some(RuntimeKvConfig {
                         dtype: vec!["float32".to_string(), "float16".to_string()],
                     }),
@@ -3042,7 +3069,7 @@ mod tests {
                     continuous_batching: None,
                     chunked_prefill: None,
                 }),
-            }),
+            )),
             kv_cache: None,
             ..empty_metadata()
         };
@@ -3052,17 +3079,14 @@ mod tests {
     #[test]
     fn no_shared_kv_when_not_gqa() {
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(AttentionConfig {
+            model: Some(model_capabilities(
+                AttentionConfig {
                     attention_type: "multi_head_attention".to_string(),
                     ..gqa_attention()
-                }),
-                max_sequence_length: Some(4096),
-                speculative: None,
-                runtime_configurable: None,
-            }),
+                },
+                Some(4096),
+                None,
+            )),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("float16".to_string()),
                 quantization_tolerance: None,
@@ -3079,14 +3103,7 @@ mod tests {
         // The CPU recipe declares fp32 GQA KV; it must take the shared-buffer
         // path (O(1)/token) rather than the growing ZeroCopyRebind path.
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(gqa_attention()),
-                max_sequence_length: Some(4096),
-                speculative: None,
-                runtime_configurable: None,
-            }),
+            model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("float32".to_string()),
                 quantization_tolerance: None,
@@ -3101,14 +3118,7 @@ mod tests {
     #[test]
     fn shared_kv_from_gqa_bf16_native_dtype() {
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(gqa_attention()),
-                max_sequence_length: Some(4096),
-                speculative: None,
-                runtime_configurable: None,
-            }),
+            model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("bfloat16".to_string()),
                 quantization_tolerance: None,
@@ -3123,14 +3133,7 @@ mod tests {
     #[test]
     fn no_shared_kv_when_unsupported_kv_dtype() {
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(gqa_attention()),
-                max_sequence_length: Some(4096),
-                speculative: None,
-                runtime_configurable: None,
-            }),
+            model: Some(model_capabilities(gqa_attention(), Some(4096), None)),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("int8".to_string()),
                 quantization_tolerance: None,
@@ -3145,14 +3148,7 @@ mod tests {
     #[test]
     fn no_shared_kv_when_max_sequence_length_absent() {
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(gqa_attention()),
-                max_sequence_length: None,
-                speculative: None,
-                runtime_configurable: None,
-            }),
+            model: Some(model_capabilities(gqa_attention(), None, None)),
             kv_cache: Some(KvCacheSpec {
                 native_dtype: Some("float16".to_string()),
                 quantization_tolerance: None,
@@ -3174,14 +3170,7 @@ mod tests {
         let mut attention = gqa_attention();
         attention.sliding_window = Some(4096);
         let metadata = InferenceMetadata {
-            model: Some(ModelCapabilities {
-                vocab_size: None,
-                io: None,
-                attention: Some(attention),
-                max_sequence_length: Some(131_072),
-                speculative: None,
-                runtime_configurable: None,
-            }),
+            model: Some(model_capabilities(attention, Some(131_072), None)),
             ..empty_metadata()
         };
         assert_eq!(sliding_window_from_metadata(&metadata).unwrap(), Some(4096));

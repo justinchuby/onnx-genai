@@ -105,10 +105,11 @@ fn native_backend_rejects_unsupported_session_device() {
     )
     .err()
     .expect("native backend must reject unsupported session options");
+    let message = format!("{error:#}");
     assert!(
-        error
-            .to_string()
-            .contains("does not support execution provider WebGpu")
+        message.contains("does not support execution provider")
+            && message.contains("WebGpuExecutionProvider"),
+        "{message}"
     );
 }
 
@@ -149,56 +150,48 @@ fn native_backend_rejects_cuda_without_cuda_feature() {
     )
     .err()
     .expect("native CUDA must require the CUDA feature");
-    assert!(error.to_string().contains(
-        "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
-    ));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(
+            "requires building onnx-genai-engine with both the 'native-backend' and 'cuda' features"
+        ),
+        "{message}"
+    );
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-fn native_sub4_cuda_fails_fast_at_load() -> anyhow::Result<()> {
+fn native_sub4_cuda_fallback_generates_coherent_decode() -> anyhow::Result<()> {
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
-        eprintln!("skipping native sub-4-bit CUDA fail-fast test; CUDA is unavailable: {error}");
+        eprintln!("skipping native sub-4-bit CUDA fallback test; CUDA is unavailable: {error}");
         return Ok(());
     }
 
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
-    let explicit_error = Engine::from_dir(
+    let mut explicit = Engine::from_dir(
         &fixture,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
             native_device: Some(NativeDecodeDevice::Cuda { index: Some(0) }),
             ..EngineConfig::default()
         },
-    )
-    .err()
-    .expect("CUDA-only load must fail before generation");
-    let routed_error = Engine::from_dir_with_session_options(
+    )?;
+    let mut routed = Engine::from_dir_with_session_options(
         &fixture,
         EngineConfig {
             decode_backend: EngineDecodeBackend::Native,
             ..EngineConfig::default()
         },
         SessionOptions::with_execution_provider(ep_selection("cuda")),
-    )
-    .err()
-    .expect("ONNX_GENAI_EP-style CUDA routing must fail before generation");
+    )?;
 
-    for error in [explicit_error, routed_error] {
-        let message = error.to_string();
-        assert!(
-            message.contains("Heterogeneous CPU+CUDA placement is required"),
-            "{message}"
-        );
-        assert!(message.contains("not yet available"), "{message}");
-        assert!(message.contains("BlockQuantizedMatMul"), "{message}");
-        assert!(message.contains("M>1 or symbolic prefill"), "{message}");
-        assert!(message.contains("Transpose"), "{message}");
-        assert!(
-            message.contains("use native CPU or the ORT backend"),
-            "{message}"
-        );
+    for engine in [&mut explicit, &mut routed] {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0, 0]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        assert_eq!(engine.generate(request)?.token_ids, vec![1, 1, 1]);
     }
     Ok(())
 }
@@ -252,7 +245,7 @@ fn engine_native_cuda_matches_cpu_tokens() -> anyhow::Result<()> {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn engine_native_scalar_gqa_metadata_enables_cuda_and_absence_rejects() -> anyhow::Result<()> {
+fn engine_native_scalar_gqa_runs_without_metadata_permission() -> anyhow::Result<()> {
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
         eprintln!("skipping native scalar GQA CUDA parity; CUDA is unavailable: {error}");
         return Ok(());
@@ -283,44 +276,5 @@ fn engine_native_scalar_gqa_metadata_enables_cuda_and_absence_rejects() -> anyho
     assert_eq!(cpu_tokens, vec![1, 1, 1, 1]);
     assert_eq!(cuda_tokens, cpu_tokens);
 
-    let strict_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/native-engine-scalar-gqa-strict")
-        .join(std::process::id().to_string());
-    if strict_fixture.exists() {
-        std::fs::remove_dir_all(&strict_fixture)?;
-    }
-    std::fs::create_dir_all(&strict_fixture)?;
-    for file in ["model.onnx", "tokenizer.json"] {
-        std::fs::copy(fixture.join(file), strict_fixture.join(file))?;
-    }
-    let metadata = std::fs::read_to_string(fixture.join("inference_metadata.yaml"))?;
-    let strict_metadata = metadata.replace(
-        "    key_sequence_lengths:\n      scalar_broadcast: unit_batch\n",
-        "",
-    );
-    assert_ne!(
-        strict_metadata, metadata,
-        "metadata permission was not removed"
-    );
-    std::fs::write(
-        strict_fixture.join("inference_metadata.yaml"),
-        strict_metadata,
-    )?;
-
-    let mut strict_cuda = Engine::from_dir(
-        &strict_fixture,
-        config(NativeDecodeDevice::Cuda { index: Some(0) }),
-    )?;
-    let error = generate(&mut strict_cuda).expect_err("missing metadata permission must reject");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("scalar seqlens_k is not enabled"),
-        "{message}"
-    );
-    assert!(
-        message.contains("model.attention.key_sequence_lengths.scalar_broadcast: unit_batch"),
-        "{message}"
-    );
-    std::fs::remove_dir_all(strict_fixture)?;
     Ok(())
 }

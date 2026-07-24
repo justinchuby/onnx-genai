@@ -504,6 +504,14 @@ pub struct ModelCapabilities {
     /// (a temporary, transitional behavior).
     #[serde(default)]
     pub io: Option<ModelIoSpec>,
+
+    /// Explicit sparse mixture-of-experts graph and routing contract.
+    ///
+    /// This describes graph structure, never a model family. Runtimes use the
+    /// declared representation and dimensions instead of inferring them from
+    /// node names, initializer shapes, or architecture strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixture_of_experts: Option<MixtureOfExpertsSpec>,
 }
 
 /// Explicit binding of the graph ports the decode step reads and writes.
@@ -1944,6 +1952,76 @@ pub struct HardwareRequirements {
     pub min_tp_degree: Option<usize>,
 }
 
+/// Explicit sparse mixture-of-experts structure and graph representation.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+pub struct MixtureOfExpertsSpec {
+    /// Expert graph representation: `dense_fallback`, `moe`, or `qmoe`.
+    #[schemars(with = "schema_vocabulary::MoERepresentation")]
+    pub representation: String,
+
+    /// Number of independently routed experts.
+    #[schemars(range(min = 1))]
+    pub routed_expert_count: usize,
+
+    /// Number of dense shared experts evaluated for every token.
+    #[schemars(range(min = 0))]
+    pub shared_expert_count: usize,
+
+    /// Number of routed experts selected for each token.
+    #[schemars(range(min = 1))]
+    pub experts_per_token: usize,
+
+    /// Intermediate width of each routed expert FFN.
+    #[schemars(range(min = 1))]
+    pub expert_intermediate_size: usize,
+
+    /// Total intermediate width of the always-on shared-expert FFN.
+    #[schemars(range(min = 0))]
+    pub shared_expert_intermediate_size: usize,
+
+    /// Expert FFN activation name, such as `silu`.
+    #[schemars(length(min = 1))]
+    pub activation: String,
+
+    /// Router scoring, selection, normalization, and scaling semantics.
+    pub router: MoERouterSpec,
+}
+
+/// Explicit router semantics, kept separate from expert FFN execution.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[schemars(transform = schema_helpers::moe_router)]
+pub struct MoERouterSpec {
+    /// Elementwise score operation applied to router logits.
+    #[schemars(with = "schema_vocabulary::MoERouterScoreFunction")]
+    pub score_function: String,
+
+    /// Expert selection operation applied to the scores.
+    #[schemars(with = "schema_vocabulary::MoERouterSelectionMethod")]
+    pub selection_method: String,
+
+    /// Whether selected aggregation weights are normalized to sum to one.
+    pub normalize_weights: bool,
+
+    /// Multiplicative scale applied to final aggregation weights.
+    #[schemars(range(min = 0.0))]
+    pub scaling_factor: f32,
+
+    /// Number of expert groups considered by grouped selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub group_count: Option<usize>,
+
+    /// Number of groups retained per token by grouped selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub groups_per_token: Option<usize>,
+
+    /// Reduction used to score a group before group TopK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<schema_vocabulary::MoEGroupScore>")]
+    pub group_score: Option<String>,
+}
+
 mod schema_vocabulary {
     use schemars::JsonSchema;
 
@@ -2245,6 +2323,38 @@ mod schema_vocabulary {
         STATE_UPDATE_KIND,
         ["replace"]
     );
+
+    extensible_string!(
+        /// Sparse expert graph representation vocabulary.
+        MoERepresentation,
+        moe_representation,
+        MOE_REPRESENTATION,
+        ["dense_fallback", "moe", "qmoe"]
+    );
+
+    extensible_string!(
+        /// Router score-operation vocabulary.
+        MoERouterScoreFunction,
+        moe_router_score_function,
+        MOE_ROUTER_SCORE_FUNCTION,
+        ["softmax", "sigmoid"]
+    );
+
+    extensible_string!(
+        /// Router expert-selection vocabulary.
+        MoERouterSelectionMethod,
+        moe_router_selection_method,
+        MOE_ROUTER_SELECTION_METHOD,
+        ["top_k", "grouped_top_k", "sparse_mixer"]
+    );
+
+    extensible_string!(
+        /// Group-scoring reduction vocabulary.
+        MoEGroupScore,
+        moe_group_score,
+        MOE_GROUP_SCORE,
+        ["maximum", "top_2_sum"]
+    );
 }
 
 mod schema_helpers {
@@ -2455,6 +2565,42 @@ mod schema_helpers {
 
     pub(super) fn state_update_kind(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::STATE_UPDATE_KIND);
+    }
+
+    pub(super) fn moe_representation(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::MOE_REPRESENTATION);
+    }
+
+    pub(super) fn moe_router_score_function(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::MOE_ROUTER_SCORE_FUNCTION);
+    }
+
+    pub(super) fn moe_router_selection_method(schema: &mut Schema) {
+        extensible_string_enum(
+            schema,
+            super::schema_vocabulary::MOE_ROUTER_SELECTION_METHOD,
+        );
+    }
+
+    pub(super) fn moe_group_score(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::MOE_GROUP_SCORE);
+    }
+
+    pub(super) fn moe_router(schema: &mut Schema) {
+        schema.ensure_object().insert(
+            "allOf".into(),
+            json!([{
+                "if": {
+                    "properties": {
+                        "selection_method": {"const": "grouped_top_k"}
+                    },
+                    "required": ["selection_method"]
+                },
+                "then": {
+                    "required": ["group_count", "groups_per_token", "group_score"]
+                }
+            }]),
+        );
     }
 
     fn extensible_string_enum(schema: &mut Schema, known_values: &[&str]) {

@@ -37,16 +37,13 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
 fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inputs() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
 
-    for (op_type, opset, dtype, expected_reason) in [
-        ("Attention", 23, DataType::Float16, "Attention: dtype f16"),
-        ("Attention", 23, DataType::BFloat16, "Attention: dtype bf16"),
-        (
-            "RotaryEmbedding",
-            23,
-            DataType::BFloat16,
-            "RotaryEmbedding: dtype bf16",
-        ),
-    ] {
+    // RotaryEmbedding still rejects bf16; Attention now accepts it (claimed
+    // separately below), so it is no longer in this rejection check.
+    {
+        let op_type = "RotaryEmbedding";
+        let opset = 23;
+        let dtype = DataType::BFloat16;
+        let expected_reason = "RotaryEmbedding: dtype bf16";
         let mut graph = Graph::new();
         let inputs = (0..3)
             .map(|i| {
@@ -76,13 +73,65 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
             !kernel.supports_strided_input(0),
             "{op_type} must request contiguous inputs"
         );
-        if op_type == "RotaryEmbedding" {
-            assert!(
-                !kernel.cuda_graph_compatible(),
-                "RotaryEmbedding requires an exact warmed signature"
-            );
-        }
+        assert!(
+            !kernel.cuda_graph_compatible(),
+            "RotaryEmbedding requires an exact warmed signature"
+        );
     }
+
+    let mut graph = Graph::new();
+    let inputs = (0..3)
+        .map(|index| {
+            graph.create_named_value(
+                format!("fp16_attention_input_{index}"),
+                DataType::Float16,
+                static_shape([1, 1, 1, 2]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = graph.create_named_value(
+        "fp16_attention_output",
+        DataType::Float16,
+        static_shape([1, 1, 1, 2]),
+    );
+    let node = Node::new(
+        NodeId(1),
+        "Attention",
+        inputs.into_iter().map(Some).collect(),
+        vec![output],
+    );
+    assert!(
+        ep.supports_op(&node, 23, &[], &[DataType::Float16; 3], &[])
+            .is_supported(),
+        "Attention must claim its fp16 activation path"
+    );
+
+    let mut graph = Graph::new();
+    let inputs = (0..3)
+        .map(|index| {
+            graph.create_named_value(
+                format!("bf16_attention_input_{index}"),
+                DataType::BFloat16,
+                static_shape([1, 1, 1, 2]),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = graph.create_named_value(
+        "bf16_attention_output",
+        DataType::BFloat16,
+        static_shape([1, 1, 1, 2]),
+    );
+    let node = Node::new(
+        NodeId(2),
+        "Attention",
+        inputs.into_iter().map(Some).collect(),
+        vec![output],
+    );
+    assert!(
+        ep.supports_op(&node, 23, &[], &[DataType::BFloat16; 3], &[])
+            .is_supported(),
+        "Attention must claim its bf16 activation path"
+    );
 
     let mut graph = Graph::new();
     let inputs = (0..3)
@@ -107,6 +156,89 @@ fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inp
             .is_supported(),
         "RotaryEmbedding must claim its fp16 activation path"
     );
+}
+
+#[test]
+fn standard_attention_claim_requires_homogeneous_floating_input_dtypes() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+
+    let claim = |input_dtypes: &[DataType]| {
+        let mut graph = Graph::new();
+        let inputs = input_dtypes
+            .iter()
+            .enumerate()
+            .map(|(index, dtype)| {
+                graph.create_named_value(
+                    format!("attention_input_{index}"),
+                    *dtype,
+                    static_shape([1, 1, 1, 2]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = graph.create_named_value(
+            "attention_output",
+            input_dtypes[0],
+            static_shape([1, 1, 1, 2]),
+        );
+        let node = Node::new(
+            NodeId(0),
+            "Attention",
+            inputs.into_iter().map(Some).collect(),
+            vec![output],
+        );
+        ep.supports_op(&node, 23, &[], input_dtypes, &[])
+    };
+
+    for input_dtypes in [
+        [
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::Float32,
+        ],
+        [
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::BFloat16,
+            DataType::Float16,
+        ],
+        [
+            DataType::Float16,
+            DataType::Float16,
+            DataType::Float16,
+            DataType::Float32,
+        ],
+        [
+            DataType::BFloat16,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::BFloat16,
+        ],
+    ] {
+        assert!(
+            !claim(&input_dtypes).is_supported(),
+            "Attention must reject mixed floating input dtypes: {input_dtypes:?}"
+        );
+    }
+
+    for floating_dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        let homogeneous = [floating_dtype; 4];
+        assert!(
+            claim(&homogeneous).is_supported(),
+            "Attention must accept a homogeneous {floating_dtype:?} additive mask"
+        );
+
+        let boolean_mask = [
+            floating_dtype,
+            floating_dtype,
+            floating_dtype,
+            DataType::Bool,
+        ];
+        assert!(
+            claim(&boolean_mask).is_supported(),
+            "Attention must accept a boolean mask with {floating_dtype:?} Q, K, and V"
+        );
+    }
 }
 
 #[test]

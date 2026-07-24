@@ -796,7 +796,6 @@ pub const GQA_CAPTURE_ERROR_POSITION: u32 = 32;
 
 pub struct GroupQueryAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
-    pub sequence_lengths_policy: GqaSequenceLengthsPolicy,
 }
 
 impl KernelFactory for GroupQueryAttentionFactory {
@@ -867,21 +866,9 @@ impl KernelFactory for GroupQueryAttentionFactory {
                     .and_then(|a| a.as_int())
                     .unwrap_or(-1),
                 softcap,
-            )?
-            .with_sequence_lengths_policy(self.sequence_lengths_policy),
+            )?,
         ))
     }
-}
-
-/// Compatibility policy for `GroupQueryAttention` key-sequence lengths.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GqaSequenceLengthsPolicy {
-    /// Require a canonical contiguous `int32 [batch_size]` or
-    /// `int32 [batch_size, 1]` representation.
-    #[default]
-    PerBatchOnly,
-    /// Also allow one contiguous rank-0 `int32` value when batch is exactly one.
-    AllowUnitBatchScalar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -901,7 +888,6 @@ pub struct GroupQueryAttentionKernel {
     rotary_interleaved: bool,
     local_window_size: i64,
     softcap: f32,
-    sequence_lengths_policy: GqaSequenceLengthsPolicy,
     backend: GroupQueryAttentionBackend,
     prep_fusion_disabled: bool,
     workspace: Mutex<GqaWorkspace>,
@@ -1062,42 +1048,28 @@ fn require_dense(view: &TensorView, name: &str, dtype: DataType) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GqaSequenceLengthsLayout {
-    PerBatch,
-    UnitBatchScalar,
-}
-
 fn validate_sequence_lengths_shape(
     shape: &[usize],
     numel: usize,
     batch: usize,
-    policy: GqaSequenceLengthsPolicy,
-) -> Result<GqaSequenceLengthsLayout> {
+) -> Result<()> {
     if shape == [batch] || shape == [batch, 1] {
-        return Ok(GqaSequenceLengthsLayout::PerBatch);
+        return Ok(());
     }
 
     let scalar = shape.is_empty() && numel == 1;
     if scalar {
-        return match (policy, batch) {
-            (GqaSequenceLengthsPolicy::AllowUnitBatchScalar, 1) => {
-                Ok(GqaSequenceLengthsLayout::UnitBatchScalar)
-            }
-            (GqaSequenceLengthsPolicy::AllowUnitBatchScalar, _) => {
-                Err(EpError::KernelFailed(format!(
-                    "cuda_ep GroupQueryAttention: scalar seqlens_k cannot represent batch {batch}; model.attention.key_sequence_lengths.scalar_broadcast: unit_batch only permits a scalar when batch_size is exactly 1, so provide contiguous int32 [batch_size] or [batch_size, 1] values for every row"
-                )))
-            }
-            (GqaSequenceLengthsPolicy::PerBatchOnly, _) => Err(EpError::KernelFailed(
-                "cuda_ep GroupQueryAttention: scalar seqlens_k is not enabled; the canonical shapes are contiguous int32 [batch_size] or [batch_size, 1]. If this graph structurally produces a scalar only for unit-batch attention, declare model.attention.key_sequence_lengths.scalar_broadcast: unit_batch in inference metadata"
-                    .into(),
-            )),
+        return if batch == 1 {
+            Ok(())
+        } else {
+            Err(EpError::KernelFailed(format!(
+                "cuda_ep GroupQueryAttention: scalar seqlens_k can only be promoted to [1] when batch_size is 1, got batch_size {batch}; provide contiguous int32 [batch_size] or [batch_size, 1] values for every row"
+            )))
         };
     }
 
     Err(EpError::KernelFailed(format!(
-        "cuda_ep GroupQueryAttention: seqlens_k must be non-negative contiguous int32 with shape [batch_size] or [batch_size, 1] (for batch_size {batch}: [{batch}] or [{batch}, 1]), got shape {shape:?}"
+        "cuda_ep GroupQueryAttention: seqlens_k must be non-negative contiguous int32 with shape [batch_size], [batch_size, 1], or a scalar for batch_size 1 (for batch_size {batch}: [{batch}] or [{batch}, 1]), got shape {shape:?}"
     )))
 }
 
@@ -1188,7 +1160,6 @@ impl GroupQueryAttentionKernel {
             rotary_interleaved,
             local_window_size,
             softcap,
-            sequence_lengths_policy: GqaSequenceLengthsPolicy::PerBatchOnly,
             backend: GroupQueryAttentionBackend::Auto,
             prep_fusion_disabled: false,
             last_capture_safe_signature: Mutex::new(None),
@@ -1197,11 +1168,6 @@ impl GroupQueryAttentionKernel {
 
     pub fn with_backend(mut self, backend: GroupQueryAttentionBackend) -> Self {
         self.backend = backend;
-        self
-    }
-
-    pub fn with_sequence_lengths_policy(mut self, policy: GqaSequenceLengthsPolicy) -> Self {
-        self.sequence_lengths_policy = policy;
         self
     }
 
@@ -1480,12 +1446,7 @@ impl GroupQueryAttentionKernel {
             ));
         }
         require_dense(&inputs[5], "seqlens_k", DataType::Int32)?;
-        let sequence_lengths_layout = validate_sequence_lengths_shape(
-            inputs[5].shape,
-            inputs[5].numel(),
-            batch,
-            self.sequence_lengths_policy,
-        )?;
+        validate_sequence_lengths_shape(inputs[5].shape, inputs[5].numel(), batch)?;
         require_dense(&inputs[6], "total_sequence_length", DataType::Int32)?;
         if inputs[6].numel() != 1 {
             return Err(EpError::KernelFailed(
@@ -1649,9 +1610,7 @@ impl GroupQueryAttentionKernel {
                     .enumerate()
                     .map(|(index, input)| {
                         (!input.is_absent()).then(|| {
-                            if index == 5
-                                && sequence_lengths_layout == GqaSequenceLengthsLayout::PerBatch
-                            {
+                            if index == 5 {
                                 vec![batch]
                             } else {
                                 input.shape.to_vec()
@@ -2229,17 +2188,18 @@ impl GroupQueryAttentionKernel {
             )?;
         } else if q.dtype == DataType::Float32 && gqa_decode::supported(q_seq, dim) {
             onnx_runtime_ep_api::record_kernel_variant!(
-                "attention_gqa_decode_f32",
-                "capture-safe f32 warp-parallel single-token decode: q_seq={}, head_dim={}; \
+                "attention_gqa_decode_f32_splitk",
+                "capture-safe f32 split-K single-token decode: q_seq={}, head_dim={}; \
+                 active split count (1/2/4/8/16, max {}) is chosen on-device; \
                  flash backend={:?} not selected",
                 q_seq,
                 dim,
+                gqa_decode::MAX_SPLITS,
                 selected_backend
             );
-            // Capture-safe warp-parallel single-token GQA decode. Reads the
-            // valid length on-device from `totals_gpu` and allocates no scratch,
-            // so it records/replays inside a CUDA graph. Keeps the reference
-            // kernel below for f32 prefill and unsupported head dims.
+            // Capture-safe split-K single-token GQA decode. Reads the valid
+            // length on-device and uses fixed module-global scratch, so both
+            // partial and merge launches record/replay inside a CUDA graph.
             gqa_decode::run(
                 &self.runtime,
                 batch,
@@ -2262,7 +2222,8 @@ impl GroupQueryAttentionKernel {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "attention_gqa_decode_fp16_splitk",
                 "capture-safe fp16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
-                 active split count (1/2/4/8, max {}) chosen on-device from valid length",
+                 active split count (up to {}) chosen on-device from the valid length \
+                 and a host occupancy target that fills the multiprocessors",
                 q_seq,
                 dim,
                 gqa_decode_fp16::MAX_SPLITS
@@ -2457,59 +2418,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sequence_lengths_shape_accepts_only_canonical_per_batch_forms() {
+    fn sequence_lengths_shape_accepts_canonical_per_batch_forms() {
         for batch in [1, 3] {
-            assert_eq!(
-                validate_sequence_lengths_shape(
-                    &[batch],
-                    batch,
-                    batch,
-                    GqaSequenceLengthsPolicy::PerBatchOnly,
-                )
-                .unwrap(),
-                GqaSequenceLengthsLayout::PerBatch
-            );
-            assert_eq!(
-                validate_sequence_lengths_shape(
-                    &[batch, 1],
-                    batch,
-                    batch,
-                    GqaSequenceLengthsPolicy::PerBatchOnly,
-                )
-                .unwrap(),
-                GqaSequenceLengthsLayout::PerBatch
-            );
+            validate_sequence_lengths_shape(&[batch], batch, batch).unwrap();
+            validate_sequence_lengths_shape(&[batch, 1], batch, batch).unwrap();
         }
     }
 
     #[test]
     fn sequence_lengths_shape_rejects_noncanonical_singleton_layouts_actionably() {
         for shape in [vec![1, 3], vec![3, 1, 1]] {
-            let error = validate_sequence_lengths_shape(
-                &shape,
-                3,
-                3,
-                GqaSequenceLengthsPolicy::PerBatchOnly,
-            )
-            .expect_err("noncanonical seqlens_k shape must fail");
+            let error = validate_sequence_lengths_shape(&shape, 3, 3)
+                .expect_err("noncanonical seqlens_k shape must fail");
             let message = format!("{error}");
-            assert!(message.contains("[batch_size] or [batch_size, 1]"));
+            assert!(message.contains("[batch_size], [batch_size, 1]"));
             assert!(message.contains(&format!("got shape {shape:?}")));
         }
     }
 
     #[test]
-    fn sequence_lengths_shape_preserves_declared_unit_batch_scalar() {
-        assert_eq!(
-            validate_sequence_lengths_shape(
-                &[],
-                1,
-                1,
-                GqaSequenceLengthsPolicy::AllowUnitBatchScalar,
-            )
-            .unwrap(),
-            GqaSequenceLengthsLayout::UnitBatchScalar
-        );
+    fn sequence_lengths_shape_promotes_unit_batch_scalar_and_rejects_larger_batches() {
+        validate_sequence_lengths_shape(&[], 1, 1).unwrap();
+        let error = validate_sequence_lengths_shape(&[], 1, 2)
+            .expect_err("a scalar cannot represent a multi-row batch");
+        assert!(format!("{error}").contains("batch_size 2"));
     }
 
     fn runtime() -> Option<Arc<CudaRuntime>> {

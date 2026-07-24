@@ -144,6 +144,107 @@ pub struct PipelineEngine {
     fixed_state_budget_bytes: u64,
 }
 
+/// The concrete backend a pipeline runs on. A pipeline never mixes backends:
+/// every component is instantiated through the same backend's
+/// [`ComponentSession`](onnx_genai_metadata::ComponentSession) implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PipelineBackend {
+    Ort,
+    Native,
+}
+
+/// Resolve an `Auto` decode-backend request to a concrete [`PipelineBackend`].
+/// Native is selected only when some component declares operators that require
+/// the native backend; otherwise ORT.
+fn resolve_auto_pipeline_backend(
+    directory: &PipelineModelDirectory,
+) -> anyhow::Result<PipelineBackend> {
+    for model_path in directory.model_paths.values() {
+        if model_requires_native_backend(model_path)? {
+            return Ok(PipelineBackend::Native);
+        }
+    }
+    Ok(PipelineBackend::Ort)
+}
+
+/// Native backend unavailable at build time: the crate was compiled without the
+/// `native-backend` feature, so no native component sessions can be constructed.
+#[cfg(not(feature = "native-backend"))]
+fn native_backend_not_compiled_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "the native backend was requested for a pipeline model, but this build of \
+         onnx-genai-engine was compiled without the 'native-backend' feature. Rebuild with \
+         `--features native-backend` (and `cuda` for GPU) to run pipelines natively, or set \
+         decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) to use ONNX \
+         Runtime."
+    )
+}
+
+/// Construct all pipeline components through the native
+/// [`ComponentSession`](onnx_genai_metadata::ComponentSession) seam, then report
+/// the first genuinely-unimplemented step for native pipeline decode.
+///
+/// Backend-neutral construction (GAP 1) is complete once every component loads
+/// and exposes graph I/O metadata through the trait. Wiring those neutral
+/// sessions into the pipeline decode loop — which still routes per-step state
+/// through ORT `Value`/`Session` — is the remaining native work (GAP 3), so
+/// this returns a clear, actionable error naming that precise next blocker
+/// rather than a blanket "native backend not supported" rejection at
+/// construction.
+#[cfg(feature = "native-backend")]
+fn build_native_pipeline_and_report_gap(
+    directory: &PipelineModelDirectory,
+    config: &EngineConfig,
+) -> anyhow::Error {
+    let components = match build_native_pipeline_components(directory, config) {
+        Ok(components) => components,
+        Err(err) => return err,
+    };
+    let component_list = components.keys().cloned().collect::<Vec<_>>().join(", ");
+    anyhow::anyhow!(
+        "native pipeline decode is not yet implemented. All {} pipeline component(s) loaded \
+         successfully on the native backend and expose their graph I/O through the \
+         backend-neutral component-session interface (components: {}), so backend selection and \
+         construction are backend-neutral. Native target decode now accepts metadata-declared \
+         token or embedding sequence inputs plus arbitrary named routed step tensors. The \
+         remaining GAP 3 work is replacing `DecodeState` and `PipelineDecodeLoopBackend` ownership \
+         of ORT `Value`/`Session` with backend-neutral tensors/component sessions, then invoking \
+         the native target step with those routed tensors. To run this pipeline today, set \
+         decode_backend = EngineDecodeBackend::Ort (or \
+         ONNX_GENAI_BACKEND=ort).",
+        components.len(),
+        component_list,
+    )
+}
+
+/// Load every declared pipeline component on the native backend, exposing each
+/// through the backend-neutral [`ComponentSession`] seam. Returns the components
+/// keyed by name so backend selection instantiates them all consistently.
+#[cfg(feature = "native-backend")]
+fn build_native_pipeline_components(
+    directory: &PipelineModelDirectory,
+    config: &EngineConfig,
+) -> anyhow::Result<
+    std::collections::BTreeMap<String, Box<dyn onnx_genai_metadata::ComponentSession>>,
+> {
+    use crate::native_component::NativeComponentSession;
+    use onnx_genai_metadata::ComponentSession;
+
+    let device = crate::engine::resolve_native_decode_device(
+        config.native_device,
+        &SessionOptions::default(),
+    )?;
+    let mut components: std::collections::BTreeMap<String, Box<dyn ComponentSession>> =
+        std::collections::BTreeMap::new();
+    for (name, path) in &directory.model_paths {
+        let session = NativeComponentSession::load(path, device).with_context(|| {
+            format!("failed to construct pipeline component '{name}' on the native backend")
+        })?;
+        components.insert(name.clone(), Box::new(session));
+    }
+    Ok(components)
+}
+
 impl Engine {
     /// Load a metadata-declared pipeline directory.
     ///
@@ -187,21 +288,33 @@ impl PipelineEngine {
         schedulers: &SchedulerRegistry,
     ) -> anyhow::Result<Self> {
         let decode_backend = requested_decode_backend(config.decode_backend)?;
-        if decode_backend == EngineDecodeBackend::Native {
-            anyhow::bail!(
-                "native backend not supported for pipeline models; \
-                 set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort)"
-            );
-        }
-        if decode_backend == EngineDecodeBackend::Auto {
-            let directory = PipelineModelDirectory::load(pipeline_dir)
-                .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
-            for (component, model_path) in &directory.model_paths {
-                if model_requires_native_backend(model_path)? {
-                    anyhow::bail!(
-                        "native backend not supported for pipeline models: component '{component}' requires the native backend"
-                    );
-                }
+        // Select ONE backend for the whole pipeline (never a mix). Explicit
+        // backends resolve without touching the model directory (so a bad
+        // request fails fast); `Auto` inspects the components' declared
+        // operators, selecting native only when some component requires it.
+        let backend = match decode_backend {
+            EngineDecodeBackend::Ort => PipelineBackend::Ort,
+            EngineDecodeBackend::Native => PipelineBackend::Native,
+            EngineDecodeBackend::Auto => {
+                let directory = PipelineModelDirectory::load(pipeline_dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
+                resolve_auto_pipeline_backend(&directory)?
+            }
+        };
+        if backend == PipelineBackend::Native {
+            // The native backend constructs every declared component through the
+            // backend-neutral `ComponentSession` seam (GAP 1); no ORT type
+            // reaches this path. When the crate is built without the
+            // `native-backend` feature there is nothing to construct.
+            #[cfg(not(feature = "native-backend"))]
+            {
+                return Err(native_backend_not_compiled_error());
+            }
+            #[cfg(feature = "native-backend")]
+            {
+                let directory = PipelineModelDirectory::load(pipeline_dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
+                return Err(build_native_pipeline_and_report_gap(&directory, &config));
             }
         }
         let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
@@ -4983,8 +5096,9 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "native-backend"))]
     #[test]
-    fn explicit_native_backend_is_rejected_before_loading_pipeline_models() {
+    fn explicit_native_backend_without_feature_reports_actionable_build_error() {
         let error = PipelineEngine::from_dir_with_config(
             Path::new("does-not-need-to-exist"),
             EngineConfig {
@@ -4993,17 +5107,19 @@ mod tests {
             },
         )
         .err()
-        .expect("native pipeline backend must be rejected");
+        .expect("native pipeline backend must report an actionable error");
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("native backend not supported for pipeline models")
+            message.contains("without the 'native-backend' feature"),
+            "unexpected error: {message}"
         );
+        // No longer the blanket "not supported for pipeline models" rejection.
+        assert!(!message.contains("native backend not supported for pipeline models"));
     }
 
     #[cfg(feature = "native-backend")]
     #[test]
-    fn auto_backend_rejects_pipeline_component_requiring_native() -> anyhow::Result<()> {
+    fn auto_backend_routes_native_only_pipeline_to_the_native_backend() -> anyhow::Result<()> {
         use onnx_runtime_loader::proto::{
             ModelProto,
             onnx::{GraphProto, NodeProto, OperatorSetIdProto},
@@ -5046,12 +5162,15 @@ pipeline:
 
         let error = PipelineEngine::from_dir_with_config(&root, EngineConfig::default())
             .err()
-            .expect("Auto must reject native-only pipeline components");
+            .expect("Auto must engage the native backend for native-only pipeline components");
+        let message = error.to_string();
+        // Auto now selects the native backend and constructs components through
+        // the backend-neutral seam rather than emitting the old blanket refusal.
         assert!(
-            error
-                .to_string()
-                .contains("native backend not supported for pipeline models")
+            message.contains("native"),
+            "error should reference the native backend: {message}"
         );
+        assert!(!message.contains("native backend not supported for pipeline models"));
         Ok(())
     }
 
