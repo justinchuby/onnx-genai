@@ -1527,10 +1527,23 @@ thread_local! {
 
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
 /// requested or the host cannot be split (fallback, logged once).
+///
+/// It is sized from [`configured_persistent_decode_threads`] (about half the
+/// logical CPUs), *not* the flat pool's eight-worker ceiling. `numa-split` is
+/// the two-level, node-pinned mirror of the persistent SPMD pool (see
+/// [`crate::decode_spmd`]) and its whole purpose is to reach *both* sockets'
+/// memory bandwidth; the eight-worker flat ceiling would leave only ~four
+/// row-sharded workers per node, far too few to saturate either memory
+/// controller, so it could never realize the bandwidth win the layout exists
+/// for. Half the logical CPUs, split across the nodes, lands each per-node
+/// sub-pool at the measured bandwidth knee while leaving cores for the
+/// dispatcher and co-tenants (a *fully*-subscribed split oversubscribes the
+/// cores and collapses throughput). `ONNX_GENAI_CPU_DECODE_THREADS` still
+/// overrides the count (and `0` opts out).
 fn numa_pools() -> Option<&'static crate::decode_numa::NumaDecodePools> {
     static NUMA_POOLS: OnceLock<Option<crate::decode_numa::NumaDecodePools>> = OnceLock::new();
     NUMA_POOLS
-        .get_or_init(|| crate::decode_numa::build_from_env(configured_decode_threads()))
+        .get_or_init(|| crate::decode_numa::build_from_env(configured_persistent_decode_threads()))
         .as_ref()
 }
 

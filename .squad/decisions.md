@@ -3315,3 +3315,10 @@ Worktree left pristine (no scratch files).
 **By:** Squad (Coordinator) integrating Vasquez (author, cdf1091), Drake (🟢 separable-part reviewer)
 **What:** Cherry-picked cdf1091 (bench_generic.rs + Cargo.toml bin) onto perf/cpu-ep-mlas. A generic single-inference native-vs-ORT bench (interleaved timing + output parity) for traditional-ML / non-genai ONNX models (resnet, yolo, etc.). Args: --model, --warmups, --runs.
 **Why:** The user asked to verify generality (resnet/yolo faster than ORT) via the onnx-genai stack. This is the reusable generality-benchmark harness. Drake reviewed the full conv-pool branch and confirmed bench_generic (base, untouched by Bishop's conv-pool) is safe/separable to land; the conv-pool part was 🔴 rejected for a straggler/reset race (tracked separately). bench_generic compiles under --features bench-native,mlas, fmt clean, required-features gates it off aarch64.
+
+### NUMA-split decode sizing fix + non-vacuous partition test (landed on PR #105)
+**Commits cherry-picked:** 69a4463 (parker, sizing) + ab3fd65 (hicks, non-vacuous test). Reviewer: Gorman (opus) 🟢 APPROVED — non-author (parker/ferro/hicks locked out).
+**What:** numa-split two-level decode layout (OPT-IN via ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split). Fix: numa_pools() no longer capped at 8 workers — sized from configured_persistent_decode_threads() (~half CPUs), split_workers caps only at per-node CPU count. DEFAULT (flat) decode path UNCHANGED (build_from_env early-returns None unless NumaSplit; use site gates on IN_NUMA_SCOPE thread-local).
+**Why safe:** row-sharded GEMV is exactly associative (each output row = independent full-K dot); per-node shard concat is bit-for-bit identical, no cross-node reduction. Locked by ..._matches_flat_gemv_bit_for_bit (to_bits) test.
+**Test non-vacuity PROVEN:** perturbing dispatch partition 3:10→4:9 → "row 3 dispatched on node 0 but placed on node 1" FAIL; revert → PASS. Closes Ferro's earlier vacuous-test rejection.
+**Gates:** 884 lib + 10 regression green; clippy w/ + w/o mlas -D warnings; fmt; aarch64 check.

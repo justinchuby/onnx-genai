@@ -301,6 +301,22 @@ mod tests {
         NumaDecodePools::build(&shards).expect("build test numa pools")
     }
 
+    fn asymmetric_two_node_pools() -> NumaDecodePools {
+        let shards = vec![
+            NodeShard {
+                index: 0,
+                cpus: vec![0],
+                workers: 1,
+            },
+            NodeShard {
+                index: 1,
+                cpus: vec![1, 2, 3],
+                workers: 3,
+            },
+        ];
+        NumaDecodePools::build(&shards).expect("build asymmetric test numa pools")
+    }
+
     #[test]
     fn row_lengths_split_proportionally_and_cover_all_rows() {
         let pools = two_node_pools();
@@ -345,5 +361,112 @@ mod tests {
         let scales: Vec<f32> = (0..n).map(|row| row as f32 * 0.5).collect();
         let placed_scales = pools.place_rows(&scales, n);
         assert_eq!(placed_scales, scales);
+    }
+
+    /// Regression guard for the core `numa-split` correctness claim: sharding a
+    /// GEMV's output rows across the per-node sub-pools and joining them must
+    /// reproduce the flat single-threaded GEMV **bit-for-bit**. A GEMV row is an
+    /// independent dot product over the whole K dimension, so row-sharding is
+    /// exactly associative -- there is no cross-row reduction and therefore no
+    /// floating-point re-association. Any divergence here means a real
+    /// cross-node reduction or a non-associative combine has crept in.
+    #[test]
+    fn dispatch_output_rows_matches_flat_gemv_bit_for_bit() {
+        let pools = two_node_pools();
+        let n = 129usize; // not a multiple of the node/worker counts
+        let k = room_k();
+        // Deterministic, non-trivial weights and activation (values chosen so the
+        // partial sums are order-sensitive if a wrong reduction is introduced).
+        let weight: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.3125 + 0.1)
+            .collect();
+        let activation: Vec<f32> = (0..k).map(|j| ((j % 13) as f32 - 6.0) * 0.5).collect();
+
+        // The same closure the flat path passes to `par_chunks_mut`: fill each
+        // output row `output_start + offset` with its dot product.
+        let gemv_row = |output_start: usize, outputs: &mut [f32]| {
+            for (offset, out) in outputs.iter_mut().enumerate() {
+                let row = output_start + offset;
+                let base = row * k;
+                let mut acc = 0.0f32;
+                for j in 0..k {
+                    acc += weight[base + j] * activation[j];
+                }
+                *out = acc;
+            }
+        };
+
+        let mut sharded = vec![0.0f32; n];
+        pools.dispatch_output_rows(&mut sharded, k, &gemv_row);
+
+        let mut flat = vec![0.0f32; n];
+        gemv_row(0, &mut flat);
+
+        // Bit-for-bit equality (not approximate): row-sharding must not perturb
+        // any single row's dot-product accumulation order.
+        assert_eq!(sharded.len(), flat.len());
+        for (row, (got, want)) in sharded.iter().zip(flat.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "row {row} diverged: sharded={got} flat={want}"
+            );
+        }
+    }
+
+    /// The row split used to place weights (`place_rows`) and to dispatch compute
+    /// (`dispatch_output_rows`) must be the *same* partition, or a node's workers
+    /// would read another node's weight rows.
+    #[test]
+    fn place_rows_and_dispatch_share_the_same_partition() {
+        let pools = asymmetric_two_node_pools();
+        let n = 13usize;
+        let lengths = pools.row_lengths(n);
+        assert_eq!(lengths, vec![3, 10]);
+
+        let source_rows: Vec<f32> = (0..n).map(|row| row as f32 + 0.25).collect();
+        let placed = pools.place_rows(&source_rows, n);
+        let mut placement_nodes = Vec::with_capacity(n);
+        for (node, &length) in lengths.iter().enumerate() {
+            placement_nodes.extend(std::iter::repeat_n(node, length));
+        }
+
+        let stamp_source_row = |output_start: usize, outputs: &mut [f32]| {
+            let current_thread = std::thread::current();
+            let thread_name = current_thread
+                .name()
+                .expect("dispatch output must run on a node-pinned worker");
+            let node = thread_name
+                .strip_prefix("onnx-genai-decode-n")
+                .and_then(|suffix| suffix.split_once('-'))
+                .and_then(|(node, _)| node.parse::<usize>().ok())
+                .expect("dispatch output must run on a named node-pinned worker");
+            for (offset, output) in outputs.iter_mut().enumerate() {
+                let row = output_start + offset;
+                assert_eq!(
+                    node, placement_nodes[row],
+                    "row {row} was dispatched on node {node}, but was placed on node {}",
+                    placement_nodes[row]
+                );
+                *output = placed[row];
+            }
+        };
+
+        let mut output = vec![0.0f32; n];
+        pools.dispatch_output_rows(&mut output, 1, &stamp_source_row);
+        for (row, (got, source)) in output.iter().zip(source_rows.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                source.to_bits(),
+                "row {row} did not retain its placed source-row identity"
+            );
+        }
+    }
+
+    /// A K large enough that `output_chunk_len` splits a node's segment into
+    /// several chunks, exercising the inner `par_chunks_mut` branch of
+    /// `dispatch_output_rows` (not just the whole-segment branch).
+    fn room_k() -> usize {
+        4096
     }
 }

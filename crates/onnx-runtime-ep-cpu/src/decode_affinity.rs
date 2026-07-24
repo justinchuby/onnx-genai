@@ -1026,6 +1026,38 @@ mod tests {
         assert!(topology.split_workers(0).is_none());
     }
 
+    /// The exact conditions [`crate::decode_numa::build_from_env`] treats as
+    /// "cannot split -> fall back to the flat single-node decode path": a
+    /// single-node host, and a multi-node host whose process cpuset leaves fewer
+    /// than two usable nodes. Both must yield `None` from the topology so the
+    /// numa-split builder declines and decode stays correct (flat path) instead
+    /// of pinning a degenerate single-node "split".
+    #[test]
+    fn numa_split_declines_when_topology_cannot_be_split() {
+        // Single-node host: nothing to split across.
+        let mut single = BTreeMap::new();
+        single.insert(0, vec![0, 1, 2, 3]);
+        let single = NumaTopology { nodes: single };
+        assert!(
+            single.split_workers(8).is_none(),
+            "single-node host must decline the split"
+        );
+
+        // Multi-node host restricted (cpuset/taskset) to a single node: after
+        // `restrict_to_allowed` only one node survives, so the split declines.
+        let host = two_node_topology();
+        let restricted = host.restrict_to_allowed(Some(&[0, 1, 2]));
+        assert_eq!(restricted.node_count(), 1);
+        assert!(
+            restricted.split_workers(8).is_none(),
+            "cpuset confined to one node must decline the split"
+        );
+
+        // A usable two-node topology still splits, so the decline is specific to
+        // un-splittable hosts, not a blanket refusal.
+        assert!(host.split_workers(8).is_some());
+    }
+
     fn two_node_topology() -> NumaTopology {
         let mut nodes = BTreeMap::new();
         nodes.insert(0, (0..8).collect::<Vec<_>>());
