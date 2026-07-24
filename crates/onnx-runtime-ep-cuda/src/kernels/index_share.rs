@@ -1482,8 +1482,7 @@ impl IndexShareKernel {
 }
 
 fn validate_indices(indices: &[i64], dims: Dims, per_batch_bound: &[usize]) -> Result<()> {
-    for b in 0..dims.batch {
-        let bound = per_batch_bound[b];
+    for (b, &bound) in per_batch_bound.iter().enumerate() {
         for h in 0..dims.index_heads {
             for q in 0..dims.q_seq {
                 let row = ((b * dims.index_heads + h) * dims.q_seq + q) * dims.selected_width;
