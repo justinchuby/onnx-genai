@@ -29,6 +29,10 @@ struct Args {
     /// Measure ORT only. Useful for recording a baseline when native loading or execution fails.
     #[arg(long)]
     ort_only: bool,
+    /// Time the native runtime only. Parity is still checked once against ORT, but the timed loop
+    /// runs native alone so ORT's intra-op threadpool is not spinning and polluting native samples.
+    #[arg(long)]
+    native_only: bool,
     /// Relative tolerance used for Float32 output parity.
     #[arg(long, default_value_t = 1e-3)]
     rel_tolerance: f32,
@@ -391,8 +395,9 @@ fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
 
     let environment = Environment::new("profile-vision")?;
-    let ort_options =
-        SessionOptions::with_execution_provider(ep_selection("cpu")).with_intra_op_threads(0);
+    let ort_intra_threads = if args.native_only { 1 } else { 0 };
+    let ort_options = SessionOptions::with_execution_provider(ep_selection("cpu"))
+        .with_intra_op_threads(ort_intra_threads);
     let ort_session = Session::new(&environment, &args.model, ort_options)
         .with_context(|| format!("load ORT CPU session from {}", args.model.display()))?;
     println!("model: {}", args.model.display());
@@ -473,8 +478,10 @@ fn main() -> Result<()> {
                 .context("native warmup")?,
         );
     }
-    for _ in 0..args.warmups {
-        std::hint::black_box(ort_session.run(&ort_inputs).context("ORT warmup")?);
+    if !args.native_only {
+        for _ in 0..args.warmups {
+            std::hint::black_box(ort_session.run(&ort_inputs).context("ORT warmup")?);
+        }
     }
     let mut native_samples = Vec::with_capacity(args.runs);
     let mut ort_samples = Vec::with_capacity(args.runs);
@@ -493,7 +500,9 @@ fn main() -> Result<()> {
             std::hint::black_box(ort_session.run(&ort_inputs).context("ORT measured run")?);
             Ok(start.elapsed().as_secs_f64() * 1_000.0)
         };
-        if run % 2 == 0 {
+        if args.native_only {
+            native_samples.push(measure_native()?);
+        } else if run % 2 == 0 {
             native_samples.push(measure_native()?);
             ort_samples.push(measure_ort()?);
         } else {
@@ -503,6 +512,15 @@ fn main() -> Result<()> {
     }
 
     let native_ms = median_ms(native_samples);
+    if args.native_only {
+        println!(
+            "result: native={native_ms:.3} ms ({:.2} infer/s) ort=skipped native-only=true \
+             parity={}",
+            1_000.0 / native_ms,
+            if parity_pass { "PASS" } else { "FAIL" }
+        );
+        return Ok(());
+    }
     let ort_ms = median_ms(ort_samples);
     println!(
         "result: native={native_ms:.3} ms ({:.2} infer/s) ort={ort_ms:.3} ms \

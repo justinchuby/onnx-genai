@@ -1101,6 +1101,276 @@ mod tests {
         assert_eq!(nemotron.len(), 2048 * 7);
     }
 
+    /// Independent naive NCHW convolution computed in f64. Serves as an oracle
+    /// for the MLAS-backed kernel across a matrix of shapes, so the multi-tile
+    /// parallel `MlasNchwcConv` / im2col paths stay bit-close to a straight
+    /// definition regardless of how MLAS partitions the work across threads.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_conv(
+        x_shape: &[usize; 4],
+        x: &[f32],
+        w_shape: &[usize; 4],
+        w: &[f32],
+        bias: Option<&[f32]>,
+        group: usize,
+        strides: [usize; 2],
+        pads: [usize; 4],
+        dilations: [usize; 2],
+    ) -> (Vec<usize>, Vec<f32>) {
+        let [n, cin, ih, iw] = *x_shape;
+        let [cout, cin_g, kh, kw] = *w_shape;
+        assert_eq!(cin / group, cin_g);
+        let oh = (ih + pads[0] + pads[2])
+            .saturating_sub(dilations[0] * (kh - 1) + 1)
+            / strides[0]
+            + 1;
+        let ow = (iw + pads[1] + pads[3])
+            .saturating_sub(dilations[1] * (kw - 1) + 1)
+            / strides[1]
+            + 1;
+        let out_per_group = cout / group;
+        let mut out = vec![0.0f32; n * cout * oh * ow];
+        for image in 0..n {
+            for oc in 0..cout {
+                let g = oc / out_per_group;
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let mut acc = bias.map_or(0.0f64, |b| b[oc] as f64);
+                        for ic in 0..cin_g {
+                            let in_c = g * cin_g + ic;
+                            for ky in 0..kh {
+                                let iy = oy * strides[0] + ky * dilations[0];
+                                if iy < pads[0] || iy - pads[0] >= ih {
+                                    continue;
+                                }
+                                let iy = iy - pads[0];
+                                for kx in 0..kw {
+                                    let ix = ox * strides[1] + kx * dilations[1];
+                                    if ix < pads[1] || ix - pads[1] >= iw {
+                                        continue;
+                                    }
+                                    let ix = ix - pads[1];
+                                    let xv = x[((image * cin + in_c) * ih + iy) * iw + ix] as f64;
+                                    let wv = w[((oc * cin_g + ic) * kh + ky) * kw + kx] as f64;
+                                    acc += xv * wv;
+                                }
+                            }
+                        }
+                        out[((image * cout + oc) * oh + oy) * ow + ox] = acc as f32;
+                    }
+                }
+            }
+        }
+        (vec![n, cout, oh, ow], out)
+    }
+
+    fn pseudo_random(count: usize, seed: usize) -> Vec<f32> {
+        (0..count)
+            .map(|i| {
+                let v = (i.wrapping_mul(2_654_435_761).wrapping_add(seed.wrapping_mul(40_503))
+                    % 1000) as f32;
+                v / 500.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Parity of the MLAS Conv kernel against the f64 reference over a matrix of
+    /// shapes: multi-channel dense 3x3 (exercises the parallel NCHWc tiles),
+    /// 1x1 pointwise, strided+padded, dilated, grouped, and depthwise. Channel
+    /// and spatial counts are large enough that MLAS splits the work across
+    /// multiple partitions, guarding the threaded convolution path.
+    #[test]
+    fn conv_matches_f64_reference_across_shapes() {
+        struct Case {
+            name: &'static str,
+            x_shape: [usize; 4],
+            w_shape: [usize; 4],
+            bias: bool,
+            group: usize,
+            strides: [usize; 2],
+            pads: [usize; 4],
+            dilations: [usize; 2],
+        }
+        let cases = [
+            Case {
+                name: "dense_3x3_multichannel",
+                x_shape: [1, 16, 20, 20],
+                w_shape: [32, 16, 3, 3],
+                bias: true,
+                group: 1,
+                strides: [1, 1],
+                pads: [1, 1, 1, 1],
+                dilations: [1, 1],
+            },
+            Case {
+                name: "pointwise_1x1",
+                x_shape: [1, 24, 14, 14],
+                w_shape: [40, 24, 1, 1],
+                bias: true,
+                group: 1,
+                strides: [1, 1],
+                pads: [0, 0, 0, 0],
+                dilations: [1, 1],
+            },
+            Case {
+                name: "strided_padded_3x3",
+                x_shape: [1, 12, 17, 19],
+                w_shape: [20, 12, 3, 3],
+                bias: false,
+                group: 1,
+                strides: [2, 2],
+                pads: [1, 1, 1, 1],
+                dilations: [1, 1],
+            },
+            Case {
+                name: "dilated_3x3",
+                x_shape: [1, 8, 18, 18],
+                w_shape: [16, 8, 3, 3],
+                bias: true,
+                group: 1,
+                strides: [1, 1],
+                pads: [2, 2, 2, 2],
+                dilations: [2, 2],
+            },
+            Case {
+                name: "grouped",
+                x_shape: [1, 16, 12, 12],
+                w_shape: [24, 4, 3, 3],
+                bias: true,
+                group: 4,
+                strides: [1, 1],
+                pads: [1, 1, 1, 1],
+                dilations: [1, 1],
+            },
+            Case {
+                name: "depthwise",
+                x_shape: [1, 32, 16, 16],
+                w_shape: [32, 1, 3, 3],
+                bias: true,
+                group: 32,
+                strides: [1, 1],
+                pads: [1, 1, 1, 1],
+                dilations: [1, 1],
+            },
+            Case {
+                name: "first_layer_3ch",
+                x_shape: [1, 3, 24, 24],
+                w_shape: [16, 3, 3, 3],
+                bias: true,
+                group: 1,
+                strides: [2, 2],
+                pads: [1, 1, 1, 1],
+                dilations: [1, 1],
+            },
+        ];
+
+        for case in &cases {
+            let x = pseudo_random(case.x_shape.iter().product(), 1);
+            let w = pseudo_random(case.w_shape.iter().product(), 7);
+            let bias = case
+                .bias
+                .then(|| pseudo_random(case.w_shape[0], 13));
+            let (ref_shape, reference) = reference_conv(
+                &case.x_shape,
+                &x,
+                &case.w_shape,
+                &w,
+                bias.as_deref(),
+                case.group,
+                case.strides,
+                case.pads,
+                case.dilations,
+            );
+            let mut attrs = vec![
+                (
+                    "strides",
+                    Attribute::Ints(vec![case.strides[0] as i64, case.strides[1] as i64]),
+                ),
+                (
+                    "pads",
+                    Attribute::Ints(vec![
+                        case.pads[0] as i64,
+                        case.pads[1] as i64,
+                        case.pads[2] as i64,
+                        case.pads[3] as i64,
+                    ]),
+                ),
+                (
+                    "dilations",
+                    Attribute::Ints(vec![case.dilations[0] as i64, case.dilations[1] as i64]),
+                ),
+            ];
+            if case.group != 1 {
+                attrs.push(("group", Attribute::Int(case.group as i64)));
+            }
+            let output = run_conv(
+                &case.x_shape,
+                &x,
+                &case.w_shape,
+                &w,
+                bias.as_deref(),
+                &ref_shape,
+                &attrs,
+            );
+            assert_eq!(output.len(), reference.len(), "case {}", case.name);
+            for (index, (actual, expected)) in output.iter().zip(&reference).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                    "case {} mismatch at {index}: actual {actual}, expected {expected}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    /// Parity of the MLAS Conv kernel against the f64 reference on a conv whose
+    /// multiply-add count exceeds the NCHWc thread-fan-out work cap
+    /// (`MLAS_NCHWC_MIN_WORK_PER_THREAD`, ~32M). This forces `MlasNchwcConv` past
+    /// the serial early-return so the work is split across multiple partitions
+    /// (`tids > 1`) and the parallel tiles are compared bit-for-bit against the
+    /// straight f64 definition. The shapes in `conv_matches_f64_reference_across_shapes`
+    /// all fall under the cap and clamp to a single tile, so this case is what
+    /// actually guards the threaded convolution path.
+    #[test]
+    fn conv_parallel_path_matches_f64_reference() {
+        // ~127M MACs: 96 * (48*48) * 64 * 9. With the ~32M/thread cap this clamps
+        // to ~3 partitions on any CI host with >= 3 cores (fewer cores -> fewer
+        // tiles, still correct), reliably exercising the multi-tile path.
+        let x_shape = [1usize, 64, 48, 48];
+        let w_shape = [96usize, 64, 3, 3];
+        let strides = [1usize, 1];
+        let pads = [1usize, 1, 1, 1];
+        let dilations = [1usize, 1];
+
+        let x = pseudo_random(x_shape.iter().product(), 3);
+        let w = pseudo_random(w_shape.iter().product(), 9);
+        let bias = pseudo_random(w_shape[0], 17);
+        let (ref_shape, reference) = reference_conv(
+            &x_shape,
+            &x,
+            &w_shape,
+            &w,
+            Some(&bias),
+            1,
+            strides,
+            pads,
+            dilations,
+        );
+        let attrs = vec![
+            ("strides", Attribute::Ints(vec![1, 1])),
+            ("pads", Attribute::Ints(vec![1, 1, 1, 1])),
+            ("dilations", Attribute::Ints(vec![1, 1])),
+        ];
+        let output = run_conv(&x_shape, &x, &w_shape, &w, Some(&bias), &ref_shape, &attrs);
+        assert_eq!(output.len(), reference.len());
+        for (index, (actual, expected)) in output.iter().zip(&reference).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                "parallel-path mismatch at {index}: actual {actual}, expected {expected}",
+            );
+        }
+    }
+
     #[test]
     fn same_upper_same_lower_and_valid_geometry() {
         let input = [4, 4];

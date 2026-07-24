@@ -613,6 +613,24 @@ Return Value:
         if (size_t(TargetThreadCount) > TasksCount) {
             TargetThreadCount = ptrdiff_t(TasksCount);
         }
+
+        //
+        // nxrt-mlas-mt: cap the fan-out by the amount of data moved. This is a
+        // memory-bound reorder; splitting a small tensor across the whole pool
+        // (e.g. the final NCHWc->NCHW copy in a mobile CNN, a few tens of
+        // thousands of elements) costs more in thread dispatch and barrier
+        // synchronization than the copy saves and runs slower than serial.
+        // Require at least this many elements per worker; large feature maps
+        // still fan out. Shape-derived, no per-model or per-target tuning.
+        //
+        constexpr size_t MinElementsPerThread = 128 * 1024;
+        ptrdiff_t UsefulThreads = ptrdiff_t(BufferSize / MinElementsPerThread);
+        if (UsefulThreads < 1) {
+            UsefulThreads = 1;
+        }
+        if (TargetThreadCount > UsefulThreads) {
+            TargetThreadCount = UsefulThreads;
+        }
     }
     WorkBlock.TargetThreadCount = TargetThreadCount;
 
