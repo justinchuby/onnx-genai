@@ -17,6 +17,14 @@
 - Both 128- and 1024-token generations were inspected. Every native backend
   produced readable, non-garbled output. Some models became repetitive at the
   long horizon, but remained linguistically coherent.
+- The Qwen3-0.6B rows were remeasured on 2026-07-24 from `ea452be0`, using
+  `/home/justinchu/mobius/.scratch/qwen3-0.6b-int4-cuda-postfix` (the
+  metadata-fixed `-postfix` artifact), rather than the generic Qwen3 artifact.
+  Unlike the original ladder, this was a shared, CPU-loaded host: CPU was pinned
+  to core 1 and GPU 3 was allocation-free before/after, but host load averaged
+  6.93–16.77 during the recorded runs. These are on-same-host before/after
+  results, not an uncontended absolute claim. Three one-run process samples per
+  backend were used; table values are their medians.
 
 ## Results
 
@@ -30,8 +38,8 @@
 | Qwen2.5-7B int4 | 274.98 | 240.41 | **1.144×** | 1024 | No |
 | Phi-4-mini int4/int8 | 320.78 | 230.70 | **1.390×** | 128 | No |
 | Phi-4-mini int4/int8 | 289.47 | 203.58 | **1.422×** | 1024 | No |
-| Qwen3-0.6B int4 | 454.97 | 428.08 | **1.063×** | 128 | No |
-| Qwen3-0.6B int4 | 402.89 | 377.74 | **1.067×** | 1024 | No |
+| Qwen3-0.6B int4 (`qwen3-0.6b-int4-cuda-postfix`)† | 530.68 | 443.54 | **1.197×** | 128 | Shared host; CPU load |
+| Qwen3-0.6B int4 (`qwen3-0.6b-int4-cuda-postfix`)† | 479.42 | 384.05 | **1.248×** | 1024 | Shared host; CPU load |
 | DeepSeek-Coder-1.3B int4 | 796.26 | 635.59 | **1.253×** | 128 | No |
 | DeepSeek-Coder-1.3B int4 | 627.39 | 512.59 | **1.224×** | 1024 | No |
 | DeepSeek-R1-Distill-Qwen-1.5B int4 | 634.26 | 439.97 | **1.442×** | 128 | No |
@@ -39,15 +47,29 @@
 | GLM-4-9B int4 | 120.88 | N/A | N/A | 128 | No |
 | GLM-4-9B int4 | 114.27 | N/A | N/A | 1024 | No |
 
-**Verdict:** native CUDA beat ORT CUDA in every comparable uncontended row,
-by 1.063–1.600×; GLM-4-9B ran coherently natively but ORT could not load it.
+**Verdict:** native CUDA beat ORT CUDA in every comparable original
+uncontended row, by 1.103–1.600×; GLM-4-9B ran coherently natively but ORT
+could not load it. The post-fix Qwen3 ratio is 1.197× at 128 tokens and 1.248×
+at 1024 tokens on a shared host, so it is not included in that uncontended
+range.
+
+† Qwen3 remeasurement source: `ea452be0740e0a9894fb6df29245e2bbe453d15e`,
+after the multi-group Q/K RMSNorm capture fix (decode seams 29→1; Chew's review
+measured about +18% native). This shared-host result is +16.6% versus the prior
+454.97 tok/s ladder value. H200 GPU 3, `CUDA_VISIBLE_DEVICES=3`, `taskset -c 1`,
+`--ep cuda`, prompt `The capital of France is`, `--steady --decode-skip 8`, one
+warmup, and three separate one-measurement runs per backend. Raw tok/s: 128 native
+530.51/533.44/530.68, ORT 451.84/443.54/438.01; 1024 native
+479.42/480.29/478.96, ORT 388.41/384.05/380.17. Native and ORT both produced
+the same coherent `Paris` / `Rome` continuation in the 128-token check.
 
 ## Coherence and failures
 
 - Qwen2.5 outputs began with `Paris` and continued in readable English.
 - Phi-4-mini answered `Paris` before continuing into its packaged prompt
   material.
-- Qwen3-0.6B continued with `Paris` and `Rome`.
+- Qwen3-0.6B (`qwen3-0.6b-int4-cuda-postfix`) continued with `Paris` and
+  `Rome`.
 - DeepSeek-Coder emitted a readable list of national capitals.
 - DeepSeek-R1 was repetitive and its packaged template emitted `C iter`, but
   the continuation remained readable rather than numerically corrupted.
