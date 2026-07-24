@@ -41,46 +41,37 @@
 //! unpinned worker group -- it still replaces the per-op Rayon barrier with the
 //! lightweight one, and stays correct.
 //!
-//! # Default-on with opt-out (rule 5)
+//! # Opt-in only (rule 5)
 //!
-//! The pool is the **default** decode path: when `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL`
-//! is unset it auto-enables, `=0` opts out (the flat Rayon + auto-`compact` legacy
-//! path), and `=1` forces it on even on hosts the auto policy would decline. The
-//! one-time activation is logged. Auto-enable is conservative: it only fires when
-//! the host is large enough that a spinning worker set is safe (>= 4 logical CPUs,
-//! see [`AUTO_MIN_LOGICAL_CPUS`]) **and** the host is not already loaded (the
-//! 1-minute load average per allowed CPU is below [`MAX_LOAD_PER_CPU_FOR_AUTO`],
-//! see [`current_contention`] / [`should_auto_enable`]); tiny or loaded hosts
-//! fall back to the flat path, and a
-//! `THREADS=0` opt-out still leaves the decode path unchanged. The unset worker
-//! count is [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`]
-//! (about half the logical CPUs), not the flat pool's eight-worker ceiling, so the
-//! out-of-box path actually scales.
+//! The pool is **opt-in**: `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` enables it,
+//! and any other value (including unset, the default) leaves decode on the flat
+//! Rayon path. It was previously the auto-enabled default, but a native-vs-ORT
+//! scoreboard (Qwen3-0.6B, commit f5c6753) and back-to-back A/B runs measured it
+//! a large, structural decode *regression* against the flat path across the whole
+//! realistic load range on a shared 2-socket host: the flat Rayon path degrades
+//! gracefully under co-tenant load, while this busy-wait barrier's spinning
+//! workers and non-participating dispatcher do not (e.g. 34.0 vs 13.9 tok/s at
+//! 1-min load 14.9 on a 96-CPU box; same regression even at equal 8-worker
+//! counts, so it is the dispatch mechanism, not oversubscription). It never beat
+//! the flat path here even in the original design's own numbers (28.7 vs
+//! 32--44 tok/s), so it no longer auto-enables. Operators on a dedicated,
+//! single-tenant host opt in with `=1` (its per-node pinning still applies); the
+//! one-time activation is logged. The forced worker count is
+//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (about
+//! half the logical CPUs); a `THREADS=0` opt-out leaves the decode path unchanged.
 //!
-//! # Precedence vs the affinity control (`ONNX_GENAI_CPU_DECODE_AFFINITY`)
+//! # Precedence when forced (`=1`) vs the affinity control
 //!
-//! The decode strategy is chosen by this precedence, highest first:
+//! When the pool is forced on (`=1`), the decode strategy precedence is, highest
+//! first:
 //!
 //! 1. **`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`** -- the explicit multi-node
 //!    split wins when its two-level layout can be built (the mutually-exclusive
-//!    selection is reported once when the persistent pool was *forced*).
-//! 2. **An explicit non-`numa-split` affinity request in Auto mode** -- when the
-//!    persistence mode is Auto (the default, `PERSISTENT_POOL` unset) *and* the
-//!    user explicitly set `ONNX_GENAI_CPU_DECODE_AFFINITY` to `off`, `compact`,
-//!    `node:<n>`, or a malformed value, the persistent default **defers to the
-//!    flat path** so [`crate::decode_affinity::plan_decode_affinity`] honors and
-//!    validates the request exactly as before (`off` = unpinned, `compact`,
-//!    `node:<n>`, and malformed values still error). An explicit affinity request
-//!    thus opts the user out of the SPMD default (see [`auto_defers_to_flat`]).
-//!    `=1` (Forced) overrides this: the persistent pool wins regardless of the
-//!    affinity env (its own per-node pinning applies).
-//! 3. **Persistent SPMD default** -- with no affinity env set (the true
-//!    out-of-box case), or when `=1` forces it, the persistent pool is used.
-//! 4. **Flat Rayon + auto-`compact`** legacy path -- `=0` (Off), a `THREADS=0`
-//!    opt-out, or a host that fails the auto-enable gate.
-//!
-//! The mutually-exclusive selection between `numa-split` and a *forced*
-//! persistent pool is reported once.
+//!    selection vs the forced persistent pool is reported once).
+//! 2. **Forced persistent SPMD** (`=1`) -- its own per-node pinning applies.
+//! 3. **Flat Rayon + auto-`compact`** legacy path -- the default (unset/Auto) and
+//!    `=0` (Off), which also honors any explicit `ONNX_GENAI_CPU_DECODE_AFFINITY`
+//!    via [`crate::decode_affinity::plan_decode_affinity`] as before.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -90,33 +81,16 @@ use std::thread::{self, JoinHandle};
 use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len;
 
-/// Environment switch for the persistent SPMD decode pool. **Default-on**: unset
-/// auto-enables (subject to the safe-host gate), `0` opts out (flat legacy path),
-/// and `1` forces it on regardless of the auto gate (rule 5).
+/// Environment switch for the persistent SPMD decode pool. **Opt-in**: unset (or
+/// any value other than `1`) uses the flat decode path, and `1` enables the
+/// persistent pool. The pool was previously default-on, but a native-vs-ORT
+/// scoreboard (Qwen3-0.6B, commit f5c6753) measured it a large *regression* on
+/// this shared 2-socket host -- 13.3 tok/s pool-on vs 37.5 tok/s pool-off -- and
+/// back-to-back A/B runs showed the flat path winning across the whole realistic
+/// load range (e.g. 34.0 vs 13.9 tok/s at 1-min load 14.9 on a 96-CPU box), so
+/// the pool no longer auto-enables. Operators on a dedicated, single-tenant host
+/// can still opt in with `=1`. See `.squad/decisions.md` (2026-07-24, Voight).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
-
-/// Minimum logical CPU count for the persistent pool to *auto*-enable when
-/// `PERSISTENT_POOL_ENV` is unset. Below this, an auto-enabled spinning worker
-/// set risks starving the dispatcher on a tiny host, so decode stays on the flat
-/// legacy path. An explicit `=1` bypasses this gate. Derived from topology, not a
-/// model/vendor constant (rule 2).
-const AUTO_MIN_LOGICAL_CPUS: usize = 4;
-
-/// Contention ceiling for the *auto* path: when the 1-minute load average divided
-/// by the number of CPUs the process may run on exceeds this, the Auto default
-/// declines the spinning persistent pool and stays on the flat decode path.
-///
-/// The pool auto-sizes to about half the allowed CPUs as workers that HARD-SPIN
-/// on a per-op barrier before parking. That is a large win on a dedicated/idle
-/// host (workers stay hot, catch back-to-back ops in microseconds), but on a
-/// loaded/oversubscribed host every per-op barrier must wait for the OS to
-/// schedule every spinning worker, so the slowest-scheduled worker gates each of
-/// the ~141 ops/token and per-token latency explodes. At `load_per_cpu > 0.7`
-/// fewer than ~30% of the allowed cores are idle, so a half-the-cores spinning
-/// set cannot run without oversubscription -- decline and let the flat/bounded
-/// path (measured 32-44 tok/s here vs ~1.4 tok/s spinning) handle decode. The
-/// threshold is a heuristic; `=1` (Forced) bypasses it for dedicated-box opt-in.
-const MAX_LOAD_PER_CPU_FOR_AUTO: f64 = 0.7;
 
 /// Spin iterations a worker or the dispatcher busy-waits before yielding /
 /// parking. Sized so back-to-back decode projections (microseconds apart) are
@@ -763,15 +737,17 @@ fn default_threads() -> Option<usize> {
 pub(crate) enum PersistenceMode {
     /// `=0`: explicit opt-out; the decode path stays on the flat legacy pool.
     Off,
-    /// Unset (or an unrecognized value): default-on, subject to the safe-host gate.
+    /// Unset (or an unrecognized value): the default. The pool is opt-in, so this
+    /// leaves decode on the flat path (same effective path as `Off`).
     Auto,
-    /// `=1`: forced on, bypassing the safe-host gate (operator override).
+    /// `=1`: opt in to the persistent pool (operator override for dedicated hosts).
     Forced,
 }
 
 /// Parse the persistence mode from the raw env value (`None` = unset). Only the
-/// exact string `0` opts out and only `1` forces; unset or any other value is
-/// treated as the default-on `Auto` so the pool is on out of the box (rule 5).
+/// exact string `1` opts in to the persistent pool; `0` is the explicit opt-out
+/// and unset or any other value maps to `Auto`, which uses the flat path by
+/// default (the pool is opt-in).
 pub(crate) fn persistence_mode_from_raw(raw: Option<&str>) -> PersistenceMode {
     match raw.map(str::trim) {
         Some("0") => PersistenceMode::Off,
@@ -784,157 +760,39 @@ fn persistence_mode() -> PersistenceMode {
     persistence_mode_from_raw(std::env::var(PERSISTENT_POOL_ENV).ok().as_deref())
 }
 
-/// Whether an explicit affinity request should defer the Auto default to the flat
-/// decode path (single source of truth for Fix (Chew #1)).
-///
-/// Returns `true` only when the persistence mode is **Auto** (the default,
-/// `PERSISTENT_POOL` unset) *and* the user has explicitly set
-/// `ONNX_GENAI_CPU_DECODE_AFFINITY` to a non-`numa-split` value
-/// (`off`/`compact`/`node:<n>`/anything malformed). In that case the user is
-/// asking the flat path's [`crate::decode_affinity::plan_decode_affinity`] to
-/// honor/validate the request, so the persistent SPMD default steps aside.
-///
-/// It returns `false` for `numa-split` (which keeps its own higher precedence),
-/// an unset or empty value (the true out-of-box case that keeps the SPMD
-/// default), and for Off/Forced modes (Forced explicitly demanded the pool, so an
-/// affinity request does not opt it out).
-pub(crate) fn auto_defers_to_flat(mode: PersistenceMode, affinity_raw: Option<&str>) -> bool {
-    if !matches!(mode, PersistenceMode::Auto) {
-        return false;
-    }
-    match affinity_raw.map(str::trim) {
-        None | Some("") => false,
-        Some("numa-split") => false,
-        Some(_) => true,
-    }
+/// Whether a persistence mode builds the persistent SPMD pool. Opt-in only: only
+/// `Forced` (`=1`) enables it; `Auto` (the unset default) and `Off` (`=0`) both
+/// use the flat decode path. Pure so the gating is unit-tested without env races.
+fn pool_mode_enables(mode: PersistenceMode) -> bool {
+    matches!(mode, PersistenceMode::Forced)
 }
 
-/// Whether the persistent pool was **explicitly forced** on (`PERSISTENT_POOL=1`).
+/// Whether the persistent pool was **explicitly opted into** (`PERSISTENT_POOL=1`).
 /// Used to keep the `numa-split` mutual-exclusion diagnostic scoped to users who
-/// actually asked for the persistent pool, not the Auto default (Gaff cleanup #2).
+/// actually asked for the persistent pool, and to make dense-f32 decode still
+/// eligible for the pool when forced.
 pub(crate) fn is_forced() -> bool {
     matches!(persistence_mode(), PersistenceMode::Forced)
 }
 
-/// Whether the host is large enough to *auto*-enable the spinning worker set.
-fn auto_enable_suitable(available: usize) -> bool {
-    available >= AUTO_MIN_LOGICAL_CPUS
-}
-
-/// The 1-minute load average, or `None` when it cannot be read on this platform.
-///
-/// Linux reads `/proc/loadavg` directly (no syscall/dep needed); other Unix
-/// platforms use `libc::getloadavg`; Windows (which has no portable load-average
-/// equivalent) and any other target return `None`, so the caller falls back to
-/// the load-agnostic default rather than guessing.
-fn loadavg_one() -> Option<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        linux_loadavg_one()
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        unix_getloadavg_one()
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_loadavg_one() -> Option<f64> {
-    // /proc/loadavg is "load1 load5 load15 running/total lastpid"; take load1.
-    let contents = std::fs::read_to_string("/proc/loadavg").ok()?;
-    let load: f64 = contents.split_whitespace().next()?.parse().ok()?;
-    (load.is_finite() && load >= 0.0).then_some(load)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn unix_getloadavg_one() -> Option<f64> {
-    let mut loads = [0.0f64; 3];
-    // SAFETY: getloadavg writes up to `nelem` doubles into the provided buffer
-    // and returns the number written (or -1). We pass a 3-element buffer.
-    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), loads.len() as libc::c_int) };
-    if n >= 1 && loads[0].is_finite() && loads[0] >= 0.0 {
-        Some(loads[0])
-    } else {
-        None
-    }
-}
-
-/// The system's recent contention as the 1-minute load average divided by the
-/// CPU count the process may run on (`allowed_cpus`). `None` when the load
-/// average is unavailable (e.g. Windows) so the auto path keeps prior behavior.
-///
-/// Using the *allowed* CPU count (the cpuset/taskset restriction) as the divisor
-/// is deliberately conservative: a system-wide load average over a restricted
-/// core budget reports higher contention, biasing the auto path toward declining
-/// the spinning pool exactly when the process has few cores to itself.
-fn current_contention(allowed_cpus: usize) -> Option<f64> {
-    if allowed_cpus == 0 {
-        return None;
-    }
-    loadavg_one().map(|load| load / allowed_cpus as f64)
-}
-
-/// The CPU count used as the contention divisor and tiny-host gate input: the
-/// process's allowed (cpuset/taskset) CPUs when known, else the logical CPU
-/// count. Never zero (falls back to 1) so downstream division is safe.
-fn contention_cpu_budget() -> usize {
-    crate::decode_affinity::allowed_cpus()
-        .map(|c| c.len())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(crate::kernels::matmul_nbits::available_parallelism_public)
-        .max(1)
-}
-
-/// Pure auto-enable decision (unit-tested). The persistent spinning pool
-/// auto-enables only when the host is large enough (`>= AUTO_MIN_LOGICAL_CPUS`)
-/// **and** contention is either unknown or below `max_load_per_cpu`:
-///
-/// * tiny host (`< AUTO_MIN_LOGICAL_CPUS`) -> `false` (decline);
-/// * `contention == None` (unknown, e.g. Windows) -> enable (prior behavior);
-/// * `contention > max_load_per_cpu` (loaded box) -> `false` (decline);
-/// * `contention <= max_load_per_cpu` (idle/light box) -> enable.
-///
-/// Forced (`=1`) never calls this: it bypasses the auto gate entirely.
-fn should_auto_enable(
-    available_cpus: usize,
-    contention: Option<f64>,
-    max_load_per_cpu: f64,
-) -> bool {
-    if !auto_enable_suitable(available_cpus) {
-        return false;
-    }
-    !matches!(contention, Some(load_per_cpu) if load_per_cpu > max_load_per_cpu)
-}
-
-/// Build the persistent SPMD layout unless it is opted out (`=0`), the worker
-/// count is unavailable (`THREADS=0`), or the safe auto-enable gate declines on a
-/// tiny host. Otherwise `Some(layout)` (the decode path uses the persistent pool).
+/// Build the persistent SPMD layout only when explicitly opted in
+/// (`PERSISTENT_POOL=1`); otherwise (unset/`=0`, or `THREADS=0`) return `None` so
+/// decode uses the flat path. See [`build_from_env`] for the rationale.
 ///
 /// Two or more usable NUMA nodes yield the two-level node-pinned layout; a
 /// single-node host, a non-NUMA machine, or a platform without pinning yields a
 /// single unpinned worker group (still the lightweight barrier, still correct).
 pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
-    let mode = persistence_mode();
-    if matches!(mode, PersistenceMode::Off) {
-        return None;
-    }
-    // Fix (Chew #1): an explicit non-`numa-split` affinity request opts the Auto
-    // default out of the persistent pool and defers to the flat path, so
-    // `plan_decode_affinity` honors and validates it exactly as before (an
-    // explicit `off`/`compact`/`node:<n>`/malformed value must not be silently
-    // ignored). `numa-split` keeps its own higher precedence, and `=1` (Forced)
-    // overrides this defer entirely.
-    if auto_defers_to_flat(
-        mode,
-        std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
-            .ok()
-            .as_deref(),
-    ) {
-        report_affinity_defer();
+    // Opt-in only: the persistent pool is built solely when explicitly forced
+    // (`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`). Unset (Auto) and `=0` (Off)
+    // both leave decode on the flat Rayon path. The spinning pool was previously
+    // the Auto default, but it measured a large, structural decode regression
+    // against the flat path across the whole realistic load range on this class
+    // of shared 2-socket host (the flat path degrades gracefully under co-tenant
+    // load; the busy-wait barrier does not), so it no longer auto-enables. See
+    // `PERSISTENT_POOL_ENV`. Operators on a dedicated single-tenant box opt in
+    // with `=1`, which still honors its own per-node pinning below.
+    if !pool_mode_enables(persistence_mode()) {
         return None;
     }
     let Some(total) = threads else {
@@ -947,40 +805,7 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     if total == 0 {
         return None;
     }
-    // Safe auto-enable gate (rule 2 conservatism): decline the spinning pool on a
-    // tiny host (dispatcher starvation) OR on a loaded/oversubscribed host (every
-    // per-op barrier would wait for the OS to reschedule all spinning workers,
-    // exploding per-token latency). Both stay on the flat legacy path. An explicit
-    // `=1` (Forced) bypasses this entire gate.
-    if matches!(mode, PersistenceMode::Auto) {
-        let available = crate::kernels::matmul_nbits::available_parallelism_public();
-        let budget = contention_cpu_budget();
-        let contention = current_contention(budget);
-        if !should_auto_enable(available, contention, MAX_LOAD_PER_CPU_FOR_AUTO) {
-            if !auto_enable_suitable(available) {
-                report_spmd_fallback(
-                    "persistent SPMD decode pool auto-enable declined: fewer than 4 logical \
-                     CPUs, where a spinning worker set risks starving the dispatcher -- staying \
-                     on the flat decode path. Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to \
-                     force it on",
-                );
-            } else {
-                report_spmd_fallback(&format!(
-                    "persistent SPMD decode pool auto-enable declined: 1-minute load average \
-                     per allowed CPU is {:.2} (> {:.2} threshold) across {budget} allowed CPUs; \
-                     a spinning worker set would oversubscribe this loaded host and gate every \
-                     per-op barrier -- staying on the flat decode path. Set \
-                     ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to force it on",
-                    contention.unwrap_or_default(),
-                    MAX_LOAD_PER_CPU_FOR_AUTO,
-                ));
-            }
-            return None;
-        }
-    }
-    if matches!(mode, PersistenceMode::Auto) {
-        report_default_on();
-    }
+    report_pool_forced();
     let shards = node_shards(total);
     Some(SpmdDecodePools::build(&shards))
 }
@@ -1014,28 +839,16 @@ fn report_spmd_fallback(message: &str) {
     }
 }
 
-/// Announce once (rule 5) that the persistent SPMD pool is active by default, so
-/// the behavior is inspectable and the opt-out is discoverable.
-fn report_default_on() {
+/// Announce once that the persistent SPMD pool was explicitly opted into
+/// (`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`), so the non-default decode path is
+/// inspectable.
+fn report_pool_forced() {
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
         eprintln!(
-            "onnx-genai: persistent SPMD decode pool active by default; set \
-             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0 to opt out"
-        );
-    }
-}
-
-/// Announce once (rule 5) that an explicit affinity request deferred the Auto
-/// default to the flat decode path, so the routing change is inspectable.
-fn report_affinity_defer() {
-    static REPORTED: OnceLock<()> = OnceLock::new();
-    if REPORTED.set(()).is_ok() {
-        eprintln!(
-            "onnx-genai: persistent SPMD decode pool: an explicit \
-             ONNX_GENAI_CPU_DECODE_AFFINITY request was set, so the default-on pool defers to \
-             the flat decode path which honors that affinity control. Set \
-             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 to force the persistent pool regardless"
+            "onnx-genai: persistent SPMD decode pool enabled via \
+             ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 (opt-in; the default decode path is the \
+             flat pool, which is faster on shared/loaded hosts)"
         );
     }
 }
@@ -1278,10 +1091,10 @@ mod tests {
     }
 
     #[test]
-    fn persistence_mode_defaults_on_and_only_zero_opts_out() {
-        // Default-on semantics (rule 5): unset -> Auto (on), `0` -> Off, `1` ->
-        // Forced. Whitespace is trimmed, and any unrecognized value is treated as
-        // the default-on Auto rather than silently disabling.
+    fn persistence_mode_parses_env_values() {
+        // Mode parsing (the pool is opt-in): unset -> Auto (flat path), `0` -> Off
+        // (flat path), `1` -> Forced (pool). Whitespace is trimmed, and any
+        // unrecognized value maps to Auto rather than surprising the user.
         assert_eq!(persistence_mode_from_raw(None), PersistenceMode::Auto);
         assert_eq!(persistence_mode_from_raw(Some("")), PersistenceMode::Auto);
         assert_eq!(
@@ -1298,105 +1111,35 @@ mod tests {
             persistence_mode_from_raw(Some(" 1 ")),
             PersistenceMode::Forced
         );
-        // Unknown values stay on (Auto), never a surprise silent opt-out.
+        // Unknown values map to Auto (flat path), never a surprise pool activation.
         assert_eq!(
             persistence_mode_from_raw(Some("true")),
             PersistenceMode::Auto
         );
         assert_eq!(persistence_mode_from_raw(Some("2")), PersistenceMode::Auto);
 
-        // Only `Off` disables the pool for callers checking mode-based gates.
-        assert!(!matches!(
-            persistence_mode_from_raw(Some("0")),
-            PersistenceMode::Auto | PersistenceMode::Forced
-        ));
-        assert!(matches!(
-            persistence_mode_from_raw(None),
-            PersistenceMode::Auto | PersistenceMode::Forced
-        ));
+        // Only `Forced` (`=1`) enables the pool; Auto and Off both use the flat path.
+        assert!(pool_mode_enables(persistence_mode_from_raw(Some("1"))));
+        assert!(!pool_mode_enables(persistence_mode_from_raw(None)));
+        assert!(!pool_mode_enables(persistence_mode_from_raw(Some("0"))));
     }
 
     #[test]
-    fn auto_enable_gate_declines_only_on_tiny_hosts() {
-        // Safe auto-enable (rule 2 conservatism): decline below the CPU floor so a
-        // spinning pool never starves the dispatcher on a tiny host; enable at and
-        // above it, where the persistent pool degrades gracefully.
-        assert!(!auto_enable_suitable(1));
-        assert!(!auto_enable_suitable(2));
-        assert!(!auto_enable_suitable(AUTO_MIN_LOGICAL_CPUS - 1));
-        assert!(auto_enable_suitable(AUTO_MIN_LOGICAL_CPUS));
-        assert!(auto_enable_suitable(8));
-        assert!(auto_enable_suitable(96));
-    }
+    fn only_forced_mode_enables_the_persistent_pool() {
+        // Regression guard for the pool-on decode regression (Voight,
+        // 2026-07-24): the persistent SPMD pool is opt-in. The default (unset ->
+        // Auto) and the explicit opt-out (`=0` -> Off) must both leave decode on
+        // the flat path so the default config is never the slow spinning pool;
+        // only `=1` (Forced) enables it. This is what makes "pool-ON (default) is
+        // never slower than pool-OFF" structurally true -- they are the same path.
+        assert!(!pool_mode_enables(PersistenceMode::Auto));
+        assert!(!pool_mode_enables(PersistenceMode::Off));
+        assert!(pool_mode_enables(PersistenceMode::Forced));
 
-    #[test]
-    fn should_auto_enable_gates_on_host_size_and_contention() {
-        let thr = MAX_LOAD_PER_CPU_FOR_AUTO;
-
-        // Idle / lightly loaded large box -> enable.
-        assert!(should_auto_enable(8, Some(0.0), thr));
-        assert!(should_auto_enable(48, Some(0.1), thr));
-        assert!(should_auto_enable(8, Some(thr), thr)); // exactly at threshold stays on
-
-        // Loaded / oversubscribed box -> decline (this is the reproduced disaster).
-        assert!(!should_auto_enable(48, Some(0.83), thr)); // load 40 / 48 allowed
-        assert!(!should_auto_enable(32, Some(1.25), thr)); // load 40 / 32 allowed
-        assert!(!should_auto_enable(8, Some(thr + 0.01), thr));
-
-        // Unknown contention (e.g. Windows / unreadable loadavg) -> keep prior
-        // behavior and enable on a suitable host.
-        assert!(should_auto_enable(8, None, thr));
-        assert!(should_auto_enable(48, None, thr));
-
-        // Tiny host -> decline regardless of contention (even idle).
-        assert!(!should_auto_enable(1, Some(0.0), thr));
-        assert!(!should_auto_enable(AUTO_MIN_LOGICAL_CPUS - 1, None, thr));
-        assert!(!should_auto_enable(2, Some(0.0), thr));
-    }
-
-    #[test]
-    fn current_contention_is_loadavg_over_allowed_cpus() {
-        // Divisor is the allowed CPU budget; zero budget is unknown (None) so we
-        // never divide by zero.
-        assert_eq!(current_contention(0), None);
-        // When a load average is available, it scales inversely with the budget:
-        // the same system load over fewer allowed CPUs reports more contention.
-        if let (Some(wide), Some(narrow)) = (current_contention(64), current_contention(4)) {
-            assert!(wide >= 0.0 && narrow >= 0.0);
-            assert!(
-                narrow >= wide,
-                "fewer allowed CPUs must not lower contention"
-            );
-        }
-    }
-
-    #[test]
-    fn auto_defers_to_flat_only_for_explicit_non_numa_affinity_in_auto_mode() {
-        use PersistenceMode::{Auto, Forced, Off};
-
-        // Auto default (PERSISTENT_POOL unset) + an explicit non-numa-split
-        // affinity request defers to the flat path so plan_decode_affinity honors
-        // it (Chew #1). `off`, `compact`, `node:<n>`, and malformed all defer.
-        assert!(auto_defers_to_flat(Auto, Some("off")));
-        assert!(auto_defers_to_flat(Auto, Some("compact")));
-        assert!(auto_defers_to_flat(Auto, Some("node:0")));
-        assert!(auto_defers_to_flat(Auto, Some(" node:3 ")));
-        assert!(auto_defers_to_flat(Auto, Some("bogus-mode")));
-
-        // The true out-of-box case (no affinity env, or an empty/whitespace value)
-        // keeps the SPMD default -- it must NOT defer.
-        assert!(!auto_defers_to_flat(Auto, None));
-        assert!(!auto_defers_to_flat(Auto, Some("")));
-        assert!(!auto_defers_to_flat(Auto, Some("   ")));
-
-        // numa-split keeps its own higher precedence, so it does not "defer" here.
-        assert!(!auto_defers_to_flat(Auto, Some("numa-split")));
-        assert!(!auto_defers_to_flat(Auto, Some(" numa-split ")));
-
-        // Forced (`=1`) explicitly demanded the persistent pool, so an affinity
-        // request never opts it out; Off already returns early upstream.
-        assert!(!auto_defers_to_flat(Forced, Some("off")));
-        assert!(!auto_defers_to_flat(Forced, Some("compact")));
-        assert!(!auto_defers_to_flat(Off, Some("off")));
+        // The default env value (unset) maps to Auto, i.e. the flat path.
+        assert!(!pool_mode_enables(persistence_mode_from_raw(None)));
+        assert!(!pool_mode_enables(persistence_mode_from_raw(Some("0"))));
+        assert!(!pool_mode_enables(persistence_mode_from_raw(Some("2"))));
+        assert!(pool_mode_enables(persistence_mode_from_raw(Some("1"))));
     }
 }

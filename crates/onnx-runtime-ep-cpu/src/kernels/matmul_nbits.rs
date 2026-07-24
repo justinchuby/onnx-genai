@@ -1341,13 +1341,6 @@ fn available_parallelism() -> usize {
         .unwrap_or(1)
 }
 
-/// The host's logical CPU count, exposed so the persistent SPMD pool can apply
-/// its safe auto-enable gate ([`crate::decode_spmd`]) without duplicating the
-/// `available_parallelism` fallback logic.
-pub fn available_parallelism_public() -> usize {
-    available_parallelism()
-}
-
 /// Choose a bounded decode pool from the host's logical CPU count.
 ///
 /// Decode projections are small and bandwidth-bound, so worker demand grows
@@ -1818,15 +1811,12 @@ pub fn with_decode_pool_scope<R: Send>(
     if !spmd_pool_eligible {
         return with_dense_decode_pool_scope(f);
     }
-    // The persistent SPMD pool is default-on (opt out with
-    // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0`). Precedence: explicit numa-split
-    // env > (Auto default, unless an explicit non-numa-split affinity defers it to
-    // the flat path -- see `decode_spmd::auto_defers_to_flat`) persistent SPMD >
-    // flat + auto-compact. The "mutually exclusive" diagnostic below is scoped to
-    // users who *explicitly* forced the persistent pool (`PERSISTENT_POOL=1`);
-    // under the Auto default the user never asked for it, and an explicit
-    // non-numa-split affinity already defers the pool anyway, so logging a
-    // conflict there would be noise.
+    // The persistent SPMD pool is opt-in (`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`;
+    // unset/`=0` use the flat path). Precedence when forced: explicit numa-split
+    // env > forced persistent SPMD > flat + auto-compact. The "mutually exclusive"
+    // diagnostic below is scoped to users who *explicitly* forced the persistent
+    // pool (`PERSISTENT_POOL=1`); the default never builds it, so there is no
+    // conflict to log there.
     let both_requested = crate::decode_spmd::is_forced()
         && std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
             .is_ok_and(|value| value.trim() == "numa-split");
@@ -5987,8 +5977,8 @@ mod tests {
         if persistent {
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
         } else {
-            // Default-on: the OFF child must explicitly opt out (`=0`) to exercise
-            // the flat legacy path; simply unsetting the var now auto-enables.
+            // Opt-in pool: the OFF child sets `=0` (unset would be flat too) to
+            // exercise the flat legacy path against the forced-pool ON child.
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "0");
         }
         let output = command.output().expect("run SPMD parity child process");
@@ -6260,8 +6250,8 @@ mod tests {
         if forced {
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
         } else {
-            // Auto: the persistence env must be unset so the default-on Auto mode
-            // is what routes (or defers), not an explicit `=0`/`=1`.
+            // Auto: the persistence env is unset so the default (opt-in disabled)
+            // path routes to the flat pool, not an explicit `=0`/`=1`.
             command.env_remove(crate::decode_spmd::PERSISTENT_POOL_ENV);
         }
         let output = command.output().expect("run affinity-defer child process");
