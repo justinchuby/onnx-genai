@@ -3289,3 +3289,8 @@ Worktree left pristine (no scratch files).
 **By:** Ripley, with Lambert review
 **What:** Filed upstream issue `microsoft/onnxruntime#29853` documenting the MLAS AVX2 M=1 asymmetric CompInt8 SQNBit correctness defect.
 **Why:** The PR #105 production guard prevents affected non-AVX-512 hosts from using the broken route; the upstream report tracks the MLAS fix.
+
+### 2026-07-24: ARM cross-platform dead-code fix (green CI on macOS/Windows arm64)
+**By:** Hasford (impl), Kano (review 🟢)
+**What:** PR #105 CI failed only on Rust (macOS arm64) + (Windows ARM64) "cross-platform offline crates" with `-D warnings` dead-code errors: `native_available` (bf16_gemm.rs) and `dot_u8_i16_scalar` (matmul_nbits.rs) unused on non-x86 in lib builds. Fix: `#[cfg_attr(not(target_arch="x86_64"), allow(dead_code))]` on the non-x86 bf16 native_available stub (used only by portable tests; lib callers are x86-gated); `#[cfg(target_arch="x86_64")]` on dot_u8_i16_scalar (only called from x86 SIMD-tail handling) and gated the single x86-specific assert in test dot_u8_i16_matches_serial_reference while keeping the portable block_dot_u8_i16 assertion on all arches.
+**Why:** User requires cross-OS/cross-CPU support. cfg-hygiene bugs, not functional gaps — ARM runtime paths already fall back to portable inline scalar. Verified by reproducing the aarch64 failure (both errors, exit 101) then confirming clean aarch64 lib+tests; x86 884/0, both clippy gates + fmt clean. Cherry-picked d3e7ed80→perf/cpu-ep-mlas.

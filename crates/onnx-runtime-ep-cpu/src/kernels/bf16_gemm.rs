@@ -43,6 +43,8 @@ pub(crate) fn native_available() -> bool {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
+// Portable tests call this stub, while all non-test library callers are x86_64-gated.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 pub(crate) fn native_available() -> bool {
     false

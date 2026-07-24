@@ -2938,6 +2938,7 @@ fn horizontal_sum_f32_512(value: std::arch::x86_64::__m512) -> f32 {
 /// A block is at most `block_size` (<= a few hundred) elements with weights in
 /// `0..=255` and activations in `-32767..=32767`, so the widest partial sum
 /// (`block_size * 255 * 32767`) stays well inside `i32`.
+#[cfg(target_arch = "x86_64")]
 fn dot_u8_i16_scalar(weight: &[u8], activation: &[i16]) -> i32 {
     debug_assert_eq!(weight.len(), activation.len());
     weight
@@ -4266,9 +4267,8 @@ mod tests {
         }
     }
 
-    /// `dot_u8_i16_scalar` (the exact `i32` reduction backing the grouped block
-    /// dot's remainder) and the SIMD grouped `block_dot_u8_i16` must both agree
-    /// with an independent reference, including a non-multiple-of-16 tail.
+    /// The grouped `block_dot_u8_i16` and, on x86_64, its scalar SIMD-tail helper
+    /// must agree with an independent reference, including a non-multiple-of-16 tail.
     #[test]
     fn dot_u8_i16_matches_serial_reference() {
         for len in [0usize, 1, 7, 15, 16, 17, 31, 128, 130] {
@@ -4281,6 +4281,7 @@ mod tests {
                 .zip(&activation)
                 .map(|(&w, &a)| w as i32 * a as i32)
                 .sum();
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(
                 dot_u8_i16_scalar(&weight, &activation),
                 expected,
