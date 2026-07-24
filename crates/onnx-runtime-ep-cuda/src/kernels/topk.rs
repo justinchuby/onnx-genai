@@ -1,9 +1,9 @@
 //! Deterministic f32 `TopK`, optimized for small router K values.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
@@ -72,6 +72,7 @@ impl KernelFactory for TopKFactory {
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1),
             largest: bool_attr("largest", true)?,
             _sorted: bool_attr("sorted", true)?,
+            warmed_signature: Mutex::new(None),
         }))
     }
 }
@@ -81,6 +82,16 @@ struct TopKKernel {
     axis: i64,
     largest: bool,
     _sorted: bool,
+    warmed_signature: Mutex<Option<TopKCaptureSignature>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TopKCaptureSignature {
+    input_shape: Vec<usize>,
+    values_shape: Vec<usize>,
+    indices_shape: Vec<usize>,
+    k_ptr: CUdeviceptr,
+    k: usize,
 }
 
 impl Kernel for TopKKernel {
@@ -122,14 +133,32 @@ impl Kernel for TopKKernel {
                 "cuda_ep TopK: axis out of range".into(),
             ));
         }
-        let mut bytes = [0_u8; 8];
-        unsafe {
-            self.runtime.dtoh(
-                &mut bytes,
-                cuptr(k_input.data_ptr::<i64>() as *const c_void),
-            )?
+        let capturing = self.runtime.is_capturing()?;
+        let k_ptr = cuptr(k_input.data_ptr::<i64>() as *const c_void);
+        let mut warmed = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep TopK: capture signature lock was poisoned".into())
+        })?;
+        let raw_k = if capturing {
+            let signature = warmed.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep TopK: K must be warmed before CUDA graph capture".into(),
+                )
+            })?;
+            if signature.input_shape != input.shape
+                || signature.values_shape != outputs[0].shape
+                || signature.indices_shape != outputs[1].shape
+                || signature.k_ptr != k_ptr
+            {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep TopK: shape or K input changed during CUDA graph capture; warm the exact signature first".into(),
+                ));
+            }
+            signature.k as i64
+        } else {
+            let mut bytes = [0_u8; 8];
+            unsafe { self.runtime.dtoh(&mut bytes, k_ptr)? };
+            i64::from_ne_bytes(bytes)
         };
-        let raw_k = i64::from_ne_bytes(bytes);
         if raw_k < 0 {
             return Err(EpError::KernelFailed(
                 "cuda_ep TopK: K must be non-negative".into(),
@@ -151,6 +180,15 @@ impl Kernel for TopKKernel {
             ));
         }
         if k == 0 {
+            if !capturing {
+                *warmed = Some(TopKCaptureSignature {
+                    input_shape: input.shape.to_vec(),
+                    values_shape: outputs[0].shape.to_vec(),
+                    indices_shape: outputs[1].shape.to_vec(),
+                    k_ptr,
+                    k,
+                });
+            }
             return Ok(());
         }
         let inner = input.shape[axis + 1..].iter().product::<usize>();
@@ -163,7 +201,7 @@ impl Kernel for TopKKernel {
         let slices = slices as u64;
         let width = width as u64;
         let inner = inner as u64;
-        let k = k as u64;
+        let k_u64 = k as u64;
         let largest = i32::from(self.largest);
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder
@@ -173,7 +211,7 @@ impl Kernel for TopKKernel {
             .arg(&slices)
             .arg(&width)
             .arg(&inner)
-            .arg(&k)
+            .arg(&k_u64)
             .arg(&largest);
         unsafe {
             builder.launch(LaunchConfig {
@@ -187,15 +225,31 @@ impl Kernel for TopKKernel {
             })
         }
         .map_err(|e| driver_err("launch TopK", e))?;
-        self.runtime.synchronize()
+        if !capturing {
+            *warmed = Some(TopKCaptureSignature {
+                input_shape: input.shape.to_vec(),
+                values_shape: outputs[0].shape.to_vec(),
+                indices_shape: outputs[1].shape.to_vec(),
+                k_ptr,
+                k,
+            });
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "TopK reads K D2H and performs a trailing host stream synchronization",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "TopK requires an eager warmup to fold its scalar K input before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "TopK capture signature lock was poisoned",
+            ),
+        }
     }
 }

@@ -268,7 +268,10 @@ impl SoftmaxKernel {
                     },
                 )
             })?;
-            return self.runtime.synchronize();
+            if !self.runtime.is_capturing()? {
+                self.runtime.synchronize()?;
+            }
+            return Ok(());
         }
 
         if x.dtype != DataType::Float32 {
@@ -320,7 +323,10 @@ impl SoftmaxKernel {
         // int, int, int) argument list matches its signature; `x_ptr`/`y_ptr` are
         // live device allocations of `outer·axis_dim·inner` f32 elements.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch softmax_f32", e))?;
-        self.runtime.synchronize()
+        if !self.runtime.is_capturing()? {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
 }
 
