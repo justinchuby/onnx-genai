@@ -111,3 +111,7 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 - Root-cause correction: the DeepSeek MLA garbage decode was not RoPE/attention math; it was `CudaRuntime::dtod` copying on the legacy default stream before EP non-blocking-stream producers finished.
 - Durable lesson: when a CUDA copy bridges graph movement (`copy_reshape`) and EP kernels, verify stream ordering before localizing numerical bugs to model-specific kernels.
 - 2026-07-24: Shipped DeepSeek MLA correctness work: async `copy_reshape` merged as `24531c4`, KV-aliasing RAW race fixed as `621936f`, and capture-enablement plan opened for `perf/deepseek-mla-capture-enable`.
+
+## 2025-06-14T00:00:00Z — DeepSeek MLA fixed-capacity merge and capture follow-up
+- `53afab0` merged fixed-capacity KV bindings and fixed-slot default-domain Attention append, yielding roughly 3–6% eager MLA decode improvement while preserving deterministic output and GQA capture.
+- Own the next in-engine capture sequence on `perf/deepseek-mla-capture`: device valid-length scalar ABI, kernel causal/pad synthesis plus `Unsqueeze_18` island pruning, device-side control, then capture enablement. This DeepSeek plain causal+pad path needs no Mobius/export work.

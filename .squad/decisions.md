@@ -70,3 +70,15 @@
 **What:** Rachael's capture-enablement plan identified five blockers: host-derived per-step control arrays, growing logical KV/mask extents, per-step synchronizations, synchronous copy-back needing `dtod_async` under capture, and ensuring D2H `nonpad_kv_seqlen` stays off decode-with-past. Proposed direction is fixed-capacity default-domain Attention KV, a device-side valid-length scalar, no per-step host sync, async copy-back, and eventually supported capture once shapes and setup are capture-safe.
 **Why:** Correctness is already merged independently. Capture enablement is medium-large engine/kernel work and must be reviewed separately.
 
+
+## 2025-06-14 — DeepSeek MLA fixed-capacity eager optimization merged
+
+### Fixed-capacity default-domain Attention KV append is on main
+**By:** Rachael; reviewed by Holden; merged by Coordinator
+**What:** Commit `53afab0` (fast-forwarded to `origin/main`) makes capacity-bound present K/V outputs of default-domain `Attention` use their fixed physical capacity and appends only the new token at the valid fixed slot. The kernel retains logical `[0, total_seq)` read bounds, so padding is not attended; dense/unbound Attention remains staged and GQA is unchanged. The regression test `decode_kv_capacity_append_matches_reference_and_ignores_padding` uses non-zero padding garbage to prove that boundary.
+**Why:** This removes DeepSeek MLA's per-token KV restride, scratch allocation, and copy-back while preserving the preceding alias-race correctness fix. Reported eager throughput improved from about 22.2 to 23.5 tok/s (blk32) and 25.2 to 26.0 tok/s (blk128); the CUDA gate was 205/0, greedy output was deterministic, and Qwen GQA capture was unchanged.
+
+### DeepSeek MLA full capture is reachable purely in-engine
+**By:** Rachael
+**What:** The growing `Unsqueeze_18` Attention bias is a self-contained causal-and-padding mask island consumed only by the 27 default-domain Attention nodes. It can be bypassed for a fixed-capacity, on-device implementation using the existing fixed-capacity raw attention mask plus a device valid-length scalar; no Mobius/export change is required for this plain causal+pad DeepSeek export. This later assessment supersedes the earlier uncertainty that a capacity-length mask required export changes.
+**Why:** Capture cannot use the current eager shape-derived valid length, which freezes under replay. Follow-up sequencing is: device valid-length scalar ABI, kernel-side causal/pad synthesis and mask-island pruning, device-side control to remove per-step D2H/H2D, then enable `capture_support()`.
