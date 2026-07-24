@@ -91,6 +91,7 @@ pub mod reshape;
 pub mod resize;
 pub mod rmsnorm;
 pub mod rotary_embedding;
+pub mod sdpa;
 pub mod selection;
 pub mod sequence;
 pub mod shape;

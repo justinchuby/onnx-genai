@@ -5,6 +5,13 @@
 //! (`contrib_ops/cpu/bert/attention_cpu_base.h` +
 //! `multihead_attention.cc`); correctness first, optimization later.
 //!
+//! This kernel is a **thin adapter over the shared [`super::sdpa`] core**: it
+//! parses/validates the MHA inputs, normalizes the various Q/K/V layouts,
+//! projects the optional bias, and concatenates any past-KV cache into dense
+//! `BNSH` f32 buffers, then hands the `QKᵀ → scale → +bias → +mask → softmax →
+//! ·V` math to [`super::sdpa::sdpa_f32`]. The core reproduces this kernel's
+//! original loop bit-for-bit, so the ORT goldens remain the regression gate.
+//!
 //! ## Semantics (matching ORT's `ComputeAttentionProbs`)
 //!
 //! ```text
@@ -53,6 +60,10 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
+use super::sdpa::{
+    AttnBias, BroadcastBias, KeyMask, NoBias, QkCapture, ScaleMode, SdpaConfig, SdpaTensors,
+    sdpa_f32,
+};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 `MultiHeadAttention` kernel carrying the resolved attributes.
@@ -335,6 +346,23 @@ fn keep_or_filter(keep: bool, filter: f32) -> f32 {
     if keep { 0.0 } else { filter }
 }
 
+/// Adapts an MHA [`PadMask`] to the shared core's [`KeyMask`] hook by carrying
+/// the derived `(q_seq, total_seq)` and the resolved `mask_filter_value`.
+struct MhaKeyMask<'a> {
+    mask: &'a PadMask,
+    q_seq: usize,
+    total_seq: usize,
+    filter: f32,
+}
+
+impl KeyMask for MhaKeyMask<'_> {
+    #[inline]
+    fn at(&self, b: usize, i: usize, j: usize) -> f32 {
+        self.mask
+            .bias(b, i, j, self.q_seq, self.total_seq, self.filter)
+    }
+}
+
 impl Kernel for MultiHeadAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("MultiHeadAttention", inputs, outputs, 3, 10, 1)?;
@@ -543,65 +571,43 @@ impl Kernel for MultiHeadAttentionKernel {
             Vec::new()
         };
 
-        let mut scores = vec![0.0f32; total_seq];
-        for b in 0..batch {
-            for n in 0..num_heads {
-                for i in 0..q_seq {
-                    // scores[j] = scale · (Q·Kᵀ) + attention_bias + mask.
-                    for (j, sc) in scores.iter_mut().enumerate() {
-                        let mut acc = 0.0f32;
-                        for p in 0..head_size {
-                            acc += q.at(b, n, i, p) * key.at(b, n, j, p);
-                        }
-                        let mut s = acc * scale;
-                        if let Some((data, dims)) = &attn_bias {
-                            let b0 = if dims[0] == 1 { 0 } else { b };
-                            let n0 = if dims[1] == 1 { 0 } else { n };
-                            let off = (((b0 * dims[1] + n0) * dims[2] + i) * dims[3]) + j;
-                            s += data[off];
-                        }
-                        // Padding mask (additive `mask_filter_value`).
-                        s += pad_mask.bias(b, i, j, q_seq, total_seq, filter);
-                        // Causal mask overrides padding with f32::MIN, as ORT
-                        // writes `numeric_limits::lowest()` into the merged mask.
-                        if causal && (j as i64) > past_seq as i64 + i as i64 {
-                            s = f32::MIN;
-                        }
-                        *sc = s;
-                    }
-
-                    if want_qk {
-                        let base = ((b * num_heads + n) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
-
-                    // Numerically-stable softmax (ORT `MlasComputeSoftmax`).
-                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for sc in scores.iter_mut() {
-                        let e = (*sc - max).exp();
-                        *sc = e;
-                        sum += e;
-                    }
-                    let inv = 1.0 / sum;
-                    for sc in scores.iter_mut() {
-                        *sc *= inv;
-                    }
-
-                    // context = probs · V.
-                    let y_base = ((b * num_heads + n) * q_seq + i) * v_head_size;
-                    for c in 0..v_head_size {
-                        let mut acc = 0.0f32;
-                        for (j, &p) in scores.iter().enumerate() {
-                            acc += p * value.at(b, n, j, c);
-                        }
-                        y[y_base + c] = acc;
-                    }
-                }
-            }
-        }
-
-        // Output 0: merge heads → (B, S, num_heads·v_head_size).
+        // Delegate the QKᵀ → scale → +bias → +mask → softmax → ·V math to the
+        // shared SDPA core. MHA is plain multi-head (num_kv_heads == num_heads),
+        // PostDot scale, no softcap; the layout/cache/bias normalization above
+        // has already reduced Q/K/V to dense BNSH f32 buffers.
+        let tensors = SdpaTensors {
+            q: &q.data,
+            k: &key.data,
+            v: &value.data,
+            batch,
+            num_heads,
+            num_kv_heads: num_heads,
+            q_seq,
+            kv_seq: total_seq,
+            head_size,
+            v_head_size,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(scale),
+            softcap: None,
+            causal,
+            past_seq,
+            causal_fill: f32::MIN,
+        };
+        let bias_hook: &dyn AttnBias = match &attn_bias {
+            Some((data, dims)) => &BroadcastBias::new(data, *dims),
+            None => &NoBias,
+        };
+        let mask_hook = MhaKeyMask {
+            mask: &pad_mask,
+            q_seq,
+            total_seq,
+            filter,
+        };
+        let qk_cap = want_qk.then_some(QkCapture {
+            scores: &mut qk_out,
+        });
+        sdpa_f32(&tensors, &cfg, bias_hook, &mask_hook, &mut y, qk_cap);
         let mut y3 = vec![0.0f32; batch * q_seq * v_hidden];
         for b in 0..batch {
             for n in 0..num_heads {
