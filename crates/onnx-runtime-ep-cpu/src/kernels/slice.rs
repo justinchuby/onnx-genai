@@ -613,4 +613,18 @@ mod tests {
         assert_eq!(vo[0].strides, vec![2]);
         assert_eq!(vo[0].byte_offset, 8);
     }
+    #[test]
+    fn slice_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[4], &[1., -2., 3., 4.]);
+        let starts = Owned::i64(&[1], &[1]);
+        let ends = Owned::i64(&[1], &[3]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2]);
+        SliceKernel
+            .execute(
+                &[x.view(), starts.view(), ends.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_u16_bits(), x.to_u16_bits()[1..3]);
+    }
 }

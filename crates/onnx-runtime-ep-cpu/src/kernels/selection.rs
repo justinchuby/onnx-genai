@@ -5,9 +5,11 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::add::require_same_dtype;
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32};
+use super::{check_arity, to_dense_i64, write_dense_bytes};
 use crate::dispatch_arith;
-use crate::dtype::{NumericElem, to_dense, write_dense};
+use crate::dtype::{
+    NumericElem, to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow,
+};
 use crate::strided::numel;
 
 pub struct ClipKernel {
@@ -26,6 +28,10 @@ impl KernelFactory for ClipFactory {
 impl Kernel for ClipKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Clip", inputs, outputs, 1, 3, 1)?;
+        #[cfg(feature = "mlas")]
+        if clip_contiguous_f32(self, inputs, &mut outputs[0])? {
+            return Ok(());
+        }
         dispatch_arith!(inputs[0].dtype, "Clip", T => {
             clip_typed::<T>(self, inputs, outputs)
         })
@@ -34,6 +40,54 @@ impl Kernel for ClipKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         true
     }
+}
+
+#[cfg(feature = "mlas")]
+fn clip_contiguous_f32(
+    kernel: &ClipKernel,
+    inputs: &[TensorView],
+    output: &mut TensorMut,
+) -> Result<bool> {
+    if inputs[0].dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || inputs[0].shape != output.shape
+        || !inputs[0].is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let minimum = if inputs.len() > 1 && !inputs[1].is_absent() {
+        require_same_dtype("Clip", &inputs[1], DataType::Float32)?;
+        scalar_typed::<f32>("Clip min", &inputs[1])?
+    } else {
+        kernel.min.unwrap_or(f32::NEG_INFINITY)
+    };
+    let maximum = if inputs.len() > 2 && !inputs[2].is_absent() {
+        require_same_dtype("Clip", &inputs[2], DataType::Float32)?;
+        scalar_typed::<f32>("Clip max", &inputs[2])?
+    } else {
+        kernel.max.unwrap_or(f32::INFINITY)
+    };
+    if minimum > maximum {
+        return Err(EpError::KernelFailed(
+            "Clip: min must not exceed max".into(),
+        ));
+    }
+    let input_start = inputs[0].data_ptr::<u8>() as usize;
+    let input_end = input_start.saturating_add(inputs[0].byte_size());
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if output_start < input_end && input_start < output_end {
+        return Ok(false);
+    }
+    let input = to_dense_f32_widen("Clip", &inputs[0])?;
+    let output_len = output.numel();
+    // SAFETY: equal contiguous Float32 shapes prove the output span, and the
+    // range check proves it does not overlap the borrowed input.
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), output_len) };
+    mlas_sys::compute_clip(&input, output, minimum, maximum);
+    Ok(true)
 }
 
 fn clip_typed<T: NumericElem + PartialOrd>(
@@ -142,7 +196,7 @@ impl Kernel for ArgKernel {
                 "{name}: output must be Int64"
             )));
         }
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen(name, &inputs[0])?;
         let axis = axis(name, self.axis, inputs[0].shape.len())?;
         let width = inputs[0].shape[axis];
         if width == 0 {
@@ -201,7 +255,13 @@ impl Kernel for TopKKernel {
                 "TopK: indices output must be Int64".into(),
             ));
         }
-        let x = to_dense_f32(&inputs[0])?;
+        if outputs[0].dtype != inputs[0].dtype {
+            return Err(EpError::KernelFailed(format!(
+                "TopK: values output dtype {:?} must match input dtype {:?}",
+                outputs[0].dtype, inputs[0].dtype
+            )));
+        }
+        let x = to_dense_f32_widen("TopK", &inputs[0])?;
         let k_values = to_dense_i64(&inputs[1])?;
         if k_values.len() != 1 || k_values[0] < 0 {
             return Err(EpError::KernelFailed(
@@ -240,7 +300,7 @@ impl Kernel for TopKKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &values)?;
+        write_dense_f32_narrow("TopK", &mut outputs[0], &values)?;
         write_dense_bytes(
             &mut outputs[1],
             &indices
@@ -281,7 +341,7 @@ impl Kernel for NonZeroKernel {
                 "NonZero: output must be Int64".into(),
             ));
         }
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen("NonZero", &inputs[0])?;
         let rank = inputs[0].shape.len();
         let strides = contiguous(inputs[0].shape);
         let mut coordinates = vec![Vec::new(); rank];
@@ -371,6 +431,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f16_out.to_f16_as_f32(), vec![0., 0.5, 1.]);
+    }
+
+    #[test]
+    fn clip_bfloat16_matches_widened_reference() {
+        let input = Owned::bf16(&[2, 4], &[-3.25, -0.5, 0.25, 1.5, 4.0, 0.75, -1.0, 2.0]);
+        let minimum = Owned::bf16(&[], &[-0.75]);
+        let maximum = Owned::bf16(&[], &[1.25]);
+        let mut output = Owned::zeros(DataType::BFloat16, &[2, 4]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(
+            &[input.view(), minimum.view(), maximum.view()],
+            &mut [output.view_mut()],
+        )
+        .unwrap();
+        let minimum = minimum.to_bf16_as_f32()[0];
+        let maximum = maximum.to_bf16_as_f32()[0];
+        let expected: Vec<f32> = input
+            .to_bf16_as_f32()
+            .into_iter()
+            .map(|value| value.clamp(minimum, maximum))
+            .collect();
+        assert_eq!(output.to_bf16_as_f32(), expected);
     }
 
     #[test]
@@ -488,6 +573,69 @@ mod tests {
         .unwrap();
         assert_eq!(y.to_i64(), vec![2, 2]);
     }
+
+    #[test]
+    fn argmax_and_argmin_accept_bfloat16() {
+        let input = Owned::bf16(&[2, 4], &[1.25, 4.5, 4.0, -2.0, -3.0, -1.0, -2.0, -1.5]);
+        let mut maximum = Owned::zeros(DataType::Int64, &[2]);
+        ArgKernel {
+            op: ArgOp::Max,
+            axis: -1,
+            keepdims: false,
+            select_last_index: false,
+        }
+        .execute(&[input.view()], &mut [maximum.view_mut()])
+        .unwrap();
+        assert_eq!(maximum.to_i64(), vec![1, 1]);
+
+        let mut minimum = Owned::zeros(DataType::Int64, &[2]);
+        ArgKernel {
+            op: ArgOp::Min,
+            axis: -1,
+            keepdims: false,
+            select_last_index: false,
+        }
+        .execute(&[input.view()], &mut [minimum.view_mut()])
+        .unwrap();
+        assert_eq!(minimum.to_i64(), vec![3, 0]);
+    }
+
+    #[test]
+    fn topk_bfloat16_values_match_widened_reference() {
+        let input = Owned::bf16(
+            &[2, 5],
+            &[2.25, 5.5, 1.0, 4.25, -1.0, -3.0, 0.5, 7.0, 6.5, 2.0],
+        );
+        let count = Owned::i64(&[], &[3]);
+        let mut values = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        let mut indices = Owned::zeros(DataType::Int64, &[2, 3]);
+        TopKKernel {
+            axis: -1,
+            largest: true,
+            sorted: true,
+        }
+        .execute(
+            &[input.view(), count.view()],
+            &mut [values.view_mut(), indices.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(
+            values.to_bf16_as_f32(),
+            vec![5.5, 4.25, 2.25, 7.0, 6.5, 2.0]
+        );
+        assert_eq!(indices.to_i64(), vec![1, 3, 0, 2, 3, 4]);
+    }
+
+    #[test]
+    fn nonzero_accepts_bfloat16() {
+        let input = Owned::bf16(&[2, 3], &[0.0, -0.0, 2.5, -1.0, 0.0, 3.0]);
+        let mut output = Owned::zeros(DataType::Int64, &[2, 3]);
+        NonZeroKernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_i64(), vec![0, 1, 1, 2, 0, 2]);
+    }
+
     #[test]
     fn topk_and_nonzero() {
         let x = Owned::f32(&[4], &[2., 5., 1., 4.]);

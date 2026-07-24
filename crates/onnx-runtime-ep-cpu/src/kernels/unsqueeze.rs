@@ -154,4 +154,15 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn unsqueeze_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[2], &[1., -2.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 2]);
+        UnsqueezeKernel {
+            axes: Some(vec![0]),
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert_eq!(out.to_u16_bits(), x.to_u16_bits());
+    }
 }

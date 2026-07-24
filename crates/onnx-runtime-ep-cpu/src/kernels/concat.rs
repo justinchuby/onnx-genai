@@ -371,4 +371,14 @@ mod tests {
         assert!(message.contains("HOW:"));
         assert_eq!(out.to_f32(), vec![99.; 8]);
     }
+    #[test]
+    fn concat_bf16_preserves_element_bits() {
+        let a = Owned::bf16(&[1, 2], &[1., -2.]);
+        let b = Owned::bf16(&[1, 2], &[3., 4.]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2, 2]);
+        run(0, &[&a, &b], &mut out);
+        let mut expected = a.to_u16_bits();
+        expected.extend(b.to_u16_bits());
+        assert_eq!(out.to_u16_bits(), expected);
+    }
 }

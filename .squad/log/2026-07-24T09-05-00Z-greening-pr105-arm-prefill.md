@@ -1,0 +1,3 @@
+# 2026-07-24T09:05:00Z — PR #105 CI, MLAS, and prefill progress
+
+PR #105’s executor early-rejection regression is green after Dietrich’s fix and Hicks’s independent approval. Ripley’s cross-CPU MLAS portability work added the AVX2 M=1 asymmetric-int8 production guard, and the upstream defect is filed as microsoft/onnxruntime#29853. Burke’s Nk-dequant plus transposed-MLAS-sgemm change restores batched MatMulNBits prefill performance by roughly 10×. The branch also merged origin/main’s bf16 RoPE/norms and glm-5.2 work, while Hasford’s ARM dead-code CI repair remains in flight in its separate worktree.

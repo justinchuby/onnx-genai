@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use onnx_runtime_ir::{Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef};
+use onnx_runtime_ir::{
+    DataType, Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef,
+};
 
 use crate::context::{MergePolicy, NodeIo, SymbolInterner, TypeInfo, TypedShape, merge_shapes};
 use crate::dim_expr::DimExpr;
@@ -141,13 +143,35 @@ impl InferenceRegistry {
                 remaining_subgraph_nodes -= 1;
             }
 
+            if is_standard_if(&node) {
+                if let Some(outputs) =
+                    infer_if_outputs(graph, &node, &subgraph_results, &mut interner)?
+                {
+                    for (slot, output) in node.outputs.iter().zip(outputs) {
+                        match output {
+                            IfOutput::Typed(type_info) => {
+                                types.insert(*slot, type_info);
+                            }
+                            IfOutput::UnknownRank(element_type) => {
+                                types.remove(slot);
+                                shape_data.remove(slot);
+                                let value = graph.value_mut(*slot);
+                                value.dtype = element_type;
+                                graph.mark_value_type_known(*slot);
+                                graph.mark_value_shape_unknown(*slot);
+                            }
+                            IfOutput::Unresolved => {}
+                        }
+                    }
+                }
+                if remaining_subgraph_nodes > 0 {
+                    pending_scope_values.extend(node.outputs.iter().copied());
+                }
+                continue;
+            }
+
             let inputs = gather_inputs(&node, &types, &shape_data);
-            let outputs = if is_standard_if(&node) {
-                infer_if_outputs(graph, &node, &subgraph_results, &mut interner)?
-                    .unwrap_or_else(|| vec![NodeIo::default(); node.outputs.len()])
-            } else {
-                self.infer_node(&node, opset_imports, inputs, policy, &mut interner)?
-            };
+            let outputs = self.infer_node(&node, opset_imports, inputs, policy, &mut interner)?;
             for (slot, io) in node.outputs.iter().zip(outputs) {
                 if let Some(ti) = io.type_info {
                     types.insert(*slot, ti);
@@ -215,12 +239,18 @@ fn is_standard_if(node: &Node) -> bool {
     node.op_type == "If" && node.is_default_domain()
 }
 
+enum IfOutput {
+    Typed(TypeInfo),
+    UnknownRank(DataType),
+    Unresolved,
+}
+
 fn infer_if_outputs(
     graph: &Graph,
     node: &Node,
     subgraph_results: &HashMap<String, ScopedInference>,
     interner: &mut SymbolInterner,
-) -> Result<Option<Vec<NodeIo>>, ShapeInferError> {
+) -> Result<Option<Vec<IfOutput>>, ShapeInferError> {
     let then_key = (node.id, "then_branch".to_string());
     let else_key = (node.id, "else_branch".to_string());
     let Some(then_branch) = graph.subgraphs.get(&then_key) else {
@@ -253,7 +283,7 @@ fn infer_if_outputs(
         if !branch_output_is_resolved(then_branch, then_id, &then_resolved)
             || !branch_output_is_resolved(else_branch, else_id, &else_resolved)
         {
-            outputs.push(NodeIo::default());
+            outputs.push(IfOutput::Unresolved);
             continue;
         }
         let then_value =
@@ -282,14 +312,8 @@ fn infer_if_outputs(
         }
 
         if then_value.shape.len() != else_value.shape.len() {
-            return Err(ShapeInferError::Invalid {
-                op: "If".to_string(),
-                detail: format!(
-                    "branch output ranks differ: {} != {}",
-                    then_value.shape.len(),
-                    else_value.shape.len()
-                ),
-            });
+            outputs.push(IfOutput::UnknownRank(then_value.dtype));
+            continue;
         }
 
         let shape = then_value
@@ -312,9 +336,9 @@ fn infer_if_outputs(
                 _ => interner.fresh_dim(),
             })
             .collect();
-        outputs.push(NodeIo::typed(TypeInfo::new(then_value.dtype, shape)));
+        outputs.push(IfOutput::Typed(TypeInfo::new(then_value.dtype, shape)));
     }
-    outputs.resize_with(node.outputs.len(), NodeIo::default);
+    outputs.resize_with(node.outputs.len(), || IfOutput::Unresolved);
 
     Ok(Some(outputs))
 }

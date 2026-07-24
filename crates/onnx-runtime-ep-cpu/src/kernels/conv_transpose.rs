@@ -397,6 +397,35 @@ mod tests {
     }
 
     #[test]
+    fn conv_transpose_bf16_matches_widened_f32_reference() {
+        let x_vals = [1.0f32, 2.0, 3.0];
+        let w_vals = [1.0f32, 0.5, -1.0];
+        let x = Owned::f32(&[1, 1, 3], &x_vals);
+        let w = Owned::f32(&[1, 1, 3], &w_vals);
+        let mut ref_out = Owned::zeros_f32(&[1, 1, 5]);
+        kernel(1, vec![3], 1)
+            .execute(&[x.view(), w.view()], &mut [ref_out.view_mut()])
+            .unwrap();
+
+        let x = Owned::bf16(&[1, 1, 3], &x_vals);
+        let w = Owned::bf16(&[1, 1, 3], &w_vals);
+        let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 1, 5]);
+        kernel(1, vec![3], 1)
+            .execute(&[x.view(), w.view()], &mut [bf16_out.view_mut()])
+            .unwrap();
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "conv_transpose bf16 {g} vs f32 {r}"
+            );
+        }
+    }
+
+    #[test]
     fn conv_transpose_1d_spreads_each_input_over_the_kernel() {
         let x = Owned::f32(&[1, 1, 3], &[1., 2., 3.]);
         let w = Owned::f32(&[1, 1, 3], &[1., 1., 1.]);

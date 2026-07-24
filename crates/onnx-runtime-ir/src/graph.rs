@@ -124,6 +124,11 @@ impl Graph {
         self.unknown_value_types.insert(id);
     }
 
+    /// Mark a value's element type as known.
+    pub fn mark_value_type_known(&mut self, id: ValueId) {
+        self.unknown_value_types.remove(&id);
+    }
+
     /// Mark a value's placeholder shape as unknown.
     pub fn mark_value_shape_unknown(&mut self, id: ValueId) {
         self.unknown_value_shapes.insert(id);
@@ -751,7 +756,10 @@ impl Graph {
 
     /// Delete `value` if it has no producer, no consumers, and is not part of
     /// the graph's I/O or initializers.
-    fn gc_value_if_orphan(&mut self, value: ValueId) {
+    ///
+    /// Clears the value's entries in the unknown-type/shape sets so a later
+    /// arena slot reuse does not inherit stale "unknown" flags.
+    pub fn gc_value_if_orphan(&mut self, value: ValueId) {
         let orphan = match self.values.get(value) {
             Some(v) => {
                 v.producer.is_none()

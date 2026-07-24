@@ -300,6 +300,10 @@ impl Kernel for PoolKernel {
                 "MaxPool: Indices must be an Int64 tensor with the output shape".into(),
             ));
         }
+        #[cfg(feature = "mlas")]
+        if try_mlas_pool(self, inputs, outputs, &expected, &pads)? {
+            return Ok(());
+        }
 
         let x = to_dense_f32_widen("Pool", &inputs[0])?;
         let spatial_size = numel(spatial);
@@ -460,6 +464,10 @@ impl Kernel for GlobalPoolKernel {
                 outputs[0].shape
             )));
         }
+        #[cfg(feature = "mlas")]
+        if try_mlas_global_pool(self, inputs, outputs, &expected)? {
+            return Ok(());
+        }
         let x = to_dense_f32_widen("GlobalPool", &inputs[0])?;
         let spatial_size = numel(&shape[2..]);
         let mut values = Vec::with_capacity(shape[0] * shape[1]);
@@ -487,6 +495,127 @@ impl Kernel for GlobalPoolKernel {
     }
 }
 
+#[cfg(feature = "mlas")]
+fn try_mlas_pool(
+    kernel: &PoolKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    expected: &[usize],
+    pads: &[usize],
+) -> Result<bool> {
+    if inputs[0].dtype != DataType::Float32
+        || outputs[0].dtype != DataType::Float32
+        || outputs.len() != 1
+        || kernel.ceil_mode
+        || kernel.params.dilations.iter().any(|&value| value != 1)
+        || !outputs[0].is_contiguous()
+    {
+        return Ok(false);
+    }
+    let kind = match kernel.kind {
+        PoolKind::Average { include_pad: false } => mlas_sys::PoolKind::AverageExcludePad,
+        PoolKind::Average { include_pad: true } => mlas_sys::PoolKind::AverageIncludePad,
+        PoolKind::Max { .. } => mlas_sys::PoolKind::Maximum,
+        PoolKind::Lp { .. } => return Ok(false),
+    };
+    run_mlas_pool(
+        kind,
+        inputs,
+        outputs,
+        &kernel.params.kernel,
+        pads,
+        &kernel.params.strides,
+        expected,
+        "Pool",
+    )
+}
+
+#[cfg(feature = "mlas")]
+fn try_mlas_global_pool(
+    kernel: &GlobalPoolKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    expected: &[usize],
+) -> Result<bool> {
+    if inputs[0].dtype != DataType::Float32
+        || outputs[0].dtype != DataType::Float32
+        || !(1..=3).contains(&(inputs[0].shape.len() - 2))
+        || !outputs[0].is_contiguous()
+    {
+        return Ok(false);
+    }
+    let kind = match kernel.kind {
+        GlobalPoolKind::Average => mlas_sys::PoolKind::AverageExcludePad,
+        GlobalPoolKind::Max => mlas_sys::PoolKind::Maximum,
+        GlobalPoolKind::Lp(_) => return Ok(false),
+    };
+    let spatial = &inputs[0].shape[2..];
+    run_mlas_pool(
+        kind,
+        inputs,
+        outputs,
+        spatial,
+        &vec![0; spatial.len() * 2],
+        &vec![1; spatial.len()],
+        expected,
+        "GlobalPool",
+    )
+}
+
+#[cfg(feature = "mlas")]
+#[allow(clippy::too_many_arguments)]
+fn run_mlas_pool(
+    kind: mlas_sys::PoolKind,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    kernel: &[usize],
+    pads: &[usize],
+    strides: &[usize],
+    expected: &[usize],
+    op: &str,
+) -> Result<bool> {
+    let output_start = outputs[0].data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(outputs[0].byte_size());
+    let input_start = inputs[0].data_ptr::<u8>() as usize;
+    let input_end = input_start.saturating_add(inputs[0].byte_size());
+    if output_start < input_end && input_start < output_end {
+        return Ok(false);
+    }
+    let x = to_dense_f32_widen(op, &inputs[0])?;
+    let input_shape = usize_to_i64(inputs[0].shape, "input shape")?;
+    let kernel = usize_to_i64(kernel, "kernel shape")?;
+    let pads = usize_to_i64(pads, "pads")?;
+    let strides = usize_to_i64(strides, "strides")?;
+    let output_shape = usize_to_i64(expected, "output shape")?;
+    // SAFETY: this is a checked contiguous Float32 output whose element count
+    // is the product of `expected`; the executor owns it exclusively.
+    let output = unsafe {
+        std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), numel(expected))
+    };
+    mlas_sys::pool(
+        kind,
+        &input_shape,
+        &kernel,
+        &pads,
+        &strides,
+        &output_shape,
+        &x,
+        output,
+    );
+    Ok(true)
+}
+
+#[cfg(feature = "mlas")]
+fn usize_to_i64(values: &[usize], name: &str) -> Result<Vec<i64>> {
+    values
+        .iter()
+        .map(|&value| {
+            i64::try_from(value)
+                .map_err(|_| EpError::KernelFailed(format!("Pool: {name} exceeds i64")))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +638,29 @@ mod tests {
             strides: strides.to_vec(),
             pads: pads.to_vec(),
             dilations: dilations.to_vec(),
+        }
+    }
+
+    #[test]
+    fn pool_bf16_matches_widened_f32_reference() {
+        let vals: Vec<f32> = (1..=16).map(|v| v as f32).collect();
+        let base = PoolKernel {
+            params: params(&[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1]),
+            auto_pad: AutoPad::NotSet,
+            ceil_mode: false,
+            kind: PoolKind::Average { include_pad: false },
+        };
+        let x = Owned::f32(&[1, 1, 4, 4], &vals);
+        let reference = average(&base, &x, &[1, 1, 2, 2]);
+
+        let x = Owned::bf16(&[1, 1, 4, 4], &vals);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 1, 2, 2]);
+        base.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        for (&r, &g) in reference.iter().zip(out.to_bf16_as_f32().iter()) {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "pool bf16 {g} vs f32 {r}"
+            );
         }
     }
 
@@ -656,6 +808,44 @@ mod tests {
             average(&same, &x, &[1, 2, 2, 2]),
             average(&explicit, &x, &[1, 2, 2, 2])
         );
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn aliasing_pool_output_takes_reference_fallback() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+
+        let mut shared = vec![1.0f32, 2.0, 3.0, 4.0];
+        let input_shape = [1, 1, 2, 2];
+        let input_strides = [4, 4, 2, 1];
+        let output_shape = [1, 1, 1, 1];
+        let output_strides = [1, 1, 1, 1];
+        let input = TensorView::new(
+            DevicePtr(shared.as_ptr().cast()),
+            DataType::Float32,
+            &input_shape,
+            &input_strides,
+            DeviceId::cpu(),
+        );
+        let output = TensorMut::new(
+            DevicePtrMut(shared.as_mut_ptr().cast()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            DeviceId::cpu(),
+        );
+        let kernel = PoolKernel {
+            params: params(&[2, 2], &[1, 1], &[0, 0, 0, 0], &[1, 1]),
+            auto_pad: AutoPad::NotSet,
+            ceil_mode: false,
+            kind: PoolKind::Max {
+                storage_order: false,
+            },
+        };
+
+        kernel.execute(&[input], &mut [output]).unwrap();
+        assert_eq!(shared, vec![4.0, 2.0, 3.0, 4.0]);
     }
 
     fn lp(kernel: PoolKernel, x: &Owned, shape: &[usize]) -> Vec<f32> {

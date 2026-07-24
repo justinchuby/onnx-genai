@@ -20,10 +20,11 @@
 //!   the same stability reason.
 //! * `Softsign` — `x / (1 + |x|)`.
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
 
 /// The per-element operation for a unary math kernel.
 #[derive(Clone, Copy)]
@@ -185,9 +186,9 @@ math_factory!(TanFactory, MathOp::Tan);
 impl Kernel for UnaryMathKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen(self.op.name(), &inputs[0])?;
         let y: Vec<f32> = x.iter().map(|&v| self.op.apply(v)).collect();
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow(self.op.name(), &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -310,5 +311,19 @@ mod tests {
             assert!((got - want).abs() < 1e-6);
             assert!(got > -1.0 && got < 1.0);
         }
+    }
+    #[test]
+    fn unary_math_bf16_matches_widened_f32_reference() {
+        let x = Owned::bf16(&[5], &[-80., -1., 0., 1., 80.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[5]);
+        run(MathOp::Softplus, &x, &mut out);
+        let expected: Vec<_> = x
+            .to_bf16_as_f32()
+            .into_iter()
+            .map(softplus)
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        assert_eq!(out.to_bf16_as_f32(), expected);
     }
 }

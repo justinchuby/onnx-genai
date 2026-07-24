@@ -238,6 +238,46 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_bfloat16_decode_and_prefill_match_widened_reference() {
+        for shape in [&[1, 8][..], &[2, 3, 8][..]] {
+            let element_count: usize = shape.iter().product();
+            let input_values: Vec<f32> = (0..element_count)
+                .map(|index| ((index * 17 % 29) as f32 - 14.0) * 0.1875)
+                .collect();
+            let scale_values: Vec<f32> =
+                (0..8).map(|index| 0.625 + index as f32 * 0.09375).collect();
+            let input = Owned::bf16(shape, &input_values);
+            let scale = Owned::bf16(&[8], &scale_values);
+            let mut output = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, shape);
+            RmsNormKernel {
+                axis: -1,
+                epsilon: 1e-5,
+            }
+            .execute(&[input.view(), scale.view()], &mut [output.view_mut()])
+            .unwrap();
+
+            let widened_input = input.to_bf16_as_f32();
+            let widened_scale = scale.to_bf16_as_f32();
+            let mut expected = Vec::with_capacity(element_count);
+            for row in widened_input.chunks_exact(8) {
+                expected.extend(reference(row, &widened_scale, 1e-5));
+            }
+            for (index, (actual, expected)) in output
+                .to_bf16_as_f32()
+                .into_iter()
+                .zip(expected)
+                .enumerate()
+            {
+                let tolerance = 2e-3 + 1e-2 * expected.abs();
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "shape {shape:?}, element {index}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rmsnorm_applies_scale() {
         let x = Owned::f32(&[1, 4], &[1., 2., 3., 4.]);
         let scale = Owned::f32(&[4], &[2., 0.5, 1., 3.]);

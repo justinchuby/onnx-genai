@@ -121,4 +121,17 @@ mod tests {
             .unwrap();
         assert_eq!(out.to_i32(), vec![2, 4]);
     }
+    #[test]
+    fn compress_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[3], &[1., -2., 3.]);
+        let c = Owned::bool_(&[3], &[true, false, true]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[2]);
+        CompressKernel { axis: Some(0) }
+            .execute(&[x.view(), c.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_u16_bits(),
+            vec![x.to_u16_bits()[0], x.to_u16_bits()[2]]
+        );
+    }
 }

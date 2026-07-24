@@ -107,7 +107,32 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
 
-    /// Reference GELU computed independently in `f64` with the crate's `erf`.
+    #[test]
+    fn gelu_bf16_matches_widened_f32_reference() {
+        let xs = [-3.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0];
+        let a = Owned::f32(&[xs.len()], &xs);
+        let mut ref_out = Owned::zeros_f32(&[xs.len()]);
+        GeluKernel
+            .execute(&[a.view()], &mut [ref_out.view_mut()])
+            .unwrap();
+
+        let a = Owned::bf16(&[xs.len()], &xs);
+        let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[xs.len()]);
+        GeluKernel
+            .execute(&[a.view()], &mut [bf16_out.view_mut()])
+            .unwrap();
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "gelu bf16 {g} vs f32 {r}"
+            );
+        }
+    }
+
     fn reference(x: f32) -> f32 {
         let xf = x as f64;
         (0.5 * xf * (1.0 + erf(xf / std::f64::consts::SQRT_2))) as f32

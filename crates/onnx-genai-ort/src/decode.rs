@@ -728,7 +728,10 @@ impl<'a> DecodeSession<'a> {
         )? {
             StepLogits::Token(token) => Ok(token),
             // The standard (non-captured) path returns a Value; reduce it here.
-            StepLogits::Value(logits) => logits.argmax_last_row(),
+            StepLogits::Value(logits) => {
+                let _sampling_span = crate::prof_span!("ort.sampling");
+                logits.argmax_last_row()
+            }
         }
     }
 

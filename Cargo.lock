@@ -2152,6 +2152,7 @@ version = "0.1.0-dev.3"
 dependencies = [
  "criterion",
  "half",
+ "libc",
  "libm",
  "mlas-sys",
  "onnx-runtime-ep-api",
@@ -2162,6 +2163,7 @@ dependencies = [
  "onnx-runtime-tracer",
  "rayon",
  "thiserror 2.0.18",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

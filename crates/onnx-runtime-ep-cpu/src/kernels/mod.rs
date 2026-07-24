@@ -36,6 +36,7 @@ pub mod block_dequant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
 pub mod cast;
+pub mod causal_conv;
 pub mod center_crop_pad;
 pub mod col2im;
 pub mod compress;
@@ -44,6 +45,8 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+#[cfg(feature = "mlas")]
+pub mod conv;
 pub mod conv_transpose;
 pub mod dropout;
 pub mod elementwise;
@@ -53,6 +56,7 @@ pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
 pub mod gather;
+pub mod gather_block_quantized;
 pub mod gelu;
 pub mod gemm;
 pub mod grid_sample;
@@ -63,6 +67,7 @@ pub mod index_share;
 pub mod indexing;
 pub mod is_inf;
 pub mod layernorm;
+pub mod linear_attention;
 pub mod log_softmax;
 pub mod logical;
 pub mod lp_normalization;
@@ -70,6 +75,8 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod moe;
 pub mod movement_ops;
+#[cfg(feature = "mlas")]
+pub mod nchwc;
 pub mod norm_ops;
 pub mod onehot;
 pub mod pad;
@@ -80,6 +87,7 @@ pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
+pub mod resize;
 pub mod rmsnorm;
 pub mod rotary_embedding;
 pub mod selection;
@@ -97,6 +105,9 @@ pub mod unique;
 pub mod unsqueeze;
 pub mod where_op;
 pub mod window;
+
+#[cfg(test)]
+mod qwen35_goldens;
 
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
@@ -249,6 +260,36 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory),
     );
+    // NCHWc blocked layout ops, emitted only by the CpuNchwcLayoutPropagation
+    // pass (never parsed from a model). They keep the CNN backbone in the MLAS
+    // channels-blocked layout so per-Conv NCHW<->NCHWc reorders are eliminated.
+    #[cfg(feature = "mlas")]
+    {
+        reg.register(
+            OpKey::new(nchwc::REORDER_TO_BLOCKED_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcReorderToBlockedFactory),
+        );
+        reg.register(
+            OpKey::new(nchwc::REORDER_TO_NCHW_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcReorderToNchwFactory),
+        );
+        reg.register(
+            OpKey::new(nchwc::NCHWC_CONV_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcConvFactory),
+        );
+        reg.register(
+            OpKey::new(nchwc::NCHWC_MAX_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcPoolFactory::max()),
+        );
+        reg.register(
+            OpKey::new(nchwc::NCHWC_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcPoolFactory::average()),
+        );
+        reg.register(
+            OpKey::new(nchwc::NCHWC_GLOBAL_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcPoolFactory::global_average()),
+        );
+    }
     reg.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
@@ -307,6 +348,24 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory),
+    );
+    // `com.microsoft::CausalConvWithState` and `com.microsoft::LinearAttention`:
+    // the hybrid linear-attention (Gated DeltaNet) primitives used by Qwen3.5 /
+    // Qwen3-Next. Shape-driven and gate-configurable (no model-specific dims).
+    reg.register(
+        OpKey::new("CausalConvWithState", "com.microsoft", 1),
+        Box::new(causal_conv::CausalConvWithStateFactory),
+    );
+    reg.register(
+        OpKey::new("LinearAttention", "com.microsoft", 1),
+        Box::new(linear_attention::LinearAttentionFactory),
+    );
+    // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
+    // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
+    // dequantizes on the fly to the graph's activation dtype.
+    reg.register(
+        OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
+        Box::new(gather_block_quantized::GatherBlockQuantizedFactory),
     );
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
@@ -416,6 +475,12 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("RotaryEmbedding", "", 23),
         Box::new(rotary_embedding::RotaryEmbeddingFactory),
     );
+    // `com.microsoft::RotaryEmbedding` contrib op: same rotation math, but the
+    // inputs are ordered `(X, position_ids, cos_cache, sin_cache)`.
+    reg.register(
+        OpKey::new("RotaryEmbedding", "com.microsoft", 1),
+        Box::new(rotary_embedding::RotaryEmbeddingContribFactory),
+    );
     // `ai.onnx::Swish` added at opset 24: y = x·sigmoid(alpha·x).
     reg.register(
         OpKey::new("Swish", "", 24),
@@ -515,6 +580,14 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
     );
     reg.register(
+        OpKey::new("Resize", "", 10),
+        Box::new(resize::ResizeFactory { since_version: 10 }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 11),
+        Box::new(resize::ResizeFactory { since_version: 11 }),
+    );
+    reg.register(
         OpKey::new("AffineGrid", "", 20),
         Box::new(affine_grid::AffineGridFactory),
     );
@@ -526,6 +599,8 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("ConvTranspose", "", 1),
         Box::new(conv_transpose::ConvTransposeFactory),
     );
+    #[cfg(feature = "mlas")]
+    reg.register(OpKey::new("Conv", "", 1), Box::new(conv::ConvFactory));
     reg.register(
         OpKey::new("CenterCropPad", "", 18),
         Box::new(center_crop_pad::CenterCropPadFactory),
@@ -877,6 +952,21 @@ pub fn to_dense_f32(view: &TensorView) -> Result<Vec<f32>> {
     if n == 0 {
         return Ok(out);
     }
+    if view.is_contiguous() {
+        // Contiguous row-major: the element origin addresses `n` consecutive
+        // f32, so a single bulk copy replaces the per-element strided walk. This
+        // is the common decode/prefill case (dense activations) and the strided
+        // loop below is a serial, non-vectorized per-element hot path otherwise.
+        //
+        // SAFETY: identical read assumptions to the strided loop below -- the
+        // validated host-accessible view describes `n` readable, contiguous f32
+        // starting at `origin`, bounds-checked against the backing allocation by
+        // the owning EP (ep-api safety invariant #1). `f32` has no invalid bit
+        // patterns.
+        let slice = unsafe { std::slice::from_raw_parts(origin, n) };
+        out.extend_from_slice(slice);
+        return Ok(out);
+    }
     let mut idx = vec![0usize; view.shape.len()];
     loop {
         let off = elem_offset(view.strides, &idx);
@@ -1006,6 +1096,20 @@ pub fn write_dense_f32(out: &mut TensorMut, data: &[f32]) -> Result<()> {
         return Ok(());
     }
     let origin = out.data_ptr_mut::<f32>();
+    if out.is_contiguous() {
+        // Contiguous row-major output: write `n` consecutive f32 in one bulk
+        // copy instead of the per-element strided walk. This is the common
+        // decode/prefill case and keeps the write off the serial hot path.
+        //
+        // SAFETY: identical write assumptions to the strided loop below -- the
+        // validated host-accessible output describes `n` writable, contiguous
+        // f32 starting at `origin`, bounds-checked against the backing
+        // allocation by the owning EP (ep-api safety invariant #1). `data.len()`
+        // was checked to equal `n` above, so every element is written once.
+        let slice = unsafe { std::slice::from_raw_parts_mut(origin, n) };
+        slice.copy_from_slice(data);
+        return Ok(());
+    }
     let strides = out.strides;
     let shape = out.shape;
     let mut idx = vec![0usize; shape.len()];
@@ -1441,6 +1545,28 @@ mod tests {
     }
 
     #[test]
+    fn write_dense_contiguous_bulk_copies() {
+        // Contiguous output takes the bulk-copy fast path.
+        let mut backing = Owned::f32(&[2, 3], &[0.0; 6]);
+        let mut out = backing.view_mut();
+        write_dense_f32(&mut out, &[1., 2., 3., 4., 5., 6.]).unwrap();
+        assert_eq!(backing.to_f32(), vec![1., 2., 3., 4., 5., 6.]);
+    }
+
+    #[test]
+    fn write_dense_strided_matches_logical_order() {
+        // Backing [2,3] row-major exposed as transposed [3,2] with strides
+        // [1,3] so the write must scatter through the non-contiguous stride
+        // walk. `to_f32` reads raw storage order to confirm the scatter.
+        let mut backing = Owned::f32(&[2, 3], &[0.0; 6]).with_view(&[3, 2], &[1, 3]);
+        let mut out = backing.view_mut();
+        // Logical [[1,2],[3,4],[5,6]] over strides [1,3] lands in storage as
+        // [1,3,5, 2,4,6].
+        write_dense_f32(&mut out, &[1., 2., 3., 4., 5., 6.]).unwrap();
+        assert_eq!(backing.to_f32(), vec![1., 3., 5., 2., 4., 6.]);
+    }
+
+    #[test]
     fn registry_has_all_phase1_ops() {
         let reg = build_cpu_registry();
         // Every Phase-1 op has at least one factory, and each resolves at a
@@ -1476,7 +1602,16 @@ mod tests {
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 85);
+        // `CausalConvWithState` and `LinearAttention` (Qwen3.5 hybrid
+        // linear-attention primitives) add two more contrib entries,
+        // `GatherBlockQuantized` (block-quantized embedding gather) adds one,
+        // and the `com.microsoft::RotaryEmbedding` contrib alias adds one.
+        // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
+        // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
+        // NCHWc layout-propagation pass add six more entries, but only when the
+        // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed).
+        let mlas_registrations = if cfg!(feature = "mlas") { 7 } else { 0 };
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 91 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1492,6 +1627,8 @@ mod tests {
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
+        #[cfg(feature = "mlas")]
+        assert!(reg.lookup("Conv", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
         assert!(reg.lookup("SpaceToDepth", "", 13).is_some());
@@ -1501,6 +1638,8 @@ mod tests {
         assert!(reg.lookup("Dropout", "", 22).is_some());
         assert!(reg.lookup("GridSample", "", 16).is_some());
         assert!(reg.lookup("GridSample", "", 20).is_some());
+        assert!(reg.lookup("Resize", "", 10).is_some());
+        assert!(reg.lookup("Resize", "", 25).is_some());
         assert!(reg.lookup("ConvTranspose", "", 22).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
@@ -1512,9 +1651,18 @@ mod tests {
             reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
                 .is_some()
         );
-        assert!(reg.lookup("Conv", "", 21).is_none());
+        assert_eq!(reg.lookup("Conv", "", 21).is_some(), cfg!(feature = "mlas"));
         assert!(
             reg.lookup("GroupQueryAttention", "com.microsoft", 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("CausalConvWithState", "com.microsoft", 1)
+                .is_some()
+        );
+        assert!(reg.lookup("LinearAttention", "com.microsoft", 1).is_some());
+        assert!(
+            reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
                 .is_some()
         );
         assert!(reg.lookup("SimplifiedLayerNormalization", "", 21).is_some());
@@ -1571,6 +1719,7 @@ mod tests {
         assert!(reg.lookup("ThresholdedRelu", "", 10).is_some());
         assert!(reg.lookup("ThresholdedRelu", "", 9).is_none());
         assert!(reg.lookup("RotaryEmbedding", "", 23).is_some());
+        assert!(reg.lookup("RotaryEmbedding", "com.microsoft", 1).is_some());
         assert!(reg.lookup("RotaryEmbedding", "", 22).is_none());
         assert!(reg.lookup("Swish", "", 24).is_some());
         assert!(reg.lookup("Swish", "", 23).is_none());

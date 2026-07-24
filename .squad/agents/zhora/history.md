@@ -109,3 +109,5 @@ Added Rayon N-range partitioning for native CPU MatMulNBits.
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 Zhora approved Rutger's clippy cleanup; required Clippy and targeted tests passed with scoped API-preserving fixes.
+
+2026-07-22T22:15:00Z — Landed `f8848c9`: f16/bf16 MatMulNBits widening/narrowing and topology-derived tuning; Chew approved with non-blocking coverage follow-ups.

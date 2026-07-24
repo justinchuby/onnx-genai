@@ -3,7 +3,8 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, Node};
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_i64};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 pub struct AffineGridKernel {
     align_corners: bool,
@@ -78,7 +79,7 @@ impl Kernel for AffineGridKernel {
             )));
         }
 
-        let theta = to_dense_f32(&inputs[0])?;
+        let theta = to_dense_f32_widen("AffineGrid", &inputs[0])?;
         let mut out = Vec::with_capacity(expected_shape.iter().product());
         if spatial_rank == 2 {
             let (height, width) = (dims[0], dims[1]);
@@ -111,7 +112,7 @@ impl Kernel for AffineGridKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("AffineGrid", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
@@ -123,6 +124,41 @@ impl Kernel for AffineGridKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn affine_grid_bf16_matches_widened_f32_reference() {
+        let theta_vals = [1.0f32, 0.25, -0.5, 0.1, 1.0, 0.75];
+        let theta_f32 = Owned::f32(&[1, 2, 3], &theta_vals);
+        let size = Owned::i64(&[4], &[1, 1, 2, 3]);
+        let mut ref_out = Owned::zeros_f32(&[1, 2, 3, 2]);
+        AffineGridKernel {
+            align_corners: true,
+        }
+        .execute(&[theta_f32.view(), size.view()], &mut [ref_out.view_mut()])
+        .unwrap();
+
+        let theta_bf16 = Owned::bf16(&[1, 2, 3], &theta_vals);
+        let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 2, 3, 2]);
+        AffineGridKernel {
+            align_corners: true,
+        }
+        .execute(
+            &[theta_bf16.view(), size.view()],
+            &mut [bf16_out.view_mut()],
+        )
+        .unwrap();
+
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "affine_grid bf16 {g} vs f32 {r}"
+            );
+        }
+    }
 
     #[test]
     fn affine_grid_2d_honors_align_corners() {

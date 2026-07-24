@@ -34,9 +34,10 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
 
 use super::add::broadcast_apply;
+use super::check_arity;
 use super::matmul::matmul_dense;
 use super::softmax::softmax_slices;
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 /// f32 SDPA kernel carrying the folded `scale` and the `k_transposed` flag.
@@ -134,7 +135,7 @@ impl Kernel for FusedAttentionKernel {
             *s *= self.scale;
         }
         if has_mask {
-            let mask = to_dense_f32(&inputs[3])?;
+            let mask = to_dense_f32_widen("FusedAttention", &inputs[3])?;
             let mask_shape = inputs[3].shape;
             broadcast_apply(&mask, mask_shape, &scores_shape, |i, val| scores[i] += val)?;
         }
@@ -159,7 +160,7 @@ impl Kernel for FusedAttentionKernel {
             DeviceId::cpu(),
         );
         let out = matmul_dense(&probs_view, v)?;
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("FusedAttention", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -419,5 +420,35 @@ mod tests {
         let r = out.to_f32();
         assert!((r[0] + r[1] - 1.0).abs() < 1e-6);
         assert!((r[2] + r[3] - 1.0).abs() < 1e-6);
+    }
+    #[test]
+    fn fused_attention_bf16_matches_widened_f32_reference() {
+        let q = Owned::bf16(&[1, 2], &[1., -1.]);
+        let k = Owned::bf16(&[2, 2], &[1., 0., 0., 1.]);
+        let v = Owned::bf16(&[2, 2], &[2., -1., -2., 3.]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[1, 2]);
+        FusedAttentionKernel {
+            scale: 1.,
+            k_transposed: false,
+        }
+        .execute(&[q.view(), k.view(), v.view()], &mut [out.view_mut()])
+        .unwrap();
+        let want = reference(
+            &q.to_bf16_as_f32(),
+            1,
+            2,
+            &k.to_bf16_as_f32(),
+            2,
+            &v.to_bf16_as_f32(),
+            2,
+            1.,
+            None,
+        );
+        let want: Vec<_> = want
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        assert_eq!(out.to_bf16_as_f32(), want);
     }
 }

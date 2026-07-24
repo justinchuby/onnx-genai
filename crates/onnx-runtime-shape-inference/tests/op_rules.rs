@@ -3224,6 +3224,16 @@ fn pooling_rejects_cancellation_masked_symbolic_overflow() {
 
 #[test]
 fn resize_infers_constant_scales_and_sizes() {
+    let legacy = run(
+        &node("Resize", 2, 1),
+        vec![
+            f32in(vec![c(2), c(3), c(4)]),
+            sd_float_vec(vec![1.0, 1.0, 1.5]),
+        ],
+        10,
+    );
+    assert_eq!(out_shape(&legacy), vec![c(2), c(3), c(6)]);
+
     let mut scales_node = node("Resize", 4, 1);
     scales_node.inputs[1] = None;
     scales_node.inputs[3] = None;

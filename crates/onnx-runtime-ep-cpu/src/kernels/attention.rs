@@ -48,7 +48,8 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 standard-`Attention` kernel carrying the resolved attributes.
 pub struct AttentionKernel {
@@ -137,7 +138,7 @@ fn to_bhsd(view: &TensorView, name: &str, num_heads: Option<usize>) -> Result<Bh
     match shape.len() {
         4 => {
             let (batch, heads, seq, dim) = (shape[0], shape[1], shape[2], shape[3]);
-            let data = to_dense_f32(view)?;
+            let data = to_dense_f32_widen("Attention", view)?.into_owned();
             Ok(Bhsd {
                 data,
                 batch,
@@ -168,7 +169,7 @@ fn to_bhsd(view: &TensorView, name: &str, num_heads: Option<usize>) -> Result<Bh
             let dim = hidden / heads;
             // Source is contiguous over (batch, seq, heads, dim); transpose the
             // seq/heads axes to produce (batch, heads, seq, dim).
-            let src = to_dense_f32(view)?;
+            let src = to_dense_f32_widen("Attention", view)?;
             let mut data = vec![0.0f32; batch * heads * seq * dim];
             for b in 0..batch {
                 for s in 0..seq {
@@ -467,13 +468,15 @@ impl Kernel for AttentionKernel {
                     data: super::to_dense_bytes(m)?.iter().map(|&b| b != 0).collect(),
                     shape: m.shape.to_vec(),
                 },
-                DataType::Float32 => Mask::Float {
-                    data: to_dense_f32(m)?,
-                    shape: m.shape.to_vec(),
-                },
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16 | DataType::Float64 => {
+                    Mask::Float {
+                        data: to_dense_f32_widen("Attention", m)?.into_owned(),
+                        shape: m.shape.to_vec(),
+                    }
+                }
                 other => {
                     return Err(EpError::KernelFailed(format!(
-                        "Attention: attn_mask dtype {other:?} not supported (expected bool or f32)"
+                        "Attention: attn_mask dtype {other:?} not supported (expected bool or floating-point)"
                     )));
                 }
             }
@@ -618,20 +621,20 @@ impl Kernel for AttentionKernel {
                     }
                 }
             }
-            write_dense_f32(&mut outputs[0], &y3)?;
+            write_dense_f32_narrow("Attention", &mut outputs[0], &y3)?;
         } else {
-            write_dense_f32(&mut outputs[0], &y)?;
+            write_dense_f32_narrow("Attention", &mut outputs[0], &y)?;
         }
 
         // present_key / present_value (outputs 1 and 2), always 4D.
         if outputs.len() >= 2 {
-            write_dense_f32(&mut outputs[1], &key.data)?;
+            write_dense_f32_narrow("Attention", &mut outputs[1], &key.data)?;
         }
         if outputs.len() >= 3 {
-            write_dense_f32(&mut outputs[2], &value.data)?;
+            write_dense_f32_narrow("Attention", &mut outputs[2], &value.data)?;
         }
         if want_qk {
-            write_dense_f32(&mut outputs[3], &qk_out)?;
+            write_dense_f32_narrow("Attention", &mut outputs[3], &qk_out)?;
         }
         Ok(())
     }
@@ -2486,5 +2489,37 @@ mod tests {
             let s = probs[i * sk] + probs[i * sk + 1];
             assert!((s - 1.0).abs() < 1e-6, "valid probs must sum to 1: {s}");
         }
+    }
+    #[test]
+    fn attention_bf16_matches_widened_f32_reference() {
+        let q = Owned::bf16(&[1, 1, 2, 2], &[1., -1., 0., 2.]);
+        let k = Owned::bf16(&[1, 1, 2, 2], &[1., 0., 0., 1.]);
+        let v = Owned::bf16(&[1, 1, 2, 2], &[2., -1., -2., 3.]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[1, 1, 2, 2]);
+        kernel(Some(1.), false, Some(1), Some(1), 0, 0.)
+            .execute(&[q.view(), k.view(), v.view()], &mut [out.view_mut()])
+            .unwrap();
+        let expected = reference(
+            &q.to_bf16_as_f32(),
+            &k.to_bf16_as_f32(),
+            &v.to_bf16_as_f32(),
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            1.,
+            false,
+            0,
+            |_, _, _, _| 0.,
+        );
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        assert_eq!(out.to_bf16_as_f32(), expected);
     }
 }

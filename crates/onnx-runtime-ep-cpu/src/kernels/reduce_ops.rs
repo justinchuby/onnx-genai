@@ -16,12 +16,11 @@
 //! dense buffer matches it element-for-element because reduced axes contribute
 //! either a retained size-1 dim (keepdims) or nothing (squeezed).
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
-use super::{
-    check_arity, to_dense_bytes, to_dense_f32, to_dense_i64, write_dense_bytes, write_dense_f32,
-};
+use super::{check_arity, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::{next_index, numel};
 
 /// The reduction to apply over the selected axes.
@@ -162,7 +161,7 @@ impl Kernel for ReduceKernel {
         if matches!(self.op, ReduceOp::Sum) && inputs[0].dtype == onnx_runtime_ir::DataType::Int64 {
             return self.execute_i64_sum(inputs, &mut outputs[0]);
         }
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen(self.op.name(), &inputs[0])?;
         let in_shape = inputs[0].shape;
         let rank = in_shape.len();
         let reduce = self.resolve_axes(inputs, rank)?;
@@ -233,7 +232,7 @@ impl Kernel for ReduceKernel {
                 .collect()
         };
         let _ = self.keepdims;
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow(self.op.name(), &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -656,5 +655,25 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 1]);
         run_attr(ReduceOp::Sum, Some(vec![1]), &x, &mut out);
         assert_eq!(out.to_f32(), vec![0., 0.]);
+    }
+    #[test]
+    fn reduce_sum_bf16_matches_widened_f32_reference() {
+        let x = Owned::bf16(&[2, 3], &[-80., 0., 1., 80., -1., 2.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 1]);
+        ReduceKernel {
+            op: ReduceOp::Sum,
+            axes_attr: Some(vec![1]),
+            keepdims: true,
+            noop_with_empty_axes: false,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        assert_eq!(
+            out.to_bf16_as_f32(),
+            vec![
+                half::bf16::from_f32(-79.).to_f32(),
+                half::bf16::from_f32(81.).to_f32()
+            ]
+        );
     }
 }

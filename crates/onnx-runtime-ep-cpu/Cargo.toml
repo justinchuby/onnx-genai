@@ -11,6 +11,10 @@ categories = ["science", "hardware-support"]
 [features]
 # Opt-in vendored MLAS f32 SGEMM. Kept off by default because it builds C++/asm.
 mlas = ["dep:mlas-sys"]
+# Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
+# gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no
+# code to production builds.
+gqa_phase_profile = []
 tracing = ["dep:onnx-runtime-tracer"]
 
 [dependencies]
@@ -24,10 +28,23 @@ onnx-runtime-tracer = { workspace = true, optional = true }
 thiserror = { workspace = true }
 half = "2"
 rayon = "1"
+libc = "0.2"
 # Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by
 # the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9
 # off near zero and failed the upstream conformance suite's tight tolerance.
 libm = "0.2"
+
+# Windows NUMA topology discovery (GetLogicalProcessorInformationEx) and
+# per-thread pinning (SetThreadGroupAffinity), with the process's allowed CPU
+# set read via GetThreadGroupAffinity. Already present transitively in the
+# workspace lock; gated to Windows targets so no non-Windows build pulls it in.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Kernel",
+] }
 
 [dev-dependencies]
 criterion = "0.5"

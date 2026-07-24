@@ -506,6 +506,44 @@ impl Tensor {
         Self::from_raw_in(shared_cpu_ep(), dtype, shape, bytes)
     }
 
+    /// Take ownership of an already-allocated, contiguous `buffer` (allocated by
+    /// `allocator`) and wrap it as a row-major tensor **without copying**. The
+    /// executor uses this to hand a produced output's host buffer straight to
+    /// the caller instead of round-tripping the bytes through
+    /// [`copy_to_host`](ExecutionProvider::copy_to_host) plus a second
+    /// allocate+copy in [`from_raw`]. The bytes are the exact same memory the
+    /// kernel wrote, so this is numerically identical to the copy path.
+    ///
+    /// `buffer` must hold exactly `storage_bytes(numel)` bytes for `dtype` and
+    /// `shape`, must be host-resident, and must be owned (not borrowed) so the
+    /// tensor can free it exactly once on drop.
+    pub(crate) fn from_owned_buffer(
+        allocator: Arc<dyn ExecutionProvider>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        buffer: DeviceBuffer,
+    ) -> Self {
+        debug_assert!(
+            !buffer.is_borrowed(),
+            "from_owned_buffer requires an owned buffer"
+        );
+        debug_assert_eq!(
+            buffer.len(),
+            dtype.storage_bytes(shape.iter().product::<usize>()).max(1),
+            "from_owned_buffer size mismatch for shape {shape:?} dtype {dtype:?}",
+        );
+        let device = buffer.device();
+        Self {
+            dtype,
+            shape,
+            layout: TensorLayout::contiguous(),
+            device,
+            buffer: Some(buffer),
+            allocator,
+            import_guard: None,
+        }
+    }
+
     /// Build an `f32` tensor from a dense row-major slice.
     pub fn from_f32(shape: &[usize], data: &[f32]) -> Result<Self> {
         let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -662,6 +700,46 @@ impl Tensor {
         Ok(())
     }
 
+    /// Borrow the elements as `f32` without copying (host tensors only).
+    /// Returns `None` on big-endian or unexpectedly misaligned hosts; panics
+    /// only when called on a non-`Float32` tensor.
+    pub fn try_as_slice_f32(&self) -> Option<&[f32]> {
+        assert_eq!(
+            self.dtype,
+            DataType::Float32,
+            "try_as_slice_f32 on non-f32 tensor"
+        );
+        if cfg!(target_endian = "big") {
+            return None;
+        }
+        let bytes = self.as_bytes();
+        if bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) != 0 {
+            return None;
+        }
+        // SAFETY: Float32 tensor storage contains `numel` contiguous, aligned
+        // f32 elements and the returned slice cannot outlive the tensor borrow.
+        Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), self.numel()) })
+    }
+
+    /// Borrow Float16/BFloat16 storage as raw 16-bit elements without copying.
+    /// Returns `None` on big-endian or unexpectedly misaligned hosts.
+    pub fn try_as_slice_u16(&self) -> Option<&[u16]> {
+        assert!(
+            matches!(self.dtype, DataType::Float16 | DataType::BFloat16),
+            "try_as_slice_u16 on non-16-bit float tensor"
+        );
+        if cfg!(target_endian = "big") {
+            return None;
+        }
+        let bytes = self.as_bytes();
+        if bytes.as_ptr().align_offset(std::mem::align_of::<u16>()) != 0 {
+            return None;
+        }
+        // SAFETY: 16-bit float storage contains `numel` contiguous, aligned u16
+        // bit patterns and the returned slice cannot outlive the tensor borrow.
+        Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u16>(), self.numel()) })
+    }
+
     /// Copy out the elements as `f32`. Panics if the dtype is not `Float32`.
     pub fn to_vec_f32(&self) -> Vec<f32> {
         assert_eq!(
@@ -669,10 +747,15 @@ impl Tensor {
             DataType::Float32,
             "to_vec_f32 on non-f32 tensor"
         );
-        self.as_bytes()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+        self.try_as_slice_f32().map_or_else(
+            || {
+                self.as_bytes()
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            },
+            <[f32]>::to_vec,
+        )
     }
 
     /// Copy out the elements as `i64`. Panics if the dtype is not `Int64`.
@@ -768,6 +851,7 @@ mod tests {
 
         // The tensor aliases the backing store without copying it.
         assert_eq!(tensor.as_bytes().len(), 16);
+        assert_eq!(tensor.try_as_slice_f32().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(tensor.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(
             drops.load(Ordering::SeqCst),
@@ -781,5 +865,16 @@ mod tests {
             1,
             "guard runs exactly once on drop"
         );
+    }
+
+    #[test]
+    fn borrows_aligned_half_storage_as_raw_bits() {
+        let bits = [0x3c00u16, 0x4000];
+        let bytes = bits
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let tensor = Tensor::from_raw(DataType::Float16, vec![2], &bytes).unwrap();
+        assert_eq!(tensor.try_as_slice_u16().unwrap(), bits);
     }
 }

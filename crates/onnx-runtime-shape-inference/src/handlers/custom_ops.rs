@@ -1,9 +1,4 @@
 //! Shape rules for runtime custom operators.
-//!
-//! `GatherBlockQuantized` shape inference is intentionally NOT registered —
-//! it awaits an authoritative `com.microsoft` schema/CPU-kernel contract. An
-//! unregistered op leaves its output shapes uninferred (safe) rather than
-//! emitting a guessed shape.
 
 use onnx_runtime_ir::{Attribute, DataType};
 
@@ -318,10 +313,114 @@ fn c(value: i64) -> DimExpr {
     DimExpr::constant(value)
 }
 
+/// `com.microsoft::CausalConvWithState`: output 0 preserves the `[B, C, L]`
+/// input activation; output 1 (present conv state) preserves the past-state
+/// `[B, C, K-1]` cache shape supplied as input 3.
+pub fn causal_conv_with_state(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(input) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, input);
+    }
+    if ctx.num_outputs() >= 2
+        && ctx.has_input(3)
+        && let Some(state) = ctx.input_type(3).cloned()
+    {
+        ctx.set_output_type(1, state);
+    }
+    Ok(())
+}
+
+/// `com.microsoft::LinearAttention`: output 0 is `[B, T, max(H_q, H_kv)·d_v]`
+/// where `d_v = value_hidden / H_kv`; output 1 (present recurrent state)
+/// preserves the past-state `[B, H_kv, d_k, d_v]` cache supplied as input 3.
+pub fn linear_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let q_num_heads = int_attr(ctx, "q_num_heads", 0)?;
+    let kv_num_heads = int_attr(ctx, "kv_num_heads", 0)?;
+    if let (Some(query), Some(query_shape), Some(value_shape)) = (
+        ctx.input_type(0).map(|t| t.dtype),
+        ctx.input_shape(0).map(<[_]>::to_vec),
+        ctx.input_shape(2).map(<[_]>::to_vec),
+    ) && query_shape.len() == 3
+        && value_shape.len() == 3
+        && kv_num_heads > 0
+        && q_num_heads > 0
+    {
+        let out_heads = q_num_heads.max(kv_num_heads);
+        let d_v = value_shape[2]
+            .checked_div(&c(kv_num_heads))
+            .unwrap_or_else(DimExpr::overflow);
+        let out_hidden = d_v.mul(&c(out_heads));
+        ctx.set_output(
+            0,
+            query,
+            vec![query_shape[0].clone(), query_shape[1].clone(), out_hidden],
+        );
+    }
+    if ctx.num_outputs() >= 2
+        && ctx.has_input(3)
+        && let Some(state) = ctx.input_type(3).cloned()
+    {
+        ctx.set_output_type(1, state);
+    }
+    Ok(())
+}
+
+/// `com.microsoft::RotaryEmbedding`: the rotation is shape-preserving, so the
+/// output mirrors the `X` activation (input 0).
+pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(input) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, input);
+    }
+    Ok(())
+}
+
+/// `com.microsoft::GatherBlockQuantized`: output preserves the scales dtype and
+/// has shape `indices.shape ++ data.shape[1:]` (for `gather_axis == 0`), with
+/// the last axis scaled by `8 / bits` when several elements are packed per byte.
+pub fn gather_block_quantized(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let gather_axis = int_attr(ctx, "gather_axis", 0)?;
+    let bits = int_attr(ctx, "bits", 4)?;
+    if gather_axis != 0 || bits <= 0 {
+        return Ok(());
+    }
+    let components = 8 / bits;
+    if let (Some(dtype), Some(data_shape), Some(indices_shape)) = (
+        ctx.input_type(2).map(|t| t.dtype),
+        ctx.input_shape(0).map(<[_]>::to_vec),
+        ctx.input_shape(1).map(<[_]>::to_vec),
+    ) && data_shape.len() >= 2
+    {
+        let last = data_shape.len() - 1;
+        let mut dims = indices_shape;
+        for (axis, dim) in data_shape.iter().enumerate().skip(1) {
+            if axis == last && components > 1 {
+                dims.push(dim.mul(&c(components)));
+            } else {
+                dims.push(dim.clone());
+            }
+        }
+        ctx.set_output(0, dtype, dims);
+    }
+    Ok(())
+}
+
 /// Register custom runtime and ORT contrib operators.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("com.microsoft", "MoE", 1, moe);
     reg.register("com.microsoft", "QMoE", 1, moe);
+    reg.register(
+        "com.microsoft",
+        "CausalConvWithState",
+        1,
+        causal_conv_with_state,
+    );
+    reg.register("com.microsoft", "LinearAttention", 1, linear_attention);
+    reg.register(
+        "com.microsoft",
+        "GatherBlockQuantized",
+        1,
+        gather_block_quantized,
+    );
+    reg.register("com.microsoft", "RotaryEmbedding", 1, rotary_embedding);
     reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
     reg.register("pkg.nxrt", "IndexShare", 1, index_share);

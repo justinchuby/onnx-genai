@@ -12,7 +12,7 @@ use onnx_genai_engine::{
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
     ProcessorChain,
 };
-use onnx_genai_ort::{Tokenizer, available_execution_providers};
+use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -286,6 +286,17 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         configure_ort_provider(args)?;
     }
 
+    if !matches!(args.backend, DecodeBackend::Native) {
+        let requested_provider = match args.ep {
+            ExecutionProvider::Cpu => "cpu",
+            ExecutionProvider::Cuda => "cuda",
+        };
+        // This single-threaded CLI sets provider selection before the process-wide
+        // runtime configuration is first read while constructing the ORT session.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_EP", requested_provider);
+        }
+    }
     let mut config = EngineConfig {
         decode_backend: args.backend.into(),
         ..EngineConfig::default()
@@ -298,6 +309,12 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             model_dir.display()
         )
     })?;
+    println!(
+        "profile_native: model={} ep={:?} backend={}",
+        model_dir.display(),
+        args.ep,
+        args.backend.as_str()
+    );
     if args.backend != DecodeBackend::Native {
         println!(
             "profile_native: resolved_backend={}",
@@ -340,7 +357,10 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         }
         if let Some(reference) = &reference_tokens {
             if reference != &result.token_ids {
-                bail!("greedy decode was not deterministic across measured runs");
+                bail!(
+                    "{} greedy decode was not deterministic across measured runs",
+                    args.backend.as_str()
+                );
             }
         } else {
             reference_tokens = Some(result.token_ids.clone());
@@ -363,8 +383,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
 
     println!(
-        "steady_median: prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
+        "steady_median: backend={} prefill={:.3} ms decode={:.3} ms/token throughput={:.2} tok/s \
          (runs={} warmups={} decode_skip={})",
+        args.backend.as_str(),
         median(&mut prefills_ms),
         median(&mut decode_ms_per_token),
         median(&mut throughputs),
@@ -375,6 +396,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
     }
+    onnx_runtime_session::print_exec_phase_profile();
     Ok(())
 }
 
@@ -693,6 +715,7 @@ fn main() -> Result<()> {
             &args,
         )?);
     }
+    profile::reset();
 
     let stats_before = session.cuda_kv_debug_stats();
     let mut generated = 0usize;
@@ -753,6 +776,9 @@ fn main() -> Result<()> {
                 .decode(&tokens)
                 .context("decode generated tokens")?
         );
+    }
+    if profile::enabled() {
+        println!("{}", profile::report(generated as u64));
     }
     Ok(())
 }

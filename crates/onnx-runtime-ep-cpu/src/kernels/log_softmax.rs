@@ -1,9 +1,10 @@
 //! Numerically stable `LogSoftmax` with ONNX-versioned axis semantics.
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
 use crate::strided::numel;
 
 /// `LogSoftmax` kernel carrying its axis and whether it uses the pre-opset-13
@@ -64,7 +65,7 @@ fn log_softmax_slices(x: &[f32], out: &mut [f32], outer: usize, axis_dim: usize,
 impl Kernel for LogSoftmaxKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("LogSoftmax", inputs, outputs, 1, 1, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        let x = to_dense_f32_widen("LogSoftmax", &inputs[0])?;
         let shape = inputs[0].shape;
         let rank = shape.len();
         if rank == 0 {
@@ -94,7 +95,7 @@ impl Kernel for LogSoftmaxKernel {
             let inner = shape[axis + 1..].iter().product();
             log_softmax_slices(&x, &mut out, outer, shape[axis], inner);
         }
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("LogSoftmax", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -171,5 +172,21 @@ mod tests {
         for output in [&shifted_out, &equal_large_out] {
             assert!((output.to_f32().iter().map(|v| v.exp()).sum::<f32>() - 1.0).abs() < 1e-6);
         }
+    }
+    #[test]
+    fn log_softmax_bf16_matches_widened_f32_reference() {
+        let values = [-10.0, 0.0, 1.0, 80.0, -80.0, 2.0];
+        let x = Owned::bf16(&[2, 3], &values);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
+        run(-1, false, &x, &mut out);
+        let rounded = x.to_bf16_as_f32();
+        let mut reference = vec![0.0; rounded.len()];
+        log_softmax_slices(&rounded, &mut reference, 2, 3, 1);
+        let expected: Vec<_> = reference
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        assert_eq!(out.to_bf16_as_f32(), expected);
     }
 }

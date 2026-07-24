@@ -168,6 +168,23 @@ mod tests {
     }
 
     #[test]
+    fn lp_normalization_bf16_matches_widened_f32_reference() {
+        let values = [1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0];
+        let reference = run(&[2, 3], &values, 1, 2);
+        let x = Owned::bf16(&[2, 3], &values);
+        let mut y = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
+        LpNormalizationKernel { axis: 1, p: 2 }
+            .execute(&[x.view()], &mut [y.view_mut()])
+            .unwrap();
+        for (&r, &g) in reference.iter().zip(y.to_bf16_as_f32().iter()) {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "lp_normalization bf16 {g} vs f32 {r}"
+            );
+        }
+    }
+
+    #[test]
     fn l1_normalization_axes_zero_one_and_last() {
         let values = [1.0, -2.0, 3.0, 4.0, -5.0, 6.0];
         assert_close(

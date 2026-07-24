@@ -89,6 +89,21 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     #[test]
+    fn expand_bf16_preserves_element_bits() {
+        // [1,3] -> [2,3]; pure byte movement must preserve bf16 patterns exactly.
+        let x = Owned::bf16(&[1, 3], &[1.5, -2.25, 3.75]);
+        let shape = Owned::i64(&[2], &[2, 3]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
+        ExpandKernel
+            .execute(&[x.view(), shape.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_bf16_as_f32(),
+            vec![1.5, -2.25, 3.75, 1.5, -2.25, 3.75]
+        );
+    }
+
+    #[test]
     fn expand_row_vector_to_matrix() {
         // [1,3] -> [2,3]
         let x = Owned::f32(&[1, 3], &[1., 2., 3.]);

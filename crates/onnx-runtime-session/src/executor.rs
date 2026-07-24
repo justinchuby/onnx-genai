@@ -56,6 +56,7 @@ use onnx_runtime_ep_api::{
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
+use onnx_runtime_ir::Attribute;
 use onnx_runtime_ir::{
     DataType, DeviceType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId,
     WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides,
@@ -81,6 +82,161 @@ fn profile_ops_enabled() -> bool {
         std::env::var("ONNX_GENAI_PROFILE_OPS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     })
+}
+
+/// Low-overhead, env-gated (`NXRT_EXEC_PHASE_PROFILE=1`) phase profiler for the
+/// executor's control-flow / subgraph-dispatch machinery. When disabled every
+/// entry point is a single relaxed-atomic load and an early return, so the
+/// production decode hot path pays no measurable cost. When enabled it
+/// accumulates wall-clock nanoseconds and a call count per named phase, which
+/// [`phase_profile_report`] renders to stderr. This exists to attribute the
+/// per-decode-step control-flow overhead (`exec_if` / `run_subgraph` / child
+/// setup) that the op-level profiler folds into the single `If` bucket.
+mod phase_profile {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+
+    pub fn enabled() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = std::env::var("NXRT_EXEC_PHASE_PROFILE")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Test-only override of the env-derived enable state.
+    #[cfg(test)]
+    pub(super) fn force_enabled(on: bool) {
+        STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    }
+
+    /// Test-only snapshot of a phase's accumulated `(total_ns, count)`.
+    #[cfg(test)]
+    pub(super) fn snapshot(phase: &'static str) -> Option<(u128, u64)> {
+        registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get(phase).map(|s| (s.total_ns, s.count)))
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct PhaseStat {
+        total_ns: u128,
+        count: u64,
+    }
+
+    fn registry() -> &'static Mutex<BTreeMap<&'static str, PhaseStat>> {
+        static REGISTRY: OnceLock<Mutex<BTreeMap<&'static str, PhaseStat>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Accumulate `nanos` against `phase`. No-op unless the profiler is enabled.
+    pub fn record(phase: &'static str, nanos: u128) {
+        if !enabled() {
+            return;
+        }
+        if let Ok(mut reg) = registry().lock() {
+            let entry = reg.entry(phase).or_default();
+            entry.total_ns += nanos;
+            entry.count += 1;
+        }
+    }
+
+    /// Scoped timer that records its lifetime to `phase` on drop.
+    pub struct PhaseSpan {
+        phase: &'static str,
+        start: Option<Instant>,
+    }
+
+    impl PhaseSpan {
+        pub fn new(phase: &'static str) -> Self {
+            let active = enabled();
+            Self {
+                phase,
+                // Avoid the clock read entirely on the disabled hot path.
+                start: if active { Some(Instant::now()) } else { None },
+            }
+        }
+    }
+
+    impl Drop for PhaseSpan {
+        fn drop(&mut self) {
+            if let Some(start) = self.start {
+                record(self.phase, start.elapsed().as_nanos());
+            }
+        }
+    }
+
+    /// Render and reset the accumulated per-phase table to stderr. Called once at
+    /// process exit (or on demand) so a single line-oriented dump is available.
+    pub fn report_to_stderr() {
+        if !enabled() {
+            return;
+        }
+        let rows: Vec<(&'static str, PhaseStat)> = match registry().lock() {
+            Ok(reg) => reg.iter().map(|(n, s)| (*n, *s)).collect(),
+            Err(_) => return,
+        };
+        static PRINTED: AtomicBool = AtomicBool::new(false);
+        if PRINTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut rows = rows;
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1.total_ns));
+        eprintln!("[nxrt-phase] phase,total_ms,calls,us/call");
+        for (name, stat) in &rows {
+            if name.ends_with("_bytes") {
+                continue;
+            }
+            let total_ms = stat.total_ns as f64 / 1_000_000.0;
+            let us_per_call = if stat.count > 0 {
+                (stat.total_ns as f64 / 1_000.0) / stat.count as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[nxrt-phase] {name},{total_ms:.3},{},{us_per_call:.2}",
+                stat.count
+            );
+        }
+        // Byte-valued counters (host traffic) are reported separately in MB.
+        for (name, stat) in &rows {
+            if !name.ends_with("_bytes") {
+                continue;
+            }
+            let total_mb = stat.total_ns as f64 / (1024.0 * 1024.0);
+            let mb_per_call = if stat.count > 0 {
+                total_mb / stat.count as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[nxrt-phase] {name},total_mb={total_mb:.1},calls={},mb/call={mb_per_call:.3}",
+                stat.count
+            );
+        }
+    }
+}
+
+/// Open an env-gated executor phase-profiling span (see [`phase_profile`]).
+macro_rules! phase_span {
+    ($phase:expr) => {
+        phase_profile::PhaseSpan::new($phase)
+    };
+}
+
+/// Public re-export so the bench/profile harness can dump the phase table.
+pub fn print_exec_phase_profile() {
+    phase_profile::report_to_stderr();
 }
 
 fn host_dtype_alignment(dtype: DataType) -> usize {
@@ -1179,6 +1335,24 @@ fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
     }
 }
 
+fn bytes_as_f64(bytes: &[u8], dtype: DataType) -> Option<Vec<f64>> {
+    match dtype {
+        DataType::Float32 => Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64)
+                .collect(),
+        ),
+        DataType::Float64 => Some(
+            bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Whether a runtime input is small enough to materialize as shape-propagation
 /// data. Keep this gate ahead of `contiguous_bytes`: unsupported tensors must
 /// degrade to absent shape-data without allocating or copying their contents.
@@ -1193,6 +1367,19 @@ fn bounded_shape_input(dtype: DataType, shape: &[usize]) -> bool {
         .iter()
         .try_fold(1usize, |count, &dim| count.checked_mul(dim))
         .is_some_and(|count| count <= MAX_SHAPE_DATA_ELEMS)
+}
+
+/// Whether a node reads the *float* runtime value of input `input_index` as
+/// shape-propagation data. Only default-domain `Resize` derives its output
+/// extent from a float `scales` input; every other op ignores float input
+/// values during shape inference. Restricting the float-value materialization to
+/// exactly these inputs keeps shape propagation from downloading an unrelated
+/// float input to host — a wasted copy that would also violate the contract that
+/// an invalid shape input is rejected *before* any host materialization.
+fn reads_float_shape_input(node: &Node, input_index: usize, opset: u64) -> bool {
+    node.is_default_domain()
+        && node.op_type == "Resize"
+        && input_index == if opset == 10 { 1 } else { 2 }
 }
 
 fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool {
@@ -1299,9 +1486,117 @@ fn dynamic_output_shapes(
     input_shapes: &[Vec<usize>],
     input_dtypes: &[DataType],
     input_values: &[Option<Vec<i64>>],
+    input_float_values: &[Option<Vec<f64>>],
     opset: u64,
 ) -> Option<Vec<Vec<usize>>> {
     match node.op_type.as_str() {
+        "Resize" if node.is_default_domain() => {
+            let input = input_shapes.first()?;
+            let rank = input.len();
+            let axes = if let Some(raw) = node.attr("axes").and_then(Attribute::as_ints) {
+                let mut axes = Vec::with_capacity(raw.len());
+                for &axis in raw {
+                    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+                    let axis = usize::try_from(axis).ok()?;
+                    if axis >= rank || axes.contains(&axis) {
+                        return None;
+                    }
+                    axes.push(axis);
+                }
+                if axes.is_empty() {
+                    (0..rank).collect()
+                } else {
+                    axes
+                }
+            } else {
+                (0..rank).collect()
+            };
+            let scales_index = if opset == 10 { 1 } else { 2 };
+            let scales = input_float_values
+                .get(scales_index)
+                .and_then(|values| values.as_deref())
+                .filter(|values| !values.is_empty());
+            let sizes = (opset >= 11)
+                .then(|| input_values.get(3).and_then(|values| values.as_deref()))
+                .flatten()
+                .filter(|values| !values.is_empty());
+            if scales.is_some() == sizes.is_some() {
+                return None;
+            }
+            let mut output = input.clone();
+            if let Some(scales) = scales {
+                if scales.len() != axes.len()
+                    || node
+                        .attr("keep_aspect_ratio_policy")
+                        .and_then(Attribute::as_str)
+                        .is_some_and(|policy| policy != "stretch")
+                {
+                    return None;
+                }
+                for (&axis, &scale) in axes.iter().zip(scales) {
+                    if !scale.is_finite() || scale <= 0.0 {
+                        return None;
+                    }
+                    let extent = input[axis] as f64 * scale;
+                    if extent > usize::MAX as f64 {
+                        return None;
+                    }
+                    output[axis] = extent.floor() as usize;
+                }
+            } else {
+                let sizes = sizes?;
+                if sizes.len() != axes.len() {
+                    return None;
+                }
+                let requested = sizes
+                    .iter()
+                    .map(|&size| usize::try_from(size).ok().filter(|&size| size > 0))
+                    .collect::<Option<Vec<_>>>()?;
+                match node
+                    .attr("keep_aspect_ratio_policy")
+                    .and_then(Attribute::as_str)
+                    .unwrap_or("stretch")
+                {
+                    "stretch" => {
+                        for (&axis, &size) in axes.iter().zip(&requested) {
+                            output[axis] = size;
+                        }
+                    }
+                    policy @ ("not_larger" | "not_smaller") => {
+                        if axes.iter().any(|&axis| input[axis] == 0) {
+                            return None;
+                        }
+                        let (numerator, denominator) = axes
+                            .iter()
+                            .zip(&requested)
+                            .map(|(&axis, &size)| (size, input[axis]))
+                            .reduce(|left, right| {
+                                let order = (left.0 as u128 * right.1 as u128)
+                                    .cmp(&(right.0 as u128 * left.1 as u128));
+                                if (policy == "not_larger" && order.is_le())
+                                    || (policy == "not_smaller" && order.is_ge())
+                                {
+                                    left
+                                } else {
+                                    right
+                                }
+                            })?;
+                        if denominator == 0 {
+                            return None;
+                        }
+                        for &axis in &axes {
+                            let product = (input[axis] as u128).checked_mul(numerator as u128)?;
+                            output[axis] = usize::try_from(
+                                (product + denominator as u128 / 2) / denominator as u128,
+                            )
+                            .ok()?;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(vec![output])
+        }
         // Opset-10+ `Slice`: data, starts, ends, [axes], [steps] as inputs. The
         // per-axis element count mirrors the `Slice` kernel's clamp semantics
         // exactly (ONNX reference), so the buffer we size here matches what the
@@ -1515,9 +1810,153 @@ fn run_ep_scoped_passes(
     let context = onnx_runtime_optimizer::PassContext::new().with_initializer_resolver(resolver);
     onnx_runtime_optimizer::run_passes(graph, &passes, &context)?;
 
+    // Best-effort shape refresh: the passes may have rewritten nodes whose
+    // output shapes downstream reads. A *data-dependent* invalidity (e.g. a
+    // `Slice` with step 0) is the runtime kernel's contract to reject, not a
+    // load-time error — before EP passes existed this re-inference did not run,
+    // so the graph built and the actionable diagnostic surfaced at `run`.
+    // Re-infer on a clone and adopt the refreshed shapes only on success so such
+    // a failure neither aborts the build nor leaves the graph partially updated;
+    // the executor's own resolution still validates shapes at run time.
     let registry = InferenceRegistry::default_registry();
     let opset_imports = graph.opset_imports.clone();
-    registry.infer_graph(graph, &opset_imports, MergePolicy::Permissive)?;
+    let mut refreshed = graph.clone();
+    if registry
+        .infer_graph(&mut refreshed, &opset_imports, MergePolicy::Permissive)
+        .is_ok()
+    {
+        *graph = refreshed;
+    }
+    Ok(())
+}
+
+fn validate_if_branch_outputs(graph: &Graph, node: &Node) -> Result<()> {
+    let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".to_string())) else {
+        return Ok(());
+    };
+    let Some(else_branch) = graph.subgraphs.get(&(node.id, "else_branch".to_string())) else {
+        return Ok(());
+    };
+
+    if then_branch.outputs.len() != else_branch.outputs.len() {
+        return Err(SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "branches declare different output counts: then_branch has {}, \
+                 else_branch has {}",
+                then_branch.outputs.len(),
+                else_branch.outputs.len()
+            ),
+        });
+    }
+    if then_branch.outputs.len() != node.outputs.len() {
+        return Err(SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "node declares {} output(s), but each branch declares {}",
+                node.outputs.len(),
+                then_branch.outputs.len()
+            ),
+        });
+    }
+    for (index, (&then_output, &else_output)) in then_branch
+        .outputs
+        .iter()
+        .zip(&else_branch.outputs)
+        .enumerate()
+    {
+        if then_branch.value_type_is_known(then_output)
+            && else_branch.value_type_is_known(else_output)
+        {
+            let then_dtype = then_branch.value(then_output).dtype;
+            let else_dtype = else_branch.value(else_output).dtype;
+            if then_dtype != else_dtype {
+                return Err(SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: format!(
+                        "branches declare different dtypes for output {index}: \
+                         then_branch is {then_dtype:?}, else_branch is {else_dtype:?}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
+    for (_, node) in graph.nodes.iter() {
+        if node.op_type == "If" && matches!(node.domain.as_str(), "" | "ai.onnx") {
+            validate_if_branch_outputs(graph, node)?;
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        validate_control_flow_signatures(subgraph)?;
+    }
+    Ok(())
+}
+
+/// Reject operators no execution provider can run, before EP optimizer passes
+/// run. An optimizer pass's postcondition validation walks the whole graph and
+/// would otherwise surface a less actionable structural error (e.g. an
+/// opset-import invariant) instead of the actionable unsupported-operator
+/// diagnostic callers rely on.
+///
+/// A CUDA graph may legitimately delegate unsupported nodes to a CPU fallback
+/// (see [`cuda_fallback_report`]), so an unsupported op is not fatal there; the
+/// check is limited to the terminal (non-CUDA) EP. Only nodes with fully static
+/// declared input shapes are pre-validated: a symbolic/data-dependent shape is
+/// resolved and validated at run time, so pre-checking a contrib op whose
+/// support is shape-conditional would change behavior for valid graphs.
+fn reject_unsupported_operators(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+    if ep.device_type() == DeviceType::Cuda {
+        return Ok(());
+    }
+    for (node_id, node) in graph.nodes.iter() {
+        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+            || is_control_flow_op(&node.op_type, &node.domain)
+            || is_sequence_op(&node.op_type, &node.domain)
+        {
+            continue;
+        }
+
+        let shapes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        // Defer nodes with any non-static declared input shape to the run-time
+        // kernel gate, which sees concrete shapes.
+        if !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
+            continue;
+        }
+        let input_dtypes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        let layouts = vec![TensorLayout::contiguous(); shapes.len()];
+        let opset = effective_opset(graph, node);
+        if let KernelMatch::Unsupported { reason } =
+            ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
+        {
+            return Err(SessionError::unsupported_op(
+                node,
+                node_id,
+                opset,
+                ep.name(),
+                reason,
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1762,6 +2201,19 @@ impl Executor {
         mut ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
     ) -> Result<Self> {
+        // Reject incompatible control-flow signatures before EP optimizers run:
+        // optimizer postconditions recursively validate subgraphs and can
+        // otherwise obscure the actionable If diagnostic with a structural
+        // error from a malformed branch.
+        validate_control_flow_signatures(&graph)?;
+        // Reject structurally invalid graphs (a non-DAG) and operators no EP can
+        // run *before* EP optimizers run. An optimizer pass's postcondition
+        // validation would otherwise obscure the actionable load-time diagnostic
+        // (a wrapped `CycleDetected`, or an opset-import invariant instead of the
+        // unsupported-operator error) with a structural error. Mirrors the
+        // control-flow signature check above.
+        graph.topological_order()?;
+        reject_unsupported_operators(&graph, ep.as_ref())?;
         fuse_silu_patterns(&mut graph);
         let graph_before_ep_passes = graph.clone();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
@@ -2676,6 +3128,25 @@ impl Executor {
         external: &ExternalBindings,
         mode: RunMode,
     ) -> Result<ScopedRunResult> {
+        // Distinguish the outermost (top-level graph) run from nested
+        // control-flow subgraph runs so the phase profiler can attribute
+        // overhead to the right layer.
+        thread_local! {
+            static RUN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let depth = RUN_DEPTH.with(|d| {
+            let cur = d.get();
+            d.set(cur + 1);
+            cur
+        });
+        struct DepthGuard;
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                RUN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let _depth_guard = DepthGuard;
+        let nested = depth > 0;
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
         self.views.clear();
@@ -2687,6 +3158,11 @@ impl Executor {
         self.restore_shared_buffers()?;
 
         // --- Resolve shapes from the actual bound inputs --------------------
+        let _phase_setup = phase_span!(if nested {
+            "run_scoped.setup_total.child"
+        } else {
+            "run_scoped.setup_total.top"
+        });
         let bindings = self.bind_symbols(inputs, external)?;
 
         for (name, _) in inputs {
@@ -2720,26 +3196,30 @@ impl Executor {
         // the run-scoped buffers from them (reused when unchanged). Values with a
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
-        let mut resolved = self.resolve_soft(&bindings);
-        if mode != RunMode::Eager {
-            // Persistent bindings seed the kernel-visible geometry selected by
-            // their input/output contracts. Seed only unresolved values:
-            // statically/symbolically resolved shapes remain authoritative.
-            external.seed_capture_shapes(&mut resolved);
-            // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
-            // shape inference but stable within a generation: seed their concrete
-            // prior-run shape so downstream capturable consumers fold into
-            // captured segments instead of forming per-consumer eager seams.
-            self.seed_control_flow_capture_shapes(&mut resolved);
-            // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
-            // output shape is data-dependent stay unresolved in `resolve_soft`
-            // and would each form an eager seam even though their kernels are
-            // already capture-safe. Seed their exact just-in-time shapes from
-            // the eager warmup — but only for the identical persistent-binding
-            // signature the warmup ran under, so a changed pointer/capacity
-            // withholds the seed instead of baking a stale shape.
-            self.seed_warm_decode_capture_shapes(&mut resolved, external);
-        }
+        let mut resolved = {
+            let _s = phase_span!("run_scoped.resolve_soft");
+            let mut resolved = self.resolve_soft(&bindings);
+            if mode != RunMode::Eager {
+                // Persistent bindings seed the kernel-visible geometry selected by
+                // their input/output contracts. Seed only unresolved values:
+                // statically/symbolically resolved shapes remain authoritative.
+                external.seed_capture_shapes(&mut resolved);
+                // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
+                // shape inference but stable within a generation: seed their concrete
+                // prior-run shape so downstream capturable consumers fold into
+                // captured segments instead of forming per-consumer eager seams.
+                self.seed_control_flow_capture_shapes(&mut resolved);
+                // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
+                // output shape is data-dependent stay unresolved in `resolve_soft`
+                // and would each form an eager seam even though their kernels are
+                // already capture-safe. Seed their exact just-in-time shapes from
+                // the eager warmup — but only for the identical persistent-binding
+                // signature the warmup ran under, so a changed pointer/capacity
+                // withholds the seed instead of baking a stale shape.
+                self.seed_warm_decode_capture_shapes(&mut resolved, external);
+            }
+            resolved
+        };
         let external_values = external
             .inputs
             .keys()
@@ -2753,7 +3233,10 @@ impl Executor {
             self.shared_buffers.remove(&vid);
             self.buffer_shapes.remove(&vid);
         }
-        self.size_buffers_excluding(&resolved, &external_values)?;
+        {
+            let _s = phase_span!("run_scoped.size_buffers");
+            self.size_buffers_excluding(&resolved, &external_values)?;
+        }
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
         for (name, tensor) in inputs {
@@ -2764,6 +3247,7 @@ impl Executor {
                 .expect("input value has a buffer");
             self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
+        drop(_phase_setup);
 
         // --- Execute nodes ---------------------------------------------------
         // Iterate by index so a control-flow node can take `&mut self` (it must
@@ -2771,6 +3255,11 @@ impl Executor {
         // disjoint-field borrow split inside `exec_kernel_node`.
         match mode {
             RunMode::Eager => {
+                let _s = phase_span!(if nested {
+                    "run_scoped.plan_eager.child"
+                } else {
+                    "run_scoped.plan_eager.top"
+                });
                 self.run_plan_eager(&mut resolved, outer_scope, external)?;
                 // Snapshot the exact just-in-time shapes this warm run resolved,
                 // together with the persistent-binding signature they were
@@ -2927,8 +3416,15 @@ impl Executor {
         // A view output (a layout op whose result aliases an input buffer) is
         // materialized to contiguous owned bytes here — external consumers and
         // the Python/DLPack boundary expect contiguous tensors.
+        let _phase_collect = phase_span!(if nested {
+            "run_scoped.collect_outputs.child"
+        } else {
+            "run_scoped.collect_outputs.top"
+        });
         let mut results = Vec::with_capacity(self.graph.outputs.len());
-        for &vid in &self.graph.outputs {
+        let mut host_output_bytes = 0usize;
+        let output_vids: Vec<ValueId> = self.graph.outputs.clone();
+        for vid in output_vids {
             if external.outputs.contains_key(&vid) {
                 results.push(None);
                 continue;
@@ -2946,10 +3442,27 @@ impl Executor {
 
             let dtype = self.value_dtypes[&vid];
             let shape = resolved[&vid].clone();
+            // Top-level outputs: hand the produced host buffer to the caller
+            // zero-copy when safe (the KV-cache round-trip the decode hot path
+            // otherwise pays every step). Child (subgraph) outputs are copied
+            // back into the parent scope, so keep them on the copy path.
+            if !nested && let Some(tensor) = self.try_move_host_output(vid, &shape, dtype)? {
+                results.push(Some(SessionOutput::Tensor(tensor)));
+                continue;
+            }
             let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
+            host_output_bytes += bytes.len();
             results.push(Some(SessionOutput::Tensor(Tensor::from_raw(
                 dtype, shape, &bytes,
             )?)));
+        }
+        // Attribution aid: at the top level, the number of graph-output bytes
+        // materialized to host each run is the per-step cost of *not* keeping
+        // outputs (e.g. a growing KV cache) in persistent device/host bindings.
+        // Recorded as a counter (bytes as the "nanos" field) so the phase table
+        // exposes total and per-call host-output traffic without extra logging.
+        if !nested {
+            phase_profile::record("collect_outputs.top_host_bytes", host_output_bytes as u128);
         }
         Ok(ScopedRunResult::Executed(results))
     }
@@ -3481,6 +3994,7 @@ impl Executor {
         // of this node's integer inputs. Buffers are NOT sized here — a view
         // output needs none, and the compute path sizes them just below.
         if outputs.iter().any(|v| !resolved.contains_key(v)) {
+            let opset = effective_opset(&self.graph, node);
             let input_values: Vec<Option<Vec<i64>>> = inputs
                 .iter()
                 .enumerate()
@@ -3488,12 +4002,30 @@ impl Executor {
                     v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
+            // Only materialize a *float* input value for the specific inputs an
+            // op actually reads as float shape data (today: `Resize` scales).
+            // Downloading any other float input here would both waste a host copy
+            // and break the "reject an invalid shape input before any host
+            // materialization" contract — e.g. a data tensor feeding an
+            // `Unsqueeze` whose integer axes is invalid must never be copied to
+            // host just to reach the unresolved-shape rejection.
+            let input_float_values: Vec<Option<Vec<f64>>> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if !reads_float_shape_input(node, i, opset) {
+                        return None;
+                    }
+                    v.and_then(|vid| self.shape_input_f64(vid, &input_shapes[i], input_dtypes[i]))
+                })
+                .collect();
             let out_shapes = dynamic_output_shapes(
                 node,
                 &input_shapes,
                 &input_dtypes,
                 &input_values,
-                effective_opset(&self.graph, node),
+                &input_float_values,
+                opset,
             )
             .ok_or_else(|| {
                 let vid = outputs
@@ -3747,7 +4279,14 @@ impl Executor {
         let opset = effective_opset(graph, node);
         let constant_inputs: Vec<bool> = inputs
             .iter()
-            .map(|input| input.is_some_and(|vid| graph.initializers.contains_key(&vid)))
+            .map(|input| {
+                input.is_some_and(|vid| {
+                    graph.initializers.contains_key(&vid)
+                        || views_meta
+                            .get(&vid)
+                            .is_some_and(|view| graph.initializers.contains_key(&view.source))
+                })
+            })
             .collect();
         let kernel = cache.get_or_create(
             node_id,
@@ -4094,6 +4633,34 @@ impl Executor {
             return None;
         }
         self.input_i64(vid, shape, dtype)
+    }
+
+    fn shape_input_f64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<f64>> {
+        if !matches!(dtype, DataType::Float32 | DataType::Float64)
+            || shape.len() > 1
+            || shape
+                .iter()
+                .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+                .is_none_or(|count| count > MAX_SHAPE_DATA_ELEMS)
+        {
+            return None;
+        }
+        let max_bytes = MAX_SHAPE_DATA_ELEMS.checked_mul(dtype.byte_size())?;
+        if let Some(view) = self.views.get(&vid) {
+            let source = self.buffers.get(&view.source)?;
+            if source.len() > max_bytes {
+                return None;
+            }
+        }
+        if self
+            .seq_elem_values
+            .get(&vid)
+            .is_some_and(|elem| elem.root_len() > max_bytes)
+        {
+            return None;
+        }
+        let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
+        bytes_as_f64(&bytes, dtype)
     }
 }
 
@@ -5063,6 +5630,83 @@ impl Executor {
         }
     }
 
+    /// Zero-copy hand-off of a top-level graph output: move the produced host
+    /// buffer straight into the returned tensor instead of copying it to host
+    /// and re-allocating it in [`Tensor::from_raw`]. This eliminates two full
+    /// per-output memcpys on the decode hot path (the growing KV-cache present
+    /// outputs re-materialized every step) while being numerically identical —
+    /// the tensor keeps the exact bytes the kernel wrote.
+    ///
+    /// Returns `None` (caller falls back to the copy path) unless every safety
+    /// precondition holds: the value is an owned, host-resident, exactly-sized
+    /// producer output that is not a view/sequence element, not pinned as a live
+    /// view source, not shared, and not listed as a graph output more than once.
+    /// Moving the buffer out forfeits this value's cross-run allocation reuse, so
+    /// its `buffer_shapes` entry is cleared to force a fresh allocation next run.
+    fn try_move_host_output(
+        &mut self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Result<Option<Tensor>> {
+        // Values the copy path materializes specially (strided gather, shared
+        // sequence element, in-place share, or a pinned live view source) must
+        // not have their backing buffer stolen.
+        if self.views.contains_key(&vid)
+            || self.seq_elem_values.contains_key(&vid)
+            || self.shared_buffers.contains_key(&vid)
+            || self.pinned.contains(&vid)
+        {
+            return Ok(None);
+        }
+        // Only a produced value owns a writable buffer. A producer-less output
+        // (initializer or graph-input passthrough) may alias read-only mmap or
+        // foreign/borrowed memory that a tensor must never free.
+        if self
+            .graph
+            .try_value(vid)
+            .is_none_or(|value| value.producer.is_none())
+        {
+            return Ok(None);
+        }
+        // A value produced by a memoized loop-invariant `If` is served on later
+        // steps directly from its resident buffer (the branch is skipped, see
+        // `exec_if`). Moving that buffer out would leave the next memoized skip
+        // handing back freed/reallocated memory, so fall back to the copy path
+        // and keep the produced buffer resident for reuse.
+        if let Some(producer) = self.graph.try_value(vid).and_then(|value| value.producer)
+            && self.if_last_predicate.contains_key(&producer)
+        {
+            return Ok(None);
+        }
+        // A value listed as a graph output more than once would be taken twice.
+        if self.graph.outputs.iter().filter(|&&o| o == vid).count() != 1 {
+            return Ok(None);
+        }
+        let value_name = || format!("value#{}", vid.0);
+        let numel = checked_numel(shape, value_name)?;
+        let n = checked_storage_bytes(dtype, numel, value_name, shape)?;
+        let movable = self.buffers.get(&vid).is_some_and(|buf| {
+            buf.device().is_host_accessible() && !buf.is_borrowed() && buf.len() == n
+        });
+        if !movable {
+            return Ok(None);
+        }
+        let buffer = self
+            .buffers
+            .remove(&vid)
+            .expect("buffer presence checked above");
+        // The buffer now belongs to the tensor; force a fresh allocation on the
+        // next run instead of the reuse fast path (which assumes it is present).
+        self.buffer_shapes.remove(&vid);
+        Ok(Some(Tensor::from_owned_buffer(
+            self.ep.clone(),
+            dtype,
+            shape.to_vec(),
+            buffer,
+        )))
+    }
+
     /// Contiguous row-major bytes of `vid` for `shape`/`dtype`, materializing a
     /// view (strided gather over its source buffer) or truncating an owned
     /// buffer to its logical size. This is the single materialization seam used
@@ -5320,49 +5964,7 @@ impl Executor {
                     ),
                 });
             }
-            if then_branch.outputs.len() != else_branch.outputs.len() {
-                return Err(SessionError::ControlFlow {
-                    op: "If".to_string(),
-                    reason: format!(
-                        "branches declare different output counts: then_branch has {}, \
-                         else_branch has {}",
-                        then_branch.outputs.len(),
-                        else_branch.outputs.len()
-                    ),
-                });
-            }
-            if then_branch.outputs.len() != node.outputs.len() {
-                return Err(SessionError::ControlFlow {
-                    op: "If".to_string(),
-                    reason: format!(
-                        "node declares {} output(s), but each branch declares {}",
-                        node.outputs.len(),
-                        then_branch.outputs.len()
-                    ),
-                });
-            }
-            for (index, (&then_output, &else_output)) in then_branch
-                .outputs
-                .iter()
-                .zip(&else_branch.outputs)
-                .enumerate()
-            {
-                if then_branch.value_type_is_known(then_output)
-                    && else_branch.value_type_is_known(else_output)
-                {
-                    let then_dtype = then_branch.value(then_output).dtype;
-                    let else_dtype = else_branch.value(else_output).dtype;
-                    if then_dtype != else_dtype {
-                        return Err(SessionError::ControlFlow {
-                            op: "If".to_string(),
-                            reason: format!(
-                                "branches declare different dtypes for output {index}: \
-                                 then_branch is {then_dtype:?}, else_branch is {else_dtype:?}"
-                            ),
-                        });
-                    }
-                }
-            }
+            validate_if_branch_outputs(&self.graph, node)?;
         }
 
         let cond_vid =
@@ -5414,8 +6016,14 @@ impl Executor {
             .get(&(node.id, attr_key.to_string()))
             .map(|body| required_outer_names(body).is_empty())
             .unwrap_or(false);
-        let prepared = self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?;
-        let outs = self.run_subgraph(&prepared, &[])?;
+        let prepared = {
+            let _s = phase_span!("execif.prepare_subgraph");
+            self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?
+        };
+        let outs = {
+            let _s = phase_span!("execif.run_subgraph");
+            self.run_subgraph(&prepared, &[])?
+        };
 
         if outs.len() != node.outputs.len() {
             return Err(SessionError::OutputShapeCountMismatch {
@@ -5424,8 +6032,11 @@ impl Executor {
                 got: outs.len(),
             });
         }
-        for (vid, t) in node.outputs.iter().zip(outs.iter()) {
-            self.store_output_tensor(*vid, t, resolved)?;
+        {
+            let _s = phase_span!("execif.store_output");
+            for (vid, t) in node.outputs.iter().zip(outs.iter()) {
+                self.store_output_tensor(*vid, t, resolved)?;
+            }
         }
         // Only enable future skips when the taken branch is loop-invariant.
         // Otherwise drop any stale memo so this `If` always re-runs.
@@ -6320,6 +6931,122 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn phase_profile_gating_and_accumulation() {
+        // Single test (not two) so the process-global enable flag is never
+        // toggled concurrently by a sibling test under the parallel runner.
+
+        // Disabled: a span records nothing and never captures a timestamp.
+        phase_profile::force_enabled(false);
+        let disabled_phase = "test.phase.disabled";
+        let before = phase_profile::snapshot(disabled_phase);
+        {
+            let _s = phase_span!(disabled_phase);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            phase_profile::snapshot(disabled_phase),
+            before,
+            "a disabled phase span must not accumulate any samples"
+        );
+
+        // Enabled: a span accumulates exactly one positive-duration sample.
+        phase_profile::force_enabled(true);
+        let enabled_phase = "test.phase.enabled";
+        let (base_ns, base_count) = phase_profile::snapshot(enabled_phase).unwrap_or((0, 0));
+        {
+            let _s = phase_span!(enabled_phase);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (after_ns, after_count) =
+            phase_profile::snapshot(enabled_phase).expect("enabled span must record a sample");
+        assert_eq!(after_count, base_count + 1, "one span => one sample");
+        assert!(
+            after_ns > base_ns,
+            "an enabled span must accumulate a positive duration"
+        );
+
+        // Restore the default (disabled) state so other tests stay inert.
+        phase_profile::force_enabled(false);
+    }
+
+    // A produced top-level output is handed to the caller by moving its host
+    // buffer out of the executor (zero-copy), while a producer-less output (an
+    // initializer routed straight to a graph output) stays on the copy path so
+    // its borrowed/shared storage is never freed. Repeated runs must keep
+    // producing correct bytes even though the produced buffer was moved out and
+    // its `buffer_shapes` entry cleared (forcing a fresh allocation each run).
+    #[test]
+    fn zero_copy_output_move_reallocates_and_preserves_producer_less_output() {
+        use onnx_runtime_ir::TensorData;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let a = graph.create_named_value("a", DataType::Float32, static_shape([3]));
+        let b = graph.create_named_value("b", DataType::Float32, static_shape([3]));
+        graph.add_input(a);
+        graph.add_input(b);
+
+        // Producer-less graph output: an initializer wired straight to an output.
+        let k = graph.create_named_value("k", DataType::Float32, static_shape([3]));
+        graph.set_initializer(
+            k,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![3],
+                [100.0f32, 200.0, 300.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+
+        // Produced output: Add(a, b). This is the movable, owned, host output.
+        let sum = graph.create_named_value("sum", DataType::Float32, static_shape([3]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![sum],
+        ));
+        graph.add_output(sum);
+        graph.add_output(k);
+
+        let mut executor = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+
+        let a_val = Tensor::from_f32(&[3], &[1.0, 2.0, 3.0]).unwrap();
+        let b_val = Tensor::from_f32(&[3], &[10.0, 20.0, 30.0]).unwrap();
+
+        // Three runs prove the move-out survives buffer reallocation: run 1 moves
+        // `sum`'s buffer out, so runs 2 and 3 must reallocate it from scratch.
+        for _ in 0..3 {
+            let outputs = executor
+                .run(&[("a", &a_val), ("b", &b_val)])
+                .expect("run must succeed after a prior output buffer was moved out");
+            assert_eq!(outputs[0].to_vec_f32(), vec![11.0, 22.0, 33.0]);
+            assert_eq!(
+                outputs[1].to_vec_f32(),
+                vec![100.0, 200.0, 300.0],
+                "producer-less initializer output must stay intact across runs"
+            );
+            // The produced output was handed off zero-copy: its buffer is gone
+            // from the executor. The initializer stays resident (copy path).
+            assert!(
+                !executor.buffers.contains_key(&sum),
+                "produced output buffer must be moved out, not copied"
+            );
+            assert!(
+                executor.buffers.contains_key(&k),
+                "producer-less output must not have its buffer stolen"
+            );
+        }
+    }
 
     struct CaptureDecliningKernel;
 
@@ -7633,7 +8360,8 @@ mod tests {
             DataType::Int64,
         ];
         let out =
-            dynamic_output_shapes(&node, &input_shapes, &input_dtypes, &input_values, 17).unwrap();
+            dynamic_output_shapes(&node, &input_shapes, &input_dtypes, &input_values, &[], 17)
+                .unwrap();
         assert_eq!(out.len(), 1, "Slice must resolve exactly one output shape");
         assert_eq!(out[0], vec![2, 2]);
 
@@ -7645,6 +8373,7 @@ mod tests {
                 &input_shapes,
                 &input_dtypes,
                 &input_values,
+                &[],
                 17
             )
             .is_none(),
@@ -7659,7 +8388,7 @@ mod tests {
             vec![ValueId(0)],
         );
         assert!(
-            dynamic_output_shapes(&other, &input_shapes, &input_dtypes, &input_values, 17)
+            dynamic_output_shapes(&other, &input_shapes, &input_dtypes, &input_values, &[], 17)
                 .is_none()
         );
     }
@@ -7680,6 +8409,7 @@ mod tests {
                 &[vec![2, 3], vec![2]],
                 &[DataType::Float32, DataType::Int64],
                 &[None, Some(vec![0, -1])],
+                &[],
                 17,
             ),
             Some(vec![vec![1, 2, 3, 1]])
@@ -7700,9 +8430,31 @@ mod tests {
                 &[vec![2, 3]],
                 &[DataType::Float32],
                 &[None],
+                &[],
                 11,
             ),
             Some(vec![vec![2, 1, 3, 1]])
+        );
+    }
+
+    #[test]
+    fn dynamic_output_shapes_resize_reads_runtime_scales() {
+        let node = Node::new(
+            NodeId(0),
+            "Resize",
+            vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+            vec![ValueId(3)],
+        );
+        assert_eq!(
+            dynamic_output_shapes(
+                &node,
+                &[vec![1, 128, 13, 13], vec![8], vec![4]],
+                &[DataType::Float32, DataType::Float32, DataType::Float32],
+                &[None, None, None],
+                &[None, None, Some(vec![1.0, 1.0, 2.0, 2.0])],
+                11,
+            ),
+            Some(vec![vec![1, 128, 26, 26]])
         );
     }
 
@@ -7754,6 +8506,7 @@ mod tests {
                     DataType::Int32,
                 ],
                 &input_values,
+                &[],
                 1,
             ),
             Some(vec![

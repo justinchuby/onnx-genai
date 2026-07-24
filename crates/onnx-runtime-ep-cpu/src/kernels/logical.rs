@@ -293,6 +293,27 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     #[test]
+    fn equal_and_comparison_accept_bf16_inputs() {
+        // Equal and the ordered comparisons dispatch over the numeric input
+        // dtype, so bf16 operands compare with the same truth values as f32.
+        let a = Owned::bf16(&[4], &[1.0, 2.5, -3.0, 4.0]);
+        let b = Owned::bf16(&[4], &[1.0, 2.0, -3.0, 5.0]);
+        let mut eq = Owned::zeros(DataType::Bool, &[4]);
+        EqualKernel
+            .execute(&[a.view(), b.view()], &mut [eq.view_mut()])
+            .unwrap();
+        assert_eq!(eq.to_bool(), vec![true, false, true, false]);
+
+        let mut gt = Owned::zeros(DataType::Bool, &[4]);
+        ComparisonKernel {
+            comparison: Comparison::Greater,
+        }
+        .execute(&[a.view(), b.view()], &mut [gt.view_mut()])
+        .unwrap();
+        assert_eq!(gt.to_bool(), vec![false, true, false, false]);
+    }
+
+    #[test]
     fn not_flips_bools() {
         let mut a = Owned::bool_(&[4], &[true, false, true, false]);
         a.bytes[0] = 7;

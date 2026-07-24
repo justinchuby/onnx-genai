@@ -538,6 +538,30 @@ impl GenAiConfig {
         &self,
         kv_native_dtype: Option<&str>,
     ) -> Result<InferenceMetadata, GenAiConfigError> {
+        self.build_inference_metadata(kv_native_dtype, None)
+    }
+
+    /// Like [`Self::to_inference_metadata`], but derives the single-decoder
+    /// KV/state topology from the decoder's actual ONNX graph inventory instead
+    /// of expanding KV name patterns over a uniform per-layer count.
+    ///
+    /// This is what lets hybrid SSM/attention decoders (sparse dense-KV layers
+    /// plus fixed `conv_state`/`recurrent_state` recurrent layers) load: only the
+    /// ports the graph truly exposes are declared. Uniform dense-KV decoders
+    /// produce byte-identical metadata to the pattern-expanded path.
+    pub fn to_inference_metadata_with_graph(
+        &self,
+        kv_native_dtype: Option<&str>,
+        decoder_graph: &ModelGraphInfo,
+    ) -> Result<InferenceMetadata, GenAiConfigError> {
+        self.build_inference_metadata(kv_native_dtype, Some(decoder_graph))
+    }
+
+    fn build_inference_metadata(
+        &self,
+        kv_native_dtype: Option<&str>,
+        decoder_graph: Option<&ModelGraphInfo>,
+    ) -> Result<InferenceMetadata, GenAiConfigError> {
         let shape = self.shape();
 
         let mut model = Map::new();
@@ -550,7 +574,7 @@ impl GenAiConfig {
         insert_usize(&mut model, "vocab_size", self.model.vocab_size);
 
         if shape == ModelShape::SingleDecoder {
-            let io = self.decoder_io_json(false);
+            let io = self.decoder_io_json(false, decoder_graph);
             if !io.is_empty() {
                 model.insert("io".into(), Value::Object(io));
             }
@@ -628,7 +652,11 @@ impl GenAiConfig {
     /// per layer. `kv_inputs` and `kv_outputs` are expanded with the same
     /// ordering so they pair positionally. Cross-attention KV (encoder-decoder)
     /// is expanded the same way into `cross_kv_inputs`/`cross_kv_outputs`.
-    fn decoder_io_json(&self, include_cross: bool) -> Map<String, Value> {
+    fn decoder_io_json(
+        &self,
+        include_cross: bool,
+        decoder_graph: Option<&ModelGraphInfo>,
+    ) -> Map<String, Value> {
         let dec = &self.model.decoder;
         let layers = dec.num_hidden_layers;
         let mut io = Map::new();
@@ -652,25 +680,49 @@ impl GenAiConfig {
             json!(dec.outputs.logits.as_deref().unwrap_or(DEFAULT_LOGITS)),
         );
 
-        if let Some(kv_inputs) = expand_kv(
-            dec.inputs.past_names.as_deref(),
-            dec.inputs.past_key_names.as_deref(),
-            dec.inputs.past_value_names.as_deref(),
-            DEFAULT_PAST_KEY,
-            DEFAULT_PAST_VALUE,
-            layers,
-        ) {
-            io.insert("kv_inputs".into(), json!(kv_inputs));
-        }
-        if let Some(kv_outputs) = expand_kv(
-            dec.outputs.present_names.as_deref(),
-            dec.outputs.present_key_names.as_deref(),
-            dec.outputs.present_value_names.as_deref(),
-            DEFAULT_PRESENT_KEY,
-            DEFAULT_PRESENT_VALUE,
-            layers,
-        ) {
-            io.insert("kv_outputs".into(), json!(kv_outputs));
+        // When the loader supplies the decoder's actual ONNX graph inventory,
+        // derive the KV/state topology from it rather than blindly expanding the
+        // `%d` KV name patterns over `0..num_hidden_layers`. Hybrid SSM/attention
+        // models (e.g. qwen3.5: linear-attention layers expose
+        // `conv_state`/`recurrent_state`, only the periodic full-attention layers
+        // expose dense `key`/`value`) have a SPARSE dense-KV port set plus fixed
+        // recurrent state ports. Trusting the uniform per-layer assumption there
+        // declares ports the graph never exposes and aborts warmup. The
+        // graph-derived path emits exactly the ports the graph presents: sparse
+        // `kv_inputs`/`kv_outputs` for dense layers and `state_pairs` for the
+        // recurrent state. A uniform dense-KV model yields an identical KV list
+        // and no state pairs, so existing models are unaffected. Any structural
+        // mismatch (missing name patterns, dtype disagreement) falls back to the
+        // pattern expansion below so no currently loading model regresses.
+        let graph_state =
+            decoder_graph.and_then(|graph| self.graph_decoder_state(graph).ok().flatten());
+        if let Some(state) = graph_state {
+            io.insert("kv_inputs".into(), json!(state.kv_inputs));
+            io.insert("kv_outputs".into(), json!(state.kv_outputs));
+            if !state.state_pairs.is_empty() {
+                io.insert("state_pairs".into(), Value::Array(state.state_pairs));
+            }
+        } else {
+            if let Some(kv_inputs) = expand_kv(
+                dec.inputs.past_names.as_deref(),
+                dec.inputs.past_key_names.as_deref(),
+                dec.inputs.past_value_names.as_deref(),
+                DEFAULT_PAST_KEY,
+                DEFAULT_PAST_VALUE,
+                layers,
+            ) {
+                io.insert("kv_inputs".into(), json!(kv_inputs));
+            }
+            if let Some(kv_outputs) = expand_kv(
+                dec.outputs.present_names.as_deref(),
+                dec.outputs.present_key_names.as_deref(),
+                dec.outputs.present_value_names.as_deref(),
+                DEFAULT_PRESENT_KEY,
+                DEFAULT_PRESENT_VALUE,
+                layers,
+            ) {
+                io.insert("kv_outputs".into(), json!(kv_outputs));
+            }
         }
 
         if include_cross {
@@ -805,7 +857,7 @@ impl GenAiConfig {
             dataflow.push(edge(&format!("embedding.{from}"), &format!("decoder.{to}")));
         }
 
-        let decoder_io = self.decoder_io_json(false);
+        let decoder_io = self.decoder_io_json(false, None);
         let decoder_io = (!decoder_io.is_empty()).then_some(Value::Object(decoder_io));
         models.insert(
             "decoder".into(),
@@ -844,7 +896,7 @@ impl GenAiConfig {
                 None,
             ),
         );
-        let decoder_io = self.decoder_io_json(true);
+        let decoder_io = self.decoder_io_json(true, None);
         let decoder_io = (!decoder_io.is_empty()).then_some(Value::Object(decoder_io));
         models.insert(
             "decoder".into(),
@@ -980,6 +1032,28 @@ pub fn inference_metadata_from_dir(
     };
     let config = load(&path)?;
     Ok(Some(config.to_inference_metadata(kv_native_dtype)?))
+}
+
+/// Like [`inference_metadata_from_dir`], but derives the single-decoder KV/state
+/// topology from the decoder's actual ONNX graph inventory (`decoder_graph`)
+/// rather than expanding KV name patterns over a uniform per-layer count.
+///
+/// This is the entry point runtime loaders use once the decoder session is
+/// available: it lets hybrid SSM/attention decoders load by declaring only the
+/// graph's real ports (sparse dense KV plus fixed recurrent `state_pairs`).
+pub fn inference_metadata_from_dir_with_graph(
+    model_dir: &Path,
+    kv_native_dtype: Option<&str>,
+    decoder_graph: &ModelGraphInfo,
+) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
+    let Some(path) = find_in_dir(model_dir) else {
+        return Ok(None);
+    };
+    let config = load(&path)?;
+    Ok(Some(config.to_inference_metadata_with_graph(
+        kv_native_dtype,
+        decoder_graph,
+    )?))
 }
 
 /// Strict compatibility conversion for an existing multimodal ORT-GenAI package.
@@ -1139,7 +1213,7 @@ impl GenAiConfig {
             kv_outputs,
             state_pairs,
             kv_dtype,
-        } = self.strict_decoder_state(graphs)?;
+        } = self.strict_decoder_state(&graphs.decoder)?;
         let has_state_pairs = !state_pairs.is_empty();
         let preprocessing =
             processor_program_json(&processor, vision, vision_pixel_info, vision_grid_info)?;
@@ -1325,7 +1399,7 @@ impl GenAiConfig {
 
     fn strict_decoder_state(
         &self,
-        graphs: &PipelineGraphInfo,
+        graph: &ModelGraphInfo,
     ) -> Result<DecoderStateMetadata, GenAiConfigError> {
         let decoder = &self.model.decoder;
         let past_key = required_str(
@@ -1345,10 +1419,10 @@ impl GenAiConfig {
             "model.decoder.outputs.present_value_names",
         )?;
 
-        let past_key_names = match_indexed_tensors(&graphs.decoder.inputs, past_key)?;
-        let past_value_names = match_indexed_tensors(&graphs.decoder.inputs, past_value)?;
-        let present_key_names = match_indexed_tensors(&graphs.decoder.outputs, present_key)?;
-        let present_value_names = match_indexed_tensors(&graphs.decoder.outputs, present_value)?;
+        let past_key_names = match_indexed_tensors(&graph.inputs, past_key)?;
+        let past_value_names = match_indexed_tensors(&graph.inputs, past_value)?;
+        let present_key_names = match_indexed_tensors(&graph.outputs, present_key)?;
+        let present_value_names = match_indexed_tensors(&graph.outputs, present_value)?;
         let indices = exact_index_set(
             &[
                 &past_key_names,
@@ -1400,13 +1474,13 @@ impl GenAiConfig {
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
         let state_inputs = suffix_tensor_map(
-            &graphs.decoder.inputs,
+            &graph.inputs,
             past_prefix,
             &kv_input_names,
             "fixed-state inputs",
         )?;
         let state_outputs = suffix_tensor_map(
-            &graphs.decoder.outputs,
+            &graph.outputs,
             present_prefix,
             &kv_output_names,
             "fixed-state outputs",
@@ -1442,6 +1516,32 @@ impl GenAiConfig {
             state_pairs,
             kv_dtype: kv_dtype.expect("non-empty KV indices establish a dtype"),
         })
+    }
+
+    /// Best-effort graph-derived decoder KV/state topology for the single-decoder
+    /// compatibility path.
+    ///
+    /// Returns `Ok(None)` when the config lacks the separate key/value name
+    /// patterns [`strict_decoder_state`](Self::strict_decoder_state) needs, and
+    /// swallows structural derivation errors into `Ok(None)` so callers can fall
+    /// back to uniform `%d` pattern expansion without regressing any model that
+    /// loads today. When it does return `Some`, the ports are exactly those the
+    /// ONNX graph exposes (sparse dense KV plus fixed recurrent `state_pairs`).
+    fn graph_decoder_state(
+        &self,
+        decoder: &ModelGraphInfo,
+    ) -> Result<Option<DecoderStateMetadata>, GenAiConfigError> {
+        let dec = &self.model.decoder;
+        // Require the separate key/value input+output patterns; combined-name or
+        // default-only configs stay on the pattern-expansion path.
+        if dec.inputs.past_key_names.is_none()
+            || dec.inputs.past_value_names.is_none()
+            || dec.outputs.present_key_names.is_none()
+            || dec.outputs.present_value_names.is_none()
+        {
+            return Ok(None);
+        }
+        Ok(self.strict_decoder_state(decoder).ok())
     }
 }
 
@@ -2086,6 +2186,241 @@ mod tests {
         assert_eq!(patchify["temporal_patch_size"], 2);
         assert_eq!(patchify["merge_size"], 2);
         assert_eq!(patchify["channel_order"], "channels_first");
+    }
+
+    fn hybrid_graph_tensor(name: &str, dtype: &str, dims: &[Option<usize>]) -> GraphTensorInfo {
+        GraphTensorInfo {
+            name: name.to_string(),
+            dtype: dtype.to_string(),
+            dimensions: dims.to_vec(),
+        }
+    }
+
+    /// A hybrid SSM/attention decoder (qwen3.5-shaped): four layers where the
+    /// odd layers are dense full-attention (`key`/`value`) and the even layers
+    /// are linear-attention recurrent (`conv_state`/`recurrent_state`). The
+    /// genai_config only carries the uniform `%d` KV pattern and a layer count,
+    /// so deriving metadata from the graph is the only way to avoid declaring the
+    /// six non-existent dense-KV ports for the recurrent layers.
+    fn hybrid_config() -> GenAiConfig {
+        serde_json::from_str(
+            r#"{
+                "model": {
+                    "type": "qwen3_5_text",
+                    "context_length": 4096,
+                    "decoder": {
+                        "head_size": 256,
+                        "hidden_size": 2048,
+                        "num_attention_heads": 8,
+                        "num_hidden_layers": 4,
+                        "num_key_value_heads": 2,
+                        "inputs": {
+                            "input_ids": "input_ids",
+                            "attention_mask": "attention_mask",
+                            "position_ids": "position_ids",
+                            "past_key_names": "past_key_values.%d.key",
+                            "past_value_names": "past_key_values.%d.value"
+                        },
+                        "outputs": {
+                            "logits": "logits",
+                            "present_key_names": "present.%d.key",
+                            "present_value_names": "present.%d.value"
+                        }
+                    }
+                },
+                "search": { "past_present_share_buffer": true, "max_length": 4096 }
+            }"#,
+        )
+        .expect("valid hybrid genai_config")
+    }
+
+    fn hybrid_decoder_graph() -> ModelGraphInfo {
+        let sym = |_n: &str| None;
+        let dense = [Some(1), Some(2), sym("seq"), Some(256)];
+        let conv = [Some(1), Some(6144), Some(3)];
+        let recur = [Some(1), Some(16), Some(128), Some(128)];
+        let mut inputs = vec![
+            hybrid_graph_tensor("input_ids", "int64", &[Some(1), sym("seq")]),
+            hybrid_graph_tensor("attention_mask", "int64", &[Some(1), sym("seq")]),
+            hybrid_graph_tensor("position_ids", "int64", &[Some(1), sym("seq")]),
+        ];
+        let mut outputs = vec![hybrid_graph_tensor(
+            "logits",
+            "float32",
+            &[Some(1), sym("seq"), Some(248320)],
+        )];
+        for layer in 0..4 {
+            if layer % 2 == 1 {
+                inputs.push(hybrid_graph_tensor(
+                    &format!("past_key_values.{layer}.key"),
+                    "float32",
+                    &dense,
+                ));
+                inputs.push(hybrid_graph_tensor(
+                    &format!("past_key_values.{layer}.value"),
+                    "float32",
+                    &dense,
+                ));
+                outputs.push(hybrid_graph_tensor(
+                    &format!("present.{layer}.key"),
+                    "float32",
+                    &dense,
+                ));
+                outputs.push(hybrid_graph_tensor(
+                    &format!("present.{layer}.value"),
+                    "float32",
+                    &dense,
+                ));
+            } else {
+                inputs.push(hybrid_graph_tensor(
+                    &format!("past_key_values.{layer}.conv_state"),
+                    "float32",
+                    &conv,
+                ));
+                inputs.push(hybrid_graph_tensor(
+                    &format!("past_key_values.{layer}.recurrent_state"),
+                    "float32",
+                    &recur,
+                ));
+                outputs.push(hybrid_graph_tensor(
+                    &format!("present.{layer}.conv_state"),
+                    "float32",
+                    &conv,
+                ));
+                outputs.push(hybrid_graph_tensor(
+                    &format!("present.{layer}.recurrent_state"),
+                    "float32",
+                    &recur,
+                ));
+            }
+        }
+        ModelGraphInfo { inputs, outputs }
+    }
+
+    #[test]
+    fn hybrid_decoder_derives_sparse_kv_and_state_pairs() {
+        let cfg = hybrid_config();
+        let graph = hybrid_decoder_graph();
+        let md = cfg
+            .to_inference_metadata_with_graph(Some("float32"), &graph)
+            .expect("hybrid metadata");
+        let io = md
+            .model
+            .as_ref()
+            .and_then(|m| m.io.as_ref())
+            .expect("decoder io");
+
+        // Only the two dense full-attention layers (1, 3) expose key/value; the
+        // recurrent layers must NOT appear in the KV lists.
+        assert_eq!(
+            io.kv_inputs.as_deref(),
+            Some(
+                [
+                    "past_key_values.1.key",
+                    "past_key_values.1.value",
+                    "past_key_values.3.key",
+                    "past_key_values.3.value",
+                ]
+                .map(String::from)
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            io.kv_outputs.as_deref(),
+            Some(
+                [
+                    "present.1.key",
+                    "present.1.value",
+                    "present.3.key",
+                    "present.3.value",
+                ]
+                .map(String::from)
+                .as_slice()
+            )
+        );
+
+        // The four recurrent ports (conv_state + recurrent_state for layers 0, 2)
+        // are declared as fixed loop-carried state pairs, replaced each step.
+        let pairs = io.state_pairs.as_ref().expect("state pairs");
+        let mut got: Vec<(String, String)> = pairs
+            .iter()
+            .map(|pair| (pair.input.clone(), pair.output.clone()))
+            .collect();
+        got.sort();
+        let mut want = vec![
+            (
+                "past_key_values.0.conv_state".to_string(),
+                "present.0.conv_state".to_string(),
+            ),
+            (
+                "past_key_values.0.recurrent_state".to_string(),
+                "present.0.recurrent_state".to_string(),
+            ),
+            (
+                "past_key_values.2.conv_state".to_string(),
+                "present.2.conv_state".to_string(),
+            ),
+            (
+                "past_key_values.2.recurrent_state".to_string(),
+                "present.2.recurrent_state".to_string(),
+            ),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+        for pair in pairs {
+            assert_eq!(pair.init.as_deref(), Some("zeros"));
+            assert_eq!(pair.update.as_deref(), Some("replace"));
+        }
+    }
+
+    #[test]
+    fn uniform_decoder_graph_matches_pattern_expansion() {
+        // A dense-KV model must produce the SAME kv_inputs whether or not the
+        // graph is supplied, and must never gain state pairs.
+        let cfg = qwen_config();
+        let without_graph = cfg.to_inference_metadata(Some("float16")).unwrap();
+        let expected_kv = without_graph
+            .model
+            .as_ref()
+            .and_then(|m| m.io.as_ref())
+            .and_then(|io| io.kv_inputs.clone())
+            .expect("pattern-expanded kv inputs");
+
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for layer in 0..24 {
+            inputs.push(hybrid_graph_tensor(
+                &format!("past_key_values.{layer}.key"),
+                "float16",
+                &[Some(1), Some(2), None, Some(64)],
+            ));
+            inputs.push(hybrid_graph_tensor(
+                &format!("past_key_values.{layer}.value"),
+                "float16",
+                &[Some(1), Some(2), None, Some(64)],
+            ));
+            outputs.push(hybrid_graph_tensor(
+                &format!("present.{layer}.key"),
+                "float16",
+                &[Some(1), Some(2), None, Some(64)],
+            ));
+            outputs.push(hybrid_graph_tensor(
+                &format!("present.{layer}.value"),
+                "float16",
+                &[Some(1), Some(2), None, Some(64)],
+            ));
+        }
+        let graph = ModelGraphInfo { inputs, outputs };
+        let with_graph = cfg
+            .to_inference_metadata_with_graph(Some("float16"), &graph)
+            .unwrap();
+        let io = with_graph
+            .model
+            .as_ref()
+            .and_then(|m| m.io.as_ref())
+            .expect("io");
+        assert_eq!(io.kv_inputs.as_ref(), Some(&expected_kv));
+        assert!(io.state_pairs.is_none());
     }
 
     fn qwen_config() -> GenAiConfig {

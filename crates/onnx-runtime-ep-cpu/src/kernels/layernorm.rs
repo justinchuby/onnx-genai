@@ -5,10 +5,11 @@
 //! the population statistics over the normalized axes. The optional `Mean` and
 //! `InvStdDev` outputs are filled when the caller provides those output slots.
 
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
 
 /// f32 LayerNormalization kernel carrying `axis` and `epsilon`.
 pub struct LayerNormKernel {
@@ -46,10 +47,10 @@ impl Kernel for LayerNormKernel {
             }
             flops
         });
-        let x = to_dense_f32(&inputs[0])?;
-        let scale = to_dense_f32(&inputs[1])?;
+        let x = to_dense_f32_widen("LayerNormalization", &inputs[0])?;
+        let scale = to_dense_f32_widen("LayerNormalization", &inputs[1])?;
         let bias = if inputs.len() == 3 {
-            Some(to_dense_f32(&inputs[2])?)
+            Some(to_dense_f32_widen("LayerNormalization", &inputs[2])?)
         } else {
             None
         };
@@ -63,14 +64,14 @@ impl Kernel for LayerNormKernel {
             self.epsilon,
         )?;
 
-        write_dense_f32(&mut outputs[0], &y)?;
+        write_dense_f32_narrow("LayerNormalization", &mut outputs[0], &y)?;
         // Optional Mean / InvStdDev outputs (shape = X.shape[:axis] with the
         // normalized axes as 1s; element count == num_groups).
         if outputs.len() > 1 {
-            write_dense_f32(&mut outputs[1], &means)?;
+            write_dense_f32_narrow("LayerNormalization", &mut outputs[1], &means)?;
         }
         if outputs.len() > 2 {
-            write_dense_f32(&mut outputs[2], &inv_stds)?;
+            write_dense_f32_narrow("LayerNormalization", &mut outputs[2], &inv_stds)?;
         }
         Ok(())
     }
@@ -232,5 +233,36 @@ mod tests {
         .unwrap();
         assert!((mean.to_f32()[0] - 2.0).abs() < 1e-6);
         assert!((mean.to_f32()[1] - 4.0).abs() < 1e-6);
+    }
+    #[test]
+    fn layernorm_bf16_matches_widened_f32_reference() {
+        let x = Owned::bf16(&[2, 3], &[-80., 0., 1., 80., -1., 2.]);
+        let scale = Owned::bf16(&[3], &[1., 0.5, 2.]);
+        let bias = Owned::bf16(&[3], &[0., -1., 1.]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
+        LayerNormKernel {
+            axis: -1,
+            epsilon: 1e-5,
+        }
+        .execute(
+            &[x.view(), scale.view(), bias.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        let (reference, _, _) = layer_norm_dense(
+            &x.to_bf16_as_f32(),
+            &[2, 3],
+            &scale.to_bf16_as_f32(),
+            Some(&bias.to_bf16_as_f32()),
+            -1,
+            1e-5,
+        )
+        .unwrap();
+        let expected: Vec<_> = reference
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_f32)
+            .collect();
+        assert_eq!(out.to_bf16_as_f32(), expected);
     }
 }

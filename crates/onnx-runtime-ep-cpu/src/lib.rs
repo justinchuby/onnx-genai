@@ -29,8 +29,13 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod backend;
+pub mod decode_affinity;
+pub mod decode_numa;
+pub mod decode_spmd;
 pub mod dtype;
 pub mod kernels;
+#[cfg(feature = "mlas")]
+pub mod nchwc_layout;
 pub mod optimizer;
 pub mod provider;
 pub mod strided;
@@ -39,7 +44,9 @@ pub mod weight_offload;
 
 pub use backend::CpuBackend;
 pub use kernels::qmoe::WeightOffloadHostCache;
-pub use optimizer::{ProjectionFusion, cpu_optimization_passes};
+pub use optimizer::{
+    ConvBatchNormActivationFusion, MatMulNBitsBiasFusion, ProjectionFusion, cpu_optimization_passes,
+};
 pub use provider::CpuExecutionProvider;
 pub use weight_offload::placement::{
     ArbitrationAction, GpuLayersOverrideReport, HostFallbackReason, IqFormat, KvAdmissionDecision,

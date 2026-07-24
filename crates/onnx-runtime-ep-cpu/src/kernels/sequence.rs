@@ -105,6 +105,19 @@ impl Kernel for RangeKernel {
                 out.extend((0..count).map(|i| start + i as f32 * delta));
                 write_dense_f32(&mut outputs[0], &out)
             }
+            DataType::Float16 | DataType::BFloat16 => {
+                let start = crate::dtype::to_dense_f32_widen("Range", &inputs[0])?[0];
+                let limit = crate::dtype::to_dense_f32_widen("Range", &inputs[1])?[0];
+                let delta = crate::dtype::to_dense_f32_widen("Range", &inputs[2])?[0];
+                if delta == 0. {
+                    return Err(EpError::KernelFailed(
+                        "Range: delta must not be zero".into(),
+                    ));
+                }
+                let count = float_range_count(start, limit, delta)?;
+                let out: Vec<f32> = (0..count).map(|i| start + i as f32 * delta).collect();
+                crate::dtype::write_dense_f32_narrow("Range", &mut outputs[0], &out)
+            }
             DataType::Int64 => {
                 let (start, limit, delta) = (
                     to_dense_i64(&inputs[0])?[0],
@@ -537,5 +550,37 @@ mod tests {
         .execute(&[x.view(), axis.view()], &mut [y.view_mut()])
         .unwrap();
         assert_eq!(y.to_f32(), vec![1., 2., 3., 4., 10., 18.]);
+    }
+    #[test]
+    fn range_bf16_matches_widened_f32_reference() {
+        let start = Owned::bf16(&[], &[-1.]);
+        let limit = Owned::bf16(&[], &[1.]);
+        let delta = Owned::bf16(&[], &[0.5]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[4]);
+        RangeKernel
+            .execute(
+                &[start.view(), limit.view(), delta.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.to_bf16_as_f32(), vec![-1., -0.5, 0., 0.5]);
+    }
+    #[test]
+    fn tile_bf16_preserves_element_bits() {
+        let x = Owned::bf16(&[2], &[1., -2.]);
+        let repeats = Owned::i64(&[1], &[2]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[4]);
+        TileKernel
+            .execute(&[x.view(), repeats.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            out.to_u16_bits(),
+            vec![
+                x.to_u16_bits()[0],
+                x.to_u16_bits()[1],
+                x.to_u16_bits()[0],
+                x.to_u16_bits()[1]
+            ]
+        );
     }
 }

@@ -78,6 +78,38 @@ struct MLAS_NCHWC_POOL_WORK_BLOCK : MLAS_NCHWC_WORK_BLOCK
 #define MLAS_CONV_KERNEL_FLAG_OTHER_ACTIVATION      0x00000008
 #define MLAS_CONV_KERNEL_MLAS_ARM_USE_KLEIDIAI      0x00000010
 
+//
+// nxrt-mlas-mt: cap the NCHWc convolution/pooling thread fan-out by the amount
+// of work. `MlasGetMaximumThreadCount` reports the whole pool, but splitting a
+// small or depthwise op into that many row tiles costs more in thread dispatch
+// and barrier synchronization than the parallelism saves (and oversubscribes
+// the machine below a serial run). Allowing at least this many multiply-adds
+// per worker keeps tiny ops serial while large dense convolutions still fan out
+// to the full pool. The threshold is a coarse, shape-derived heuristic — not a
+// per-model or per-target tuning knob.
+//
+#define MLAS_NCHWC_MIN_WORK_PER_THREAD 0x2000000  // ~32M multiply-adds
+
+inline
+ptrdiff_t
+MlasNchwcClampThreadCount(
+    ptrdiff_t MaximumThreadCount,
+    size_t TotalWork
+    )
+{
+    if (MaximumThreadCount <= 1) {
+        return 1;
+    }
+    size_t UsefulThreads = TotalWork / MLAS_NCHWC_MIN_WORK_PER_THREAD;
+    if (UsefulThreads < 1) {
+        UsefulThreads = 1;
+    }
+    if (static_cast<size_t>(MaximumThreadCount) > UsefulThreads) {
+        return static_cast<ptrdiff_t>(UsefulThreads);
+    }
+    return MaximumThreadCount;
+}
+
 size_t
 MLASCALL
 MlasNchwcGetBlockSize(
@@ -1399,8 +1431,19 @@ Return Value:
     //
     // Schedule the operation across a set of worker threads.
     //
+    // Cap the degree of parallelism by the amount of work so that small and
+    // depthwise convolutions (common in mobile CNNs) are not split into more
+    // tiles than they can amortize: the per-tile thread-dispatch and barrier
+    // cost otherwise exceeds the compute saved, and over-subscription slows the
+    // op below a serial run. This is a general, shape-derived heuristic (scaled
+    // by the multiply-accumulate count) with no model- or target-specific
+    // special-casing; large dense convolutions still fan out to the full pool.
+    //
 
-    WorkBlock.tids = MlasGetMaximumThreadCount(ThreadPool);
+    WorkBlock.tids = MlasNchwcClampThreadCount(
+        MlasGetMaximumThreadCount(ThreadPool),
+        WorkBlock.BatchCount * GroupCount * WorkBlock.OutputChannels * WorkBlock.OutputSize *
+            WorkBlock.InputChannels * WorkBlock.KernelShape[0] * WorkBlock.KernelShape[1]);
 
     MlasExecuteThreaded(ThreadedRoutine, &WorkBlock, WorkBlock.tids, ThreadPool);
 }
@@ -1475,8 +1518,13 @@ Return Value:
     //
     // Schedule the operation across a set of worker threads.
     //
+    // Cap the degree of parallelism by the amount of work (see MlasNchwcConv).
+    //
 
-    WorkBlock.tids = MlasGetMaximumThreadCount(ThreadPool);
+    WorkBlock.tids = MlasNchwcClampThreadCount(
+        MlasGetMaximumThreadCount(ThreadPool),
+        WorkBlock.BatchCount * WorkBlock.OutputChannels * WorkBlock.OutputSize *
+            WorkBlock.KernelShape[0] * WorkBlock.KernelShape[1]);
 
     MlasExecuteThreaded(MlasNchwcThreaded<MLAS_NCHWC_POOL_ALGORITHM>, &WorkBlock, WorkBlock.tids, ThreadPool);
 }

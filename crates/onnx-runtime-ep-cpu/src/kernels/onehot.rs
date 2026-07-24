@@ -117,6 +117,24 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     #[test]
+    fn onehot_bf16_values_preserve_element_bits() {
+        let indices = Owned::i64(&[3], &[0, 2, 1]);
+        let depth = Owned::i64(&[], &[3]);
+        let values = Owned::bf16(&[2], &[-1.5, 2.25]);
+        let mut out = Owned::zeros(DataType::BFloat16, &[3, 3]);
+        OneHotKernel { axis: -1 }
+            .execute(
+                &[indices.view(), depth.view(), values.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(
+            out.to_bf16_as_f32(),
+            vec![2.25, -1.5, -1.5, -1.5, -1.5, 2.25, -1.5, 2.25, -1.5]
+        );
+    }
+
+    #[test]
     fn inserts_nonfinal_axis() {
         let indices = Owned::i64(&[2, 2], &[0, 2, 1, 0]);
         let depth = Owned::i64(&[], &[3]);

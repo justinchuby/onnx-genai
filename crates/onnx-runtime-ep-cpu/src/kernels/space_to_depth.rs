@@ -99,6 +99,22 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     #[test]
+    fn space_to_depth_bf16_preserves_element_bits() {
+        let vals: Vec<f32> = (1..=16).map(|v| v as f32).collect();
+        let input = Owned::bf16(&[1, 1, 4, 4], &vals);
+        let mut output = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 4, 2, 2]);
+        SpaceToDepthKernel { blocksize: 2 }
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(
+            output.to_bf16_as_f32(),
+            vec![
+                1., 3., 9., 11., 2., 4., 10., 12., 5., 7., 13., 15., 6., 8., 14., 16.
+            ]
+        );
+    }
+
+    #[test]
     fn rearranges_each_spatial_offset_into_channels() {
         let input = Owned::f32(
             &[1, 1, 4, 4],

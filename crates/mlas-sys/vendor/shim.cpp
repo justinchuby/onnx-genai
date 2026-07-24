@@ -21,7 +21,9 @@
 #include "core/mlas/inc/mlas_qnbit.h"
 
 #include <cstddef>
+#include <cstring>
 #include <functional>
+#include <new>
 
 // ---- Pluggable parallel-for backend (driven from Rust/Rayon) ----------------
 
@@ -303,4 +305,266 @@ extern "C" void mlas_sgemm_packed(
         &data, 1,
         /*ThreadPool=*/nullptr,
         /*BackendKernelSelectorConfig=*/nullptr);
+}
+
+// ---- Vectorized logistic (sigmoid) -----------------------------------------
+// Exposes MLAS's SIMD sigmoid so callers can build activations such as SiLU
+// (`x * sigmoid(x)`) on top of a battle-tested vectorized exp instead of a
+// scalar `expf` loop. Single-threaded: the caller drives any outer sharding.
+extern "C" void mlas_compute_logistic(
+    const float* input,
+    float* output,
+    size_t n)
+{
+    MlasComputeLogistic(input, output, n);
+}
+
+extern "C" void mlas_eltwise_add(
+    const float* left,
+    const float* right,
+    float* output,
+    size_t n)
+{
+    MlasEltwiseAdd<float>(left, right, output, n);
+}
+
+extern "C" void mlas_compute_activation(
+    int kind,
+    float minimum,
+    float maximum,
+    const float* input,
+    float* output,
+    size_t n)
+{
+    if (input != output) {
+        std::memcpy(output, input, n * sizeof(float));
+    }
+    MLAS_ACTIVATION activation{};
+    activation.ActivationKind = static_cast<MLAS_ACTIVATION_KIND>(kind);
+    activation.Parameters.Clip.minimum = minimum;
+    activation.Parameters.Clip.maximum = maximum;
+    MlasActivation(&activation, output, nullptr, 1, n, n);
+}
+
+// ---- Float convolution -------------------------------------------------------
+
+namespace {
+struct mlas_conv_plan {
+    MLAS_ACTIVATION activation{};
+    MLAS_CONV_PARAMETERS parameters{};
+};
+}  // namespace
+
+extern "C" void* mlas_conv_prepare(
+    size_t dimensions,
+    size_t batch_count,
+    size_t group_count,
+    size_t input_channels_per_group,
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* dilation_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    size_t filter_count_per_group,
+    size_t* working_buffer_elements)
+{
+    mlas_conv_plan* plan = nullptr;
+    try {
+        plan = new mlas_conv_plan();
+        plan->activation.ActivationKind = MlasIdentityActivation;
+        MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+        MlasConvPrepare(
+            &plan->parameters,
+            dimensions,
+            batch_count,
+            group_count,
+            input_channels_per_group,
+            input_shape,
+            kernel_shape,
+            dilation_shape,
+            padding,
+            stride_shape,
+            output_shape,
+            filter_count_per_group,
+            &plan->activation,
+            working_buffer_elements,
+            /*ChannelsLast=*/false,
+            /*Beta=*/0.0f,
+            thread_pool);
+        return plan;
+    } catch (...) {
+        delete plan;
+        return nullptr;
+    }
+}
+
+extern "C" void mlas_conv_run(
+    const void* opaque_plan,
+    const float* input,
+    const float* filter,
+    const float* bias,
+    float* working_buffer,
+    float* output)
+{
+    const auto* plan = static_cast<const mlas_conv_plan*>(opaque_plan);
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasConv(
+        &plan->parameters,
+        input,
+        filter,
+        bias,
+        working_buffer,
+        output,
+        thread_pool);
+}
+
+extern "C" void mlas_conv_plan_destroy(void* opaque_plan)
+{
+    delete static_cast<mlas_conv_plan*>(opaque_plan);
+}
+
+// ---- NCHWc blocked convolution (ORT's fast float Conv path) -----------------
+//
+// MLAS's NCHWc kernels keep activations in a channels-blocked layout (channels
+// split into SIMD-width blocks) and consume a pre-reordered ("pre-packed")
+// filter, exactly as ONNX Runtime's nchwc_transformer does. This is the
+// high-throughput float convolution path; the plain `MlasConv` above falls back
+// to im2col+GEMM. The caller (Rust) mirrors the transformer's per-conv layout
+// decisions: reorder the filter once at kernel construction, reorder the input
+// per call, run the blocked conv, then reorder the output back to NCHW.
+
+extern "C" size_t mlas_nchwc_block_size()
+{
+    return MlasNchwcGetBlockSize();
+}
+
+extern "C" void mlas_nchwc_reorder_input_nchw(
+    const float* source,
+    float* dest,
+    size_t channels,
+    size_t input_size)
+{
+    MlasReorderInputNchw(source, dest, channels, input_size);
+}
+
+extern "C" void mlas_nchwc_reorder_output_nchw(
+    const int64_t* output_shape,
+    const float* source,
+    float* dest)
+{
+    MlasReorderOutputNchw(output_shape, source, dest, /*ThreadPool=*/nullptr);
+}
+
+extern "C" void mlas_nchwc_reorder_filter_bibo(
+    const int64_t* filter_shape,
+    const float* source,
+    float* dest)
+{
+    MlasReorderFilterOIHWBiBo(filter_shape, source, dest);
+}
+
+extern "C" void mlas_nchwc_reorder_filter_bo(
+    const int64_t* filter_shape,
+    const float* source,
+    float* dest)
+{
+    MlasReorderFilterOIHWBo(filter_shape, source, dest);
+}
+
+extern "C" void mlas_nchwc_conv(
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* dilation_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    size_t group_count,
+    const float* input,
+    const float* filter,
+    const float* bias,
+    float* output,
+    int activation_kind,
+    float activation_value0,
+    float activation_value1,
+    int zero_mode)
+{
+    MLAS_ACTIVATION activation{};
+    activation.ActivationKind = static_cast<MLAS_ACTIVATION_KIND>(activation_kind);
+    activation.Parameters.Values[0] = activation_value0;
+    activation.Parameters.Values[1] = activation_value1;
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasNchwcConv(
+        input_shape,
+        kernel_shape,
+        dilation_shape,
+        padding,
+        stride_shape,
+        output_shape,
+        group_count,
+        input,
+        filter,
+        bias,
+        output,
+        &activation,
+        zero_mode != 0,
+        thread_pool,
+        /*BackendKernelSelectorConfig=*/nullptr,
+        /*UseBf16=*/false);
+}
+
+// ---- Float pooling -----------------------------------------------------------
+
+extern "C" void mlas_pool(
+    int kind,
+    size_t dimensions,
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    const float* input,
+    float* output)
+{
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasPool(
+        static_cast<MLAS_POOLING_KIND>(kind),
+        dimensions,
+        input_shape,
+        kernel_shape,
+        padding,
+        stride_shape,
+        output_shape,
+        input,
+        output,
+        thread_pool);
+}
+
+// NCHWc blocked 2-D pooling. `input_shape`/`output_shape` are blocked NCHWc
+// shapes (channel dimension rounded up to the SIMD block); MLAS pools each
+// channel independently over the blocked buffer, so no NCHW<->NCHWc reorder is
+// needed around it. Mirrors ONNX Runtime's NchwcTransformer pool handling.
+extern "C" void mlas_nchwc_pool(
+    int kind,
+    const int64_t* input_shape,
+    const int64_t* kernel_shape,
+    const int64_t* dilation_shape,
+    const int64_t* padding,
+    const int64_t* stride_shape,
+    const int64_t* output_shape,
+    const float* input,
+    float* output)
+{
+    MLAS_THREADPOOL* thread_pool = reinterpret_cast<MLAS_THREADPOOL*>(1);
+    MlasNchwcPool(
+        static_cast<MLAS_POOLING_KIND>(kind),
+        input_shape,
+        kernel_shape,
+        dilation_shape,
+        padding,
+        stride_shape,
+        output_shape,
+        input,
+        output,
+        thread_pool);
 }

@@ -133,3 +133,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-22T21-35-00Z — ORT CUDA attention review
 Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CUDA_ATTENTION` bypassed the typed `RuntimeConfig` registry. Named Deckard as reviser and locked Howie out of this artifact.
+
+2026-07-22T22:15:00Z — Approved Tyrell’s `122b31a` cross-OS affinity and safe auto-enable after N1/N2 fixes; Windows >64-CPU validation remains non-blocking.

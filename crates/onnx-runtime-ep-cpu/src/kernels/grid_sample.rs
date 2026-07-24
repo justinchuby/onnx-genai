@@ -3,7 +3,8 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, Node};
 
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::check_arity;
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -235,8 +236,8 @@ impl Kernel for GridSampleKernel {
             ));
         }
 
-        let input = to_dense_f32(&inputs[0])?;
-        let grid = to_dense_f32(&inputs[1])?;
+        let input = to_dense_f32_widen("GridSample", &inputs[0])?;
+        let grid = to_dense_f32_widen("GridSample", &inputs[1])?;
         let mut output = Vec::with_capacity(expected_output.iter().product());
         if rank == 4 {
             let (batch, channels, height, width) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
@@ -367,7 +368,7 @@ impl Kernel for GridSampleKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &output)
+        write_dense_f32_narrow("GridSample", &mut outputs[0], &output)
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
@@ -380,6 +381,39 @@ mod tests {
     use super::*;
     use crate::kernels::{build_cpu_registry, testutil::Owned};
     use onnx_runtime_ir::{Node, NodeId};
+
+    #[test]
+    fn grid_sample_bf16_matches_widened_f32_reference() {
+        let x_vals = [1.0f32, 2.0, 3.0, 4.0];
+        let grid_vals = [-1.0f32, -1.0, 0.0, 0.0];
+        let x_f32 = Owned::f32(&[1, 1, 2, 2], &x_vals);
+        let grid_f32 = Owned::f32(&[1, 1, 2, 2], &grid_vals);
+        let mut ref_out = Owned::zeros_f32(&[1, 1, 1, 2]);
+        kernel(16, Mode::Linear, PaddingMode::Zeros, true)
+            .execute(&[x_f32.view(), grid_f32.view()], &mut [ref_out.view_mut()])
+            .unwrap();
+
+        let x_bf16 = Owned::bf16(&[1, 1, 2, 2], &x_vals);
+        let grid_bf16 = Owned::bf16(&[1, 1, 2, 2], &grid_vals);
+        let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 1, 1, 2]);
+        kernel(16, Mode::Linear, PaddingMode::Zeros, true)
+            .execute(
+                &[x_bf16.view(), grid_bf16.view()],
+                &mut [bf16_out.view_mut()],
+            )
+            .unwrap();
+
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "grid_sample bf16 {g} vs f32 {r}"
+            );
+        }
+    }
 
     fn kernel(
         since_version: u32,

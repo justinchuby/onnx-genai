@@ -25,6 +25,7 @@ mlas = [
     "onnx-genai-engine/mlas",
     "onnx-runtime-ep-cpu/mlas",
 ]
+gqa_phase_profile = ["onnx-runtime-ep-cpu/gqa_phase_profile"]
 cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
 # Device-sampler-only CUDA: enables the ORT built-in CUDA EP path plus the
 # on-device argmax/sampler in `onnx-genai-ort` WITHOUT the pure-Rust
@@ -76,3 +77,11 @@ required-features = ["bench-ort"]
 [[bin]]
 name = "profile_native"
 required-features = ["bench-native"]
+
+[[bin]]
+name = "profile_vision"
+required-features = ["mlas"]
+
+[[bin]]
+name = "bench_generic"
+required-features = ["mlas"]

@@ -3,7 +3,8 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, Node};
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_i64};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 pub struct Col2ImKernel {
@@ -133,7 +134,7 @@ impl Kernel for Col2ImKernel {
             )));
         }
 
-        let input = to_dense_f32(&inputs[0])?;
+        let input = to_dense_f32_widen("Col2Im", &inputs[0])?;
         let image_elements = numel(&image);
         let mut output = vec![0.0; numel(&expected)];
         for n in 0..inputs[0].shape[0] {
@@ -167,7 +168,7 @@ impl Kernel for Col2ImKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &output)
+        write_dense_f32_narrow("Col2Im", &mut outputs[0], &output)
     }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
@@ -186,6 +187,50 @@ fn coordinates_to_offset(coords: &[usize], shape: &[usize]) -> usize {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn col2im_bf16_matches_widened_f32_reference() {
+        let vals: Vec<f32> = (1..=16).map(|v| v as f32).collect();
+        let image = Owned::i64(&[2], &[3, 3]);
+        let block = Owned::i64(&[2], &[2, 2]);
+
+        let input_f32 = Owned::f32(&[1, 4, 4], &vals);
+        let mut ref_out = Owned::zeros_f32(&[1, 1, 3, 3]);
+        Col2ImKernel {
+            dilations: vec![],
+            pads: vec![],
+            strides: vec![],
+        }
+        .execute(
+            &[input_f32.view(), image.view(), block.view()],
+            &mut [ref_out.view_mut()],
+        )
+        .unwrap();
+
+        let input_bf16 = Owned::bf16(&[1, 4, 4], &vals);
+        let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[1, 1, 3, 3]);
+        Col2ImKernel {
+            dilations: vec![],
+            pads: vec![],
+            strides: vec![],
+        }
+        .execute(
+            &[input_bf16.view(), image.view(), block.view()],
+            &mut [bf16_out.view_mut()],
+        )
+        .unwrap();
+
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "col2im bf16 {g} vs f32 {r}"
+            );
+        }
+    }
 
     fn kernel(dilations: Vec<i64>, pads: Vec<i64>, strides: Vec<i64>) -> Col2ImKernel {
         Col2ImKernel {

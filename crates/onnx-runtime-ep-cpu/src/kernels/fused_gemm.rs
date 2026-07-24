@@ -19,9 +19,10 @@ use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
 use super::add::broadcast_apply;
+use super::check_arity;
 use super::matmul::{MatMulPrepack, matmul_dense_prepacked};
 use super::relu::relu_in_place;
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 `Relu(MatMul(A, B) + bias)` kernel with initializer-only prepacking.
 #[derive(Default)]
@@ -48,13 +49,13 @@ impl Kernel for FusedGemmKernel {
         // MatMul(A, B) into a dense buffer laid out over the output shape.
         let mut out = matmul_dense_prepacked(&inputs[0], &inputs[1], &self.prepack)?;
         // Broadcast-add the bias in place, matching a standalone `Add`.
-        let bias = to_dense_f32(&inputs[2])?;
+        let bias = to_dense_f32_widen("FusedGemm", &inputs[2])?;
         let bias_shape = inputs[2].shape;
         let out_shape = outputs[0].shape.to_vec();
         broadcast_apply(&bias, bias_shape, &out_shape, |i, v| out[i] += v)?;
         // Elementwise Relu, matching a standalone `Relu` on the biased result.
         relu_in_place(&mut out);
-        write_dense_f32(&mut outputs[0], &out)
+        write_dense_f32_narrow("FusedGemm", &mut outputs[0], &out)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -66,6 +67,45 @@ impl Kernel for FusedGemmKernel {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    #[test]
+    fn fused_gemm_bf16_matches_widened_f32_reference() {
+        let a_vals = [1.0f32, 2., 3., 4., 5., 6.];
+        let b_vals = [7.0f32, 8., 9., 10., 11., 12.];
+        let bias_vals = [-60.0f32, 20.];
+        let a = Owned::f32(&[2, 3], &a_vals);
+        let b = Owned::f32(&[3, 2], &b_vals);
+        let bias = Owned::f32(&[2], &bias_vals);
+        let mut ref_out = Owned::zeros_f32(&[2, 2]);
+        FusedGemmKernel::default()
+            .execute(
+                &[a.view(), b.view(), bias.view()],
+                &mut [ref_out.view_mut()],
+            )
+            .unwrap();
+
+        let a = Owned::bf16(&[2, 3], &a_vals);
+        let b = Owned::bf16(&[3, 2], &b_vals);
+        let bias = Owned::bf16(&[2], &bias_vals);
+        let mut bf16_out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 2]);
+        FusedGemmKernel::default()
+            .execute(
+                &[a.view(), b.view(), bias.view()],
+                &mut [bf16_out.view_mut()],
+            )
+            .unwrap();
+
+        for (&r, &g) in ref_out
+            .to_f32()
+            .iter()
+            .zip(bf16_out.to_bf16_as_f32().iter())
+        {
+            assert!(
+                (r - g).abs() <= 0.03 * r.abs().max(1.0),
+                "fused_gemm bf16 {g} vs f32 {r}"
+            );
+        }
+    }
 
     #[test]
     fn relu_clamps_negative_prebias_sums() {

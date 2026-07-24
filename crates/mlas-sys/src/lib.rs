@@ -11,6 +11,7 @@
 
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::ptr::NonNull;
 use std::sync::Once;
 
 use rayon::prelude::*;
@@ -60,6 +61,96 @@ unsafe extern "C" {
     );
 
     fn mlas_float_kernel_id() -> c_int;
+
+    /// Vectorized logistic (sigmoid) over `n` contiguous f32s: single-threaded
+    /// MLAS SIMD sigmoid, used to build SiLU without a scalar `expf` loop.
+    fn mlas_compute_logistic(input: *const f32, output: *mut f32, n: usize);
+    fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
+    fn mlas_compute_activation(
+        kind: c_int,
+        minimum: f32,
+        maximum: f32,
+        input: *const f32,
+        output: *mut f32,
+        n: usize,
+    );
+
+    fn mlas_conv_prepare(
+        dimensions: usize,
+        batch_count: usize,
+        group_count: usize,
+        input_channels_per_group: usize,
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        dilation_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        filter_count_per_group: usize,
+        working_buffer_elements: *mut usize,
+    ) -> *mut c_void;
+    fn mlas_conv_run(
+        plan: *const c_void,
+        input: *const f32,
+        filter: *const f32,
+        bias: *const f32,
+        working_buffer: *mut f32,
+        output: *mut f32,
+    );
+    fn mlas_conv_plan_destroy(plan: *mut c_void);
+
+    // ---- NCHWc blocked convolution ----
+    fn mlas_nchwc_block_size() -> usize;
+    fn mlas_nchwc_reorder_input_nchw(
+        source: *const f32,
+        dest: *mut f32,
+        channels: usize,
+        input_size: usize,
+    );
+    fn mlas_nchwc_reorder_output_nchw(output_shape: *const i64, source: *const f32, dest: *mut f32);
+    fn mlas_nchwc_reorder_filter_bibo(filter_shape: *const i64, source: *const f32, dest: *mut f32);
+    fn mlas_nchwc_reorder_filter_bo(filter_shape: *const i64, source: *const f32, dest: *mut f32);
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_nchwc_conv(
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        dilation_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        group_count: usize,
+        input: *const f32,
+        filter: *const f32,
+        bias: *const f32,
+        output: *mut f32,
+        activation_kind: c_int,
+        activation_value0: f32,
+        activation_value1: f32,
+        zero_mode: c_int,
+    );
+    fn mlas_pool(
+        kind: c_int,
+        dimensions: usize,
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        input: *const f32,
+        output: *mut f32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    fn mlas_nchwc_pool(
+        kind: c_int,
+        input_shape: *const i64,
+        kernel_shape: *const i64,
+        dilation_shape: *const i64,
+        padding: *const i64,
+        stride_shape: *const i64,
+        output_shape: *const i64,
+        input: *const f32,
+        output: *mut f32,
+    );
 
     // ---- Blocked n-bit quantized GEMM (SQNBitGemm) ----
     fn mlas_qnbit_gemm_available(bits: usize, blk_len: usize, comp_type: c_int) -> c_int;
@@ -183,8 +274,372 @@ pub fn selected_float_kernel() -> i32 {
     unsafe { mlas_float_kernel_id() as i32 }
 }
 
-/// Pre-packed B weight buffer, mirroring how ORT pre-packs constant MatMul
-/// weights once and reuses the packed panel across calls.
+/// Compute the elementwise logistic (sigmoid) `output = 1 / (1 + exp(-input))`
+/// over equal-length contiguous f32 slices using MLAS's SIMD sigmoid. Single
+/// threaded; callers shard across threads themselves when needed.
+///
+/// This is the vectorized primitive behind SiLU (`x * sigmoid(x)`), replacing a
+/// scalar `expf` loop that LLVM cannot autovectorize.
+pub fn compute_logistic(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_logistic input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_logistic(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute contiguous Float32 elementwise addition with MLAS SIMD.
+pub fn eltwise_add(left: &[f32], right: &[f32], output: &mut [f32]) {
+    assert_eq!(left.len(), right.len());
+    assert_eq!(left.len(), output.len());
+    unsafe {
+        mlas_eltwise_add(
+            left.as_ptr(),
+            right.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+}
+
+/// Compute contiguous Float32 ReLU with MLAS SIMD.
+pub fn compute_relu(input: &[f32], output: &mut [f32]) {
+    assert_eq!(input.len(), output.len());
+    unsafe {
+        mlas_compute_activation(
+            1,
+            0.0,
+            0.0,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+}
+
+/// Compute contiguous Float32 clipping with MLAS SIMD.
+pub fn compute_clip(input: &[f32], output: &mut [f32], minimum: f32, maximum: f32) {
+    assert_eq!(input.len(), output.len());
+    unsafe {
+        mlas_compute_activation(
+            5,
+            minimum,
+            maximum,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+        );
+    }
+}
+
+/// Prepared MLAS Float32 convolution parameters for one concrete NCHW shape.
+pub struct ConvPlan {
+    ptr: NonNull<c_void>,
+    working_buffer_elements: usize,
+}
+
+// SAFETY: MLAS treats prepared convolution parameters as immutable during
+// execution. Each call supplies disjoint input, scratch, and output buffers.
+unsafe impl Send for ConvPlan {}
+unsafe impl Sync for ConvPlan {}
+
+impl ConvPlan {
+    /// Prepare an N-dimensional NCHW convolution and return its scratch size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        batch_count: usize,
+        group_count: usize,
+        input_channels_per_group: usize,
+        input_shape: &[i64],
+        kernel_shape: &[i64],
+        dilation_shape: &[i64],
+        padding: &[i64],
+        stride_shape: &[i64],
+        output_shape: &[i64],
+        filter_count_per_group: usize,
+    ) -> Option<Self> {
+        let dimensions = input_shape.len();
+        assert!((1..=3).contains(&dimensions));
+        assert_eq!(kernel_shape.len(), dimensions);
+        assert_eq!(dilation_shape.len(), dimensions);
+        assert_eq!(padding.len(), dimensions * 2);
+        assert_eq!(stride_shape.len(), dimensions);
+        assert_eq!(output_shape.len(), dimensions);
+        ensure_threading();
+        let mut working_buffer_elements = 0;
+        let ptr = unsafe {
+            mlas_conv_prepare(
+                dimensions,
+                batch_count,
+                group_count,
+                input_channels_per_group,
+                input_shape.as_ptr(),
+                kernel_shape.as_ptr(),
+                dilation_shape.as_ptr(),
+                padding.as_ptr(),
+                stride_shape.as_ptr(),
+                output_shape.as_ptr(),
+                filter_count_per_group,
+                &mut working_buffer_elements,
+            )
+        };
+        Some(Self {
+            ptr: NonNull::new(ptr)?,
+            working_buffer_elements,
+        })
+    }
+
+    /// Number of Float32 scratch elements required by [`Self::run`].
+    pub fn working_buffer_elements(&self) -> usize {
+        self.working_buffer_elements
+    }
+
+    /// Execute the prepared convolution.
+    pub fn run(
+        &self,
+        input: &[f32],
+        filter: &[f32],
+        bias: Option<&[f32]>,
+        working_buffer: &mut [f32],
+        output: &mut [f32],
+    ) {
+        assert!(working_buffer.len() >= self.working_buffer_elements);
+        ensure_threading();
+        unsafe {
+            mlas_conv_run(
+                self.ptr.as_ptr(),
+                input.as_ptr(),
+                filter.as_ptr(),
+                bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+                if self.working_buffer_elements == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    working_buffer.as_mut_ptr()
+                },
+                output.as_mut_ptr(),
+            );
+        }
+    }
+}
+
+impl Drop for ConvPlan {
+    fn drop(&mut self) {
+        unsafe { mlas_conv_plan_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// MLAS activation applied inside (or immediately after) a convolution.
+///
+/// Mirrors `MLAS_ACTIVATION_KIND`; the two `values` carry the kind-specific
+/// parameters (`Clip` min/max, `LeakyRelu`/`HardSigmoid` alpha/beta).
+#[derive(Clone, Copy, Debug)]
+pub struct NchwcActivation {
+    /// Raw `MLAS_ACTIVATION_KIND` discriminant (0 = identity, 1 = relu, 5 = clip).
+    pub kind: i32,
+    /// Kind-specific parameters, laid over the `Parameters.Values[2]` union.
+    pub values: [f32; 2],
+}
+
+impl NchwcActivation {
+    /// No activation (`MlasIdentityActivation`).
+    pub const IDENTITY: Self = Self {
+        kind: 0,
+        values: [0.0, 0.0],
+    };
+    /// ReLU (`MlasReluActivation`).
+    pub const RELU: Self = Self {
+        kind: 1,
+        values: [0.0, 0.0],
+    };
+
+    /// Clip activation (`MlasClipActivation`) with the given bounds.
+    pub fn clip(minimum: f32, maximum: f32) -> Self {
+        Self {
+            kind: 5,
+            values: [minimum, maximum],
+        }
+    }
+}
+
+/// SIMD channel-block width used by the MLAS NCHWc kernels (8 for AVX2, 16 for
+/// AVX-512). A value `<= 1` means the host has no blocked-convolution kernel and
+/// callers must use the plain [`ConvPlan`] path instead.
+pub fn nchwc_block_size() -> usize {
+    unsafe { mlas_nchwc_block_size() }
+}
+
+/// Reorder an `OIHW` filter into the `OIHWBiBo` layout (both input and output
+/// channels blocked), padding partial blocks with zeros. `dest` must hold
+/// `round_up(O, block) * round_up(I, block) * H * W` elements.
+pub fn nchwc_reorder_filter_bibo(filter_shape: &[i64; 4], source: &[f32], dest: &mut [f32]) {
+    unsafe {
+        mlas_nchwc_reorder_filter_bibo(filter_shape.as_ptr(), source.as_ptr(), dest.as_mut_ptr())
+    };
+}
+
+/// Reorder an `OIHW` filter into the `OIHWBo` layout (only output channels
+/// blocked), padding partial output blocks with zeros. Used for the NCHW-input
+/// (first-layer) and depthwise algorithms. `dest` must hold
+/// `round_up(O, block) * I * H * W` elements.
+pub fn nchwc_reorder_filter_bo(filter_shape: &[i64; 4], source: &[f32], dest: &mut [f32]) {
+    unsafe {
+        mlas_nchwc_reorder_filter_bo(filter_shape.as_ptr(), source.as_ptr(), dest.as_mut_ptr())
+    };
+}
+
+/// Reorder an NCHW activation plane set into NCHWc. `channels` must be a
+/// multiple of 4; `dest` must hold `round_up(channels, block) * input_size`
+/// elements (partial trailing block is zero padded).
+pub fn nchwc_reorder_input_nchw(
+    source: &[f32],
+    dest: &mut [f32],
+    channels: usize,
+    input_size: usize,
+) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_reorder_input_nchw(source.as_ptr(), dest.as_mut_ptr(), channels, input_size)
+    };
+}
+
+/// Reorder an NCHWc output buffer back to dense NCHW, keeping only
+/// `output_shape[1]` channels.
+pub fn nchwc_reorder_output_nchw(output_shape: &[i64; 4], source: &[f32], dest: &mut [f32]) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_reorder_output_nchw(output_shape.as_ptr(), source.as_ptr(), dest.as_mut_ptr())
+    };
+}
+
+/// Execute an NCHWc blocked 2-D convolution.
+///
+/// `input`/`output` are in NCHWc block layout except for the NCHW-input
+/// (first-layer) algorithm, where `input` stays plain NCHW. `filter` must be
+/// pre-reordered (`OIHWBiBo` or `OIHWBo`) to match the algorithm MLAS selects
+/// from the shape. `bias`, when present, must be padded to
+/// `round_up(output_channels, block)` elements. `zero_mode` false accumulates
+/// into `output` (Conv/Sum fusion); true overwrites it.
+#[allow(clippy::too_many_arguments)]
+pub fn nchwc_conv(
+    input_shape: &[i64; 4],
+    kernel_shape: &[i64; 2],
+    dilation_shape: &[i64; 2],
+    padding: &[i64; 4],
+    stride_shape: &[i64; 2],
+    output_shape: &[i64; 4],
+    group_count: usize,
+    input: &[f32],
+    filter: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+    activation: NchwcActivation,
+    zero_mode: bool,
+) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_conv(
+            input_shape.as_ptr(),
+            kernel_shape.as_ptr(),
+            dilation_shape.as_ptr(),
+            padding.as_ptr(),
+            stride_shape.as_ptr(),
+            output_shape.as_ptr(),
+            group_count,
+            input.as_ptr(),
+            filter.as_ptr(),
+            bias.map_or(std::ptr::null(), <[f32]>::as_ptr),
+            output.as_mut_ptr(),
+            activation.kind,
+            activation.values[0],
+            activation.values[1],
+            i32::from(zero_mode),
+        );
+    }
+}
+
+/// MLAS Float32 pooling mode.
+#[derive(Clone, Copy, Debug)]
+#[repr(i32)]
+pub enum PoolKind {
+    Maximum = 0,
+    AverageExcludePad = 1,
+    AverageIncludePad = 2,
+}
+
+/// Execute an N-dimensional NCHW Float32 pool using MLAS.
+#[allow(clippy::too_many_arguments)]
+pub fn pool(
+    kind: PoolKind,
+    input_shape: &[i64],
+    kernel_shape: &[i64],
+    padding: &[i64],
+    stride_shape: &[i64],
+    output_shape: &[i64],
+    input: &[f32],
+    output: &mut [f32],
+) {
+    let dimensions = input_shape.len().saturating_sub(2);
+    assert!((1..=3).contains(&dimensions));
+    assert_eq!(kernel_shape.len(), dimensions);
+    assert_eq!(padding.len(), dimensions * 2);
+    assert_eq!(stride_shape.len(), dimensions);
+    assert_eq!(output_shape.len(), dimensions + 2);
+    ensure_threading();
+    unsafe {
+        mlas_pool(
+            kind as c_int,
+            dimensions,
+            input_shape.as_ptr(),
+            kernel_shape.as_ptr(),
+            padding.as_ptr(),
+            stride_shape.as_ptr(),
+            output_shape.as_ptr(),
+            input.as_ptr(),
+            output.as_mut_ptr(),
+        );
+    }
+}
+
+/// Execute an NCHWc blocked 2-D pool using MLAS.
+///
+/// `input_shape` / `output_shape` are the blocked NCHWc shapes
+/// `[N, round_up(C, block), H, W]`; MLAS pools each channel independently on the
+/// blocked buffer, so callers keep the activation in NCHWc across the pool with
+/// no reorder. `input` / `output` are blocked buffers. Mirrors ONNX Runtime's
+/// `NchwcTransformer` handling of pooling.
+#[allow(clippy::too_many_arguments)]
+pub fn nchwc_pool(
+    kind: PoolKind,
+    input_shape: &[i64; 4],
+    kernel_shape: &[i64; 2],
+    dilation_shape: &[i64; 2],
+    padding: &[i64; 4],
+    stride_shape: &[i64; 2],
+    output_shape: &[i64; 4],
+    input: &[f32],
+    output: &mut [f32],
+) {
+    ensure_threading();
+    unsafe {
+        mlas_nchwc_pool(
+            kind as c_int,
+            input_shape.as_ptr(),
+            kernel_shape.as_ptr(),
+            dilation_shape.as_ptr(),
+            padding.as_ptr(),
+            stride_shape.as_ptr(),
+            output_shape.as_ptr(),
+            input.as_ptr(),
+            output.as_mut_ptr(),
+        );
+    }
+}
 ///
 /// MLAS's packed layout is accessed with aligned AVX-512 loads/stores, so the
 /// backing allocation is 64-byte aligned (a plain `Vec<u8>` is not).
@@ -460,9 +915,37 @@ pub fn sqnbit_gemm(
     c: &mut [f32],
     multithread: bool,
 ) {
+    let n = packed.n;
+    assert_eq!(c.len(), m * n, "C must be m*n");
+    // Contiguous output: leading dimension equals the packed weight's N.
+    // SAFETY: `c` is `m * n` contiguous f32s, so writing `m` rows of `n`
+    // columns at stride `n` stays in bounds.
+    unsafe { sqnbit_gemm_into(packed, m, a, bias, c.as_mut_ptr(), n, multithread) };
+}
+
+/// Compute one N-shard of `C = A * dequant(packed) + bias` into a caller-owned
+/// output whose leading dimension is `ldc` (columns per row), writing this
+/// shard's `packed.n` columns starting at `c` for each of the `m` rows. This
+/// lets a weight partitioned along N (e.g. one shard per decode worker) write
+/// its columns into a shared `[m, ldc]` output without a scatter copy; for a
+/// single full-width shard `ldc == packed.n` and it matches [`sqnbit_gemm`].
+///
+/// # Safety
+/// `c` must point at a valid f32 region covering `(m - 1) * ldc + packed.n`
+/// elements (the last row needs `packed.n` columns), `ldc >= packed.n`, and no
+/// other thread may write the same `[row, col]` cells concurrently.
+pub unsafe fn sqnbit_gemm_into(
+    packed: &SQNBitPackedB,
+    m: usize,
+    a: &[f32],
+    bias: Option<&[f32]>,
+    c: *mut f32,
+    ldc: usize,
+    multithread: bool,
+) {
     let (k, n) = (packed.k, packed.n);
     assert_eq!(a.len(), m * k, "A must be m*k");
-    assert_eq!(c.len(), m * n, "C must be m*n");
+    assert!(ldc >= n, "ldc must be >= packed N");
     if let Some(bias) = bias {
         assert_eq!(bias.len(), n, "bias must be length n");
     }
@@ -510,8 +993,8 @@ pub fn sqnbit_gemm(
             packed.has_zp as c_int,
             zp_ptr,
             bias_ptr,
-            c.as_mut_ptr(),
-            n,
+            c,
+            ldc,
             ws_ptr,
             multithread as c_int,
         );
@@ -728,10 +1211,7 @@ mod tests {
             -1
         };
         eprintln!("selected f32 GEMM kernel id = {id}; expected {expected} for host ISA");
-        assert_eq!(
-            id, expected,
-            "MLAS f32 GEMM dispatch did not match host ISA"
-        );
+        assert_eq!(id, expected, "MLAS f32 GEMM dispatch did not match host ISA");
     }
 
     /// Single-thread performance probe for the medium f32 MatMul shape
@@ -972,6 +1452,118 @@ mod tests {
         check_sqnbit(SQNBitComputeType::Fp32, 4, 128, 512, 32, false, true);
     }
 
+    /// N-sharding parity: splitting the weight into contiguous output-column
+    /// shards and running each through [`sqnbit_gemm_into`] (writing its columns
+    /// into a shared `[m, n]` output at stride `n`) reproduces the full-width
+    /// [`sqnbit_gemm`] result. Each output column is a GEMV over K independent of
+    /// the other columns, so partitioning N cannot change the arithmetic
+    /// *modulo* MLAS's own SIMD column-tiling: the fp32 kernel processes columns
+    /// in fixed-width tiles, so a shard boundary that falls mid-tile can reorder
+    /// a block-sum reduction and shift a result by ~1 ULP. The tolerance is a few
+    /// ULP (much tighter than the `2e-2` dequant-reference tolerance), which is
+    /// the invariant the ep-cpu decode path relies on when it fans a projection's
+    /// N-shards across the persistent decode workers (verified byte-identical
+    /// end-to-end over 128 greedy tokens on Qwen2.5-0.5B).
+    #[test]
+    fn sqnbit_int4_n_shards_match_full() {
+        let n = 96usize;
+        // Include all export block sizes and a second K/block combination. The
+        // deliberately uneven N shards below remain the decode-pool analogue.
+        for &(k, block_size) in &[(256usize, 32usize), (256, 64), (256, 128), (384, 64)] {
+            for &m in &[1usize, 5] {
+                for &asym in &[false, true] {
+                    for &with_bias in &[false, true] {
+                        let weights: Vec<f32> =
+                            (0..n * k).map(|i| (i as f32 * 0.017 + 0.3).sin()).collect();
+                        let (packed_b, scales, zps, _) =
+                            quantize_int4(&weights, n, k, block_size, asym);
+                        let a: Vec<f32> = (0..m * k)
+                            .map(|i| ((i as f32 * 0.011 + 0.7).cos()) * 0.5)
+                            .collect();
+                        let bias: Option<Vec<f32>> =
+                            with_bias.then(|| (0..n).map(|i| (i as f32 * 0.03).sin()).collect());
+
+                        let full = match SQNBitPackedB::new(
+                            n,
+                            k,
+                            4,
+                            block_size,
+                            SQNBitComputeType::Fp32,
+                            &packed_b,
+                            &scales,
+                            zps.as_deref(),
+                        ) {
+                            Some(p) => p,
+                            None => {
+                                eprintln!("SQNBit blk={block_size} unavailable; skipping");
+                                return;
+                            }
+                        };
+                        let mut c_full = vec![0.0f32; m * n];
+                        sqnbit_gemm(&full, m, &a, bias.as_deref(), &mut c_full, true);
+
+                        let blocks = k.div_ceil(block_size);
+                        let blob = block_size / 2;
+                        let zp_row = blocks.div_ceil(2);
+                        // Deliberately uneven contiguous shards, like the decode
+                        // pool's per-worker segments.
+                        let shards: &[(usize, usize)] = &[(0, 17), (17, 30), (47, 1), (48, 48)];
+                        // multithread=false mirrors the per-worker SPMD dispatch;
+                        // multithread=true mirrors the prefill shard loop.
+                        for &mt in &[false, true] {
+                            let mut c_shard = vec![0.0f32; m * n];
+                            for &(start, len) in shards {
+                                let pb =
+                                    &packed_b[start * blocks * blob..(start + len) * blocks * blob];
+                                let sc = &scales[start * blocks..(start + len) * blocks];
+                                let zp = zps
+                                    .as_deref()
+                                    .map(|z| &z[start * zp_row..(start + len) * zp_row]);
+                                let packed = SQNBitPackedB::new(
+                                    len,
+                                    k,
+                                    4,
+                                    block_size,
+                                    SQNBitComputeType::Fp32,
+                                    pb,
+                                    sc,
+                                    zp,
+                                )
+                                .expect("shard packs when the full weight packs");
+                                let bias_shard = bias.as_deref().map(|b| &b[start..start + len]);
+                                // SAFETY: shards own disjoint contiguous column ranges
+                                // of the [m, n] output; `start + len <= n`.
+                                unsafe {
+                                    sqnbit_gemm_into(
+                                        &packed,
+                                        m,
+                                        &a,
+                                        bias_shard,
+                                        c_shard.as_mut_ptr().add(start),
+                                        n,
+                                        mt,
+                                    );
+                                }
+                            }
+                            // A few ULP at magnitude ~60 is ~2.5e-4; 1e-3 covers the
+                            // worst-case tiling reorder with margin while still being
+                            // ~20x tighter than the dequant-reference tolerance.
+                            assert_close(
+                                &c_shard,
+                                &c_full,
+                                1e-3,
+                                &format!(
+                                    "N-sharded (multithread={mt}) vs full: \
+                                     k{k} blk{block_size} m{m} asym{asym} bias{with_bias}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn sqnbit_int4_compint8_matches_reference() {
         // Portability guard pending microsoft/onnxruntime#29853: only the AVX2
@@ -985,9 +1577,44 @@ mod tests {
             return;
         }
         // int8-activation compute quantizes A, so tolerances are looser.
+        //
+        // Cross-CPU caveat: MLAS's *AVX2* M=1 CompInt8 SQNBit microkernel with a
+        // zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes) is
+        // numerically broken -- it disagrees with the dequantized reference by
+        // ~46% (mlas=6.09 vs ref=11.29), far beyond int8 quantization tolerance.
+        // The AVX-512 M=1 kernel and every AVX2 M>1 kernel (which apply the zero
+        // point via the precomputed block-sum correction) are correct. Verified
+        // under Intel SDE (`sde64 -hsw` fails, `-skx` passes); see
+        // .squad/decisions/inbox/ripley-mlas-cross-cpu.md and the upstream issue
+        // draft ripley-ort-issue-draft.md. Production never hits this path: int4
+        // MatMulNBits with m=1 always routes to the hand int8 decode kernel (the
+        // `sqnbit_decode_min() >= 2` crossover), and `try_mlas_sqnbit` additionally
+        // refuses M=1 asymmetric CompInt8 on non-AVX-512 hosts. So the M=1
+        // asymmetric case only exercises an MLAS capability we deliberately avoid;
+        // gate it to AVX-512 hosts (where it is correct) rather than asserting a
+        // value MLAS computes wrong on AVX2.
+        // MLAS installs its correct AVX-512 SQNBit dispatch only when the host
+        // has AVX512F *and* the core trio BW+DQ+VL (vendored platform.cpp:572,
+        // under the AVX512F check at :547); AVX512F alone falls back to the
+        // Avx2/Avx2vnni dispatch, i.e. the broken kernel. Mirror that exact gate
+        // so the skip condition matches production's `host_has_mlas_sqnbit_avx512`.
+        #[cfg(target_arch = "x86_64")]
+        let host_has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        #[cfg(not(target_arch = "x86_64"))]
+        let host_has_avx512 = false;
         for &blk in &[32usize, 64, 128] {
             for &m in &[1usize, 8] {
                 for &asym in &[false, true] {
+                    if m == 1 && asym && !host_has_avx512 {
+                        eprintln!(
+                            "skipping MLAS-broken AVX2 M=1 asymmetric CompInt8 blk{blk} \
+                             (production uses the hand int8 kernel here)"
+                        );
+                        continue;
+                    }
                     check_sqnbit(SQNBitComputeType::Int8, m, 96, 256, blk, asym, false);
                 }
             }
@@ -1029,10 +1656,539 @@ mod tests {
                             }
                             start.elapsed().as_secs_f64() * 1e6 / iters as f64
                         });
-                        eprintln!("SQNBit int4 {comp:?} K={k} N={n} M={m} {threads}t: {per_us:.1} us/iter");
+                        eprintln!(
+                            "SQNBit int4 {comp:?} K={k} N={n} M={m} {threads}t: {per_us:.1} us/iter"
+                        );
                     }
                 }
             }
+        }
+    }
+
+    fn round_up(value: usize, multiple: usize) -> usize {
+        value.div_ceil(multiple) * multiple
+    }
+
+    /// Naive NCHW convolution reference (group=1) with optional bias.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_conv_nchw(
+        input: &[f32],
+        filter: &[f32],
+        bias: Option<&[f32]>,
+        n: usize,
+        cin: usize,
+        hin: usize,
+        win: usize,
+        cout: usize,
+        kh: usize,
+        kw: usize,
+        pad: [usize; 4],
+        stride: [usize; 2],
+        group: usize,
+    ) -> (Vec<f32>, usize, usize) {
+        let hout = (hin + pad[0] + pad[2] - kh) / stride[0] + 1;
+        let wout = (win + pad[1] + pad[3] - kw) / stride[1] + 1;
+        let cin_g = cin / group;
+        let cout_g = cout / group;
+        let mut out = vec![0.0f32; n * cout * hout * wout];
+        for ni in 0..n {
+            for oc in 0..cout {
+                let g = oc / cout_g;
+                for oy in 0..hout {
+                    for ox in 0..wout {
+                        let mut acc = bias.map_or(0.0, |b| b[oc]);
+                        for icg in 0..cin_g {
+                            let ic = g * cin_g + icg;
+                            for ky in 0..kh {
+                                let iy = oy * stride[0] + ky;
+                                if iy < pad[0] || iy - pad[0] >= hin {
+                                    continue;
+                                }
+                                let iy = iy - pad[0];
+                                for kx in 0..kw {
+                                    let ix = ox * stride[1] + kx;
+                                    if ix < pad[1] || ix - pad[1] >= win {
+                                        continue;
+                                    }
+                                    let ix = ix - pad[1];
+                                    let iv = input[((ni * cin + ic) * hin + iy) * win + ix];
+                                    let fv = filter[(((oc * cin_g) + icg) * kh + ky) * kw + kx];
+                                    acc += iv * fv;
+                                }
+                            }
+                        }
+                        out[((ni * cout + oc) * hout + oy) * wout + ox] = acc;
+                    }
+                }
+            }
+        }
+        (out, hout, wout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_nchwc_group1(
+        input: &[f32],
+        filter: &[f32],
+        bias: Option<&[f32]>,
+        n: usize,
+        cin: usize,
+        hin: usize,
+        win: usize,
+        cout: usize,
+        kh: usize,
+        kw: usize,
+        pad: [usize; 4],
+        stride: [usize; 2],
+    ) -> Vec<f32> {
+        let block = nchwc_block_size();
+        let hout = (hin + pad[0] + pad[2] - kh) / stride[0] + 1;
+        let wout = (win + pad[1] + pad[3] - kw) / stride[1] + 1;
+        let nchwc_cout = round_up(cout, block);
+        let filter_shape = [cout as i64, cin as i64, kh as i64, kw as i64];
+
+        let reorder_input = cin >= block;
+        let (packed_filter, conv_input, in_channels_for_shape) = if reorder_input {
+            let nchwc_cin = round_up(cin, block);
+            let mut pf = vec![0.0f32; nchwc_cout * nchwc_cin * kh * kw];
+            nchwc_reorder_filter_bibo(&filter_shape, filter, &mut pf);
+            let mut blocked = vec![0.0f32; n * nchwc_cin * hin * win];
+            for ni in 0..n {
+                nchwc_reorder_input_nchw(
+                    &input[ni * cin * hin * win..(ni + 1) * cin * hin * win],
+                    &mut blocked[ni * nchwc_cin * hin * win..(ni + 1) * nchwc_cin * hin * win],
+                    cin,
+                    hin * win,
+                );
+            }
+            (pf, blocked, nchwc_cin)
+        } else {
+            let mut pf = vec![0.0f32; nchwc_cout * cin * kh * kw];
+            nchwc_reorder_filter_bo(&filter_shape, filter, &mut pf);
+            (pf, input.to_vec(), cin)
+        };
+
+        let padded_bias = bias.map(|b| {
+            let mut pb = vec![0.0f32; nchwc_cout];
+            pb[..cout].copy_from_slice(b);
+            pb
+        });
+
+        let mut blocked_out = vec![0.0f32; n * nchwc_cout * hout * wout];
+        nchwc_conv(
+            &[
+                n as i64,
+                in_channels_for_shape as i64,
+                hin as i64,
+                win as i64,
+            ],
+            &[kh as i64, kw as i64],
+            &[1, 1],
+            &[pad[0] as i64, pad[1] as i64, pad[2] as i64, pad[3] as i64],
+            &[stride[0] as i64, stride[1] as i64],
+            &[n as i64, nchwc_cout as i64, hout as i64, wout as i64],
+            1,
+            &conv_input,
+            &packed_filter,
+            padded_bias.as_deref(),
+            &mut blocked_out,
+            NchwcActivation::IDENTITY,
+            true,
+        );
+
+        let mut out = vec![0.0f32; n * cout * hout * wout];
+        nchwc_reorder_output_nchw(
+            &[n as i64, cout as i64, hout as i64, wout as i64],
+            &blocked_out,
+            &mut out,
+        );
+        out
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    #[test]
+    fn nchwc_block_size_is_supported() {
+        // On x86_64 the vendored build always has an NCHWc kernel (8 or 16).
+        assert!(nchwc_block_size() >= 8, "block size {}", nchwc_block_size());
+    }
+
+    #[test]
+    fn nchwc_conv_pointwise_matches_reference() {
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, 2 * block, 7, 7, 3 * block);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let bias: Vec<f32> = (0..cout).map(|i| (i as f32) * 0.01).collect();
+        let (want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            1,
+            1,
+            [0; 4],
+            [1, 1],
+            1,
+        );
+        let got = run_nchwc_group1(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            1,
+            1,
+            [0; 4],
+            [1, 1],
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_3x3_blocked_matches_reference() {
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, block, 9, 9, block);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin * 9)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+            .collect();
+        let (want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            None,
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [1, 1],
+            1,
+        );
+        let got = run_nchwc_group1(
+            &input,
+            &filter,
+            None,
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [1, 1],
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_first_layer_nchw_input_matches_reference() {
+        // Input channels < block: the NCHW-input (first-layer) algorithm.
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, 3, 16, 16, block + block / 2);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 19) as f32 - 9.0) * 0.04)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin * 9)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
+            .collect();
+        let bias: Vec<f32> = (0..cout).map(|i| (i as f32) * 0.02 - 0.3).collect();
+        let (want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [2, 2],
+            1,
+        );
+        let got = run_nchwc_group1(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [2, 2],
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_depthwise_matches_reference() {
+        // Depthwise: group == channels, one input & output channel per group.
+        let block = nchwc_block_size();
+        let channels = 2 * block; // must be a multiple of 4
+        let (n, hin, win) = (1, 8, 8);
+        let input: Vec<f32> = (0..n * channels * hin * win)
+            .map(|i| ((i % 15) as f32 - 7.0) * 0.06)
+            .collect();
+        // Filter shape [channels, 1, 3, 3].
+        let filter: Vec<f32> = (0..channels * 9)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let bias: Vec<f32> = (0..channels).map(|i| (i as f32) * 0.01).collect();
+        let (want, hout, wout) = ref_conv_nchw(
+            &input,
+            &filter,
+            Some(&bias),
+            n,
+            channels,
+            hin,
+            win,
+            channels,
+            3,
+            3,
+            [1, 1, 1, 1],
+            [1, 1],
+            channels,
+        );
+
+        let nchwc_ch = round_up(channels, block);
+        let mut pf = vec![0.0f32; nchwc_ch * 9];
+        nchwc_reorder_filter_bo(&[channels as i64, 1, 3, 3], &filter, &mut pf);
+        let mut blocked_in = vec![0.0f32; n * nchwc_ch * hin * win];
+        nchwc_reorder_input_nchw(&input, &mut blocked_in, channels, hin * win);
+        let mut padded_bias = vec![0.0f32; nchwc_ch];
+        padded_bias[..channels].copy_from_slice(&bias);
+        let mut blocked_out = vec![0.0f32; n * nchwc_ch * hout * wout];
+        nchwc_conv(
+            &[n as i64, nchwc_ch as i64, hin as i64, win as i64],
+            &[3, 3],
+            &[1, 1],
+            &[1, 1, 1, 1],
+            &[1, 1],
+            &[n as i64, nchwc_ch as i64, hout as i64, wout as i64],
+            nchwc_ch, // group count == blocked channel count for depthwise
+            &blocked_in,
+            &pf,
+            Some(&padded_bias),
+            &mut blocked_out,
+            NchwcActivation::IDENTITY,
+            true,
+        );
+        let mut got = vec![0.0f32; n * channels * hout * wout];
+        nchwc_reorder_output_nchw(
+            &[n as i64, channels as i64, hout as i64, wout as i64],
+            &blocked_out,
+            &mut got,
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_conv_relu_activation_matches_reference() {
+        let block = nchwc_block_size();
+        let (n, cin, hin, win, cout) = (1, block, 5, 5, block);
+        let input: Vec<f32> = (0..n * cin * hin * win)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.2)
+            .collect();
+        let filter: Vec<f32> = (0..cout * cin)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.1)
+            .collect();
+        let (mut want, _, _) = ref_conv_nchw(
+            &input,
+            &filter,
+            None,
+            n,
+            cin,
+            hin,
+            win,
+            cout,
+            1,
+            1,
+            [0; 4],
+            [1, 1],
+            1,
+        );
+        for v in &mut want {
+            *v = v.max(0.0);
+        }
+        // Reuse pointwise path but apply ReLU.
+        let nchwc_cout = round_up(cout, block);
+        let nchwc_cin = round_up(cin, block);
+        let mut pf = vec![0.0f32; nchwc_cout * nchwc_cin];
+        nchwc_reorder_filter_bibo(&[cout as i64, cin as i64, 1, 1], &filter, &mut pf);
+        let mut blocked_in = vec![0.0f32; n * nchwc_cin * hin * win];
+        nchwc_reorder_input_nchw(&input, &mut blocked_in, cin, hin * win);
+        let mut blocked_out = vec![0.0f32; n * nchwc_cout * hin * win];
+        nchwc_conv(
+            &[n as i64, nchwc_cin as i64, hin as i64, win as i64],
+            &[1, 1],
+            &[1, 1],
+            &[0; 4],
+            &[1, 1],
+            &[n as i64, nchwc_cout as i64, hin as i64, win as i64],
+            1,
+            &blocked_in,
+            &pf,
+            None,
+            &mut blocked_out,
+            NchwcActivation::RELU,
+            true,
+        );
+        let mut got = vec![0.0f32; n * cout * hin * win];
+        nchwc_reorder_output_nchw(
+            &[n as i64, cout as i64, hin as i64, win as i64],
+            &blocked_out,
+            &mut got,
+        );
+        assert!(
+            max_abs_diff(&want, &got) < 1e-4,
+            "diff {}",
+            max_abs_diff(&want, &got)
+        );
+    }
+
+    #[test]
+    fn nchwc_pool_max_and_average_match_reference() {
+        let block = nchwc_block_size();
+        let channels = block + block / 2; // partial trailing block exercises padding
+        let (n, hin, win) = (1, 8, 8);
+        let (kh, kw) = (2usize, 2usize);
+        let (sh, sw) = (2usize, 2usize);
+        let hout = (hin - kh) / sh + 1;
+        let wout = (win - kw) / sw + 1;
+        let input: Vec<f32> = (0..n * channels * hin * win)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.13)
+            .collect();
+
+        let nchwc_ch = round_up(channels, block);
+        let mut blocked_in = vec![0.0f32; n * nchwc_ch * hin * win];
+        nchwc_reorder_input_nchw(&input, &mut blocked_in, channels, hin * win);
+
+        for kind in [PoolKind::Maximum, PoolKind::AverageIncludePad] {
+            let mut blocked_out = vec![0.0f32; n * nchwc_ch * hout * wout];
+            nchwc_pool(
+                kind,
+                &[n as i64, nchwc_ch as i64, hin as i64, win as i64],
+                &[kh as i64, kw as i64],
+                &[1, 1],
+                &[0, 0, 0, 0],
+                &[sh as i64, sw as i64],
+                &[n as i64, nchwc_ch as i64, hout as i64, wout as i64],
+                &blocked_in,
+                &mut blocked_out,
+            );
+            let mut got = vec![0.0f32; n * channels * hout * wout];
+            nchwc_reorder_output_nchw(
+                &[n as i64, channels as i64, hout as i64, wout as i64],
+                &blocked_out,
+                &mut got,
+            );
+
+            let mut want = vec![0.0f32; n * channels * hout * wout];
+            for c in 0..channels {
+                for oh in 0..hout {
+                    for ow in 0..wout {
+                        let mut acc = if matches!(kind, PoolKind::Maximum) {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        };
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                let ih = oh * sh + ky;
+                                let iw = ow * sw + kx;
+                                let v = input[((c * hin) + ih) * win + iw];
+                                if matches!(kind, PoolKind::Maximum) {
+                                    acc = acc.max(v);
+                                } else {
+                                    acc += v;
+                                }
+                            }
+                        }
+                        if !matches!(kind, PoolKind::Maximum) {
+                            acc /= (kh * kw) as f32;
+                        }
+                        want[((c * hout) + oh) * wout + ow] = acc;
+                    }
+                }
+            }
+            assert!(
+                max_abs_diff(&want, &got) < 1e-4,
+                "kind {kind:?} diff {}",
+                max_abs_diff(&want, &got)
+            );
+        }
+    }
+
+    /// NCHW -> NCHWc -> NCHW must reproduce the original activation exactly for
+    /// the kept channels, including when the channel count leaves a partial
+    /// trailing block (padding lanes are added on the way in and dropped on the
+    /// way out). This is the layout round-trip the graph pass relies on at
+    /// region entry/exit boundaries.
+    #[test]
+    fn nchwc_reorder_round_trip_is_identity() {
+        let block = nchwc_block_size();
+        // Exercise both an exact multiple of the block and a partial trailing
+        // block (still a multiple of 4, the reorder's channel-group unit).
+        for &channels in &[block, block + 4] {
+            let (n, h, w) = (1usize, 5usize, 7usize);
+            let plane = h * w;
+            let input: Vec<f32> = (0..n * channels * plane)
+                .map(|i| ((i % 17) as f32 - 8.0) * 0.07)
+                .collect();
+
+            let nchwc_ch = round_up(channels, block);
+            let mut blocked = vec![7.0f32; n * nchwc_ch * plane]; // non-zero fill
+            nchwc_reorder_input_nchw(&input, &mut blocked, channels, plane);
+
+            let mut back = vec![0.0f32; n * channels * plane];
+            nchwc_reorder_output_nchw(
+                &[n as i64, channels as i64, h as i64, w as i64],
+                &blocked,
+                &mut back,
+            );
+
+            assert_eq!(back, input, "round-trip mismatch for channels={channels}");
         }
     }
 }
