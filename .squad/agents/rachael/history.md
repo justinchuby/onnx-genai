@@ -115,3 +115,8 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 ## 2025-06-14T00:00:00Z — DeepSeek MLA fixed-capacity merge and capture follow-up
 - `53afab0` merged fixed-capacity KV bindings and fixed-slot default-domain Attention append, yielding roughly 3–6% eager MLA decode improvement while preserving deterministic output and GQA capture.
 - Own the next in-engine capture sequence on `perf/deepseek-mla-capture`: device valid-length scalar ABI, kernel causal/pad synthesis plus `Unsqueeze_18` island pruning, device-side control, then capture enablement. This DeepSeek plain causal+pad path needs no Mobius/export work.
+
+## 2025-06-14T00:00:00Z — MLA capture ABI a′ landed; c1 in flight
+
+- `e14d7df` on `perf/deepseek-mla-capture` landed the device valid-length ABI for fixed-capacity default-domain Attention decode; it is verified but not merged to main.
+- The c1 continuation is extending the ABI to explicit prefill+decode device lengths, then fixed-cap switching and capture-safe control/scratch work before enabling capture.

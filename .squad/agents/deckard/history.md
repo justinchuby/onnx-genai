@@ -100,3 +100,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - `97c1a56` landed the shared `CudaOnDeviceConstantSelect` capability and capture-safe scalar `Where`: pure constant-branch `If` nodes can now lower to a live device predicate with conservative unequal-table zero-padding guards.
 - Phi LongRoPE decode collapsed from two captured regions to one. Interleaved idle-GPU performance improved 203.50→322.15 tok/s (+58.3%), with byte-identical 160-token and 4,200-token boundary generation and a 201/0 CUDA gate.
+
+## 2025-06-14T00:00:00Z — QMoE vectorized unpack merged
+
+- Vectorized int4 unpack plus compile-time quant-layout specialization landed on `origin/main` as `53f9df6`.
+- QMoE linear time fell 6.36→2.51 ms/token (-60.5%); real DeepSeek E2E rose +11.9% (block-32) and +13.8% (block-128), with dense behavior unchanged.

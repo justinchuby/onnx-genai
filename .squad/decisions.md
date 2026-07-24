@@ -82,3 +82,17 @@
 **By:** Rachael
 **What:** The growing `Unsqueeze_18` Attention bias is a self-contained causal-and-padding mask island consumed only by the 27 default-domain Attention nodes. It can be bypassed for a fixed-capacity, on-device implementation using the existing fixed-capacity raw attention mask plus a device valid-length scalar; no Mobius/export change is required for this plain causal+pad DeepSeek export. This later assessment supersedes the earlier uncertainty that a capacity-length mask required export changes.
 **Why:** Capture cannot use the current eager shape-derived valid length, which freezes under replay. Follow-up sequencing is: device valid-length scalar ABI, kernel-side causal/pad synthesis and mask-island pruning, device-side control to remove per-step D2H/H2D, then enable `capture_support()`.
+
+## 2025-06-14 — QMoE decode kernel optimization merged
+
+### Vectorized int4 unpack and layout specialization landed on main
+**By:** Deckard; profiled by Pris; reviewed by Chew; merged by Coordinator
+**What:** Commit `53f9df6` adds compile-time quant-layout specialization and vectorized int4 unpacking to the CUDA QMoE decode linear path. It was fast-forward merged to `origin/main` from `perf/qmoe-vectorized-unpack`. QMoE linear time fell from 6.36 to 2.51 ms/token (-60.5%); real DeepSeek-V2-Lite end-to-end throughput improved 23.66→26.48 tok/s (+11.9%) for block-32 and 24.25→27.60 tok/s (+13.8%) for block-128. The MoE-only path leaves dense behavior unchanged.
+**Why:** Pris established that the former scalar path was instruction/dequant-ALU bound (about 73% SM throughput, 2.8% peak DRAM, 3.2 waves/SM), not HBM-bound or grid-starved, making vectorized unpacking and compile-time layout selection the appropriate general optimization. Chew independently confirmed the vectorized and forced-scalar implementations are byte-identical, specialization has a general non-fallthrough path, gate `206/0`, QMoE parity `27/0`, and three exact deterministic runs on both exports (token `8913`, “ Paris”).
+
+## 2025-06-14 — DeepSeek MLA capture ABI remains in progress
+
+### Device valid-length decode foundation landed on the capture branch, not main
+**By:** Rachael
+**What:** Commit `e14d7df` on `perf/deepseek-mla-capture` implements the verified (a′) device valid-length ABI for fixed-capacity, mask-masked, single-query default-domain Attention decode. `derive_len` writes a device i32 from the decode mask frontier; optional `dev_len` makes `build_kv` and `attention_row` use that device value while the null path remains bit-for-bit unchanged. It is **not merged to main** and capture remains disabled while bindings grow. Reported validation: CUDA gate `205/0`, clean clippy, deterministic DeepSeek block-32/block-128 greedy outputs, and unchanged Qwen GQA capture.
+**Why:** This is a safe decode-only enabling refactor, not completion of MLA capture. The current mask-frontier inference cannot establish a prefill causal mask’s true length. The c1 continuation therefore needs a prefill+decode-capable explicit device seqlens/valid-length ABI, eager prefill followed by a fixed-capacity binding switch at the prefill/decode boundary, deferred capture gating, and removal of host synchronizations, per-op allocation, and HtoD controls before `capture_support()` can be enabled.
