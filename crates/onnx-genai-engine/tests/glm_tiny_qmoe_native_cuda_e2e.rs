@@ -1,6 +1,13 @@
 //! Native eager-decode regression for the deterministic tiny GLM-5.2
 //! DSA-MoE fixture emitted with two `pkg.nxrt::IndexShare` nodes and fused QMoE.
 //!
+//! This native-CUDA regression requires both `cuda` and `native-backend`:
+//!
+//! ```bash
+//! CUDA_VISIBLE_DEVICES=1 cargo test -p onnx-genai-engine \
+//!   --features cuda,native-backend glm_tiny_qmoe
+//! ```
+//!
 //! The committed fixture is reproducible with:
 //!
 //! ```bash
@@ -11,7 +18,7 @@
 //!
 //! `GLM_TINY_QMOE_E2E_DIR` may override the committed fixture. Missing fixture
 //! files skip cleanly so source packages that omit binary fixtures remain green.
-#![cfg(feature = "native-backend")]
+#![cfg(all(feature = "cuda", feature = "native-backend"))]
 
 use std::path::{Path, PathBuf};
 
@@ -99,7 +106,7 @@ fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
 }
 
 #[test]
-fn glm52_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result<()> {
+fn glm_tiny_qmoe_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result<()> {
     let Some(dir) = fixture_dir() else {
         return Ok(());
     };
@@ -112,9 +119,8 @@ fn glm52_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
 #[test]
-fn glm52_native_cuda_eager_matches_cpu_and_declines_capture() -> anyhow::Result<()> {
+fn glm_tiny_qmoe_native_cuda_eager_matches_cpu_and_declines_capture() -> anyhow::Result<()> {
     let Some(dir) = fixture_dir() else {
         return Ok(());
     };
