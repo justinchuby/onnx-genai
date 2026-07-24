@@ -192,7 +192,70 @@ fn build_node(
     (graph, id, output_specs)
 }
 
-/// Concrete per-slot shapes (empty for omitted optionals) for `get_kernel`.
+/// Like [`build_node`], but the 3-output present is sized to the fixed capacity
+/// `present_seq` (the past cache length) rather than `total_seq`, exercising the
+/// in-place capacity present path where the present aliases past.
+fn build_node_capacity(
+    inputs: &[Option<HostTensor>],
+    case: Case,
+    present_seq: usize,
+) -> (Graph, NodeId, Vec<OutputSpec>) {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(DOMAIN.into(), 1);
+    let node_inputs: Vec<Option<_>> = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            slot.as_ref().map(|tensor| {
+                let value = graph.create_named_value(
+                    format!("input_{index}"),
+                    tensor.dtype,
+                    static_shape(tensor.shape.iter().copied()),
+                );
+                graph.add_input(value);
+                value
+            })
+        })
+        .collect();
+
+    let batch = inputs[0].as_ref().expect("query is required").shape[0];
+    let dtype = inputs[0].as_ref().expect("query is required").dtype;
+    let y_shape = vec![batch, case.q_heads, case.q_seq, case.head_size];
+    let mut node_outputs = Vec::new();
+    let mut output_specs = Vec::new();
+    node_outputs.push(graph.create_named_value(
+        "output",
+        dtype,
+        static_shape(y_shape.iter().copied()),
+    ));
+    output_specs.push(OutputSpec {
+        dtype,
+        shape: y_shape,
+    });
+    for name in ["present_key", "present_value"] {
+        let shape = vec![batch, case.kv_heads, present_seq, case.head_size];
+        node_outputs.push(graph.create_named_value(
+            name,
+            dtype,
+            static_shape(shape.iter().copied()),
+        ));
+        output_specs.push(OutputSpec { dtype, shape });
+    }
+
+    let mut node = Node::new(NodeId(0), "IndexShare", node_inputs, node_outputs.clone());
+    node.domain = DOMAIN.into();
+    node.attributes
+        .insert("num_heads".into(), Attribute::Int(case.q_heads as i64));
+    node.attributes
+        .insert("kv_num_heads".into(), Attribute::Int(case.kv_heads as i64));
+    node.attributes
+        .insert("scale".into(), Attribute::Float(case.scale));
+    let id = graph.insert_node(node);
+    for out in node_outputs {
+        graph.add_output(out);
+    }
+    (graph, id, output_specs)
+}
 fn concrete_shapes(inputs: &[Option<HostTensor>]) -> Vec<Vec<usize>> {
     inputs
         .iter()
@@ -1331,4 +1394,65 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
         ep.deallocate(buffer).expect("free input");
     }
     eprintln!("captured invalid index latched capture-error word 0x{latched:x}");
+}
+
+/// The in-place fixed-capacity present path: the 3-output present aliases the
+/// fixed-capacity `past` bindings (present sequence == past sequence, no growing
+/// `past ⧺ current`), and the valid length — hence the current-token write
+/// position and the index range — is carried by the causal/padding
+/// `attention_bias` frontier. The CUDA kernel derives that frontier on-device
+/// (capture-safe) and must reproduce the CPU oracle: `Y` within tolerance and
+/// the aliased present bit-exact.
+#[test]
+fn capacity_present_aliases_past_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    // Fixed capacity 5, one current token, logical valid length 4 (bias finite
+    // for k in [0,4), -inf at k=4). write_pos = valid_len - current_seq = 3, so
+    // the current token overwrites capacity row 3; row 4 is never gathered.
+    let capacity = 5usize;
+    let case = Case {
+        q_heads: 2,
+        kv_heads: 2,
+        q_seq: 1,
+        head_size: 3,
+        total_seq: capacity, // gather stride is the capacity for this path
+        scale: 0.5,
+    };
+    let q = HostTensor::f32(&[1, 2, 1, 3], &sequence(6, -0.25));
+    // Current token K/V (written at capacity row 3).
+    let cur_k = HostTensor::f32(&[1, 2, 1, 3], &sequence(6, 0.5));
+    let cur_v = HostTensor::f32(&[1, 2, 1, 3], &sequence(6, -0.5));
+    // Fixed-capacity past caches [B, kv, capacity, H]; rows 3 and 4 hold
+    // arbitrary values (row 3 is overwritten by the current token, row 4 masked).
+    let past_k = HostTensor::f32(&[1, 2, capacity, 3], &sequence(2 * capacity * 3, 0.125));
+    let past_v = HostTensor::f32(&[1, 2, capacity, 3], &sequence(2 * capacity * 3, -1.0));
+    // Indices reference only valid positions (< 4), per index head.
+    let indices = HostTensor::i64(&[1, 2, 1, 4], &[0, 1, 3, -1, 0, 2, 3, -1]);
+    // Additive bias [B, N, S_q, capacity]: finite in [0,4), -inf at 4.
+    let mut bias_vals = Vec::new();
+    for _ in 0..(case.q_heads * case.q_seq) {
+        for k in 0..capacity {
+            bias_vals.push(if k < 4 { 0.0 } else { f32::NEG_INFINITY });
+        }
+    }
+    let bias = HostTensor::f32(&[1, case.q_heads, 1, capacity], &bias_vals);
+    let inputs = [
+        Some(q),
+        Some(cur_k),
+        Some(cur_v),
+        Some(past_k),
+        Some(past_v),
+        Some(indices),
+        Some(bias),
+    ];
+
+    let (graph, node, specs) = build_node_capacity(&inputs, case, capacity);
+    let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU capacity IndexShare");
+    let gpu = run_gpu(&ep, &graph, node, &inputs, &specs).expect("CUDA capacity IndexShare");
+    let delta = assert_close(&gpu[0], &cpu[0], "capacity output");
+    assert_bit_exact(&gpu[1], &cpu[1], "capacity present_key");
+    assert_bit_exact(&gpu[2], &cpu[2], "capacity present_value");
+    // The present must have the fixed-capacity shape (aliases past), not grow.
+    assert_eq!(specs[1].shape[2], capacity, "present must be capacity-sized");
+    eprintln!("capacity_present: Y max|Δ|={delta}");
 }
