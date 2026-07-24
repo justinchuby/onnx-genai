@@ -5,13 +5,13 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use super::check_arity;
 use super::gelu::{exact_gelu, tanh_gelu};
 use super::layernorm::layer_norm_dense;
 use super::rmsnorm::rms_norm_dense;
-use super::{check_arity, to_dense_f32, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
-fn require_fused_float_dtype(op: &str, inputs: &[TensorView], output: &TensorMut) -> Result<()> {
+fn require_fused_float_dtype(op: &str, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
     let dtype = inputs[0].dtype;
     if !matches!(
         dtype,
@@ -21,11 +21,49 @@ fn require_fused_float_dtype(op: &str, inputs: &[TensorView], output: &TensorMut
             "{op}: unsupported dtype {dtype:?}; expected Float16, BFloat16, or Float32"
         )));
     }
-    if inputs.iter().any(|input| input.dtype != dtype) || output.dtype != dtype {
+    if inputs
+        .iter()
+        .any(|input| !input.is_absent() && input.dtype != dtype)
+        || outputs.iter().any(|output| output.dtype != dtype)
+    {
         return Err(EpError::KernelFailed(format!(
             "{op}: input and output dtypes must all match (got input {dtype:?}, output {:?})",
-            output.dtype
+            outputs[0].dtype
         )));
+    }
+    Ok(())
+}
+
+fn require_skip_layer_norm_dtype(inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
+    let dtype = inputs[0].dtype;
+    if !matches!(
+        dtype,
+        DataType::Float16 | DataType::BFloat16 | DataType::Float32
+    ) {
+        return Err(EpError::KernelFailed(format!(
+            "SkipLayerNormalization: unsupported dtype {dtype:?}; expected Float16, BFloat16, or Float32"
+        )));
+    }
+    if inputs
+        .iter()
+        .any(|input| !input.is_absent() && input.dtype != dtype)
+    {
+        return Err(EpError::KernelFailed(format!(
+            "SkipLayerNormalization: input dtypes must all match (got input {dtype:?})"
+        )));
+    }
+    for (index, output) in outputs.iter().enumerate() {
+        let expected = if matches!(index, 1 | 2) {
+            DataType::Float32
+        } else {
+            dtype
+        };
+        if output.dtype != expected {
+            return Err(EpError::KernelFailed(format!(
+                "SkipLayerNormalization: output {index} must have dtype {expected:?}, got {:?}",
+                output.dtype
+            )));
+        }
     }
     Ok(())
 }
@@ -57,7 +95,7 @@ impl KernelFactory for BiasGeluFactory {
 impl Kernel for BiasGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("BiasGelu", inputs, outputs, 2, 2, 1)?;
-        require_fused_float_dtype("BiasGelu", inputs, &outputs[0])?;
+        require_fused_float_dtype("BiasGelu", inputs, outputs)?;
         let x = to_dense_f32_widen("BiasGelu", &inputs[0])?;
         let bias = to_dense_f32_widen("BiasGelu", &inputs[1])?;
         let width = last_dim_bias(inputs[0].shape, &bias, "BiasGelu")?;
@@ -86,7 +124,7 @@ impl KernelFactory for FastGeluFactory {
 impl Kernel for FastGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("FastGelu", inputs, outputs, 1, 2, 1)?;
-        require_fused_float_dtype("FastGelu", inputs, &outputs[0])?;
+        require_fused_float_dtype("FastGelu", inputs, outputs)?;
         let x = to_dense_f32_widen("FastGelu", &inputs[0])?;
         let bias = if inputs.len() == 2 {
             Some(to_dense_f32_widen("FastGelu", &inputs[1])?)
@@ -130,7 +168,7 @@ impl KernelFactory for QuickGeluFactory {
 impl Kernel for QuickGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuickGelu", inputs, outputs, 1, 1, 1)?;
-        require_fused_float_dtype("QuickGelu", inputs, &outputs[0])?;
+        require_fused_float_dtype("QuickGelu", inputs, outputs)?;
         let y = to_dense_f32_widen("QuickGelu", &inputs[0])?
             .iter()
             .map(|&x| {
@@ -178,24 +216,25 @@ impl Kernel for SkipLayerNormKernel {
         // `mean` (1), `inv_std_var` (2), and `input_skip_bias_sum` (3). A valid
         // node may request as few as one output, so only require output 0.
         check_arity("SkipLayerNormalization", inputs, outputs, 3, 5, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let skip = to_dense_f32(&inputs[1])?;
+        require_skip_layer_norm_dtype(inputs, outputs)?;
+        let x = to_dense_f32_widen("SkipLayerNormalization", &inputs[0])?;
+        let skip = to_dense_f32_widen("SkipLayerNormalization", &inputs[1])?;
         if inputs[0].shape != inputs[1].shape || x.len() != skip.len() {
             return Err(EpError::KernelFailed(
                 "SkipLayerNormalization: skip must have the same shape as X".into(),
             ));
         }
-        let gamma = to_dense_f32(&inputs[2])?;
+        let gamma = to_dense_f32_widen("SkipLayerNormalization", &inputs[2])?;
         // `beta` (slot 3) and `bias` (slot 4) are independently optional: the
         // executor may pass an absent placeholder for either while the other is
         // present, so guard each slot separately instead of by input count.
         let beta = if inputs.len() >= 4 && !inputs[3].is_absent() {
-            Some(to_dense_f32(&inputs[3])?)
+            Some(to_dense_f32_widen("SkipLayerNormalization", &inputs[3])?)
         } else {
             None
         };
         let bias = if inputs.len() >= 5 && !inputs[4].is_absent() {
-            Some(to_dense_f32(&inputs[4])?)
+            Some(to_dense_f32_widen("SkipLayerNormalization", &inputs[4])?)
         } else {
             None
         };
@@ -206,7 +245,7 @@ impl Kernel for SkipLayerNormKernel {
         // sum = X + skip + bias (bias broadcasts over the last dimension).
         let sum = x
             .iter()
-            .zip(&skip)
+            .zip(skip.iter())
             .enumerate()
             .map(|(i, (&a, &b))| a + b + bias.as_ref().map_or(0.0, |v| v[i % width.unwrap()]))
             .collect::<Vec<_>>();
@@ -218,16 +257,16 @@ impl Kernel for SkipLayerNormKernel {
             -1,
             self.epsilon,
         )?;
-        write_dense_f32(&mut outputs[0], &y)?;
+        write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[0], &y)?;
         if outputs.len() > 1 {
-            write_dense_f32(&mut outputs[1], &means)?;
+            write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[1], &means)?;
         }
         if outputs.len() > 2 {
-            write_dense_f32(&mut outputs[2], &inv_stds)?;
+            write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[2], &inv_stds)?;
         }
         // Output 3 (`input_skip_bias_sum`) is the pre-normalization X-shaped sum.
         if outputs.len() > 3 {
-            write_dense_f32(&mut outputs[3], &sum)?;
+            write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[3], &sum)?;
         }
         Ok(())
     }
@@ -472,6 +511,69 @@ mod tests {
         assert_close(&y.to_f32(), &want);
         assert_close(&mean.to_f32(), &means);
         assert_close(&inv_std.to_f32(), &invs);
+    }
+
+    #[test]
+    fn skip_layer_norm_bf16_matches_ort_literal_goldens() {
+        // Independent literal goldens: output and sum are RNE-rounded bf16,
+        // while ORT specifies float32 mean and inverse standard deviation.
+        // This covers zero, negative, and large-magnitude residual inputs.
+        let x = Owned::bf16(&[1, 4], &[0., -2., 80., -80.]);
+        let skip = Owned::bf16(&[1, 4], &[1., 2., -4., 4.]);
+        let gamma = Owned::bf16(&[4], &[1., 0.5, -1., 2.]);
+        let beta = Owned::bf16(&[4], &[0.; 4]);
+        let bias = Owned::bf16(&[4], &[0.; 4]);
+        let mut y = Owned::zeros(DataType::BFloat16, &[1, 4]);
+        let mut mean = Owned::zeros_f32(&[1, 1]);
+        let mut inv_std = Owned::zeros_f32(&[1, 1]);
+        let mut sum = Owned::zeros(DataType::BFloat16, &[1, 4]);
+
+        SkipLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[
+                    x.view(),
+                    skip.view(),
+                    gamma.view(),
+                    beta.view(),
+                    bias.view(),
+                ],
+                &mut [
+                    y.view_mut(),
+                    mean.view_mut(),
+                    inv_std.view_mut(),
+                    sum.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(y.to_u16_bits(), vec![0x3c65, 0xbb18, 0xbfb4, 0xc036]);
+        assert_eq!(sum.to_u16_bits(), vec![0x3f80, 0x0000, 0x4298, 0xc298]);
+        assert_close(&mean.to_f32(), &[0.25]);
+        assert_close(&inv_std.to_f32(), &[0.018_607_47]);
+    }
+
+    #[test]
+    fn skip_layer_norm_bf16_infinities_propagate_nan() {
+        let x = Owned::bf16(&[1, 4], &[f32::INFINITY, f32::NEG_INFINITY, 0., -0.]);
+        let skip = Owned::bf16(&[1, 4], &[0.; 4]);
+        let gamma = Owned::bf16(&[4], &[1.; 4]);
+        let mut y = Owned::zeros(DataType::BFloat16, &[1, 4]);
+        let mut mean = Owned::zeros_f32(&[1, 1]);
+        let mut inv_std = Owned::zeros_f32(&[1, 1]);
+
+        SkipLayerNormKernel { epsilon: 1e-5 }
+            .execute(
+                &[x.view(), skip.view(), gamma.view()],
+                &mut [y.view_mut(), mean.view_mut(), inv_std.view_mut()],
+            )
+            .unwrap();
+
+        for bits in y.to_u16_bits() {
+            assert_eq!(bits & 0x7f80, 0x7f80, "expected NaN, got 0x{bits:04x}");
+            assert_ne!(bits & 0x007f, 0, "expected NaN, got 0x{bits:04x}");
+        }
+        assert!(mean.to_f32()[0].is_nan());
+        assert!(inv_std.to_f32()[0].is_nan());
     }
 
     #[test]
