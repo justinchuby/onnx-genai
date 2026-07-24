@@ -876,7 +876,7 @@ fn concat_fixed_shape_captures_and_matches_eager() {
 }
 
 #[test]
-fn reshape_constant_shape_warms_zero_copy_view() {
+fn reshape_exact_signature_captures_async_copy() {
     let ep = gpu();
     let runtime = ep.runtime();
     let device = ep.device_id();
@@ -884,14 +884,13 @@ fn reshape_constant_shape_warms_zero_copy_view() {
     let input_shape = [1, 1, 3072];
     let shape_shape = [4];
     let output_shape = [1, 1, 16, 192];
-    let mut kernel = build_movement_kernel(
+    let kernel = build_movement_kernel(
         &ep,
         "Reshape",
         &[input_shape.to_vec(), shape_shape.to_vec()],
         &[output_shape.to_vec()],
         &[],
     );
-    kernel.set_constant_inputs(&[false, true]);
     assert!(matches!(
         kernel.capture_support(),
         CaptureSupport::Unsupported { .. }
@@ -928,31 +927,57 @@ fn reshape_constant_shape_warms_zero_copy_view() {
             device,
         ),
     ];
-    assert!(kernel.view_outputs(&inputs, 1).is_none());
-
     let mut output_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
     let output_strides = compute_contiguous_strides(&output_shape);
-    let mut outputs = [TensorMut::new(
-        DevicePtrMut(output_buffer.as_mut_ptr()),
-        DataType::Float32,
-        &output_shape,
-        &output_strides,
-        device,
-    )];
-    kernel.execute(&inputs, &mut outputs).unwrap();
-    let mut copied = vec![0; data_bytes.len()];
+    let mut execute = || {
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device,
+        )];
+        kernel.execute(&inputs, &mut outputs).unwrap();
+    };
+    execute();
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute();
+    runtime.end_graph_capture().unwrap();
+
+    let replay_data = data
+        .iter()
+        .map(|value| value + 10_000.0)
+        .collect::<Vec<_>>();
+    let replay_bytes = raw(&replay_data);
+    unsafe {
+        runtime
+            .htod(&replay_bytes, cuptr(data_buffer.as_ptr()))
+            .unwrap()
+    };
+    runtime.replay_graph().unwrap();
+    let mut copied = vec![0; replay_bytes.len()];
     unsafe {
         runtime
             .dtoh(&mut copied, cuptr(output_buffer.as_ptr()))
             .unwrap()
     };
-    assert_eq!(copied, data_bytes);
-    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
-    let views = kernel.view_outputs(&inputs, 1).unwrap();
-    assert_eq!(views[0].input_index, 0);
-    assert_eq!(views[0].shape, output_shape);
-    assert_eq!(views[0].strides, vec![3072, 3072, 192, 1]);
-    assert_eq!(views[0].byte_offset, 0);
+    assert_eq!(copied, replay_bytes);
+    assert!(runtime.reset_graph().unwrap());
+
+    let changed_output_shape = [1, 1, 8, 384];
+    let changed_output_strides = compute_contiguous_strides(&changed_output_shape);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let mut changed_output = [TensorMut::new(
+        DevicePtrMut(output_buffer.as_mut_ptr()),
+        DataType::Float32,
+        &changed_output_shape,
+        &changed_output_strides,
+        device,
+    )];
+    let error = kernel.execute(&inputs, &mut changed_output).unwrap_err();
+    assert!(error.to_string().contains("warm the exact signature first"));
+    runtime.abort_graph_capture().unwrap();
 
     ep.deallocate(data_buffer).unwrap();
     ep.deallocate(shape_buffer).unwrap();

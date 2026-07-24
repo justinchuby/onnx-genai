@@ -4,9 +4,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
-use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
-};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};
@@ -394,56 +392,47 @@ impl KernelFactory for ReshapeFactory {
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ReshapeKernel {
             runtime: self.runtime.clone(),
-            constant_shape_input: false,
-            warmed_output_shape: Mutex::new(None),
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReshapeCaptureSignature {
+    dtype: DataType,
+    input_shape: Vec<usize>,
+    output_shape: Vec<usize>,
 }
 
 #[derive(Debug)]
 struct ReshapeKernel {
     runtime: Arc<CudaRuntime>,
-    constant_shape_input: bool,
-    warmed_output_shape: Mutex<Option<Vec<usize>>>,
+    warmed_signature: Mutex<Option<ReshapeCaptureSignature>>,
 }
 
 impl Kernel for ReshapeKernel {
-    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
-        self.constant_shape_input = constant_inputs.get(1).copied().unwrap_or(false);
-    }
-
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         arity("Reshape", inputs, outputs, 1, 2, 1)?;
         require_dense("Reshape", inputs, outputs)?;
+        let capturing = self.runtime.is_capturing()?;
+        let signature = ReshapeCaptureSignature {
+            dtype: inputs[0].dtype,
+            input_shape: inputs[0].shape.to_vec(),
+            output_shape: outputs[0].shape.to_vec(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Reshape: capture signature lock was poisoned".into())
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Reshape: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
+            ));
+        }
         copy_reshape(&self.runtime, "Reshape", &inputs[0], &mut outputs[0])?;
-        if self.constant_shape_input {
-            let mut warmed = self.warmed_output_shape.lock().map_err(|_| {
-                EpError::KernelFailed("cuda_ep Reshape: capture signature lock was poisoned".into())
-            })?;
-            *warmed = Some(outputs[0].shape.to_vec());
+        if !capturing {
+            *warmed_signature = Some(signature);
         }
         Ok(())
-    }
-
-    fn view_outputs(&self, inputs: &[TensorView], num_outputs: usize) -> Option<Vec<ViewOutput>> {
-        if !self.constant_shape_input
-            || num_outputs != 1
-            || inputs.len() != 2
-            || inputs[0].is_absent()
-            || !inputs[0].is_contiguous()
-        {
-            return None;
-        }
-        let shape = self.warmed_output_shape.lock().ok()?.clone()?;
-        if product(&shape, "Reshape").ok()? != inputs[0].numel() {
-            return None;
-        }
-        Some(vec![ViewOutput {
-            input_index: 0,
-            strides: compute_contiguous_strides(&shape),
-            shape,
-            byte_offset: inputs[0].byte_offset,
-        }])
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
@@ -451,10 +440,10 @@ impl Kernel for ReshapeKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        match self.warmed_output_shape.lock() {
-            Ok(shape) if shape.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "Reshape must warm its constant-shape zero-copy view before capture",
+                "Reshape must warm its exact shape/dtype copy signature before capture",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "Reshape capture signature lock was poisoned",
