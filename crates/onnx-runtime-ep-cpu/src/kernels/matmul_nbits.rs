@@ -6505,9 +6505,35 @@ mod tests {
             .collect()
     }
 
+    /// Output width shared by every parity-child config. N=176 with three
+    /// persistent workers cuts the unaligned (align=1) worker boundaries at
+    /// columns 59 and 118 -- both *mid-N-tile* (59 = 4*14+3, 118 = 4*29+2). The
+    /// shipped [`MLAS_SQNBIT_DECODE_SHARD_ALIGN`] = 16 snaps them to 64 and 112
+    /// (both whole N-tile boundaries), so every SQNBit 4-wide N-tile stays
+    /// inside one shard and the sharded decode is bit-identical to full-width.
+    /// Disabling the fix (const -> 1) restores the mid-tile cut, which drifts by
+    /// 1+ ULP on this host (verified across every config below), so this guard
+    /// is *non-vacuous*: see `.squad/decisions/inbox/chew-spmd-test-harden.md`.
+    #[cfg(feature = "mlas")]
+    const MLAS_SHARD_PARITY_N: usize = 176;
+
+    /// `(k, block_size)` configs the parity child sweeps. Each one was verified
+    /// (drift search harness `search_drift_configs`) to differ from full-width
+    /// under an unaligned mid-tile cut at N=176/3-workers, so the aligned guard
+    /// cannot pass vacuously for any of them. All symmetric (int4, zp=8) so the
+    /// child needs no zero-point plumbing.
+    #[cfg(feature = "mlas")]
+    const MLAS_SHARD_PARITY_CONFIGS: &[(usize, usize)] =
+        &[(256, 128), (512, 32), (256, 64), (256, 32), (128, 32)];
+
     /// Isolated child so the persistent-pool and `NO_SHARD` one-time env gates
     /// are initialized independently. This exercises the actual cached
     /// `mlas_shards` + SPMD-scope route, not a manually assembled shard proxy.
+    ///
+    /// Sweeps every [`MLAS_SHARD_PARITY_CONFIGS`] entry at
+    /// [`MLAS_SHARD_PARITY_N`] and concatenates all decode outputs into one
+    /// bit-stream, so the parent bit-compares the *entire* drift matrix (the
+    /// shard route vs the `NO_SHARD` full-width route) in one shot.
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_parity_subprocess() {
@@ -6515,7 +6541,7 @@ mod tests {
             return;
         }
 
-        let (n, k, block_size) = (97usize, 256usize, 64usize);
+        let n = MLAS_SHARD_PARITY_N;
         let pool = crate::decode_spmd::pools().expect("forced persistent SPMD pool");
         let segments = pool.output_column_segments(n, MLAS_SQNBIT_DECODE_SHARD_ALIGN);
         assert_eq!(
@@ -6529,59 +6555,74 @@ mod tests {
             "N={n} must create uneven worker output-column segments: {segments:?}"
         );
 
-        let blocks = k.div_ceil(block_size);
-        let weights_nk = pseudo(n * k, 0.3);
-        let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
-        let b = Owned::u8(&[n, blocks, block_size / 2], &packed_bytes);
-        let scales_t = Owned::f32(&[n, blocks], &scales);
-        let kernel = test_kernel(k, n, block_size);
-        let activation = pseudo(k, 0.8);
-        let mut output = vec![0.0f32; n];
+        let activation = pseudo(
+            MLAS_SHARD_PARITY_CONFIGS
+                .iter()
+                .map(|&(k, _)| k)
+                .max()
+                .unwrap(),
+            0.8,
+        );
+        let mut encoded = String::new();
+        for &(k, block_size) in MLAS_SHARD_PARITY_CONFIGS {
+            let blocks = k.div_ceil(block_size);
+            let weights_nk = pseudo(n * k, 0.3);
+            let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed_bytes);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let kernel = test_kernel(k, n, block_size);
+            let mut output = vec![0.0f32; n];
 
-        let served = with_decode_pool_scope(true, || {
-            assert!(
-                spmd_decode_active().is_some(),
-                "the actual MLAS call must run inside the persistent SPMD scope"
+            let served = with_decode_pool_scope(true, || {
+                assert!(
+                    spmd_decode_active().is_some(),
+                    "the actual MLAS call must run inside the persistent SPMD scope"
+                );
+                kernel
+                    .try_mlas_sqnbit(
+                        &b.view(),
+                        &scales_t.view(),
+                        None,
+                        None,
+                        true,
+                        &activation[..k],
+                        1,
+                        None,
+                        &mut output,
+                    )
+                    .unwrap()
+            });
+            assert_eq!(
+                served,
+                Some(()),
+                "MLAS CompFp32 must serve this decode (k={k} blk={block_size})"
             );
-            kernel
-                .try_mlas_sqnbit(
-                    &b.view(),
-                    &scales_t.view(),
-                    None,
-                    None,
-                    true,
-                    &activation,
-                    1,
-                    None,
-                    &mut output,
-                )
-                .unwrap()
-        });
-        assert_eq!(served, Some(()), "MLAS CompFp32 must serve this decode");
 
-        if mlas_no_shard() {
-            assert!(
-                kernel.mlas_shards.get().is_none(),
-                "NO_SHARD must select the full-width MLAS call"
-            );
-        } else {
-            let shards = kernel
-                .mlas_shards
-                .get()
-                .expect("the cached sharded MLAS route must be populated")
-                .as_ref()
-                .expect("MLAS packed every worker shard");
-            assert_eq!(shards.len(), segments.len());
-            assert!(
-                shards.iter().flatten().count() > 1,
-                "the cached route must contain multiple real MLAS shards"
-            );
+            if mlas_no_shard() {
+                assert!(
+                    kernel.mlas_shards.get().is_none(),
+                    "NO_SHARD must select the full-width MLAS call (k={k} blk={block_size})"
+                );
+            } else {
+                let shards = kernel
+                    .mlas_shards
+                    .get()
+                    .expect("the cached sharded MLAS route must be populated")
+                    .as_ref()
+                    .expect("MLAS packed every worker shard");
+                assert_eq!(shards.len(), segments.len());
+                assert!(
+                    shards.iter().flatten().count() > 1,
+                    "the cached route must contain multiple real MLAS shards \
+                     (k={k} blk={block_size})"
+                );
+            }
+
+            for value in &output {
+                encoded.push_str(&format!("{:08x}", value.to_bits()));
+            }
         }
 
-        let encoded: String = output
-            .iter()
-            .map(|value| format!("{:08x}", value.to_bits()))
-            .collect();
         println!("{MLAS_SHARD_PARITY_MARKER}{encoded}");
     }
 
@@ -6590,7 +6631,14 @@ mod tests {
     /// snapped to [`MLAS_SQNBIT_DECODE_SHARD_ALIGN`], keeping every MLAS N-tile
     /// whole inside one shard, so the sharded decode is now *bit-identical* to
     /// the full-width call (no ~1 ULP N-tile-boundary drift): assert byte-for-
-    /// byte equality of the raw f32 bit patterns.
+    /// byte equality of the raw f32 bit patterns across the entire
+    /// [`MLAS_SHARD_PARITY_CONFIGS`] drift matrix.
+    ///
+    /// Non-vacuity is enforced by construction: every config is a *known
+    /// drifter* at N=176/3-workers when alignment is off (see
+    /// `search_drift_configs` and the decision note). Flipping
+    /// `MLAS_SQNBIT_DECODE_SHARD_ALIGN` from 16 to 1 makes this test fail with
+    /// `max_ulp >= 1`; with 16 it passes bit-exact.
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_matches_no_shard_full_width() {
@@ -6608,11 +6656,119 @@ mod tests {
             .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
             .map(|(i, (a, b))| (i, a.to_bits(), b.to_bits()))
             .collect();
+        let max_ulp = sharded
+            .iter()
+            .zip(&full_width)
+            .map(|(a, b)| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs())
+            .max()
+            .unwrap_or(0);
         assert!(
             mismatches.is_empty(),
-            "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width; \
-             mismatching (index, sharded_bits, full_bits): {mismatches:?}"
+            "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width \
+             (max_ulp={max_ulp}); if this fails, MLAS_SQNBIT_DECODE_SHARD_ALIGN is not \
+             keeping N-tiles whole. mismatching (index, sharded_bits, full_bits): {mismatches:?}"
         );
+    }
+
+    /// TEMP search harness: for a sweep of (n, worker_count, k, block_size),
+    /// build unaligned (align=1) contiguous N shards exactly the way the SPMD
+    /// route would, run each shard's SQNBit GEMV, concat, and report which
+    /// configs drift from the full-width call. Run with:
+    ///   cargo test -p onnx-runtime-ep-cpu --features mlas -- --ignored --nocapture search_drift_configs
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore]
+    fn search_drift_configs() {
+        fn split(n: usize, w: usize) -> Vec<(usize, usize)> {
+            let base = n / w;
+            let rem = n % w;
+            let mut segs = Vec::new();
+            let mut off = 0;
+            for worker in 0..w {
+                let len = base + usize::from(worker < rem);
+                segs.push((off, len));
+                off += len;
+            }
+            segs
+        }
+        for &n in &[97usize, 129, 130, 131, 176, 177, 191, 193, 200, 255, 257] {
+            for &w in &[2usize, 3, 4, 5, 6, 7, 8] {
+                if w > n {
+                    continue;
+                }
+                for &(k, block_size) in &[
+                    (256usize, 128usize),
+                    (512, 32),
+                    (256, 64),
+                    (256, 32),
+                    (128, 32),
+                ] {
+                    for &asym in &[false, true] {
+                        let blocks = k.div_ceil(block_size);
+                        let blob = block_size / 2;
+                        let weights_nk = pseudo(n * k, 0.3);
+                        let (packed, scales, zps, _dq) =
+                            quantize(&weights_nk, n, k, block_size, asym);
+                        let activation = pseudo(k, 0.8);
+
+                        let make = |start: usize, len: usize| {
+                            let pb = &packed[start * blocks * blob..(start + len) * blocks * blob];
+                            let sc = &scales[start * blocks..(start + len) * blocks];
+                            let zp = zps.as_deref().map(|z| {
+                                let row = blocks.div_ceil(2);
+                                &z[start * row..(start + len) * row]
+                            });
+                            mlas_sys::SQNBitPackedB::new(
+                                len,
+                                k,
+                                4,
+                                block_size,
+                                mlas_sys::SQNBitComputeType::Fp32,
+                                pb,
+                                sc,
+                                zp,
+                            )
+                        };
+                        let Some(full) = make(0, n) else { continue };
+                        let mut c_full = vec![0.0f32; n];
+                        mlas_sys::sqnbit_gemm(&full, 1, &activation, None, &mut c_full, false);
+
+                        let segs = split(n, w);
+                        let mut c_shard = vec![0.0f32; n];
+                        for &(start, len) in &segs {
+                            if len == 0 {
+                                continue;
+                            }
+                            let packed_shard = make(start, len).unwrap();
+                            let mut out = vec![0.0f32; len];
+                            mlas_sys::sqnbit_gemm(
+                                &packed_shard,
+                                1,
+                                &activation,
+                                None,
+                                &mut out,
+                                false,
+                            );
+                            c_shard[start..start + len].copy_from_slice(&out);
+                        }
+                        let max_ulp = c_full
+                            .iter()
+                            .zip(&c_shard)
+                            .map(|(a, b)| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs())
+                            .max()
+                            .unwrap_or(0);
+                        if max_ulp > 0 {
+                            let interior: Vec<usize> =
+                                segs.iter().map(|&(s, _)| s).skip(1).collect();
+                            println!(
+                                "DRIFT n={n} w={w} k={k} blk={block_size} asym={asym} \
+                                 max_ulp={max_ulp} boundaries={interior:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     const AFFINITY_DEFER_CHILD_ENV: &str = "NXRT_AFFINITY_DEFER_CHILD";
