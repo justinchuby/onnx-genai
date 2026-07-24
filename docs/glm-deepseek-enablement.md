@@ -312,11 +312,12 @@ Native CUDA on GPU 4 generated a coherent response:
 , but I'm not sure what you're asking. Can you please clarify your question"
 ```
 
-Steady decode was 91.51 tok/s (10.928 ms/token). Capture diagnostics reported
-41 captured segments and 40 eager seams, one per fused-MLP activation `Split`.
-The measured run reported `captures=1 replays=29 fallbacks=0`, so GLM-4 dense
-execution is unblocked. The seams are a performance issue, not an execution
-fallback.
+The initial steady decode result was 91.51 tok/s (10.928 ms/token), with 41
+captured segments and 40 eager seams caused by the fused-MLP activation
+`Split` nodes. Commit `bd9b3a74` added the generic static `Split` capture plan,
+collapsing decode to 1 captured segment and 0 eager seams. Current measurements
+are approximately 118–120 tok/s, with greedy output byte-identical to the
+pre-capture path and no graph fallbacks.
 
 One packaging caveat remains: the original GPTQ repository exposes only a
 custom slow tiktoken tokenizer, so Mobius cannot derive `tokenizer.json`
