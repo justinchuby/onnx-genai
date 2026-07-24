@@ -2401,7 +2401,7 @@ pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result
     {
         use prost::Message;
 
-        let bytes = std::fs::read(model_path).with_context(|| {
+        let bytes = onnx_runtime_loader::read_model_binary(model_path).with_context(|| {
             format!(
                 "Failed to inspect model '{}' for native operators",
                 model_path.display()
@@ -2801,23 +2801,26 @@ struct ScanNodeProto {
 /// carries no graph at all. The caller treats every `None` conservatively as
 /// "has control flow".
 ///
-/// The file is memory-mapped and decoded into [`ScanModelProto`], whose minimal
-/// field set makes prost skip the inline weight tensors without reading them, so
-/// only the pages holding the node region (and the field headers walked to reach
-/// it) are ever faulted in — cheap even for a multi-gigabyte inline-weight
-/// `model.onnx`. An earlier revision gave up on any file over 512 MB and
-/// conservatively reported "has control flow", which wrongly disabled CUDA graph
-/// capture for large inline-weight models (a ~20% decode-throughput loss).
+/// Binary models are memory-mapped and decoded into [`ScanModelProto`], whose
+/// minimal field set makes prost skip the inline weight tensors without reading
+/// them. Textproto fixtures are first converted through the loader's canonical
+/// path. An earlier revision gave up on any file over 512 MB and conservatively
+/// reported "has control flow", which wrongly disabled CUDA graph capture for
+/// large inline-weight models (a ~20% decode-throughput loss).
 fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
     use prost::Message;
 
-    let file = std::fs::File::open(model_path).ok()?;
-    // SAFETY: the model file is treated as immutable for the brief lifetime of
-    // this scan. Model files are not rewritten in place while their directory is
-    // in use, so no concurrent truncation (which could raise SIGBUS) is expected.
-    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-
-    let model = ScanModelProto::decode(&mmap[..]).ok()?;
+    let model = if onnx_runtime_loader::is_textproto_path(model_path) {
+        let bytes = onnx_runtime_loader::read_model_binary(model_path).ok()?;
+        ScanModelProto::decode(bytes.as_slice()).ok()?
+    } else {
+        let file = std::fs::File::open(model_path).ok()?;
+        // SAFETY: the model file is treated as immutable for the brief lifetime of
+        // this scan. Model files are not rewritten in place while their directory is
+        // in use, so no concurrent truncation (which could raise SIGBUS) is expected.
+        let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+        ScanModelProto::decode(&mmap[..]).ok()?
+    };
     let graph = model.graph?;
     Some(graph.node.iter().any(|node| {
         matches!(node.domain.as_str(), "" | "ai.onnx")
@@ -3275,6 +3278,17 @@ mod tests {
             );
             std::fs::remove_file(&truncated).ok();
         }
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn backend_and_control_flow_scans_parse_textproto_fixture() -> anyhow::Result<()> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/model.onnx.textproto");
+
+        assert!(!model_requires_native_backend(&path)?);
+        assert!(!model_has_control_flow_nodes(&path));
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
