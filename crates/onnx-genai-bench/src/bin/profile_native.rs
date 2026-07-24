@@ -8,7 +8,7 @@ use clap::{Parser, ValueEnum};
 use onnx_genai_bench::{fixture_path, synthetic_decoder};
 use onnx_genai_engine::logits::{MinPProcessor, RepetitionPenaltyProcessor};
 use onnx_genai_engine::{
-    Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
     ProcessorChain,
 };
@@ -48,6 +48,21 @@ impl From<DecodeBackend> for EngineDecodeBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DecodePrecisionArg {
+    Model,
+    Fp16,
+}
+
+impl From<DecodePrecisionArg> for DecodePrecision {
+    fn from(precision: DecodePrecisionArg) -> Self {
+        match precision {
+            DecodePrecisionArg::Model => Self::Model,
+            DecodePrecisionArg::Fp16 => Self::Fp16,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Profile token generation through the shared engine decode loop")]
 struct Args {
@@ -81,6 +96,9 @@ struct Args {
     /// --features bench-native,bench-ort (plus cuda for --ep cuda).
     #[arg(long, value_enum, default_value_t = DecodeBackend::Native)]
     backend: DecodeBackend,
+    /// Decoder numeric precision. Fp16 is opt-in; model preserves authored precision.
+    #[arg(long, value_enum, default_value_t = DecodePrecisionArg::Model)]
+    decode_precision: DecodePrecisionArg,
     #[arg(long, default_value = "Hello")]
     prompt: String,
     /// When set, capture an `onnx-runtime-tracer` timeline of a single traced
@@ -299,6 +317,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
     let mut config = EngineConfig {
         decode_backend: args.backend.into(),
+        decode_precision: args.decode_precision.into(),
         ..EngineConfig::default()
     };
     config.native_device = Some(device);
@@ -425,6 +444,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
 
     let mut config = EngineConfig {
         decode_backend: args.backend.into(),
+        decode_precision: args.decode_precision.into(),
         ..EngineConfig::default()
     };
     config.native_device = Some(match args.ep {
@@ -791,6 +811,7 @@ mod tests {
     fn parses_backend_values_and_preserves_native_default() {
         let default = Args::try_parse_from(["profile_native", "--synthetic"]).unwrap();
         assert_eq!(default.backend, DecodeBackend::Native);
+        assert_eq!(default.decode_precision, DecodePrecisionArg::Model);
 
         for (value, expected) in [
             ("native", DecodeBackend::Native),
@@ -800,6 +821,23 @@ mod tests {
             let args = Args::try_parse_from(["profile_native", "--synthetic", "--backend", value])
                 .unwrap();
             assert_eq!(args.backend, expected);
+        }
+    }
+
+    #[test]
+    fn parses_decode_precision_values_and_preserves_model_default() {
+        for (value, expected) in [
+            ("model", DecodePrecisionArg::Model),
+            ("fp16", DecodePrecisionArg::Fp16),
+        ] {
+            let args = Args::try_parse_from([
+                "profile_native",
+                "--synthetic",
+                "--decode-precision",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.decode_precision, expected);
         }
     }
 
