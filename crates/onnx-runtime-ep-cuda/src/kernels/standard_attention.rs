@@ -1085,10 +1085,15 @@ impl Kernel for StandardAttentionKernel {
 
             // When staged, publish the freshly-built dense cache back into the
             // aliased present/past buffer for the next step. Source and
-            // destination are disjoint, so this copy is race-free.
+            // destination are disjoint, so this copy is race-free. Issue it
+            // stream-ordered on the EP compute stream: `build_kv` (the producer)
+            // and the next step's `build_kv` (the consumer) both run on that same
+            // stream, so the copy is implicitly ordered against them without a
+            // full device `synchronize()`. The execute-exit synchronize (below)
+            // still drains it, preserving blocking semantics for eager callers.
             if stage_key {
                 unsafe {
-                    self.runtime.dtod(
+                    self.runtime.dtod_async(
                         key_kv_ptr,
                         present_key_ptr,
                         present_key_expected * element_bytes,
@@ -1097,7 +1102,7 @@ impl Kernel for StandardAttentionKernel {
             }
             if stage_value {
                 unsafe {
-                    self.runtime.dtod(
+                    self.runtime.dtod_async(
                         value_kv_ptr,
                         present_value_ptr,
                         present_value_expected * element_bytes,
