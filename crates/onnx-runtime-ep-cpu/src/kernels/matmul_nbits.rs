@@ -223,6 +223,25 @@ struct MlasShard {
     packed: mlas_sys::SQNBitPackedB,
 }
 
+/// N-tile alignment for the persistent-pool MLAS SQNBit decode shards.
+///
+/// MLAS's SQNBit M=1 GEMV kernels process output columns in fixed-width N-tiles
+/// (four columns on the x86 AVX2/AVX-512 and ARM NEON `SQ4BitGemmM1Kernel`
+/// paths). A per-worker shard boundary that splits an N-tile makes MLAS reduce
+/// that tile's block-sums through its narrower remainder path, so the column
+/// lands ~1 ULP off the full-width call -- enough to flip a razor-thin greedy
+/// argmax tie (observed on qwen3-0.6b int4 decode). Snapping every interior
+/// shard boundary to a multiple of this constant keeps every N-tile whole
+/// inside one shard, so each shard reproduces the full-width tiling exactly and
+/// the concatenated decode output is bit-identical to the unsharded path.
+///
+/// `16` is a safe multiple of the 4-wide SQNBit M=1 N-tile on every supported
+/// ISA (all such tiles are powers of two <= 16, so they divide 16); the tiny
+/// (< 16 column) load imbalance it introduces is negligible for decode's large
+/// projection widths.
+#[cfg(feature = "mlas")]
+const MLAS_SQNBIT_DECODE_SHARD_ALIGN: usize = 16;
+
 struct Int8Weight {
     values: Vec<i8>,
     scales: Vec<f32>,
@@ -889,16 +908,20 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
     ) {
         if let Some(spmd) = (m == 1).then(spmd_decode_active).flatten() {
-            spmd.dispatch_output_rows_indexed(result, &|global_index, start, outputs| {
-                let Some(shard) = shards.get(global_index).and_then(Option::as_ref) else {
-                    return;
-                };
-                debug_assert_eq!(shard.start, start);
-                debug_assert_eq!(shard.len, outputs.len());
-                let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
-                // m == 1: `outputs` is this shard's contiguous output row.
-                mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
-            });
+            spmd.dispatch_output_rows_indexed(
+                result,
+                MLAS_SQNBIT_DECODE_SHARD_ALIGN,
+                &|global_index, start, outputs| {
+                    let Some(shard) = shards.get(global_index).and_then(Option::as_ref) else {
+                        return;
+                    };
+                    debug_assert_eq!(shard.start, start);
+                    debug_assert_eq!(shard.len, outputs.len());
+                    let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
+                    // m == 1: `outputs` is this shard's contiguous output row.
+                    mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
+                },
+            );
             return;
         }
         // Prefill or no active decode scope: each shard writes its columns into
@@ -932,7 +955,7 @@ impl MatMulNBitsKernel {
     #[cfg(feature = "mlas")]
     fn mlas_shard_segments(&self) -> Vec<(usize, usize)> {
         match crate::decode_spmd::pools() {
-            Some(spmd) => spmd.output_column_segments(self.n),
+            Some(spmd) => spmd.output_column_segments(self.n, MLAS_SQNBIT_DECODE_SHARD_ALIGN),
             None => vec![(0, self.n)],
         }
     }
@@ -6494,7 +6517,7 @@ mod tests {
 
         let (n, k, block_size) = (97usize, 256usize, 64usize);
         let pool = crate::decode_spmd::pools().expect("forced persistent SPMD pool");
-        let segments = pool.output_column_segments(n);
+        let segments = pool.output_column_segments(n, MLAS_SQNBIT_DECODE_SHARD_ALIGN);
         assert_eq!(
             segments.len(),
             3,
@@ -6563,19 +6586,32 @@ mod tests {
     }
 
     /// Chew #2: the real cached SPMD MLAS-shard decode route must agree with
-    /// the `NO_SHARD=1` full-width route. MLAS may change a result by ~1 ULP at
-    /// a SIMD N-tile boundary, so use the same 1e-3 tolerance as mlas-sys'
-    /// direct sharded-vs-full parity invariant.
+    /// the `NO_SHARD=1` full-width route. The per-worker shard boundaries are
+    /// snapped to [`MLAS_SQNBIT_DECODE_SHARD_ALIGN`], keeping every MLAS N-tile
+    /// whole inside one shard, so the sharded decode is now *bit-identical* to
+    /// the full-width call (no ~1 ULP N-tile-boundary drift): assert byte-for-
+    /// byte equality of the raw f32 bit patterns.
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_matches_no_shard_full_width() {
         let sharded = mlas_shard_parity_child_output(false);
         let full_width = mlas_shard_parity_child_output(true);
-        mlas_close(
-            &sharded,
-            &full_width,
-            1e-3,
-            "cached SPMD MLAS shards vs NO_SHARD full-width decode",
+        assert_eq!(
+            sharded.len(),
+            full_width.len(),
+            "cached SPMD MLAS shards vs NO_SHARD full-width decode: length mismatch"
+        );
+        let mismatches: Vec<_> = sharded
+            .iter()
+            .zip(&full_width)
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, (a, b))| (i, a.to_bits(), b.to_bits()))
+            .collect();
+        assert!(
+            mismatches.is_empty(),
+            "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width; \
+             mismatching (index, sharded_bits, full_bits): {mismatches:?}"
         );
     }
 
