@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,38 @@ import onnx
 import torch
 from onnx import numpy_helper
 from transformers import AutoModelForCausalLM
+
+
+def rewrite_accuracy_level_1(source_dir: Path, output_dir: Path) -> int:
+    """Create an accuracy-level-1 model directory without copying weight data."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for source in source_dir.iterdir():
+        if source.name == "model.onnx":
+            continue
+        target = output_dir / source.name
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        if source.name == "model.onnx.data":
+            os.link(source, target)
+        else:
+            target.symlink_to(source.resolve())
+
+    graph = onnx.load(source_dir / "model.onnx", load_external_data=False)
+    changed = 0
+    for node in graph.graph.node:
+        if node.op_type != "MatMulNBits":
+            continue
+        accuracy = next(
+            (attribute for attribute in node.attribute if attribute.name == "accuracy_level"),
+            None,
+        )
+        if accuracy is None:
+            node.attribute.append(onnx.helper.make_attribute("accuracy_level", 1))
+        else:
+            accuracy.i = 1
+        changed += 1
+    onnx.save(graph, output_dir / "model.onnx")
+    return changed
 
 
 def dequantize_q4(initializers: dict[str, object], base: str) -> torch.Tensor:
@@ -119,7 +152,7 @@ def install_exact_onnx_weights(model: object, model_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", required=True)
-    parser.add_argument("--hf-model", required=True)
+    parser.add_argument("--hf-model")
     parser.add_argument(
         "--golden",
         type=Path,
@@ -135,6 +168,11 @@ def main() -> None:
         choices=("onnx-q4", "hf-dense"),
         default="onnx-q4",
     )
+    parser.add_argument(
+        "--rewrite-acc1-dir",
+        type=Path,
+        help="write an ORT fp32-activation oracle model directory and exit",
+    )
     args = parser.parse_args()
 
     golden = json.loads(args.golden.read_text())
@@ -144,6 +182,23 @@ def main() -> None:
     )
     if case is None:
         parser.error(f"unknown case: {args.case}")
+    model_dir = args.model_root / case["model_path"]
+    if args.rewrite_acc1_dir is not None:
+        changed = rewrite_accuracy_level_1(model_dir, args.rewrite_acc1_dir)
+        print(
+            json.dumps(
+                {
+                    "source": os.fspath(model_dir),
+                    "output": os.fspath(args.rewrite_acc1_dir),
+                    "matmul_nbits_nodes": changed,
+                    "accuracy_level": 1,
+                },
+                indent=2,
+            )
+        )
+        return
+    if args.hf_model is None:
+        parser.error("--hf-model is required unless --rewrite-acc1-dir is used")
     if "oracle_input_ids" not in case:
         parser.error(f"case {args.case} has no oracle prefix")
 
@@ -156,7 +211,7 @@ def main() -> None:
     model.eval()
     if args.weights == "onnx-q4":
         install_exact_onnx_weights(
-            model, args.model_root / case["model_path"] / "model.onnx"
+            model, model_dir / "model.onnx"
         )
 
     input_ids = torch.tensor([case["oracle_input_ids"]], dtype=torch.long)
