@@ -85,6 +85,7 @@ pub mod quantization;
 pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
+pub mod resize;
 pub mod reshape;
 pub mod rmsnorm;
 pub mod rotary_embedding;
@@ -577,6 +578,14 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("GridSample", "", 20),
         Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 10),
+        Box::new(resize::ResizeFactory { since_version: 10 }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 11),
+        Box::new(resize::ResizeFactory { since_version: 11 }),
     );
     reg.register(
         OpKey::new("AffineGrid", "", 20),
@@ -1601,7 +1610,7 @@ mod tests {
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries.
         let mlas_registrations = usize::from(cfg!(feature = "mlas"));
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 95 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 97 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1628,6 +1637,8 @@ mod tests {
         assert!(reg.lookup("Dropout", "", 22).is_some());
         assert!(reg.lookup("GridSample", "", 16).is_some());
         assert!(reg.lookup("GridSample", "", 20).is_some());
+        assert!(reg.lookup("Resize", "", 10).is_some());
+        assert!(reg.lookup("Resize", "", 25).is_some());
         assert!(reg.lookup("ConvTranspose", "", 22).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());

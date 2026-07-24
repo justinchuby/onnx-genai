@@ -548,7 +548,43 @@ fn resize_extent_from_ratio(
     Ok(rounded as i64)
 }
 
-/// `Resize` (opset 13/18/19): infer from a constant `sizes` or `scales`
+/// Legacy `Resize` opset 10: infer from the required `scales` input.
+pub fn resize_v10(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(input) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    validate_vector_input(ctx, 1, "Resize")?;
+    let Some(scales) = ctx
+        .input_shape_data(1)
+        .and_then(ShapeData::as_float_vector)
+        .map(<[f64]>::to_vec)
+    else {
+        let output = (0..input.rank()).map(|_| ctx.fresh_dim()).collect();
+        ctx.set_output(0, input.dtype, output);
+        return Ok(());
+    };
+    if scales.len() != input.rank() {
+        return Err(ShapeInferError::Invalid {
+            op: "Resize".into(),
+            detail: format!(
+                "scales has {} values but input rank is {}",
+                scales.len(),
+                input.rank()
+            ),
+        });
+    }
+    let mut output = input.shape;
+    for (extent, scale) in output.iter_mut().zip(scales) {
+        *extent = match extent.as_const() {
+            Some(extent) => DimExpr::constant(resize_extent_from_scale(extent, scale)?),
+            None => ctx.fresh_dim(),
+        };
+    }
+    ctx.set_output(0, input.dtype, output);
+    Ok(())
+}
+
+/// `Resize` (opset 11+): infer from a constant `sizes` or `scales`
 /// vector. Runtime-computed vectors preserve only the output rank.
 pub fn resize(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {
@@ -1746,7 +1782,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Unsqueeze", 1, unsqueeze_v1);
     reg.register("", "Unsqueeze", 13, unsqueeze_v13);
     reg.register("", "Expand", 8, expand);
-    reg.register("", "Resize", 13, resize);
+    reg.register("", "Resize", 10, resize_v10);
+    reg.register("", "Resize", 11, resize);
     reg.register("", "Concat", 1, concat);
     reg.register("", "Slice", 1, slice);
     reg.register("", "Split", 1, split);

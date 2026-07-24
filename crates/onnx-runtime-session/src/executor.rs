@@ -56,6 +56,7 @@ use onnx_runtime_ep_api::{
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::strided::view_in_bounds;
+use onnx_runtime_ir::Attribute;
 use onnx_runtime_ir::{
     DataType, DeviceType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId,
     WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides,
@@ -1255,6 +1256,24 @@ fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
     }
 }
 
+fn bytes_as_f64(bytes: &[u8], dtype: DataType) -> Option<Vec<f64>> {
+    match dtype {
+        DataType::Float32 => Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64)
+                .collect(),
+        ),
+        DataType::Float64 => Some(
+            bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Whether a runtime input is small enough to materialize as shape-propagation
 /// data. Keep this gate ahead of `contiguous_bytes`: unsupported tensors must
 /// degrade to absent shape-data without allocating or copying their contents.
@@ -1336,9 +1355,117 @@ fn dynamic_output_shapes(
     input_shapes: &[Vec<usize>],
     input_dtypes: &[DataType],
     input_values: &[Option<Vec<i64>>],
+    input_float_values: &[Option<Vec<f64>>],
     opset: u64,
 ) -> Option<Vec<Vec<usize>>> {
     match node.op_type.as_str() {
+        "Resize" if node.is_default_domain() => {
+            let input = input_shapes.first()?;
+            let rank = input.len();
+            let axes = if let Some(raw) = node.attr("axes").and_then(Attribute::as_ints) {
+                let mut axes = Vec::with_capacity(raw.len());
+                for &axis in raw {
+                    let axis = if axis < 0 { axis + rank as i64 } else { axis };
+                    let axis = usize::try_from(axis).ok()?;
+                    if axis >= rank || axes.contains(&axis) {
+                        return None;
+                    }
+                    axes.push(axis);
+                }
+                if axes.is_empty() {
+                    (0..rank).collect()
+                } else {
+                    axes
+                }
+            } else {
+                (0..rank).collect()
+            };
+            let scales_index = if opset == 10 { 1 } else { 2 };
+            let scales = input_float_values
+                .get(scales_index)
+                .and_then(|values| values.as_deref())
+                .filter(|values| !values.is_empty());
+            let sizes = (opset >= 11)
+                .then(|| input_values.get(3).and_then(|values| values.as_deref()))
+                .flatten()
+                .filter(|values| !values.is_empty());
+            if scales.is_some() == sizes.is_some() {
+                return None;
+            }
+            let mut output = input.clone();
+            if let Some(scales) = scales {
+                if scales.len() != axes.len()
+                    || node
+                        .attr("keep_aspect_ratio_policy")
+                        .and_then(Attribute::as_str)
+                        .is_some_and(|policy| policy != "stretch")
+                {
+                    return None;
+                }
+                for (&axis, &scale) in axes.iter().zip(scales) {
+                    if !scale.is_finite() || scale <= 0.0 {
+                        return None;
+                    }
+                    let extent = input[axis] as f64 * scale;
+                    if extent > usize::MAX as f64 {
+                        return None;
+                    }
+                    output[axis] = extent.floor() as usize;
+                }
+            } else {
+                let sizes = sizes?;
+                if sizes.len() != axes.len() {
+                    return None;
+                }
+                let requested = sizes
+                    .iter()
+                    .map(|&size| usize::try_from(size).ok().filter(|&size| size > 0))
+                    .collect::<Option<Vec<_>>>()?;
+                match node
+                    .attr("keep_aspect_ratio_policy")
+                    .and_then(Attribute::as_str)
+                    .unwrap_or("stretch")
+                {
+                    "stretch" => {
+                        for (&axis, &size) in axes.iter().zip(&requested) {
+                            output[axis] = size;
+                        }
+                    }
+                    policy @ ("not_larger" | "not_smaller") => {
+                        if axes.iter().any(|&axis| input[axis] == 0) {
+                            return None;
+                        }
+                        let (numerator, denominator) = axes
+                            .iter()
+                            .zip(&requested)
+                            .map(|(&axis, &size)| (size, input[axis]))
+                            .reduce(|left, right| {
+                                let order = (left.0 as u128 * right.1 as u128)
+                                    .cmp(&(right.0 as u128 * left.1 as u128));
+                                if (policy == "not_larger" && order.is_le())
+                                    || (policy == "not_smaller" && order.is_ge())
+                                {
+                                    left
+                                } else {
+                                    right
+                                }
+                            })?;
+                        if denominator == 0 {
+                            return None;
+                        }
+                        for &axis in &axes {
+                            let product = (input[axis] as u128).checked_mul(numerator as u128)?;
+                            output[axis] = usize::try_from(
+                                (product + denominator as u128 / 2) / denominator as u128,
+                            )
+                            .ok()?;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            Some(vec![output])
+        }
         // Opset-10+ `Slice`: data, starts, ends, [axes], [steps] as inputs. The
         // per-axis element count mirrors the `Slice` kernel's clamp semantics
         // exactly (ONNX reference), so the buffer we size here matches what the
@@ -3499,11 +3626,19 @@ impl Executor {
                     v.and_then(|vid| self.shape_input_i64(vid, &input_shapes[i], input_dtypes[i]))
                 })
                 .collect();
+            let input_float_values: Vec<Option<Vec<f64>>> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.and_then(|vid| self.shape_input_f64(vid, &input_shapes[i], input_dtypes[i]))
+                })
+                .collect();
             let out_shapes = dynamic_output_shapes(
                 node,
                 &input_shapes,
                 &input_dtypes,
                 &input_values,
+                &input_float_values,
                 effective_opset(&self.graph, node),
             )
             .ok_or_else(|| {
@@ -4061,6 +4196,34 @@ impl Executor {
             return None;
         }
         self.input_i64(vid, shape, dtype)
+    }
+
+    fn shape_input_f64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<f64>> {
+        if !matches!(dtype, DataType::Float32 | DataType::Float64)
+            || shape.len() > 1
+            || shape
+                .iter()
+                .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+                .is_none_or(|count| count > MAX_SHAPE_DATA_ELEMS)
+        {
+            return None;
+        }
+        let max_bytes = MAX_SHAPE_DATA_ELEMS.checked_mul(dtype.byte_size())?;
+        if let Some(view) = self.views.get(&vid) {
+            let source = self.buffers.get(&view.source)?;
+            if source.len() > max_bytes {
+                return None;
+            }
+        }
+        if self
+            .seq_elem_values
+            .get(&vid)
+            .is_some_and(|elem| elem.root_len() > max_bytes)
+        {
+            return None;
+        }
+        let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
+        bytes_as_f64(&bytes, dtype)
     }
 }
 
@@ -7760,7 +7923,8 @@ mod tests {
             DataType::Int64,
         ];
         let out =
-            dynamic_output_shapes(&node, &input_shapes, &input_dtypes, &input_values, 17).unwrap();
+            dynamic_output_shapes(&node, &input_shapes, &input_dtypes, &input_values, &[], 17)
+                .unwrap();
         assert_eq!(out.len(), 1, "Slice must resolve exactly one output shape");
         assert_eq!(out[0], vec![2, 2]);
 
@@ -7772,6 +7936,7 @@ mod tests {
                 &input_shapes,
                 &input_dtypes,
                 &input_values,
+                &[],
                 17
             )
             .is_none(),
@@ -7786,7 +7951,7 @@ mod tests {
             vec![ValueId(0)],
         );
         assert!(
-            dynamic_output_shapes(&other, &input_shapes, &input_dtypes, &input_values, 17)
+            dynamic_output_shapes(&other, &input_shapes, &input_dtypes, &input_values, &[], 17)
                 .is_none()
         );
     }
@@ -7795,7 +7960,7 @@ mod tests {
     fn dynamic_output_shapes_unsqueeze_supports_input_and_attribute_axes() {
         use onnx_runtime_ir::Attribute;
 
-        let mut input_axes = Node::new(
+        let input_axes = Node::new(
             NodeId(0),
             "Unsqueeze",
             vec![Some(ValueId(0)), Some(ValueId(1))],
@@ -7807,6 +7972,7 @@ mod tests {
                 &[vec![2, 3], vec![2]],
                 &[DataType::Float32, DataType::Int64],
                 &[None, Some(vec![0, -1])],
+                &[],
                 17,
             ),
             Some(vec![vec![1, 2, 3, 1]])
@@ -7827,9 +7993,31 @@ mod tests {
                 &[vec![2, 3]],
                 &[DataType::Float32],
                 &[None],
+                &[],
                 11,
             ),
             Some(vec![vec![2, 1, 3, 1]])
+        );
+    }
+
+    #[test]
+    fn dynamic_output_shapes_resize_reads_runtime_scales() {
+        let node = Node::new(
+            NodeId(0),
+            "Resize",
+            vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+            vec![ValueId(3)],
+        );
+        assert_eq!(
+            dynamic_output_shapes(
+                &node,
+                &[vec![1, 128, 13, 13], vec![8], vec![4]],
+                &[DataType::Float32, DataType::Float32, DataType::Float32],
+                &[None, None, None],
+                &[None, None, Some(vec![1.0, 1.0, 2.0, 2.0])],
+                11,
+            ),
+            Some(vec![vec![1, 128, 26, 26]])
         );
     }
 
@@ -7881,6 +8069,7 @@ mod tests {
                     DataType::Int32,
                 ],
                 &input_values,
+                &[],
                 1,
             ),
             Some(vec![
