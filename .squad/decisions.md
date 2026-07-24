@@ -1,6 +1,6 @@
 # Decisions
 
-> Current decision ledger. Older ledgers are under `.squad/decisions/archive/`.
+> Older entries archived under `.squad/decisions-archive/`.
 
 > Scribe archive policy: when this file exceeds the hard gate, keep only the current active reconciliation here and move older active ledger content into `.squad/decisions/archive/`.
 
