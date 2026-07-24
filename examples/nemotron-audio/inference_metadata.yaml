@@ -1,0 +1,120 @@
+# NVIDIA Nemotron 3.5 ASR Streaming 0.6B (Foundry Local ONNX package).
+#
+# Model artifact: nemotron-3.5-asr-streaming-0.6b-generic-cpu:3
+# Source: azureml://registries/azureml/models/nemotron-3.5-asr-streaming-0.6b-generic-cpu/versions/3
+# Downloaded with foundry-local-sdk 0.6.0's Catalog.get_model(...).download().
+#
+# The audio processor produces float32 log-mel features [1, 65, 128] for each
+# 8,960-sample 16-kHz chunk.  The ONNX encoder, LSTM prediction network, and
+# joiner ports below are taken directly from the downloaded graphs.  The
+# `io` blocks express ports with existing semantic bindings; README.md records
+# the complete graph I/O inventory, including non-semantic ports.
+pipeline:
+  models:
+    audio_features:
+      filename: audio_processor_config.json
+      type: audio_feature_extractor
+    vad:
+      filename: silero_vad.onnx
+      type: audio_vad
+    audio_encoder:
+      filename: encoder.onnx
+      type: audio_encoder
+      io:
+        state_pairs:
+          - input: cache_last_channel
+            output: cache_last_channel_next
+            init: zeros
+            update: replace
+          - input: cache_last_time
+            output: cache_last_time_next
+            init: zeros
+            update: replace
+          - input: cache_last_channel_len
+            output: cache_last_channel_len_next
+            init: zeros
+            update: replace
+    prediction_network:
+      filename: decoder.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        sequence_source: token_ids
+        token_input: targets
+        hidden_output: decoder_output
+        state_pairs:
+          - input: h_in
+            output: h_out
+            init: zeros
+            update: replace
+          - input: c_in
+            output: c_out
+            init: zeros
+            update: replace
+    joiner:
+      filename: joint.onnx
+      type: decoder
+      io:
+        logits_output: joint_output
+  dataflow:
+    - from: audio_features.audio_signal
+      to: audio_encoder.audio_signal
+      dtype: fp32
+      device_transfer: false
+    - from: audio_features.length
+      to: audio_encoder.length
+      dtype: int64
+      device_transfer: false
+    - from: audio_encoder.outputs
+      to: joiner.encoder_output
+      dtype: fp32
+      device_transfer: false
+    - from: prediction_network.decoder_output
+      to: joiner.decoder_output
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: extract_audio_features
+        strategy:
+          kind: single_pass
+          model: audio_features
+        run_on: every_step
+      - name: voice_activity_detection
+        strategy:
+          kind: single_pass
+          model: vad
+        run_on: on_demand
+      - name: encode_audio_chunk
+        strategy:
+          kind: single_pass
+          model: audio_encoder
+        run_on: every_step
+      - name: predict_transcript_symbol
+        strategy:
+          kind: autoregressive
+          decoder: prediction_network
+          max_tokens: 10
+        run_on: every_step
+      - name: join_audio_and_symbol
+        strategy:
+          kind: single_pass
+          model: joiner
+        run_on: every_step
+  phases:
+    audio_features:
+      run_on: every_step
+      when_present: audio
+    vad:
+      run_on: on_demand
+      when_present: audio
+    audio_encoder:
+      run_on: every_step
+      when_present: audio
+    prediction_network:
+      run_on: every_step
+      when_present: audio
+    joiner:
+      run_on: every_step
+      when_present: audio

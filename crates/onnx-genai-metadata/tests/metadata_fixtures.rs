@@ -19,6 +19,13 @@ fn crate_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn example(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples")
+        .join(name)
+}
+
 #[test]
 fn parses_valid_yaml_fixture() {
     let metadata =
@@ -303,6 +310,42 @@ fn parses_and_validates_pipeline_fixture() {
         PipelineStrategyKind::Composite
     ));
     assert_eq!(spec.strategy.stages.len(), 2);
+}
+
+#[test]
+fn nemotron_audio_pipeline_example_parses_and_validates() {
+    let path = example("nemotron-audio/inference_metadata.yaml");
+    let metadata = load_metadata(&path).expect("Nemotron audio example parses");
+    let pipeline = metadata.pipeline.expect("pipeline section");
+
+    let instance: serde_json::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(path).expect("example is readable"))
+            .expect("example converts to JSON");
+    schema_validator()
+        .validate(&instance)
+        .expect("Nemotron audio example validates against the JSON schema");
+    validate_pipeline_spec(&pipeline).expect("Nemotron audio pipeline is structurally valid");
+    assert_eq!(pipeline.models["audio_encoder"].role, "audio_encoder");
+    assert_eq!(
+        pipeline.models["audio_encoder"]
+            .io
+            .as_ref()
+            .and_then(|io| io.state_pairs.as_ref())
+            .map(Vec::len),
+        Some(3)
+    );
+    assert_eq!(
+        pipeline.models["prediction_network"]
+            .io
+            .as_ref()
+            .and_then(|io| io.state_pairs.as_ref())
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(matches!(
+        pipeline.strategy.kind,
+        PipelineStrategyKind::Composite
+    ));
 }
 
 #[test]
