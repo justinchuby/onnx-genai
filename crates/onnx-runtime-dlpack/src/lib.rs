@@ -960,17 +960,13 @@ mod tests {
     // ── Import-side tests ──────────────────────────────────────────────────
 
     /// A fake foreign producer: a boxed backing buffer + shape whose `deleter`
-    /// increments a static counter, so we can prove the import owner calls it
-    /// exactly once.
+    /// increments its test-local counter, so we can prove the import owner calls
+    /// it exactly once without sharing state between tests.
     struct FakeProducer {
         _backing: Vec<u8>,
         shape: Vec<i64>,
+        drops: Arc<AtomicUsize>,
     }
-
-    static IMPORT_DROPS: AtomicUsize = AtomicUsize::new(0);
-    /// Serialises the tests that assert on the shared `IMPORT_DROPS` counter so
-    /// the default parallel test runner cannot interleave their reset+observe.
-    static IMPORT_DROPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     unsafe extern "C" fn fake_deleter(managed: *mut DLManagedTensor) {
         if managed.is_null() {
@@ -981,20 +977,23 @@ mod tests {
         unsafe {
             let ctx = (*managed).manager_ctx as *mut FakeProducer;
             if !ctx.is_null() {
-                drop(Box::from_raw(ctx));
+                let producer = Box::from_raw(ctx);
+                producer.drops.fetch_add(1, Ordering::SeqCst);
+                drop(producer);
             }
             // The managed tensor header itself is a separate leaked box.
             drop(Box::from_raw(managed));
         }
-        IMPORT_DROPS.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Build a heap `*mut DLManagedTensor` that mimics what torch/numpy hand us.
-    fn make_fake_managed(shape: Vec<i64>) -> *mut DLManagedTensor {
+    fn make_fake_managed(shape: Vec<i64>) -> (*mut DLManagedTensor, Arc<AtomicUsize>) {
         let numel: usize = shape.iter().map(|&d| d as usize).product();
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut producer = Box::new(FakeProducer {
             _backing: vec![0u8; numel * 4],
             shape,
+            drops: Arc::clone(&drops),
         });
         let data = producer._backing.as_mut_ptr() as *mut c_void;
         let shape_ptr = producer.shape.as_mut_ptr();
@@ -1020,12 +1019,12 @@ mod tests {
             manager_ctx: ctx as *mut c_void,
             deleter: Some(fake_deleter),
         });
-        Box::into_raw(managed)
+        (Box::into_raw(managed), drops)
     }
 
     #[test]
     fn borrowed_view_reads_fields() {
-        let managed = make_fake_managed(vec![2, 3]);
+        let (managed, _drops) = make_fake_managed(vec![2, 3]);
         // SAFETY: `managed` is a live fake we just built; freed via the owner.
         unsafe {
             let view = borrowed_view(managed);
@@ -1044,41 +1043,29 @@ mod tests {
 
     #[test]
     fn owner_calls_foreign_deleter_exactly_once() {
-        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        IMPORT_DROPS.store(0, Ordering::SeqCst);
-        let managed = make_fake_managed(vec![4]);
+        let (managed, drops) = make_fake_managed(vec![4]);
         // SAFETY: single owner of a live fake managed tensor.
         let owner = unsafe { ManagedTensorOwner::new(managed) };
-        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(owner);
-        assert_eq!(IMPORT_DROPS.load(Ordering::SeqCst), 1, "deleter ran once");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "deleter ran once");
     }
 
     #[test]
     fn call_deleter_is_idempotent_across_explicit_call_and_drop() {
         // The Python guard calls `call_deleter` under the GIL; `Drop` then runs
         // too. The `deleted` flag must collapse both into a single deleter call.
-        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        IMPORT_DROPS.store(0, Ordering::SeqCst);
-        let managed = make_fake_managed(vec![2, 3]);
+        let (managed, drops) = make_fake_managed(vec![2, 3]);
         // SAFETY: single owner of a live fake managed tensor.
         let mut owner = unsafe { ManagedTensorOwner::new(managed) };
         // SAFETY: no CPython C-API involved in the fake deleter, so no GIL is
         // required here; models the guard's explicit call.
         unsafe { owner.call_deleter() };
-        assert_eq!(
-            IMPORT_DROPS.load(Ordering::SeqCst),
-            1,
-            "explicit call ran deleter"
-        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "explicit call ran deleter");
         // SAFETY: redundant call must be a no-op.
         unsafe { owner.call_deleter() };
         drop(owner);
-        assert_eq!(
-            IMPORT_DROPS.load(Ordering::SeqCst),
-            1,
-            "no double free after Drop"
-        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "no double free after Drop");
     }
 
     #[test]
@@ -1086,22 +1073,18 @@ mod tests {
         // The owner is `Send`; dropping it on another OS thread must still run
         // the deleter exactly once (the raw mechanism is thread-move-safe; the
         // GIL requirement is layered on by the Python guard, not this crate).
-        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        IMPORT_DROPS.store(0, Ordering::SeqCst);
-        let managed = make_fake_managed(vec![5]);
+        let (managed, drops) = make_fake_managed(vec![5]);
         // SAFETY: single owner of a live fake managed tensor.
         let owner = unsafe { ManagedTensorOwner::new(managed) };
         std::thread::spawn(move || drop(owner))
             .join()
             .expect("drop thread panicked");
         assert_eq!(
-            IMPORT_DROPS.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             1,
             "deleter ran once off-thread"
         );
     }
-
-    static IMPORT_DROPS_V: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn fake_deleter_versioned(managed: *mut DLManagedTensorVersioned) {
         if managed.is_null() {
@@ -1111,18 +1094,23 @@ mod tests {
         unsafe {
             let ctx = (*managed).manager_ctx as *mut FakeProducer;
             if !ctx.is_null() {
-                drop(Box::from_raw(ctx));
+                let producer = Box::from_raw(ctx);
+                producer.drops.fetch_add(1, Ordering::SeqCst);
+                drop(producer);
             }
             drop(Box::from_raw(managed));
         }
-        IMPORT_DROPS_V.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn make_fake_managed_versioned(shape: Vec<i64>) -> *mut DLManagedTensorVersioned {
+    fn make_fake_managed_versioned(
+        shape: Vec<i64>,
+    ) -> (*mut DLManagedTensorVersioned, Arc<AtomicUsize>) {
         let numel: usize = shape.iter().map(|&d| d as usize).product();
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut producer = Box::new(FakeProducer {
             _backing: vec![0u8; numel * 4],
             shape,
+            drops: Arc::clone(&drops),
         });
         let data = producer._backing.as_mut_ptr() as *mut c_void;
         let shape_ptr = producer.shape.as_mut_ptr();
@@ -1153,7 +1141,7 @@ mod tests {
                 byte_offset: 0,
             },
         });
-        Box::into_raw(managed)
+        (Box::into_raw(managed), drops)
     }
 
     #[test]
@@ -1161,33 +1149,23 @@ mod tests {
         // The versioned owner is the default path for modern torch/numpy
         // (DLPack major ≥ 1). Its foreign deleter must run EXACTLY once and be
         // idempotent across an explicit `call_deleter` followed by `Drop`.
-        let _serial = IMPORT_DROPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        IMPORT_DROPS_V.store(0, Ordering::SeqCst);
-        let managed = make_fake_managed_versioned(vec![4]);
+        let (managed, drops) = make_fake_managed_versioned(vec![4]);
         // SAFETY: single owner of a live fake versioned managed tensor.
         let mut owner = unsafe { ManagedTensorVersionedOwner::new(managed) };
-        assert_eq!(IMPORT_DROPS_V.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
         // SAFETY: no CPython C-API in the fake deleter, so no GIL required;
         // models the Python guard's explicit call under the GIL.
         unsafe { owner.call_deleter() };
         assert_eq!(
-            IMPORT_DROPS_V.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
             1,
             "explicit call ran deleter once"
         );
         // SAFETY: redundant call must be a no-op.
         unsafe { owner.call_deleter() };
-        assert_eq!(
-            IMPORT_DROPS_V.load(Ordering::SeqCst),
-            1,
-            "second call is idempotent"
-        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "second call is idempotent");
         drop(owner);
-        assert_eq!(
-            IMPORT_DROPS_V.load(Ordering::SeqCst),
-            1,
-            "no double free after Drop"
-        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "no double free after Drop");
     }
 
     #[test]
