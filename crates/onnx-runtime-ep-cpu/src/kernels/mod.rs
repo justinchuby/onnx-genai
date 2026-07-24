@@ -75,6 +75,7 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod moe;
 pub mod movement_ops;
+pub mod msft_attention;
 pub mod multi_head_attention;
 #[cfg(feature = "mlas")]
 pub mod nchwc;
@@ -360,6 +361,17 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("MultiHeadAttention", "com.microsoft", 1),
         Box::new(multi_head_attention::MultiHeadAttentionFactory),
+    );
+    // `com.microsoft::Attention` (opset 1): the packed-QKV BERT/GPT attention
+    // op. Takes the raw hidden state plus a merged Q/K/V projection weight and
+    // bias, projects `input @ weights + bias`, splits into Q/K/V, then runs the
+    // same SDPA math as MHA. Supports `mask_index` (raw/key-length forms),
+    // `attention_bias`, `unidirectional` causal masking, `qkv_hidden_sizes`,
+    // an explicit `scale`, and the `past`→`present` KV cache. f32 reference
+    // kernel matching ORT 1.26.0; unblocks Whisper's packed-QKV encoder.
+    reg.register(
+        OpKey::new("Attention", "com.microsoft", 1),
+        Box::new(msft_attention::MsftAttentionFactory),
     );
     // `com.microsoft::CausalConvWithState` and `com.microsoft::LinearAttention`:
     // the hybrid linear-attention (Gated DeltaNet) primitives used by Qwen3.5 /
@@ -1621,14 +1633,15 @@ mod tests {
         // `CausalConvWithState` and `LinearAttention` (Qwen3.5 hybrid
         // linear-attention primitives) add two more contrib entries,
         // `GatherBlockQuantized` (block-quantized embedding gather) adds one,
-        // the `com.microsoft::RotaryEmbedding` contrib alias adds one, and
-        // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one.
+        // the `com.microsoft::RotaryEmbedding` contrib alias adds one,
+        // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one, and
+        // `com.microsoft::Attention` (packed-QKV SDPA) adds one.
         // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed).
         let mlas_registrations = if cfg!(feature = "mlas") { 7 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 92 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 93 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
