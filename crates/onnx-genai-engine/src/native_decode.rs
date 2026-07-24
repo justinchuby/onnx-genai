@@ -199,6 +199,7 @@ pub struct NativeDecodeSession {
     present_to_past: HashMap<String, String>,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
+    cpu_kv: Option<DecodeCpuKvState>,
     trace: TraceContext,
     current_len: usize,
     last_hidden: Option<Vec<f32>>,
@@ -874,6 +875,22 @@ impl NativeDecodeSession {
             None
         };
 
+        // Persistent in-place CPU KV: eligible only for pure-attention decoders
+        // (no recurrent state pairs, which are replaced wholesale each step and
+        // cannot be appended in place) running on the CPU device. Gated behind
+        // `ONNX_GENAI_CPU_INPLACE_KV` (default on; set to 0 to force the legacy
+        // host round-trip). Any ineligible KV geometry disables it transparently.
+        let cpu_kv = if session.device_id().device_type != DeviceType::Cuda
+            && state_pairs.is_empty()
+        {
+            match cpu_inplace_kv_max_len_from_env()? {
+                Some(max_len) => DecodeCpuKvState::new(&mut session, &present_to_past, max_len)?,
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             session,
             input_ids,
@@ -885,6 +902,7 @@ impl NativeDecodeSession {
             present_to_past,
             past: HashMap::new(),
             cuda,
+            cpu_kv,
             trace: TraceContext::noop(),
             current_len: 0,
             last_hidden: None,
@@ -1897,6 +1915,156 @@ enum NativeCpuDecodeResult {
     Token(TokenId),
 }
 
+/// Default persistent CPU KV cache capacity (sequence positions) when the
+/// `ONNX_GENAI_CPU_KV_MAX_LEN` override is unset. Matches the CUDA default.
+const DEFAULT_CPU_KV_MAX_LEN: usize = 4096;
+
+/// Persistent in-place CPU KV cache — the CPU analogue of [`DecodeCudaState`]'s
+/// present==past device bindings.
+///
+/// Each growable attention KV pair is bound to ONE persistent host buffer of
+/// full physical capacity `[1, H, max_len, Dh]`, with the present output aliased
+/// onto the past input. The CPU GroupQueryAttention kernel detects that aliasing
+/// and appends each step's K/V rows in place (see `group_query_attention.rs`),
+/// so the decode loop no longer re-feeds the growing past as freshly-copied host
+/// inputs nor round-trips the full present cache to host every step. `input_ids`,
+/// `attention_mask` and `position_ids` remain ordinary per-step host inputs, and
+/// `logits`/`hidden` still materialize normally, so only the KV traffic changes.
+struct DecodeCpuKvState {
+    /// One present==past binding per growable KV pair, sorted by past name.
+    bindings: Vec<DeviceIoBinding>,
+    max_len: usize,
+    logical_len: usize,
+}
+
+impl DecodeCpuKvState {
+    /// Build persistent CPU KV bindings, or `Ok(None)` when the model is not
+    /// eligible for the in-place path (any KV input that is not rank-4 f32 with a
+    /// static head geometry, e.g. an f16 cache). `present_to_past` must contain
+    /// only growable attention KV pairs — recurrent state pairs are handled by
+    /// the host copy path and their presence disables this fast path upstream.
+    fn new(
+        session: &mut InferenceSession,
+        present_to_past: &HashMap<String, String>,
+        max_len: usize,
+    ) -> anyhow::Result<Option<Self>> {
+        let mut pairs = present_to_past
+            .iter()
+            .map(|(present, past)| (present.clone(), past.clone()))
+            .collect::<Vec<_>>();
+        pairs.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        // The append-only in-place path lives ONLY in the CPU GroupQueryAttention
+        // kernel (see `group_query_attention.rs::detect_inplace_kv`). Binding
+        // present==past for a cache consumed by any other op (e.g. a plain Concat)
+        // would not append in place and could corrupt output, so require every
+        // bound past KV input to feed a GroupQueryAttention node; otherwise leave
+        // the model on the safe host copy path.
+        let past_names = pairs.iter().map(|(_, past)| past.clone()).collect::<Vec<_>>();
+        if !all_pasts_consumed_by_gqa(session.graph(), &past_names) {
+            return Ok(None);
+        }
+        let mut bindings = Vec::with_capacity(pairs.len());
+        for (present, past) in pairs {
+            let meta = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == past)
+                .with_context(|| format!("missing native KV input metadata for '{past}'"))?;
+            // Only contiguous rank-4 f32 caches take the in-place path; anything
+            // else (f16, non-rank-4, dynamic non-seq dims) disables it so the
+            // model keeps the correct host copy path with no regression.
+            if meta.dtype != DataType::Float32 || meta.shape.len() != 4 {
+                return Ok(None);
+            }
+            let mut physical_shape = Vec::with_capacity(4);
+            for (axis, dim) in meta.shape.iter().copied().enumerate() {
+                let value = if axis == 0 {
+                    1
+                } else if axis == 2 {
+                    max_len
+                } else if let Dim::Static(value) = dim {
+                    value
+                } else {
+                    return Ok(None);
+                };
+                physical_shape.push(value);
+            }
+            let mut logical_shape = physical_shape.clone();
+            logical_shape[2] = 0;
+            bindings.push(session.allocate_device_binding(
+                past,
+                Some(present),
+                meta.dtype,
+                physical_shape,
+                logical_shape,
+            )?);
+        }
+        if bindings.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            bindings,
+            max_len,
+            logical_len: 0,
+        }))
+    }
+
+    /// Advance every KV binding's logical sequence length to `len`, exposing the
+    /// freshly-appended rows to the next step's consumers.
+    fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
+        for binding in &mut self.bindings {
+            let mut shape = binding.physical_shape().to_vec();
+            shape[2] = len;
+            binding.set_logical_shape(shape)?;
+        }
+        self.logical_len = len;
+        Ok(())
+    }
+}
+
+/// Read the persistent CPU KV cache capacity override, falling back to
+/// [`DEFAULT_CPU_KV_MAX_LEN`]. Returns `Ok(None)` when the in-place path is
+/// disabled via `ONNX_GENAI_CPU_INPLACE_KV=0`.
+fn cpu_inplace_kv_max_len_from_env() -> anyhow::Result<Option<usize>> {
+    match std::env::var("ONNX_GENAI_CPU_INPLACE_KV") {
+        Ok(value) if matches!(value.trim(), "0" | "off" | "false" | "no") => return Ok(None),
+        _ => {}
+    }
+    match std::env::var("ONNX_GENAI_CPU_KV_MAX_LEN") {
+        Ok(value) => {
+            let parsed = value.trim().parse::<usize>().with_context(|| {
+                format!("invalid ONNX_GENAI_CPU_KV_MAX_LEN={value:?}: expected a positive integer")
+            })?;
+            if parsed == 0 {
+                bail!("ONNX_GENAI_CPU_KV_MAX_LEN must be greater than zero");
+            }
+            Ok(Some(parsed))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(Some(DEFAULT_CPU_KV_MAX_LEN)),
+        Err(error) => Err(error).context("read ONNX_GENAI_CPU_KV_MAX_LEN"),
+    }
+}
+
+/// True when every `past` KV input name feeds at least one `GroupQueryAttention`
+/// node — the only CPU kernel that implements the append-only in-place path. The
+/// persistent present==past binding is safe to apply only under this condition;
+/// any other producer (e.g. a plain `Concat`) requires the host copy path.
+fn all_pasts_consumed_by_gqa(graph: &onnx_runtime_ir::Graph, past_names: &[String]) -> bool {
+    if past_names.is_empty() {
+        return false;
+    }
+    let gqa_consumed: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.op_type == "GroupQueryAttention")
+        .flat_map(|(_, node)| node.inputs.iter().copied().flatten())
+        .filter_map(|value_id| graph.value(value_id).name.as_deref())
+        .collect();
+    past_names
+        .iter()
+        .all(|past| gqa_consumed.contains(past.as_str()))
+}
+
 impl NativeDecodeSession {
     fn decode_cpu(
         &mut self,
@@ -2032,6 +2200,146 @@ impl NativeDecodeSession {
         self.current_len = total_len;
         Ok(result)
     }
+
+    /// Decode one or more tokens using the persistent in-place CPU KV cache.
+    ///
+    /// Mirrors [`Self::decode_cpu`] but replaces the growing past-KV host inputs
+    /// and the full present-KV host round-trip with present==past device
+    /// bindings: `input_ids`, `attention_mask` and `position_ids` are still fed
+    /// as fresh host inputs, but the KV caches persist in host buffers that the
+    /// GroupQueryAttention kernel appends to in place. Only bound (present) KV
+    /// outputs are suppressed; `logits`/`hidden` materialize as usual.
+    fn decode_cpu_inplace(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        greedy: bool,
+    ) -> anyhow::Result<NativeCpuDecodeResult> {
+        let total_len = past_len
+            .checked_add(token_ids.len())
+            .context("native decode context length overflow")?;
+        let max_len = self
+            .cpu_kv
+            .as_ref()
+            .expect("decode_cpu_inplace requires CPU KV state")
+            .max_len;
+        if total_len > max_len {
+            bail!(
+                "CPU KV capacity exceeded: requested context length {total_len}, configured max_len {max_len} (raise ONNX_GENAI_CPU_KV_MAX_LEN)"
+            );
+        }
+
+        let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
+        let attention_mask = Tensor::from_i64(&[1, total_len], &vec![1; total_len])?;
+        let mut owned = Vec::with_capacity(3);
+        owned.push((self.input_ids.clone(), input_ids));
+        owned.push((self.attention_mask.clone(), attention_mask));
+        if let Some(position_ids_name) = &self.position_ids {
+            let positions = (past_len..total_len)
+                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let position_ids = Tensor::from_i64(&[1, token_ids.len()], &positions)?;
+            owned.push((position_ids_name.clone(), position_ids));
+        }
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        drop(prepare_span);
+
+        let state = self
+            .cpu_kv
+            .as_mut()
+            .expect("decode_cpu_inplace requires CPU KV state");
+        let run_result: anyhow::Result<_> = {
+            let _run_span = onnx_genai_ort::prof_span!("native.session_run");
+            if token_ids.len() == 1 {
+                onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
+                    self.session
+                        .run_with_device_bindings(&bindings, &mut state.bindings)
+                        .map_err(anyhow::Error::from)
+                })
+            } else {
+                self.session
+                    .run_with_device_bindings(&bindings, &mut state.bindings)
+                    .map_err(anyhow::Error::from)
+            }
+        };
+        let outputs = match run_result {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native in-place decoder forward pass failed{diagnosis}: {error}");
+            }
+        };
+        // The freshly-appended rows become visible to the next step's consumers.
+        state.set_logical_len(total_len)?;
+
+        let fetch_span = onnx_genai_ort::prof_span!("native.logits_fetch");
+        if outputs.len() != self.session.outputs().len() {
+            bail!(
+                "native in-place decoder returned {} outputs, but the graph declares {}",
+                outputs.len(),
+                self.session.outputs().len()
+            );
+        }
+        let mut logits = None;
+        let mut hidden = None;
+        for (metadata, tensor) in self.session.outputs().iter().zip(outputs) {
+            let Some(tensor) = tensor else {
+                // A `None` output is a suppressed present==past KV binding, which
+                // is exactly what the in-place cache expects.
+                if self.present_to_past.contains_key(&metadata.name) {
+                    continue;
+                }
+                bail!(
+                    "native in-place decoder suppressed non-KV output '{}'",
+                    metadata.name
+                );
+            };
+            if metadata.name == self.logits {
+                logits = Some(tensor);
+            } else if self.hidden_output.as_deref() == Some(metadata.name.as_str()) {
+                hidden = Some(tensor);
+            } else if self.present_to_past.contains_key(&metadata.name) {
+                bail!(
+                    "native in-place decoder unexpectedly materialized bound present output '{}'",
+                    metadata.name
+                );
+            }
+        }
+        let logits = logits
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        let result = if greedy {
+            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
+            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
+        } else {
+            let logits = extract_logits(&logits)?;
+            if logits.iter().flatten().any(|value| !value.is_finite()) {
+                bail!("native decoder produced non-finite logits");
+            }
+            NativeCpuDecodeResult::Logits(logits)
+        };
+        self.last_hidden = match (&self.hidden_output, hidden) {
+            (Some(name), Some(tensor)) => Some(
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
+            ),
+            (Some(name), None) => {
+                bail!("native decoder omitted declared hidden output '{name}'")
+            }
+            (None, _) => None,
+        };
+        drop(fetch_span);
+
+        self.current_len = total_len;
+        Ok(result)
+    }
 }
 
 impl DecodeBackend for NativeDecodeSession {
@@ -2040,7 +2348,10 @@ impl DecodeBackend for NativeDecodeSession {
     }
 
     fn max_context(&self) -> Option<usize> {
-        self.cuda.as_ref().map(|state| state.max_len)
+        self.cuda
+            .as_ref()
+            .map(|state| state.max_len)
+            .or_else(|| self.cpu_kv.as_ref().map(|state| state.max_len))
     }
 
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -2055,6 +2366,12 @@ impl DecodeBackend for NativeDecodeSession {
         }
         if self.cuda.is_some() {
             return self.decode_cuda(token_ids, past_len);
+        }
+        if self.cpu_kv.is_some() {
+            return match self.decode_cpu_inplace(token_ids, past_len, false)? {
+                NativeCpuDecodeResult::Logits(logits) => Ok(logits),
+                NativeCpuDecodeResult::Token(_) => unreachable!("logits decode requested"),
+            };
         }
         match self.decode_cpu(token_ids, past_len, false)? {
             NativeCpuDecodeResult::Logits(logits) => Ok(logits),
@@ -2087,6 +2404,12 @@ impl DecodeBackend for NativeDecodeSession {
                 .context("native CUDA decoder produced no logits")?;
             return Ok(Some(token));
         }
+        if self.cpu_kv.is_some() {
+            return match self.decode_cpu_inplace(token_ids, past_len, true)? {
+                NativeCpuDecodeResult::Token(token) => Ok(Some(token)),
+                NativeCpuDecodeResult::Logits(_) => unreachable!("greedy token decode requested"),
+            };
+        }
         match self.decode_cpu(token_ids, past_len, true)? {
             NativeCpuDecodeResult::Token(token) => Ok(Some(token)),
             NativeCpuDecodeResult::Logits(_) => unreachable!("greedy token decode requested"),
@@ -2118,6 +2441,17 @@ impl DecodeBackend for NativeDecodeSession {
                 state.invalidate_graph(&mut self.session)?;
             }
             state.rewind(target_len)?;
+            self.current_len = target_len;
+            return Ok(());
+        }
+        if let Some(state) = &mut self.cpu_kv {
+            // Append-only persistent buffers preserve rows [0, target_len), so a
+            // rewind is just shrinking the exposed logical length; the next
+            // appended step overwrites [target_len, ...) in place.
+            state.set_logical_len(target_len)?;
+            if target_len == 0 {
+                self.last_hidden = None;
+            }
             self.current_len = target_len;
             return Ok(());
         }
@@ -4051,5 +4385,135 @@ mod tests {
                 .to_string()
                 .contains("unsupported logits tensor shape")
         );
+    }
+
+    /// Build a rank-4 growable KV input consumed by a `GroupQueryAttention`
+    /// node. The node is never executed — these tests only inspect graph
+    /// topology through [`all_pasts_consumed_by_gqa`].
+    fn graph_with_gqa_consuming_past(past_name: &str) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 11);
+        let batch = graph.intern_symbol("batch");
+        let past = graph.intern_symbol("past");
+        let past_key = graph.create_named_value(
+            past_name,
+            DataType::Float32,
+            vec![batch.into(), 1.into(), past.into(), 1.into()],
+        );
+        graph.add_input(past_key);
+        let present = graph.create_named_value(
+            "present.0.key",
+            DataType::Float32,
+            vec![batch.into(), 1.into(), past.into(), 1.into()],
+        );
+        insert_op(&mut graph, "GroupQueryAttention", vec![past_key], present, &[]);
+        graph.add_output(present);
+        graph
+    }
+
+    #[test]
+    fn all_pasts_consumed_by_gqa_true_only_when_every_past_feeds_gqa() {
+        let past = "past_key_values.0.key".to_string();
+        let gqa_graph = graph_with_gqa_consuming_past(&past);
+        assert!(all_pasts_consumed_by_gqa(&gqa_graph, &[past.clone()]));
+        // A past that no GQA node consumes must not enable the in-place path.
+        assert!(!all_pasts_consumed_by_gqa(
+            &gqa_graph,
+            &["past_key_values.0.value".to_string()]
+        ));
+        // Empty pair sets are never eligible.
+        assert!(!all_pasts_consumed_by_gqa(&gqa_graph, &[]));
+    }
+
+    #[test]
+    fn all_pasts_consumed_by_gqa_false_for_concat_producer() {
+        // The `tiny_decoder` builds present KV with a plain `Concat`, which has
+        // no append-aware in-place path, so the gate must decline it.
+        let session = tiny_decoder(false);
+        let pasts = vec![
+            "past_key_values.0.key".to_string(),
+            "past_key_values.0.value".to_string(),
+        ];
+        assert!(!all_pasts_consumed_by_gqa(session.graph(), &pasts));
+    }
+
+    #[test]
+    fn decode_cpu_kv_state_declines_non_gqa_model() {
+        // End-to-end gate: on a Concat-based decoder the persistent CPU KV state
+        // must refuse to bind (returns `Ok(None)`), keeping the safe copy path.
+        let mut session = tiny_decoder(false);
+        let mut present_to_past = HashMap::new();
+        present_to_past.insert(
+            "present.0.key".to_string(),
+            "past_key_values.0.key".to_string(),
+        );
+        present_to_past.insert(
+            "present.0.value".to_string(),
+            "past_key_values.0.value".to_string(),
+        );
+        let state = DecodeCpuKvState::new(&mut session, &present_to_past, 128)
+            .expect("gate must not error");
+        assert!(state.is_none(), "Concat producer must not take in-place path");
+    }
+
+    #[test]
+    fn tiny_decoder_matches_across_inplace_env_toggle() {
+        // The Concat model falls back to the copy path regardless of the opt-in
+        // env var, so greedy decoding is identical whether the flag is on or off
+        // — proving the gate prevents any behavioural change on ineligible models.
+        let _guard = env_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        let run = |value: &str| -> Vec<Vec<f32>> {
+            // SAFETY: serialized by `env_lock`; restored below.
+            unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", value) };
+            let mut session =
+                NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+            let prefill = session.decode(&[1, 2, 3], 0).expect("prefill");
+            let step = session.decode(&[4], 3).expect("decode step");
+            unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
+            let mut rows = prefill;
+            rows.extend(step);
+            rows
+        };
+        let on = run("1");
+        let off = run("0");
+        assert_eq!(on, off, "in-place env toggle must not change Concat decode");
+    }
+
+    #[test]
+    fn cpu_inplace_kv_max_len_env_parsing() {
+        let _guard = env_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        // SAFETY: serialized by `env_lock`; each case restores the environment.
+        unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
+        unsafe { std::env::remove_var("ONNX_GENAI_CPU_KV_MAX_LEN") };
+        assert_eq!(
+            cpu_inplace_kv_max_len_from_env().expect("default"),
+            Some(DEFAULT_CPU_KV_MAX_LEN)
+        );
+
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", "0") };
+        assert_eq!(cpu_inplace_kv_max_len_from_env().expect("disabled"), None);
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", "1") };
+
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_KV_MAX_LEN", "2048") };
+        assert_eq!(
+            cpu_inplace_kv_max_len_from_env().expect("custom"),
+            Some(2048)
+        );
+
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_KV_MAX_LEN", "0") };
+        assert!(cpu_inplace_kv_max_len_from_env().is_err(), "zero rejected");
+
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_KV_MAX_LEN", "notanumber") };
+        assert!(cpu_inplace_kv_max_len_from_env().is_err(), "garbage rejected");
+
+        unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
+        unsafe { std::env::remove_var("ONNX_GENAI_CPU_KV_MAX_LEN") };
+    }
+
+    /// Serializes the environment-variable-mutating tests so their `set_var`
+    /// calls do not race under the parallel test runner.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 }
