@@ -371,6 +371,93 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `com.microsoft::Attention`: packed Q/K/V projection followed by attention.
+///
+/// Input 0 is `(batch, sequence, input_hidden)` and input 1 is the packed
+/// projection weight `(input_hidden, q_hidden + k_hidden + v_hidden)`. Unless
+/// `qkv_hidden_sizes` overrides the split, the packed width is divided equally.
+/// Output 0 is `(batch, sequence, v_hidden)`. The optional packed present cache
+/// is `(2, batch, num_heads, past_sequence + sequence, q_head_size)`.
+pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let input = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let weights = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(input), Some(weights), Some(dtype)) = (input, weights, dtype) else {
+        return Ok(());
+    };
+    if input.len() != 3 || weights.len() != 2 {
+        return Err(ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: format!(
+                "input must be rank 3 and weights rank 2 (got input={}, weights={})",
+                input.len(),
+                weights.len()
+            ),
+        });
+    }
+
+    let num_heads = ctx
+        .node
+        .attr("num_heads")
+        .and_then(Attribute::as_int)
+        .map(DimExpr::constant)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: "missing required `num_heads` attribute".into(),
+        })?;
+
+    let (q_hidden, v_hidden) = match ctx
+        .node
+        .attr("qkv_hidden_sizes")
+        .and_then(Attribute::as_ints)
+    {
+        Some(sizes) if sizes.len() == 3 => {
+            (DimExpr::constant(sizes[0]), DimExpr::constant(sizes[2]))
+        }
+        Some(sizes) => {
+            return Err(ShapeInferError::Invalid {
+                op: "Attention".into(),
+                detail: format!(
+                    "qkv_hidden_sizes must contain 3 elements, got {}",
+                    sizes.len()
+                ),
+            });
+        }
+        None => {
+            let hidden = weights[1]
+                .checked_div(&DimExpr::constant(3))
+                .unwrap_or_else(|| ctx.fresh_dim());
+            (hidden.clone(), hidden)
+        }
+    };
+
+    let batch = input[0].clone();
+    let sequence = input[1].clone();
+    ctx.set_output(0, dtype, vec![batch.clone(), sequence.clone(), v_hidden]);
+
+    if ctx.num_outputs() > 1 {
+        let head_size = q_hidden
+            .checked_div(&num_heads)
+            .unwrap_or_else(|| ctx.fresh_dim());
+        let total_sequence = match ctx.input_shape(4) {
+            Some(past) if past.len() == 5 => past[3].add(&sequence),
+            _ => sequence,
+        };
+        ctx.set_output(
+            1,
+            dtype,
+            vec![
+                DimExpr::constant(2),
+                batch,
+                num_heads,
+                total_sequence,
+                head_size,
+            ],
+        );
+    }
+    Ok(())
+}
+
 /// `com.microsoft::MultiHeadAttention`: scaled dot-product attention taking
 /// *separate* query/key/value inputs (unlike the packed-QKV
 /// `com.microsoft::Attention`).
@@ -580,6 +667,9 @@ pub fn register(reg: &mut InferenceRegistry) {
     // cache — total_seq stays kv_seq). The registry resolves the highest
     // `min_opset <= version`, so this single rule serves opsets 23–26.
     reg.register("", "Attention", 23, attention);
+    // com.microsoft::Attention (opset 1): raw hidden states plus a packed Q/K/V
+    // projection. This is used by optimized Whisper encoders.
+    reg.register("com.microsoft", "Attention", 1, msft_attention);
     // com.microsoft::MultiHeadAttention (opset 1): separate Q/K/V inputs whose
     // value head size may differ from the query/key head size, so the output
     // and present_value are sized from V while present_key is sized from Q/K.

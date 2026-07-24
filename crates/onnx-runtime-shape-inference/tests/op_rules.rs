@@ -728,6 +728,71 @@ fn attention_opset24_nonpad_external_cache_no_past_concat() {
     assert_eq!(shape_i(3), vec![c(1), c(2), c(3), c(5)]);
 }
 
+// --- com.microsoft::Attention ---------------------------------------------
+
+fn msft_attention_node(num_inputs: usize, num_outputs: usize, num_heads: i64) -> Node {
+    with_attr(
+        with_domain(node("Attention", num_inputs, num_outputs), "com.microsoft"),
+        "num_heads",
+        Attribute::Int(num_heads),
+    )
+}
+
+#[test]
+fn msft_attention_foundry_whisper_encoder_shape() {
+    // Foundry Whisper-tiny encoder Attention: X [B,1500,384], packed projection
+    // [384,1152] and 6 heads. The context preserves the model hidden width.
+    let n = msft_attention_node(3, 1, 6);
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(1), c(1500), c(384)]),
+            f32in(vec![c(384), c(1152)]),
+            f32in(vec![c(1152)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(1), c(1500), c(384)]);
+}
+
+#[test]
+fn msft_attention_asymmetric_value_and_present_cache_shapes() {
+    let n = with_attr(
+        msft_attention_node(5, 2, 4),
+        "qkv_hidden_sizes",
+        Attribute::Ints(vec![32, 32, 64]),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),
+            f32in(vec![c(32), c(128)]),
+            f32in(vec![c(128)]),
+            NodeIo::default(),
+            f32in(vec![c(2), c(2), c(4), c(7), c(8)]),
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
+    assert_eq!(shape_at(&outs, 1), vec![c(2), c(2), c(4), c(10), c(8)]);
+}
+
+#[test]
+fn msft_attention_missing_num_heads_errors() {
+    let n = with_domain(node("Attention", 3, 1), "com.microsoft");
+    let err = try_run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(3), c(32)]),
+            f32in(vec![c(32), c(96)]),
+            f32in(vec![c(96)]),
+        ],
+        1,
+    )
+    .expect_err("missing num_heads must error");
+    assert_invalid(err, "Attention", "num_heads");
+}
+
 // --- com.microsoft::MultiHeadAttention ------------------------------------
 
 fn multi_head_attention_node(num_inputs: usize, num_outputs: usize, num_heads: i64) -> Node {
