@@ -194,6 +194,7 @@ pub struct NativeDecodeSession {
     trace: TraceContext,
     current_len: usize,
     last_hidden: Option<Vec<f32>>,
+    uses_decode_pool: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,6 +244,7 @@ pub(crate) struct NativeProposerSession {
     present_to_past: Vec<(String, String)>,
     past: HashMap<String, Tensor>,
     current_len: usize,
+    uses_decode_pool: bool,
 }
 
 impl NativeProposerSession {
@@ -386,6 +388,7 @@ impl NativeProposerSession {
             }
         };
 
+        let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
             session,
             sequence_source,
@@ -399,6 +402,7 @@ impl NativeProposerSession {
             present_to_past,
             past: HashMap::new(),
             current_len: 0,
+            uses_decode_pool,
         })
     }
 
@@ -541,10 +545,16 @@ impl NativeProposerSession {
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
             .collect::<Vec<_>>();
-        let outputs = self
-                .session
-                .run(&bindings)
-                .context("native proposer forward pass failed; verify metadata port names, sequence_source, kv_ownership, and tensor shapes")?;
+        let run_single_token = sequence_len == 1;
+        let uses_decode_pool = self.uses_decode_pool;
+        let outputs = if run_single_token {
+            onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
+                self.session.run(&bindings)
+            })
+        } else {
+            self.session.run(&bindings)
+        }
+        .context("native proposer forward pass failed; verify metadata port names, sequence_source, kv_ownership, and tensor shapes")?;
         let names = self
             .session
             .outputs()
@@ -972,6 +982,7 @@ impl NativeDecodeSession {
             None
         };
 
+        let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
             session,
             step_inputs,
@@ -985,6 +996,7 @@ impl NativeDecodeSession {
             trace: TraceContext::noop(),
             current_len: 0,
             last_hidden: None,
+            uses_decode_pool,
         })
     }
 
@@ -2302,7 +2314,8 @@ impl NativeDecodeSession {
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
             if token_ids.len() == 1 {
-                onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
+                let uses_decode_pool = self.uses_decode_pool;
+                onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session.run(&bindings).map_err(anyhow::Error::from)
                 })
             } else {
@@ -2487,6 +2500,7 @@ impl NativeDecodeSession {
             .collect::<Vec<_>>();
         drop(prepare_span);
 
+        let uses_decode_pool = self.uses_decode_pool;
         let state = self
             .cpu_kv
             .as_mut()
@@ -2494,7 +2508,7 @@ impl NativeDecodeSession {
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
             if token_ids.len() == 1 {
-                onnx_runtime_ep_cpu::with_decode_pool_scope(|| {
+                onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session
                         .run_with_device_bindings(&bindings, &mut state.bindings)
                         .map_err(anyhow::Error::from)
@@ -3169,6 +3183,34 @@ fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tens
     Tensor::from_raw(tensor.dtype, shape, &bytes).context("create sliced native KV tensor")
 }
 
+/// Whether the model's decode dispatches work through the shared CPU decode
+/// pool -- i.e. it contains quantized `MatMulNBits` / `QMoE` projections whose
+/// row-sharding runs on the persistent SPMD (or numa-split) decode workers.
+///
+/// A dense-f32 graph (no such nodes) instead has its dominant `MatMul`s serviced
+/// by the multi-threaded MLAS GEMM, which gains nothing from the SPMD pool's
+/// pinned, spinning workers and is slowed by them; such models take the bounded
+/// dense decode pool instead (see
+/// `onnx_runtime_ep_cpu::with_decode_pool_scope`). The check keys off a
+/// structural graph property, never off a specific model, so it generalizes
+/// across every quantized and f32 model. Subgraphs (e.g. `If` branches) are
+/// scanned too so control-flow-wrapped decoders are classified correctly.
+fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
+    for (_, node) in graph.nodes.iter() {
+        if matches!(node.op_type.as_str(), "MatMulNBits" | "QMoE") {
+            return true;
+        }
+        for attr in node.attributes.values() {
+            if let onnx_runtime_ir::Attribute::Graph(subgraph) = attr {
+                if graph_uses_decode_pool(subgraph) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
     if error.contains("f32 kernel input requires Float32, got Int64") {
         for (_, node) in session.graph().nodes.iter() {
@@ -3313,6 +3355,47 @@ mod tests {
             args[onnx_runtime_tracer::ARG_CAPTURE_REJECTED_REASON],
             report.entries[0].reason
         );
+    }
+
+    #[test]
+    fn graph_uses_decode_pool_detects_quantized_ops_including_subgraphs() {
+        let f32_vec = |graph: &mut Graph| {
+            graph.create_value(DataType::Float32, vec![1.into(), 8.into()])
+        };
+
+        // Dense-f32 graph (only MatMul) gains nothing from the SPMD decode pool.
+        let mut dense = Graph::new();
+        let a = f32_vec(&mut dense);
+        let b = dense.create_value(DataType::Float32, vec![8.into(), 8.into()]);
+        let out = f32_vec(&mut dense);
+        insert_op(&mut dense, "MatMul", vec![a, b], out, &[]);
+        assert!(!graph_uses_decode_pool(&dense));
+
+        // Quantized graph (MatMulNBits) dispatches through the SPMD pool.
+        let mut quant = Graph::new();
+        let qa = f32_vec(&mut quant);
+        let qw = quant.create_value(DataType::Uint8, vec![8.into(), 2.into()]);
+        let qout = f32_vec(&mut quant);
+        insert_op(&mut quant, "MatMulNBits", vec![qa, qw], qout, &[]);
+        assert!(graph_uses_decode_pool(&quant));
+
+        // A quantized op nested in an `If` subgraph is still detected.
+        let mut branch = Graph::new();
+        let ba = f32_vec(&mut branch);
+        let bw = branch.create_value(DataType::Uint8, vec![8.into(), 2.into()]);
+        let bout = f32_vec(&mut branch);
+        insert_op(&mut branch, "MatMulNBits", vec![ba, bw], bout, &[]);
+        let mut outer = Graph::new();
+        let cond = outer.create_value(DataType::Bool, vec![1.into()]);
+        let if_out = f32_vec(&mut outer);
+        insert_op(
+            &mut outer,
+            "If",
+            vec![cond],
+            if_out,
+            &[("then_branch", Attribute::Graph(Box::new(branch)))],
+        );
+        assert!(graph_uses_decode_pool(&outer));
     }
 
     fn insert_op(

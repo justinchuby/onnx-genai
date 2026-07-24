@@ -891,6 +891,45 @@ mod tests {
 
     #[cfg(feature = "mlas")]
     #[test]
+    fn default_gemm_backend_matches_generic_reference() {
+        // Locks the auto-detected default GEMM path: after flipping the f32
+        // default to MLAS, `gemm()` (which dispatches on `CpuBackend::auto_detect`)
+        // must still match the generic reference within f32 tolerance, so the
+        // faster default never changes decode outputs (token-ID parity).
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 2048, 2048),   // decode GEMV (m=1), the dense hot path
+            (1, 2304, 9216),   // GeGLU up/gate projection tile
+            (1, 9216, 2304),   // GeGLU down projection tile
+            (5, 128, 256),
+            (32, 512, 512),
+        ];
+        assert_eq!(CpuBackend::auto_detect(), CpuBackend::Mlas);
+        let mut state = 0x1234_abcd_u32;
+        let mut next_f32 = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.25
+        };
+        for &(m, k, n) in SHAPES {
+            let a: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| next_f32()).collect();
+            let mut expected = vec![0.0; m * n];
+            let mut actual = vec![0.0; m * n];
+            gemm_generic(&a, &b, &mut expected, m, k, n);
+            gemm(&a, &b, &mut actual, m, k, n).unwrap();
+            let max_error = actual
+                .iter()
+                .zip(&expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 1e-3,
+                "{m}x{k} @ {k}x{n}: default-backend max error {max_error} exceeds tolerance"
+            );
+        }
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
     fn mlas_gemm_matches_generic_for_matrix_and_batched_vector_tiles() {
         const SHAPES: &[(usize, usize, usize)] = &[
             (1, 1, 1),

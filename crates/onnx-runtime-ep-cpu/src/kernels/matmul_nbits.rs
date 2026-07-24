@@ -106,6 +106,19 @@ const MAX_TOPOLOGY_DECODE_THREADS: usize = 8;
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
 
+/// Upper bound on the bounded pool used for the **dense-f32** decode path (see
+/// [`configured_dense_decode_threads`]). Unlike the quantized `MatMulNBits`
+/// kernels, a dense-f32 model's decode is serviced by the multi-threaded MLAS
+/// GEMM (one cache-aware parallel-for per projection, not a per-row fork/join),
+/// so it scales well past the eight-worker flat ceiling. It is nonetheless pure
+/// memory-bandwidth-bound GEMV, so throughput plateaus once the memory channels
+/// saturate and extra workers only add sync + contention; the cap keeps the
+/// default inside that plateau on many-core hosts (measured flat 16--32 workers
+/// on a 96-core 2-socket Xeon; regressions when oversubscribing toward all 96).
+const MAX_DENSE_DECODE_THREADS: usize = 32;
+static DENSE_DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
+    OnceLock::new();
+
 /// Env knob for the int4 MatMulNBits hand-decode ↔ MLAS SQNBit crossover (`m`
 /// row count). MatMulNBits int4 with `m < NXRT_SQNBIT_DECODE_MIN` uses the
 /// specialized hand-written int4/int8 decode path (`int4_matmul_m1` for block-32
@@ -1160,6 +1173,47 @@ fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> 
     (threads > 0).then(|| threads.min(available))
 }
 
+/// Default worker count for the **dense-f32** decode pool ([`DENSE_DECODE_POOL`]).
+///
+/// The dense path runs the multi-threaded MLAS GEMM, which scales past the flat
+/// pool's eight-worker ceiling but is memory-bandwidth-bound, so it plateaus
+/// once the memory controllers saturate. `available / 4`, clamped to
+/// `[8, MAX_DENSE_DECODE_THREADS]`, lands inside the measured plateau on large
+/// hosts (24 workers on a 96-way 2-socket Xeon) while still using every core on
+/// small hosts. Derived purely from the logical CPU count (Rule 2, no per-model
+/// tuning); `ONNX_GENAI_CPU_DECODE_THREADS` overrides it.
+fn default_dense_decode_threads(available: usize) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    let scaled = (available / 4).max(1);
+    Some(scaled.clamp(8.min(available), MAX_DENSE_DECODE_THREADS).min(available))
+}
+
+/// Resolve the dense-f32 decode pool worker count from the raw
+/// `ONNX_GENAI_CPU_DECODE_THREADS` value and the host's logical CPU count.
+/// `Some("0")` opts out (`None` → run on the global Rayon pool); an explicit
+/// positive count is honored (clamped to `available`); unset/unparseable falls
+/// back to [`default_dense_decode_threads`].
+fn resolve_dense_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    let default = default_dense_decode_threads(available)?;
+    let threads = match raw {
+        Some("0") => return None,
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|threads| *threads > 0)
+            .unwrap_or(default),
+        None => default,
+    };
+    Some(threads.min(available))
+}
+
+fn configured_dense_decode_threads() -> Option<usize> {
+    let value = std::env::var(DECODE_THREADS_ENV).ok();
+    let available = available_parallelism();
+    resolve_dense_decode_threads(value.as_deref(), available)
+}
+
 #[cfg(feature = "mlas")]
 fn default_sqnbit_decode_min(available: usize) -> usize {
     default_decode_threads(available)
@@ -1518,6 +1572,19 @@ impl Drop for DecodeResidencyGuard {
 /// decode-pool workers (see [`with_decode_pool`]), eliminating the per-op
 /// external-thread-to-pool crossing that fragments end-to-end decode throughput.
 ///
+/// `model_uses_spmd_pool` says whether this model's decode actually dispatches
+/// work *through* the shared decode pool -- i.e. it contains quantized
+/// `MatMulNBits` (or quantized MoE) projections whose row-sharding runs on the
+/// persistent SPMD / numa-split workers. When it is `false` the decode is a
+/// **dense-f32** graph whose dominant `MatMul`s are serviced by the
+/// multi-threaded MLAS GEMM on the pool's Rayon workers; the persistent SPMD
+/// pool's pinned, *spinning* workers then provide no benefit and actively steal
+/// cores from (and contend with) that GEMM. Such models therefore skip the
+/// spinning SPMD/numa pools (unless the pool was explicitly forced on) and use
+/// the bounded, non-spinning [`DENSE_DECODE_POOL`] instead. This keys off a
+/// structural graph property (quantized vs dense), never off a specific model,
+/// so it generalizes across every f32 and quantized model (RULES §2).
+///
 /// Behaviour by pool state:
 /// * `Ok(Some(pool))` -- install `f` on the decode pool; the residency flag is
 ///   set *inside* the installed closure (on the worker thread that actually runs
@@ -1531,7 +1598,19 @@ impl Drop for DecodeResidencyGuard {
 ///
 /// Callers should enter this scope only for the M=1 CPU decode case; prefill
 /// (M>1) and non-CPU paths must keep using the global pool.
-pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+pub fn with_decode_pool_scope<R: Send>(
+    model_uses_spmd_pool: bool,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    // Dense-f32 decode gains nothing from the spinning SPMD / numa-split worker
+    // sets and loses cores to them, so unless the persistent pool was explicitly
+    // forced on it skips them and runs on the bounded, non-spinning dense pool
+    // (which the multi-threaded MLAS GEMM tiles across). Keying off model op-mix
+    // (quantized vs dense), not model identity, keeps this general.
+    let spmd_pool_eligible = model_uses_spmd_pool || crate::decode_spmd::is_forced();
+    if !spmd_pool_eligible {
+        return with_dense_decode_pool_scope(f);
+    }
     // The persistent SPMD pool is default-on (opt out with
     // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0`). Precedence: explicit numa-split
     // env > (Auto default, unless an explicit non-numa-split affinity defers it to
@@ -1594,6 +1673,22 @@ pub fn with_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         );
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
+        Ok(Some(pool)) => pool.install(move || {
+            let _guard = DecodeResidencyGuard::enter();
+            f()
+        }),
+        _ => f(),
+    }
+}
+
+/// Install `f` on the bounded, non-spinning [`DENSE_DECODE_POOL`] used by the
+/// dense-f32 decode path. The multi-threaded MLAS GEMM behind each dense
+/// `MatMul` tiles its work across this pool's Rayon workers; the decode-residency
+/// flag makes any inner [`with_decode_pool`] calls run inline. When the pool
+/// opts out (`ONNX_GENAI_CPU_DECODE_THREADS=0`) or fails to build, `f` runs on
+/// the global Rayon pool, preserving correctness.
+fn with_dense_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match DENSE_DECODE_POOL.get_or_init(|| build_decode_pool(configured_dense_decode_threads())) {
         Ok(Some(pool)) => pool.install(move || {
             let _guard = DecodeResidencyGuard::enter();
             f()
@@ -3517,6 +3612,62 @@ mod tests {
     }
 
     #[test]
+    fn dense_decode_thread_default_scales_and_clamps() {
+        // The dense-f32 MLAS path scales past the flat 8-cap but plateaus at the
+        // memory-bandwidth knee, so the default is `available/4` clamped to
+        // `[8, MAX_DENSE_DECODE_THREADS]` (topology-derived, rule 2).
+        assert_eq!(default_dense_decode_threads(96), Some(24));
+        assert_eq!(default_dense_decode_threads(128), Some(32)); // clamped to the cap
+        assert_eq!(default_dense_decode_threads(64), Some(16));
+        assert_eq!(default_dense_decode_threads(48), Some(12));
+        assert_eq!(default_dense_decode_threads(16), Some(8)); // clamped up to the floor
+        assert_eq!(default_dense_decode_threads(8), Some(8)); // floor never exceeds host
+        assert_eq!(default_dense_decode_threads(4), Some(4)); // tiny host: use all cores
+        assert_eq!(default_dense_decode_threads(1), Some(1));
+        assert_eq!(default_dense_decode_threads(0), None);
+        // Distinct from both the flat cap (8) and the persistent default (48) on
+        // a big host: the dense path has its own bandwidth-tuned sizing.
+        assert_ne!(default_dense_decode_threads(96), default_decode_threads(96));
+        assert_ne!(
+            default_dense_decode_threads(96),
+            default_persistent_threads(96)
+        );
+    }
+
+    #[test]
+    fn dense_decode_threads_honor_env_and_opt_out() {
+        // Unset -> the dense default (available/4, clamped).
+        assert_eq!(resolve_dense_decode_threads(None, 96), Some(24));
+        assert_eq!(resolve_dense_decode_threads(Some(""), 96), Some(24));
+        // Explicit `0` opts out -> run on the global Rayon pool.
+        assert_eq!(resolve_dense_decode_threads(Some("0"), 96), None);
+        // An explicit positive count is honored and clamped to the host.
+        assert_eq!(resolve_dense_decode_threads(Some("20"), 96), Some(20));
+        assert_eq!(resolve_dense_decode_threads(Some("1000"), 96), Some(96));
+        assert_eq!(resolve_dense_decode_threads(Some("1"), 96), Some(1));
+        // Unparseable/negative values fall back to the dense default.
+        assert_eq!(resolve_dense_decode_threads(Some("abc"), 96), Some(24));
+        assert_eq!(resolve_dense_decode_threads(Some("8"), 0), None);
+    }
+
+    #[test]
+    fn dense_decode_pool_scope_runs_and_clears_residency() {
+        // The dense scope (model_uses_spmd_pool = false) must run `f` to
+        // completion and never leave the residency flag set on the caller
+        // thread, regardless of whether the bounded pool was built.
+        let sum = with_decode_pool_scope(false, || (0..1_000u64).sum::<u64>());
+        assert_eq!(sum, 499_500);
+        assert!(
+            !IN_DECODE_POOL.with(Cell::get),
+            "dense scope must not leak the residency flag to the caller"
+        );
+        // A dense scope must never route through the SPMD/numa persistent pools
+        // (those are for quantized decode), so the SPMD-active probe is false in
+        // the caller's frame afterwards.
+        assert!(spmd_decode_active().is_none());
+    }
+
+    #[test]
     fn decode_thread_pool_supports_global_pool_opt_out() {
         assert!(build_decode_pool(None).unwrap().is_none());
         let pool = build_decode_pool(Some(3)).unwrap().unwrap();
@@ -3579,7 +3730,7 @@ mod tests {
             .ok()
             .and_then(Option::as_ref)
             .is_some();
-        let (flag_inside, inline_same_thread) = with_decode_pool_scope(|| {
+        let (flag_inside, inline_same_thread) = with_decode_pool_scope(true, || {
             let worker = std::thread::current().id();
             let inner = with_decode_pool(|| std::thread::current().id()).unwrap();
             (IN_DECODE_POOL.with(Cell::get), inner == worker)
@@ -4315,7 +4466,7 @@ mod tests {
         let dot_kernel = selected_dot_kernel();
         let mut bytes = Vec::with_capacity(6 * n * std::mem::size_of::<f32>());
 
-        with_decode_pool_scope(|| {
+        with_decode_pool_scope(true, || {
             for op in 0..6usize {
                 let mut output = vec![0.0f32; n];
                 int4_matmul_m1(&activation, &packed, &mut output, k, n, dot_kernel);
@@ -4493,7 +4644,7 @@ mod tests {
         let activation = pseudo(k, 0.8);
         let mut output = vec![0.0f32; n];
 
-        let served = with_decode_pool_scope(|| {
+        let served = with_decode_pool_scope(true, || {
             assert!(
                 spmd_decode_active().is_some(),
                 "the actual MLAS call must run inside the persistent SPMD scope"

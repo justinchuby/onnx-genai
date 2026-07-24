@@ -59,8 +59,17 @@ impl CpuBackend {
     ///
     /// * Android → `Xnnpack` (placeholder; Generic arithmetic today).
     /// * macOS / iOS → `Accelerate` (placeholder; Generic arithmetic today).
-    /// * Otherwise → `SimdX86` when the host is x86-64 with AVX2 + FMA; else
+    /// * Otherwise → vendored **`Mlas`** when the `mlas` Cargo feature is
+    ///   compiled on x86-64 (multi-threaded, and the fastest measured f32 GEMM
+    ///   path — see `docs/BENCH_CPU_F32_GEMM.md`); else the built-in `SimdX86`
+    ///   MLAS-style microkernel when the host is x86-64 with AVX2 + FMA; else
     ///   `Generic`.
+    ///
+    /// Flipping the f32 default to MLAS matters because dense-f32 decode is
+    /// dominated (>95%) by MatMul, and MLAS's cache-aware tiling + threading
+    /// beats the built-in `SimdX86` microkernel by a wide margin (measured 3-4x
+    /// on Gemma-2-2B f32). The choice is host/build-derived only (no per-model
+    /// or per-op branching), so it generalizes across f32 models.
     pub fn auto_detect() -> Self {
         if let Some(backend) = Self::from_env_override(std::env::var("NXRT_CPU_GEMM_BACKEND").ok())
         {
@@ -81,13 +90,26 @@ impl CpuBackend {
             not(target_os = "ios")
         ))]
         {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // Prefer the vendored, multi-threaded MLAS SGEMM when it is compiled
+            // in on x86-64: it is the fastest f32 GEMM available here and MLAS
+            // does its own runtime ISA dispatch (with a scalar fallback), so it
+            // is safe on any x86-64 host regardless of AVX2/FMA availability.
+            #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
             {
-                if has_simd_x86() {
-                    return Self::SimdX86;
-                }
+                Self::Mlas
             }
-            Self::Generic
+            // Without the MLAS backend, fall back to the built-in AVX2/FMA
+            // microkernel on capable x86 hosts, else the portable Generic path.
+            #[cfg(not(all(feature = "mlas", target_arch = "x86_64")))]
+            {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    if has_simd_x86() {
+                        return Self::SimdX86;
+                    }
+                }
+                Self::Generic
+            }
         }
     }
 
@@ -155,7 +177,16 @@ mod tests {
     #[test]
     fn auto_detect_tracks_simd_x86_support() {
         let expected = {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // MLAS, when compiled in on x86-64, is the preferred f32 default and
+            // wins regardless of AVX2/FMA (it does its own ISA dispatch).
+            #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+            {
+                CpuBackend::Mlas
+            }
+            #[cfg(all(
+                not(all(feature = "mlas", target_arch = "x86_64")),
+                any(target_arch = "x86", target_arch = "x86_64")
+            ))]
             {
                 if has_simd_x86() {
                     CpuBackend::SimdX86
