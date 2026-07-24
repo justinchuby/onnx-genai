@@ -239,6 +239,12 @@ fn validate_backend(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn print_backend_label(backend: DecodeBackend) {
+    if backend != DecodeBackend::Native {
+        println!("profile_native: backend={}", backend.as_str());
+    }
+}
+
 fn configure_ort_provider(args: &Args) -> Result<()> {
     let requested_provider = match args.ep {
         ExecutionProvider::Cpu => "cpu",
@@ -274,12 +280,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
     }
-    println!(
-        "profile_native: model={} ep={:?} backend={}",
-        model_dir.display(),
-        args.ep,
-        args.backend.as_str()
-    );
+    print_backend_label(args.backend);
     println!("profile_native: {}", describe_sampling(args));
     if matches!(args.backend, DecodeBackend::Ort | DecodeBackend::Auto) {
         configure_ort_provider(args)?;
@@ -297,14 +298,16 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             model_dir.display()
         )
     })?;
-    println!(
-        "profile_native: resolved_backend={}",
-        match engine.decode_backend() {
-            EngineDecodeBackend::Native => "native",
-            EngineDecodeBackend::Ort => "ort",
-            EngineDecodeBackend::Auto => "auto",
-        }
-    );
+    if args.backend != DecodeBackend::Native {
+        println!(
+            "profile_native: resolved_backend={}",
+            match engine.decode_backend() {
+                EngineDecodeBackend::Native => "native",
+                EngineDecodeBackend::Ort => "ort",
+                EngineDecodeBackend::Auto => "auto",
+            }
+        );
+    }
 
     for _ in 0..args.warmups {
         std::hint::black_box(
@@ -386,14 +389,14 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         bail!("--tokens must be greater than --decode-skip");
     }
     println!(
-        "profile_native: pipeline={} ep={:?} backend={} tokens={} warmups={} runs={}",
+        "profile_native: pipeline={} ep={:?} tokens={} warmups={} runs={}",
         model_dir.display(),
         args.ep,
-        args.backend.as_str(),
         args.tokens,
         args.warmups,
         args.runs
     );
+    print_backend_label(args.backend);
     if matches!(args.backend, DecodeBackend::Ort | DecodeBackend::Auto) {
         configure_ort_provider(args)?;
     }
@@ -589,11 +592,10 @@ fn main() -> Result<()> {
     };
 
     println!(
-        "profile_native: model={} ep={:?} backend={} layers={} prompt_tokens={prompt_tokens:?} \
+        "profile_native: model={} ep={:?} layers={} prompt_tokens={prompt_tokens:?} \
          tokens={} warmups={} runs={}",
         model.display(),
         args.ep,
-        args.backend.as_str(),
         session.kv_layer_count(),
         args.tokens,
         args.warmups,
@@ -773,6 +775,13 @@ mod tests {
                 .unwrap();
             assert_eq!(args.backend, expected);
         }
+    }
+
+    #[test]
+    fn rejects_invalid_backend_value() {
+        let error = Args::try_parse_from(["profile_native", "--synthetic", "--backend", "bogus"])
+            .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[cfg(not(feature = "bench-ort"))]
