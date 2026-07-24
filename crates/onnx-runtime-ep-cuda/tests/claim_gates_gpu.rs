@@ -79,11 +79,18 @@ fn assert_supported(
 fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
 
-    assert_rejected(
+    assert_supported(
         &ep,
         "RMSNormalization",
         23,
         &[DataType::BFloat16, DataType::Float32],
+        1,
+    );
+    assert_rejected(
+        &ep,
+        "RMSNormalization",
+        23,
+        &[DataType::Float64, DataType::Float32],
         1,
     );
     let fp16_dtypes = [DataType::Float16, DataType::Float32];
