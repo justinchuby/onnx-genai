@@ -176,6 +176,23 @@ fn mlas_no_shard() -> bool {
     })
 }
 
+/// Force the prefill (`m > 1`) MLAS SQNBit path back to the pre-fix serial
+/// loop (each per-worker shard run with MLAS `multithread=true`, one after
+/// another). The default parallel `(shard x m-row-block)` dispatch is
+/// bit-identical to this loop (`max_ulp = 0`) and ~15x faster on a busy
+/// many-core box, so this exists only as an A/B escape hatch. Off by default.
+/// Parsed once.
+#[cfg(feature = "mlas")]
+fn mlas_prefill_serial() -> bool {
+    static PREFILL_SERIAL: OnceLock<bool> = OnceLock::new();
+    *PREFILL_SERIAL.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_MM_MLAS_PREFILL_SERIAL").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
 /// Smallest `m` (batch·seq row count) that routes int4 MatMulNBits to MLAS
 /// SQNBit; smaller `m` uses the hand int4/int8 decode path. Parsed once from
 /// `NXRT_SQNBIT_DECODE_MIN`, defaulting to [`default_sqnbit_decode_min`].
@@ -924,10 +941,91 @@ impl MatMulNBitsKernel {
             );
             return;
         }
-        // Prefill or no active decode scope: each shard writes its columns into
-        // the shared [m, n] output at leading dimension `self.n`, using MLAS's
-        // own tile parallelism.
         let base = result.as_mut_ptr();
+        let active = shards.iter().filter(|shard| shard.is_some()).count();
+
+        // Prefill (`m > 1`) with per-worker shards: the persistent SPMD decode
+        // pool splits N into one shard per worker so decode can hand each
+        // resident worker a column range. That partition is *wrong* for prefill
+        // if run the way decode's flat path would -- looping the shards serially
+        // and letting each one fan across the pool with MLAS's own
+        // `multithread=true` fires one global-Rayon fork/join per *narrow* shard
+        // (N / workers columns). A prefill with `W` shards then pays `W`
+        // sequential fork/joins, each spreading a sliver of work across the whole
+        // machine with poor per-tile efficiency; measured ~15x slower than a
+        // single dispatch (155 vs ~2300 GFLOP/s, Xeon 8480C, 48 shards). This is
+        // the prefill analogue of the decode fork/join cost the persistent pool
+        // removes -- so remove it the same way: issue ONE Rayon parallel pass
+        // over `(shard x m-row-block)` tiles, each running `multithread=false` on
+        // its own disjoint `[rows) x [cols)` output window. Row-major
+        // N-partitioning (with the shipped [`MLAS_SQNBIT_DECODE_SHARD_ALIGN`]
+        // boundaries) and independent M rows make every tile's outputs
+        // independent, so the concatenated result is *bit-identical* to the
+        // serial `multithread=true` loop and to a single full-width call
+        // (verified `max_ulp = 0`). Tiling M as well as N keeps every core busy
+        // when the shard count is below the host thread count, without needing a
+        // second full-width packed weight. Gated on `m > 1 && active > 1`:
+        // decode (`m == 1`) with no SPMD scope and the single-shard no-pool case
+        // keep the original one-call path below (a single full-width
+        // `multithread=true` call is already optimal there).
+        if m > 1 && active > 1 && !mlas_prefill_serial() {
+            let n = self.n;
+            let k = self.k;
+            let threads = rayon::current_num_threads().max(1);
+            // Aim for roughly one tile per hardware thread: split each shard's M
+            // rows into enough blocks to reach `threads` tiles total.
+            let row_blocks = (threads / active).clamp(1, m);
+            let rows_per_block = m.div_ceil(row_blocks);
+            let live: Vec<&MlasShard> = shards.iter().flatten().collect();
+            let mut tiles: Vec<(usize, usize, usize)> = Vec::with_capacity(live.len() * row_blocks);
+            for (shard_index, _) in live.iter().enumerate() {
+                let mut row = 0;
+                while row < m {
+                    let rows = rows_per_block.min(m - row);
+                    tiles.push((shard_index, row, rows));
+                    row += rows;
+                }
+            }
+            struct OutputBase(*mut f32);
+            // SAFETY: every tile writes a disjoint `[row_start, row_start+rows)`
+            // x `[shard.start, shard.start+shard.len)` window of the single
+            // `[m, n]` output, so the workers never alias.
+            unsafe impl Sync for OutputBase {}
+            let out = OutputBase(base);
+            let out = &out;
+            let live = &live;
+            tiles
+                .par_iter()
+                .for_each(|&(shard_index, row_start, rows)| {
+                    let shard = live[shard_index];
+                    let bias = bias.map(|bias| &bias[shard.start..shard.start + shard.len]);
+                    let activations = &activations[row_start * k..(row_start + rows) * k];
+                    // SAFETY: `out.0.add(row_start * n + shard.start)` is the first
+                    // element of this tile's window; the kernel writes `rows` rows at
+                    // leading dimension `n`, each covering `shard.len` columns, all
+                    // within `[m, n]` (`row_start + rows <= m`,
+                    // `shard.start + shard.len <= n`).
+                    let dst = unsafe { out.0.add(row_start * n + shard.start) };
+                    unsafe {
+                        mlas_sys::sqnbit_gemm_into(
+                            &shard.packed,
+                            rows,
+                            activations,
+                            bias,
+                            dst,
+                            n,
+                            false,
+                        );
+                    }
+                });
+            return;
+        }
+
+        // Single full-width shard (no persistent pool), or `m == 1` with no
+        // active decode scope: each shard writes its columns into the shared
+        // `[m, n]` output at leading dimension `self.n`, using MLAS's own tile
+        // parallelism. With a single full-width shard this is exactly the
+        // previous one-call `multithread=true` behaviour.
         for shard in shards.iter().flatten() {
             let bias = bias.map(|bias| &bias[shard.start..shard.start + shard.len]);
             // SAFETY: shards own disjoint contiguous column ranges of a single
@@ -6833,6 +6931,199 @@ mod tests {
             "aligned SPMD MLAS-shard decode must be bit-identical to NO_SHARD full-width \
              (max_ulp={max_ulp}); if this fails, MLAS_SQNBIT_DECODE_SHARD_ALIGN is not \
              keeping N-tiles whole. mismatching (index, sharded_bits, full_bits): {mismatches:?}"
+        );
+    }
+
+    #[cfg(feature = "mlas")]
+    const MLAS_PREFILL_PARITY_CHILD_ENV: &str = "NXRT_MLAS_PREFILL_PARITY_CHILD";
+    #[cfg(feature = "mlas")]
+    const MLAS_PREFILL_PARITY_MARKER: &str = "NXRT_MLAS_PREFILL_PARITY_BYTES=";
+
+    /// Batched rows the prefill parity child runs (`m > 1`, odd so the
+    /// `(shard x m-row-block)` tiling produces uneven row blocks). With the child's
+    /// `RAYON_NUM_THREADS` above its persistent-worker count, the parallel prefill
+    /// dispatch splits each shard's rows into multiple blocks, so this exercises
+    /// both the N-shard and the M-row-block tiling axes.
+    #[cfg(feature = "mlas")]
+    const MLAS_PREFILL_PARITY_M: usize = 7;
+
+    /// Run the prefill (`m > 1`) MLAS SQNBit path in a child process so the
+    /// one-time `ONNX_GENAI_CPU_MM_MLAS_PREFILL_SERIAL` gate initializes cleanly.
+    /// With `serial = true` the child forces the pre-fix serial per-shard
+    /// `multithread=true` loop; with `serial = false` it uses the default parallel
+    /// `(shard x m-row-block)` dispatch. Both run through the real cached
+    /// `mlas_shards` route under a forced multi-worker persistent pool, so a
+    /// bit-comparison of the two outputs proves the parallel dispatch is
+    /// token-exact to the serial baseline. Returns the concatenated `[m, n]`
+    /// output bits across the drift-matrix configs.
+    #[cfg(feature = "mlas")]
+    fn mlas_prefill_parity_child_output(serial: bool) -> Vec<f32> {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::mlas_prefill_dispatch_parity_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(MLAS_PREFILL_PARITY_CHILD_ENV, "1")
+            .env(DECODE_THREADS_ENV, "3")
+            // More Rayon threads than persistent workers so the parallel prefill
+            // dispatch also splits M into row blocks (row_blocks = threads/shards).
+            .env("RAYON_NUM_THREADS", "6")
+            .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        if serial {
+            command.env("ONNX_GENAI_CPU_MM_MLAS_PREFILL_SERIAL", "1");
+        } else {
+            command.env_remove("ONNX_GENAI_CPU_MM_MLAS_PREFILL_SERIAL");
+        }
+        let output = command
+            .output()
+            .expect("run MLAS prefill parity child process");
+        assert!(
+            output.status.success(),
+            "MLAS prefill parity child failed (serial={serial}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("child output is UTF-8");
+        let encoded = stdout
+            .lines()
+            .find_map(|line| {
+                line.find(MLAS_PREFILL_PARITY_MARKER)
+                    .map(|index| &line[index + MLAS_PREFILL_PARITY_MARKER.len()..])
+            })
+            .expect("child emitted MLAS prefill parity bytes");
+        assert_eq!(encoded.len() % 8, 0);
+        encoded
+            .as_bytes()
+            .chunks_exact(8)
+            .map(|hex| {
+                let hex = std::str::from_utf8(hex).unwrap();
+                f32::from_bits(u32::from_str_radix(hex, 16).unwrap())
+            })
+            .collect()
+    }
+
+    /// Isolated child: run a batched (`m > 1`) prefill MatMulNBits through the
+    /// real cached SPMD MLAS-shard route across the [`MLAS_SHARD_PARITY_CONFIGS`]
+    /// drift matrix and emit every output's f32 bits. The parent runs this twice
+    /// (serial vs parallel dispatch) and bit-compares. Prefill runs *outside* a
+    /// decode scope, so `run_mlas_shards` takes its `m > 1` branch.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_prefill_dispatch_parity_subprocess() {
+        if std::env::var(MLAS_PREFILL_PARITY_CHILD_ENV).is_err() {
+            return;
+        }
+
+        let n = MLAS_SHARD_PARITY_N;
+        let m = MLAS_PREFILL_PARITY_M;
+        let pool = crate::decode_spmd::pools().expect("forced persistent SPMD pool");
+        let segments = pool.output_column_segments(n, MLAS_SQNBIT_DECODE_SHARD_ALIGN);
+        assert!(
+            segments.iter().filter(|&&(_, len)| len > 0).count() > 1,
+            "prefill parity needs multiple real N shards to exercise the parallel \
+             dispatch: {segments:?}"
+        );
+
+        let max_k = MLAS_SHARD_PARITY_CONFIGS
+            .iter()
+            .map(|&(k, _)| k)
+            .max()
+            .unwrap();
+        let activation = pseudo(m * max_k, 0.8);
+        let mut encoded = String::new();
+        for &(k, block_size) in MLAS_SHARD_PARITY_CONFIGS {
+            let blocks = k.div_ceil(block_size);
+            let weights_nk = pseudo(n * k, 0.3);
+            let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed_bytes);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let kernel = test_kernel(k, n, block_size);
+            let mut output = vec![0.0f32; m * n];
+
+            // Batched activations: the first `m * k` entries reshaped as [m, k].
+            let mut activations = vec![0.0f32; m * k];
+            for row in 0..m {
+                activations[row * k..(row + 1) * k]
+                    .copy_from_slice(&activation[row * max_k..row * max_k + k]);
+            }
+
+            let served = kernel
+                .try_mlas_sqnbit(
+                    &b.view(),
+                    &scales_t.view(),
+                    None,
+                    None,
+                    true,
+                    &activations,
+                    m,
+                    None,
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(
+                served,
+                Some(()),
+                "MLAS CompFp32 must serve this prefill (k={k} blk={block_size})"
+            );
+            let shards = kernel
+                .mlas_shards
+                .get()
+                .expect("the cached sharded MLAS route must be populated")
+                .as_ref()
+                .expect("MLAS packed every worker shard");
+            assert!(
+                shards.iter().flatten().count() > 1,
+                "the cached route must contain multiple real MLAS shards \
+                 (k={k} blk={block_size})"
+            );
+
+            for value in &output {
+                encoded.push_str(&format!("{:08x}", value.to_bits()));
+            }
+        }
+
+        println!("{MLAS_PREFILL_PARITY_MARKER}{encoded}");
+    }
+
+    /// The default parallel `(shard x m-row-block)` prefill dispatch must be
+    /// *bit-identical* to the pre-fix serial per-shard `multithread=true` loop.
+    /// Both write the same N-tile-aligned shards into disjoint output windows, so
+    /// the concatenated `[m, n]` result cannot differ by even one ULP. This locks
+    /// the token-exactness of the prefill-dispatch fix: reusing the warm parked
+    /// pool via a single parallel pass changes only *how* the shards are
+    /// dispatched, never the arithmetic. (A companion mlas-sys experiment,
+    /// `perf_prefill_shard_dispatch`, shows the same output also equals a single
+    /// full-width call, `max_ulp = 0`, and is ~15x faster than the serial loop.)
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_prefill_parallel_dispatch_matches_serial() {
+        let parallel = mlas_prefill_parity_child_output(false);
+        let serial = mlas_prefill_parity_child_output(true);
+        assert_eq!(
+            parallel.len(),
+            serial.len(),
+            "parallel vs serial prefill dispatch: length mismatch"
+        );
+        let mismatches: Vec<_> = parallel
+            .iter()
+            .zip(&serial)
+            .enumerate()
+            .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+            .map(|(i, (a, b))| (i, a.to_bits(), b.to_bits()))
+            .collect();
+        let max_ulp = parallel
+            .iter()
+            .zip(&serial)
+            .map(|(a, b)| (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            mismatches.is_empty(),
+            "parallel prefill dispatch must be bit-identical to the serial \
+             multithread=true loop (max_ulp={max_ulp}); mismatching \
+             (index, parallel_bits, serial_bits): {mismatches:?}"
         );
     }
 
