@@ -69,6 +69,14 @@ struct Dims {
     head_size: usize,
     index_heads: usize,
     selected_width: usize,
+    /// Per-head row stride of the present cache the attention gathers from:
+    /// `total_seq` for the growing concat present, or the fixed `past_seq`
+    /// capacity when the present aliases `past` in place (capacity mode).
+    cache_seq: usize,
+    /// `true` when the 3-output present aliases the fixed-capacity `past`
+    /// bindings (present sequence == past sequence) instead of growing via
+    /// `past ⧺ current`. Selected for whole-step CUDA-graph capture.
+    capacity_mode: bool,
 }
 
 struct Bias {
@@ -141,7 +149,6 @@ impl Kernel for IndexShareKernel {
         let past_k = optional_input(inputs, 3).map(to_dense_f32).transpose()?;
         let past_v = optional_input(inputs, 4).map(to_dense_f32).transpose()?;
         let indices = to_dense_i64(&inputs[5])?;
-        validate_indices(&indices, dims)?;
         let bias = optional_input(inputs, 6)
             .map(|view| {
                 Ok::<Bias, EpError>(Bias {
@@ -151,13 +158,53 @@ impl Kernel for IndexShareKernel {
             })
             .transpose()?;
 
-        let present_k = concatenate_cache(past_k.as_deref(), &current_k, dims);
-        let present_v = concatenate_cache(past_v.as_deref(), &current_v, dims);
         let scale = self
             .scale
             .unwrap_or_else(|| 1.0 / (dims.head_size as f32).sqrt());
         let sqrt_scale = scale.sqrt();
         let mut output = vec![0.0f32; dims.batch * dims.q_heads * dims.q_seq * dims.head_size];
+
+        if dims.capacity_mode {
+            // The 3-output present aliases the fixed-capacity `past` bindings in
+            // place (no growing `past ⧺ current`). The valid length — hence the
+            // write position of the current token(s) and the index range — is
+            // carried by the causal/padding `attention_bias` frontier, because
+            // the capacity-sized `past` shape no longer encodes it.
+            let bias = bias.as_ref().ok_or_else(|| {
+                error(
+                    "capacity-mode IndexShare (present aliases fixed-capacity past) requires attention_bias to carry the valid length",
+                )
+            })?;
+            let past_k = past_k
+                .as_deref()
+                .expect("capacity mode requires a past cache");
+            let past_v = past_v
+                .as_deref()
+                .expect("capacity mode requires a past cache");
+            let valid_lens = capacity_valid_lens(bias, dims);
+            validate_indices(&indices, dims, &valid_lens)?;
+            let present_k = build_capacity_present(past_k, &current_k, dims, &valid_lens);
+            let present_v = build_capacity_present(past_v, &current_v, dims, &valid_lens);
+            attend_selected(
+                &mut output,
+                &present_k,
+                &present_v,
+                dims.cache_seq,
+                &q,
+                &indices,
+                Some(bias),
+                dims,
+                sqrt_scale,
+            );
+            write_dense_f32(&mut outputs[0], &output)?;
+            write_dense_f32(&mut outputs[1], &present_k)?;
+            write_dense_f32(&mut outputs[2], &present_v)?;
+            return Ok(());
+        }
+
+        validate_indices(&indices, dims, &vec![dims.total_seq; dims.batch])?;
+        let present_k = concatenate_cache(past_k.as_deref(), &current_k, dims);
+        let present_v = concatenate_cache(past_v.as_deref(), &current_v, dims);
 
         // The concat present packs exactly `total_seq` positions per head, so
         // the cache row stride equals `total_seq`.
@@ -335,8 +382,68 @@ fn concatenate_cache(past: Option<&[f32]>, current: &[f32], dims: Dims) -> Vec<f
     present
 }
 
-fn validate_indices(indices: &[i64], dims: Dims) -> Result<()> {
+/// Per-batch valid length carried by the capacity-mode `attention_bias`
+/// frontier: `valid_len[b] = 1 + max{ k : bias(b, ·, ·, k) is finite }`.
+///
+/// A causal/padding mask is finite for every attended (valid) key position and
+/// `-inf` beyond it, so the rightmost finite column marks the logical cache
+/// length. The current token(s) occupy `[valid_len - current_seq, valid_len)`.
+/// This mirrors how default-domain `Attention` derives its valid length from
+/// the additive mask at fixed capacity (see the session executor's
+/// `kernel_input_uses_physical_capacity`).
+fn capacity_valid_lens(bias: &Bias, dims: Dims) -> Vec<usize> {
+    (0..dims.batch)
+        .map(|b| {
+            let mut valid = 0usize;
+            for h in 0..dims.q_heads {
+                for qi in 0..dims.q_seq {
+                    for k in 0..dims.cache_seq {
+                        if bias.at(b, h, qi, k).is_finite() {
+                            valid = valid.max(k + 1);
+                        }
+                    }
+                }
+            }
+            valid
+        })
+        .collect()
+}
+
+/// Build the fixed-capacity ("in-place") present that aliases `past` at
+/// `dims.cache_seq` positions: every capacity row is copied from `past`, then
+/// the current token(s) are written at `[valid_len - current_seq, valid_len)`.
+///
+/// Positions at or beyond `valid_len` are never read by [`attend_selected`]
+/// (the indices only name positions `< valid_len`), so attention over this
+/// layout matches the growing concat present byte-for-byte. `past` is supplied
+/// at capacity (`past_seq == cache_seq`), so the present has the same shape as
+/// the `past` binding — the aliasing the device capacity kernel performs.
+fn build_capacity_present(
+    past: &[f32],
+    current: &[f32],
+    dims: Dims,
+    valid_lens: &[usize],
+) -> Vec<f32> {
+    let cap_row = dims.cache_seq * dims.head_size;
+    let current_row = dims.current_seq * dims.head_size;
+    let mut present = vec![0.0f32; dims.batch * dims.kv_heads * cap_row];
     for b in 0..dims.batch {
+        let write_pos = valid_lens[b].saturating_sub(dims.current_seq);
+        for h in 0..dims.kv_heads {
+            let dst = (b * dims.kv_heads + h) * cap_row;
+            present[dst..dst + cap_row].copy_from_slice(&past[dst..dst + cap_row]);
+            let current_base = (b * dims.kv_heads + h) * current_row;
+            let at = dst + write_pos * dims.head_size;
+            present[at..at + current_row]
+                .copy_from_slice(&current[current_base..current_base + current_row]);
+        }
+    }
+    present
+}
+
+fn validate_indices(indices: &[i64], dims: Dims, per_batch_bound: &[usize]) -> Result<()> {
+    for b in 0..dims.batch {
+        let bound = per_batch_bound[b];
         for h in 0..dims.index_heads {
             for q in 0..dims.q_seq {
                 let row = ((b * dims.index_heads + h) * dims.q_seq + q) * dims.selected_width;
@@ -366,16 +473,13 @@ fn validate_indices(indices: &[i64], dims: Dims) -> Result<()> {
                             format!("index {index} follows trailing -1 padding"),
                         ));
                     }
-                    if index as usize >= dims.total_seq {
+                    if index as usize >= bound {
                         return Err(index_error(
                             b,
                             h,
                             q,
                             column,
-                            format!(
-                                "index {index} is out of range for cache length {}",
-                                dims.total_seq
-                            ),
+                            format!("index {index} is out of range for cache length {bound}"),
                         ));
                     }
                     if let Some(previous) = previous
@@ -477,22 +581,37 @@ fn validate_runtime_shapes(
     if selected[3] == 0 {
         return Err(error("selected_indices K dimension must be nonzero"));
     }
-    if let Some(bias) = optional_input(inputs, 6) {
-        validate_bias_shape(bias.shape, [batch, q_heads, q_seq, total_seq]).map_err(error)?;
-    }
     if outputs[0].shape != q {
         return Err(error(format!(
             "output shape {:?} must equal query shape {q:?}",
             outputs[0].shape
         )));
     }
+    let mut cache_seq = total_seq;
+    let mut capacity_mode = false;
     if outputs.len() == 3 {
-        let expected = [batch, kernel.kv_num_heads, total_seq, head_size];
-        if outputs[1].shape != expected || outputs[2].shape != expected {
+        let concat = [batch, kernel.kv_num_heads, total_seq, head_size];
+        let capacity = [batch, kernel.kv_num_heads, past_seq, head_size];
+        // The present may either grow (`past ⧺ current`, sequence == total_seq)
+        // or alias the fixed-capacity `past` in place (sequence == past_seq,
+        // requires a past cache). `past_seq < total_seq` always (current_seq >=
+        // 1), so the two shapes are unambiguous and no existing concat caller
+        // trips the capacity branch.
+        if outputs[1].shape == concat && outputs[2].shape == concat {
+            // Growing concat present.
+        } else if past_seq > 0 && outputs[1].shape == capacity && outputs[2].shape == capacity {
+            capacity_mode = true;
+            cache_seq = past_seq;
+        } else {
             return Err(error(format!(
-                "present_key and present_value shapes must be {expected:?}"
+                "present_key and present_value shapes must be {concat:?} (growing) or {capacity:?} (fixed capacity)"
             )));
         }
+    }
+    // The bias spans the gathered cache: `total_seq` for the concat present, or
+    // the fixed `cache_seq` capacity when the present aliases past in place.
+    if let Some(bias) = optional_input(inputs, 6) {
+        validate_bias_shape(bias.shape, [batch, q_heads, q_seq, cache_seq]).map_err(error)?;
     }
     Ok(Dims {
         batch,
@@ -505,6 +624,8 @@ fn validate_runtime_shapes(
         head_size,
         index_heads,
         selected_width: selected[3],
+        cache_seq,
+        capacity_mode,
     })
 }
 
@@ -1248,6 +1369,224 @@ mod tests {
         );
     }
 
+    /// Build a capacity-mode IndexShare node: `past`/`present` are sized to a
+    /// fixed `capacity` (present aliases past), and `attention_bias` of width
+    /// `capacity` carries the valid length via its finite frontier.
+    #[allow(clippy::too_many_arguments)]
+    fn run_capacity(
+        case: Case,
+        capacity: usize,
+        q: &[f32],
+        current_k: &[f32],
+        current_v: &[f32],
+        past_k: &[f32],
+        past_v: &[f32],
+        indices: &[i64],
+        bias: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        let specs = [
+            (
+                DataType::Float32,
+                vec![case.batch, case.q_heads, case.q_seq, case.head_size],
+            ),
+            (
+                DataType::Float32,
+                vec![case.batch, case.kv_heads, case.current_seq, case.head_size],
+            ),
+            (
+                DataType::Float32,
+                vec![case.batch, case.kv_heads, case.current_seq, case.head_size],
+            ),
+            (
+                DataType::Float32,
+                vec![case.batch, case.kv_heads, capacity, case.head_size],
+            ),
+            (
+                DataType::Float32,
+                vec![case.batch, case.kv_heads, capacity, case.head_size],
+            ),
+            (
+                DataType::Int64,
+                vec![case.batch, case.index_heads, case.q_seq, case.width],
+            ),
+            (
+                DataType::Float32,
+                vec![case.batch, case.q_heads, case.q_seq, capacity],
+            ),
+        ];
+        let inputs = specs
+            .iter()
+            .enumerate()
+            .map(|(index, (dtype, shape))| {
+                let value = graph.create_named_value(
+                    format!("input_{index}"),
+                    *dtype,
+                    static_shape(shape.iter().copied()),
+                );
+                graph.add_input(value);
+                Some(value)
+            })
+            .collect();
+        let mut node_outputs = vec![graph.create_named_value(
+            "output",
+            DataType::Float32,
+            static_shape([case.batch, case.q_heads, case.q_seq, case.head_size]),
+        )];
+        for name in ["present_key", "present_value"] {
+            node_outputs.push(graph.create_named_value(
+                name,
+                DataType::Float32,
+                static_shape([case.batch, case.kv_heads, capacity, case.head_size]),
+            ));
+        }
+        let mut node = Node::new(NodeId(0), OP, inputs, node_outputs);
+        node.domain = "pkg.nxrt".into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(case.q_heads as i64));
+        node.attributes
+            .insert("kv_num_heads".into(), Attribute::Int(case.kv_heads as i64));
+        node.attributes
+            .insert("scale".into(), Attribute::Float(case.scale));
+        let id = graph.insert_node(node);
+        let kernel = IndexShareFactory.create(graph.node(id), &[])?;
+
+        let q = Owned::f32(&[case.batch, case.q_heads, case.q_seq, case.head_size], q);
+        let current_k = Owned::f32(
+            &[case.batch, case.kv_heads, case.current_seq, case.head_size],
+            current_k,
+        );
+        let current_v = Owned::f32(
+            &[case.batch, case.kv_heads, case.current_seq, case.head_size],
+            current_v,
+        );
+        let past_k = Owned::f32(&[case.batch, case.kv_heads, capacity, case.head_size], past_k);
+        let past_v = Owned::f32(&[case.batch, case.kv_heads, capacity, case.head_size], past_v);
+        let indices = Owned::i64(
+            &[case.batch, case.index_heads, case.q_seq, case.width],
+            indices,
+        );
+        let bias = Owned::f32(&[case.batch, case.q_heads, case.q_seq, capacity], bias);
+        let inputs = vec![
+            q.view(),
+            current_k.view(),
+            current_v.view(),
+            past_k.view(),
+            past_v.view(),
+            indices.view(),
+            bias.view(),
+        ];
+        let mut output = Owned::zeros_f32(&[case.batch, case.q_heads, case.q_seq, case.head_size]);
+        let mut present_k =
+            Owned::zeros_f32(&[case.batch, case.kv_heads, capacity, case.head_size]);
+        let mut present_v =
+            Owned::zeros_f32(&[case.batch, case.kv_heads, capacity, case.head_size]);
+        kernel.execute(
+            &inputs,
+            &mut [
+                output.view_mut(),
+                present_k.view_mut(),
+                present_v.view_mut(),
+            ],
+        )?;
+        Ok((output.to_f32(), present_k.to_f32(), present_v.to_f32()))
+    }
+
+    /// End-to-end through the public kernel API: a capacity-mode call (present
+    /// aliases fixed-capacity past, valid length from the bias frontier) yields
+    /// the byte-identical attention output and the same valid present region as
+    /// the growing concat call. This is what keeps CPU==CUDA parity once the
+    /// device kernel and executor bind the KV cache at capacity for capture.
+    #[test]
+    fn capacity_mode_execute_matches_concat_execute_byte_for_byte() {
+        let case = Case {
+            batch: 1,
+            q_heads: 4,
+            kv_heads: 2,
+            q_seq: 1,
+            current_seq: 1,
+            past_seq: 5,
+            head_size: 3,
+            index_heads: 4,
+            width: 4,
+            scale: 0.25,
+        };
+        let total = case.past_seq + case.current_seq;
+        let q = sequence(case.batch * case.q_heads * case.q_seq * case.head_size, 0.25);
+        let past_k = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, -0.5);
+        let past_v = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, 0.75);
+        let current_k =
+            sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, 0.125);
+        let current_v =
+            sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, -1.25);
+        // Strictly-increasing causal indices per (index-head, query).
+        let mut indices = vec![-1i64; case.batch * case.index_heads * case.q_seq * case.width];
+        for ih in 0..case.index_heads {
+            let row = (ih * case.q_seq) * case.width;
+            for k in 0..case.width.min(total) {
+                indices[row + k] = (total - case.width.min(total) + k) as i64;
+            }
+        }
+        // Concat reference with a causal bias over [0, total).
+        let concat_bias = vec![0.0f32; case.batch * case.q_heads * case.q_seq * total];
+        let (out_concat, pk_concat, pv_concat) = run(
+            case,
+            &q,
+            &current_k,
+            &current_v,
+            Some(&past_k),
+            Some(&past_v),
+            &indices,
+            Some(&concat_bias),
+        )
+        .unwrap();
+
+        for capacity in [total, total + 3, total + 9] {
+            // Capacity past: valid [0, past_seq) from past, garbage after.
+            let mut cap_k =
+                vec![987.0f32; case.batch * case.kv_heads * capacity * case.head_size];
+            let mut cap_v =
+                vec![-654.0f32; case.batch * case.kv_heads * capacity * case.head_size];
+            let past_row = case.past_seq * case.head_size;
+            let cap_row = capacity * case.head_size;
+            for bh in 0..case.batch * case.kv_heads {
+                cap_k[bh * cap_row..bh * cap_row + past_row]
+                    .copy_from_slice(&past_k[bh * past_row..bh * past_row + past_row]);
+                cap_v[bh * cap_row..bh * cap_row + past_row]
+                    .copy_from_slice(&past_v[bh * past_row..bh * past_row + past_row]);
+            }
+            // Capacity bias: finite over [0, total), -inf beyond (the frontier).
+            let mut cap_bias =
+                vec![f32::NEG_INFINITY; case.batch * case.q_heads * case.q_seq * capacity];
+            for bhq in 0..case.batch * case.q_heads * case.q_seq {
+                for k in 0..total {
+                    cap_bias[bhq * capacity + k] = 0.0;
+                }
+            }
+            let (out_cap, pk_cap, pv_cap) = run_capacity(
+                case, capacity, &q, &current_k, &current_v, &cap_k, &cap_v, &indices, &cap_bias,
+            )
+            .unwrap();
+            assert_eq!(out_cap, out_concat, "capacity {capacity}: output diverged");
+            // The valid present region [0, total) must equal the concat present.
+            let cap_row = capacity * case.head_size;
+            let concat_row = total * case.head_size;
+            for bh in 0..case.batch * case.kv_heads {
+                assert_eq!(
+                    &pk_cap[bh * cap_row..bh * cap_row + concat_row],
+                    &pk_concat[bh * concat_row..bh * concat_row + concat_row],
+                    "capacity {capacity}: present_key valid region diverged"
+                );
+                assert_eq!(
+                    &pv_cap[bh * cap_row..bh * cap_row + concat_row],
+                    &pv_concat[bh * concat_row..bh * concat_row + concat_row],
+                    "capacity {capacity}: present_value valid region diverged"
+                );
+            }
+        }
+    }
+
     fn dims_of(case: Case) -> Dims {
         Dims {
             batch: case.batch,
@@ -1260,6 +1599,8 @@ mod tests {
             head_size: case.head_size,
             index_heads: case.index_heads,
             selected_width: case.width,
+            cache_seq: case.past_seq + case.current_seq,
+            capacity_mode: false,
         }
     }
 
