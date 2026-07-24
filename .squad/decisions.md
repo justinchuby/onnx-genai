@@ -3668,3 +3668,31 @@ These now surface their true kernel decline (they were previously hidden as unre
 **By:** Bilecki
 **What:** Store an `Arc<AtomicUsize>` in each fake producer context and have its foreign deleter increment that test-local counter; remove the shared import counters and serialization lock.
 **Why:** The shared static counter allowed unrelated deferred deleters to contaminate another test's assertion, observed as a Windows ARM64-only failure. Per-test ownership makes the deleter assertions hermetic while leaving production idempotency behavior unchanged.
+
+<!-- scribe-merge-2026-07-24T21-47-08Z-inbox-reconciliation -->
+## 2026-07-24 — Decision inbox reconciliation (CPU coverage, ARM64 reliability, MHA/SDPA)
+
+### Cross-platform CPU test and build hygiene
+**By:** Hasford, Vasquez, Apone, Drake, Dutch; reviewed by Drake, Apone, and the applicable non-author reviewers.
+
+- Gate `dot_u8_i16_scalar` to x86_64 while retaining portable BF16 grouped-dot coverage and narrowly permitting the non-x86 test stub to be dead in library-only builds; this restores `-D warnings` aarch64 checks without weakening portable assertions.
+- The Windows ARM64 SPMD parity crash was a test-harness oversubscription/flakiness issue, not an ARM kernel race: the old fixed 31-worker decode plus 31-worker Rayon setup exceeded constrained runners and did not deterministically preserve odd worker counts. `parity_worker_count()` now selects the largest odd host-bounded count, capped at 15; parity remains non-vacuous on every platform. Drake approved with only a tiny-host coverage nit, and Apone approved the follow-up forced-pool bound with a documentation nit.
+- The persistent-pool auto-enable review found the park/unpark SeqCst handshake free of lost wakeups, with flat-default fallback, hysteresis, and token-exact parity. The SQNBit shard investigation identified MLAS N-tile boundary alignment as the source of pool-vs-flat ULP drift and recommends aligned interior shard boundaries.
+
+### BF16 coverage and GELU special values
+**By:** Vasquez (coverage audit), Pris (oracle revision), Hicks (reviewer); approved by Hicks after revision.
+
+- CPU EP BF16 uses portable `half::bf16` widen/compute/narrow dispatch. Batch 1 adds the three fused `com.microsoft` GELU activations and exhaustive independent BF16 special-value coverage for unary math; unrelated f32-only/custom kernels remain scoped for later audits.
+- The initial BF16 review rejected self-referential expected values. Pris replaced them with literal BF16 goldens and definition-based special-value checks. This exposed and fixed the GELU-family `-∞` defect: exact, tanh, and Quick GELU now return `+0.0` (not NaN) for `-∞`; `+∞`, NaN, and signed zero follow their defined behavior. Hicks approved the revised commit and all listed test/clippy gates passed.
+
+### MultiHeadAttention shape and kernel architecture
+**By:** Deckard (implementation); reviewed by Gorman.
+
+- MHA shape inference derives output/present-value dimensions from V independently of Q/K head size, while present-key dimensions derive from Q/K; unsupported packed/rank-mismatched layouts fail explicitly. Gorman's review confirmed the rule against live ORT, with only documentation/test-framing nits.
+- The CPU MHA kernel is numerically correct against live ORT, including causal past offsets, cross-attention, differing V head size, masks, bias, and rejection paths. The shared `sdpa.rs` core is a genuine generic path, with MHA retained as a thin adapter; the 12 parity cases remained byte-identical before and after factoring. Follow-ups are migration documentation, post-softmax QK capture modes, and a later hot-loop dispatch performance pass.
+
+### MLAS reference-test scope
+**By:** Dutch (review); upstream issue tracked at `microsoft/onnxruntime#29853`.
+
+- Reject the broad SQNBit skip until its comment and message identify the scoped AVX2 `CompInt8`, M=1, asymmetric/non-zero-point defect and link the upstream issue. The original author is locked out of the revision; a different agent must update the durable explanation.
+
