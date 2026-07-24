@@ -1,7 +1,7 @@
 //! Deterministic per-lane CUDA implementation of ONNX `CumSum`.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -65,14 +65,23 @@ impl KernelFactory for CumSumFactory {
             runtime: self.runtime.clone(),
             exclusive: bool_attr("exclusive")?,
             reverse: bool_attr("reverse")?,
+            warmed_signature: Mutex::new(None),
         }))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CumSumCaptureSignature {
+    dtype: DataType,
+    shape: Vec<usize>,
+    axis: usize,
 }
 
 struct CumSumKernel {
     runtime: Arc<CudaRuntime>,
     exclusive: bool,
     reverse: bool,
+    warmed_signature: Mutex<Option<CumSumCaptureSignature>>,
 }
 
 impl Kernel for CumSumKernel {
@@ -104,25 +113,50 @@ impl Kernel for CumSumKernel {
                 "cuda_ep CumSum: axis must be an Int64 scalar".into(),
             ));
         }
-        let mut bytes = [0_u8; 8];
-        unsafe {
-            self.runtime.dtoh(
-                &mut bytes,
-                cuptr(axis_input.data_ptr::<i64>() as *const c_void),
-            )?
+        let capturing = self.runtime.is_capturing()?;
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep CumSum: capture signature lock was poisoned".into())
+        })?;
+        let axis = if capturing {
+            let signature = warmed_signature.as_ref().ok_or_else(|| {
+                EpError::KernelFailed(
+                    "cuda_ep CumSum: capture started before the fixed axis was warmed".into(),
+                )
+            })?;
+            if signature.dtype != input.dtype || signature.shape != input.shape {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep CumSum: shape or dtype changed during CUDA graph capture".into(),
+                ));
+            }
+            signature.axis
+        } else {
+            let mut bytes = [0_u8; 8];
+            unsafe {
+                self.runtime.dtoh(
+                    &mut bytes,
+                    cuptr(axis_input.data_ptr::<i64>() as *const c_void),
+                )?
+            };
+            let raw = i64::from_ne_bytes(bytes);
+            let rank = input.shape.len();
+            let normalized = if raw < 0 { raw + rank as i64 } else { raw };
+            if normalized < 0 || normalized as usize >= rank {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep CumSum: axis out of range".into(),
+                ));
+            }
+            normalized as usize
         };
-        let raw = i64::from_ne_bytes(bytes);
-        let rank = input.shape.len();
-        let normalized = if raw < 0 { raw + rank as i64 } else { raw };
-        if normalized < 0 || normalized as usize >= rank {
-            return Err(EpError::KernelFailed(
-                "cuda_ep CumSum: axis out of range".into(),
-            ));
-        }
         if output.numel() == 0 {
+            if !capturing {
+                *warmed_signature = Some(CumSumCaptureSignature {
+                    dtype: input.dtype,
+                    shape: input.shape.to_vec(),
+                    axis,
+                });
+            }
             return Ok(());
         }
-        let axis = normalized as usize;
         let inner = input.shape[axis + 1..].iter().product::<usize>();
         let width = input.shape[axis];
         let outer = input.shape[..axis].iter().product::<usize>();
@@ -157,15 +191,28 @@ impl Kernel for CumSumKernel {
             })
         }
         .map_err(|e| driver_err("launch CumSum", e))?;
-        self.runtime.synchronize()
+        if !capturing {
+            *warmed_signature = Some(CumSumCaptureSignature {
+                dtype: input.dtype,
+                shape: input.shape.to_vec(),
+                axis,
+            });
+        }
+        Ok(())
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {
         false
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "CumSum reads the axis D2H and performs a trailing host stream synchronization",
-        )
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "CumSum must warm its fixed axis/shape signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "CumSum capture signature lock was poisoned",
+            ),
+        }
     }
 }
