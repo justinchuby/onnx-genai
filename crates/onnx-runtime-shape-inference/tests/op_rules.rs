@@ -778,6 +778,56 @@ fn msft_attention_asymmetric_value_and_present_cache_shapes() {
 }
 
 #[test]
+fn msft_attention_without_past_leaves_present_unresolved() {
+    let mut n = with_attr(
+        msft_attention_node(5, 2, 4),
+        "qkv_hidden_sizes",
+        Attribute::Ints(vec![32, 32, 64]),
+    );
+    n.inputs[4] = None;
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),
+            f32in(vec![c(32), c(128)]),
+            f32in(vec![c(128)]),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
+    assert!(
+        outs[1].type_info.is_none(),
+        "present shape must remain unresolved when past is absent"
+    );
+}
+
+#[test]
+fn msft_attention_growth_with_symbolic_sequence_leaves_present_sequence_dynamic() {
+    let n = with_attr(
+        msft_attention_node(5, 2, 4),
+        "qkv_hidden_sizes",
+        Attribute::Ints(vec![32, 32, 64]),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), sym(1), c(32)]),
+            f32in(vec![c(32), c(128)]),
+            f32in(vec![c(128)]),
+            NodeIo::default(),
+            f32in(vec![c(2), c(2), c(4), c(7), c(8)]),
+        ],
+        1,
+    );
+    let present = shape_at(&outs, 1);
+    assert_eq!(present[..3], [c(2), c(2), c(4)]);
+    assert!(present[3].as_const().is_none());
+    assert_eq!(present[4], c(8));
+}
+
+#[test]
 fn msft_attention_shared_buffer_present_preserves_past_seq() {
     // With `past_present_share_buffer=1`, present and past alias the same
     // buffer, so ORT keeps the present cache the SAME shape as the past input:
