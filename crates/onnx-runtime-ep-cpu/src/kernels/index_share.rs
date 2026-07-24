@@ -157,71 +157,21 @@ impl Kernel for IndexShareKernel {
             .scale
             .unwrap_or_else(|| 1.0 / (dims.head_size as f32).sqrt());
         let sqrt_scale = scale.sqrt();
-        let group = dims.q_heads / dims.kv_heads;
         let mut output = vec![0.0f32; dims.batch * dims.q_heads * dims.q_seq * dims.head_size];
-        let mut scores = vec![0.0f32; dims.selected_width];
 
-        for b in 0..dims.batch {
-            for qh in 0..dims.q_heads {
-                let kvh = qh / group;
-                let ih = if dims.index_heads == 1 { 0 } else { qh };
-                for qi in 0..dims.q_seq {
-                    let row = ((b * dims.index_heads + ih) * dims.q_seq + qi) * dims.selected_width;
-                    let valid = indices[row..row + dims.selected_width]
-                        .iter()
-                        .take_while(|&&index| index != -1)
-                        .count();
-                    for selected in 0..valid {
-                        let key_position = indices[row + selected] as usize;
-                        let mut score = 0.0f32;
-                        for d in 0..dims.head_size {
-                            let q_offset =
-                                ((b * dims.q_heads + qh) * dims.q_seq + qi) * dims.head_size + d;
-                            let k_offset = ((b * dims.kv_heads + kvh) * dims.total_seq
-                                + key_position)
-                                * dims.head_size
-                                + d;
-                            score +=
-                                (q[q_offset] * sqrt_scale) * (present_k[k_offset] * sqrt_scale);
-                        }
-                        if let Some(bias) = &bias {
-                            score += bias.at(b, qh, qi, key_position);
-                        }
-                        scores[selected] = score;
-                    }
-
-                    let max = scores[..valid]
-                        .iter()
-                        .copied()
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    if max == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    let mut sum = 0.0f32;
-                    for score in &mut scores[..valid] {
-                        *score = (*score - max).exp();
-                        sum += *score;
-                    }
-                    let inverse = 1.0 / sum;
-                    for score in &mut scores[..valid] {
-                        *score *= inverse;
-                    }
-                    let out_base = ((b * dims.q_heads + qh) * dims.q_seq + qi) * dims.head_size;
-                    for d in 0..dims.head_size {
-                        let mut value = 0.0f32;
-                        for selected in 0..valid {
-                            let key_position = indices[row + selected] as usize;
-                            let v_offset = ((b * dims.kv_heads + kvh) * dims.total_seq
-                                + key_position)
-                                * dims.head_size
-                                + d;
-                            value += scores[selected] * present_v[v_offset];
-                        }
-                        output[out_base + d] = value;
-                    }
-                }
-            }
-        }
+        // The concat present packs exactly `total_seq` positions per head, so
+        // the cache row stride equals `total_seq`.
+        attend_selected(
+            &mut output,
+            &present_k,
+            &present_v,
+            dims.total_seq,
+            &q,
+            &indices,
+            bias.as_ref(),
+            dims,
+            sqrt_scale,
+        );
 
         write_dense_f32(&mut outputs[0], &output)?;
         if outputs.len() == 3 {
@@ -234,6 +184,135 @@ impl Kernel for IndexShareKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+/// Compute IndexShare attention into `output` over a present cache whose
+/// per-head row stride is `cache_seq` positions.
+///
+/// The concat present path passes `cache_seq == dims.total_seq`. A
+/// fixed-capacity ("in-place") present — where the cache aliases `past` at
+/// `max_len` and the current token's K/V is written at its absolute position —
+/// passes `cache_seq == capacity`. The attention result is **byte-identical**
+/// for both layouts because the loop only ever reads key positions named by
+/// `selected_indices`, and those indices carry the same absolute positions
+/// regardless of how many trailing capacity rows the cache reserves. This is
+/// the numerical contract the device capacity-present kernel must match.
+#[allow(clippy::too_many_arguments)]
+fn attend_selected(
+    output: &mut [f32],
+    present_k: &[f32],
+    present_v: &[f32],
+    cache_seq: usize,
+    q: &[f32],
+    indices: &[i64],
+    bias: Option<&Bias>,
+    dims: Dims,
+    sqrt_scale: f32,
+) {
+    let group = dims.q_heads / dims.kv_heads;
+    let mut scores = vec![0.0f32; dims.selected_width];
+    for b in 0..dims.batch {
+        for qh in 0..dims.q_heads {
+            let kvh = qh / group;
+            let ih = if dims.index_heads == 1 { 0 } else { qh };
+            for qi in 0..dims.q_seq {
+                let row = ((b * dims.index_heads + ih) * dims.q_seq + qi) * dims.selected_width;
+                let valid = indices[row..row + dims.selected_width]
+                    .iter()
+                    .take_while(|&&index| index != -1)
+                    .count();
+                for selected in 0..valid {
+                    let key_position = indices[row + selected] as usize;
+                    let mut score = 0.0f32;
+                    for d in 0..dims.head_size {
+                        let q_offset =
+                            ((b * dims.q_heads + qh) * dims.q_seq + qi) * dims.head_size + d;
+                        let k_offset = ((b * dims.kv_heads + kvh) * cache_seq + key_position)
+                            * dims.head_size
+                            + d;
+                        score += (q[q_offset] * sqrt_scale) * (present_k[k_offset] * sqrt_scale);
+                    }
+                    if let Some(bias) = bias {
+                        score += bias.at(b, qh, qi, key_position);
+                    }
+                    scores[selected] = score;
+                }
+
+                let max = scores[..valid]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if max == f32::NEG_INFINITY {
+                    continue;
+                }
+                let mut sum = 0.0f32;
+                for score in &mut scores[..valid] {
+                    *score = (*score - max).exp();
+                    sum += *score;
+                }
+                let inverse = 1.0 / sum;
+                for score in &mut scores[..valid] {
+                    *score *= inverse;
+                }
+                let out_base = ((b * dims.q_heads + qh) * dims.q_seq + qi) * dims.head_size;
+                for d in 0..dims.head_size {
+                    let mut value = 0.0f32;
+                    for selected in 0..valid {
+                        let key_position = indices[row + selected] as usize;
+                        let v_offset = ((b * dims.kv_heads + kvh) * cache_seq + key_position)
+                            * dims.head_size
+                            + d;
+                        value += scores[selected] * present_v[v_offset];
+                    }
+                    output[out_base + d] = value;
+                }
+            }
+        }
+    }
+}
+
+/// Build a fixed-capacity ("in-place") present cache that aliases `past` at
+/// `capacity` positions instead of growing it via concat.
+///
+/// Positions `[0, past_seq)` hold `past`, the current token's K/V is written at
+/// `[past_seq, past_seq + current_seq)`, and any trailing positions up to
+/// `capacity` are left as `fill`. Those trailing rows are never read by
+/// [`attend_selected`] because `selected_indices` only name positions
+/// `< total_seq`, so attention over this layout matches the concat present
+/// byte-for-byte. This mirrors the device kernel's capacity-present mode, where
+/// present aliases the fixed-capacity `past_key`/`past_value` bindings.
+#[cfg(test)]
+fn capacity_present(
+    past: Option<&[f32]>,
+    current: &[f32],
+    dims: Dims,
+    capacity: usize,
+    fill: f32,
+) -> Vec<f32> {
+    assert!(
+        capacity >= dims.total_seq,
+        "capacity {capacity} must hold at least total_seq {}",
+        dims.total_seq
+    );
+    let mut present = vec![fill; dims.batch * dims.kv_heads * capacity * dims.head_size];
+    let past_row = dims.past_seq * dims.head_size;
+    let current_row = dims.current_seq * dims.head_size;
+    let cap_row = capacity * dims.head_size;
+    for b in 0..dims.batch {
+        for h in 0..dims.kv_heads {
+            let dst_base = (b * dims.kv_heads + h) * cap_row;
+            if let Some(past) = past {
+                let past_base = (b * dims.kv_heads + h) * past_row;
+                present[dst_base..dst_base + past_row]
+                    .copy_from_slice(&past[past_base..past_base + past_row]);
+            }
+            let current_base = (b * dims.kv_heads + h) * current_row;
+            let write = dst_base + dims.past_seq * dims.head_size;
+            present[write..write + current_row]
+                .copy_from_slice(&current[current_base..current_base + current_row]);
+        }
+    }
+    present
 }
 
 fn concatenate_cache(past: Option<&[f32]>, current: &[f32], dims: Dims) -> Vec<f32> {
@@ -736,7 +815,7 @@ mod tests {
     use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
     use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     struct Case {
         batch: usize,
         q_heads: usize,
@@ -1167,6 +1246,132 @@ mod tests {
             error.contains("index 5 follows trailing -1 padding"),
             "{error}"
         );
+    }
+
+    fn dims_of(case: Case) -> Dims {
+        Dims {
+            batch: case.batch,
+            q_heads: case.q_heads,
+            kv_heads: case.kv_heads,
+            q_seq: case.q_seq,
+            current_seq: case.current_seq,
+            past_seq: case.past_seq,
+            total_seq: case.past_seq + case.current_seq,
+            head_size: case.head_size,
+            index_heads: case.index_heads,
+            selected_width: case.width,
+        }
+    }
+
+    /// Locks in the S2 numerical contract: attention over a fixed-capacity
+    /// ("in-place") present that aliases `past` at `capacity` and writes the
+    /// current token at its absolute position is byte-identical to attention
+    /// over the growing concat present, for every head layout / bias / index
+    /// pattern. The device capacity-present kernel must match this exactly.
+    #[test]
+    fn capacity_present_attention_matches_concat_byte_for_byte() {
+        let cases = [
+            Case {
+                batch: 1,
+                q_heads: 1,
+                kv_heads: 1,
+                q_seq: 1,
+                current_seq: 1,
+                past_seq: 3,
+                head_size: 2,
+                index_heads: 1,
+                width: 3,
+                scale: 0.5,
+            },
+            Case {
+                batch: 2,
+                q_heads: 4,
+                kv_heads: 2,
+                q_seq: 2,
+                current_seq: 3,
+                past_seq: 5,
+                head_size: 3,
+                index_heads: 4,
+                width: 4,
+                scale: 0.25,
+            },
+        ];
+        for case in cases {
+            let dims = dims_of(case);
+            let sqrt_scale = case.scale.sqrt();
+            let total = dims.total_seq;
+            let q = sequence(case.batch * case.q_heads * case.q_seq * case.head_size, 0.25);
+            let past_k = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, -0.5);
+            let past_v = sequence(case.batch * case.kv_heads * case.past_seq * case.head_size, 0.75);
+            let current_k =
+                sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, 0.125);
+            let current_v =
+                sequence(case.batch * case.kv_heads * case.current_seq * case.head_size, -1.25);
+            // Ascending, unique, causal indices per (batch, index-head, query).
+            let mut indices = vec![-1i64; case.batch * case.index_heads * case.q_seq * case.width];
+            for b in 0..case.batch {
+                for ih in 0..case.index_heads {
+                    for qi in 0..case.q_seq {
+                        let row = ((b * case.index_heads + ih) * case.q_seq + qi) * case.width;
+                        let limit = (case.past_seq + qi + 1).min(total);
+                        let count = case.width.min(limit);
+                        for k in 0..count {
+                            indices[row + k] = (limit - count + k) as i64;
+                        }
+                    }
+                }
+            }
+
+            for bias in [None, Some(())] {
+                let bias = bias.map(|()| {
+                    let data = (0..case.batch * case.q_heads * case.q_seq * total)
+                        .map(|i| ((i % 5) as f32) * 0.1 - 0.2)
+                        .collect::<Vec<_>>();
+                    Bias {
+                        data,
+                        shape: vec![case.batch, case.q_heads, case.q_seq, total],
+                    }
+                });
+
+                let concat_k = concatenate_cache(Some(&past_k), &current_k, dims);
+                let concat_v = concatenate_cache(Some(&past_v), &current_v, dims);
+                let mut expected =
+                    vec![0.0f32; case.batch * case.q_heads * case.q_seq * case.head_size];
+                attend_selected(
+                    &mut expected,
+                    &concat_k,
+                    &concat_v,
+                    total,
+                    &q,
+                    &indices,
+                    bias.as_ref(),
+                    dims,
+                    sqrt_scale,
+                );
+
+                for capacity in [total, total + 1, total + 7] {
+                    let cap_k = capacity_present(Some(&past_k), &current_k, dims, capacity, 987.0);
+                    let cap_v = capacity_present(Some(&past_v), &current_v, dims, capacity, -654.0);
+                    let mut actual =
+                        vec![0.0f32; case.batch * case.q_heads * case.q_seq * case.head_size];
+                    attend_selected(
+                        &mut actual,
+                        &cap_k,
+                        &cap_v,
+                        capacity,
+                        &q,
+                        &indices,
+                        bias.as_ref(),
+                        dims,
+                        sqrt_scale,
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "capacity {capacity} diverged from concat for case {case:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
