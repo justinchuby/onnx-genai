@@ -534,7 +534,7 @@ impl Kernel for ResizeKernel {
                 inputs[0].dtype, outputs[0].dtype
             )));
         }
-        if inputs[0].shape.iter().any(|&extent| extent == 0) {
+        if inputs[0].shape.contains(&0) {
             return Err(EpError::KernelFailed(format!(
                 "{OP}: WHAT: input shape {:?} contains a zero extent. \
                  WHY: interpolation cannot sample an empty axis. \

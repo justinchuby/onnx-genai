@@ -36,8 +36,12 @@ mod mm_profile {
     use std::time::Instant;
 
     static WIDEN_NS: AtomicU64 = AtomicU64::new(0);
+    // MLAS-only phase counters are retained for ONNX_GENAI_PROFILE_MM=1.
+    #[cfg(feature = "mlas")]
     static GEMV_NS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "mlas")]
     static NARROW_NS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "mlas")]
     static CALLS: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
@@ -65,15 +69,18 @@ mod mm_profile {
     pub fn time_widen<T>(f: impl FnOnce() -> T) -> T {
         timed(&WIDEN_NS, f)
     }
+    #[cfg(feature = "mlas")]
     pub fn time_gemv<T>(f: impl FnOnce() -> T) -> T {
         timed(&GEMV_NS, f)
     }
+    #[cfg(feature = "mlas")]
     pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
         timed(&NARROW_NS, f)
     }
 
     /// Record one MatMulNBits call and, every 512 calls, emit the running split
     /// to stderr so the harness can tail the final line.
+    #[cfg(feature = "mlas")]
     pub fn tick() {
         if !enabled() {
             return;
@@ -2509,11 +2516,15 @@ fn gemv_nk_u8_i16(
     let mut quantized = vec![0i16; k];
     let mut group_scales = vec![0.0f32; k_groups];
     let mut block_activation_sums = vec![0.0f32; k_blocks];
+    // These index parallel activation and output arrays by the shared group.
+    #[allow(clippy::needless_range_loop)]
     for grp in 0..k_groups {
         let start = grp * group;
         let end = (start + group).min(k);
         group_scales[grp] = quantize_block_i16(&activation[start..end], &mut quantized[start..end]);
     }
+    // These index parallel activation and output arrays by the shared block.
+    #[allow(clippy::needless_range_loop)]
     for block in 0..k_blocks {
         let start = block * block_size;
         let end = (start + block_size).min(k);
@@ -4075,8 +4086,8 @@ mod tests {
         // Symmetric weights, scale 1, zero-point 128 -> effective w = value - 128.
         // Row0: massive-channel weight 0, small channels +4. Row1: massive 1, 0.
         let mut values = vec![128u8; n * k];
-        for j in 1..k {
-            values[j] = 132; // row0 small channels -> +4
+        for value in values.iter_mut().take(k).skip(1) {
+            *value = 132; // row0 small channels -> +4
         }
         values[k] = 129; // row1 massive channel -> +1
         let scales = vec![1.0f32; n]; // one block per row

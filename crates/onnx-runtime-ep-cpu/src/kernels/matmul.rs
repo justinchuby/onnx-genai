@@ -896,6 +896,8 @@ mod tests {
         // Widened accumulation must still retain the correct first-column winner
         // before the single final f16 narrowing.
         let a = Owned::f16(&[1, 4], &[1., 1., 1., 1.]);
+        // Exact f16 representable input used to exercise the near-tie boundary.
+        #[allow(clippy::excessive_precision)]
         let b = Owned::f16(
             &[4, 2],
             &[5.00390625, 5.0, 5.00390625, 5.0, 5.00390625, 5.0, 5.0, 5.0],

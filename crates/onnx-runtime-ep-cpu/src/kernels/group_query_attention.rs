@@ -1502,6 +1502,8 @@ mod tests {
     ) -> Vec<f32> {
         let half = rotary_dim / 2;
         let mut output = input.to_vec();
+        // Keep the shared sequence index for the input, output, and position arrays.
+        #[allow(clippy::needless_range_loop)]
         for s in 0..seq {
             for h in 0..heads {
                 let base = (s * heads + h) * head_width;

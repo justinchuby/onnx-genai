@@ -7,7 +7,9 @@ use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
 use super::check_arity;
 use crate::dispatch_arith;
-use crate::dtype::{ComputeDomain, NumericElem, to_dense, to_dense_f32_widen, write_dense};
+#[cfg(feature = "mlas")]
+use crate::dtype::to_dense_f32_widen;
+use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::{next_index, numel};
 
 /// Stateless broadcasting Add kernel (dtype-generic).
