@@ -2143,10 +2143,13 @@ unsafe fn int4_dot_row_avxvnni(
 ) -> f32 {
     use std::arch::x86_64::*;
 
-    let mut accumulator = _mm256_setzero_ps();
+    // Two independent f32 accumulators break the loop-carried `add_ps` latency
+    // chain (mirrors the 512-bit kernel); the two partials are summed at the end.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
     let low_mask = _mm_set1_epi8(0x0f);
     let zero_point = _mm256_set1_epi8(8);
-    for (block, &scale) in scales.iter().enumerate() {
+    let block_scaled = |block: usize| -> __m256 {
         // SAFETY: each scale corresponds to 32 activation bytes and 16 packed bytes.
         let packed = unsafe { _mm_loadu_si128(packed_weight.as_ptr().add(block * 16).cast()) };
         let low = _mm_and_si128(packed, low_mask);
@@ -2160,11 +2163,20 @@ unsafe fn int4_dot_row_avxvnni(
         let signed_activation = _mm256_sign_epi8(activation, weight);
         let dot =
             _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), absolute_weight, signed_activation);
-        let block_scale = scale * activation_scales[block];
-        let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
-        accumulator = _mm256_add_ps(accumulator, scaled);
+        let block_scale = scales[block] * activation_scales[block];
+        _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale))
+    };
+    let block_count = scales.len();
+    let mut block = 0usize;
+    while block + 2 <= block_count {
+        acc0 = _mm256_add_ps(acc0, block_scaled(block));
+        acc1 = _mm256_add_ps(acc1, block_scaled(block + 1));
+        block += 2;
     }
-    horizontal_sum_f32_256(accumulator)
+    if block < block_count {
+        acc0 = _mm256_add_ps(acc0, block_scaled(block));
+    }
+    horizontal_sum_f32_256(_mm256_add_ps(acc0, acc1))
 }
 
 /// 512-bit VNNI int4 block dot. Each int4 block is 32 int8 activations / 16
@@ -2193,6 +2205,58 @@ unsafe fn int4_dot_row_avxvnni(
 /// range; the result is bit-identical to the natural-order kernel (same integer
 /// products and reduction order) and matches the scalar reference to a few ULP
 /// (only the cross-block f32 accumulation order differs, as before).
+/// Scaled f32x16 contribution of one *pair* of int4 blocks (`b0`, `b0+1`) for
+/// the 512-bit VNNI kernel: the exact integer dot of each block (unsigned nibble
+/// `dpbusd` minus the `8*sum(act)` zero-point correction) converted to f32 and
+/// multiplied by its combined `weight_scale * activation_scale`. Lanes 0..8 hold
+/// block `b0`, lanes 8..16 hold block `b0+1`. Factored out so [`int4_dot_row_avx512vnni`]
+/// can run several of these into independent accumulators, breaking the
+/// loop-carried `add_ps` latency chain (the reduction was latency-bound, not
+/// throughput-bound). The integer products are identical to the inlined form; only
+/// the cross-pair f32 accumulation order differs, exactly as before.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni,avx512vl")]
+#[inline]
+unsafe fn int4_pair_scaled_avx512(
+    activation: &[i8],
+    packed_weight: &[u8],
+    scales: &[f32],
+    activation_scales: &[f32],
+    b0: usize,
+) -> std::arch::x86_64::__m512 {
+    use std::arch::x86_64::*;
+
+    let low_mask256 = _mm256_set1_epi8(0x0f);
+    let ones = _mm512_set1_epi8(1);
+    // Assemble weight512 128-bit lanes [b0_low, b0_high, b1_low, b1_high] from
+    // low256=[b0_low,b1_low] (64-bit words 0,1,2,3) and high256=[b0_high,b1_high]
+    // (words 0,1,2,3 selected as 8..11). Index order is lane0..lane7.
+    let perm_idx = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
+    let b1 = b0 + 1;
+    // SAFETY: two contiguous blocks own 32 packed bytes.
+    let packed = unsafe { _mm256_loadu_si256(packed_weight.as_ptr().add(b0 * 16).cast()) };
+    let low = _mm256_and_si256(packed, low_mask256);
+    let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask256);
+    let weight = _mm512_permutex2var_epi64(
+        _mm512_castsi256_si512(low),
+        perm_idx,
+        _mm512_castsi256_si512(high),
+    );
+    // SAFETY: two contiguous deinterleaved blocks own 64 activation bytes
+    // (including zero padding).
+    let act = unsafe { _mm512_loadu_si512(activation.as_ptr().add(b0 * 32).cast()) };
+    let wdot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), weight, act);
+    let asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, act);
+    let dot = _mm512_sub_epi32(wdot, _mm512_slli_epi32(asum, 3));
+    let s0 = scales[b0] * activation_scales[b0];
+    let s1 = scales[b1] * activation_scales[b1];
+    // Lanes 0..8 carry block b0's scale, lanes 8..16 carry block b1's.
+    let scale_vec = _mm512_set_ps(
+        s1, s1, s1, s1, s1, s1, s1, s1, s0, s0, s0, s0, s0, s0, s0, s0,
+    );
+    _mm512_mul_ps(_mm512_cvtepi32_ps(dot), scale_vec)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni,avx512vl")]
 unsafe fn int4_dot_row_avx512vnni(
@@ -2218,45 +2282,83 @@ unsafe fn int4_dot_row_avx512vnni(
     };
 
     let block_count = scales.len();
-    let ones = _mm512_set1_epi8(1);
     let ones256 = _mm256_set1_epi8(1);
-    let low_mask256 = _mm256_set1_epi8(0x0f);
-    // Assemble weight512 128-bit lanes [b0_low, b0_high, b1_low, b1_high] from
-    // low256=[b0_low,b1_low] (64-bit words 0,1,2,3) and high256=[b0_high,b1_high]
-    // (words 0,1,2,3 selected as 8..11). Index order is lane0..lane7.
-    let perm_idx = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
-    let mut accumulator = _mm512_setzero_ps();
 
     // Fuse two blocks per 512-bit `dpbusd`; defer reduction to one final pass.
-    for pair in 0..block_count / 2 {
-        let b0 = pair * 2;
-        let b1 = b0 + 1;
-        // SAFETY: two contiguous blocks own 32 packed bytes.
-        let packed = unsafe { _mm256_loadu_si256(packed_weight.as_ptr().add(b0 * 16).cast()) };
-        let low = _mm256_and_si256(packed, low_mask256);
-        let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask256);
-        let weight = _mm512_permutex2var_epi64(
-            _mm512_castsi256_si512(low),
-            perm_idx,
-            _mm512_castsi256_si512(high),
-        );
-        // SAFETY: two contiguous deinterleaved blocks own 64 activation bytes
-        // (including zero padding).
-        let act = unsafe { _mm512_loadu_si512(activation.as_ptr().add(b0 * 32).cast()) };
-        let wdot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), weight, act);
-        let asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, act);
-        let dot = _mm512_sub_epi32(wdot, _mm512_slli_epi32(asum, 3));
-        let s0 = scales[b0] * activation_scales[b0];
-        let s1 = scales[b1] * activation_scales[b1];
-        // Lanes 0..8 carry block b0's scale, lanes 8..16 carry block b1's.
-        let scale_vec = _mm512_set_ps(
-            s1, s1, s1, s1, s1, s1, s1, s1, s0, s0, s0, s0, s0, s0, s0, s0,
-        );
-        accumulator = _mm512_add_ps(
-            accumulator,
-            _mm512_mul_ps(_mm512_cvtepi32_ps(dot), scale_vec),
-        );
+    // Four independent f32 accumulators break the loop-carried `add_ps`
+    // dependency chain: with a single accumulator each block's `add_ps` waited on
+    // the previous one (~4-cycle latency x block_count), leaving the two `dpbusd`
+    // per pair — the actual work — stalled on the reduction. Rotating four chains
+    // (unroll-by-4 over pairs) lets the out-of-order engine keep the VNNI ports
+    // busy; the four partials are summed once at the end. Software-prefetch the
+    // pair four iterations ahead so the streamed weight bytes are resident.
+    let pairs = block_count / 2;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+    let mut pair = 0usize;
+    while pair + 4 <= pairs {
+        // SAFETY: prefetch is a hint; an out-of-bounds address is harmless.
+        unsafe {
+            _mm_prefetch(
+                packed_weight.as_ptr().add((pair + 4) * 2 * 16).cast(),
+                _MM_HINT_T0,
+            );
+        }
+        // SAFETY: each pair index is < block_count/2, so its blocks are in range.
+        acc0 = _mm512_add_ps(acc0, unsafe {
+            int4_pair_scaled_avx512(
+                activation,
+                packed_weight,
+                scales,
+                activation_scales,
+                pair * 2,
+            )
+        });
+        acc1 = _mm512_add_ps(acc1, unsafe {
+            int4_pair_scaled_avx512(
+                activation,
+                packed_weight,
+                scales,
+                activation_scales,
+                (pair + 1) * 2,
+            )
+        });
+        acc2 = _mm512_add_ps(acc2, unsafe {
+            int4_pair_scaled_avx512(
+                activation,
+                packed_weight,
+                scales,
+                activation_scales,
+                (pair + 2) * 2,
+            )
+        });
+        acc3 = _mm512_add_ps(acc3, unsafe {
+            int4_pair_scaled_avx512(
+                activation,
+                packed_weight,
+                scales,
+                activation_scales,
+                (pair + 3) * 2,
+            )
+        });
+        pair += 4;
     }
+    while pair < pairs {
+        // SAFETY: pair < block_count/2.
+        acc0 = _mm512_add_ps(acc0, unsafe {
+            int4_pair_scaled_avx512(
+                activation,
+                packed_weight,
+                scales,
+                activation_scales,
+                pair * 2,
+            )
+        });
+        pair += 1;
+    }
+    let accumulator = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
 
     let mut value = _mm512_reduce_add_ps(accumulator);
 
@@ -4712,7 +4814,10 @@ mod tests {
         {
             return;
         }
-        for blocks in [1usize, 2, 3, 4, 5, 8, 9] {
+        // Cover every 4-pair unroll boundary and remainder (pairs % 4 ∈
+        // {0,1,2,3}) plus an odd trailing block: block counts 10..=18 exercise
+        // the multi-accumulator tail that the [1,2,3,4,5,8,9] set alone misses.
+        for blocks in [1usize, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 16, 17, 18] {
             let activation: Vec<i8> = (0..blocks * 32)
                 .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
                 .collect();
@@ -4737,6 +4842,80 @@ mod tests {
                 (wide - scalar).abs() <= 1e-4 * scalar.abs().max(1.0),
                 "blocks={blocks}: avx512 int4 dot {wide} != scalar {scalar}",
             );
+        }
+    }
+
+    /// Multi-accumulator regression: the 4-way-unrolled AVX-512 int4 GEMV must
+    /// pick the SAME winning output row as the scalar reference on a near-tie
+    /// across N rows. The four independent f32 accumulators reorder the
+    /// cross-block reduction; this guards that the reorder never flips the argmax
+    /// (token divergence) even when two rows are within a few ULP, across every
+    /// unroll remainder (block counts 6..=18) and an odd trailing block.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_dot_row_avx512vnni_multiaccumulator_preserves_argmax_vs_scalar() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl"))
+        {
+            return;
+        }
+        for blocks in [6usize, 7, 10, 11, 12, 13, 16, 17, 18] {
+            // Two output rows differing only in the last block's weights, so
+            // their dots land in a near-tie and any accumulation-order drift
+            // would be maximally able to flip the winner.
+            let n = 8usize;
+            let activation: Vec<i8> = (0..blocks * 32)
+                .map(|i| (((i * 29 + 3) % 255) as i32 - 127) as i8)
+                .collect();
+            let activation_deint = deinterleave_activation_int4(&activation);
+            let activation_scales: Vec<f32> = (0..blocks)
+                .map(|i| ((i * 5 % 13) + 1) as f32 / 40.0)
+                .collect();
+            let base_packed: Vec<u8> = (0..blocks * 16)
+                .map(|i| ((i * 53 + 7) % 256) as u8)
+                .collect();
+            let base_scales: Vec<f32> = (0..blocks)
+                .map(|i| ((i * 13 % 17) + 1) as f32 / 100.0)
+                .collect();
+
+            let mut scalar_out = vec![0.0f32; n];
+            let mut wide_out = vec![0.0f32; n];
+            for row in 0..n {
+                // Perturb one nibble per row by a single quantum to create a
+                // tight spread of dot products across rows.
+                let mut packed = base_packed.clone();
+                let idx = row % packed.len();
+                packed[idx] = packed[idx].wrapping_add(1);
+                scalar_out[row] =
+                    int4_dot_row_scalar(&activation, &packed, &base_scales, &activation_scales);
+                // SAFETY: features asserted above.
+                wide_out[row] = unsafe {
+                    int4_dot_row_avx512vnni(
+                        &activation_deint,
+                        &packed,
+                        &base_scales,
+                        &activation_scales,
+                    )
+                };
+            }
+            assert_eq!(
+                argmax(&scalar_out),
+                argmax(&wide_out),
+                "blocks={blocks}: multi-accumulator avx512 flipped argmax vs scalar\n\
+                 scalar={scalar_out:?}\nwide={wide_out:?}",
+            );
+            for row in 0..n {
+                assert!(
+                    (wide_out[row] - scalar_out[row]).abs()
+                        <= 1e-4 * scalar_out[row].abs().max(1.0),
+                    "blocks={blocks} row={row}: {} != {}",
+                    wide_out[row],
+                    scalar_out[row],
+                );
+            }
         }
     }
 
