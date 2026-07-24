@@ -3178,3 +3178,99 @@ CAVEAT: box load 45-94 the whole time (never <5 after 15 min) — absolute tok/s
 **By:** Squad (Coordinator), integrating Dietrich's fix + Hicks's adversarial review
 **What:** Merged `executor.rs` fix (`643c4c6`) restoring the "reject-before-materialize" contract that the origin/main merge tightened and our CPU-EP perf commits regressed (5 executor tests + `slice_zero_step` failing on PR #105). Three fixes: (1) `reads_float_shape_input()` gates float shape-value host materialization to ONLY default-domain `Resize` scales (opset 10→idx1, else idx2), so an unrelated float input is no longer downloaded before an invalid integer shape input is rejected; (2) `reject_unsupported_operators()` + `graph.topological_order()?` run BEFORE EP optimizer passes (mirroring the control-flow signature pre-check), skipping CUDA EP (legit CPU fallback) and deferring non-static-shape nodes to the run-time kernel gate; (3) post-EP-pass `infer_graph` is now best-effort (infer on clone, adopt on success) so a data-dependent invalidity (Slice step 0) rejects at run time instead of aborting the build. Zero-copy decode fast path (`try_move_host_output`) unchanged.
 **Why:** origin/main requires invalid shapes/cyclic plans/unsupported ops be rejected before any `copy_to_host`. Our decode-perf float-shape reader + always-on CPU-EP passes violated the ordering. Hicks independently verified (adversarial): 32/0 executor, whole session crate green (`slice_view` 5/5), test files have EMPTY diff (not weakened), zero-copy perf test intact, `reads_float_shape_input` opset index matches ONNX Resize spec, no other op reads float shape data, no panic risk, collapsible-if rewrite logically identical, clippy `-D warnings` exit 0 + fmt clean. This greens the Rust test jobs + Rust quality on PR #105 without regressing decode perf.
+
+---
+
+### 2026-07-24: DETAILED REVIEW — Vasquez's adversarial adjudication of Hudson's qwen3-0.6b divergence
+
+**Reviewer:** Vasquez-1 (numerical-correctness, CPU EP); **Author:** Hudson; **Method:** Adversarial non-author review on worktree `/home/justinchu/onnx-genai-cpu-divergence`
+
+**Full verification report:**
+
+#### Item 1 — IS THE ORACLE VALID? ✅ PASS (stronger than described)
+
+- Confirmed the deployed model is `MatMulNBits`, `block_size=128`, all `accuracy_level=4`, **mixed weight width** (92 nodes 4-bit, 105 nodes 8-bit). Hudson's shorthand "int4" is a simplification but the acc-level=4 int8-**activation** tie-break story applies uniformly to all 197 nodes.
+- Reproduced Hudson's exact oracle recipe: loaded `model.onnx`, rewrote `accuracy_level 4→1` on **all 197** MatMulNBits nodes (I touched *only* the `accuracy_level` attribute — weights/scales/graph untouched), ran through **ONNX Runtime CPU** on the committed 18-token prefix. In ORT's MatMulNBits, `accuracy_level` selects only the **activation** compute type (1=fp32, 4=int8); weights stay quantized. So acc=1 is strictly higher precision than acc=4 for the *same* weights → "closer to acc=1" == "more accurate for this deployed quantized model." Reasoning is sound.
+- **Crucial anti-bias check:** the oracle is **ORT's own fp32 path**, i.e. completely independent of the native kernel. Native is therefore *not* being graded by its own ruler — it cannot be inadvertently advantaged by shared acc=1/acc=4 code. Native still matches this ORT-fp32 oracle where ORT-int8 does not. That is the strongest possible form of this argument.
+- (Aside: repo also ships an even-more-independent PyTorch/HF oracle `scripts/qwen_q4_f32_oracle.py`, but it has no qwen3-0.6b case and assumes block-32; not used here. Not a defect.)
+
+Reproduced table (ORT-fp32 oracle, single-prefill, intra_op=1):
+
+| compute | argmax | logit(518)−logit(264) | Hudson | match |
+|---|---|---|---|---|
+| acc=1 ORACLE (ORT fp32) | **518** | **+0.04382** | +0.0438 | ✅ |
+| native (acc=4 int8) | **518** | +0.05162 | +0.0516 | ✅ |
+| ORT (acc=4 int8) | 264 | −0.05270 | −0.0527 | ✅ |
+
+#### Item 2 — "29/30 vs 28/30" MEANINGFUL OR NOISE? ⚠️ PASS-with-caveat
+
+- Honest reading: 29 vs 28 over sub-0.05 ties is **statistically indistinguishable, marginally better** — NOT a robust "we're better." Hudson's note actually frames it correctly ("razor-thin," "not less accurate ... marginally more"); it does **not** overclaim. The verdict does **not** rest on the 1-position margin — it rests on native matching the fp32 oracle at the one *resolvable* divergence while ORT does not, plus native never being worse across my independent prompts (Item 6).
+- **Caveat (non-blocking):** the 30-position aggregate harness is **not committed**, so I could not independently reproduce the 29-vs-28 count. Given the user's bar is "not LESS accurate," and that bar is met by reproduced evidence, this is acceptable — but the aggregate should be treated as illustrative, not a precise measurement.
+
+#### Item 3 — REPRODUCE THE KEY DATUM LIVE. ✅ PASS
+
+- Rebuilt `profile_native` with `--features mlas,bench-ort`.
+- **Native** teacher-forced `--dump-logprobs` at the 18-token prefix: `selected=518`, logsm(518)=−1.5635, logsm(264)=−1.6151, gap **+0.0516**. Exact match.
+- **ORT** greedy generation split reproduced live: native `[576,3364,1265,2924,518,…]` vs ORT `[576,3364,1265,2924,264,…]` — divergence at gen-index 4, native→**518**, ORT→**264**. ✅
+- **Oracle** reproduced from scratch (above): acc=1→518, acc=4→264. ✅
+- All three argmaxes and all three signed gaps match Hudson to 4 decimals.
+
+#### Item 4 — REGRESSION TEST QUALITY. ✅ PASS
+
+```
+test qwen3_0_6b_int4_native_decode_keeps_high_precision_argmax ... ok
+qwen3-0.6b divergence lock OK: native token = 518 (fp32-oracle-correct; ORT = 264), benign-tie gap = 0.05162 logprob
+test result: ok. 1 passed; 0 failed; 0 ignored; ... finished in 90.07s
+```
+
+- **Non-vacuous:** loads the real qwen3-0.6b model, runs actual native int4/int8 decode, asserts argmax==518 AND that 264 is the top-8 runner-up AND 0<gap<0.2. If native regressed to ORT's 264 the first `assert_eq!(selected, 518)` fails loudly. Directionally correct.
+- **Gated:** `#[ignore]` + `QWEN3_0_6B_E2E_DIR` (defaults to foundry cache). Missing dir → `eprintln!` + `Ok(())` (graceful skip, no false-fail). Verified reasoning by inspection.
+
+#### Item 5 — NO HIDDEN KERNEL CHANGE. ✅ PASS
+
+- `git show d3ff05b --stat`: **only** `crates/onnx-genai-engine/tests/qwen3_0_6b_divergence.rs` (+167). No production/kernel change.
+- `cargo test -p onnx-runtime-ep-cpu --features mlas` on a clean run: **879 passed, 0 failed, 7 ignored** — matches Hudson. The class guard `int4_decode_preserves_f32_argmax_where_per_row_int8_activation_flips` **passes**.
+- **NOTE (unrelated to this change):** a first, fully-parallel run flaked with 15 `kernels::qmoe::tests` failures (host-cache/mmap-residency + global `reset_offload_test_state`/`metrics_test_lock` contention — resource-sensitive on a shared box); a clean re-run was green. Pre-existing test-infra flakiness in a different subsystem; **not** caused by d3ff05b. Worth a separate ticket, not a blocker here.
+
+#### Item 6 — PROMPT-BIAS. ✅ PASS (native never worse than ORT on my prompts)
+
+- "…staying healthy during winter": native and ORT **token-identical** for 48 tokens (no divergence).
+- "Explain the theory of relativity…": free-running split at index 31 — free-run **native=6319 matches the fp32 oracle**, free-run **ORT=914 does not**. (Teacher-forced single-prefill at that agreed 42-token prefix gives native=914==ORT=914, oracle=6319 — a tie between the backends; see caveat below.)
+- Net across 3 prompts: native is **tied-or-better** vs ORT everywhere, **never worse** — consistent with "not less accurate."
+
+**Methodological caveat (non-blocking, applies to Item 2's harness):** at ultra-thin ties, **teacher-forced single-prefill logits are not identical to the deployed incremental (KV-cached) decode** — even within one backend. Demonstrated at the relativity prefix: free-running native emitted 6319 but single-prefill native emitted 914 (gap ~0.016). It happens the qwen3 headline case is *consistent* (free-run native 518 == teacher-forced 518 == oracle 518), so the committed regression test faithfully locks real behavior **there**. But the teacher-forced probe should not be read as a bit-exact proxy for deployment argmax at sub-0.02 ties. Recommend a follow-up (Hudson locked out on this artifact — assign e.g. **Gorman** or another correctness agent) to add a note in the test/decision that the lock is on the teacher-forced single-step, and, if desired, add a free-running end-to-end assertion for the qwen3 case.
+
+**VERDICT: 🟢 APPROVE** — keep native (benign int8-activation tie-break) and merge the regression test. Oracle is valid and independent of native; native/ORT/oracle numbers reproduced to 4 decimals; native matches the fp32 oracle at the one resolvable divergence where ORT flips; native is tied-or-better (never worse) across the extra prompts; commit adds only a well-gated, non-vacuous test with no kernel change; kernel guard + 879/0 confirmed on a clean run.
+
+---
+
+### 2026-07-24: DETAILED VERIFICATION — Hicks's adversarial review of Dietrich's executor fix
+
+**Reviewer:** Hicks (runtime/executor); **Author:** Dietrich; **Commit:** `862e471` on `fix/session-executor-early-reject`
+
+**Observed test/gate results (worktree `/home/justinchu/onnx-genai-cpu-exec`, LD_LIBRARY_PATH set to ort-prebuilt):**
+
+- `cargo test -p onnx-runtime-session --test executor` → **32 passed, 0 failed**.
+- `cargo test -p onnx-runtime-session` → whole crate green (69+26+22+13+6+5+3+2+… across all binaries, incl. `slice_view` 5/5 with `slice_zero_step_reports_actionable_error`).
+- `zero_copy_output_move_reallocates_and_preserves_producer_less_output` (unit) → passed.
+- `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings` → exit 0.
+- `cargo fmt --all -- --check` → clean.
+
+**Independent verification (NOT trusting the author summary):**
+
+1. **Tests were NOT weakened: VERIFIED.** `git diff 386be50..862e471` on the two test files is EMPTY. Read each body directly — they assert the real contract: `HostDownloadCountingEp` counts `copy_to_host`; the four *before_host_materialization* tests assert `downloads == 0` AND the correct error variant (`UnresolvedShape` / Unsqueeze "1-D tensor"). The cyclic test asserts the exact `SessionError::Graph(GraphError::CycleDetected)` variant. `unsupported_op_...unnamed` asserts the sentinel + "node <unnamed node #0>, opset 0". `slice_zero_step` asserts build succeeds then `run` errors with "step".
+
+2. **`reads_float_shape_input` alignment: VERIFIED.** `dynamic_output_shapes` reads `input_float_values` in exactly one arm — default-domain `Resize`, using `scales_index = if opset==10 {1} else {2}`, byte-identical to the new gate. Matches ONNX Resize spec (opset 10: scales=in1; opset 11+: roi=1, scales=2). No other op (Upsample included) ever consumed float shape values, so gating them out regresses NO valid dynamic-shape graph; it only stops a wasted host copy that violated the reject-before-materialize contract.
+
+3. **Pre-check ordering: VERIFIED.** `reject_unsupported_operators` + `graph.topological_order()?` are placed right after `validate_control_flow_signatures` and BEFORE `run_ep_scoped_passes`, mirroring the existing pre-check. No panic risk: `effective_opset`'s `unreachable!` is unreachable here because `validate_model` (lib.rs:811, before build) already rejects missing opset_imports. The pass skips CUDA (legit CPU fallback via `cuda_fallback_report`), ep_context / control-flow / sequence ops, and DEFERS any node with a non-static declared input shape to the run-time kernel gate — the deferred-symbolic path is pre-existing behavior, acknowledged, acceptable.
+
+4. **Best-effort `infer_graph`: VERIFIED.** On failure the original graph is untouched; on success shapes only improve. Zero-copy decode fast path preserved (its perf test passes).
+
+5. **Collapsible-if rewrite: VERIFIED.** The `if !nested && let Some(t) = …?` let-chain is logically identical to the old nested `if` — short-circuit means `try_move_host_output` still runs only when `!nested`, `?` propagates identically, and the Ok(None) fall-through is unchanged.
+
+**Correctness holes found:** none blocking. Only the (intended, pre-existing) deferral of symbolic-shape unsupported ops to the run-time gate, which is documented and consistent with the CUDA-fallback design.
+
+Worktree left pristine (no scratch files).
+
+**VERDICT: 🟢 APPROVE** — 32/0 executor, whole session crate green, tests unweakened, no correctness holes. 
+
