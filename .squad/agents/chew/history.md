@@ -134,3 +134,6 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 ## 2026-07-24T08:06:19+0000 — GLM capture diagnostic review
 
 - Fresh-reviewed Tyrell's `8437b059` 🟢 GREEN: logging-only observability, unchanged capture predicate, and clean build/clippy/fmt validation.
+## 2026-07-24T08-37-30+0000 — capacity-present foundation review
+
+- Reviewed Tyrell's foundation 🟡 for formatting only; the formatting fix landed, and test-gated capacity-present plus clippy/tests are clean.

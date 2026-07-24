@@ -164,3 +164,6 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 
 - Fresh-reviewed Deckard's bf16 RoPE/normalization change 🟢 GREEN: correct fp32 accumulation, unchanged f16/f32 behavior, sound claim gating, and real fp32-oracle coverage.
 - Flagged a stale-base artifact involving `native_decode.rs`; rebase preserved Tyrell's diagnostic before the `668a8b77` merge.
+## 2026-07-24T08-37-30+0000 — bf16 final review
+
+- Fresh bf16 RoPE/norm review is 🟢 GREEN; `668a8b77` is merged with fp32 accumulation and real oracle coverage intact.

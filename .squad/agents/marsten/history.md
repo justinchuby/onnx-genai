@@ -26,3 +26,7 @@
 
 - Nsight shows native decode is latency-bound by weight-read Long-Scoreboard stalls, not DRAM-roofline-bound: gate/up is 43.2% at 2.99 waves; down/QKV/O-proj are 20.7%/19.8%/7.8% at 0.57/0.55/0.55 waves.
 - Recommended symmetric gate/up weight prefetch as the top bit-exact next lever (estimated 2–4% E2E); split-K is rejected.
+## 2026-07-24T08-37-30+0000 — 7B prefetch closure and regression sweep
+
+- The roofline remains weight-read latency-bound, but Deckard's symmetric gate/up prefetch A/B regressed 7B 1.01%; do not pursue it.
+- `668a8b77` regression sweep retained token IDs across Qwen 0.5B/1.5B/7B, Phi-4-mini, GLM-4-9B (two captures), and DeepSeek-V2-Lite; native lead was 1.10–1.58×.

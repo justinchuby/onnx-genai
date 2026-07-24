@@ -130,3 +130,6 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 - Added bf16 support to CUDA RoPE and RMSNorm/LayerNorm using fp32 widening and accumulation, narrowing only at store; f16/f32 remain byte-identical.
 - Gaff reviewed 🟢; 210/210 CUDA tests and clippy passed. Merged as `668a8b77`.
 - A separate symmetric gate/up weight-prefetch bit-exact A/B is in progress; no performance outcome is recorded yet.
+## 2026-07-24T08-37-30+0000 — gate/up prefetch negative
+
+- Bit-exact gate/up weight prefetch lowered Long-Scoreboard cycles but regressed Qwen2.5-7B end-to-end throughput 1.01%; it was not pushed.

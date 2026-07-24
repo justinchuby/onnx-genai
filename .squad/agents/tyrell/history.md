@@ -46,3 +46,6 @@ WP-B landed: Progress docs should now treat WP-B as fully landed after WP-B3 `3d
 
 - Established that whole-step capture requires a staged packed-KV/indexer kernel rewrite: four past-KV bindings remain logical and `IndexShare::build_present` concatenates rather than capacity-aliases.
 - Landed diagnostic-only capture-decline logging as `8437b059`; Chew reviewed 🟢. No capture gate behavior changed.
+## 2026-07-24T08-37-30+0000 — capacity-present capture foundation
+
+- CPU-oracle in-place capacity-present and byte-parity coverage landed (`a9160593`, `31e41fc0`). S1/S2-CUDA/S3/S4 and frozen-v1 ABI remain open; S2-CUDA plus S1 is only dispatched.

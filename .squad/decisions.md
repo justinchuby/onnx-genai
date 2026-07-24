@@ -509,3 +509,24 @@ captured/eager fragmentation toward a small number of stable replay graphs.
 **By:** Marsten
 **What:** Post-down-GEMV Nsight roofline analysis identifies Long-Scoreboard stalls on weight reads, not a DRAM roofline. Gate/up fused GEMV accounts for 43.2% of time at 2.99 waves; down is 20.7% at 0.57 waves, QKV 19.8% at 0.55, and output projection 7.8% at 0.55. The highest-ranked bit-exact next lever is symmetric gate/up weight prefetch, estimated at 2–4% end-to-end; split-K is rejected.
 **Why:** Further tuning should target latency hiding in gate/up rather than split-K or bandwidth-oriented work that the measurements do not support.
+
+<!-- scribe-merge-2026-07-24T08-37-30+0000-7b-roofline-prefetch-negative-glm-capture-foundation -->
+## 2026-07-24 — 7B prefetch result and GLM capture foundation
+
+### Do not pursue the gate/up weight-prefetch experiment
+**By:** Deckard; based on Marsten's roofline priority
+**What:** The symmetric, bit-exact gate/up weight-prefetch A/B produced **-1.01%** on Qwen2.5-7B. Although Long-Scoreboard cycles decreased, there was no end-to-end gain; the experiment was not pushed.
+**Why:** Qwen2.5-7B bit-exact decode tuning has reached diminishing returns. The rejected result supersedes the prefetch recommendation as an implementation priority without invalidating the latency-bound roofline diagnosis.
+
+### Preserve GLM capacity-present capture work as staged follow-up
+**By:** Tyrell; reviewed by Chew
+**What:** CPU-oracle in-place capacity-present support and byte-parity coverage landed in the IndexShare foundation (`a9160593`, with formatting integration at `31e41fc0`). This establishes the capacity-present contract for GLM-5.2 DSA. The remaining S1, S2-CUDA, S3, and S4 work, including the frozen-v1 ABI choice, remains scoped; S2-CUDA plus S1 is dispatched but incomplete.
+**Why:** The merged foundation is evidence for the safe CPU-side contract only. It must not be represented as completed whole-step CUDA capture.
+
+### Regression sweep keeps the native CUDA lead bounded and regression-free
+**By:** Marsten
+**What:** On main at `668a8b77`, Qwen 0.5B/1.5B/7B, Phi-4-mini, GLM-4-9B (two captures), and DeepSeek-V2-Lite all retained their token IDs. Native CUDA remained **1.10–1.58×** faster than ORT across the comparable sweep.
+**Why:** The sweep validates that the bf16 RoPE/norm merge and adjacent decode work did not regress the covered real-model paths; it does not claim broader model coverage than measured.
+
+### Reconciled inbox sources
+The following source records were processed and semantically deduplicated against the current ledger; their distinct outcomes are retained in the dated sections above and earlier capture/parity sections: `chew-glm-capture-diag-review.md`, `chew-glm-capture-foundation-review.md`, `deckard-phi-capture-seams.md`, `deckard-phi-ondevice-rope.md`, `gaff-bf16-rope-norm-review.md`, `leon-moe-reshape-fold.md`, `marsten-7b-roofline-postdown.md`, `marsten-glm4-static-split.md`, `marsten-phi-postfix-nongpu-profile.md`, `marsten-phi-stacked-rebench.md`, `marsten-regression-sweep-668a8b77.md`, `marsten-scoreboard.md`, `rachael-mask-island-closure.md`, `sebastian-moe-routing-capture.md`, `sebastian-qmoe-64expert.md`, `sebastian-qmoe-test-fix.md`, `sebastian-static-split-test.md`, and `tyrell-executor-shape-seeding.md`.
