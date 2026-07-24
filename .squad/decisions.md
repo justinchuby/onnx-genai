@@ -3696,3 +3696,29 @@ These now surface their true kernel decline (they were previously hidden as unre
 
 - Reject the broad SQNBit skip until its comment and message identify the scoped AVX2 `CompInt8`, M=1, asymmetric/non-zero-point defect and link the upstream issue. The original author is locked out of the revision; a different agent must update the durable explanation.
 
+<!-- scribe-merge-2026-07-24T22-32-50Z-attention-bf16 -->
+## 2026-07-24 — PRs #122, #124, and #125: BF16 SkipLayerNorm and shared CPU attention
+
+### PR #122 — BF16 SkipLayerNormalization
+**By:** Pris/Vasquez (implementation and coverage); reviewed by Hicks.
+
+**What:** `com.microsoft::SkipLayerNormalization` widens BF16 inputs to f32 and RNE-narrows BF16 outputs. Outputs 0 (`output`) and 3 (`input_skip_bias_sum`) retain the input dtype; outputs 1 (`mean`) and 2 (`inv_std_var`) are kept as float32, matching the ORT schema. Literal BF16 goldens and infinity/NaN coverage use independent references.
+
+**Why:** The first review rejected the all-outputs-match dtype check and BF16 statistic test because ORT defines the statistics as float32. The revision corrected both. ORT CPU 1.26/1.27 has no BF16 `SkipLayerNormalization` kernel (`NOT_IMPLEMENTED`), so this change adds CPU EP capability rather than mirroring an existing ORT CPU implementation.
+
+### PR #124 — Migrate `ai.onnx::Attention` onto shared SDPA
+**By:** Deckard; reviewed by Gorman.
+
+**What:** The Attention implementation now uses the shared SDPA core, removing the duplicated QKᵀ→scale→softcap→bias/mask→softmax→V loop. The core gained `QkCaptureStage` and a fully-masked-row guard. A 153-case dump covering rank/causal/softcap/qk modes, GQA/MQA, cache, masks, and padding was independently reproduced byte-for-byte: SHA256 `cbfcde4f41ee5b6f55203233f30986628ce89aee63e9f9df21f091176a0fe5b9`.
+
+**Why:** This is a DRY migration with byte-identical behavior; MHA/FusedAttention parity remains intact.
+
+### PR #125 — packed-QKV `com.microsoft::Attention`
+**By:** Ripley; reviewed by Drake.
+
+**Contract:** The CPU packed-QKV kernel runs over the SDPA core. PostDot scale is `1/sqrt(head_size)`; causal mode is `unidir && S > 1`; `mask_index` accepts `(B)`, `(2B)`, or `(3B+2)` forms; past cache is `(2,B,N,P,H)`. Unsupported `do_rotary`, `share_buffer`, 4-D masks, and past+bias combinations are rejected cleanly.
+
+**Impact:** This unblocks Whisper encoder attention. End-to-end Whisper wiring remains pending.
+
+**Review outcome:** PRs #122, #124, and #125 landed on main at `3f30f92`.
+
