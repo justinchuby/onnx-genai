@@ -1812,6 +1812,21 @@ fn int4_matmul_m1(
 
     let (activation, activation_scales) =
         quantize_activation_signed(activation, padded_k, BLOCK_SIZE);
+    // The SIMD int4 kernels consume a deinterleaved activation layout (evens
+    // then odds per 32-block) so they can skip the per-block nibble
+    // deinterleave; the scalar reference keeps natural order. Deinterleave once
+    // here, amortized over all N output rows.
+    #[cfg(target_arch = "x86_64")]
+    let use_simd = matches!(dot_kernel, DotKernel::AvxVnni | DotKernel::Avx512Vnni);
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_simd = false;
+    let deinterleaved;
+    let activation: &[i8] = if use_simd {
+        deinterleaved = deinterleave_activation_int4(&activation);
+        &deinterleaved
+    } else {
+        &activation
+    };
     let compute = |output_start: usize, outputs: &mut [f32]| {
         for (offset, output) in outputs.iter_mut().enumerate() {
             let output_index = output_start + offset;
@@ -1820,7 +1835,7 @@ fn int4_matmul_m1(
             let scale_start = output_index * k_blocks;
             let scale_end = scale_start + k_blocks;
             *output = int4_dot_row(
-                &activation,
+                activation,
                 &weight.values[packed_start..packed_end],
                 &weight.scales[scale_start..scale_end],
                 &activation_scales,
@@ -1832,6 +1847,34 @@ fn int4_matmul_m1(
     parallel_output_rows(result, padded_k, compute);
 }
 
+/// Deinterleave int8 activations for the SIMD int4 kernels. Within each
+/// 32-wide K-block, emit the 16 even-index activations (`act[2i]`, which pair
+/// with the packed low nibbles / natural weights `2i`) followed by the 16
+/// odd-index activations (`act[2i+1]`, pairing with the high nibbles / weights
+/// `2i+1`). Done once per matmul, this lets [`int4_dot_row_avxvnni`] and
+/// [`int4_dot_row_avx512vnni`] skip the per-block `unpacklo/unpackhi` nibble
+/// deinterleave (the int4-decode bottleneck) — the weights stay in
+/// low-then-high order and the matching activation permutation is amortized
+/// over every N output row. The scalar reference keeps the natural layout.
+fn deinterleave_activation_int4(activation: &[i8]) -> Vec<i8> {
+    debug_assert_eq!(activation.len() % 32, 0);
+    let mut out = vec![0i8; activation.len()];
+    for (block_in, block_out) in activation
+        .chunks_exact(32)
+        .zip(out.chunks_exact_mut(32))
+    {
+        for i in 0..16 {
+            block_out[i] = block_in[2 * i];
+            block_out[16 + i] = block_in[2 * i + 1];
+        }
+    }
+    out
+}
+
+/// Compute one int4 output row (`m=1` decode). For the SIMD kernels
+/// (`AvxVnni`/`Avx512Vnni`) `activation` MUST be in the deinterleaved layout of
+/// [`deinterleave_activation_int4`]; the `Scalar` kernel takes natural order.
+/// [`int4_matmul_m1`] selects the right layout for the chosen kernel.
 fn int4_dot_row(
     activation: &[i8],
     packed_weight: &[u8],
@@ -1883,6 +1926,14 @@ fn int4_dot_row_scalar(
     value
 }
 
+/// 256-bit VNNI int4 block dot. `activation` MUST be in the deinterleaved
+/// layout produced by [`deinterleave_activation_int4`] (per 32-wide block: the
+/// 16 even-index activations, then the 16 odd-index ones). That lets the weight
+/// unpack keep the low nibbles (natural weights `2i`) in lanes 0..16 and the
+/// high nibbles (`2i+1`) in lanes 16..32 without an `unpacklo/unpackhi`
+/// deinterleave per block: the matching activation permutation is done once per
+/// matmul instead of once per output row. The numeric result is bit-identical
+/// to the natural-order kernel (same integer products, same reduction order).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn int4_dot_row_avxvnni(
@@ -1901,10 +1952,9 @@ unsafe fn int4_dot_row_avxvnni(
         let packed = unsafe { _mm_loadu_si128(packed_weight.as_ptr().add(block * 16).cast()) };
         let low = _mm_and_si128(packed, low_mask);
         let high = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
-        let weight = _mm256_sub_epi8(
-            _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high)),
-            zero_point,
-        );
+        // Low nibbles (weights 2i) stay in lanes 0..16, high nibbles (2i+1) in
+        // lanes 16..32; the deinterleaved activation load below matches this.
+        let weight = _mm256_sub_epi8(_mm256_set_m128i(high, low), zero_point);
         // SAFETY: each block has 32 activation bytes, including zero padding.
         let activation = unsafe { _mm256_loadu_si256(activation.as_ptr().add(block * 32).cast()) };
         let absolute_weight = _mm256_sign_epi8(weight, weight);
@@ -1924,14 +1974,26 @@ unsafe fn int4_dot_row_avxvnni(
 /// (unavailable at 512-bit), the raw *unsigned* nibbles (0..15) drive `dpbusd`
 /// directly and the `-8` zero-point is corrected once per pair via a second
 /// `dpbusd` against all-ones (the exact per-lane activation sum) shifted left by
-/// 3: `sum((nibble-8)*a) = sum(nibble*a) - 8*sum(a)`. This drops two `sign` ops
-/// per block and lets activations load straight as one 512-bit vector (one fewer
-/// cross-lane insert). The 16 int32 lanes split into the even block (0..8) and
-/// odd block (8..16); a per-lane scale vector folds both into one f32x16
-/// accumulator with a single horizontal reduction. An odd trailing block uses
-/// the same scheme at 256-bit. Each block's dot is an exact integer inside
-/// f32's 2^24 range; the result matches the scalar reference to a few ULP (only
-/// the cross-block f32 accumulation order differs, as in the 256-bit kernel).
+/// 3: `sum((nibble-8)*a) = sum(nibble*a) - 8*sum(a)`.
+///
+/// `activation` MUST be in the deinterleaved layout produced by
+/// [`deinterleave_activation_int4`]: per 32-wide block the 16 even-index
+/// activations then the 16 odd-index ones. This removes the per-block
+/// `unpacklo/unpackhi` nibble deinterleave that dominated the (unpack-bound)
+/// int4 decode. Instead the weights stay in low-then-high nibble order and the
+/// two blocks of a pair are unpacked from a single 32-byte `_mm256_loadu_si256`
+/// with one `_mm512_permutex2var_epi64` that assembles the four 128-bit halves
+/// `[b0_low, b0_high, b1_low, b1_high]` — matching the deinterleaved activation
+/// load — replacing four `unpack` + two cross-lane inserts per pair. The
+/// activation permutation is amortized once per matmul over all N output rows.
+///
+/// The 16 int32 lanes split into the even block (0..8) and odd block (8..16); a
+/// per-lane scale vector folds both into one f32x16 accumulator with a single
+/// horizontal reduction. An odd trailing block uses the same unsigned-nibble
+/// scheme at 256-bit. Each block's dot is an exact integer inside f32's 2^24
+/// range; the result is bit-identical to the natural-order kernel (same integer
+/// products and reduction order) and matches the scalar reference to a few ULP
+/// (only the cross-block f32 accumulation order differs, as before).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni,avx512vl")]
 unsafe fn int4_dot_row_avx512vnni(
@@ -1944,29 +2006,43 @@ unsafe fn int4_dot_row_avx512vnni(
 
     let low_mask = _mm_set1_epi8(0x0f);
 
-    // Unsigned nibble weights (0..15) for one block, in natural order
-    // (`w[2b]=low(byte b)`, `w[2b+1]=high(byte b)`) so lane j aligns with the
-    // natural-order activation load. The `-8` zero point is applied afterwards.
+    // Unsigned nibble weights (0..15) for one block in low-then-high layout
+    // (`lanes 0..16 = low(byte b)`, `lanes 16..32 = high(byte b)`), matching the
+    // deinterleaved activation load. Used for the odd trailing block; the main
+    // loop unpacks two blocks at once. The `-8` zero point is applied afterwards.
     let block_weight = |block: usize| -> __m256i {
         // SAFETY: each block owns 16 packed bytes.
         let packed = unsafe { _mm_loadu_si128(packed_weight.as_ptr().add(block * 16).cast()) };
         let low = _mm_and_si128(packed, low_mask);
         let high = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
-        _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+        _mm256_set_m128i(high, low)
     };
 
     let block_count = scales.len();
     let ones = _mm512_set1_epi8(1);
     let ones256 = _mm256_set1_epi8(1);
+    let low_mask256 = _mm256_set1_epi8(0x0f);
+    // Assemble weight512 128-bit lanes [b0_low, b0_high, b1_low, b1_high] from
+    // low256=[b0_low,b1_low] (64-bit words 0,1,2,3) and high256=[b0_high,b1_high]
+    // (words 0,1,2,3 selected as 8..11). Index order is lane0..lane7.
+    let perm_idx = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
     let mut accumulator = _mm512_setzero_ps();
 
     // Fuse two blocks per 512-bit `dpbusd`; defer reduction to one final pass.
     for pair in 0..block_count / 2 {
         let b0 = pair * 2;
         let b1 = b0 + 1;
-        let weight =
-            _mm512_inserti64x4(_mm512_castsi256_si512(block_weight(b0)), block_weight(b1), 1);
-        // SAFETY: two contiguous blocks own 64 activation bytes (incl. padding).
+        // SAFETY: two contiguous blocks own 32 packed bytes.
+        let packed = unsafe { _mm256_loadu_si256(packed_weight.as_ptr().add(b0 * 16).cast()) };
+        let low = _mm256_and_si256(packed, low_mask256);
+        let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask256);
+        let weight = _mm512_permutex2var_epi64(
+            _mm512_castsi256_si512(low),
+            perm_idx,
+            _mm512_castsi256_si512(high),
+        );
+        // SAFETY: two contiguous deinterleaved blocks own 64 activation bytes
+        // (including zero padding).
         let act = unsafe { _mm512_loadu_si512(activation.as_ptr().add(b0 * 32).cast()) };
         let wdot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), weight, act);
         let asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, act);
@@ -4077,6 +4153,8 @@ mod tests {
             .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
             .collect();
         let packed: Vec<u8> = (0..blocks * 16).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+        // SIMD int4 kernels consume the deinterleaved activation layout.
+        let activation_deint = deinterleave_activation_int4(&activation);
         let scales: Vec<f32> = (0..blocks).map(|i| ((i % 17) + 1) as f32 / 100.0).collect();
         let ascales: Vec<f32> = (0..blocks).map(|i| ((i % 11) + 1) as f32 / 50.0).collect();
         let iters = 2000u32;
@@ -4085,7 +4163,8 @@ mod tests {
             let mut acc = 0.0f32;
             for _ in 0..iters {
                 // SAFETY: avxvnni present (implied by avx512vnni box) or 256 path.
-                acc += unsafe { int4_dot_row_avxvnni(&activation, &packed, &scales, &ascales) };
+                acc +=
+                    unsafe { int4_dot_row_avxvnni(&activation_deint, &packed, &scales, &ascales) };
             }
             std::hint::black_box(acc);
             t.elapsed().as_nanos() as u64
@@ -4095,7 +4174,9 @@ mod tests {
             let mut acc = 0.0f32;
             for _ in 0..iters {
                 // SAFETY: avx512 features confirmed above.
-                acc += unsafe { int4_dot_row_avx512vnni(&activation, &packed, &scales, &ascales) };
+                acc += unsafe {
+                    int4_dot_row_avx512vnni(&activation_deint, &packed, &scales, &ascales)
+                };
             }
             std::hint::black_box(acc);
             t.elapsed().as_nanos() as u64
@@ -4146,6 +4227,155 @@ mod tests {
         );
     }
 
+    /// Reference copy of the PREVIOUS 512-bit int4 unpack (natural-order
+    /// activation, per-block `unpacklo/unpackhi` deinterleave + `inserti64x4`),
+    /// kept only in the test module to time the before/after delta of the
+    /// deinterleaved-activation unpack. Numerically identical to the current
+    /// kernel; used solely as the "before" baseline in
+    /// `int4_unpack_before_after_bench`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni,avx512vl")]
+    unsafe fn int4_dot_row_avx512vnni_old(
+        activation: &[i8],
+        packed_weight: &[u8],
+        scales: &[f32],
+        activation_scales: &[f32],
+    ) -> f32 {
+        use std::arch::x86_64::*;
+        let low_mask = _mm_set1_epi8(0x0f);
+        let block_weight = |block: usize| -> __m256i {
+            // SAFETY: each block owns 16 packed bytes.
+            let packed =
+                unsafe { _mm_loadu_si128(packed_weight.as_ptr().add(block * 16).cast()) };
+            let low = _mm_and_si128(packed, low_mask);
+            let high = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
+            _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+        };
+        let block_count = scales.len();
+        let ones = _mm512_set1_epi8(1);
+        let ones256 = _mm256_set1_epi8(1);
+        let mut accumulator = _mm512_setzero_ps();
+        for pair in 0..block_count / 2 {
+            let b0 = pair * 2;
+            let b1 = b0 + 1;
+            let weight = _mm512_inserti64x4(
+                _mm512_castsi256_si512(block_weight(b0)),
+                block_weight(b1),
+                1,
+            );
+            // SAFETY: two contiguous blocks own 64 activation bytes.
+            let act = unsafe { _mm512_loadu_si512(activation.as_ptr().add(b0 * 32).cast()) };
+            let wdot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), weight, act);
+            let asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, act);
+            let dot = _mm512_sub_epi32(wdot, _mm512_slli_epi32(asum, 3));
+            let s0 = scales[b0] * activation_scales[b0];
+            let s1 = scales[b1] * activation_scales[b1];
+            let scale_vec =
+                _mm512_set_ps(s1, s1, s1, s1, s1, s1, s1, s1, s0, s0, s0, s0, s0, s0, s0, s0);
+            accumulator =
+                _mm512_add_ps(accumulator, _mm512_mul_ps(_mm512_cvtepi32_ps(dot), scale_vec));
+        }
+        let mut value = _mm512_reduce_add_ps(accumulator);
+        if block_count % 2 == 1 {
+            let block = block_count - 1;
+            let weight = block_weight(block);
+            // SAFETY: the final block owns 32 activation bytes.
+            let act = unsafe { _mm256_loadu_si256(activation.as_ptr().add(block * 32).cast()) };
+            let wdot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), weight, act);
+            let asum = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones256, act);
+            let dot = _mm256_sub_epi32(wdot, _mm256_slli_epi32(asum, 3));
+            let block_scale = scales[block] * activation_scales[block];
+            let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
+            value += horizontal_sum_f32_256(scaled);
+        }
+        value
+    }
+
+    /// Before/after timing of the int4 512-bit unpack over a realistic decode
+    /// GEMV (K=2048, N=2048, block_size=32, m=1). "Before" is the previous
+    /// natural-order `unpacklo/unpackhi + inserti64x4` unpack; "after" is the
+    /// current deinterleaved-activation + `permutex2var` unpack (the activation
+    /// deinterleave is done once, amortized over all N rows). Prints median of 5
+    /// runs. Run with `--ignored --nocapture`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore]
+    fn int4_unpack_before_after_bench() {
+        use std::time::Instant;
+        assert!(
+            std::arch::is_x86_feature_detected!("avx512vnni")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+                && std::arch::is_x86_feature_detected!("avx512bw"),
+            "bench requires avx512vnni/vl/bw",
+        );
+        let k = 2048usize;
+        let n = 2048usize;
+        let blocks = k / 32;
+        // One shared activation row (natural order) + its deinterleaved form.
+        let activation: Vec<i8> = (0..k)
+            .map(|i| (((i * 37 + 11) % 255) as i32 - 127) as i8)
+            .collect();
+        let activation_deint = deinterleave_activation_int4(&activation);
+        let ascales: Vec<f32> = (0..blocks).map(|i| ((i % 11) + 1) as f32 / 50.0).collect();
+        // N independent weight rows.
+        let packed: Vec<u8> =
+            (0..n * blocks * 16).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+        let scales: Vec<f32> =
+            (0..n * blocks).map(|i| ((i % 17) + 1) as f32 / 100.0).collect();
+
+        let reps = 7u32;
+        let median = |mut runs: Vec<u64>| -> u64 {
+            runs.sort_unstable();
+            runs[runs.len() / 2]
+        };
+        let mut old_runs = Vec::new();
+        let mut new_runs = Vec::new();
+        // Interleave old/new reps to share any thermal/load drift.
+        for _ in 0..reps {
+            let t = Instant::now();
+            let mut acc = 0.0f32;
+            for row in 0..n {
+                let ps = &packed[row * blocks * 16..(row + 1) * blocks * 16];
+                let ss = &scales[row * blocks..(row + 1) * blocks];
+                // SAFETY: features asserted above; slices sized per row.
+                acc += unsafe { int4_dot_row_avx512vnni_old(&activation, ps, ss, &ascales) };
+            }
+            std::hint::black_box(acc);
+            old_runs.push(t.elapsed().as_nanos() as u64);
+
+            let t = Instant::now();
+            let mut acc = 0.0f32;
+            // Amortized: deinterleave once per matmul (as production does).
+            let act = deinterleave_activation_int4(&activation);
+            for row in 0..n {
+                let ps = &packed[row * blocks * 16..(row + 1) * blocks * 16];
+                let ss = &scales[row * blocks..(row + 1) * blocks];
+                // SAFETY: features asserted above; slices sized per row.
+                acc += unsafe { int4_dot_row_avx512vnni(&act, ps, ss, &ascales) };
+            }
+            std::hint::black_box(acc);
+            new_runs.push(t.elapsed().as_nanos() as u64);
+        }
+        // Correctness spot-check: new (deinterleaved) == old (natural) per row.
+        let ps = &packed[0..blocks * 16];
+        let ss = &scales[0..blocks];
+        // SAFETY: features asserted above.
+        let old0 = unsafe { int4_dot_row_avx512vnni_old(&activation, ps, ss, &ascales) };
+        let new0 = unsafe { int4_dot_row_avx512vnni(&activation_deint, ps, ss, &ascales) };
+        assert!((old0 - new0).abs() <= 1e-4 * old0.abs().max(1.0), "old {old0} new {new0}");
+
+        let old_ms = median(old_runs) as f64 / 1e6;
+        let new_ms = median(new_runs) as f64 / 1e6;
+        eprintln!(
+            "INT4 UNPACK BEFORE/AFTER (K={k} N={n} block=32, median of {reps}):\n\
+             before (unpacklo/unpackhi + inserti64x4): {old_ms:>8.3} ms\n\
+             after  (deinterleave-once + permutex2var): {new_ms:>8.3} ms\n\
+             speedup: {:.3}x  ({:+.1}%)",
+            old_ms / new_ms,
+            (old_ms / new_ms - 1.0) * 100.0,
+        );
+    }
+
     /// The 512-bit VNNI int4 block dot must match the scalar reference to a few
     /// ULP for any block count, including an odd trailing block routed through
     /// the 256-bit remainder. (Only the cross-block f32 accumulation order
@@ -4173,14 +4403,68 @@ mod tests {
             let activation_scales: Vec<f32> =
                 (0..blocks).map(|i| ((i * 7 % 11) + 1) as f32 / 50.0).collect();
             let scalar = int4_dot_row_scalar(&activation, &packed, &scales, &activation_scales);
+            // The SIMD kernel consumes the deinterleaved activation layout; the
+            // scalar oracle stays natural-order.
+            let activation_deint = deinterleave_activation_int4(&activation);
             // SAFETY: feature support confirmed above.
             let wide = unsafe {
-                int4_dot_row_avx512vnni(&activation, &packed, &scales, &activation_scales)
+                int4_dot_row_avx512vnni(&activation_deint, &packed, &scales, &activation_scales)
             };
             assert!(
                 (wide - scalar).abs() <= 1e-4 * scalar.abs().max(1.0),
                 "blocks={blocks}: avx512 int4 dot {wide} != scalar {scalar}",
             );
+        }
+    }
+
+    /// The 256-bit VNNI int4 block dot (`AvxVnni` path) must match the scalar
+    /// reference for any block count, including an odd trailing block. On this
+    /// AVX-512 host the selected kernel is `Avx512Vnni`, so this path is not
+    /// otherwise exercised; the direct call keeps it non-vacuously validated
+    /// wherever `avxvnni` is present.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int4_dot_row_avxvnni_matches_scalar() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avxvnni"))
+        {
+            return;
+        }
+        for blocks in [1usize, 2, 3, 4, 5, 8, 9] {
+            let activation: Vec<i8> = (0..blocks * 32)
+                .map(|i| (((i * 41 + 5) % 255) as i32 - 127) as i8)
+                .collect();
+            let packed: Vec<u8> = (0..blocks * 16).map(|i| ((i * 47 + 3) % 256) as u8).collect();
+            let scales: Vec<f32> =
+                (0..blocks).map(|i| ((i * 13 % 17) + 1) as f32 / 100.0).collect();
+            let activation_scales: Vec<f32> =
+                (0..blocks).map(|i| ((i * 7 % 11) + 1) as f32 / 50.0).collect();
+            let scalar = int4_dot_row_scalar(&activation, &packed, &scales, &activation_scales);
+            let activation_deint = deinterleave_activation_int4(&activation);
+            // SAFETY: avx2 + avxvnni confirmed above.
+            let wide = unsafe {
+                int4_dot_row_avxvnni(&activation_deint, &packed, &scales, &activation_scales)
+            };
+            assert!(
+                (wide - scalar).abs() <= 1e-4 * scalar.abs().max(1.0),
+                "blocks={blocks}: avxvnni int4 dot {wide} != scalar {scalar}",
+            );
+        }
+    }
+
+    /// The deinterleave transform used by the SIMD int4 kernels is a pure
+    /// per-block permutation: recombining evens/odds reproduces natural order,
+    /// so it cannot change any dot result.
+    #[test]
+    fn deinterleave_activation_int4_is_a_block_permutation() {
+        let activation: Vec<i8> = (0..96i32).map(|i| (i - 48) as i8).collect();
+        let deint = deinterleave_activation_int4(&activation);
+        assert_eq!(deint.len(), activation.len());
+        for block in 0..activation.len() / 32 {
+            for i in 0..16 {
+                assert_eq!(deint[block * 32 + i], activation[block * 32 + 2 * i]);
+                assert_eq!(deint[block * 32 + 16 + i], activation[block * 32 + 2 * i + 1]);
+            }
         }
     }
 
