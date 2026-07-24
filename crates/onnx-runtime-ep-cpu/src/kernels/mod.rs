@@ -75,6 +75,7 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod moe;
 pub mod movement_ops;
+pub mod multi_head_attention;
 #[cfg(feature = "mlas")]
 pub mod nchwc;
 pub mod norm_ops;
@@ -90,6 +91,7 @@ pub mod reshape;
 pub mod resize;
 pub mod rmsnorm;
 pub mod rotary_embedding;
+pub mod sdpa;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
@@ -349,6 +351,15 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory),
+    );
+    // `com.microsoft::MultiHeadAttention` (opset 1): scaled dot-product
+    // attention with separate Q/K/V inputs (value head size may differ from the
+    // query/key head size), an optional Q/K/V bias, key_padding_mask, additive
+    // attention_bias, causal (`unidirectional`) masking, and an in-op KV cache
+    // (`past_*` → `present_*`). f32 reference kernel matching ORT 1.26.0.
+    reg.register(
+        OpKey::new("MultiHeadAttention", "com.microsoft", 1),
+        Box::new(multi_head_attention::MultiHeadAttentionFactory),
     );
     // `com.microsoft::CausalConvWithState` and `com.microsoft::LinearAttention`:
     // the hybrid linear-attention (Gated DeltaNet) primitives used by Qwen3.5 /
@@ -1610,13 +1621,14 @@ mod tests {
         // `CausalConvWithState` and `LinearAttention` (Qwen3.5 hybrid
         // linear-attention primitives) add two more contrib entries,
         // `GatherBlockQuantized` (block-quantized embedding gather) adds one,
-        // and the `com.microsoft::RotaryEmbedding` contrib alias adds one.
+        // the `com.microsoft::RotaryEmbedding` contrib alias adds one, and
+        // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one.
         // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed).
         let mlas_registrations = if cfg!(feature = "mlas") { 7 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 91 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 92 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1659,6 +1671,10 @@ mod tests {
         assert_eq!(reg.lookup("Conv", "", 21).is_some(), cfg!(feature = "mlas"));
         assert!(
             reg.lookup("GroupQueryAttention", "com.microsoft", 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("MultiHeadAttention", "com.microsoft", 1)
                 .is_some()
         );
         assert!(
