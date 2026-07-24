@@ -377,7 +377,9 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// projection weight `(input_hidden, q_hidden + k_hidden + v_hidden)`. Unless
 /// `qkv_hidden_sizes` overrides the split, the packed width is divided equally.
 /// Output 0 is `(batch, sequence, v_hidden)`. The optional packed present cache
-/// is `(2, batch, num_heads, past_sequence + sequence, q_head_size)`.
+/// is `(2, batch, num_heads, past_sequence + sequence, q_head_size)`, except
+/// when `past_present_share_buffer=1`, where present and past share a buffer so
+/// the present cache keeps the past input's shape (dim 3 preserved).
 pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let input = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
     let weights = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
@@ -439,7 +441,20 @@ pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError>
         let head_size = q_hidden
             .checked_div(&num_heads)
             .unwrap_or_else(|| ctx.fresh_dim());
+        // When `past_present_share_buffer=1`, present and past alias the same
+        // buffer, so ORT's `AttentionTypeAndShapeInference` keeps the present
+        // cache the SAME shape as the past input (dim 3 = the shared buffer's
+        // `max_sequence_length`). Only with the default `0` does dim 3 grow to
+        // `past_sequence_length + sequence_length`. If past is absent there is
+        // no buffer to share, so the cache grows from zero (= `sequence`).
+        let share_buffer = ctx
+            .node
+            .attr("past_present_share_buffer")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0)
+            != 0;
         let total_sequence = match ctx.input_shape(4) {
+            Some(past) if past.len() == 5 && share_buffer => past[3].clone(),
             Some(past) if past.len() == 5 => past[3].add(&sequence),
             _ => sequence,
         };

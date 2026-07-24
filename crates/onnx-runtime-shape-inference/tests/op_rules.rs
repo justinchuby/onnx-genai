@@ -778,6 +778,36 @@ fn msft_attention_asymmetric_value_and_present_cache_shapes() {
 }
 
 #[test]
+fn msft_attention_shared_buffer_present_preserves_past_seq() {
+    // With `past_present_share_buffer=1`, present and past alias the same
+    // buffer, so ORT keeps the present cache the SAME shape as the past input:
+    // dim 3 (the buffer's max_sequence_length) is preserved rather than grown.
+    // past [2,2,4,7,8], sequence 3 => present stays [2,2,4,7,8] (not [..,10,..]).
+    let n = with_attr(
+        with_attr(
+            msft_attention_node(5, 2, 4),
+            "qkv_hidden_sizes",
+            Attribute::Ints(vec![32, 32, 64]),
+        ),
+        "past_present_share_buffer",
+        Attribute::Int(1),
+    );
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(3), c(32)]),
+            f32in(vec![c(32), c(128)]),
+            f32in(vec![c(128)]),
+            NodeIo::default(),
+            f32in(vec![c(2), c(2), c(4), c(7), c(8)]),
+        ],
+        1,
+    );
+    assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
+    assert_eq!(shape_at(&outs, 1), vec![c(2), c(2), c(4), c(7), c(8)]);
+}
+
+#[test]
 fn msft_attention_missing_num_heads_errors() {
     let n = with_domain(node("Attention", 3, 1), "com.microsoft");
     let err = try_run(
