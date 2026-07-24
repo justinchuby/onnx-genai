@@ -1,14 +1,34 @@
 //! `com.microsoft` fused transformer kernels composed from the shared CPU
-//! GELU, LayerNorm, and RMSNorm implementations.
+//! GELU, LayerNorm, and RMSNorm implementations. Floating activation kernels
+//! widen f16/bf16 to f32 for compute and narrow their result back to storage.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{DataType, Node};
 
 use super::gelu::{exact_gelu, tanh_gelu};
 use super::layernorm::layer_norm_dense;
 use super::rmsnorm::rms_norm_dense;
 use super::{check_arity, to_dense_f32, write_dense_f32};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+
+fn require_fused_float_dtype(op: &str, inputs: &[TensorView], output: &TensorMut) -> Result<()> {
+    let dtype = inputs[0].dtype;
+    if !matches!(
+        dtype,
+        DataType::Float16 | DataType::BFloat16 | DataType::Float32
+    ) {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: unsupported dtype {dtype:?}; expected Float16, BFloat16, or Float32"
+        )));
+    }
+    if inputs.iter().any(|input| input.dtype != dtype) || output.dtype != dtype {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: input and output dtypes must all match (got input {dtype:?}, output {:?})",
+            output.dtype
+        )));
+    }
+    Ok(())
+}
 
 fn last_dim_bias(x_shape: &[usize], bias: &[f32], op: &str) -> Result<usize> {
     let Some(&width) = x_shape.last() else {
@@ -37,15 +57,16 @@ impl KernelFactory for BiasGeluFactory {
 impl Kernel for BiasGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("BiasGelu", inputs, outputs, 2, 2, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
-        let bias = to_dense_f32(&inputs[1])?;
+        require_fused_float_dtype("BiasGelu", inputs, &outputs[0])?;
+        let x = to_dense_f32_widen("BiasGelu", &inputs[0])?;
+        let bias = to_dense_f32_widen("BiasGelu", &inputs[1])?;
         let width = last_dim_bias(inputs[0].shape, &bias, "BiasGelu")?;
         let y = x
             .iter()
             .enumerate()
             .map(|(i, &v)| exact_gelu(v + bias[i % width]))
             .collect::<Vec<_>>();
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("BiasGelu", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -65,9 +86,10 @@ impl KernelFactory for FastGeluFactory {
 impl Kernel for FastGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("FastGelu", inputs, outputs, 1, 2, 1)?;
-        let x = to_dense_f32(&inputs[0])?;
+        require_fused_float_dtype("FastGelu", inputs, &outputs[0])?;
+        let x = to_dense_f32_widen("FastGelu", &inputs[0])?;
         let bias = if inputs.len() == 2 {
-            Some(to_dense_f32(&inputs[1])?)
+            Some(to_dense_f32_widen("FastGelu", &inputs[1])?)
         } else {
             None
         };
@@ -80,7 +102,7 @@ impl Kernel for FastGeluKernel {
             .enumerate()
             .map(|(i, &v)| tanh_gelu(v + bias.as_ref().map_or(0.0, |b| b[i % width.unwrap()])))
             .collect::<Vec<_>>();
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("FastGelu", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -108,9 +130,10 @@ impl KernelFactory for QuickGeluFactory {
 impl Kernel for QuickGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuickGelu", inputs, outputs, 1, 1, 1)?;
-        let y = to_dense_f32(&inputs[0])?
-            .into_iter()
-            .map(|x| {
+        require_fused_float_dtype("QuickGelu", inputs, &outputs[0])?;
+        let y = to_dense_f32_widen("QuickGelu", &inputs[0])?
+            .iter()
+            .map(|&x| {
                 let z = self.alpha * x;
                 let sigmoid = if z >= 0.0 {
                     1.0 / (1.0 + (-z).exp())
@@ -121,7 +144,7 @@ impl Kernel for QuickGeluKernel {
                 x * sigmoid
             })
             .collect::<Vec<_>>();
-        write_dense_f32(&mut outputs[0], &y)
+        write_dense_f32_narrow("QuickGelu", &mut outputs[0], &y)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -334,6 +357,78 @@ mod tests {
             .unwrap();
         let want = [-1f32, 0.5, 2.].map(|v| v / (1. + (-2. * v).exp()));
         assert_close(&out.to_f32(), &want);
+    }
+
+    #[test]
+    fn fused_gelu_activations_bf16_match_widened_f32_reference() {
+        let x_values = [-2.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN];
+        let bias_values = [0.25, -0.5, 0.0];
+        let x = Owned::bf16(&[2, 3], &x_values);
+        let bias = Owned::bf16(&[3], &bias_values);
+        let widened_x = x.to_bf16_as_f32();
+        let widened_bias = bias.to_bf16_as_f32();
+
+        let reference_x = Owned::f32(&[2, 3], &widened_x);
+        let reference_bias = Owned::f32(&[3], &widened_bias);
+        let mut reference = Owned::zeros_f32(&[2, 3]);
+        BiasGeluKernel
+            .execute(
+                &[reference_x.view(), reference_bias.view()],
+                &mut [reference.view_mut()],
+            )
+            .unwrap();
+        let mut output = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        BiasGeluKernel
+            .execute(&[x.view(), bias.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(
+            output.to_u16_bits(),
+            reference
+                .to_f32()
+                .into_iter()
+                .map(|value| half::bf16::from_f32(value).to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let mut reference = Owned::zeros_f32(&[2, 3]);
+        FastGeluKernel
+            .execute(
+                &[reference_x.view(), reference_bias.view()],
+                &mut [reference.view_mut()],
+            )
+            .unwrap();
+        let mut output = Owned::zeros(DataType::BFloat16, &[2, 3]);
+        FastGeluKernel
+            .execute(&[x.view(), bias.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(
+            output.to_u16_bits(),
+            reference
+                .to_f32()
+                .into_iter()
+                .map(|value| half::bf16::from_f32(value).to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let quick_values = [-2.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN];
+        let quick = Owned::bf16(&[quick_values.len()], &quick_values);
+        let reference_quick = Owned::f32(&[quick_values.len()], &quick.to_bf16_as_f32());
+        let mut reference = Owned::zeros_f32(&[quick_values.len()]);
+        QuickGeluKernel { alpha: 1.702 }
+            .execute(&[reference_quick.view()], &mut [reference.view_mut()])
+            .unwrap();
+        let mut output = Owned::zeros(DataType::BFloat16, &[quick_values.len()]);
+        QuickGeluKernel { alpha: 1.702 }
+            .execute(&[quick.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(
+            output.to_u16_bits(),
+            reference
+                .to_f32()
+                .into_iter()
+                .map(|value| half::bf16::from_f32(value).to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

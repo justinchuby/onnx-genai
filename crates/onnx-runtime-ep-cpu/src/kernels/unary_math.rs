@@ -1,11 +1,12 @@
-//! Additional unary f32 elementwise math kernels (`docs/ORT2.md` §4.4).
+//! Additional unary floating-point elementwise math kernels (`docs/ORT2.md` §4.4).
 //!
 //! These mirror the [`elementwise`](super::elementwise) unary family (a straight
-//! per-element `f32 -> f32` map through [`to_dense_f32`]/[`write_dense_f32`]) but
+//! per-element map through [`to_dense_f32_widen`]/[`write_dense_f32_narrow`]) but
 //! live in their own module to keep the shared `elementwise.rs` low-conflict
 //! while the dtype-coverage pass proceeds there in parallel.
 //!
-//! Every op targets ONNX/NumPy numerics on `f32`:
+//! Every op widens `f16`/`bf16` to `f32`, computes using ONNX/NumPy numerics,
+//! and narrows back to the requested output float type:
 //!
 //! * `Abs`, `Neg`, `Reciprocal` — trivial arithmetic.
 //! * `Exp`, `Log`, `Sin`, `Cos` — `std` intrinsics.
@@ -377,5 +378,94 @@ mod tests {
             .map(half::bf16::to_f32)
             .collect();
         assert_eq!(out.to_bf16_as_f32(), expected);
+    }
+
+    #[test]
+    fn every_unary_math_op_bf16_matches_widened_f32_reference_and_special_values() {
+        // Keep each op's domain-specific exceptional values in the test input:
+        // the oracle widens the *stored* bf16 input, evaluates in f32, then
+        // rounds once back to bf16, which is the kernel's public contract.
+        let cases: &[(MathOp, &[f32])] = &[
+            (MathOp::Abs, &[f32::NEG_INFINITY, -0.0, -1.5, f32::NAN]),
+            (MathOp::Neg, &[f32::INFINITY, -0.0, 1.5, f32::NAN]),
+            (
+                MathOp::Reciprocal,
+                &[f32::NEG_INFINITY, -2.0, 0.0, f32::NAN],
+            ),
+            (
+                MathOp::Exp,
+                &[f32::NEG_INFINITY, -1.0, 0.0, f32::INFINITY, f32::NAN],
+            ),
+            (MathOp::Log, &[0.0, 1.0, f32::INFINITY, -1.0, f32::NAN]),
+            (
+                MathOp::Sign,
+                &[f32::NEG_INFINITY, -0.0, 0.0, f32::INFINITY, f32::NAN],
+            ),
+            (MathOp::Floor, &[-1.5, -0.0, 0.5, f32::INFINITY, f32::NAN]),
+            (MathOp::Ceil, &[-1.5, -0.0, 0.5, f32::INFINITY, f32::NAN]),
+            (MathOp::Round, &[-1.5, -0.0, 0.5, 1.5, f32::NAN]),
+            (
+                MathOp::Sin,
+                &[-1.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Cos,
+                &[-1.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Sigmoid,
+                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Softplus,
+                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Softsign,
+                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (MathOp::Acos, &[-1.0, 0.0, 1.0, 2.0, f32::NAN]),
+            (MathOp::Acosh, &[0.0, 1.0, 2.0, f32::INFINITY, f32::NAN]),
+            (MathOp::Asin, &[-1.0, 0.0, 1.0, 2.0, f32::NAN]),
+            (
+                MathOp::Asinh,
+                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Atan,
+                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (MathOp::Atanh, &[-1.0, 0.0, 0.5, 1.0, 2.0, f32::NAN]),
+            (
+                MathOp::Cosh,
+                &[f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Sinh,
+                &[f32::NEG_INFINITY, -1.0, -0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+            (
+                MathOp::Tan,
+                &[-1.0, -0.0, 0.0, 1.0, f32::INFINITY, f32::NAN],
+            ),
+        ];
+
+        for &(op, values) in cases {
+            let input = Owned::bf16(&[values.len()], values);
+            let mut output = Owned::zeros(DataType::BFloat16, &[values.len()]);
+            run(op, &input, &mut output);
+
+            let expected = input
+                .to_bf16_as_f32()
+                .into_iter()
+                .map(|value| half::bf16::from_f32(op.apply(value)).to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output.to_u16_bits(),
+                expected,
+                "{} bf16 output did not equal f32-reference-rounded-to-bf16",
+                op.name()
+            );
+        }
     }
 }
