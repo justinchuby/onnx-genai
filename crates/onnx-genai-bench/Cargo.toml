@@ -81,3 +81,7 @@ required-features = ["bench-native"]
 [[bin]]
 name = "profile_vision"
 required-features = ["mlas"]
+
+[[bin]]
+name = "bench_generic"
+required-features = ["mlas"]
