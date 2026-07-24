@@ -27,7 +27,7 @@ onnx-genai-metadata = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-genai-scheduler = { workspace = true }
 onnx-genai-engine = { workspace = true }
-onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.3", default-features = false }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.4", default-features = false }
 onnx-genai-preprocess = { workspace = true }
 onnx-genai-comfyui-config = { workspace = true }
 anyhow = { workspace = true }
