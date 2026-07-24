@@ -1342,7 +1342,15 @@ impl NativeDecodeSession {
                 state.max_len
             );
         }
-        state.extend_mask(past_len, total_len)?;
+        // Single-token decode freezes the mask to physical capacity so the step
+        // is CUDA-graph-capture eligible; multi-token prefill keeps the growing
+        // logical length (prefix-sensitive causal island).
+        let mask_expose = if token_ids.len() == 1 {
+            state.max_len
+        } else {
+            total_len
+        };
+        state.extend_mask(past_len, total_len, mask_expose)?;
 
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
@@ -1507,7 +1515,7 @@ impl NativeDecodeSession {
                 state.max_len
             );
         }
-        state.extend_mask(past_len, total_len)?;
+        state.extend_mask(past_len, total_len, total_len)?;
         state.invalidate_graph(&mut self.session)?;
         let ids = token_ids
             .iter()
@@ -1586,7 +1594,7 @@ impl NativeDecodeSession {
                 state.max_len
             );
         }
-        state.extend_mask(past_len, total_len)?;
+        state.extend_mask(past_len, total_len, state.max_len)?;
         state.write_decode_inputs(token_id, past_len)?;
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
@@ -1683,7 +1691,7 @@ impl DecodeCudaState {
             None::<String>,
             DataType::Int64,
             vec![1, max_len],
-            vec![1, 0],
+            vec![1, max_len],
         )?;
         mask.write_bytes(0, &vec![0; max_len * std::mem::size_of::<i64>()])?;
 
@@ -1947,10 +1955,20 @@ impl DecodeCudaState {
         })
     }
 
-    fn extend_mask(&mut self, start: usize, end: usize) -> anyhow::Result<()> {
-        if end > self.max_len || start > end {
+    /// Write the valid `1`s for keys `[start, end)` and set the mask's exposed
+    /// logical length. `expose_len` is the last-dim extent the graph's mask
+    /// island (and hence the Attention kernel) sees: for a single-token decode
+    /// step it is the fixed physical capacity (`max_len`), which freezes the
+    /// island to a shape-static `[1,1,1,max_len]` additive bias (correct for a
+    /// single query row — verified: the padding suffix maps to `-inf`, the valid
+    /// prefix to `0`), so the decode step carries no growing logical input and
+    /// stays CUDA-graph-capture eligible. Multi-token prefill passes `end`
+    /// (the growing valid length) because the causal island is prefix-sensitive
+    /// for `q_seq > 1` and must see the exact logical length.
+    fn extend_mask(&mut self, start: usize, end: usize, expose_len: usize) -> anyhow::Result<()> {
+        if end > self.max_len || start > end || expose_len > self.max_len || end > expose_len {
             bail!(
-                "invalid CUDA mask update {start}..{end} for capacity {}",
+                "invalid CUDA mask update {start}..{end} (expose {expose_len}) for capacity {}",
                 self.max_len
             );
         }
@@ -1958,7 +1976,7 @@ impl DecodeCudaState {
             .flat_map(|_| 1i64.to_le_bytes())
             .collect::<Vec<_>>();
         self.bindings[0].write_bytes(start * std::mem::size_of::<i64>(), &ones)?;
-        self.bindings[0].set_logical_shape(vec![1, end])?;
+        self.bindings[0].set_logical_shape(vec![1, expose_len])?;
         Ok(())
     }
 

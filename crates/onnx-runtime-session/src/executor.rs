@@ -1123,9 +1123,27 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
     // GQA treats the cache tensor extent as capacity and obtains the valid past
     // length from seqlens_k. Standard Attention instead derives past length from
     // the cache tensor extent itself.
-    node.domain == "com.microsoft"
+    if node.domain == "com.microsoft"
         && node.op_type == "GroupQueryAttention"
         && matches!(input_index, 3 | 4)
+    {
+        return true;
+    }
+    // Default-domain `Attention` with an in-op KV cache (past_key=input 4,
+    // past_value=input 5) can likewise treat the cache extent as physical
+    // capacity, deriving the valid attended length on-device from the additive
+    // attention mask (input 3) instead of the growing cache extent. This mirrors
+    // the GQA treatment and is what lets the decode step bind the KV cache at a
+    // fixed capacity so whole-step CUDA-graph capture stays shape-static. Gated
+    // to the mask-driven, non-causal form (a present mask input and no
+    // `is_causal` attribute): that path derives length from the mask frontier,
+    // so the cache extent is pure capacity. Causal-attribute or mask-less
+    // Attention still reads the cache extent as the valid length.
+    node.is_default_domain()
+        && node.op_type == "Attention"
+        && matches!(input_index, 4 | 5)
+        && node.inputs.get(3).is_some_and(Option::is_some)
+        && node.attr("is_causal").and_then(|attr| attr.as_int()).unwrap_or(0) == 0
 }
 
 fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
@@ -3261,6 +3279,18 @@ impl Executor {
         {
             let node = self.graph.node(node_id);
             if node.is_default_domain() && node.op_type == "Attention" {
+                // When the past K/V inputs are themselves bound at physical
+                // capacity (fixed-capacity decode, capture path), the standard
+                // `present = past + current` shape rule sees the *physical* past
+                // extent and over-counts the present seq axis beyond the bound
+                // buffer. In that case the present buffer's true shape is simply
+                // its physical capacity (mirroring GroupQueryAttention, whose
+                // present rule takes `past_capacity.max(total)`); the valid
+                // length lives on-device and context-overflow is caught earlier
+                // in the decoder (`total_len > max_len`). Otherwise keep the
+                // conservative `physical >= logical` guard.
+                let kv_capacity_bound = kernel_input_uses_physical_capacity(node, 4)
+                    && kernel_input_uses_physical_capacity(node, 5);
                 for (oi, &ovid) in outputs.iter().enumerate() {
                     if oi == 0 {
                         continue;
@@ -3271,9 +3301,10 @@ impl Executor {
                         && value.shape.iter().zip(&output_shapes[oi]).enumerate().all(
                             |(axis, (&physical, &logical))| axis == 2 || physical == logical,
                         )
-                        && value.shape.get(2).zip(output_shapes[oi].get(2)).is_some_and(
-                            |(&physical, &logical)| physical >= logical,
-                        )
+                        && (kv_capacity_bound
+                            || value.shape.get(2).zip(output_shapes[oi].get(2)).is_some_and(
+                                |(&physical, &logical)| physical >= logical,
+                            ))
                     {
                         output_shapes[oi] = value.shape.clone();
                     }
