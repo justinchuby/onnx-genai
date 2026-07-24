@@ -1219,7 +1219,11 @@ fn kernel_input_uses_physical_capacity(node: &Node, input_index: usize) -> bool 
         && node.op_type == "Attention"
         && matches!(input_index, 4 | 5)
         && node.inputs.get(3).is_some_and(Option::is_some)
-        && node.attr("is_causal").and_then(|attr| attr.as_int()).unwrap_or(0) == 0
+        && node
+            .attr("is_causal")
+            .and_then(|attr| attr.as_int())
+            .unwrap_or(0)
+            == 0
 }
 
 fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
@@ -2450,10 +2454,7 @@ impl Executor {
     /// the graph remains installed and valid for the next step, or `false` when a
     /// control-flow branch flip retired it mid-step (the token was still produced
     /// correctly via an eager fallback) and the caller must re-warm/re-capture.
-    pub(crate) fn replay_device_graph(
-        &mut self,
-        bindings: &mut [DeviceIoBinding],
-    ) -> Result<bool> {
+    pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.device_graph_signature.as_ref() != Some(&signature) {
@@ -2806,15 +2807,12 @@ impl Executor {
                             // retry, unless we already quarantined it (no
                             // progress), hit the attempt bound, or cannot
                             // attribute the failure to a node.
-                            let quarantined = self.last_capture_failed_node.take().and_then(
-                                |node_id| {
+                            let quarantined =
+                                self.last_capture_failed_node.take().and_then(|node_id| {
                                     let node = self.graph.node(node_id);
                                     let key = (canonical_domain(node), node.op_type.clone());
-                                    self.capture_quarantine_ops
-                                        .insert(key)
-                                        .then_some(())
-                                },
-                            );
+                                    self.capture_quarantine_ops.insert(key).then_some(())
+                                });
                             if quarantined.is_some()
                                 && self.capture_quarantine_ops.len() < max_capture_attempts
                             {
@@ -3405,9 +3403,7 @@ impl Executor {
                     // a different-shaped branch than capture assumed reallocated
                     // an output a later captured segment reads: retire the graph
                     // and finish this step eagerly.
-                    if mode == RunMode::Replay
-                        && self.control_flow_seam_invalidated(pi, resolved)
-                    {
+                    if mode == RunMode::Replay && self.control_flow_seam_invalidated(pi, resolved) {
                         invalidated = true;
                     }
                 }
@@ -3542,13 +3538,18 @@ impl Executor {
                     if let Some(value) = external.outputs.get(&ovid)
                         && value.accepts_subshape
                         && value.shape.len() == output_shapes[oi].len()
-                        && value.shape.iter().zip(&output_shapes[oi]).enumerate().all(
-                            |(axis, (&physical, &logical))| axis == 2 || physical == logical,
-                        )
+                        && value
+                            .shape
+                            .iter()
+                            .zip(&output_shapes[oi])
+                            .enumerate()
+                            .all(|(axis, (&physical, &logical))| axis == 2 || physical == logical)
                         && (kv_capacity_bound
-                            || value.shape.get(2).zip(output_shapes[oi].get(2)).is_some_and(
-                                |(&physical, &logical)| physical >= logical,
-                            ))
+                            || value
+                                .shape
+                                .get(2)
+                                .zip(output_shapes[oi].get(2))
+                                .is_some_and(|(&physical, &logical)| physical >= logical))
                     {
                         output_shapes[oi] = value.shape.clone();
                     }

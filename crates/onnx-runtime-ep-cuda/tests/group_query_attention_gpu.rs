@@ -5,12 +5,12 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
-    gqa_capture_error_description, CudaExecutionProvider, GroupQueryAttentionBackend,
-    GroupQueryAttentionKernel, GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE,
+    CudaExecutionProvider, GQA_CAPTURE_ERROR_PAST_CAPACITY, GQA_CAPTURE_ERROR_PAST_NEGATIVE,
     GQA_CAPTURE_ERROR_POSITION, GQA_CAPTURE_ERROR_QUERY_NEGATIVE, GQA_CAPTURE_ERROR_TOTAL_OVERFLOW,
+    GroupQueryAttentionBackend, GroupQueryAttentionKernel, gqa_capture_error_description,
 };
 use onnx_runtime_ir::{
-    compute_contiguous_strides, static_shape, Attribute, DataType, Graph, Node, NodeId,
+    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 use std::time::Instant;
@@ -1035,10 +1035,11 @@ fn parity_fixture(
     assert_eq!(case.totals.len(), case.batch);
     assert!(case.totals.iter().all(|&total| total >= case.k_seq));
     assert!(case.totals.iter().all(|&total| total >= case.q_seq));
-    assert!(case
-        .totals
-        .iter()
-        .all(|&total| total - case.k_seq <= case.past_capacity));
+    assert!(
+        case.totals
+            .iter()
+            .all(|&total| total - case.k_seq <= case.past_capacity)
+    );
     let scale_values = |mut values: Vec<f32>| {
         for value in &mut values {
             *value *= case.magnitude;
@@ -2244,9 +2245,11 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
 
     let overflow = capture_invalid(Some(i32::MAX), None);
     assert_ne!(overflow & GQA_CAPTURE_ERROR_TOTAL_OVERFLOW, 0);
-    assert!(gqa_capture_error_description(overflow)
-        .unwrap()
-        .contains("seqlens_k + 1 overflows int32"));
+    assert!(
+        gqa_capture_error_description(overflow)
+            .unwrap()
+            .contains("seqlens_k + 1 overflows int32")
+    );
 
     let negative = capture_invalid(Some(-1), None);
     assert_ne!(negative & GQA_CAPTURE_ERROR_PAST_NEGATIVE, 0);
@@ -2257,15 +2260,19 @@ fn gqa_gpu_capture_detects_invalid_decode_metadata() {
 
     let capacity = capture_invalid(Some(6), None);
     assert_ne!(capacity & GQA_CAPTURE_ERROR_PAST_CAPACITY, 0);
-    assert!(gqa_capture_error_description(capacity)
-        .unwrap()
-        .contains("effective past length exceeds past cache extent"));
+    assert!(
+        gqa_capture_error_description(capacity)
+            .unwrap()
+            .contains("effective past length exceeds past cache extent")
+    );
 
     let position = capture_invalid(None, Some(i64::MAX));
     assert_ne!(position & GQA_CAPTURE_ERROR_POSITION, 0);
-    assert!(gqa_capture_error_description(position)
-        .unwrap()
-        .contains("rotary position exceeds cache rows"));
+    assert!(
+        gqa_capture_error_description(position)
+            .unwrap()
+            .contains("rotary position exceeds cache rows")
+    );
 
     // Leave the latch clean for any later kernel sharing this runtime.
     runtime.reset_capture_error().unwrap();

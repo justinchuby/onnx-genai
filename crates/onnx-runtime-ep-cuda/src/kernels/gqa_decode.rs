@@ -58,20 +58,19 @@ pub(super) fn supported(query_seq: usize, head_dim: usize) -> bool {
 pub(super) fn single_split_direct_flag() -> i32 {
     #[cfg(test)]
     {
-        let override_value =
-            TEST_SINGLE_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        let override_value = TEST_SINGLE_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
         if override_value >= 0 {
             return override_value;
         }
     }
     use std::sync::OnceLock;
     static FLAG: OnceLock<i32> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        match std::env::var("ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT") {
+    *FLAG.get_or_init(
+        || match std::env::var("ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT") {
             Ok(value) if value == "0" => 0,
             _ => 1,
-        }
-    })
+        },
+    )
 }
 
 /// Test-only override for [`single_split_direct_flag`]: `-1` defers to the env

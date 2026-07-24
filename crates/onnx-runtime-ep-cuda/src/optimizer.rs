@@ -1368,9 +1368,7 @@ impl OptimizationPass for CudaGateUpSwiGluFusion {
             // `CudaSkipRmsNormMatMulFusion` folds in later, so leave it empty
             // (None) here; symmetric weights add no trailing slots at all and
             // stay byte-identical to the pre-zero-point contract.
-            if let (Some(gate_zp), Some(up_zp)) =
-                (plan.gate_zero_points, plan.up_zero_points)
-            {
+            if let (Some(gate_zp), Some(up_zp)) = (plan.gate_zero_points, plan.up_zero_points) {
                 fused.inputs.push(None);
                 fused.inputs.push(Some(gate_zp));
                 fused.inputs.push(Some(up_zp));
@@ -1686,12 +1684,7 @@ impl OptimizationPass for CudaOnDeviceConstantSelect {
 }
 
 impl CudaOnDeviceConstantSelect {
-    fn plan_select(
-        &self,
-        graph: &Graph,
-        ctx: &PassContext,
-        if_node: NodeId,
-    ) -> Option<SelectPlan> {
+    fn plan_select(&self, graph: &Graph, ctx: &PassContext, if_node: NodeId) -> Option<SelectPlan> {
         let node = graph.try_node(if_node)?;
         let cond = node.inputs.first().copied().flatten()?;
         let then_key = (if_node, "then_branch".to_string());
@@ -3804,19 +3797,21 @@ mod tests {
         let cos = graph.create_named_value(
             "cos_cache",
             DataType::Float16,
-            then_dims.iter().map(|&d| Dim::Static(d)).collect::<Vec<_>>(),
+            then_dims
+                .iter()
+                .map(|&d| Dim::Static(d))
+                .collect::<Vec<_>>(),
         );
         let sin = graph.create_named_value(
             "sin_cache",
             DataType::Float16,
-            then_dims.iter().map(|&d| Dim::Static(d)).collect::<Vec<_>>(),
+            then_dims
+                .iter()
+                .map(|&d| Dim::Static(d))
+                .collect::<Vec<_>>(),
         );
-        let if_node = graph.insert_node(Node::new(
-            NodeId(0),
-            "If",
-            vec![Some(cond)],
-            vec![cos, sin],
-        ));
+        let if_node =
+            graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![cos, sin]));
         graph.add_output(cos);
         graph.add_output(sin);
 
@@ -3888,8 +3883,16 @@ mod tests {
                 output if output == sin => (THEN_SIN_SENTINEL, ELSE_SIN_SENTINEL),
                 output => panic!("unexpected Where output {output:?}"),
             };
-            assert_eq!(x_bytes.len(), 4 * 2 * 2, "then const is the full long table");
-            assert_eq!(y_bytes.len(), 4 * 2 * 2, "else const padded to the long shape");
+            assert_eq!(
+                x_bytes.len(),
+                4 * 2 * 2,
+                "then const is the full long table"
+            );
+            assert_eq!(
+                y_bytes.len(),
+                4 * 2 * 2,
+                "else const padded to the long shape"
+            );
             assert_eq!(
                 x_bytes,
                 &fp16_bytes(4, 2, then_sentinel),

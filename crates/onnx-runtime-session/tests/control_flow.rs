@@ -186,7 +186,13 @@ fn invariant_if_branch(value: f32) -> Graph {
         &[2],
         f32_bytes(&[value, value]),
     );
-    let zero = init(&mut b, "zero", DataType::Float32, &[2], f32_bytes(&[0.0, 0.0]));
+    let zero = init(
+        &mut b,
+        "zero",
+        DataType::Float32,
+        &[2],
+        f32_bytes(&[0.0, 0.0]),
+    );
     let out = op(
         &mut b,
         "Add",
