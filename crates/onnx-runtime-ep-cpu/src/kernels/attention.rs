@@ -49,6 +49,9 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
+use super::sdpa::{
+    AttnBias, NoMask, QkCapture, QkCaptureStage, ScaleMode, SdpaConfig, SdpaTensors, sdpa_f32,
+};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 standard-`Attention` kernel carrying the resolved attributes.
@@ -324,6 +327,40 @@ impl Mask {
     }
 }
 
+/// Combines `ai.onnx::Attention`'s stage-3 masking — per-batch padding
+/// frontier, offset-aware causal frontier, and the additive/boolean
+/// `attn_mask` — into the shared core's [`AttnBias`] hook. Its `at` mirrors the
+/// original kernel's per-`(b, qh, i, j)` branch exactly: a padded or
+/// causally-masked position returns `-inf` (added to the finite scaled score,
+/// which is equivalent to overwriting it), otherwise it returns the resolved
+/// `attn_mask` bias. This lets the core apply masking additively with
+/// `cfg.causal = false`, reproducing the standalone loop bit-for-bit.
+struct AttnMaskBias<'a> {
+    mask: &'a Mask,
+    is_causal: bool,
+    total_seq: usize,
+    /// Per-batch causal offset: query `i` attends key `j` iff `j <= i + offset`.
+    offsets: &'a [i64],
+    /// Per-batch padding frontier: keys at `j >= limit` are masked regardless
+    /// of causality. `None` when there is no external-cache padding.
+    pad_limits: &'a [Option<i64>],
+}
+
+impl AttnBias for AttnMaskBias<'_> {
+    #[inline]
+    fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32 {
+        if let Some(limit) = self.pad_limits[b]
+            && (j as i64) >= limit
+        {
+            return f32::NEG_INFINITY;
+        }
+        if self.is_causal && (j as i64) > i as i64 + self.offsets[b] {
+            return f32::NEG_INFINITY;
+        }
+        self.mask.bias(b, head, i, j, self.total_seq)
+    }
+}
+
 impl Kernel for AttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
@@ -425,7 +462,6 @@ impl Kernel for AttentionKernel {
                  {kv_heads} (MHA/GQA/MQA)"
             )));
         }
-        let group = q_heads / kv_heads;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             // Dominant SDPA work: QKᵀ and probability·V MACs (two FLOPs each),
             // plus the standalone softmax estimate over every score.
@@ -452,11 +488,6 @@ impl Kernel for AttentionKernel {
         let scale = self
             .scale
             .unwrap_or_else(|| 1.0 / (head_size as f32).sqrt());
-        // Fold `sqrt(scale)` into each Q and K operand so the dot product is
-        // `(Q·√scale)·(K·√scale)` rather than `scale·(Q·K)`. This matches the
-        // spec's `Q*sqrt(scale)`, `K*sqrt(scale)` pattern and avoids overflowing
-        // an intermediate `Q·Kᵀ` for extreme magnitudes.
-        let sqrt_scale = scale.sqrt();
 
         // Resolve the attention mask (input 3), if present. Presence is decided
         // by input-slot binding, so a rank-0 (scalar) mask is honored rather
@@ -484,126 +515,87 @@ impl Kernel for AttentionKernel {
             Mask::None
         };
 
+        // Normalize the op-specific inputs onto the shared SDPA core. Q/K/V are
+        // already dense `BNSH` (`[batch, heads, seq, dim]`) after `to_bhsd` and
+        // the cache concat, which is exactly the [`SdpaTensors`] contract, so no
+        // repacking is needed. All op-specific masking (per-batch padding and
+        // causal frontiers + `attn_mask`) folds into a single [`AttnBias`], and
+        // `ai.onnx::Attention`'s overflow-safe √scale maps to
+        // [`ScaleMode::SplitSqrt`]. The core reproduces the exact
+        // `scale → [softcap] → +mask → softmax → ·V` sequence this kernel used
+        // to inline, so outputs are bit-for-bit identical.
+        //
+        // Per-batch causal offset: query in-block index `i` attends key `j` iff
+        // `j <= i + offset`. With an external cache the offset is
+        // `nonpad_kv_seqlen[b] - q_seq`; with an in-op past cache it is
+        // `past_seq`; otherwise 0. The per-batch padding frontier masks keys at
+        // `j >= nonpad_kv_seqlen[b]` regardless of causal mode.
+        let mut offsets = vec![0i64; batch];
+        let mut pad_limits: Vec<Option<i64>> = vec![None; batch];
+        for b in 0..batch {
+            offsets[b] = match &nonpad_kv_seqlen {
+                Some(seqlen) => seqlen[b] - q_seq as i64,
+                None => past_seq as i64,
+            };
+            pad_limits[b] = nonpad_kv_seqlen.as_ref().map(|seqlen| seqlen[b]);
+        }
+        let bias = AttnMaskBias {
+            mask: &mask,
+            is_causal: self.is_causal,
+            total_seq,
+            offsets: &offsets,
+            pad_limits: &pad_limits,
+        };
+
+        let cfg = SdpaConfig {
+            // √scale folded into each operand (overflow-safe), matching the
+            // spec's `Q*sqrt(scale)`, `K*sqrt(scale)` pattern.
+            scale: ScaleMode::SplitSqrt(scale),
+            softcap: (self.softcap != 0.0).then_some(self.softcap),
+            // Causal + padding masking is expressed through `bias` above, so the
+            // core's own causal path stays off.
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let tensors = SdpaTensors {
+            q: &q.data,
+            k: &key.data,
+            v: &value.data,
+            batch,
+            num_heads: q_heads,
+            num_kv_heads: kv_heads,
+            q_seq,
+            kv_seq: total_seq,
+            head_size,
+            v_head_size,
+        };
+
         let mut y = vec![0.0f32; batch * q_heads * q_seq * v_head_size];
         // qk_matmul_output buffer, produced only when a 4th output is present.
+        // `qk_matmul_output_mode` has the same meaning across opsets 23–26: 0 =
+        // raw (scaled) QK, 1 = after softcap (before mask), 2 = after
+        // mask+softcap, 3 = post-softmax probabilities.
         let want_qk = outputs.len() >= 4;
         let mut qk_out = if want_qk {
             vec![0.0f32; batch * q_heads * q_seq * total_seq]
         } else {
             Vec::new()
         };
-
-        // `qk_matmul_output_mode` has the same meaning across opsets 23–26 (the
-        // schema descriptions are identical): 1 = after softcap (before mask),
-        // 2 = after mask+softcap.
-        let (softcap_mode, mask_mode) = (1, 2);
-
-        let mut scores = vec![0.0f32; total_seq];
-        for b in 0..batch {
-            // Per-batch causal offset: query in-block index `i` attends key `j`
-            // iff `j <= i + offset`. With an external cache the offset is
-            // `nonpad_kv_seqlen[b] - q_seq`; with an in-op past cache it is
-            // `past_seq`; otherwise 0. A negative offset fully masks leading
-            // query rows (→ zero output rows).
-            let offset: i64 = match &nonpad_kv_seqlen {
-                Some(seqlen) => seqlen[b] - q_seq as i64,
-                None => past_seq as i64,
+        let qk_cap = want_qk.then(|| {
+            let stage = match self.qk_matmul_output_mode {
+                0 => QkCaptureStage::PostScale,
+                1 => QkCaptureStage::PostSoftcap,
+                2 => QkCaptureStage::PreSoftmax,
+                _ => QkCaptureStage::PostSoftmax,
             };
-            // Per-batch padding frontier: with `nonpad_kv_seqlen`, keys at
-            // `j >= nonpad_kv_seqlen[b]` are padding in the external KV cache
-            // and must be masked to -inf REGARDLESS of causal mode. This
-            // composes with (intersects) the causal frontier and `attn_mask`.
-            let pad_limit: Option<i64> = nonpad_kv_seqlen.as_ref().map(|seqlen| seqlen[b]);
-            for qh in 0..q_heads {
-                let kvh = qh / group;
-                for i in 0..q_seq {
-                    // Stage 1: scaled Q·Kᵀ scores for this query row, with
-                    // sqrt(scale) folded into each operand (overflow-safe).
-                    for (j, sc) in scores.iter_mut().enumerate() {
-                        let mut acc = 0.0f32;
-                        for p in 0..head_size {
-                            acc += (q.at(b, qh, i, p) * sqrt_scale)
-                                * (key.at(b, kvh, j, p) * sqrt_scale);
-                        }
-                        *sc = acc;
-                    }
-                    // qk mode 0: raw (scaled) QK matmul output.
-                    if want_qk && self.qk_matmul_output_mode == 0 {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
-
-                    // Stage 2: softcap (before mask), applied when nonzero.
-                    if self.softcap != 0.0 {
-                        for sc in scores.iter_mut() {
-                            *sc = self.softcap * (*sc / self.softcap).tanh();
-                        }
-                    }
-                    // qk mode 1: after softcap, before mask.
-                    if want_qk && self.qk_matmul_output_mode == softcap_mode {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
-
-                    // Stage 3: attention mask + causal frontier (additive bias).
-                    let causal_limit = i as i64 + offset;
-                    for (j, sc) in scores.iter_mut().enumerate() {
-                        // Padding mask: applies regardless of `is_causal`.
-                        let is_pad = pad_limit.is_some_and(|limit| (j as i64) >= limit);
-                        if is_pad {
-                            *sc = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        if self.is_causal && (j as i64) > causal_limit {
-                            *sc = f32::NEG_INFINITY;
-                            continue;
-                        }
-                        let bias = mask.bias(b, qh, i, j, total_seq);
-                        *sc += bias;
-                    }
-                    // qk mode 2: after mask+softcap, before softmax.
-                    if want_qk && self.qk_matmul_output_mode == mask_mode {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
-
-                    // Stage 4: numerically-stable softmax with a fully-masked
-                    // row guard (all -inf → zero row, not NaN).
-                    let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    if max == f32::NEG_INFINITY {
-                        for sc in scores.iter_mut() {
-                            *sc = 0.0;
-                        }
-                    } else {
-                        let mut sum = 0.0f32;
-                        for sc in scores.iter_mut() {
-                            let e = (*sc - max).exp();
-                            *sc = e;
-                            sum += e;
-                        }
-                        let inv = 1.0 / sum;
-                        for sc in scores.iter_mut() {
-                            *sc *= inv;
-                        }
-                    }
-                    // qk mode 3: post-softmax probabilities.
-                    if want_qk && self.qk_matmul_output_mode == 3 {
-                        let base = ((b * q_heads + qh) * q_seq + i) * total_seq;
-                        qk_out[base..base + total_seq].copy_from_slice(&scores);
-                    }
-
-                    // Stage 5: Y = probs · V.
-                    let y_base = ((b * q_heads + qh) * q_seq + i) * v_head_size;
-                    for c in 0..v_head_size {
-                        let mut acc = 0.0f32;
-                        for (j, &p) in scores.iter().enumerate() {
-                            acc += p * value.at(b, kvh, j, c);
-                        }
-                        y[y_base + c] = acc;
-                    }
-                }
+            QkCapture {
+                scores: &mut qk_out,
+                stage,
             }
-        }
+        });
+
+        sdpa_f32(&tensors, &cfg, &bias, &NoMask, &mut y, qk_cap);
 
         // Write Y, reshaping back to the rank of Q.
         if q_rank == 3 {
@@ -2490,6 +2482,190 @@ mod tests {
             assert!((s - 1.0).abs() < 1e-6, "valid probs must sum to 1: {s}");
         }
     }
+    /// Byte-identical migration guard: runs the kernel over a broad battery of
+    /// configurations and writes the raw f32 *bit patterns* of every output to
+    /// the file named by `ATTN_GOLDEN_DUMP`. Run pre- and post-migration and
+    /// diff the two dumps to prove bit-for-bit equivalence. `#[ignore]` so it
+    /// only runs when invoked explicitly.
+    #[test]
+    #[ignore]
+    fn byte_identical_capture() {
+        use std::fmt::Write as _;
+        let path = std::env::var("ATTN_GOLDEN_DUMP")
+            .unwrap_or_else(|_| "attn_golden_dump.txt".to_string());
+        let mut out = String::new();
+
+        // Deterministic case runner: dumps every output slot's bits.
+        let mut dump = |name: &str, outs: &[Owned]| {
+            let _ = write!(out, "CASE {name}");
+            for o in outs {
+                let _ = write!(out, " |");
+                for x in o.to_f32() {
+                    let _ = write!(out, " {:08x}", x.to_bits());
+                }
+            }
+            out.push('\n');
+        };
+
+        // Sweep: rank (3D/4D), causal, softcap, qk_mode, GQA group, with a KV
+        // cache and a float mask, over deterministic conformance inputs.
+        let mut idx = 0usize;
+        for &rank4 in &[true, false] {
+            for &causal in &[false, true] {
+                for &softcap in &[0.0f32, 20.0, -15.0] {
+                    for qk_mode in 0..=3i64 {
+                        for &(qh, kvh) in &[(2usize, 2usize), (4, 2), (2, 1)] {
+                            idx += 1;
+                            let (b, sq, sk, d, dv) = (2usize, 3usize, 3usize, 4usize, 4usize);
+                            let q = conformance_values(b * qh * sq * d, idx);
+                            let k = conformance_values(b * kvh * sk * d, idx + 1);
+                            let v = conformance_values(b * kvh * sk * dv, idx + 2);
+                            let want_qk = true;
+                            let ker =
+                                kernel(Some(0.3), causal, Some(qh), Some(kvh), qk_mode, softcap);
+                            let mut y;
+                            let mut pk = Owned::zeros_f32(&[b, kvh, sk, d]);
+                            let mut pv = Owned::zeros_f32(&[b, kvh, sk, dv]);
+                            let mut qk = Owned::zeros_f32(&[b, qh, sq, sk]);
+                            let (qi, ki, vi);
+                            if rank4 {
+                                y = Owned::zeros_f32(&[b, qh, sq, dv]);
+                                qi = Owned::f32(&[b, qh, sq, d], &q);
+                                ki = Owned::f32(&[b, kvh, sk, d], &k);
+                                vi = Owned::f32(&[b, kvh, sk, dv], &v);
+                            } else {
+                                y = Owned::zeros_f32(&[b, sq, qh * dv]);
+                                // 3D layout: (b, seq, heads*dim) from the bhsd data.
+                                let q3 = bhsd_to_bsh(&q, b, qh, sq, d);
+                                let k3 = bhsd_to_bsh(&k, b, kvh, sk, d);
+                                let v3 = bhsd_to_bsh(&v, b, kvh, sk, dv);
+                                qi = Owned::f32(&[b, sq, qh * d], &q3);
+                                ki = Owned::f32(&[b, sk, kvh * d], &k3);
+                                vi = Owned::f32(&[b, sk, kvh * dv], &v3);
+                            }
+                            let _ = want_qk;
+                            ker.execute(
+                                &[qi.view(), ki.view(), vi.view()],
+                                &mut [y.view_mut(), pk.view_mut(), pv.view_mut(), qk.view_mut()],
+                            )
+                            .unwrap();
+                            dump(
+                                &format!(
+                                    "sweep r4={rank4} causal={causal} softcap={softcap} qk={qk_mode} qh={qh} kvh={kvh}"
+                                ),
+                                &[y, pk, pv, qk],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Float additive mask (4D, broadcast over heads).
+        {
+            let (b, h, sq, sk, d, dv) = (1, 2, 2, 3, 3, 2);
+            let q = conformance_values(b * h * sq * d, 7);
+            let k = conformance_values(b * h * sk * d, 8);
+            let v = conformance_values(b * h * sk * dv, 9);
+            let mask = conformance_values(sq * sk, 11);
+            let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+            kernel(Some(0.4), false, None, None, 2, 0.0)
+                .execute(
+                    &[
+                        Owned::f32(&[b, h, sq, d], &q).view(),
+                        Owned::f32(&[b, h, sk, d], &k).view(),
+                        Owned::f32(&[b, h, sk, dv], &v).view(),
+                        Owned::f32(&[1, 1, sq, sk], &mask).view(),
+                    ],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            dump("float_mask", &[y]);
+        }
+
+        // Bool mask, including a fully-masked row.
+        {
+            let (b, h, sq, sk, d, dv) = (1, 1, 2, 3, 2, 2);
+            let q = conformance_values(b * h * sq * d, 13);
+            let k = conformance_values(b * h * sk * d, 14);
+            let v = conformance_values(b * h * sk * dv, 15);
+            let mask = [true, false, false, false, false, false];
+            let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+            kernel(Some(0.5), false, None, None, 0, 0.0)
+                .execute(
+                    &[
+                        Owned::f32(&[b, h, sq, d], &q).view(),
+                        Owned::f32(&[b, h, sk, d], &k).view(),
+                        Owned::f32(&[b, h, sk, dv], &v).view(),
+                        Owned::bool_(&[b, sq, sk], &mask).view(),
+                    ],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            dump("bool_mask_fully_masked_row", &[y]);
+        }
+
+        // KV cache concat + present outputs (4D).
+        {
+            let (b, h, sq, past, cur, d, dv) = (1, 2, 2, 2, 2, 3, 3);
+            let q = conformance_values(b * h * sq * d, 21);
+            let pk = conformance_values(b * h * past * d, 22);
+            let pv = conformance_values(b * h * past * dv, 23);
+            let ck = conformance_values(b * h * cur * d, 24);
+            let cv = conformance_values(b * h * cur * dv, 25);
+            let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+            let mut prk = Owned::zeros_f32(&[b, h, past + cur, d]);
+            let mut prv = Owned::zeros_f32(&[b, h, past + cur, dv]);
+            kernel(Some(0.3), true, None, None, 0, 0.0)
+                .execute(
+                    &[
+                        Owned::f32(&[b, h, sq, d], &q).view(),
+                        Owned::f32(&[b, h, cur, d], &ck).view(),
+                        Owned::f32(&[b, h, cur, dv], &cv).view(),
+                        absent(),
+                        Owned::f32(&[b, h, past, d], &pk).view(),
+                        Owned::f32(&[b, h, past, dv], &pv).view(),
+                    ],
+                    &mut [y.view_mut(), prk.view_mut(), prv.view_mut()],
+                )
+                .unwrap();
+            dump("kv_cache", &[y, prk, prv]);
+        }
+
+        // nonpad_kv_seqlen: positive/zero/negative offsets + qk modes.
+        for &(off_name, nonpad) in &[("pos", 3i64), ("zero", 2), ("neg", 1)] {
+            for qk_mode in [2i64, 3] {
+                let (b, h, sq, sk, d, dv) = (1, 1, 2, 3, 2, 2);
+                let q = conformance_values(b * h * sq * d, 31);
+                let k = conformance_values(b * h * sk * d, 32);
+                let v = conformance_values(b * h * sk * dv, 33);
+                let seq = [nonpad];
+                let mut y = Owned::zeros_f32(&[b, h, sq, dv]);
+                let mut pk = Owned::zeros_f32(&[b, h, sk, d]);
+                let mut pv = Owned::zeros_f32(&[b, h, sk, dv]);
+                let mut qk = Owned::zeros_f32(&[b, h, sq, sk]);
+                kernel_v(24, Some(0.5), true, None, None, qk_mode, 0.0)
+                    .execute(
+                        &[
+                            Owned::f32(&[b, h, sq, d], &q).view(),
+                            Owned::f32(&[b, h, sk, d], &k).view(),
+                            Owned::f32(&[b, h, sk, dv], &v).view(),
+                            absent(),
+                            absent(),
+                            absent(),
+                            Owned::i64(&[b], &seq).view(),
+                        ],
+                        &mut [y.view_mut(), pk.view_mut(), pv.view_mut(), qk.view_mut()],
+                    )
+                    .unwrap();
+                dump(&format!("nonpad_{off_name}_qk{qk_mode}"), &[y, pk, pv, qk]);
+            }
+        }
+
+        std::fs::write(&path, out).unwrap();
+        eprintln!("wrote golden dump to {path}");
+    }
+
     #[test]
     fn attention_bf16_matches_widened_f32_reference() {
         let q = Owned::bf16(&[1, 1, 2, 2], &[1., -1., 0., 2.]);
