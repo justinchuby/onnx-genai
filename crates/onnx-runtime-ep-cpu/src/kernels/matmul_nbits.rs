@@ -7272,6 +7272,15 @@ mod tests {
             }
             other => panic!("unknown affinity-defer scenario `{other}`"),
         }
+        // Deterministically stop and join the persistent pool's workers before
+        // this child process exits. The pool lives in a module-level `static`,
+        // which Rust never `Drop`s at exit, so without this join the forced
+        // scenario's hot worker threads would still be spinning/parked on
+        // `Arc<SharedState>` while the process tears down its runtime -- the
+        // race that intermittently faulted this child with an empty-stderr
+        // `STATUS_ACCESS_VIOLATION` (0xC0000005) on native Windows ARM64. It is a
+        // no-op for the auto scenarios (they build no pool).
+        crate::decode_spmd::shutdown_pools();
         println!("{AFFINITY_DEFER_MARKER}ok");
     }
 
