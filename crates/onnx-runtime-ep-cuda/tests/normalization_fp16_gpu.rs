@@ -300,6 +300,63 @@ fn fp16_rmsnorm_parallel_reduction_matches_serial_f32_reference() {
 }
 
 #[test]
+fn fp16_rmsnorm_fixed_multigroup_qk_shape_is_capture_supported() {
+    // Qwen3 applies RMSNorm per attention head, so a single decode-step Q/K norm
+    // sees a fixed multi-group shape (16 groups for Q, 8 for K, each over the
+    // 128-wide head dim). `run_norm` asserts the warmed kernel reports
+    // `cuda_graph_compatible()`, so this both checks bit parity against the
+    // serial f32 reference and locks in that fixed multi-group norms are now
+    // admitted into CUDA graph capture (previously excluded by `num_groups == 1`).
+    let head_dim = 128;
+    let epsilon = 1e-6;
+    for num_groups in [16usize, 8] {
+        let total = num_groups * head_dim;
+        let input = (0..total)
+            .map(|index| f16::from_f32(((index * 37 + 11) % 257) as f32 / 64.0 - 2.0))
+            .collect::<Vec<_>>();
+        let scale_f32 = (0..head_dim)
+            .map(|index| 0.75 + (index % 29) as f32 / 64.0)
+            .collect::<Vec<_>>();
+        let scale_half = scale_f32
+            .iter()
+            .copied()
+            .map(f16::from_f32)
+            .collect::<Vec<_>>();
+        let input_f32 = input.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        let expected = rms_reference(&input_f32, &scale_f32, head_dim, epsilon);
+        let shape = [num_groups, head_dim];
+        let outputs = run_norm(
+            "RMSNormalization",
+            23,
+            &[
+                half_tensor(&shape, &input),
+                half_tensor(&[head_dim], &scale_half),
+            ],
+            &[
+                (DataType::Float16, shape.to_vec()),
+                (DataType::Float32, vec![num_groups]),
+            ],
+            &[
+                ("axis", Attribute::Int(-1)),
+                ("epsilon", Attribute::Float(epsilon)),
+            ],
+        )
+        .unwrap();
+        let error = max_abs_error(&decode_half(&outputs[0]), &expected);
+        assert!(
+            decode_float(&outputs[1])
+                .into_iter()
+                .all(|value| value.is_finite())
+        );
+        println!("fp16 RMSNorm multigroup groups={num_groups} max_abs_error={error:.9e}");
+        assert!(
+            error <= 2e-3,
+            "multi-group fp16 RMSNorm parallel f32 reduction exceeded tolerance"
+        );
+    }
+}
+
+#[test]
 fn fp16_layernorm_matches_serial_f32_reference_for_half_and_float_affine() {
     let norm_size = 1024;
     let epsilon = 1e-5;
