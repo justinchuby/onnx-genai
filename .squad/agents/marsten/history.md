@@ -21,3 +21,8 @@
 ## 2026-07-24T07:25:03+0000 — Down-GEMV performance confirmed
 
 - Independent runs close the pending validation: Qwen2.5-7B improved 296.21→302.34 tok/s (+2.07%) and ratio to ORT 1.08→1.10×. Qwen 1.5B and 0.5B improved +1.79% and +1.24%; all runs retained identical tokens and capture.
+
+## 2026-07-24T08:06:19+0000 — Qwen2.5-7B post-down-GEMV roofline
+
+- Nsight shows native decode is latency-bound by weight-read Long-Scoreboard stalls, not DRAM-roofline-bound: gate/up is 43.2% at 2.99 waves; down/QKV/O-proj are 20.7%/19.8%/7.8% at 0.57/0.55/0.55 waves.
+- Recommended symmetric gate/up weight prefetch as the top bit-exact next lever (estimated 2–4% E2E); split-K is rejected.

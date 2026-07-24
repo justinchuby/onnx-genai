@@ -159,3 +159,8 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 ## 2026-07-24T07:25:03+0000 — GLM-5.2 IndexShare exporter review
 
 - Reviewed Tyrell's Mobius IndexShare emission. Initial 🔴 was limited to stale test coverage; after Roy changed the test to assert IndexShare lowering, the exporter was 🟢 approved.
+
+## 2026-07-24T08:06:19+0000 — bf16 CUDA kernel review
+
+- Fresh-reviewed Deckard's bf16 RoPE/normalization change 🟢 GREEN: correct fp32 accumulation, unchanged f16/f32 behavior, sound claim gating, and real fp32-oracle coverage.
+- Flagged a stale-base artifact involving `native_decode.rs`; rebase preserved Tyrell's diagnostic before the `668a8b77` merge.

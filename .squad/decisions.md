@@ -491,3 +491,21 @@ captured/eager fragmentation toward a small number of stable replay graphs.
 **By:** Marsten
 **What:** The bit-exact down-GEMV change increased Qwen2.5-7B native throughput from 296.21 to 302.34 tok/s (+2.07%), raising its ratio against ORT from 1.08× to 1.10×. Qwen 1.5B and 0.5B gained +1.79% and +1.24%, respectively; generated tokens remained unchanged and capture remained intact.
 **Why:** The independent measurements close the pending end-to-end performance validation for `720fa032`.
+
+<!-- scribe-merge-2026-07-24T08-06-19+0000-glm-capture-diag-bf16-7b-roofline -->
+## 2026-07-24 — GLM capture diagnostics, bf16 CUDA kernels, and Qwen 7B roofline
+
+### GLM-5.2 DSA whole-step capture remains a multi-stage kernel rewrite
+**By:** Tyrell; reviewed by Chew
+**What:** Commit `8437b059` adds diagnostic logging in `native_decode.rs` explaining declined CUDA-graph capture without changing the admission predicate. GLM-5.2 DSA decode retains four packed past-KV bindings as logical because the packed index is carried through `present.N.key`, generic movement operators consume it, and a non-capacity-aware fp32 indexer MatMul remains. `IndexShare::build_present` also concatenates past and current data rather than aliasing a fixed-capacity buffer.
+**Why:** Eager execution is correct, but whole-step capture cannot be honestly claimed until the packed-KV/indexer path is redesigned in stages; the diagnostic makes every present decline auditable without risking capture behavior.
+
+### CUDA RoPE and normalization kernels support bf16 with fp32 accumulation
+**By:** Deckard; reviewed by Gaff
+**What:** Commit `668a8b77` adds bf16 support to CUDA RoPE and RMSNorm/LayerNorm kernels. Each bf16 computation widens to fp32 and narrows only when storing; existing f16 and f32 paths remain byte-identical. The implementation passed all 210 CUDA tests and clean clippy, including genuine fp32-oracle coverage.
+**Why:** bf16 models can use the native CUDA kernels without weakening the established fp32 accumulation discipline or regressing existing dtypes.
+
+### Qwen2.5-7B native decode is latency-bound on weight reads
+**By:** Marsten
+**What:** Post-down-GEMV Nsight roofline analysis identifies Long-Scoreboard stalls on weight reads, not a DRAM roofline. Gate/up fused GEMV accounts for 43.2% of time at 2.99 waves; down is 20.7% at 0.57 waves, QKV 19.8% at 0.55, and output projection 7.8% at 0.55. The highest-ranked bit-exact next lever is symmetric gate/up weight prefetch, estimated at 2–4% end-to-end; split-K is rejected.
+**Why:** Further tuning should target latency hiding in gate/up rather than split-K or bandwidth-oriented work that the measurements do not support.

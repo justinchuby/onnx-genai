@@ -130,3 +130,7 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 
 - Reviewed the runtime companion for GLM-5.2 IndexShare lowering 🟡; only a pre-existing formatting nit was found and it was fixed during integration.
 - The index-share shape handler and native CUDA E2E coverage merged as `6fdc8742`; tiny QMoE native CUDA decode is byte-identical to CPU.
+
+## 2026-07-24T08:06:19+0000 — GLM capture diagnostic review
+
+- Fresh-reviewed Tyrell's `8437b059` 🟢 GREEN: logging-only observability, unchanged capture predicate, and clean build/clippy/fmt validation.

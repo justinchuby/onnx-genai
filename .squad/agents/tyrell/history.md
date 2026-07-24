@@ -41,3 +41,8 @@ WP-B landed: Progress docs should now treat WP-B as fully landed after WP-B3 `3d
 - Mobius now emits `pkg.nxrt::IndexShare`, causal-bias slicing, sorted TopK, and MLA v-head zero-padding for GLM-5.2 DSA-MoE. Runtime gained the companion index-share shape handler and native CUDA E2E test.
 - Tiny QMoE decodes native CUDA with CPU byte parity and GLM-4 remains non-regressed. Runtime merged as `6fdc8742`; Mobius commits `4816c20` and `7453e2c` are folded into PR #404 awaiting Justin's merge.
 - DSA decode is eager for now: an unresolved symbolic auxiliary output axis forfeits CUDA-graph capture; consume fixed-capacity past K/V tensors directly when capture is required.
+
+## 2026-07-24T08:06:19+0000 — GLM-5.2 DSA capture diagnosis
+
+- Established that whole-step capture requires a staged packed-KV/indexer kernel rewrite: four past-KV bindings remain logical and `IndexShare::build_present` concatenates rather than capacity-aliases.
+- Landed diagnostic-only capture-decline logging as `8437b059`; Chew reviewed 🟢. No capture gate behavior changed.

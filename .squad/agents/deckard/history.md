@@ -124,3 +124,9 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - Merged `dde5371a`, defaulting ORT CUDA graphs off for `profile_native --backend ort` after ORT capture failed with `ort_value must contain a constructed tensor`; Chew found only a pre-existing fmt nit.
 - Audit confirms down-GEMV was the only redundant activation shared-memory staging case. QKV/gate-up staging remains load-bearing because eight warps reuse the normalized fp16 vector.
+
+## 2026-07-24T08:06:19+0000 — bf16 CUDA RoPE and normalization
+
+- Added bf16 support to CUDA RoPE and RMSNorm/LayerNorm using fp32 widening and accumulation, narrowing only at store; f16/f32 remain byte-identical.
+- Gaff reviewed 🟢; 210/210 CUDA tests and clippy passed. Merged as `668a8b77`.
+- A separate symmetric gate/up weight-prefetch bit-exact A/B is in progress; no performance outcome is recorded yet.
