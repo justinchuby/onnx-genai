@@ -778,7 +778,7 @@ fn msft_attention_asymmetric_value_and_present_cache_shapes() {
 }
 
 #[test]
-fn msft_attention_without_past_propagates_present_dtype_but_not_shape() {
+fn msft_attention_without_past_sets_precise_present_shape() {
     let mut n = with_attr(
         msft_attention_node(5, 2, 4),
         "qkv_hidden_sizes",
@@ -797,20 +797,19 @@ fn msft_attention_without_past_propagates_present_dtype_but_not_shape() {
         1,
     );
     assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
-    // ORT propagates the present cache's element type even when `past` is
-    // absent; only the SHAPE stays unresolved. In this IR an unranked shape is
-    // the empty dimension vector, so the present output must carry the
-    // propagated dtype with an EMPTY shape -- neither fully absent (dtype
-    // dropped) nor a fabricated ranked shape.
+    // When `past` is absent the present cache holds exactly the current
+    // sequence's keys and values, so `total_sequence == sequence`. This
+    // framework's executor allocates the present-cache buffer FROM the inferred
+    // shape, so it must be the full precise rank-5 shape
+    // `(2, batch, num_heads, sequence, head_size)` -- an empty (scalar) shape
+    // would under-allocate the buffer and break the kernel's cache write.
+    // batch=2, num_heads=4, sequence=3, head_size = q_hidden(32) / num_heads(4) = 8.
     let present = outs[1]
         .type_info
         .as_ref()
         .expect("present cache dtype must be propagated when past is absent");
     assert_eq!(present.dtype, DataType::Float32);
-    assert!(
-        present.shape.is_empty(),
-        "present shape must stay unranked (empty) when past is absent"
-    );
+    assert_eq!(shape_at(&outs, 1), vec![c(2), c(2), c(4), c(3), c(8)]);
 }
 
 #[test]

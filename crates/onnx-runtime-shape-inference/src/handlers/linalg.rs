@@ -376,14 +376,14 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// Input 0 is `(batch, sequence, input_hidden)` and input 1 is the packed
 /// projection weight `(input_hidden, q_hidden + k_hidden + v_hidden)`. Unless
 /// `qkv_hidden_sizes` overrides the split, the packed width is divided equally.
-/// Output 0 is `(batch, sequence, v_hidden)`. When a past cache is present, the
-/// optional packed present cache is
-/// `(2, batch, num_heads, past_sequence + sequence, q_head_size)`, except when
-/// `past_present_share_buffer=1`, where present and past share a buffer so the
-/// present cache keeps the past input's shape (dim 3 preserved). The present
-/// cache's dtype is propagated independently of its shape: even when `past` is
-/// absent (so the shape stays unranked) the element type is still set, matching
-/// ORT's `AttentionTypeAndShapeInference`.
+/// Output 0 is `(batch, sequence, v_hidden)`. The optional packed present cache
+/// is a rank-5 tensor `(2, batch, num_heads, total_sequence, q_head_size)`. When
+/// a past cache is present, `total_sequence = past_sequence + sequence`, except
+/// when `past_present_share_buffer=1`, where present and past share a buffer so
+/// the present cache keeps the past input's shape (dim 3 preserved). When `past`
+/// is absent, `total_sequence = sequence` (the present cache holds exactly the
+/// current sequence's keys and values). The present cache's dtype is propagated
+/// in every case, matching ORT's `AttentionTypeAndShapeInference`.
 pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let input = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
     let weights = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
@@ -444,24 +444,14 @@ pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError>
     if ctx.num_outputs() > 1 {
         // ORT's `AttentionTypeAndShapeInference` propagates the present cache's
         // ELEMENT TYPE (`propagateElemTypeFromInputToOutput`) unconditionally
-        // and *before* any shape reasoning; only the present *shape* depends on
-        // the `past` cache. The dtype is therefore set here in every case,
-        // while the shape is resolved only when `past` supplies one.
-        //
-        // When `past` is absent ORT emits output 1 with an element type but no
-        // `TensorShapeProto` -- dtype known, shape unranked. This IR encodes an
-        // absent shape as the empty dimension vector: the loader maps a missing
-        // `TensorShapeProto` to an empty `Shape` (see `onnx_runtime_ir::shape`),
-        // so an empty `TypedShape` here reproduces ORT's exact output-1 state.
-        // This is deliberately NOT a rank-0 scalar claim about the KV cache; the
-        // framework's `TypeInfo` couples dtype with a known-rank shape and has
-        // no dtype-only channel, so the empty shape is the honest expressible
-        // representation of "dtype propagated, shape unresolved".
+        // and *before* any shape reasoning; the dtype is therefore set here in
+        // every case. The present *shape* is a rank-5 packed KV cache
+        // `(2, batch, num_heads, total_sequence, head_size)`.
+        let head_size = q_hidden
+            .checked_div(&num_heads)
+            .unwrap_or_else(|| ctx.fresh_dim());
         let present_shape = match ctx.input_shape(4).map(<[DimExpr]>::to_vec) {
             Some(past) if past.len() == 5 => {
-                let head_size = q_hidden
-                    .checked_div(&num_heads)
-                    .unwrap_or_else(|| ctx.fresh_dim());
                 // When `past_present_share_buffer=1`, present and past alias the
                 // same buffer, so ORT keeps the present cache the SAME shape as
                 // the past input (dim 3 = the shared buffer's
@@ -489,7 +479,19 @@ pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError>
                     head_size,
                 ]
             }
-            _ => Vec::new(),
+            // When `past` is ABSENT the present cache holds exactly the current
+            // sequence's keys and values, so `total_sequence == sequence`. Unlike
+            // ORT -- which leaves output 1 unranked and lets its executor allocate
+            // the buffer dynamically at runtime -- this framework's executor
+            // allocates the present-cache buffer FROM the inferred shape, so it
+            // needs a valid, correctly-ranked shape. An empty `TypedShape` is
+            // interpreted downstream as a rank-0 scalar (numel == 1), which
+            // under-allocates the buffer and makes the kernel's full-cache write
+            // fail. We therefore emit the full, precise rank-5 shape here,
+            // mirroring the sibling `MultiHeadAttention` handler, which likewise
+            // sets its present cache to `total_sequence = kv_sequence` when past
+            // is absent instead of leaving it unresolved.
+            _ => vec![DimExpr::constant(2), batch, num_heads, sequence, head_size],
         };
         ctx.set_output(1, dtype, present_shape);
     }

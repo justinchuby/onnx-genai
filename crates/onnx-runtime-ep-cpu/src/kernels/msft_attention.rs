@@ -765,4 +765,62 @@ mod tests {
             assert!((a - b).abs() < 1e-6, "got {got:?}, expected {expected:?}");
         }
     }
+
+    #[test]
+    fn present_cache_without_past_fills_precise_rank5_shape() {
+        // Regression guard for the shape-inference/kernel contract when `past`
+        // is ABSENT (prefill / first decode step). The present-cache output
+        // buffer is allocated FROM the inferred shape; shape inference now emits
+        // the precise rank-5 shape `(2, batch, num_heads, sequence, head_size)`
+        // (total_sequence == sequence with no past). The kernel writes exactly
+        // `2 * batch * num_heads * sequence * head_size` f32s, so a scalar/empty
+        // shaped output (numel == 1) would under-allocate and fail the write.
+        let k = kernel(&[("num_heads", Attribute::Int(1))]).unwrap();
+        let input = vec![0.1f32, 0.2, 0.3, 0.4]; // (1,2,2)
+        let weights: Vec<f32> = (0..12).map(|x| (x as f32) * 0.05 - 0.2).collect();
+        let bias: Vec<f32> = (0..6).map(|x| (x as f32) * 0.01).collect();
+        let it = Owned::f32(&[1, 2, 2], &input);
+        let wt = Owned::f32(&[2, 6], &weights);
+        let bt = Owned::f32(&[6], &bias);
+        let mut out0 = Owned::f32(&[1, 2, 2], &[0.0; 4]);
+        // present cache: (2, batch=1, num_heads=1, sequence=2, head_size=2) => 8.
+        let mut present = Owned::f32(&[2, 1, 1, 2, 2], &[0.0; 8]);
+        k.execute(
+            &[it.view(), wt.view(), bt.view()],
+            &mut [out0.view_mut(), present.view_mut()],
+        )
+        .expect("precise rank-5 present shape must allocate and write correctly");
+
+        // Present holds K then V, each `(batch, num_heads, sequence, head_size)`.
+        let proj = |tok: usize, col: usize| -> f32 {
+            let mut acc = bias[col];
+            for d in 0..2 {
+                acc += input[tok * 2 + d] * weights[d * 6 + col];
+            }
+            acc
+        };
+        let mut expected = vec![0.0f32; 8];
+        for t in 0..2 {
+            for d in 0..2 {
+                expected[t * 2 + d] = proj(t, 2 + d); // K columns [2,4)
+                expected[4 + t * 2 + d] = proj(t, 4 + d); // V columns [4,6)
+            }
+        }
+        let got = present.to_f32();
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "got {got:?}, expected {expected:?}");
+        }
+
+        // roy's scalar bug: a rank-0 (numel == 1) present output under-allocates
+        // and the kernel's full-cache write must fail rather than corrupt memory.
+        let mut scalar_present = Owned::f32(&[], &[0.0]);
+        let err = k.execute(
+            &[it.view(), wt.view(), bt.view()],
+            &mut [out0.view_mut(), scalar_present.view_mut()],
+        );
+        assert!(
+            err.is_err(),
+            "a scalar (numel==1) present output must fail the cache write"
+        );
+    }
 }
