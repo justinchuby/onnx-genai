@@ -4,9 +4,31 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-25T01:15:00Z_
+_Last updated: 2026-07-25T01:42:00Z_
 
-**Current `origin/main` implementation HEAD:** `9f1618bb`.
+**Current `origin/main` implementation HEAD:** `5a8c3dc9`.
+
+## 2026-07-25 — Valid CUDA-artifact native-vs-ORT large-model sweep
+
+- **Three legitimate GPU-vs-GPU comparisons:** using Foundry `cuda-gpu`
+  artifacts on an idle physical H200 GPU 6, native beat ORT on Phi-4-mini
+  (**322.04 vs. 232.58 tok/s, 1.385×**), Qwen2.5-1.5B (**632.62 vs. 435.66
+  tok/s, 1.452×**), and Qwen2.5-7B (**302.24 vs. 274.75 tok/s, 1.100×**).
+  The important real 7B result is a credible but modest **10.0%** native win.
+- **ORT validity directly observed:** no run emitted the inserted-`Memcpy`
+  warning from the invalid `generic-cpu` baseline. A 100-ms physical-GPU
+  monitor observed 88%, 86%, and 91% peak utilization and 5,289, 2,727, and
+  5,797 MiB peak allocation for Phi-4, Qwen-1.5B, and Qwen-7B ORT,
+  respectively. ORT's standard shape-op assignment notice remained, but model
+  compute demonstrably executed on CUDA.
+- **fp16 option was a no-op:** all three artifacts already use fp16
+  activation/scales; native `model` and `fp16` token streams were identical and
+  throughput ratios were 1.001×, 1.000×, and 1.000×.
+- **Correctness eyeball:** Phi-4 and Qwen-7B were coherent and identical across
+  backends. Qwen-1.5B was readable initially but degenerated into the same
+  repeated sentence under both native and ORT, so it is a valid performance row
+  but not a clean coherence result. Full spreads, commands, and validity
+  evidence: `docs/benchmarks/2026-07-25-legit-cuda-native-vs-ort.md`.
 
 ## 2026-07-25 — Uncontended H200 acc-4/fp16/ORT sweep
 
