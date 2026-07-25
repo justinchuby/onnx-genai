@@ -1101,3 +1101,27 @@ Reserved `onnx-genai` 0.0.0 on PyPI with a pure-Python placeholder at `python/on
 - **onnx-genai engine (Phase 2, `54bf250`): Gemma4-style VLM composite runtime.** A composite can now run `vision_encoder → embedding(fusion) → autoregressive decoder that consumes inputs_embeds` (not raw input_ids). Two engine gaps closed in `pipeline.rs`: (1) `seed_prompt_token_inputs` seeds the prompt token ids into the shared pool as `embedding.input_ids` so the fusion component can run in the prompt phase; (2) `embeds_step_binding` detects a decoder with no `input_ids` input but an `inputs_embeds` input and re-runs the fusion component on the running token each decode step (prefill reuses the full-prompt embeds), while excluding the `inputs_embeds` edge from the fixed cross-conditioning extras. A conventional decoder (whisper `encoder_hidden_states`, codec) returns `None` and is untouched. Deterministic fixture `tests/fixtures/tiny-gemma4-vlm` (`scripts/build_tiny_gemma4_vlm.py`) + non-ignored e2e test asserting exact token ids `[0,5,6,7]` where the first token is vision-dependent via the fused image placeholder. DESIGN.md §20 gained the VLM inputs_embeds example.
 - **Mobius (Phase 3, mobius `f313bd1`): composite multimodal metadata emission.** `write_onnx_genai_config` now dispatches diffusion → **multimodal-composite** → decoder. A package with a `decoder` plus `vision_encoder`/`audio_encoder` (+`embedding`) emits a `kind: composite` `inference_metadata.yaml`: single_pass `encode_vision`/`encode_audio`/`fuse_embeddings` stages (prompt_only) + an `autoregressive` `decode` stage (every_step), with dataflow `vision_encoder.image_features→embedding.image_features`, `audio_encoder.audio_features→embedding.audio_features`, `embedding.inputs_embeds→decoder.inputs_embeds`. Built from the discovered component set (vision-only / audio-only / vision+audio). 68 onnx_genai integration tests pass; both emitted docs validate against the onnx-genai JSON schema.
 - **Cross-repo contract verified consistent:** the YAML Mobius emits is structurally identical to what the onnx-genai engine consumes (same models, dataflow edges, composite stages); Mobius omits the optional per-stage `max_tokens` (runtime-controlled). Audio-to-audio, ASR (whisper), and VLM+audio composites now share one clear, extensible composite contract. Remaining any-to-any: TTS (AR code/mel decoder → post-decode vocoder single_pass stage) and the optional GGUF-vision (clip/mmproj) path for building the vision/audio encoder from a Gemma4 mmproj-*.gguf.
+
+## DeepSeek native support gaps (2026-07-25)
+
+Detailed measurements and parity evidence are in
+[`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.md).
+
+- [ ] **Full-model QMoE coherence:** validate native CUDA QMoE with a complete
+  DeepSeek-V2 package and real tokenizer. The current real-shape conformance
+  artifact proves exact routing/token parity but decodes only decimal token IDs.
+- [ ] **GPU-resident ORT QMoE baseline:** obtain or export a QMoE artifact that
+  ORT CUDA executes on GPU. The current reference inserts four `Memcpy` nodes,
+  shows 0% sustained GPU utilization, and runs at 2.45 tok/s, so it cannot be
+  used for a native-vs-ORT performance claim.
+- [ ] **DeepSeek-R1 numerical parity policy:** preserve the existing fp32-oracle
+  regression lock (`deepseek_r1_1_5b_divergence.rs`, which adjudicates the
+  `"capital of France"` prompt: native picks oracle-correct 374, ORT CUDA flips
+  to 315) and explicitly report that native and ORT CUDA can diverge at close
+  MatMulNBits decisions. On the 2026-07-25 benchmark prompt native chose token
+  374 by +0.0625 while ORT CUDA chose token 594 by +0.015625 — a *different*,
+  not-yet-oracle-adjudicated divergence; extend the fp32 oracle to that prompt.
+- [x] **DeepSeek-Coder dense int4:** native CUDA loads, emits coherent code,
+  matches ORT CUDA for 128 greedy tokens, and has no observed unsupported op.
+- [x] **DeepSeek-V2 real-shape QMoE routing:** native CUDA loads and matches ORT
+  for 32 greedy tokens; token-0 top-40 log-probability max error is 0.001409.
