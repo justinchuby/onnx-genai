@@ -775,6 +775,50 @@ scale_data_type: FLOAT16
 # Two codebooks, 256 entries each, 8-dimensional vectors
 ```
 
+### 12.11 MXFP6 E3M2 (OCP Microscaling FP6)
+
+6-bit floating point with shared E8M0 block exponent. Same MX family structure
+as MXFP4, wider elements give better accuracy for attention/FFN weights.
+**Not expressible in QDQ.**
+
+```yaml
+type_uri: "onnx:mxfp6-e3m2-block32/v1"
+block_size: 32
+bytes_per_block: 25          # 32 × 6 bits = 24 bytes + 1 byte shared_exp
+encoding:
+  family: ENCODING_AFFINE
+  bits: 6
+  bit_interpretation: FP_E3M2  # 1 sign + 3 exp + 2 mantissa
+  nested:
+    super_block_size: 32
+    sub_block_size: 32
+    sub_blocks_per_super: 1
+    sub_fields: [{name: "shared_exp", data_type: UINT8, bits: 8}]
+dequant_formula:
+  steps: [UNPACK, FP_DECODE(e3m2), CAST(f16), MULTIPLY(sub.shared_exp)]
+```
+
+### 12.12 FP6 LLM (DeepSpeed TC-FPn split storage)
+
+6-bit floating point with split-byte packing for Tensor Core alignment.
+The 6-bit value is split into 2-bit + 4-bit segments stored in separate
+memory regions, enabling efficient GEMM without bit-manipulation overhead
+at decode time. **Requires runtime plugin.**
+
+```yaml
+type_uri: "onnx-community:fp6-llm-e3m2/v1"
+block_size: 128
+bytes_per_block: 112         # 128 × 6/8 = 96 data + 16 scale bytes
+encoding:
+  family: ENCODING_CUSTOM
+  # TC-FPn splits each 6-bit value into hi(2-bit) and lo(4-bit) segments
+  # stored contiguously by segment for Tensor Core tile alignment.
+  # Requires custom dequant kernel.
+group_size: 128
+scale_data_type: FLOAT16
+# Codec plugin: "cargo add onnx-codec-fp6"
+```
+
 ### Summary Table
 
 | Format | bpw | Encoding Family | Nested | Auto-Codec | Notes |
@@ -789,6 +833,8 @@ scale_data_type: FLOAT16
 | Ternary 1.58 | 1.63 | PACKED_INTEGER | No | ✅ | Base-3 |
 | FP8 E4M3 | 8.0 | SYMMETRIC | No | ✅ | Standard float |
 | AQLM 2×8 | 3.0 | CUSTOM | N/A | ❌ (needs plugin) | Multi-codebook |
+| MXFP6 E3M2 | 6.125 | AFFINE | Yes | ✅ | MX shared exponent |
+| FP6 LLM (TC-FPn) | 6.125 | CUSTOM | No | ❌ (needs plugin) | Split storage for TC |
 
 ## 13. Relationship to Existing `SUB4BIT_QUANT.md`
 
