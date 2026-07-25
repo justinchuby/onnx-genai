@@ -557,10 +557,10 @@ mod tests {
             row[15] = nan;
             rows.push(row);
         }
-        // NaN in the last lane of a longer block spanning two vectors.
+        // (b) NaN in the final lane (index 31) of the second full 16-lane vector.
         {
-            let mut row: Vec<f32> = (0..40).map(|i| ((i as f32) - 20.0) * 0.3).collect();
-            row[15] = nan;
+            let mut row: Vec<f32> = (0..32).map(|i| ((i as f32) - 16.0) * 0.3).collect();
+            row[31] = nan;
             rows.push(row);
         }
         // (b) A leading NaN followed by finite values.
