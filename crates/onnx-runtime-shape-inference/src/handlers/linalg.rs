@@ -371,6 +371,133 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `com.microsoft::Attention`: packed Q/K/V projection followed by attention.
+///
+/// Input 0 is `(batch, sequence, input_hidden)` and input 1 is the packed
+/// projection weight `(input_hidden, q_hidden + k_hidden + v_hidden)`. Unless
+/// `qkv_hidden_sizes` overrides the split, the packed width is divided equally.
+/// Output 0 is `(batch, sequence, v_hidden)`. The optional packed present cache
+/// is a rank-5 tensor `(2, batch, num_heads, total_sequence, q_head_size)`. When
+/// a past cache is present, `total_sequence = past_sequence + sequence`, except
+/// when `past_present_share_buffer=1`, where present and past share a buffer so
+/// the present cache keeps the past input's shape (dim 3 preserved). When `past`
+/// is absent, `total_sequence = sequence` (the present cache holds exactly the
+/// current sequence's keys and values). The present cache's dtype is propagated
+/// in every case, matching ORT's `AttentionTypeAndShapeInference`.
+pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let input = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let weights = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(0);
+    let (Some(input), Some(weights), Some(dtype)) = (input, weights, dtype) else {
+        return Ok(());
+    };
+    if input.len() != 3 || weights.len() != 2 {
+        return Err(ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: format!(
+                "input must be rank 3 and weights rank 2 (got input={}, weights={})",
+                input.len(),
+                weights.len()
+            ),
+        });
+    }
+
+    let num_heads = ctx
+        .node
+        .attr("num_heads")
+        .and_then(Attribute::as_int)
+        .map(DimExpr::constant)
+        .ok_or_else(|| ShapeInferError::Invalid {
+            op: "Attention".into(),
+            detail: "missing required `num_heads` attribute".into(),
+        })?;
+
+    let (q_hidden, v_hidden) = match ctx
+        .node
+        .attr("qkv_hidden_sizes")
+        .and_then(Attribute::as_ints)
+    {
+        Some(sizes) if sizes.len() == 3 => {
+            (DimExpr::constant(sizes[0]), DimExpr::constant(sizes[2]))
+        }
+        Some(sizes) => {
+            return Err(ShapeInferError::Invalid {
+                op: "Attention".into(),
+                detail: format!(
+                    "qkv_hidden_sizes must contain 3 elements, got {}",
+                    sizes.len()
+                ),
+            });
+        }
+        None => {
+            let hidden = weights[1]
+                .checked_div(&DimExpr::constant(3))
+                .unwrap_or_else(|| ctx.fresh_dim());
+            (hidden.clone(), hidden)
+        }
+    };
+
+    let batch = input[0].clone();
+    let sequence = input[1].clone();
+    ctx.set_output(0, dtype, vec![batch.clone(), sequence.clone(), v_hidden]);
+
+    if ctx.num_outputs() > 1 {
+        // ORT's `AttentionTypeAndShapeInference` propagates the present cache's
+        // ELEMENT TYPE (`propagateElemTypeFromInputToOutput`) unconditionally
+        // and *before* any shape reasoning; the dtype is therefore set here in
+        // every case. The present *shape* is a rank-5 packed KV cache
+        // `(2, batch, num_heads, total_sequence, head_size)`.
+        let head_size = q_hidden
+            .checked_div(&num_heads)
+            .unwrap_or_else(|| ctx.fresh_dim());
+        let present_shape = match ctx.input_shape(4).map(<[DimExpr]>::to_vec) {
+            Some(past) if past.len() == 5 => {
+                // When `past_present_share_buffer=1`, present and past alias the
+                // same buffer, so ORT keeps the present cache the SAME shape as
+                // the past input (dim 3 = the shared buffer's
+                // `max_sequence_length`). Only with the default `0` does dim 3
+                // grow to `past_sequence_length + sequence_length`, and only
+                // when both lengths are statically known.
+                let share_buffer = ctx
+                    .node
+                    .attr("past_present_share_buffer")
+                    .and_then(Attribute::as_int)
+                    .unwrap_or(0)
+                    != 0;
+                let total_sequence = if share_buffer {
+                    past[3].clone()
+                } else if past[3].as_const().is_some() && sequence.as_const().is_some() {
+                    past[3].add(&sequence)
+                } else {
+                    ctx.fresh_dim()
+                };
+                vec![
+                    DimExpr::constant(2),
+                    batch,
+                    num_heads,
+                    total_sequence,
+                    head_size,
+                ]
+            }
+            // When `past` is ABSENT the present cache holds exactly the current
+            // sequence's keys and values, so `total_sequence == sequence`. Unlike
+            // ORT -- which leaves output 1 unranked and lets its executor allocate
+            // the buffer dynamically at runtime -- this framework's executor
+            // allocates the present-cache buffer FROM the inferred shape, so it
+            // needs a valid, correctly-ranked shape. An empty `TypedShape` is
+            // interpreted downstream as a rank-0 scalar (numel == 1), which
+            // under-allocates the buffer and makes the kernel's full-cache write
+            // fail. We therefore emit the full, precise rank-5 shape here,
+            // mirroring the sibling `MultiHeadAttention` handler, which likewise
+            // sets its present cache to `total_sequence = kv_sequence` when past
+            // is absent instead of leaving it unresolved.
+            _ => vec![DimExpr::constant(2), batch, num_heads, sequence, head_size],
+        };
+        ctx.set_output(1, dtype, present_shape);
+    }
+    Ok(())
+}
+
 /// `com.microsoft::MultiHeadAttention`: scaled dot-product attention taking
 /// *separate* query/key/value inputs (unlike the packed-QKV
 /// `com.microsoft::Attention`).
@@ -580,6 +707,9 @@ pub fn register(reg: &mut InferenceRegistry) {
     // cache — total_seq stays kv_seq). The registry resolves the highest
     // `min_opset <= version`, so this single rule serves opsets 23–26.
     reg.register("", "Attention", 23, attention);
+    // com.microsoft::Attention (opset 1): raw hidden states plus a packed Q/K/V
+    // projection. This is used by optimized Whisper encoders.
+    reg.register("com.microsoft", "Attention", 1, msft_attention);
     // com.microsoft::MultiHeadAttention (opset 1): separate Q/K/V inputs whose
     // value head size may differ from the query/key head size, so the output
     // and present_value are sized from V while present_key is sized from Q/K.
