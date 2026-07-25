@@ -298,6 +298,29 @@ impl Backend {
     }
 
     /// Run one turn, streaming tokens through `callback`.
+    /// Clear the pipeline reuse counters so a profile covers only the next turn.
+    fn reset_reuse_stats(&self) {
+        if let Self::Pipeline(pipeline) = self {
+            pipeline.engine.reset_cache_stats();
+        }
+    }
+
+    /// What a multimodal pipeline avoided recomputing, or `None` for a single
+    /// decoder graph, which has no encoder or attachments to reuse.
+    fn multimodal_reuse(&self) -> Option<profile::MultimodalReuse> {
+        let Self::Pipeline(pipeline) = self else {
+            return None;
+        };
+        let stats = pipeline.engine.cache_stats();
+        Some(profile::MultimodalReuse {
+            encoder_hits: stats.encoder_hits,
+            encoder_misses: stats.encoder_misses,
+            encoder_bytes: stats.encoder_bytes,
+            prefix_reused_tokens: stats.prefix_reused_tokens,
+            prefill_tokens: stats.prefill_tokens,
+        })
+    }
+
     /// Cumulative KV page counters, when the backend keeps a page pool.
     fn page_stats(&self) -> Option<onnx_genai::kv::PageStats> {
         match self {
@@ -488,6 +511,7 @@ fn run_generation_turn(
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
+    backend.reset_reuse_stats();
 
     let mut output = String::new();
     let mut timings = profile::TokenTimings::default();
@@ -531,6 +555,7 @@ fn run_generation_turn(
     timings.finish();
     if let Some(profile) = profile {
         profile.timings = timings;
+        profile.multimodal_reuse = backend.multimodal_reuse();
         if let Ok(result) = &result {
             profile.finish_reason = Some(format!("{:?}", result.finish_reason));
             profile.prefix_cache_hit = Some(result.prefix_cache_hit_len);
@@ -1463,9 +1488,16 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                     Some(config) => {
                         let split = config.markers.split(&output, config.opened_by_template);
                         if !split.complete {
+                            // The decode budget ran out mid-thought, so there is
+                            // no answer. Drop the whole exchange rather than
+                            // record an empty assistant turn, which would teach
+                            // the model that questions go unanswered.
                             eprintln!(
-                                "note: generation stopped inside the model's reasoning, so this turn has no answer to remember. Raise --max-new-tokens."
+                                "note: generation stopped inside the model's reasoning, so this turn is not kept. Raise --max-new-tokens."
                             );
+                            history.pop();
+                            profiling.emit(&mut profile)?;
+                            continue;
                         }
                         split.answer.to_string()
                     }

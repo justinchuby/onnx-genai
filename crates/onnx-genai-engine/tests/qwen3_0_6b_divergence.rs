@@ -47,6 +47,8 @@
 //!   -- --ignored --nocapture
 //! ```
 
+#![cfg(all(feature = "native-backend", feature = "cuda"))]
+
 use onnx_genai_engine::{GenerateOptions, NativeDecodeDevice, NativeDecodeSession, ProcessorChain};
 use onnx_genai_ort::Tokenizer;
 

@@ -64,6 +64,8 @@
 //!   -- --ignored --nocapture
 //! ```
 
+#![cfg(all(feature = "native-backend", feature = "cuda"))]
+
 use onnx_genai_engine::{
     Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, ProcessorChain,

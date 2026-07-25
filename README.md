@@ -144,8 +144,29 @@ A *partial* set is rejected rather than topped up: once you start positioning
 placeholders, guessing where the rest belong would silently change which image a
 sentence refers to. The metadata contract behind this is documented in
 [docs/MODEL_METADATA.md](docs/MODEL_METADATA.md#multimodal-input-the-placeholder-contract),
-which also covers how audio input differs and why multimodal prompts do not use
-the prefix cache.
+which also covers how audio input differs.
+
+#### Asking again about the same attachment
+
+An image costs a turn twice: the encoder forward pass, and a prompt in which
+that one image has expanded into hundreds or thousands of tokens. Neither is
+repeated when you keep talking about the same picture — the encoder's output is
+memoized under a digest of the exact pixels that produced it, and the decoder
+keeps the KV it already computed, prefilling only the tokens the new turn added.
+
+Attach a *different* image and both are recomputed, because that digest is part
+of the cache key. It has to be: placeholder expansion makes two different
+photographs produce byte-identical token sequences, so a cache keyed on tokens
+alone would answer fluently about a picture the model was never shown.
+`--profile` shows what was skipped:
+
+```text
+encoder cache                     1 hit / 0 run
+multimodal prefix reuse          613 tokens
+```
+
+`EngineConfig::pipeline_cache_bytes` bounds the memoized encoder outputs
+(512 MiB by default; `0` turns the cache off).
 
 ### Profiling
 
@@ -301,12 +322,18 @@ degrades quality and inflates the context, since the reasoning of a long session
 can dwarf the conversation itself.
 
 If the decode budget runs out inside the reasoning, the turn genuinely has no
-answer, and the REPL says so rather than silently storing an empty reply:
+answer. The exchange is dropped rather than stored as an empty reply, which
+would otherwise teach the model that questions go unanswered:
 
 ```text
-note: generation stopped inside the model's reasoning, so this turn has no
-answer to remember. Raise --max-new-tokens.
+note: generation stopped inside the model's reasoning, so this turn is not
+kept. Raise --max-new-tokens.
 ```
+
+One trade-off worth knowing: because the thinking is stripped before history is
+replayed, a follow-up prompt is *not* a continuation of what the model last had
+in its KV cache. Multimodal KV reuse therefore misses for reasoning models (the
+encoder cache still hits). That is the price of not replaying chain-of-thought.
 
 ### Transcribe speech
 

@@ -11,6 +11,10 @@ use crate::engine::{
 };
 use crate::kv_bridge::infer_kv_model_info;
 use crate::logits::TokenId;
+use crate::pipeline_cache::{
+    ComponentOutputCache, Digest, DigestBuilder, PipelineCacheStats, RetainedContext, absorb_value,
+    digest_named_values, graph_is_deterministic,
+};
 use crate::processors::build_processor_chain;
 use crate::{
     EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
@@ -23,6 +27,7 @@ use onnx_genai_metadata::{
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -142,6 +147,16 @@ pub struct PipelineEngine {
     decoder_state: Option<DecodeState>,
     tokenizer_component: String,
     fixed_state_budget_bytes: u64,
+    /// Memoized prompt-phase component outputs, so a repeated attachment does
+    /// not re-run its encoder. Behind a `RefCell` because the prompt phase runs
+    /// from `&self` paths (single-pass, iterative) as well as `&mut self` ones.
+    component_cache: RefCell<ComponentOutputCache>,
+    /// Components whose graphs contain only deterministic operators, and whose
+    /// outputs may therefore be memoized. Computed once at load.
+    memoizable_components: BTreeSet<String>,
+    /// Decoder KV left over from the previous generation, and the identity of
+    /// the prompt and attachments that produced it.
+    retained: Option<RetainedContext>,
 }
 
 /// The concrete backend a pipeline runs on. A pipeline never mixes backends:
@@ -245,6 +260,27 @@ fn build_native_pipeline_components(
     Ok(components)
 }
 
+/// Components whose graphs contain only deterministic operators.
+///
+/// Read once at load, because a component's declared phase says when it runs,
+/// never that it is pure — a graph with `RandomNormal` in it would otherwise be
+/// memoized and hand back the same draw forever. A model that cannot be read or
+/// parsed is simply left out: declining to cache is always safe, and refusing to
+/// load a pipeline over a cache optimization would not be.
+fn deterministic_components(directory: &PipelineModelDirectory) -> BTreeSet<String> {
+    directory
+        .model_paths
+        .iter()
+        .filter(|(_, path)| {
+            onnx_runtime_loader::read_model_binary(path)
+                .ok()
+                .and_then(|bytes| onnx_runtime_loader::proto::decode_model(&bytes).ok())
+                .is_some_and(|model| graph_is_deterministic(&model))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 impl Engine {
     /// Load a metadata-declared pipeline directory.
     ///
@@ -320,6 +356,7 @@ impl PipelineEngine {
         let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
+        let memoizable_components = deterministic_components(&models.directory);
         // Only autoregressive pipelines drive a token-by-token decode loop and
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
@@ -377,6 +414,11 @@ impl PipelineEngine {
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,
+            component_cache: RefCell::new(ComponentOutputCache::new(
+                usize::try_from(config.pipeline_cache_bytes).unwrap_or(usize::MAX),
+            )),
+            memoizable_components,
+            retained: None,
         })
     }
 
@@ -512,6 +554,15 @@ impl PipelineEngine {
             self.models.directory.spec.vision.as_ref(),
         )?;
 
+        // Decide how much of the previous turn's decoder KV this prompt can
+        // keep before anything is rebuilt, because the answer decides whether
+        // the decode state is recreated or carried over.
+        let inputs_digest = Self::digest_request_identity(&pipeline_request);
+        let reused = self.reusable_prefix_len(inputs_digest, &prompt_tokens);
+        // Any failure below leaves the decoder KV in an unknown state, so the
+        // retention is dropped now and only re-established on success.
+        self.retained = None;
+
         let mut tensors = self.prepare_request_tensors(pipeline_request.inputs, &present)?;
         // Seed the prompt token ids into the shared pool so a prompt-phase
         // component that consumes `input_ids` (e.g. a text encoder) can run.
@@ -534,26 +585,38 @@ impl PipelineEngine {
         // used to enumerate graph ports is released first.
         let step_bindings = self.build_step_bindings(&ar.step_components, &present)?;
 
+        // A decoder whose position ids arrive over a dataflow edge receives one
+        // tensor covering the whole prompt. Prefilling only a suffix would hand
+        // it positions for tokens it is not being given, so such a pipeline
+        // recomputes rather than reuses.
+        let reused = if reused > 0 && self.decoder_positions_are_routed(&decoder_in_edges) {
+            0
+        } else {
+            reused
+        };
+
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        self.decoder_state = Some({
-            let decoder = self
-                .models
-                .session(&ar.decoder)
-                .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-            let decoder_io = self
-                .models
-                .directory
-                .spec
-                .models
-                .get(&ar.decoder)
-                .and_then(|component| component.io.as_ref());
-            DecodeState::new_with_io_positions_and_state_budget(
-                decoder,
-                decoder_io,
-                self.models.directory.spec.positions.as_ref(),
-                self.fixed_state_budget_bytes,
-            )?
-        });
+        if reused == 0 {
+            self.decoder_state = Some({
+                let decoder = self
+                    .models
+                    .session(&ar.decoder)
+                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
+                let decoder_io = self
+                    .models
+                    .directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                DecodeState::new_with_io_positions_and_state_budget(
+                    decoder,
+                    decoder_io,
+                    self.models.directory.spec.positions.as_ref(),
+                    self.fixed_state_budget_bytes,
+                )?
+            });
+        }
 
         let decoder = self
             .models
@@ -589,11 +652,15 @@ impl PipelineEngine {
             step_components,
             decoder_in_edges,
             context_tokens: prompt_tokens,
+            retained_len: reused,
             prompt_len: 0,
             generated_count: 0,
+            kv_len: reused,
         };
-        backend.prompt_len = backend.context_tokens.len();
-        let mut loop_state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
+        // Prefill only what the retained KV does not already cover.
+        backend.prompt_len = backend.context_tokens.len() - backend.retained_len;
+        let prefilled = backend.prompt_len;
+        let mut loop_state = DecodeLoopState::new(reused, options.seed, options.top_logprobs);
         let result = run_decode_loop(
             &mut backend,
             &mut loop_state,
@@ -603,7 +670,56 @@ impl PipelineEngine {
             None,
             callback,
         )?;
+        // Exactly the tokens whose KV the decoder now holds. Truncated to
+        // `kv_len` rather than taken whole: the last sampled token was committed
+        // to the context but never fed to the decoder, so its KV does not exist
+        // and the next turn must prefill it.
+        let mut final_context = backend.context_tokens.clone();
+        final_context.truncate(backend.kv_len);
+        let retains_kv = backend.decoder_state.use_kv;
+
+        self.component_cache
+            .borrow_mut()
+            .note_prefix_reuse(reused, prefilled);
+        if retains_kv && let Some(inputs) = inputs_digest {
+            self.retained = Some(RetainedContext {
+                inputs,
+                tokens: final_context,
+            });
+        }
         Ok((result, tensors))
+    }
+
+    /// Whether the decoder's position ids are supplied by a dataflow edge
+    /// rather than derived from the absolute past length.
+    fn decoder_positions_are_routed(&self, decoder_in_edges: &[(String, String)]) -> bool {
+        let Some(position_input) = self
+            .decoder_state
+            .as_ref()
+            .and_then(|state| state.io.position_ids_input.as_deref())
+        else {
+            return false;
+        };
+        decoder_in_edges
+            .iter()
+            .any(|(_, port)| port == position_input)
+    }
+
+    /// How many leading prompt tokens the retained decoder KV can serve.
+    ///
+    /// Zero whenever anything about the request's identity changed, whenever
+    /// the prompt is not a strict extension of the retained context, or whenever
+    /// the attachments could not be digested.
+    fn reusable_prefix_len(&self, inputs: Option<Digest>, prompt_tokens: &[TokenId]) -> usize {
+        let (Some(inputs), Some(retained), Some(state)) =
+            (inputs, self.retained.as_ref(), self.decoder_state.as_ref())
+        else {
+            return 0;
+        };
+        if !state.use_kv {
+            return 0;
+        }
+        retained.reusable_prefix(inputs, prompt_tokens)
     }
 
     /// Post-decode counterpart to [`synthesize`](Self::synthesize) for a
@@ -1849,6 +1965,46 @@ impl PipelineEngine {
                 .session(component)
                 .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
             let inputs = self.component_inputs(component, session, tensors, present)?;
+
+            // A prompt-phase component is a pure function of its inputs — that
+            // is what separates it from an `every_step` component — so identical
+            // input bytes mean identical outputs. Re-asking about the same image
+            // then costs a hash instead of a vision encoder forward pass.
+            let memoizable = self.component_cache.borrow().is_enabled()
+                && self.memoizable_components.contains(component);
+            let key = memoizable.then(|| {
+                digest_named_values(
+                    component,
+                    inputs.iter().map(|(name, value)| (name.as_str(), value)),
+                )
+            });
+            let key = match key {
+                Some(Some(key)) => Some(key),
+                // Enabled but undigestible: run without touching the cache
+                // rather than key on a partial description of the inputs.
+                Some(None) => {
+                    self.component_cache.borrow_mut().note_unkeyable();
+                    None
+                }
+                None => None,
+            };
+            if let Some(key) = key
+                && let Some(cached) = self.component_cache.borrow_mut().get(key)
+            {
+                if let Some(sink) = timings.as_deref_mut() {
+                    sink.push(serde_json::json!({
+                        "component": component,
+                        "phase": phase,
+                        "ms": 0.0,
+                        "cached": true,
+                    }));
+                }
+                for (name, value) in cached {
+                    tensors.insert(format!("{component}.{name}"), value);
+                }
+                continue;
+            }
+
             let refs = inputs
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
@@ -1864,11 +2020,71 @@ impl PipelineEngine {
                     "ms": started.elapsed().as_secs_f64() * 1e3,
                 }));
             }
-            for (name, value) in session.output_names().iter().zip(outputs) {
+            let named = session
+                .output_names()
+                .iter()
+                .cloned()
+                .zip(outputs)
+                .collect::<Vec<_>>();
+            if let Some(key) = key {
+                let mut cache = self.component_cache.borrow_mut();
+                cache.note_miss();
+                cache.insert(key, &named);
+            }
+            for (name, value) in named {
                 tensors.insert(format!("{component}.{name}"), value);
             }
         }
         Ok(())
+    }
+
+    /// Counters describing what the pipeline's reuse caches did.
+    pub fn cache_stats(&self) -> PipelineCacheStats {
+        self.component_cache.borrow().stats()
+    }
+
+    /// Clear the per-generation counters reported by [`cache_stats`](Self::cache_stats).
+    pub fn reset_cache_stats(&self) {
+        self.component_cache.borrow_mut().reset_stats();
+    }
+
+    /// Digest everything about a request that changes what the decoder computes.
+    ///
+    /// This is the part of a multimodal prompt's identity that token ids cannot
+    /// express: placeholder expansion turns any image into the same repeated
+    /// token, so two different pictures produce byte-identical prompts. Without
+    /// this digest in the key, retained KV for one photo would be served for
+    /// another and the model would answer confidently about a picture it never
+    /// saw.
+    ///
+    /// Covers the bound tensors, the presence keys, and the tile count.
+    ///
+    /// `None` when some input cannot be digested, which disables reuse for the
+    /// request rather than keying it on an incomplete description.
+    fn digest_request_identity(request: &PipelineGenerateRequest) -> Option<Digest> {
+        let mut builder = DigestBuilder::new();
+
+        // Presence keys gate which components run and which optional decoder
+        // inputs are bound, so the same tensors under different presence keys
+        // are a different computation and must not share KV.
+        builder.absorb_u64(request.present.len() as u64);
+        for key in &request.present {
+            builder.absorb_str(key);
+        }
+        // Tile count drives placeholder expansion for encoder-free multimodal
+        // pipelines, and so the meaning of the prompt's placeholder run.
+        builder.absorb_u64(request.num_image_tiles.unwrap_or(0) as u64);
+
+        let mut endpoints = request.inputs.keys().collect::<Vec<_>>();
+        endpoints.sort();
+        builder.absorb_u64(endpoints.len() as u64);
+        for endpoint in endpoints {
+            builder.absorb_str(endpoint);
+            if !absorb_value(&mut builder, &request.inputs[endpoint]) {
+                return None;
+            }
+        }
+        Some(builder.finish())
     }
 
     fn component_inputs(
@@ -2303,8 +2519,20 @@ struct PipelineDecodeLoopBackend<'a> {
     /// `(source_endpoint, decoder_input_port)` routing recomputed each step.
     decoder_in_edges: Vec<(String, String)>,
     context_tokens: Vec<TokenId>,
+    /// Leading tokens whose KV was carried over from the previous generation and
+    /// so must not be prefilled again.
+    retained_len: usize,
     prompt_len: usize,
     generated_count: usize,
+    /// Tokens the decoder has actually run, and therefore the exact length its
+    /// KV covers.
+    ///
+    /// Tracked rather than derived from `context_tokens`, because the two differ:
+    /// `commit_token` appends the sampled token, but that token is not fed to the
+    /// decoder until the *next* step, so at the end of a generation the context
+    /// is one token longer than the KV. Retaining the context length would claim
+    /// KV that does not exist and corrupt the next turn's attention.
+    kv_len: usize,
 }
 
 impl PipelineDecodeLoopBackend<'_> {
@@ -2394,10 +2622,13 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         } else {
             0
         };
+        // On the first step feed only the tokens not already covered by
+        // retained KV (`prompt_len` is the uncovered suffix, and equals the
+        // whole prompt when nothing was retained); afterwards, the running token.
         let input_tokens = if self.decoder_state.use_kv && self.generated_count > 0 {
             self.context_tokens[self.context_tokens.len() - 1..].to_vec()
         } else {
-            self.context_tokens.clone()
+            self.context_tokens[self.retained_len..].to_vec()
         };
         // Refresh every `every_step` component over exactly the tokens the
         // decoder is about to consume, then route their (and any cached) outputs
@@ -2411,6 +2642,7 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             past_len,
             &extras,
         )?;
+        self.kv_len = past_len + input_tokens.len();
         extract_next_token_logits_with_io(
             self.decoder,
             outputs,
@@ -5527,5 +5759,73 @@ pipeline:
             err.to_string().contains("empty token sequence"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The reuse key must separate requests that compute different things, not
+    /// just requests with different attachments.
+    mod request_identity {
+        use super::super::*;
+
+        fn request() -> PipelineGenerateRequest {
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2])))
+        }
+
+        fn pixels(value: f32) -> Value {
+            Value::from_slice_f32(&[value; 4], &[1, 4]).expect("build a test tensor")
+        }
+
+        #[test]
+        fn identical_requests_share_a_key() {
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request().with_input("encoder.pixel_values", pixels(1.0));
+            assert_eq!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn a_different_attachment_changes_the_key() {
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request().with_input("encoder.pixel_values", pixels(2.0));
+            assert_ne!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn presence_keys_change_the_key() {
+            // Presence gates which components run and which optional decoder
+            // inputs are bound, so the same tensors under different presence
+            // keys describe a different computation.
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request()
+                .with_input("encoder.pixel_values", pixels(1.0))
+                .with_presence("audio");
+            assert_ne!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn the_image_tile_count_changes_the_key() {
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request()
+                .with_input("encoder.pixel_values", pixels(1.0))
+                .with_image_tile_count(4);
+            assert_ne!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn an_undigestible_request_disables_reuse() {
+            // Nothing bound is still a well-defined identity; the `None` case is
+            // reserved for tensors whose bytes cannot be read.
+            assert!(PipelineEngine::digest_request_identity(&request()).is_some());
+        }
     }
 }

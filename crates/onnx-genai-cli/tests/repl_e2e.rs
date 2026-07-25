@@ -32,7 +32,18 @@ fn sample_png() -> PathBuf {
 /// The script is fed all at once; the REPL exits on the trailing empty line or
 /// on EOF, so every test terminates without needing a timeout.
 fn repl(model: &Path, extra_arguments: &[&str], script: &str) -> Output {
+    repl_with_global_flags(model, &[], extra_arguments, script)
+}
+
+/// Run the REPL with flags that belong before the subcommand (`--profile`).
+fn repl_with_global_flags(
+    model: &Path,
+    global_arguments: &[&str],
+    extra_arguments: &[&str],
+    script: &str,
+) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+        .args(global_arguments)
         .arg("run")
         .arg(model)
         .args(extra_arguments)
@@ -341,8 +352,8 @@ fn reasoning_model() -> PathBuf {
 #[test]
 fn a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer() {
     // Two tokens cannot reach the closing delimiter, so the turn genuinely has
-    // no answer to remember — and the REPL must say so rather than silently
-    // storing an empty assistant message.
+    // no answer. The REPL must say so and drop the exchange, rather than record
+    // an empty assistant message that teaches the model questions go unanswered.
     let output = text(&repl(
         &reasoning_model(),
         &["--max-new-tokens", "2"],
@@ -356,6 +367,10 @@ fn a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer() {
     assert!(
         output.contains("--max-new-tokens"),
         "the fix must be named: {output}"
+    );
+    assert!(
+        output.contains("this turn is not kept"),
+        "the user must be told the exchange was dropped: {output}"
     );
 }
 
@@ -371,5 +386,36 @@ fn a_model_without_reasoning_delimiters_reports_nothing_about_them() {
     assert!(
         !output.contains("reasoning"),
         "a plain model must not mention reasoning: {output}"
+    );
+}
+
+#[test]
+fn a_second_question_about_the_same_image_reuses_the_encoder() {
+    // The reason multimodal reuse exists: a follow-up about the same picture
+    // should not re-run the vision encoder, and `--profile` is where a user can
+    // see that it did not.
+    let image = sample_png();
+    let path = image.to_str().unwrap();
+    let script = format!("/image {path} describe it\n/image {path} and again\n\n");
+    let output = repl_with_global_flags(
+        &fixture("tiny-vlm-image-input"),
+        &["--profile"],
+        &["--max-new-tokens", "2"],
+        &script,
+    );
+    let text = text(&output);
+
+    assert!(
+        output.status.success(),
+        "the REPL must exit cleanly: {text}"
+    );
+    assert!(
+        text.contains("encoder cache"),
+        "the profile must report encoder reuse: {text}"
+    );
+    // The first turn runs the encoder; the second must find it memoized.
+    assert!(
+        text.contains("1 hit / 0 run"),
+        "the follow-up turn must hit the memoized encoder output: {text}"
     );
 }

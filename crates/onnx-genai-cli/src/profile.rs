@@ -162,6 +162,28 @@ pub(crate) struct RunProfile {
     pub(crate) prefix_cache_hit: Option<usize>,
     pub(crate) memory: MemoryUsage,
     pub(crate) pages: Option<PageActivity>,
+    /// Reuse across a multi-component (multimodal) pipeline's generations.
+    pub(crate) multimodal_reuse: Option<MultimodalReuse>,
+}
+
+/// What a multimodal pipeline avoided recomputing for this generation.
+///
+/// An image costs twice: the encoder forward pass, and a prompt in which that
+/// one image expanded into hundreds of tokens. This reports how much of each
+/// was carried over from a previous turn.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MultimodalReuse {
+    pub(crate) encoder_hits: u64,
+    pub(crate) encoder_misses: u64,
+    pub(crate) encoder_bytes: u64,
+    pub(crate) prefix_reused_tokens: u64,
+    pub(crate) prefill_tokens: u64,
+}
+
+impl MultimodalReuse {
+    fn is_idle(&self) -> bool {
+        self.encoder_hits == 0 && self.encoder_misses == 0 && self.prefix_reused_tokens == 0
+    }
 }
 
 /// KV page pool activity over the run.
@@ -323,6 +345,22 @@ impl RunProfile {
         }
         if let Some(hit) = self.prefix_cache_hit.filter(|hit| *hit > 0) {
             let _ = writeln!(out, "{:<24} {:>10} tokens", "prefix cache reuse", hit);
+        }
+        if let Some(reuse) = self.multimodal_reuse.filter(|reuse| !reuse.is_idle()) {
+            if reuse.encoder_hits + reuse.encoder_misses > 0 {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10} hit / {} run",
+                    "encoder cache", reuse.encoder_hits, reuse.encoder_misses
+                );
+            }
+            if reuse.prefix_reused_tokens > 0 {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10} tokens",
+                    "multimodal prefix reuse", reuse.prefix_reused_tokens
+                );
+            }
         }
         if let Some(ttft) = self.timings.time_to_first_token() {
             let _ = writeln!(
@@ -524,6 +562,16 @@ impl RunProfile {
         }
         if let Some(hit) = self.prefix_cache_hit {
             fields.push(format!("\"prefix_cache_hit_tokens\":{hit}"));
+        }
+        if let Some(reuse) = self.multimodal_reuse.filter(|reuse| !reuse.is_idle()) {
+            fields.push(format!(
+                "\"multimodal_reuse\":{{\"encoder_hits\":{},\"encoder_misses\":{},\"encoder_bytes\":{},\"prefix_reused_tokens\":{},\"prefill_tokens\":{}}}",
+                reuse.encoder_hits,
+                reuse.encoder_misses,
+                reuse.encoder_bytes,
+                reuse.prefix_reused_tokens,
+                reuse.prefill_tokens
+            ));
         }
         if let Some(ttft) = self.timings.time_to_first_token() {
             fields.push(format!(

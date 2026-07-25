@@ -24,6 +24,7 @@ pub mod native_decode;
 #[cfg(feature = "native-backend")]
 pub(crate) mod native_speculative;
 pub mod pipeline;
+pub mod pipeline_cache;
 pub(crate) mod processors;
 pub mod sampling;
 pub(crate) mod session;

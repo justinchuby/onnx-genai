@@ -325,18 +325,65 @@ declares *modality → placeholder → token count* once per modality.
 
 ### Prefix caching and multimodal prompts
 
-The prefix cache is a **token-id trie** keyed on the prompt's tokens, and it is
-attached to the single-model `Engine`. Multi-component pipelines — every
-multimodal path — run on `PipelineEngine`, which does not consult it, so a
-multimodal turn always reports `prefix_cache_hit_len == 0`.
+An image costs a turn twice: the encoder forward pass, and a prompt in which
+that one image has expanded into hundreds or thousands of placeholder tokens.
+A conversation that keeps referring to the same picture would pay both on every
+turn. `PipelineEngine` removes both repeats.
 
-That is the safe default, and enabling it naively would be a **correctness bug**:
-two different images expand to the *same* run of `image_token_id`, so a
-token-only key would happily reuse KV pages computed from a different image's
-embeddings — the model would attend to the wrong picture. Extending prefix
-caching to multimodal prompts requires folding a digest of the injected
-multimodal tensors into the cache key, so that identical text with a different
-image misses.
+**Why the single-model prefix cache cannot simply be reused.** That cache is a
+**token-id trie**, and a token-id key is unsound the moment embeddings enter the
+prompt from anywhere but the token embedding table. Placeholder expansion
+replaces an image with a run of one repeated `image_token_id`, so two entirely
+different photographs produce *byte-identical* token sequences. Keyed on tokens
+alone, a cache would serve the first photograph's KV for the second, and the
+model would answer fluently about a picture it was never shown.
 
-Text-only prompts do benefit today, including across CLI REPL turns: a second
-turn reuses the first turn's prompt *and* its generated tokens.
+**The key is therefore tokens plus a digest of every bound input tensor.** The
+digest is a 128-bit content hash over each `component.input` endpoint's dtype,
+shape, and element bytes. Change the picture and the digest changes, the prefix
+stops matching, and the turn is recomputed. 128 bits rather than 64 because
+nothing verifies a hit.
+
+Two reuses follow from that key:
+
+* **Encoder memoization.** A prompt-phase component is a pure function of its
+  inputs — that is what distinguishes it from an `every_step` component — so its
+  outputs are memoized under the digest of those inputs. Re-asking about the
+  same attachment costs a hash instead of a vision or audio encoder pass. The
+  budget is `EngineConfig::pipeline_cache_bytes` (default 512 MiB, `0` disables);
+  entries are evicted least-recently-used.
+* **Decoder KV prefix reuse.** The decoder keeps the KV from the previous
+  generation and prefills only the tokens the new prompt added.
+
+Reuse of the decoder KV requires the retained context to be a strict **prefix**
+of the new prompt. A prompt that diverges part-way is recomputed rather than
+partially rewound: pipeline components hold their past as opaque per-graph
+tensors with no declared sequence axis, so there is nothing sound to truncate
+along. The append-only case it does cover is exactly the multi-turn conversation
+it exists for. Reuse is also skipped when the decoder's position ids arrive over
+a `dataflow` edge, since such a tensor covers the whole prompt and prefilling
+only a suffix would hand the decoder positions for tokens it is not being given.
+
+Memoization additionally requires the component's graph to contain only
+deterministic operators. A declared phase says *when* a component runs, never
+that it is pure, so purity is read off the graph (including subgraphs) rather
+than assumed: memoizing a graph containing `RandomNormal` would freeze its first
+draw and return it forever.
+
+Two further consequences worth knowing:
+
+* **Reuse stops one token short of the previous turn's output.** The last
+  sampled token is appended to the context but never fed back to the decoder, so
+  no KV exists for it and the next turn prefills it.
+* **Reasoning models reuse little or nothing.** Earlier turns' thinking is
+  stripped from the conversation before it is replayed (see the CLI's multi-turn
+  behavior), so the next prompt is not a strict extension of the retained
+  context. The encoder memoization still applies; the KV reuse does not. This is
+  the cost of not replaying chain-of-thought, not a defect.
+
+`--profile` reports both as `encoder cache` (hits / runs) and
+`multimodal prefix reuse` (tokens carried over).
+
+Text-only prompts continue to use the single-model token-id prefix cache,
+including across CLI REPL turns: a second turn reuses the first turn's prompt
+*and* its generated tokens.

@@ -316,6 +316,59 @@ impl Value {
     /// component-session seam. The tensor must be host-resident (the pipeline
     /// component path runs on CPU); the returned buffer is `numel *
     /// dtype.size_of()` bytes in row-major order.
+    /// Whether this tensor's data lives in host memory the CPU may dereference.
+    ///
+    /// `GetTensorMutableData` hands back whatever address the tensor's allocator
+    /// produced, which for a device-allocated value is a device pointer. Reading
+    /// it as host memory is undefined behavior, so anything that dereferences the
+    /// data pointer must check this first.
+    pub fn is_host_resident(&self) -> Result<bool> {
+        let api = crate::error::api()?;
+        let get_memory_info = api
+            .GetTensorMemoryInfo
+            .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+        let get_device_type = api
+            .MemoryInfoGetDeviceType
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetDeviceType"))?;
+        let mut memory_info = std::ptr::null();
+        // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
+        // OrtMemoryInfo for the lifetime of the value, so it must not be freed.
+        crate::error::check_status(unsafe {
+            get_memory_info(self.ptr.as_ptr(), &mut memory_info)
+        })?;
+        if memory_info.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        let mut device_type = onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU;
+        // SAFETY: `memory_info` is the non-null table ORT just returned, and
+        // `device_type` is a valid out-parameter for the duration of the call.
+        unsafe { get_device_type(memory_info, &mut device_type) };
+        Ok(device_type == onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU)
+    }
+
+    /// Borrow the tensor's raw little-endian element bytes.
+    ///
+    /// The borrowing counterpart to [`to_raw_bytes`](Self::to_raw_bytes), for
+    /// readers that only scan the bytes (hashing, comparison) and would
+    /// otherwise pay a full copy of a multi-megabyte tensor to do it.
+    ///
+    /// Errors for a device-resident tensor rather than handing back a slice over
+    /// a device pointer.
+    pub fn as_raw_bytes(&self) -> Result<&[u8]> {
+        if !self.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "cannot borrow bytes of a device-resident tensor; copy it to host first"
+                    .to_string(),
+            ));
+        }
+        let bytes = self.numel() * self.dtype.size_of();
+        let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
+        // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
+        // tensor's row-major allocation, checked host-resident above and kept
+        // alive by `self`, which also bounds the returned slice's lifetime.
+        Ok(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), bytes) })
+    }
+
     pub fn to_raw_bytes(&self) -> Result<Vec<u8>> {
         let bytes = self.numel() * self.dtype.size_of();
         let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
@@ -1057,6 +1110,34 @@ fn tensor_data_ptr(value: *mut onnx_genai_ort_sys::OrtValue) -> Result<*mut std:
         return Err(OrtError::NullPointer);
     }
     Ok(data)
+}
+
+#[cfg(test)]
+mod host_residency_tests {
+    use super::*;
+
+    #[test]
+    fn a_host_tensor_reports_host_residency_and_lends_its_bytes() {
+        let value = Value::from_slice_f32(&[1.0, 2.0], &[2]).expect("build a host tensor");
+        assert!(value.is_host_resident().expect("memory info is available"));
+        assert_eq!(
+            value.as_raw_bytes().expect("host bytes are borrowable"),
+            &[1.0f32, 2.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()[..],
+            "the borrowed bytes must be the tensor's little-endian elements"
+        );
+    }
+
+    #[test]
+    fn borrowed_bytes_match_the_copying_accessor() {
+        let value = Value::from_slice_i64(&[7, -3, 0], &[3]).expect("build a host tensor");
+        assert_eq!(
+            value.as_raw_bytes().expect("host bytes"),
+            &value.to_raw_bytes().expect("copied bytes")[..]
+        );
+    }
 }
 
 #[cfg(test)]
