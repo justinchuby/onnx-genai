@@ -366,9 +366,16 @@ only a suffix would hand the decoder positions for tokens it is not being given.
 
 Memoization additionally requires the component's graph to contain only
 deterministic operators. A declared phase says *when* a component runs, never
-that it is pure, so purity is read off the graph (including subgraphs) rather
-than assumed: memoizing a graph containing `RandomNormal` would freeze its first
-draw and return it forever.
+that it is pure, so purity is read off the graph rather than assumed: memoizing
+a graph containing `RandomNormal` would freeze its first draw and return it
+forever. Everything the runtime will execute is checked — subgraphs of `Loop`
+and `If`, and model-local functions, whose calling node's `op_type` reveals
+nothing about the body that gets inlined.
+
+The check covers the standard ONNX operator set, where which operators are
+random is fixed by the specification. A custom-domain operator is taken at face
+value; a package whose encoder contains a non-deterministic custom operator
+should set `pipeline_cache_bytes` to `0`.
 
 Two further consequences worth knowing:
 

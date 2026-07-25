@@ -168,17 +168,36 @@ const NON_DETERMINISTIC_OPERATORS: &[&str] = &[
 ///
 /// A component's declared phase says only *when* it runs, never that it is
 /// deterministic, so purity is read off the graph instead of assumed from
-/// `run_on: prompt_only`. Subgraphs are walked too: a random operator inside a
-/// `Loop` or `If` body is no less random.
+/// `run_on: prompt_only`.
+///
+/// Everything the runtime will execute is walked, not just the main graph: a
+/// random operator is no less random for sitting inside a `Loop` body or a
+/// model-local function that gets inlined at load.
+///
+/// The blacklist covers the standard ONNX operator set, where "which operators
+/// are random" is fixed by the specification. A custom-domain operator is taken
+/// at face value; a package whose encoder contains a non-deterministic custom
+/// operator should set `pipeline_cache_bytes` to `0`.
 pub fn graph_is_deterministic(model: &onnx_runtime_loader::proto::ModelProto) -> bool {
-    model
+    let main_graph = model
         .graph
         .as_ref()
-        .is_none_or(graph_nodes_are_deterministic)
+        .is_none_or(graph_nodes_are_deterministic);
+    // A node may call a model-local function whose body holds the random
+    // operator; the caller's own op_type reveals nothing about it.
+    main_graph
+        && model
+            .functions
+            .iter()
+            .all(|function| nodes_are_deterministic(&function.node))
 }
 
 fn graph_nodes_are_deterministic(graph: &onnx_runtime_loader::proto::onnx::GraphProto) -> bool {
-    graph.node.iter().all(|node| {
+    nodes_are_deterministic(&graph.node)
+}
+
+fn nodes_are_deterministic(nodes: &[onnx_runtime_loader::proto::onnx::NodeProto]) -> bool {
+    nodes.iter().all(|node| {
         !NON_DETERMINISTIC_OPERATORS.contains(&node.op_type.as_str())
             && node.attribute.iter().all(|attribute| {
                 attribute
@@ -411,7 +430,7 @@ mod tests {
         use super::super::graph_is_deterministic;
         use onnx_runtime_loader::proto::ModelProto;
         use onnx_runtime_loader::proto::onnx::{
-            AttributeProto, GraphProto, NodeProto, attribute_proto,
+            AttributeProto, FunctionProto, GraphProto, NodeProto, attribute_proto,
         };
 
         fn node(op_type: &str) -> NodeProto {
@@ -465,6 +484,30 @@ mod tests {
                 !graph_is_deterministic(&model(vec![loop_node])),
                 "a Loop body is no less random for being nested"
             );
+        }
+
+        #[test]
+        fn a_random_operator_inside_a_model_local_function_still_counts() {
+            // The calling node's op_type is the function's name, which says
+            // nothing about the body the runtime will inline and run.
+            let mut model = model(vec![node("MyFusedEncoderBlock")]);
+            model.functions.push(FunctionProto {
+                name: "MyFusedEncoderBlock".to_string(),
+                node: vec![node("MatMul"), node("RandomNormal")],
+                ..FunctionProto::default()
+            });
+            assert!(!graph_is_deterministic(&model));
+        }
+
+        #[test]
+        fn a_deterministic_model_local_function_stays_memoizable() {
+            let mut model = model(vec![node("MyFusedEncoderBlock")]);
+            model.functions.push(FunctionProto {
+                name: "MyFusedEncoderBlock".to_string(),
+                node: vec![node("MatMul"), node("Add")],
+                ..FunctionProto::default()
+            });
+            assert!(graph_is_deterministic(&model));
         }
 
         #[test]
