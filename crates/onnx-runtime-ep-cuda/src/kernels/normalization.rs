@@ -855,7 +855,7 @@ const NORM_BLOCK: u32 = 256;
 const SKIP_RMSNORM_WARP_HALF4_MULTIPLE: usize = 32 * 4;
 
 fn preferred_norm_block_threads(norm_size: usize, max_threads_per_block: u32) -> u32 {
-    let reported_limit = max_threads_per_block.max(32).min(NORM_BLOCK);
+    let reported_limit = max_threads_per_block.clamp(32, NORM_BLOCK);
     let device_limit = 1 << (31 - reported_limit.leading_zeros());
     let useful_threads = norm_size
         .max(32)
