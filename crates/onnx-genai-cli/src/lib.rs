@@ -27,6 +27,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -694,6 +695,32 @@ struct SamplingArgs {
     raw: bool,
 }
 
+/// Shared CPU resource controls for `generate` and `run`.
+#[derive(Debug, Args)]
+struct CpuArgs {
+    /// Cap native CPU decode to N worker cores. Overrides
+    /// ONNX_GENAI_CPU_DECODE_THREADS; when neither is set, automatic sizing is
+    /// unchanged. Where supported, persistent workers are pinned to at most N
+    /// allowed CPUs.
+    #[arg(long, value_name = "N")]
+    cpu_cores: Option<NonZeroUsize>,
+}
+
+impl CpuArgs {
+    fn apply(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        {
+            onnx_genai_engine::set_cpu_decode_thread_budget(self.cpu_cores.map(NonZeroUsize::get))
+                .map_err(anyhow::Error::msg)?;
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            let _ = self.cpu_cores;
+        }
+        Ok(())
+    }
+}
+
 impl SamplingArgs {
     fn to_options(&self) -> GenerateOptions {
         let mut options = GenerateOptions::default();
@@ -977,6 +1004,9 @@ struct GenerateArgs {
     engine: EngineArgs,
 
     #[command(flatten)]
+    cpu: CpuArgs,
+
+    #[command(flatten)]
     image_output: ImageOutputArgs,
 
     #[command(flatten)]
@@ -1004,6 +1034,9 @@ struct RunArgs {
 
     #[command(flatten)]
     engine: EngineArgs,
+
+    #[command(flatten)]
+    cpu: CpuArgs,
 }
 
 /// Output shape for `transcribe`.
@@ -1069,6 +1102,9 @@ struct TranscribeArgs {
 
     #[command(flatten)]
     engine: EngineArgs,
+
+    #[command(flatten)]
+    cpu: CpuArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1139,6 +1175,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 
 fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
+    args.cpu.apply()?;
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
     if args.image_output.output_image.is_some() && args.audio_output.output_audio.is_some() {
@@ -1338,6 +1375,7 @@ fn generate_audio(
 
 fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
+    args.cpu.apply()?;
     let model_dir = resolve_model_dir(&args.model);
     let load_started = std::time::Instant::now();
     let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
@@ -1731,6 +1769,7 @@ impl Transcriber {
 }
 
 fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
+    args.cpu.apply()?;
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
@@ -2340,6 +2379,50 @@ mod tests {
             }
             _ => panic!("expected generate command"),
         }
+    }
+
+    #[test]
+    fn cpu_cores_is_shared_by_generate_and_run() {
+        let generate = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--cpu-cores",
+            "8",
+        ])
+        .unwrap();
+        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--cpu-cores", "4"]).unwrap();
+
+        match generate.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(8));
+            }
+            _ => panic!("expected generate command"),
+        }
+        match run.command {
+            Commands::Run(args) => {
+                assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(4));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cpu_cores_rejects_zero() {
+        assert!(
+            Cli::try_parse_from([
+                "onnx-genai",
+                "generate",
+                "./m",
+                "--prompt",
+                "hi",
+                "--cpu-cores",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

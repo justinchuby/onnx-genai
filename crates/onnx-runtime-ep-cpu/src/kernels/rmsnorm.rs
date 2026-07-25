@@ -179,7 +179,7 @@ pub(crate) fn rms_norm_dense(
     for g in 0..num_groups {
         let base = g * norm_size;
         let slice = &x[base..base + norm_size];
-        let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / norm_size as f32;
+        let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
         let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
         for e in 0..norm_size {
             let idx = base + e;

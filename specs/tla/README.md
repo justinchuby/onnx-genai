@@ -76,6 +76,67 @@ Checked invariants:
 - `ActiveGenerationsMatch`: allocator reuse cannot occur under an active read or
   write lease.
 
+### `KvAdmission.tla`
+
+Models continuous-batching admission against one shared, fixed-size KV cache
+pool. Each resident request grows its KV extent monotonically through chunked
+prefill and committed decode steps, and releases the whole extent only at
+completion, so requests acquire incrementally and free once.
+
+The modeled rule is: grant KV to a request only when its outstanding need still
+fits in the currently free pool. The rule is stated over need and free extent
+alone, so it does not depend on grant size or on the order in which the
+scheduler visits requests.
+
+Checked invariants:
+
+- `CapacityRespected`: charged extents never exceed the configured pool.
+- `ExtentsConserved`: held plus outstanding need reconstructs each request's
+  peak footprint.
+- `NoOverCharge`: no request is charged beyond the KV it will ever need.
+- `TerminalReleasesAll`: completion returns every extent; a finished workload
+  leaves an empty pool.
+- `ResidentCanDrain`: a resident request's outstanding need always fits the
+  pool once its own held extent is counted.
+- `ProgressPossible`: in every reachable non-terminal state some unfinished
+  request can still be driven to completion out of the free pool. This is the
+  deadlock-freedom obligation; resident requests can never strand KV against
+  each other.
+
+`KvAdmissionUnguarded.cfg` is a negative model that disables the guard and must
+violate `ProgressPossible`. `check.sh` asserts that violation, so a model that
+stops catching its own counterexample fails the run.
+
+The module does not assert fairness between eligible requests. Batch shaping,
+priority ordering, and arrival timing are scheduler obligations covered by
+deterministic conformance campaigns.
+
+### `NodeFailure.tla`
+
+Models quiescence after a node fault. A fault is not a global time cut: work
+already enqueued on a surviving node keeps draining, while the failed node
+stops accepting and stops executing at the fault instant.
+
+Checked invariants:
+
+- `FailedNodeStopsAtFault`: no operation spanning the failed node executes
+  after the fault, however early it was submitted. Filtering purely on
+  submission time violates this and lets a dead node run queued work.
+- `NoCompletionAfterFailure`: an operation spanning the failed node never
+  reports a completion later than the fault instant.
+- `SurvivorWorkIsNotDiscarded`: work confined to surviving nodes is never
+  discarded merely because it starts after the fault.
+- `QuiescenceBoundedByDeadline` and `QuiescenceAfterFault`: quiescence is
+  whichever comes first, surviving work draining or the coordinator closing the
+  epoch at `FaultAt + QuiesceTimeout`, and never precedes the fault.
+- `SettledExactlyOnce`: every operation reaches one terminal classification.
+
+`NodeFailureUnguarded.cfg` is a negative model that lets the failed node keep
+executing queued work and must violate `FailedNodeStopsAtFault`.
+
+The module does not assert failure-detection latency or replanning. Heartbeat
+policy and epoch handoff are covered by deterministic conformance campaigns.
+
 ## Running
 
 Install [TLA+ tools](https://github.com/tlaplus/tlaplus/releases), then run from
@@ -98,4 +159,6 @@ constants is useful, but does not replace implementation trace conformance.
 - `docs/MEMORY_ARCHITECTURE.md` section 5.3.1 (pressure protocol)
 - `docs/DISTRIBUTED_RUNTIME.md` sections 3.1 and 3.2.1 (completion and ordering)
 - `docs/DISTRIBUTED_RUNTIME.md` section 8.1 (rank-local DAG scheduling)
+- `docs/MEMORY_ARCHITECTURE.md` KV cache pool sizing and admission
+- `docs/DISTRIBUTED_RUNTIME.md` node failure, abort, and quiescence
 - `REFINEMENT.md` (implementation linearization and verification gates)

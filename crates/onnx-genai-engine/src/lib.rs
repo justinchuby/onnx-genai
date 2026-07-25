@@ -59,6 +59,8 @@ pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
 };
 #[cfg(feature = "native-backend")]
+pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;
+#[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     IterativeOverrides, PipelineEngine, PipelineGenerateRequest, PipelineSynthesis,

@@ -26,6 +26,24 @@ onnx-genai version                            # version + execution providers
 `generate`, `run`, and `show` accept either a model directory or a config file
 inside it (a file resolves to its parent directory).
 
+### Polite CPU decode
+
+Use `--cpu-cores N` with `generate` or `run` to cap native CPU decode to N
+persistent workers:
+
+```bash
+onnx-genai generate ./model --prompt "Hello" --cpu-cores 8
+```
+
+Where thread affinity is supported, decode workers are pinned to at most N CPUs
+from the process's allowed CPU set, leaving the rest of a shared machine
+available to other programs. The equivalent environment setting is
+`ONNX_GENAI_CPU_DECODE_THREADS=N`. Precedence is explicit `--cpu-cores` >
+environment variable > automatic sizing. With neither setting, the
+peak-throughput automatic default is unchanged. This controls native decode
+workers; use an OS cpuset/taskset as well when the entire process, including
+prefill or ONNX Runtime work, must be hard-confined.
+
 ## Runtime selection
 
 Choose an execution provider at runtime with `ONNX_GENAI_EP` (e.g. `cpu`,

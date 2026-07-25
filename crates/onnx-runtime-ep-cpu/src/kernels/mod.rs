@@ -96,6 +96,7 @@ pub mod sdpa;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
+pub mod simd_sumsq;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;

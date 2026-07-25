@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -106,6 +107,9 @@ mod mm_profile {
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Process-local override set by first-class callers such as the CLI. Zero means
+/// no override, so the environment variable and automatic default still apply.
+static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// Decode is bandwidth-bound and pays one fork/join per projection. Profiling
 /// across the existing 4--96 worker sweep found no gain above eight workers and
 /// clear regressions at 16+, so topology scaling is capped here; the environment
@@ -1441,7 +1445,7 @@ fn dequantize_nbits_value(
 fn configured_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_decode_threads(value.as_deref(), available)
+    resolve_decode_threads_with_override(decode_threads_override(), value.as_deref(), available)
 }
 
 /// The worker count for the persistent SPMD decode pool ([`crate::decode_spmd`]).
@@ -1459,7 +1463,29 @@ fn configured_decode_threads() -> Option<usize> {
 pub fn configured_persistent_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_persistent_decode_threads(value.as_deref(), available)
+    resolve_persistent_decode_threads_with_override(
+        decode_threads_override(),
+        value.as_deref(),
+        available,
+    )
+}
+
+/// Set or clear a process-local CPU decode worker budget.
+///
+/// This is the programmatic equivalent of `ONNX_GENAI_CPU_DECODE_THREADS`, with
+/// higher precedence. Call it before constructing a native decode session; pools
+/// are initialized lazily and retain their initial size for the process lifetime.
+pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(), &'static str> {
+    if threads == Some(0) {
+        return Err("CPU decode thread budget must be greater than zero");
+    }
+    DECODE_THREADS_OVERRIDE.store(threads.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+fn decode_threads_override() -> Option<usize> {
+    std::num::NonZeroUsize::new(DECODE_THREADS_OVERRIDE.load(Ordering::Acquire))
+        .map(std::num::NonZeroUsize::get)
 }
 
 /// Default persistent-pool worker count for `available` logical CPUs: half of
@@ -1481,17 +1507,29 @@ fn default_persistent_threads(available: usize) -> Option<usize> {
 /// value and the host's logical CPU count. `Some("0")` opts out (`None`); an
 /// explicit positive count is honored (clamped to `available`); an unset or
 /// unparseable value falls back to [`default_persistent_threads`].
+#[cfg(test)]
 fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    resolve_persistent_decode_threads_with_override(None, raw, available)
+}
+
+fn resolve_persistent_decode_threads_with_override(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let default = default_persistent_threads(available)?;
-    let threads = match raw {
-        Some("0") => return None,
-        Some(raw) => raw
-            .parse::<usize>()
-            .ok()
-            .filter(|threads| *threads > 0)
-            .unwrap_or(default),
-        None => default,
+    let threads = match override_threads {
+        Some(threads) => threads,
+        None => match raw {
+            Some("0") => return None,
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|threads| *threads > 0)
+                .unwrap_or(default),
+            None => default,
+        },
     };
     Some(threads.min(available))
 }
@@ -1519,13 +1557,25 @@ fn default_decode_threads(available: usize) -> Option<usize> {
     )
 }
 
+#[cfg(test)]
 fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    resolve_decode_threads_with_override(None, raw, available)
+}
+
+fn resolve_decode_threads_with_override(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let default = default_decode_threads(available)?;
-    let threads = match raw {
-        Some("0") => return None,
-        Some(raw) => raw.parse::<usize>().unwrap_or(default),
-        None => default,
+    let threads = match override_threads {
+        Some(threads) => threads,
+        None => match raw {
+            Some("0") => return None,
+            Some(raw) => raw.parse::<usize>().unwrap_or(default),
+            None => default,
+        },
     };
     (threads > 0).then(|| threads.min(available))
 }
@@ -1554,17 +1604,29 @@ fn default_dense_decode_threads(available: usize) -> Option<usize> {
 /// `Some("0")` opts out (`None` → run on the global Rayon pool); an explicit
 /// positive count is honored (clamped to `available`); unset/unparseable falls
 /// back to [`default_dense_decode_threads`].
+#[cfg(test)]
 fn resolve_dense_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    resolve_dense_decode_threads_with_override(None, raw, available)
+}
+
+fn resolve_dense_decode_threads_with_override(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let default = default_dense_decode_threads(available)?;
-    let threads = match raw {
-        Some("0") => return None,
-        Some(raw) => raw
-            .parse::<usize>()
-            .ok()
-            .filter(|threads| *threads > 0)
-            .unwrap_or(default),
-        None => default,
+    let threads = match override_threads {
+        Some(threads) => threads,
+        None => match raw {
+            Some("0") => return None,
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|threads| *threads > 0)
+                .unwrap_or(default),
+            None => default,
+        },
     };
     Some(threads.min(available))
 }
@@ -1572,7 +1634,11 @@ fn resolve_dense_decode_threads(raw: Option<&str>, available: usize) -> Option<u
 fn configured_dense_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_dense_decode_threads(value.as_deref(), available)
+    resolve_dense_decode_threads_with_override(
+        decode_threads_override(),
+        value.as_deref(),
+        available,
+    )
 }
 
 #[cfg(feature = "mlas")]
@@ -2300,6 +2366,23 @@ fn int4_matmul_m1(
     } else {
         &activation
     };
+    // The int4 zero-point correction is `8 * sum(activation)` per K-block, which
+    // depends only on the (deinterleaved) activation — it is identical for every
+    // one of the N output columns. The AVX-512 VNNI kernel used to recompute it
+    // per column via a second `vpdpbusd` against all-ones (doubling the VNNI-port
+    // work in the hot loop). Precompute it once here (already `<< 3`) in the exact
+    // per-lane `vpdpbusd(ones, act)` layout so the kernel just loads and subtracts,
+    // keeping the integer result bit-identical while halving the hot-loop dpbusd
+    // count. Only the AVX-512 kernel consumes it; other kernels ignore the slice.
+    #[cfg(target_arch = "x86_64")]
+    let precompute_act_sums = matches!(dot_kernel, DotKernel::Avx512Vnni);
+    #[cfg(not(target_arch = "x86_64"))]
+    let precompute_act_sums = false;
+    let act_sum8: Vec<i32> = if precompute_act_sums {
+        activation_block_sums8(activation, k_blocks)
+    } else {
+        Vec::new()
+    };
     let compute = |output_start: usize, outputs: &mut [f32]| {
         for (offset, output) in outputs.iter_mut().enumerate() {
             let output_index = output_start + offset;
@@ -2312,6 +2395,7 @@ fn int4_matmul_m1(
                 &weight.values[packed_start..packed_end],
                 &weight.scales[scale_start..scale_end],
                 &activation_scales,
+                &act_sum8,
                 dot_kernel,
             );
         }
@@ -2341,15 +2425,45 @@ fn deinterleave_activation_int4(activation: &[i8]) -> Vec<i8> {
     out
 }
 
+/// Precompute the int4 zero-point correction `8 * sum(activation)` per K-block
+/// in the exact per-lane layout of `_mm512_dpbusd_epi32(0, ones, act)`: each
+/// 32-byte deinterleaved block yields 8 int32 lanes, lane `j` being the sum of
+/// the four activation bytes `act[block*32 + 4j .. +4]`, left-shifted by 3 (the
+/// `* 8` zero-point factor). Because it depends only on the activation, it is
+/// identical across every N output column, so [`int4_dot_row_avx512vnni`] loads
+/// it instead of recomputing a second `vpdpbusd` per column. The scalar sum
+/// matches the VNNI integer arithmetic exactly (four `i8` addends per lane), so
+/// the decode stays bit-identical.
+fn activation_block_sums8(activation: &[i8], k_blocks: usize) -> Vec<i32> {
+    debug_assert!(activation.len() >= k_blocks * 32);
+    let mut sums = vec![0i32; k_blocks * 8];
+    for block in 0..k_blocks {
+        let base = block * 32;
+        for lane in 0..8 {
+            let o = base + lane * 4;
+            let sum = activation[o] as i32
+                + activation[o + 1] as i32
+                + activation[o + 2] as i32
+                + activation[o + 3] as i32;
+            sums[block * 8 + lane] = sum << 3;
+        }
+    }
+    sums
+}
+
 /// Compute one int4 output row (`m=1` decode). For the SIMD kernels
 /// (`AvxVnni`/`Avx512Vnni`) `activation` MUST be in the deinterleaved layout of
 /// [`deinterleave_activation_int4`]; the `Scalar` kernel takes natural order.
-/// [`int4_matmul_m1`] selects the right layout for the chosen kernel.
+/// `act_sum8` is the precomputed per-block activation zero-point correction
+/// (see [`activation_block_sums8`]); it is consumed only by the AVX-512 kernel
+/// and may be empty for the others. [`int4_matmul_m1`] selects the right layout
+/// and precomputation for the chosen kernel.
 fn int4_dot_row(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
     activation_scales: &[f32],
+    act_sum8: &[i32],
     _kernel: DotKernel,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -2369,12 +2483,20 @@ fn int4_dot_row(
             DotKernel::Avx512Vnni => {
                 // SAFETY: selected_dot_kernel checked AVX2, AVX512-VNNI, and AVX512VL.
                 return unsafe {
-                    int4_dot_row_avx512vnni(activation, packed_weight, scales, activation_scales)
+                    int4_dot_row_avx512vnni(
+                        activation,
+                        packed_weight,
+                        scales,
+                        activation_scales,
+                        act_sum8,
+                    )
                 };
             }
             DotKernel::Scalar => {}
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = act_sum8;
     int4_dot_row_scalar(activation, packed_weight, scales, activation_scales)
 }
 
@@ -2498,12 +2620,12 @@ unsafe fn int4_pair_scaled_avx512(
     packed_weight: &[u8],
     scales: &[f32],
     activation_scales: &[f32],
+    act_sum8: &[i32],
     b0: usize,
 ) -> std::arch::x86_64::__m512 {
     use std::arch::x86_64::*;
 
     let low_mask256 = _mm256_set1_epi8(0x0f);
-    let ones = _mm512_set1_epi8(1);
     // Assemble weight512 128-bit lanes [b0_low, b0_high, b1_low, b1_high] from
     // low256=[b0_low,b1_low] (64-bit words 0,1,2,3) and high256=[b0_high,b1_high]
     // (words 0,1,2,3 selected as 8..11). Index order is lane0..lane7.
@@ -2522,8 +2644,14 @@ unsafe fn int4_pair_scaled_avx512(
     // (including zero padding).
     let act = unsafe { _mm512_loadu_si512(activation.as_ptr().add(b0 * 32).cast()) };
     let wdot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), weight, act);
-    let asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, act);
-    let dot = _mm512_sub_epi32(wdot, _mm512_slli_epi32(asum, 3));
+    // The `8*sum(act)` zero-point correction is activation-only and identical for
+    // every N column, so it was precomputed once (already `<< 3`) in the exact
+    // `dpbusd(ones, act)` lane layout — load it instead of issuing a second
+    // `dpbusd` per column. Integer result is unchanged. Lanes 0..8 = block b0,
+    // lanes 8..16 = block b1 (16 contiguous i32 starting at `b0 * 8`).
+    // SAFETY: `act_sum8` has 8 lanes per block; the pair owns 16 in range.
+    let asum8 = unsafe { _mm512_loadu_si512(act_sum8.as_ptr().add(b0 * 8).cast()) };
+    let dot = _mm512_sub_epi32(wdot, asum8);
     let s0 = scales[b0] * activation_scales[b0];
     let s1 = scales[b1] * activation_scales[b1];
     // Lanes 0..8 carry block b0's scale, lanes 8..16 carry block b1's.
@@ -2540,6 +2668,7 @@ unsafe fn int4_dot_row_avx512vnni(
     packed_weight: &[u8],
     scales: &[f32],
     activation_scales: &[f32],
+    act_sum8: &[i32],
 ) -> f32 {
     use std::arch::x86_64::*;
 
@@ -2558,16 +2687,18 @@ unsafe fn int4_dot_row_avx512vnni(
     };
 
     let block_count = scales.len();
-    let ones256 = _mm256_set1_epi8(1);
 
     // Fuse two blocks per 512-bit `dpbusd`; defer reduction to one final pass.
     // Four independent f32 accumulators break the loop-carried `add_ps`
     // dependency chain: with a single accumulator each block's `add_ps` waited on
-    // the previous one (~4-cycle latency x block_count), leaving the two `dpbusd`
+    // the previous one (~4-cycle latency x block_count), leaving the `dpbusd`
     // per pair — the actual work — stalled on the reduction. Rotating four chains
     // (unroll-by-4 over pairs) lets the out-of-order engine keep the VNNI ports
     // busy; the four partials are summed once at the end. Software-prefetch the
-    // pair four iterations ahead so the streamed weight bytes are resident.
+    // pair four iterations ahead so the streamed weight bytes are resident. The
+    // per-column zero-point `dpbusd` is gone — its `8*sum(act)` correction is
+    // precomputed once per matmul in `act_sum8` — so each pair now issues a
+    // single `dpbusd` (weight·act), halving the hot-loop VNNI-port pressure.
     let pairs = block_count / 2;
     let mut acc0 = _mm512_setzero_ps();
     let mut acc1 = _mm512_setzero_ps();
@@ -2589,6 +2720,7 @@ unsafe fn int4_dot_row_avx512vnni(
                 packed_weight,
                 scales,
                 activation_scales,
+                act_sum8,
                 pair * 2,
             )
         });
@@ -2598,6 +2730,7 @@ unsafe fn int4_dot_row_avx512vnni(
                 packed_weight,
                 scales,
                 activation_scales,
+                act_sum8,
                 (pair + 1) * 2,
             )
         });
@@ -2607,6 +2740,7 @@ unsafe fn int4_dot_row_avx512vnni(
                 packed_weight,
                 scales,
                 activation_scales,
+                act_sum8,
                 (pair + 2) * 2,
             )
         });
@@ -2616,6 +2750,7 @@ unsafe fn int4_dot_row_avx512vnni(
                 packed_weight,
                 scales,
                 activation_scales,
+                act_sum8,
                 (pair + 3) * 2,
             )
         });
@@ -2629,6 +2764,7 @@ unsafe fn int4_dot_row_avx512vnni(
                 packed_weight,
                 scales,
                 activation_scales,
+                act_sum8,
                 pair * 2,
             )
         });
@@ -2638,15 +2774,18 @@ unsafe fn int4_dot_row_avx512vnni(
 
     let mut value = _mm512_reduce_add_ps(accumulator);
 
-    // Odd trailing block via the same unsigned-nibble scheme at 256-bit.
+    // Odd trailing block via the same unsigned-nibble scheme at 256-bit. Its
+    // zero-point correction is likewise the precomputed `act_sum8` (8 lanes for
+    // this block), so no second `dpbusd` is issued here either.
     if block_count % 2 == 1 {
         let block = block_count - 1;
         let weight = block_weight(block);
         // SAFETY: the final block owns 32 activation bytes (incl. padding).
         let act = unsafe { _mm256_loadu_si256(activation.as_ptr().add(block * 32).cast()) };
         let wdot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), weight, act);
-        let asum = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones256, act);
-        let dot = _mm256_sub_epi32(wdot, _mm256_slli_epi32(asum, 3));
+        // SAFETY: the final block owns 8 precomputed sum lanes at `block * 8`.
+        let asum8 = unsafe { _mm256_loadu_si256(act_sum8.as_ptr().add(block * 8).cast()) };
+        let dot = _mm256_sub_epi32(wdot, asum8);
         let block_scale = scales[block] * activation_scales[block];
         let scaled = _mm256_mul_ps(_mm256_cvtepi32_ps(dot), _mm256_set1_ps(block_scale));
         value += horizontal_sum_f32_256(scaled);
@@ -5554,6 +5693,7 @@ mod tests {
             .collect();
         // SIMD int4 kernels consume the deinterleaved activation layout.
         let activation_deint = deinterleave_activation_int4(&activation);
+        let act_sum8 = activation_block_sums8(&activation_deint, blocks);
         let scales: Vec<f32> = (0..blocks).map(|i| ((i % 17) + 1) as f32 / 100.0).collect();
         let ascales: Vec<f32> = (0..blocks).map(|i| ((i % 11) + 1) as f32 / 50.0).collect();
         let iters = 2000u32;
@@ -5574,7 +5714,13 @@ mod tests {
             for _ in 0..iters {
                 // SAFETY: avx512 features confirmed above.
                 acc += unsafe {
-                    int4_dot_row_avx512vnni(&activation_deint, &packed, &scales, &ascales)
+                    int4_dot_row_avx512vnni(
+                        &activation_deint,
+                        &packed,
+                        &scales,
+                        &ascales,
+                        &act_sum8,
+                    )
                 };
             }
             std::hint::black_box(acc);
@@ -5752,11 +5898,12 @@ mod tests {
             let mut acc = 0.0f32;
             // Amortized: deinterleave once per matmul (as production does).
             let act = deinterleave_activation_int4(&activation);
+            let act_sum8 = activation_block_sums8(&act, blocks);
             for row in 0..n {
                 let ps = &packed[row * blocks * 16..(row + 1) * blocks * 16];
                 let ss = &scales[row * blocks..(row + 1) * blocks];
                 // SAFETY: features asserted above; slices sized per row.
-                acc += unsafe { int4_dot_row_avx512vnni(&act, ps, ss, &ascales) };
+                acc += unsafe { int4_dot_row_avx512vnni(&act, ps, ss, &ascales, &act_sum8) };
             }
             std::hint::black_box(acc);
             new_runs.push(t.elapsed().as_nanos() as u64);
@@ -5764,9 +5911,11 @@ mod tests {
         // Correctness spot-check: new (deinterleaved) == old (natural) per row.
         let ps = &packed[0..blocks * 16];
         let ss = &scales[0..blocks];
+        let act_sum8 = activation_block_sums8(&activation_deint, blocks);
         // SAFETY: features asserted above.
         let old0 = unsafe { int4_dot_row_avx512vnni_old(&activation, ps, ss, &ascales) };
-        let new0 = unsafe { int4_dot_row_avx512vnni(&activation_deint, ps, ss, &ascales) };
+        let new0 =
+            unsafe { int4_dot_row_avx512vnni(&activation_deint, ps, ss, &ascales, &act_sum8) };
         assert!(
             (old0 - new0).abs() <= 1e-4 * old0.abs().max(1.0),
             "old {old0} new {new0}"
@@ -5821,9 +5970,16 @@ mod tests {
             // The SIMD kernel consumes the deinterleaved activation layout; the
             // scalar oracle stays natural-order.
             let activation_deint = deinterleave_activation_int4(&activation);
+            let act_sum8 = activation_block_sums8(&activation_deint, blocks);
             // SAFETY: feature support confirmed above.
             let wide = unsafe {
-                int4_dot_row_avx512vnni(&activation_deint, &packed, &scales, &activation_scales)
+                int4_dot_row_avx512vnni(
+                    &activation_deint,
+                    &packed,
+                    &scales,
+                    &activation_scales,
+                    &act_sum8,
+                )
             };
             assert!(
                 (wide - scalar).abs() <= 1e-4 * scalar.abs().max(1.0),
@@ -5858,6 +6014,7 @@ mod tests {
                 .map(|i| (((i * 29 + 3) % 255) as i32 - 127) as i8)
                 .collect();
             let activation_deint = deinterleave_activation_int4(&activation);
+            let act_sum8 = activation_block_sums8(&activation_deint, blocks);
             let activation_scales: Vec<f32> = (0..blocks)
                 .map(|i| ((i * 5 % 13) + 1) as f32 / 40.0)
                 .collect();
@@ -5885,6 +6042,7 @@ mod tests {
                         &packed,
                         &base_scales,
                         &activation_scales,
+                        &act_sum8,
                     )
                 };
             }
@@ -6505,6 +6663,27 @@ mod tests {
         assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
         assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
         assert_eq!(resolve_persistent_decode_threads(Some("8"), 0), None);
+    }
+
+    #[test]
+    fn explicit_budget_precedes_env_for_every_decode_pool() {
+        assert_eq!(
+            resolve_decode_threads_with_override(Some(6), Some("2"), 96),
+            Some(6)
+        );
+        assert_eq!(
+            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96),
+            Some(8)
+        );
+        assert_eq!(
+            resolve_dense_decode_threads_with_override(Some(12), Some("0"), 96),
+            Some(12)
+        );
+        assert_eq!(
+            resolve_persistent_decode_threads_with_override(None, None, 96),
+            Some(48),
+            "the uncapped automatic default must remain unchanged"
+        );
     }
 
     #[test]
@@ -8699,6 +8878,107 @@ mod tests {
                         hand_us / mlas_us
                     );
                 }
+            }
+        }
+    }
+
+    /// Focused int4 M=1 GEMV micro-bench at 0.6B (Qwen3-0.6B) decode shapes,
+    /// reporting ns/call, GB/s (int4 weight bytes streamed = N*K/2) and GFLOP/s
+    /// (2*N*K) for the hand VNNI GEMV vs MLAS SQNBit CompInt8, at 1 and 32
+    /// threads, median-of-5. This is the Phase-1 gating probe for the int4 GEMV
+    /// decode kernel: the ratio hand_ns/mlas_ns is "how much slower than MLAS we
+    /// are" (>1 = slower). Shapes are a probe fixture; production never hardcodes
+    /// them. Run with:
+    ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
+    ///     int4_gemv_decode_microbench -- --ignored --nocapture
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn int4_gemv_decode_microbench() {
+        use std::time::Instant;
+
+        // Median-of-5 ns/call for one warm, L3-resident M=1 GEMV.
+        fn median_ns<F: FnMut() + Send>(threads: usize, mut run: F) -> f64 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for _ in 0..30 {
+                    run();
+                }
+                let mut samples = [0.0f64; 5];
+                for sample in samples.iter_mut() {
+                    let iters = 300u32;
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        run();
+                    }
+                    *sample = start.elapsed().as_secs_f64() * 1e9 / iters as f64;
+                }
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                samples[2]
+            })
+        }
+
+        let block_size = 32usize;
+        let dot_kernel = selected_dot_kernel();
+        // (label, K, N) for one Qwen3-0.6B (hidden=1024, intermediate=3072,
+        // vocab=151936) decode token. qkv is the fused q(2048)+k(1024)+v(1024).
+        let shapes: &[(&str, usize, usize)] = &[
+            ("qkv_proj", 1024, 4096),
+            ("o_proj", 2048, 1024),
+            ("gate_proj", 1024, 3072),
+            ("up_proj", 1024, 3072),
+            ("down_proj", 3072, 1024),
+            ("lm_head", 1024, 151936),
+        ];
+
+        eprintln!(
+            "int4 GEMV M=1 microbench (Qwen3-0.6B shapes), dot_kernel={dot_kernel:?}, median-of-5"
+        );
+        for &(label, k, n) in shapes {
+            let weights_nk = pseudo(n * k, 0.3);
+            let (packed_bytes, scales, _zps, _dq) = quantize(&weights_nk, n, k, block_size, false);
+            let int4_weight = PackedInt4Weight {
+                values: packed_bytes.clone(),
+                scales: scales.clone(),
+            };
+            let mlas_packed = mlas_sys::SQNBitPackedB::new(
+                n,
+                k,
+                4,
+                block_size,
+                mlas_sys::SQNBitComputeType::Int8,
+                &packed_bytes,
+                &scales,
+                None,
+            )
+            .expect("MLAS SQNBit int4 must be available for the perf probe");
+            let a = pseudo(k, 0.8);
+            let weight_bytes = (n as f64) * (k as f64) / 2.0;
+            let flops = 2.0 * (n as f64) * (k as f64);
+
+            for threads in [1usize, 32] {
+                let hand_ns = median_ns(threads, || {
+                    let mut out = vec![0.0f32; n];
+                    int4_matmul_m1(&a, &int4_weight, &mut out, k, n, dot_kernel);
+                });
+                let mlas_ns = median_ns(threads, || {
+                    let mut out = vec![0.0f32; n];
+                    mlas_sys::sqnbit_gemm(&mlas_packed, 1, &a, None, &mut out, true);
+                });
+                let hand_gbs = weight_bytes / hand_ns;
+                let mlas_gbs = weight_bytes / mlas_ns;
+                let hand_gflops = flops / hand_ns;
+                let mlas_gflops = flops / mlas_ns;
+                eprintln!(
+                    "{label:10} K={k:6} N={n:6} {threads:2}t: \
+                     hand {hand_ns:8.0}ns {hand_gbs:6.1}GB/s {hand_gflops:6.1}GF | \
+                     mlas {mlas_ns:8.0}ns {mlas_gbs:6.1}GB/s {mlas_gflops:6.1}GF | \
+                     ratio(hand/mlas)={:.2}x",
+                    hand_ns / mlas_ns
+                );
             }
         }
     }
