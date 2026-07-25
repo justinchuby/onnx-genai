@@ -2319,16 +2319,7 @@ fn quantize_activation_signed(
             continue;
         }
         let src = &activation[start..real_end];
-        let max_abs = src.iter().map(|value| value.abs()).fold(0.0, f32::max);
-        if max_abs == 0.0 {
-            continue;
-        }
-        // Match MLAS bit-for-bit: scale = max_abs/127, inverse = 127/max_abs.
-        *scale = max_abs / 127.0;
-        let inverse_scale = 127.0 / max_abs;
-        for (out, &value) in out_block.iter_mut().zip(src) {
-            *out = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
-        }
+        *scale = crate::kernels::simd_quant::quantize_block_i8(src, &mut out_block[..src.len()]);
     }
     (quantized, scales)
 }
@@ -2827,16 +2818,8 @@ fn quantize_activation(
             continue;
         }
         let src = &activation[start..real_end];
-        let max_abs = src.iter().map(|value| value.abs()).fold(0.0, f32::max);
-        if max_abs == 0.0 {
-            continue;
-        }
-        *scale = max_abs / 127.0;
-        let inverse_scale = 127.0 / max_abs;
-        for (out, &value) in out_block.iter_mut().zip(src) {
-            let signed = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
-            *out = (signed as i16 + 128) as u8;
-        }
+        *scale =
+            crate::kernels::simd_quant::quantize_block_u8_offset(src, &mut out_block[..src.len()]);
     }
     (quantized, scales)
 }
@@ -3550,23 +3533,7 @@ fn eight_bit_int16_activation() -> bool {
 /// scale 0 and all-zero codes.
 fn quantize_block_i16(activation: &[f32], out: &mut [i16]) -> f32 {
     debug_assert_eq!(activation.len(), out.len());
-    let mut amax = 0.0f32;
-    for &value in activation {
-        amax = amax.max(value.abs());
-    }
-    if amax == 0.0 {
-        out.fill(0);
-        return 0.0;
-    }
-    let scale = amax / 32767.0;
-    let inv_scale = 32767.0 / amax;
-    for (code, &value) in out.iter_mut().zip(activation) {
-        // amax is the block max, so value * inv_scale is in [-32767, 32767];
-        // round-half-away and clamp defensively against fp rounding at the edge.
-        let scaled = (value * inv_scale).round();
-        *code = scaled.clamp(-32767.0, 32767.0) as i16;
-    }
-    scale
+    crate::kernels::simd_quant::quantize_block_i16(activation, out)
 }
 
 /// Activation quantization granularity (elements per int16 scale) for the 8-bit
