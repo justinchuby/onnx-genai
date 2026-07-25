@@ -78,7 +78,11 @@ fn native_engine(dir: &Path, device: NativeDecodeDevice) -> anyhow::Result<Engin
     )
 }
 
-fn generate(engine: &mut Engine, prompt_ids: Vec<u32>, max_new_tokens: usize) -> anyhow::Result<Vec<u32>> {
+fn generate(
+    engine: &mut Engine,
+    prompt_ids: Vec<u32>,
+    max_new_tokens: usize,
+) -> anyhow::Result<Vec<u32>> {
     let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt_ids));
     request.options.max_new_tokens = max_new_tokens;
     request.options.temperature = 0.0;
@@ -129,7 +133,10 @@ fn glm_tiny_quant_native_cuda_decodes_indexer_prompts() -> anyhow::Result<()> {
             "native CUDA decode for prompt {prompt_ids:?} must complete all {max_new_tokens} tokens"
         );
         for &tok in &cuda_tokens {
-            assert!(tok < 256, "generated token id {tok} is outside the tiny vocab (256)");
+            assert!(
+                tok < 256,
+                "generated token id {tok} is outside the tiny vocab (256)"
+            );
         }
     }
 

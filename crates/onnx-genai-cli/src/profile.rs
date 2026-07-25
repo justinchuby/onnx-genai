@@ -14,6 +14,8 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+use crate::memory::{format_bytes, peak_resident_bytes};
+
 /// Wall-clock timings collected across one generation.
 #[derive(Debug, Default)]
 pub(crate) struct TokenTimings {
@@ -154,6 +156,75 @@ pub(crate) struct RunProfile {
     pub(crate) prompt_tokens: Option<usize>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) prefix_cache_hit: Option<usize>,
+    pub(crate) memory: MemoryUsage,
+}
+
+/// Memory the run needed, from the kernel and from the engine's own accounting.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MemoryUsage {
+    /// Process high-water mark: weights, KV pages, ORT arenas and transients
+    /// together, which is what decides whether a model fits on a machine.
+    pub(crate) peak_resident_bytes: Option<u64>,
+    /// KV cache budget the engine sized for this model.
+    pub(crate) kv_budget_bytes: Option<u64>,
+    /// Tokens that budget holds.
+    pub(crate) kv_max_tokens: Option<u64>,
+    /// Host RAM the engine's governor accounts as in use. Zero means the
+    /// governor tracks nothing on this path, not that nothing is resident —
+    /// peak resident memory is the number to trust there.
+    pub(crate) host_ram_used_bytes: Option<u64>,
+    /// Device memory the engine's governor accounts as in use, and its ceiling.
+    ///
+    /// This is the engine's own bookkeeping, not the driver's. On a discrete
+    /// GPU it is the only device figure reported here, because device
+    /// allocations do not appear in the host process's resident set.
+    pub(crate) device_used_bytes: Option<u64>,
+    pub(crate) device_limit_bytes: Option<u64>,
+    /// What the device ceiling is carved into. Reporting only a total answers
+    /// "how much" but never "why", which is the question when a model does not
+    /// fit: weights are fixed, but the KV budget is what a longer context eats.
+    pub(crate) composition: Option<DeviceComposition>,
+}
+
+/// How the device memory ceiling is divided.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DeviceComposition {
+    pub(crate) model_weights_bytes: u64,
+    pub(crate) activations_bytes: u64,
+    pub(crate) runtime_overhead_bytes: u64,
+    pub(crate) kv_bytes: u64,
+    pub(crate) kv_pages: u64,
+    pub(crate) kv_page_bytes: u64,
+}
+
+impl DeviceComposition {
+    /// Whether the fixed (non-KV) reservation was actually measured.
+    ///
+    /// The engine currently reserves zero for weights, activations, and runtime
+    /// overhead (a documented TODO in its resource governor). Printing those as
+    /// `0 B` would read as "this model has no weights", so the composition is
+    /// withheld until the engine measures it — the KV figures, which are real,
+    /// are still reported.
+    fn fixed_reservation_measured(&self) -> bool {
+        self.model_weights_bytes > 0
+            || self.activations_bytes > 0
+            || self.runtime_overhead_bytes > 0
+    }
+}
+
+impl MemoryUsage {
+    /// Sample the kernel's high-water mark. Call after the work is done.
+    pub(crate) fn sample_peak(&mut self) {
+        self.peak_resident_bytes = peak_resident_bytes();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.peak_resident_bytes.is_none()
+            && self.kv_budget_bytes.is_none()
+            && self.host_ram_used_bytes.is_none()
+            && self.device_used_bytes.is_none()
+            && self.composition.is_none()
+    }
 }
 
 impl RunProfile {
@@ -251,6 +322,101 @@ impl RunProfile {
         if let Some(reason) = &self.finish_reason {
             let _ = writeln!(out, "{:<24} {}", "finish reason", reason);
         }
+        if !self.memory.is_empty() {
+            if let Some(peak) = self.memory.peak_resident_bytes {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}",
+                    "peak resident memory",
+                    format_bytes(peak)
+                );
+            }
+            if let Some(kv) = self.memory.kv_budget_bytes {
+                let tokens = self
+                    .memory
+                    .kv_max_tokens
+                    .map(|tokens| format!(" ({tokens} tokens)"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}{tokens}",
+                    "kv cache budget",
+                    format_bytes(kv)
+                );
+            }
+            if let Some(host) = self.memory.host_ram_used_bytes.filter(|bytes| *bytes > 0) {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}",
+                    "engine host ram in use",
+                    format_bytes(host)
+                );
+            }
+            if let Some(composition) = self
+                .memory
+                .composition
+                .filter(DeviceComposition::fixed_reservation_measured)
+            {
+                let _ = writeln!(out, "device memory breakdown:");
+                for (label, bytes) in [
+                    ("  model weights", composition.model_weights_bytes),
+                    ("  activations", composition.activations_bytes),
+                    ("  runtime overhead", composition.runtime_overhead_bytes),
+                    ("  kv cache", composition.kv_bytes),
+                ] {
+                    // An unmeasured component is omitted: "0 B" beside a real
+                    // figure reads as "this model has none", which is wrong.
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let share = self
+                        .memory
+                        .device_limit_bytes
+                        .filter(|limit| *limit > 0)
+                        .map(|limit| format!("  {:>5.1}%", bytes as f64 / limit as f64 * 100.0))
+                        .unwrap_or_default();
+                    let _ = writeln!(out, "{label:<24} {:>10}{share}", format_bytes(bytes));
+                }
+                if composition.kv_pages > 0 {
+                    let _ = writeln!(
+                        out,
+                        "{:<24} {:>10} x {}",
+                        "  kv pages",
+                        composition.kv_pages,
+                        format_bytes(composition.kv_page_bytes)
+                    );
+                }
+                let unmeasured: Vec<&str> = [
+                    ("activations", composition.activations_bytes),
+                    ("runtime overhead", composition.runtime_overhead_bytes),
+                ]
+                .into_iter()
+                .filter(|(_, bytes)| *bytes == 0)
+                .map(|(label, _)| label)
+                .collect();
+                if !unmeasured.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "  ({} not yet measured by the engine)",
+                        unmeasured.join(" and ")
+                    );
+                }
+            }
+            if let Some(device) = self.memory.device_used_bytes.filter(|bytes| *bytes > 0) {
+                let limit = self
+                    .memory
+                    .device_limit_bytes
+                    .filter(|bytes| *bytes > 0)
+                    .map(|limit| format!(" of {}", format_bytes(limit)))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}{limit}",
+                    "device memory in use",
+                    format_bytes(device)
+                );
+            }
+        }
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
         // only exists when the engine's stage profiler was enabled.
@@ -320,6 +486,39 @@ impl RunProfile {
         }
         if let Some(reason) = &self.finish_reason {
             fields.push(format!("\"finish_reason\":{}", json_string(reason)));
+        }
+        if let Some(peak) = self.memory.peak_resident_bytes {
+            fields.push(format!("\"peak_resident_bytes\":{peak}"));
+        }
+        if let Some(kv) = self.memory.kv_budget_bytes {
+            fields.push(format!("\"kv_cache_budget_bytes\":{kv}"));
+        }
+        if let Some(tokens) = self.memory.kv_max_tokens {
+            fields.push(format!("\"kv_cache_max_tokens\":{tokens}"));
+        }
+        if let Some(host) = self.memory.host_ram_used_bytes.filter(|bytes| *bytes > 0) {
+            fields.push(format!("\"engine_host_ram_bytes\":{host}"));
+        }
+        if let Some(device) = self.memory.device_used_bytes.filter(|bytes| *bytes > 0) {
+            fields.push(format!("\"device_memory_bytes\":{device}"));
+        }
+        if let Some(limit) = self.memory.device_limit_bytes.filter(|bytes| *bytes > 0) {
+            fields.push(format!("\"device_memory_limit_bytes\":{limit}"));
+        }
+        if let Some(composition) = self
+            .memory
+            .composition
+            .filter(DeviceComposition::fixed_reservation_measured)
+        {
+            fields.push(format!(
+                "\"device_memory_breakdown\":{{\"model_weights_bytes\":{},\"activations_bytes\":{},\"runtime_overhead_bytes\":{},\"kv_bytes\":{},\"kv_pages\":{},\"kv_page_bytes\":{}}}",
+                composition.model_weights_bytes,
+                composition.activations_bytes,
+                composition.runtime_overhead_bytes,
+                composition.kv_bytes,
+                composition.kv_pages,
+                composition.kv_page_bytes
+            ));
         }
         format!("{{{}}}", fields.join(","))
     }
@@ -448,6 +647,142 @@ mod tests {
         assert!((value["denoise_steps"].as_f64().unwrap() - 25.0).abs() < 1e-6);
         assert!((value["time_to_first_token_ms"].as_f64().unwrap() - 200.0).abs() < 1e-6);
         assert!(value["decode_tokens_per_second"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn memory_is_reported_when_measured_and_omitted_when_not() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        assert!(
+            !profile.to_text().contains("peak resident memory"),
+            "an unmeasured platform must not invent a number"
+        );
+
+        profile.memory.peak_resident_bytes = Some(3 * 1024 * 1024);
+        profile.memory.kv_budget_bytes = Some(1024 * 1024);
+        profile.memory.kv_max_tokens = Some(4096);
+        profile.memory.device_used_bytes = Some(2 * 1024 * 1024 * 1024);
+        profile.memory.device_limit_bytes = Some(8 * 1024 * 1024 * 1024);
+
+        let text = profile.to_text();
+        assert!(text.contains("peak resident memory"), "{text}");
+        assert!(text.contains("3.0 MiB"), "{text}");
+        assert!(text.contains("4096 tokens"), "{text}");
+        // Device memory is reported separately: on a discrete GPU it is invisible
+        // to the host resident set.
+        assert!(text.contains("device memory in use"), "{text}");
+        assert!(text.contains("2.0 GiB of 8.0 GiB"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["peak_resident_bytes"], 3 * 1024 * 1024);
+        assert_eq!(value["kv_cache_max_tokens"], 4096);
+        assert_eq!(value["device_memory_bytes"], 2u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_device_breakdown_names_where_memory_went() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.device_limit_bytes = Some(8 * 1024 * 1024 * 1024);
+        profile.memory.composition = Some(DeviceComposition {
+            model_weights_bytes: 2 * 1024 * 1024 * 1024,
+            activations_bytes: 512 * 1024 * 1024,
+            runtime_overhead_bytes: 256 * 1024 * 1024,
+            kv_bytes: 4 * 1024 * 1024 * 1024,
+            kv_pages: 2048,
+            kv_page_bytes: 2 * 1024 * 1024,
+        });
+
+        let text = profile.to_text();
+
+        assert!(text.contains("device memory breakdown"), "{text}");
+        assert!(text.contains("model weights"), "{text}");
+        assert!(text.contains("kv cache"), "{text}");
+        assert!(
+            !text.contains("not yet measured"),
+            "every component was measured here:\n{text}"
+        );
+        // Shares make it obvious which component to shrink first.
+        assert!(text.contains("25.0%"), "weights share missing:\n{text}");
+        assert!(text.contains("50.0%"), "kv share missing:\n{text}");
+        assert!(text.contains("2048 x 2.0 MiB"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        let breakdown = &value["device_memory_breakdown"];
+        assert_eq!(breakdown["model_weights_bytes"], 2u64 * 1024 * 1024 * 1024);
+        assert_eq!(breakdown["kv_pages"], 2048);
+    }
+
+    #[test]
+    fn unmeasured_components_are_named_rather_than_shown_as_zero() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.device_limit_bytes = Some(4 * 1024 * 1024 * 1024);
+        // What the engine reports today: weights and KV measured, the rest not.
+        profile.memory.composition = Some(DeviceComposition {
+            model_weights_bytes: 1024 * 1024 * 1024,
+            activations_bytes: 0,
+            runtime_overhead_bytes: 0,
+            kv_bytes: 3 * 1024 * 1024 * 1024,
+            kv_pages: 100,
+            kv_page_bytes: 32 * 1024 * 1024,
+        });
+
+        let text = profile.to_text();
+
+        assert!(text.contains("model weights"), "{text}");
+        assert!(
+            !text.contains("activations                   0 B"),
+            "a zero must not read as 'no activations':\n{text}"
+        );
+        assert!(
+            text.contains("activations and runtime overhead not yet measured"),
+            "the gap must be named:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_fixed_reservation_withholds_the_breakdown() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.kv_budget_bytes = Some(1024);
+        // What the engine reports today: KV is real, the fixed reservation is
+        // still a zeroed placeholder.
+        profile.memory.composition = Some(DeviceComposition {
+            model_weights_bytes: 0,
+            activations_bytes: 0,
+            runtime_overhead_bytes: 0,
+            kv_bytes: 1024,
+            kv_pages: 4,
+            kv_page_bytes: 256,
+        });
+
+        let text = profile.to_text();
+
+        assert!(
+            !text.contains("model weights"),
+            "an unmeasured reservation must not read as a model with no weights:\n{text}"
+        );
+        // The KV budget is measured, so it is still reported.
+        assert!(text.contains("kv cache budget"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert!(value.get("device_memory_breakdown").is_none());
+    }
+
+    #[test]
+    fn an_unaccounted_device_is_omitted_rather_than_reported_as_zero() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.memory.peak_resident_bytes = Some(1024);
+        // A CPU run: the governor tracks no device bytes. Printing "0 B" would
+        // read as "the GPU used nothing" rather than "nothing was measured".
+        profile.memory.device_used_bytes = Some(0);
+
+        let text = profile.to_text();
+
+        assert!(!text.contains("device memory"), "{text}");
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert!(value.get("device_memory_bytes").is_none());
     }
 
     #[test]

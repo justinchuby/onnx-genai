@@ -54,5 +54,9 @@ const EXPECTED_TOKENS: &[u32] = &[
 #[test]
 #[ignore = "requires the shipped Foundry Phi-3.5-mini int4 artifact and a CUDA device"]
 fn phi35_mini_native_fp16_matches_ort_greedy() -> anyhow::Result<()> {
-    decode_lock::assert_native_fp16_matches_ort_greedy("PHI35_MINI_E2E_DIR", PROMPT, EXPECTED_TOKENS)
+    decode_lock::assert_native_fp16_matches_ort_greedy(
+        "PHI35_MINI_E2E_DIR",
+        PROMPT,
+        EXPECTED_TOKENS,
+    )
 }

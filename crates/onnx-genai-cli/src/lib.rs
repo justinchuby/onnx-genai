@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 
+mod memory;
 mod profile;
 use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
@@ -273,6 +274,37 @@ impl Backend {
     }
 
     /// Run one turn, streaming tokens through `callback`.
+    /// KV-cache accounting from the engine's resource governor.
+    ///
+    /// Only a single-model engine runs a governor; a pipeline reports nothing
+    /// rather than a zero that would read as "no KV cache".
+    fn kv_usage(&self) -> Option<profile::MemoryUsage> {
+        match self {
+            Self::Text(engine) => {
+                let snapshot = engine.resource_snapshot();
+                let budget = snapshot.derived_budget;
+                let breakdown = snapshot.breakdown;
+                Some(profile::MemoryUsage {
+                    kv_budget_bytes: Some(budget.kv_bytes),
+                    kv_max_tokens: Some(budget.max_total_tokens),
+                    host_ram_used_bytes: Some(snapshot.host_ram.used),
+                    device_used_bytes: Some(snapshot.vram.used),
+                    device_limit_bytes: Some(snapshot.resolved_limits.vram_bytes),
+                    peak_resident_bytes: None,
+                    composition: Some(profile::DeviceComposition {
+                        model_weights_bytes: breakdown.model_weights_bytes,
+                        activations_bytes: breakdown.activations_bytes,
+                        runtime_overhead_bytes: breakdown.ort_overhead_bytes,
+                        kv_bytes: budget.kv_bytes,
+                        kv_pages: budget.total_pages,
+                        kv_page_bytes: budget.kv_bytes.checked_div(budget.total_pages).unwrap_or(0),
+                    }),
+                })
+            }
+            Self::Pipeline(_) => None,
+        }
+    }
+
     /// Number of tokens the prompt occupies, when the backend can tell.
     fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
         match self {
@@ -649,7 +681,11 @@ impl ProfileArgs {
     }
 
     /// Emit whatever the caller asked for.
-    fn emit(&self, profile: &RunProfile) -> anyhow::Result<()> {
+    fn emit(&self, profile: &mut RunProfile) -> anyhow::Result<()> {
+        if !self.requested() {
+            return Ok(());
+        }
+        profile.memory.sample_peak();
         if self.profile {
             eprint!("{}", profile.to_text());
         }
@@ -1004,6 +1040,9 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     let mut backend = Backend::load(&model_dir)?;
     profile.phase("model load", load_started.elapsed());
     profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
+    if let Some(memory) = backend.kv_usage() {
+        profile.memory = memory;
+    }
     match run_generation_turn(&mut backend, turn, args.stream, Some(&mut profile)) {
         Ok(output) => {
             if args.stream {
@@ -1011,7 +1050,7 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             } else {
                 println!("{output}");
             }
-            profiling.emit(&profile)?;
+            profiling.emit(&mut profile)?;
             Ok(())
         }
         Err(error) if is_interrupt_error(&error) => {
@@ -1092,7 +1131,7 @@ fn generate_image(
             image.height
         );
     }
-    profiling.emit(&profile)?;
+    profiling.emit(&mut profile)?;
     Ok(())
 }
 
@@ -1152,7 +1191,7 @@ fn generate_audio(
         audio.channels,
         if audio.channels == 1 { "" } else { "s" }
     );
-    profiling.emit(&profile)?;
+    profiling.emit(&mut profile)?;
     Ok(())
 }
 
@@ -1286,13 +1325,16 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
         let mut profile = RunProfile::new(model_dir.display().to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
+        if let Some(memory) = backend.kv_usage() {
+            profile.memory = memory;
+        }
         match run_generation_turn(&mut backend, turn, true, Some(&mut profile)) {
             Ok(output) => {
                 println!();
                 history.push(ChatMessage::assistant(output));
                 // Report per turn: in a session the interesting comparison is
                 // between turns, not a single number at exit.
-                profiling.emit(&profile)?;
+                profiling.emit(&mut profile)?;
             }
             Err(error) if is_interrupt_error(&error) => {
                 // Drop the interrupted turn from history so a partial/aborted
@@ -1564,7 +1606,7 @@ fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyhow::Result<(
         }
     }
     totals.record(&mut profile);
-    profiling.emit(&profile)?;
+    profiling.emit(&mut profile)?;
     Ok(())
 }
 

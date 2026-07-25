@@ -133,9 +133,16 @@ impl EngineResourceGovernor {
         limits: ResourceLimits,
         allow_runtime_override: bool,
         kv_config: ModelKvConfig,
+        model_weights_bytes: u64,
     ) -> Result<Self, ResourceError> {
         let capacities = fallback_capacity_providers(&limits);
-        Self::new_with_capacities(limits, allow_runtime_override, capacities, kv_config)
+        Self::new_with_capacities(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            model_weights_bytes,
+        )
     }
 
     fn new_with_capacities(
@@ -143,15 +150,21 @@ impl EngineResourceGovernor {
         allow_runtime_override: bool,
         capacities: CapacityProviders,
         kv_config: ModelKvConfig,
+        model_weights_bytes: u64,
     ) -> Result<Self, ResourceError> {
-        // TODO(RULES.md #2, §26.11.4): replace provisional capacities and zero
-        // fixed reservations with vendor-neutral EP-backed device capacity/usage
-        // queries plus OS/filesystem providers for the warm and cold tiers.
+        // Model weights are measured from the package on disk (graph plus its
+        // ONNX external-data blob), so the KV budget is derived from what is
+        // actually left rather than from the whole ceiling.
+        //
+        // TODO(RULES.md #2, §26.11.4): the remaining reservations still read
+        // zero — activations and runtime overhead need runtime instrumentation,
+        // and device capacity needs a vendor-neutral EP-backed query to replace
+        // the provisional constants below.
         let inner = ResourceGovernor::new(
             limits,
             capacities,
             VramBreakdown {
-                model_weights_bytes: 0,
+                model_weights_bytes,
                 activations_bytes: 0,
                 ort_overhead_bytes: 0,
             },
@@ -293,6 +306,9 @@ pub(crate) fn resolved_host_ram_budget(
         config.limits.clone(),
         config.allow_runtime_override,
         governor_kv_config(kv_model, config)?,
+        // This resolves the host-RAM ceiling only, which the weight reservation
+        // does not affect; the model path is not in scope here.
+        0,
     )
     .context("failed to resolve the engine memory budget for decoder fixed state")?;
     Ok(governor.snapshot().resolved_limits.host_ram_bytes)
@@ -511,6 +527,7 @@ impl Engine {
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
+            onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?;
         let mut scheduler_config = config.scheduler.clone();
@@ -988,6 +1005,7 @@ impl Engine {
             config.limits.clone(),
             config.allow_runtime_override,
             governor_kv_config,
+            onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?;
         let mut scheduler_config = config.scheduler.clone();
@@ -3437,6 +3455,7 @@ mod tests {
                 page_size_bytes: 100,
                 tokens_per_page: 16,
             },
+            0,
         )
         .unwrap();
         let snapshot = governor.snapshot();
@@ -3471,6 +3490,7 @@ mod tests {
                 page_size_bytes: 100,
                 tokens_per_page: 16,
             },
+            0,
         )
         .unwrap();
         let second = EngineResourceGovernor::new_with_capacities(
@@ -3484,6 +3504,7 @@ mod tests {
                 page_size_bytes: 100,
                 tokens_per_page: 16,
             },
+            0,
         )
         .unwrap();
 
@@ -3511,6 +3532,7 @@ mod tests {
                 page_size_bytes: 1,
                 tokens_per_page: 1,
             },
+            0,
         )
         .unwrap();
         let snapshot = governor.snapshot();
@@ -3547,6 +3569,7 @@ mod tests {
                 page_size_bytes: 100,
                 tokens_per_page: 16,
             },
+            0,
         )
         .unwrap();
         governor.byte_budget().try_reserve(300).unwrap();
@@ -3588,6 +3611,7 @@ mod tests {
                 page_size_bytes: 100,
                 tokens_per_page: 16,
             },
+            0,
         )
         .unwrap();
         assert!(matches!(

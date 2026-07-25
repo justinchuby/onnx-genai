@@ -248,3 +248,95 @@ pub enum MetadataWarning {
     ConflictingForce { node: String, source_a: HintSource, source_b: HintSource },
 }
 ```
+
+## Multimodal input: the placeholder contract
+
+A vision-language package declares two things, and the runtime derives everything
+else from them. Neither is inferred from a model or vendor name.
+
+**1. How pixels become a tensor** — `preprocessing.image`, a transform program
+(decode → resize → rescale → normalize → tile/patchify) whose `outputs` bind
+produced tensors to exact `component.input` endpoints:
+
+```yaml
+preprocessing:
+  image:
+    transforms:
+      - {op: decode, outputs: [decoded]}
+      - {op: convert_rgb, inputs: [decoded], outputs: [rgb]}
+      - {op: resize, inputs: [rgb], outputs: [resized], size: 336, mode: fixed}
+      - {op: rescale, inputs: [resized], outputs: [rescaled], scale: 0.00392156862745098}
+      - {op: normalize, inputs: [rescaled], outputs: [normalized], mean: [0.5, 0.5, 0.5], std: [0.5, 0.5, 0.5]}
+    outputs:
+      - {source: normalized, name: vision_encoder.pixel_values, content: pixels, dtype: float32}
+```
+
+**2. Where the image sits in the text** — `pipeline.vision`, the placeholder
+expansion contract:
+
+```yaml
+pipeline:
+  vision:
+    image_placeholder_token_id: 262144   # marks WHERE to expand
+    image_token_id: 262145               # what is written into the expansion
+    token_count_source: per_tile         # per_tile | per_patch | from_grid
+    tokens_per_tile: 256
+```
+
+The prompt must carry exactly one `image_placeholder_token_id` per image, in
+prompt order. Before KV sizing, each placeholder is replaced by the declared run
+of `image_token_id`, whose length comes from `token_count_source`.
+
+### Callers do not write placeholders by hand
+
+Requiring a caller to type a model's private placeholder spelling would mean
+reading this file to write a prompt. Both front ends therefore insert them:
+
+- a prompt that already positions placeholders is honored verbatim;
+- a prompt that positions none gets one per image **prepended**, in the
+  conventional "images, then the question about them" order;
+- a *partial* set is rejected. The caller clearly meant to position them, and
+  guessing where the rest belong would silently change which image a sentence
+  refers to.
+
+The rule lives in `onnx_genai_server::multimodal`, shared by the CLI and
+`/v1/chat/completions`.
+
+### Audio input: two different shapes
+
+Audio arrives in one of two shapes, and only the first is implemented today.
+
+**Encoder-decoder speech recognition** (Whisper-style) — supported. A component
+declares an `input_features` input; the runtime extracts log-mel features into
+it and seeds the decoder with the model's own transcription prompt. The spoken
+audio *is* the content, so it replaces the text prompt rather than sitting
+inside it. This is what `onnx-genai transcribe`, `generate --audio`, and
+`/v1/audio/transcriptions` drive.
+
+**Audio as an embedded modality in an omni LLM** (Gemma-3n/4-style, where audio
+tokens are interleaved with text like image tokens) — **not yet implemented**.
+Structurally it is the vision contract with a different encoder: it needs an
+`audio_placeholder_token_id` / `audio_token_id` expansion contract alongside
+`pipeline.vision`, plus a `preprocessing.audio` program binding features to the
+encoder endpoint. The engine's dataflow already expresses the graph; what is
+missing is the declared contract and its expansion, not the execution. Adding it
+should generalize the existing expansion rather than duplicate it, so a package
+declares *modality → placeholder → token count* once per modality.
+
+### Prefix caching and multimodal prompts
+
+The prefix cache is a **token-id trie** keyed on the prompt's tokens, and it is
+attached to the single-model `Engine`. Multi-component pipelines — every
+multimodal path — run on `PipelineEngine`, which does not consult it, so a
+multimodal turn always reports `prefix_cache_hit_len == 0`.
+
+That is the safe default, and enabling it naively would be a **correctness bug**:
+two different images expand to the *same* run of `image_token_id`, so a
+token-only key would happily reuse KV pages computed from a different image's
+embeddings — the model would attend to the wrong picture. Extending prefix
+caching to multimodal prompts requires folding a digest of the injected
+multimodal tensors into the cache key, so that identical text with a different
+image misses.
+
+Text-only prompts do benefit today, including across CLI REPL turns: a second
+turn reuses the first turn's prompt *and* its generated tokens.

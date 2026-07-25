@@ -72,7 +72,10 @@ fn model_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_MODEL_DIR));
     if !dir.is_dir() {
-        eprintln!("skipping fp16 decode probe: model dir absent: {}", dir.display());
+        eprintln!(
+            "skipping fp16 decode probe: model dir absent: {}",
+            dir.display()
+        );
         return None;
     }
     if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {

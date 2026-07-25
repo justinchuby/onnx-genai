@@ -142,7 +142,10 @@ onnx-genai generate models/my-vlm --image cat.png --image dog.png \
 
 A *partial* set is rejected rather than topped up: once you start positioning
 placeholders, guessing where the rest belong would silently change which image a
-sentence refers to.
+sentence refers to. The metadata contract behind this is documented in
+[docs/MODEL_METADATA.md](docs/MODEL_METADATA.md#multimodal-input-the-placeholder-contract),
+which also covers how audio input differs and why multimodal prompts do not use
+the prefix cache.
 
 ### Profiling
 
@@ -165,6 +168,8 @@ decode throughput             39.28 tok/s
 end-to-end throughput         33.34 tok/s
 inter-token latency      mean 24.2 / p50 23.0 / p90 27.5 / p99 36.5 / max 36.5 ms
 finish reason            MaxTokens
+peak resident memory        2.5 GiB
+kv cache budget             7.2 GiB (314560 tokens)
 
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
@@ -183,6 +188,51 @@ per-stage table answers "ORT kernels or our orchestration?".
 Each mode adds its own counters: denoise steps and ms/step for `--output-image`,
 audio produced and real-time factor for `--output-audio`, and segments, audio
 transcribed, real-time factor and slowest segment for `transcribe`.
+
+#### What the memory numbers cover
+
+Memory is reported from two independent sources, because neither alone is the
+whole picture:
+
+| line | source | covers |
+|---|---|---|
+| `peak resident memory` | the kernel's high-water mark for this process | model weights, KV pages, ONNX Runtime arenas, and transient tensors |
+| `device memory in use` | the engine's resource governor | what the engine accounts as allocated on the device, against its own ceiling |
+| `kv cache budget` | the engine's derived budget | bytes reserved for KV, and how many tokens that holds |
+| `device memory breakdown` | the governor's fixed-reservation split | how the ceiling divides into model weights and KV cache |
+
+The breakdown answers "why doesn't this fit": weights are fixed, so the KV
+budget is what a longer context has to come out of.
+
+```text
+device memory breakdown:
+  model weights             1.8 GiB   25.7%
+  kv cache                  5.4 GiB   74.3%
+  kv pages                    14612 x 384.0 KiB
+  (activations and runtime overhead not yet measured by the engine)
+```
+
+Model weights are measured from the package on disk — the `.onnx` graph plus its
+ONNX external-data blob — and the KV budget is derived from what is left, so the
+engine no longer promises KV capacity the weights are already using. Activations
+and runtime overhead still read zero and are named as unmeasured rather than
+printed as `0 B`; they need runtime instrumentation.
+
+Two platform caveats worth knowing before you read a number as "total memory":
+
+- **Discrete GPU (CUDA):** device allocations do **not** appear in the host
+  process's resident set, so `peak resident memory` excludes VRAM entirely.
+  `device memory in use` is the figure to read — but it is the engine's own
+  accounting, not the driver's, so it does not include allocator fragmentation
+  or CUDA context overhead. A driver-level probe (`cudaMemGetInfo`) is not wired
+  up yet.
+- **Apple Silicon (unified memory):** there is no separate device pool, and GPU
+  buffers are allocated in the process's address space, so `peak resident
+  memory` already accounts for them. `device memory in use` stays absent rather
+  than reporting a misleading zero.
+
+A number that was never measured is omitted rather than printed as `0`, so an
+absent line means "not accounted here", never "nothing was used".
 
 ```bash
 # Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)

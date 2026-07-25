@@ -44,7 +44,10 @@ pub use eagle3::{
 };
 pub use env::Environment;
 pub use error::{OrtError, Result};
-pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
+pub use loader::{
+    ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths,
+    model_weight_bytes,
+};
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
 };

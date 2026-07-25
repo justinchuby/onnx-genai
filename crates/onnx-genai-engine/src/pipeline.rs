@@ -5177,6 +5177,7 @@ pipeline:
     #[test]
     fn plan_routes_prompt_encoder_outputs_to_decoder_inputs() -> anyhow::Result<()> {
         let spec = PipelineSpec {
+            audio: None,
             models: BTreeMap::from([
                 ("vision_encoder".to_string(), component("encoder")),
                 ("decoder".to_string(), component("decoder")),
@@ -5352,6 +5353,7 @@ pipeline:
     fn plan_builds_composite_single_pass_stages() -> anyhow::Result<()> {
         // Audio-to-audio codec: encoder -> decoder, both single-pass stages.
         let spec = PipelineSpec {
+            audio: None,
             models: BTreeMap::from([
                 ("encoder".to_string(), component("encoder")),
                 ("decoder".to_string(), component("decoder")),
@@ -5401,6 +5403,7 @@ pipeline:
     #[test]
     fn composite_iterative_stage_is_rejected_for_now() {
         let spec = PipelineSpec {
+            audio: None,
             models: BTreeMap::from([("encoder".to_string(), component("encoder"))]),
             dataflow: vec![],
             strategy: PipelineStrategy {

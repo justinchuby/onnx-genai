@@ -184,6 +184,11 @@ pub struct GovernorSnapshot {
     pub configured_limits: ResourceLimits,
     pub resolved_limits: ResolvedLimits,
     pub derived_budget: DerivedBudget,
+    /// What the fixed (non-KV) reservation is made of.
+    ///
+    /// `derived_budget.reserved_bytes` is the sum; this is the composition, so a
+    /// caller can report *where* device memory went rather than only how much.
+    pub breakdown: VramBreakdown,
     pub vram: TierSnapshot,
     pub host_ram: TierSnapshot,
     pub disk_spill: Option<TierSnapshot>,
@@ -506,6 +511,7 @@ impl ResourceGovernor {
             configured_limits: state.configured_limits.clone(),
             resolved_limits: state.resolved_limits,
             derived_budget: state.derived_budget,
+            breakdown: self.breakdown,
             vram: TierSnapshot::new(vram_budget.used, vram_budget.limit),
             host_ram: capacity_snapshot(
                 self.capacities.host_ram.as_ref(),

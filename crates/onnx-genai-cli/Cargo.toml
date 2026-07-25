@@ -59,6 +59,10 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+# getrusage for the peak-RSS probe; Linux reads /proc/self/status instead.
+libc = "0.2"
+
 [dev-dependencies]
 # The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
 image = { version = "0.25", default-features = false, features = ["png"] }

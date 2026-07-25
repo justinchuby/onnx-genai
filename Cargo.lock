@@ -1971,6 +1971,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "image",
+ "libc",
  "onnx-genai",
  "onnx-genai-engine",
  "onnx-genai-server",
