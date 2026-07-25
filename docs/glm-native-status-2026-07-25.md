@@ -99,16 +99,28 @@ artifact contains a native-only `pkg.nxrt::IndexShare` op.
   which recorded native q4 end-to-end decode at 148.58 tok/s.
 
 **Result:** dense GLM-5.2 q4 native decode is currently broken at the second
-generated token. The failure is an actionable shape-contract/runtime-binding
-gap at `indexer/Add_node_70`, not a numerical divergence, so an accuracy-level
-oracle is not applicable yet.
+generated token. This artifact has two standard `ai.onnx::Attention` nodes and
+no `pkg.nxrt::IndexShare` node: `indexer` here names the GLM DSA subgraph, not
+the native IndexShare kernel. The native CUDA fixed-capacity decode state
+deliberately exposes `attention_mask` at physical capacity (4096) on
+single-token steps. That is valid for the ordinary attention bias, but this
+export also feeds the mask through `Cast → Squeeze → Cast` into the indexer
+score `Add`; its other operand retains the logical prefix. Thus this is a
+native decode-time mask-binding/capacity-exposure bug, not an unsupported op,
+kernel failure, numerical divergence, or export artifact. An accuracy-level
+oracle is not applicable until the binding policy is fixed.
 
 ## Current gaps
 
-1. Restore native GLM-5.2 tiny-q4 multi-token decode by resolving the growing
-   logical-prefix (`2`, `5`, ...) versus fixed `4096` input mismatch at
-   `model/layers.0/self_attn/indexer/Add_node_70`; add a native-CUDA regression
-   that requires more than one generated token.
+1. Restore native GLM-5.2 tiny-q4 multi-token decode by changing the CUDA
+   single-token `attention_mask` exposure policy: retain its logical length
+   when a mask-dependent non-Attention consumer reaches the GLM indexer score
+   path, rather than always exposing the fixed 4096 capacity. The relevant
+   implementation is `DecodeCudaState::extend_mask` in
+   `crates/onnx-genai-engine/src/native_decode.rs`; the runtime must then keep
+   `Add_node_70` operands at the same logical prefix (`2`, `5`, ...). Add a
+   native-CUDA regression that requires more than one generated token, with
+   both `[123]` and `[1,2,3,4]` prompts.
 2. Obtain an ORT-compatible GLM-4 export/runtime supporting the
    `GroupQueryAttention.rotary_embedding_dim` partial-RoPE schema. Until then,
    GLM-4 parity, log-probability comparison, and native-vs-ORT speed claims are

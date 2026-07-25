@@ -1135,8 +1135,13 @@ Detailed measurements, exact errors, and GPU-residency evidence are in
   emits token `110`, then fails at
   `model/layers.0/self_attn/indexer/Add_node_70` because the growing logical
   prefix (`[1,1,2]`, or `[1,1,5]` with a four-token prompt) cannot broadcast
-  with `[1,1,4096]`. This regresses the historical 148.58 tok/s end-to-end
-  result. Add a native-CUDA regression requiring at least two generated tokens.
+  with `[1,1,4096]`. This q4 export has standard `Attention` nodes, not
+  `pkg.nxrt::IndexShare`; native CUDA incorrectly exposes its fixed-capacity
+  decode `attention_mask` to a mask-dependent GLM indexer score path. Restrict
+  the physical-mask exposure in `DecodeCudaState::extend_mask` to safe
+  topologies (or preserve a logical mask for this path), then add native-CUDA
+  multi-token regressions for `[123]` and `[1,2,3,4]`. This regresses the
+  historical 148.58 tok/s end-to-end result.
 - [ ] **ORT-compatible GLM-4 partial-RoPE reference:** the available ORT CUDA
   build rejects `rotary_embedding_dim` on
   `com.microsoft::GroupQueryAttention`, so GLM-4 token/log-probability parity
