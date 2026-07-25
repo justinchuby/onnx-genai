@@ -76,7 +76,7 @@ This covers INT4/INT8/UINT8/FP8 with per-tensor or per-channel granularity.
 ┌────────────────────────────────────────────────────────────────┐
 │  Model File (ONNX)                                             │
 │                                                                │
-│  QuantTypeDecl[] — structural type declarations                │
+│  QuantTypeDeclProto[] — structural type declarations                │
 │  TensorProto.quant_type_uri — "this tensor uses type X"        │
 │  QuantizedEdge[] — activation quant policies (static only)     │
 └────────────────────────────────┬───────────────────────────────┘
@@ -85,25 +85,26 @@ This covers INT4/INT8/UINT8/FP8 with per-tensor or per-channel granularity.
 ┌────────────────────────────────────────────────────────────────┐
 │  Runtime (onnx-genai)                                          │
 │                                                                │
-│  Codec Registry                                                │
-│    ├── Built-in: int4, int8, fp8, mxfp4, ...                  │
-│    ├── EP-provided: vendor types registered during EP init     │
-│    └── User plugins: installed crates / .so / WASM             │
+│  Execution Resolution Order                                    │
+│    1. EP native kernel (recognizes encoding.family)             │
+│    2. User-registered codec (runtime.register_quant_codec)      │
+│    3. Inline dequant_function execution (always available)      │
 │                                                                │
-│  Auto-Codec Generator                                          │
-│    └── Derives naive codec from QuantTypeDecl when no plugin   │
+│  DequantizeExtensible Op                                       │
+│    └── Bridges CUSTOM_QUANT tensors → float                    │
+│    └── EP fuses DequantizeExtensible → MatMul patterns          │
 │                                                                │
 │  Dispatch Chain                                                │
-│    └── EP Native → EP Dequant → Streaming Fallback Dequant     │
+│    └── EP Native → User Codec → Inline Function Fallback        │
 └────────────────────────────────────────────────────────────────┘
 ```
 
 ## 3. Type Declaration (Model-Side)
 
-### 3.1 QuantTypeDecl Schema
+### 3.1 QuantTypeDeclProto Schema
 
 ```protobuf
-message QuantTypeDecl {
+message QuantTypeDeclProto {
   // Unique identifier. Namespace rules: "onnx:" reserved for spec-blessed types,
   // "vendor:<name>:" for vendor-specific, anything else is community.
   string type_uri = 1;
@@ -112,8 +113,8 @@ message QuantTypeDecl {
   int32 block_size = 2;          // logical elements per block
   int32 bytes_per_block = 3;     // storage bytes per block
 
-  // === Encoding descriptor (required) ===
-  EncodingDescriptor encoding = 4;
+  // === Encoding descriptor (required, hints for native dispatch) ===
+  EncodingDescriptorProto encoding = 4;
 
   // === Composition (optional) ===
   ScalarType scale_type = 5;     // type of per-group scale values
@@ -121,8 +122,17 @@ message QuantTypeDecl {
   int32 group_size = 7;          // elements sharing one scale (0 = per-tensor)
   PaddingMode padding_mode = 8;  // behavior when tensor dim % group_size != 0
 
-  // === Dequant specification ===
-  DequantFormula formula = 9;    // canonical formula with explicit cast points
+  // === Dequant function (required) ===
+  // Inline ONNX FunctionProto defining canonical dequantization.
+  // Fixed signature:
+  //   input "packed": uint8[bytes_per_block]
+  //   input "scale": scale_type scalar
+  //   output "values": float32[block_size]
+  // Runtime uses encoding.family as optimization hint; falls back to
+  // executing this function when no native kernel or user codec exists.
+  FunctionProto dequant_function = 9;
+
+  // === Test vectors ===
   bytes test_vector_input = 10;  // reference: packed block bytes
   bytes test_vector_output = 11; // reference: expected f32 values (IEEE 754)
   int32 test_vector_count = 12;  // number of elements in test vector
@@ -138,44 +148,34 @@ enum EncodingFamily {
   LOOKUP_TABLE = 2;     // codebook[index] * scale
   PACKED_INTEGER = 3;   // base-N packing (ternary, quinary, etc.)
   LOGARITHMIC = 4;      // sign * scale * base^exponent
-  CUSTOM = 15;          // requires codec plugin, no auto-generation
+  CUSTOM = 15;          // no standard pattern; rely on dequant_function
 }
 
-message EncodingDescriptor {
+message EncodingDescriptorProto {
   EncodingFamily family = 1;
 
-  // Family-specific fields
+  // Family-specific fields (hints for native kernel dispatch)
   int32 packing_base = 2;       // for PACKED_INTEGER: base of the encoding (3 for ternary)
   int32 packing_radix = 3;      // elements packed per storage unit
   BitOrder bit_order = 4;       // LSB_FIRST or MSB_FIRST
   repeated float codebook = 5;  // for LOOKUP_TABLE: the fixed codebook values
-  float value_offset = 6;       // additive offset applied after decode (e.g., -1 for {0,1,2}→{-1,0,1})
+  float value_offset = 6;       // additive offset applied after decode
 
   // Nested block structure (for K-Quants, GGUF super-blocks, MXFP)
-  optional NestedBlockLayout nested = 7;
+  optional NestedBlockLayoutProto nested = 7;
 }
 
-// Nested (hierarchical) block layout for formats with super-block + sub-block
-// structure. Examples: Q2_K through Q6_K, MXFP with shared exponent.
-message NestedBlockLayout {
-  int32 super_block_size = 1;         // total elements per super-block (e.g., 256)
-  int32 sub_block_size = 2;           // elements per sub-block (e.g., 32)
-  int32 sub_blocks_per_super = 3;     // super_block_size / sub_block_size
-
-  // Fields at the super-block level (decoded once per super-block)
-  repeated BlockField super_fields = 4;
-
-  // Fields at the sub-block level (decoded once per sub-block)
-  repeated BlockField sub_fields = 5;
-
-  // Byte layout within one super-block: field order in serialized bytes.
-  // If omitted, fields are packed in declaration order:
-  // [super_fields...] [sub_block_0_fields... sub_block_0_data...] [sub_block_1...] ...
+message NestedBlockLayoutProto {
+  int32 super_block_size = 1;
+  int32 sub_block_size = 2;
+  int32 sub_blocks_per_super = 3;
+  repeated BlockFieldProto super_fields = 4;
+  repeated BlockFieldProto sub_fields = 5;
   optional BlockByteLayout byte_layout = 6;
 }
 
-message BlockField {
-  string name = 1;        // referenced in DequantFormula as "super.<name>" or "sub.<name>"
+message BlockFieldProto {
+  string name = 1;        // referenced in dequant_function graph
   int32 data_type = 2;    // TensorProto.DataType (FLOAT16, UINT8, etc.)
   int32 bits = 3;         // for sub-byte fields (e.g., 6-bit scales)
   int32 count = 4;        // number of this field per block (default 1)
@@ -193,27 +193,6 @@ message FieldRange {
   int32 byte_length = 3;
 }
 
-message DequantFormula {
-  // Canonical formula expressed as ordered steps with explicit intermediate types.
-  // Example for ternary: unpack(base3) → add(-1.0) → cast(f16) → multiply(scale)
-  repeated DequantStep steps = 1;
-}
-
-message DequantStep {
-  enum Op {
-    UNPACK = 0;    // decode packed representation to logical integers
-    ADD = 1;       // add constant (value_offset)
-    MULTIPLY = 2;  // multiply by scale
-    CAST = 3;      // cast to target type
-    LOOKUP = 4;    // index into codebook
-    SUBTRACT = 5;  // subtract zero_point
-  }
-  Op op = 1;
-  ScalarType cast_to = 2;       // for CAST
-  float constant = 3;           // for ADD/MULTIPLY with constant
-  string operand = 4;           // "scale" | "zero_point" | "codebook"
-}
-
 enum PaddingMode {
   ERROR = 0;          // reject if dimension not divisible
   ZERO_PAD = 1;       // pad partial group with zeros
@@ -228,7 +207,7 @@ message TensorProto {
   // ... existing fields ...
 
   // If set, raw_data contains packed quantized bytes interpreted by the
-  // referenced QuantTypeDecl. data_type field is set to UNDEFINED.
+  // referenced QuantTypeDeclProto. data_type field is set to CUSTOM_QUANT (32).
   string quant_type_uri = 20;
 }
 ```
@@ -244,6 +223,8 @@ extensible types will reject the model with a clear error rather than misinterpr
 
 ```rust
 /// A codec that can dequantize (and optionally quantize) a custom type.
+/// Users register these for high-performance paths; the inline dequant_function
+/// serves as the fallback when no codec is registered.
 pub trait QuantCodec: Send + Sync + 'static {
     /// Unique type URI this codec handles.
     fn type_uri(&self) -> &str;
@@ -260,56 +241,90 @@ pub trait QuantCodec: Send + Sync + 'static {
 
     /// Validate codec against declaration's test vectors.
     /// Runtime calls this once at registration time.
-    fn validate(&self, decl: &QuantTypeDecl) -> Result<(), CodecValidationError>;
+    fn validate(&self, decl: &QuantTypeDeclProto) -> Result<(), CodecValidationError>;
 }
 ```
 
-### 4.2 Codec Registry
+### 4.2 Codec Registry & Resolution
 
 ```rust
 pub struct CodecRegistry {
-    codecs: HashMap<String, Arc<dyn QuantCodec>>,
-    auto_generator: AutoCodecGenerator,
+    user_codecs: HashMap<String, Arc<dyn QuantCodec>>,
 }
 
 impl CodecRegistry {
-    /// Register a codec. Validates against known declarations.
+    /// Register a user-provided high-performance codec.
+    /// Validates against test vectors in the declaration.
     pub fn register(&mut self, codec: Arc<dyn QuantCodec>) -> Result<()>;
 
-    /// Resolve codec for a type_uri. Falls back to auto-generation if:
-    /// 1. No registered codec exists
-    /// 2. Declaration's encoding family is not CUSTOM
-    /// 3. Declaration has valid test vectors for verification
-    pub fn resolve(&self, decl: &QuantTypeDecl) -> Result<Arc<dyn QuantCodec>>;
+    /// Resolution order:
+    /// 1. EP native kernel (handled at EP level, not here)
+    /// 2. User-registered codec (this registry)
+    /// 3. Inline dequant_function execution (always available)
+    pub fn resolve(&self, type_uri: &str) -> Option<Arc<dyn QuantCodec>>;
 }
-```
 
-### 4.3 Auto-Codec Generation
-
-For types with `encoding.family != CUSTOM`, the runtime can derive a correct (but
-potentially slow) codec from the structural declaration + DequantFormula:
-
-```rust
-impl AutoCodecGenerator {
-    pub fn generate(&self, decl: &QuantTypeDecl) -> Result<Arc<dyn QuantCodec>> {
-        // 1. Parse DequantFormula steps into an interpreter
-        // 2. Build a generic block decoder
-        // 3. Validate against test vectors (MUST pass or reject)
-        let codec = InterpretedCodec::from_formula(&decl.formula)?;
-
-        // Verify correctness
-        let output = codec.dequantize_block(&decl.test_vector_input, ...);
-        assert_vectors_match(&output, &decl.test_vector_output, TOLERANCE)?;
-
-        Ok(Arc::new(codec))
+// Public API for user codec registration
+impl Runtime {
+    pub fn register_quant_codec(
+        &mut self,
+        type_uri: &str,
+        codec: impl QuantCodec,
+    ) -> Result<()> {
+        // 1. Look up QuantTypeDeclProto by type_uri
+        // 2. Validate codec against test_vector_input/output
+        // 3. Register in codec registry
     }
 }
 ```
 
-**Constraints on auto-generated codecs:**
-- Constant-time execution (no data-dependent branching) for production safety
+### 4.3 Inline Function Fallback
+
+When no EP native kernel or user codec handles a type, the runtime executes
+the inline `dequant_function` (standard ONNX FunctionProto) from the
+`QuantTypeDeclProto`. This is always correct but may be slower than native paths.
+
+```rust
+impl InlineFunctionExecutor {
+    pub fn execute_dequant(
+        &self,
+        decl: &QuantTypeDeclProto,
+        packed: &[u8],
+        scale: f32,
+    ) -> Result<Vec<f32>> {
+        // Execute decl.dequant_function as a standard ONNX graph
+        // Uses existing op execution infrastructure
+    }
+}
+```
+
+**Constraints on inline function execution:**
 - Streaming dequant (per-block, not materializing full tensor) to avoid OOM
 - Clearly marked as "fallback" in profiling/logging
+
+### 4.4 DequantizeExtensible Op
+
+A new ONNX operator that bridges `CUSTOM_QUANT` tensors to standard float ops:
+
+```
+DequantizeExtensible(input: T1, scale: T2, zero_point?: T2) → output: T3
+
+Type constraints:
+  T1: CUSTOM_QUANT
+  T2: float16, bfloat16, float32
+  T3: float16, bfloat16, float32
+
+Attributes:
+  block_size: int (from QuantTypeDeclProto)
+```
+
+**Fusion:** EPs SHOULD recognize and fuse:
+```
+DequantizeExtensible(W) → MatMul(X, W_dequant)
+→ fused: QuantizedMatMul(X, W_packed)
+```
+
+This preserves compatibility with existing ops while enabling quantized fast paths.
 
 ## 5. EP Negotiation
 
@@ -338,7 +353,7 @@ pub trait ExecutionProvider {
     fn claim_quantized_subgraph(
         &self,
         subgraph: &SubgraphView,
-        types: &[&QuantTypeDecl],
+        types: &[&QuantTypeDeclProto],
     ) -> Option<FusedKernelHandle>;
 
     /// Register EP-provided codecs into the runtime registry.
@@ -365,11 +380,11 @@ with test inputs during EP registration.
 
 ```
 Model loads → for each quantized tensor:
-  1. Resolve QuantTypeDecl from model
+  1. Resolve QuantTypeDeclProto from model
   2. Check CodecRegistry for matching codec
      → Found: use it
      → Not found + family != CUSTOM: auto-generate, validate against test vectors
-     → Not found + family == CUSTOM: error("install codec plugin: {uri}")
+     → Not found + family == CUSTOM: error("no native kernel for: {uri}")
   3. Query EPs via supports_quant_type()
      → Native: pass raw bytes to EP kernel
      → Dequant: runtime streams dequant per-block → EP computes on target type
@@ -449,9 +464,9 @@ Graph optimization passes see quantized tensors as opaque:
 
 ### 8.2 QDQ Compatibility Layer
 
-For mixed models containing both legacy QDQ nodes and new QuantTypeDecl tensors:
+For mixed models containing both legacy QDQ nodes and new QuantTypeDeclProto tensors:
 - Both representations are valid in the same model
-- Optimizer pass `ConvertQDQToExtensible` can lower QDQ patterns to QuantTypeDecl
+- Optimizer pass `ConvertQDQToExtensible` can lower QDQ patterns to QuantTypeDeclProto
   (opt-in, for models that want to migrate)
 - No forced migration: QDQ remains valid indefinitely
 
@@ -490,7 +505,7 @@ For mixed models containing both legacy QDQ nodes and new QuantTypeDecl tensors:
 
 ### 10.3 Model Trust
 
-- A model's `QuantTypeDecl` is pure data (no executable content)
+- A model's `QuantTypeDeclProto` is pure data (no executable content)
 - Worst case of a malicious declaration: runtime generates wrong results
   → mitigated by test vector validation
 - Runtime SHOULD log a warning for unrecognized community-namespace types
@@ -504,19 +519,19 @@ No change required. QDQ continues to work as-is.
 ### 11.2 For Model Converters
 
 Tools like `onnxruntime_genai` model builder and llama.cpp GGUF converters can
-emit QuantTypeDecl-based models. Conversion:
+emit QuantTypeDeclProto-based models. Conversion:
 
 ```
 GGUF model → for each tensor:
   1. Map GGUF type_id to type_uri (e.g., "onnx-community:iq2_xs/v1")
   2. Copy raw packed bytes into TensorProto.raw_data
-  3. Emit QuantTypeDecl with encoding descriptor + test vectors from GGUF spec
+  3. Emit QuantTypeDeclProto with encoding descriptor + test vectors from GGUF spec
 ```
 
 ### 11.3 For Runtime Implementers
 
 Minimum viable implementation:
-1. Parse QuantTypeDecl from model
+1. Parse QuantTypeDeclProto from model
 2. Implement auto-codec generator for families {AFFINE, SYMMETRIC, PACKED_INTEGER}
 3. Dequant all weights to f16 at load time (simple, slow, correct)
 
@@ -542,7 +557,7 @@ encoding:
   bit_order: BIT_ORDER_LSB_FIRST
 group_size: 32
 scale_data_type: FLOAT16
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                      # extract 4-bit signed int
     - { op: DEQUANT_CAST, cast_to: FLOAT16 }
@@ -566,7 +581,7 @@ encoding:
   bit_order: BIT_ORDER_LSB_FIRST
 group_size: 64
 scale_data_type: FLOAT16      # absmax scale
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                       # extract 4-bit index
     - { op: DEQUANT_LOOKUP, operand: "codebook" }  # codebook[index]
@@ -594,7 +609,7 @@ encoding:
       - { name: "shared_exp", data_type: UINT8, bits: 8 }  # E8M0 exponent
   bit_order: BIT_ORDER_LSB_FIRST
 group_size: 32
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                              # extract FP4 mantissa
     - { op: DEQUANT_CAST, cast_to: FLOAT16 }
@@ -626,7 +641,7 @@ encoding:
       - { name: "scale", bits: 6 }             # per sub-block scale
       - { name: "min", bits: 6 }               # per sub-block minimum
 group_size: 256
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                                    # extract 4-bit values
     - { op: DEQUANT_CAST, cast_to: FLOAT32 }
@@ -660,7 +675,7 @@ encoding:
       - { name: "scale", bits: 4 }
       - { name: "min", bits: 4 }
 group_size: 256
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                                    # extract 2-bit values
     - { op: DEQUANT_CAST, cast_to: FLOAT32 }
@@ -686,7 +701,7 @@ encoding:
   bit_order: BIT_ORDER_LSB_FIRST
 group_size: 32
 scale_data_type: FLOAT16
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                       # extract 4-bit index
     - { op: DEQUANT_LOOKUP, operand: "codebook" }  # codebook[index]
@@ -708,7 +723,7 @@ encoding:
   family: ENCODING_CUSTOM     # too complex for auto-generation
 group_size: 256
 scale_data_type: FLOAT16
-# No dequant_formula — requires codec plugin.
+# No dequant_formula — has no native fast-path — uses inline dequant_function.
 # Runtime without the plugin will error:
 # "Missing codec for ggml:iq1_s/v1. Install: cargo add onnx-codec-ggml"
 test_vector_packed: <50 bytes>
@@ -732,7 +747,7 @@ encoding:
   value_offset: -1.0          # map {0,1,2} → {-1,0,1}
 group_size: 64
 scale_data_type: FLOAT16
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                      # base-3 decode → {0,1,2}
     - { op: DEQUANT_ADD, constant: -1.0 }         # → {-1,0,1}
@@ -752,7 +767,7 @@ encoding:
   family: ENCODING_SYMMETRIC
 group_size: 0                 # per-tensor scale
 scale_data_type: FLOAT32
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps:
     - { op: DEQUANT_UNPACK }                      # interpret as fp8 → float
     - { op: DEQUANT_MULTIPLY, operand: "scale" }
@@ -768,7 +783,7 @@ type_uri: "onnx-community:aqlm-2x8/v1"
 block_size: 8                 # 8 weights per group
 bytes_per_block: 3            # 2 bytes (2 × 8-bit codebook indices) + 1 byte metadata
 encoding:
-  family: ENCODING_CUSTOM     # additive multi-codebook needs plugin
+  family: ENCODING_CUSTOM     # additive multi-codebook dequant_function only
 group_size: 8
 scale_data_type: FLOAT16
 # Codec implements: output[i] = sum(codebook_k[index_k][i]) * scale
@@ -794,7 +809,7 @@ encoding:
     sub_block_size: 32
     sub_blocks_per_super: 1
     sub_fields: [{name: "shared_exp", data_type: UINT8, bits: 8}]
-dequant_formula:
+dequant_function:  # equivalent ops:
   steps: [UNPACK, FP_DECODE(e3m2), CAST(f16), MULTIPLY(sub.shared_exp)]
 ```
 
@@ -821,7 +836,7 @@ scale_data_type: FLOAT16
 
 ### Summary Table
 
-| Format | bpw | Encoding Family | Nested | Auto-Codec | Notes |
+| Format | bpw | Encoding Family | Nested | Native Fast-Path | Notes |
 |--------|-----|-----------------|--------|------------|-------|
 | INT4 Symmetric | 4.5 | SYMMETRIC | No | ✅ | QDQ-equivalent |
 | NF4 (QLoRA) | 4.5 | LOOKUP_TABLE | No | ✅ | 16-entry codebook |
@@ -829,12 +844,12 @@ scale_data_type: FLOAT16
 | Q4_K | 4.5 | AFFINE | Yes (2-level) | ✅ | 6-bit sub-scales |
 | Q2_K | 2.625 | AFFINE | Yes (2-level) | ✅ | Aggressive 2-bit |
 | IQ4_NL | 4.5 | LOOKUP_TABLE | No | ✅ | Non-linear codebook |
-| IQ1_S | 1.56 | CUSTOM | N/A | ❌ (needs plugin) | Grid shifts |
+| IQ1_S | 1.56 | CUSTOM | N/A | ❌ (dequant_function only) | Grid shifts |
 | Ternary 1.58 | 1.63 | PACKED_INTEGER | No | ✅ | Base-3 |
 | FP8 E4M3 | 8.0 | SYMMETRIC | No | ✅ | Standard float |
-| AQLM 2×8 | 3.0 | CUSTOM | N/A | ❌ (needs plugin) | Multi-codebook |
+| AQLM 2×8 | 3.0 | CUSTOM | N/A | ❌ (dequant_function only) | Multi-codebook |
 | MXFP6 E3M2 | 6.125 | AFFINE | Yes | ✅ | MX shared exponent |
-| FP6 LLM (TC-FPn) | 6.125 | CUSTOM | No | ❌ (needs plugin) | Split storage for TC |
+| FP6 LLM (TC-FPn) | 6.125 | CUSTOM | No | ❌ (dequant_function only) | Split storage for TC |
 
 ## 13. Relationship to Existing `SUB4BIT_QUANT.md`
 
