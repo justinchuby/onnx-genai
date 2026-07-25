@@ -4,9 +4,30 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-24T23:15:00Z_
+_Last updated: 2026-07-25T01:15:00Z_
 
-**Current `origin/main` implementation HEAD:** `9271c881` (opt-in fp16-fused decode precision mode).
+**Current `origin/main` implementation HEAD:** `9f1618bb`.
+
+## 2026-07-25 — Uncontended H200 acc-4/fp16/ORT sweep
+
+- **Trustworthy quiet-GPU validation for #123 and #127:** on physical H200 GPU
+  6 (0 MiB, 0% utilization before every configuration), the accuracy-level-4
+  native `model` path reached **193.31 tok/s** on Phi-3.5-mini and **159.10
+  tok/s** on Qwen2.5-Coder-7B. Opt-in fp16 reached **378.89** and **300.87
+  tok/s**, respectively: **1.960×** and **1.891×** over the corrected fp32
+  activation path. This replaces the prior contended-host caveat for those
+  native absolute rates.
+- **Native beat ORT on both CUDA-targeted artifacts:** Qwen2.5-0.5B measured
+  **907.87 vs. 583.31 tok/s (1.556×)**, and DeepSeek-R1-Distill-Qwen-1.5B
+  measured **633.69 vs. 445.92 tok/s (1.421×)**. Their fp16 option was the
+  expected no-op because the graphs already use fp16 activation/scales.
+- **Honest ORT caveat for generic-CPU artifacts:** Phi and Coder measured
+  native-model/ORT ratios of **25.302×** and **5.357×**, but ORT inserted 67/57
+  `Memcpy` nodes and warned of partial CUDA EP assignment. Those ratios describe
+  the exact available artifacts, not optimized CUDA-targeted ORT exports.
+  Generated text was readable; Qwen2.5-Coder-7B had an identical backend-neutral
+  EOS/newline tail. Full medians, spreads, commands, host state, and sanity
+  notes: `docs/benchmarks/2026-07-25-uncontended-native-vs-ort-sweep.md`.
 
 ## 2026-07-24 — Accuracy-level-4 correctness and opt-in fp16 decode payoff
 
