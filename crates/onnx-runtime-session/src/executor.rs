@@ -7395,6 +7395,19 @@ mod tests {
         assert!(!kernel_input_uses_padded_capacity(&cumsum, 0));
         assert!(!kernel_input_uses_padded_capacity(&unsqueeze, 0));
         assert!(!kernel_input_uses_padded_capacity(&shape, 1));
+
+        // GLM-5.2's `indexer` attention branch consumes the attention mask
+        // through elementwise arithmetic (a `Cast`→`Add` that combines a
+        // logical-width indexer score with the mask). Such a consumer is NOT
+        // padded-capacity-safe: it must observe the logical valid length, or the
+        // padded physical capacity (`max_len`) leaks into the `Add` and fails to
+        // broadcast against the logical-width score. Because it is not in the
+        // Shape/ReduceSum allowlist, the binding is forced to expose its logical
+        // prefix — which is exactly what fixes the GLM-5.2 decode broadcast bug.
+        let indexer_add = Node::new(NodeId(4), "Add", vec![], vec![]);
+        let indexer_cast = Node::new(NodeId(5), "Cast", vec![], vec![]);
+        assert!(!kernel_input_uses_padded_capacity(&indexer_add, 0));
+        assert!(!kernel_input_uses_padded_capacity(&indexer_cast, 0));
     }
 
     struct WeightDeliveryKernel {

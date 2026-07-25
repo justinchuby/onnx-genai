@@ -311,6 +311,19 @@ impl DeviceIoBinding {
             && self.logical_shape != self.physical_shape
     }
 
+    /// Whether this input binding is configured to expose its *logical* prefix
+    /// (valid length) to kernels rather than the padded physical capacity. Unlike
+    /// [`Self::has_dynamic_logical_input_shape`], this is a *static* property of
+    /// the binding (fixed at allocation from the consumer-scoped capacity policy)
+    /// and does not depend on the current logical shape. Callers that freeze a
+    /// growing input to physical capacity for CUDA-graph eligibility must consult
+    /// this: a binding that exposes its logical prefix cannot be frozen, because
+    /// at least one consumer requires the valid length rather than the padded
+    /// capacity (e.g. GLM-5.2's indexer arithmetic branch).
+    pub fn exposes_logical_input_shape(&self) -> bool {
+        self.bind_input && self.expose_logical_input_shape
+    }
+
     pub fn set_logical_shape(&mut self, shape: Vec<usize>) -> Result<()> {
         validate_logical_shape(&self.physical_shape, &shape)?;
         self.logical_shape = shape;
@@ -876,5 +889,59 @@ mod tests {
             .collect::<Vec<_>>();
         let tensor = Tensor::from_raw(DataType::Float16, vec![2], &bytes).unwrap();
         assert_eq!(tensor.try_as_slice_u16().unwrap(), bits);
+    }
+
+    /// `exposes_logical_input_shape` is a *static* property of the binding (fixed
+    /// at allocation from the consumer-scoped capacity policy), whereas
+    /// `has_dynamic_logical_input_shape` additionally requires the current logical
+    /// shape to differ from physical. The single-token decode mask freeze relies
+    /// on this distinction: a mask that exposes its logical prefix must NOT be
+    /// frozen to physical capacity even while its logical shape still equals
+    /// physical at construction — otherwise the padded width leaks into a
+    /// non-capacity-aware consumer (GLM-5.2's indexer arithmetic).
+    #[test]
+    fn exposes_logical_is_static_while_dynamic_tracks_current_shape() {
+        // A mask-like binding that exposes its logical prefix, allocated with
+        // logical == physical (the state at decode construction time).
+        let mut logical_mask = DeviceIoBinding::allocate(
+            shared_cpu_ep(),
+            "attention_mask".into(),
+            true,
+            None,
+            DataType::Int64,
+            vec![1, 4096],
+            vec![1, 4096],
+            true,
+        )
+        .unwrap();
+        assert!(logical_mask.exposes_logical_input_shape());
+        // Not yet dynamic: logical still equals physical.
+        assert!(!logical_mask.has_dynamic_logical_input_shape());
+        // Kernels observe the logical prefix, so once decode drives the mask to
+        // the growing valid length it becomes dynamic (and forfeits capture).
+        logical_mask.set_logical_shape(vec![1, 5]).unwrap();
+        assert!(logical_mask.exposes_logical_input_shape());
+        assert!(logical_mask.has_dynamic_logical_input_shape());
+        assert_eq!(logical_mask.kernel_input_shape(), &[1, 5]);
+
+        // A capacity-exposing binding (all consumers padded-safe) never exposes
+        // its logical prefix: it stays frozen at physical capacity regardless of
+        // the current logical shape, so kernels always see the padded width.
+        let mut physical_mask = DeviceIoBinding::allocate(
+            shared_cpu_ep(),
+            "attention_mask".into(),
+            true,
+            None,
+            DataType::Int64,
+            vec![1, 4096],
+            vec![1, 5],
+            false,
+        )
+        .unwrap();
+        assert!(!physical_mask.exposes_logical_input_shape());
+        assert!(!physical_mask.has_dynamic_logical_input_shape());
+        assert_eq!(physical_mask.kernel_input_shape(), &[1, 4096]);
+        physical_mask.set_logical_shape(vec![1, 4096]).unwrap();
+        assert!(!physical_mask.exposes_logical_input_shape());
     }
 }

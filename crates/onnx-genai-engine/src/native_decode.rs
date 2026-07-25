@@ -126,6 +126,14 @@ struct DecodeCudaState {
     logits_dtype: DataType,
     greedy_result: DeviceIoBinding,
     graph_enabled: bool,
+    /// `true` when the attention-mask binding exposes its *logical* valid length
+    /// (not the padded physical capacity) to at least one consumer that is not a
+    /// capacity-aware kernel — e.g. GLM-5.2's `indexer` arithmetic branch, which
+    /// combines a logical-width score with the mask and would break if the mask
+    /// leaked at physical `max_len`. When set, single-token decode must expose the
+    /// mask at the growing logical length rather than freezing it to `max_len`,
+    /// which also forfeits CUDA-graph capture (mirroring the eager prefill path).
+    mask_exposes_logical: bool,
     graph_phase: DecodeCudaGraphPhase,
     graph_captures: u64,
     graph_replays: u64,
@@ -1274,9 +1282,11 @@ impl NativeDecodeSession {
         }
         // Single-token decode freezes the mask to physical capacity so the step
         // is CUDA-graph-capture eligible; multi-token prefill keeps the growing
-        // logical length (prefix-sensitive causal island).
+        // logical length (prefix-sensitive causal island). A mask whose logical
+        // valid length feeds a non-capacity-aware consumer (see
+        // `decode_mask_expose_len`) cannot be frozen and uses `total_len`.
         let mask_expose = if token_ids.len() == 1 {
-            state.max_len
+            state.decode_mask_expose_len(total_len)
         } else {
             total_len
         };
@@ -1524,7 +1534,7 @@ impl NativeDecodeSession {
                 state.max_len
             );
         }
-        state.extend_mask(past_len, total_len, state.max_len)?;
+        state.extend_mask(past_len, total_len, state.decode_mask_expose_len(total_len))?;
         state.write_decode_inputs(token_id, past_len)?;
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
@@ -1875,7 +1885,27 @@ impl DecodeCudaState {
                 dynamic_logical.join(", ")
             );
         }
-        let graph_enabled = graph_enabled && dynamic_logical.is_empty();
+        // The attention-mask binding (bindings[0]) is allocated with the
+        // consumer-scoped capacity policy: it exposes its logical valid length
+        // whenever any consumer is not a padded-capacity-safe kernel (Shape /
+        // ReduceSum). Such a mask cannot be frozen to physical `max_len` during
+        // single-token decode — doing so leaks the padded width into that
+        // consumer (e.g. GLM-5.2's indexer `Add`, which broadcasts the mask
+        // against a logical-width score). At construction the mask's logical and
+        // physical shapes are still equal (`max_len`), so it is not yet caught by
+        // the `has_dynamic_logical_input_shape` scan above; recognise it here from
+        // the static policy so decode drives it at the growing logical length and,
+        // like any growing logical input, forfeits CUDA-graph capture.
+        let mask_exposes_logical = bindings
+            .first()
+            .is_some_and(DeviceIoBinding::exposes_logical_input_shape);
+        if graph_enabled && mask_exposes_logical {
+            tracing::debug!(
+                "native CUDA decode graph capture disabled: attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer (e.g. an indexer arithmetic branch); single-token decode uses the growing logical mask width and continues eagerly",
+                bindings[0].input_name()
+            );
+        }
+        let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
 
         Ok(Self {
             logical_len: 0,
@@ -1891,6 +1921,7 @@ impl DecodeCudaState {
             logits_dtype,
             greedy_result,
             graph_enabled,
+            mask_exposes_logical,
             graph_phase: DecodeCudaGraphPhase::NeedsWarmup,
             graph_captures: 0,
             graph_replays: 0,
@@ -1913,6 +1944,20 @@ impl DecodeCudaState {
     /// stays CUDA-graph-capture eligible. Multi-token prefill passes `end`
     /// (the growing valid length) because the causal island is prefix-sensitive
     /// for `q_seq > 1` and must see the exact logical length.
+    /// The last-dim extent to expose for the attention mask on a single-token
+    /// decode step. Frozen to the physical capacity (`max_len`) so the step stays
+    /// CUDA-graph-capture eligible — *unless* the mask binding exposes its logical
+    /// valid length to a non-capacity-aware consumer (`mask_exposes_logical`), in
+    /// which case the true valid length (`total_len`) must be used or the padded
+    /// width leaks into that consumer's arithmetic (see [`Self::mask_exposes_logical`]).
+    fn decode_mask_expose_len(&self, total_len: usize) -> usize {
+        if self.mask_exposes_logical {
+            total_len
+        } else {
+            self.max_len
+        }
+    }
+
     fn extend_mask(&mut self, start: usize, end: usize, expose_len: usize) -> anyhow::Result<()> {
         if end > self.max_len || start > end || expose_len > self.max_len || end > expose_len {
             bail!(
