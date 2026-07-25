@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use onnx_genai::StopSequence;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingRequest {
@@ -177,11 +178,101 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ChatMessageContent {
     Text(String),
     Parts(Vec<ChatMessageContentPart>),
+}
+
+/// Content part `type` values this server understands, quoted in every
+/// rejection so a client learns the accepted set from the error alone.
+const SUPPORTED_CONTENT_PART_TYPES: &str = "\"text\", \"image_url\", \"input_audio\"";
+
+/// OpenAI's chat `content` is either a plain string or an array of typed parts.
+///
+/// This is deserialized by hand rather than with `#[serde(untagged)]` because
+/// an untagged enum collapses every inner failure into "data did not match any
+/// variant", discarding which part was wrong and why. Multimodal requests carry
+/// the most structure and therefore fail in the most ways, so each one reports
+/// its own index, its `type`, and the accepted shape.
+impl<'de> Deserialize<'de> for ChatMessageContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(text) => Ok(Self::Text(text)),
+            serde_json::Value::Array(items) => {
+                let mut parts = Vec::with_capacity(items.len());
+                for (index, item) in items.into_iter().enumerate() {
+                    parts.push(content_part(index, item).map_err(D::Error::custom)?);
+                }
+                Ok(Self::Parts(parts))
+            }
+            other => Err(D::Error::custom(format!(
+                "What: a chat message's `content` was rejected. \
+                 Why: it is {}, but content must be a string or an array of typed parts. \
+                 How: send \"content\": \"...\" for plain text, or an array of parts with `type` in {SUPPORTED_CONTENT_PART_TYPES}.",
+                json_kind(&other)
+            ))),
+        }
+    }
+}
+
+/// Human name for a JSON value's kind, for use in rejection messages.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Parse one content part, naming the offending index and `type` on failure.
+fn content_part(index: usize, value: serde_json::Value) -> Result<ChatMessageContentPart, String> {
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "What: chat message content part {index} was rejected. \
+             Why: it is {}, but every content part must be an object carrying a `type` field. \
+             How: send {{\"type\": \"text\", \"text\": \"...\"}} or another part whose `type` is in {SUPPORTED_CONTENT_PART_TYPES}.",
+            json_kind(&value)
+        )
+    })?;
+    let part_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "What: chat message content part {index} was rejected. \
+                 Why: it has no string `type` field, so the server cannot tell text from image or audio. \
+                 How: add a `type` of {SUPPORTED_CONTENT_PART_TYPES}."
+            )
+        })?
+        .to_string();
+    let shape = match part_type.as_str() {
+        "text" => "{\"type\": \"text\", \"text\": \"...\"}",
+        "image_url" => {
+            "{\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,...\" | \"https://...\"}}"
+        }
+        "input_audio" => {
+            "{\"type\": \"input_audio\", \"input_audio\": {\"data\": \"<base64>\", \"format\": \"wav\"}}"
+        }
+        other => {
+            return Err(format!(
+                "What: chat message content part {index} was rejected. \
+                 Why: its `type` is \"{other}\", which this server does not implement. \
+                 How: use a supported part type: {SUPPORTED_CONTENT_PART_TYPES}."
+            ));
+        }
+    };
+    serde_json::from_value(value).map_err(|error| {
+        format!(
+            "What: chat message content part {index} (type \"{part_type}\") was rejected. \
+             Why: {error}. \
+             How: send it as {shape}."
+        )
+    })
 }
 
 impl ChatMessageContent {
@@ -232,7 +323,7 @@ impl From<String> for ChatMessageContent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatMessageContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
@@ -240,14 +331,75 @@ pub enum ChatMessageContentPart {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageUrl {
     pub url: String,
+    /// OpenAI's fidelity hint (`auto`, `low`, `high`). Accepted for client
+    /// compatibility but not acted on: how an image is resized and tiled is
+    /// declared by the model package's `preprocessing.image` program, never
+    /// chosen by the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputAudio {
     pub data: String,
     pub format: String,
+}
+
+/// `POST /v1/images/generations` request.
+///
+/// Mirrors OpenAI's images API for the fields a local diffusion package can
+/// honor. Sampling knobs OpenAI does not expose (`negative_prompt`, `steps`,
+/// `guidance_scale`, `seed`) are documented extensions; when omitted, the
+/// package's own declared `num_steps` / `guidance_scale` are used.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageGenerationRequest {
+    pub model: String,
+    pub prompt: String,
+    /// Number of images to render. Defaults to 1.
+    #[serde(default)]
+    pub n: Option<usize>,
+    /// `"<width>x<height>"` in pixels; both must be multiples of 8.
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<ImageResponseFormat>,
+    /// End-user identifier. Accepted and ignored; this server has no per-user state.
+    #[serde(default)]
+    pub user: Option<String>,
+
+    // ── onnx-genai extensions ──
+    /// Classifier-free-guidance unconditional prompt.
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    #[serde(default)]
+    pub steps: Option<usize>,
+    #[serde(default)]
+    pub guidance_scale: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageResponseFormat {
+    #[default]
+    B64Json,
+    Url,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageGenerationResponse {
+    pub created: u64,
+    pub data: Vec<ImageData>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageData {
+    /// Base64-encoded PNG bytes.
+    pub b64_json: String,
 }
 
 #[derive(Debug, Serialize)]

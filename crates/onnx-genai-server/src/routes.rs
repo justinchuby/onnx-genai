@@ -7,10 +7,12 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Multipart, Path as AxumPath, State},
+    extract::{FromRequest, Multipart, Path as AxumPath, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
+use base64::Engine as _;
+use onnx_genai::text_to_image::TextToImageRequest;
 use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
@@ -41,7 +43,8 @@ use crate::{
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
+        ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
         StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
@@ -320,6 +323,67 @@ impl ApiError {
             message: message.into(),
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
+    }
+}
+
+/// JSON body extractor that reports rejections as OpenAI-shaped [`ApiError`]s.
+///
+/// Axum's stock `Json` rejection returns a 422 whose body is a bare
+/// "Failed to deserialize the JSON body into the target type: ..." string. That
+/// loses the what/why/how contract every user-facing failure owes the caller,
+/// so this wrapper re-frames the rejection — and passes through the detailed
+/// messages the multimodal content-part parser already produces.
+pub(crate) struct ApiJson<T>(pub(crate) T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
+        }
+    }
+}
+
+/// Drop serde's trailing " at line N column M", which points into a body the
+/// caller cannot see and only dilutes the actionable message.
+pub(crate) fn strip_serde_position(message: &str) -> &str {
+    match message.rfind(" at line ") {
+        Some(index) if message[index..].ends_with(char::is_numeric) => message[..index].trim_end(),
+        _ => message,
+    }
+}
+
+/// Turn an axum JSON rejection into an actionable message.
+fn describe_json_rejection(rejection: &JsonRejection) -> String {
+    let text = rejection.body_text();
+    // Content-part rejections are already what/why/how; surface them verbatim
+    // rather than burying them behind axum's generic prefix.
+    if let Some(start) = text.find("What: ") {
+        return strip_serde_position(&text[start..]).to_string();
+    }
+    match rejection {
+        JsonRejection::MissingJsonContentType(_) => {
+            "What: the request was rejected before parsing. \
+             Why: it did not declare `Content-Type: application/json`. \
+             How: send the header `Content-Type: application/json` with a JSON body."
+                .to_string()
+        }
+        JsonRejection::JsonSyntaxError(_) => format!(
+            "What: the request body could not be parsed as JSON. \
+             Why: {text}. \
+             How: send a well-formed JSON object."
+        ),
+        _ => format!(
+            "What: the request body did not match this endpoint's schema. \
+             Why: {text}. \
+             How: check the field names and types against the OpenAI API reference for this endpoint."
+        ),
     }
 }
 
@@ -772,7 +836,7 @@ pub(crate) async fn delete_session(
 pub(crate) async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    ApiJson(request): ApiJson<CompletionRequest>,
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     if handle.pipeline {
@@ -804,7 +868,7 @@ pub(crate) async fn completions(
 
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
-    Json(request): Json<EmbeddingRequest>,
+    ApiJson(request): ApiJson<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_embedding_request(&request, &handle.tokenizer)?;
@@ -1208,10 +1272,124 @@ async fn stream_completion(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
+/// Maximum images one request may render, bounding a single request's cost.
+const MAX_IMAGES_PER_REQUEST: usize = 4;
+
+/// `POST /v1/images/generations` — OpenAI-compatible text-to-image.
+///
+/// Renders through the model package's own declared denoise loop; the sampler,
+/// scheduler, and component wiring all come from its metadata. Only
+/// `b64_json` is offered because this server stores nothing and therefore has
+/// no URL to hand back.
+pub(crate) async fn image_generations(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<ImageGenerationRequest>,
+) -> Result<Response, ApiError> {
+    let handle = resolve_model(&state.registry, &request.model).await?;
+    if !handle.text_to_image {
+        return Err(ApiError::bad_request(format!(
+            "What: image generation was rejected for model '{}'. \
+             Why: its package declares no denoise loop (`pipeline.strategy.denoiser`), so it cannot produce images. \
+             How: serve a diffusion package, or call /v1/chat/completions for text.",
+            handle.id
+        )));
+    }
+    if let Some(ImageResponseFormat::Url) = request.response_format {
+        return Err(ApiError::bad_request(
+            "What: response_format \"url\" was rejected. \
+             Why: this server does not host generated images, so it has no URL to return. \
+             How: request response_format \"b64_json\" and decode the base64 PNG yourself.",
+        ));
+    }
+    let count = request.n.unwrap_or(1);
+    if count == 0 || count > MAX_IMAGES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "What: n={count} was rejected. \
+             Why: each request renders between 1 and {MAX_IMAGES_PER_REQUEST} images. \
+             How: request n between 1 and {MAX_IMAGES_PER_REQUEST}."
+        )));
+    }
+    let (width, height) = parse_image_size(request.size.as_deref())?;
+
+    let render_request = TextToImageRequest {
+        prompt: request.prompt.clone(),
+        negative_prompt: request.negative_prompt.clone().unwrap_or_default(),
+        steps: request.steps,
+        guidance_scale: request.guidance_scale,
+        start_step: None,
+        seed: request.seed.unwrap_or(0),
+        width,
+        height,
+        batch_size: count,
+        tokenizer_path: None,
+        text_encoder_path: None,
+        vae_decoder: None,
+    };
+    let images = handle
+        .engine
+        .render_images(handle.model_dir.clone(), render_request)
+        .await
+        .map_err(map_generate_submit_error)?
+        .map_err(|error| ApiError::bad_request(format!("image generation failed: {error:#}")))?;
+
+    let data = images
+        .iter()
+        .map(|image| encode_png_base64(image).map(|b64_json| ImageData { b64_json }))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error: anyhow::Error| {
+            ApiError::internal(format!("image encoding failed: {error:#}"))
+        })?;
+    if data.is_empty() {
+        return Err(ApiError::internal(
+            "What: image generation returned nothing. \
+             Why: the pipeline produced fewer images than the requested batch. \
+             How: retry with n=1, or report this as a pipeline output-shape bug.",
+        ));
+    }
+
+    Ok(Json(ImageGenerationResponse {
+        created: now_unix(),
+        data,
+    })
+    .into_response())
+}
+
+/// Parse OpenAI's `"<width>x<height>"` size, defaulting to 512x512.
+fn parse_image_size(size: Option<&str>) -> Result<(usize, usize), ApiError> {
+    const DEFAULT_SIDE: usize = 512;
+    let Some(size) = size
+        .map(str::trim)
+        .filter(|size| !size.is_empty() && *size != "auto")
+    else {
+        return Ok((DEFAULT_SIDE, DEFAULT_SIDE));
+    };
+    let reject = || {
+        ApiError::bad_request(format!(
+            "What: size \"{size}\" was rejected. \
+             Why: it is not a \"<width>x<height>\" pair of positive integers. \
+             How: send a size such as \"512x512\" or \"768x512\", or omit it for 512x512."
+        ))
+    };
+    let (width, height) = size.split_once(['x', 'X']).ok_or_else(reject)?;
+    let width: usize = width.trim().parse().map_err(|_| reject())?;
+    let height: usize = height.trim().parse().map_err(|_| reject())?;
+    if width == 0 || height == 0 {
+        return Err(reject());
+    }
+    Ok((width, height))
+}
+
+/// Encode one rendered image as a base64 PNG.
+fn encode_png_base64(image: &onnx_genai::text_to_image::RenderedImage) -> anyhow::Result<String> {
+    let mut png = Vec::new();
+    onnx_genai::text_to_image::write_png(image, &mut png)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    ApiJson(request): ApiJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
@@ -1225,33 +1403,44 @@ pub(crate) async fn chat_completions(
     let input_audio = request.input_audio();
     if !image_urls.is_empty() && !input_audio.is_empty() {
         return Err(ApiError::bad_request(
-            "image and audio inputs cannot be combined in one request",
+            "What: the request mixed image and audio content parts. \
+             Why: a pipeline consumes one non-text modality per generation, so the server cannot bind both. \
+             How: send the image and the audio as separate requests.",
         ));
     }
     if input_audio.len() > 1 {
-        return Err(ApiError::bad_request(
-            "only one input_audio content part is supported per request",
-        ));
-    }
-    if !image_urls.is_empty() && !handle.pipeline {
-        return Err(ApiError::bad_request(
-            "this model does not support image input",
-        ));
+        return Err(ApiError::bad_request(format!(
+            "What: {} input_audio content parts were rejected. \
+             Why: an audio pipeline transcribes one clip per generation. \
+             How: send one input_audio part per request.",
+            input_audio.len()
+        )));
     }
     if !image_urls.is_empty() && handle.vision_input.is_none() {
-        return Err(ApiError::bad_request(
-            "this pipeline model does not support image input",
-        ));
-    }
-    if !input_audio.is_empty() && !handle.pipeline {
-        return Err(ApiError::bad_request(
-            "this model does not support audio input",
-        ));
+        return Err(ApiError::bad_request(format!(
+            "What: image input was rejected for model '{}'. \
+             Why: {}. \
+             How: serve a vision-language package, or send the message as text only.",
+            handle.id,
+            if handle.pipeline {
+                "its package declares no image preprocessing program (`preprocessing.image` bound to a component input, plus `pipeline.vision`)"
+            } else {
+                "it is a single decoder graph, not a multi-component pipeline, so it has no image encoder to bind"
+            }
+        )));
     }
     if !input_audio.is_empty() && handle.audio_input.is_none() {
-        return Err(ApiError::bad_request(
-            "this pipeline model does not support audio input",
-        ));
+        return Err(ApiError::bad_request(format!(
+            "What: audio input was rejected for model '{}'. \
+             Why: {}. \
+             How: serve a speech package, or send the message as text only.",
+            handle.id,
+            if handle.pipeline {
+                "no component of its package declares an `input_features` audio input"
+            } else {
+                "it is a single decoder graph, not a multi-component pipeline, so it has no audio encoder to bind"
+            }
+        )));
     }
     if request.stream {
         Ok(

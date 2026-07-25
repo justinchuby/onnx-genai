@@ -187,3 +187,130 @@ fn generate_renders_a_prompt_to_a_png() {
     let decoded = image::open(&out).expect("the CLI must write a readable PNG");
     assert_eq!((decoded.width(), decoded.height()), (8, 8));
 }
+
+#[test]
+fn image_and_audio_cannot_be_combined_in_one_turn() {
+    let image = sample_png();
+    let model = fixture("tiny-whisper");
+    let output = run(&[
+        "generate",
+        model.to_str().unwrap(),
+        "--image",
+        image.to_str().unwrap(),
+        "--audio",
+        model.join("tiny.wav").to_str().unwrap(),
+        "--prompt",
+        "",
+        "--raw",
+        "--max-new-tokens",
+        "1",
+    ]);
+
+    assert!(!output.status.success(), "mixing modalities must fail");
+    let message = stderr(&output);
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+}
+
+#[test]
+fn rendering_against_a_non_diffusion_model_explains_why() {
+    let out = repository_root().join("target/test-fixtures/cli-never-written.png");
+    let output = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "a cat",
+        "--output-image",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(!output.status.success(), "a text model cannot render");
+    let message = stderr(&output);
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+}
+
+#[test]
+fn rendering_rejects_sizes_that_the_vae_cannot_produce() {
+    let out = repository_root().join("target/test-fixtures/cli-bad-size.png");
+    let output = run(&[
+        "generate",
+        fixture("tiny-txt2img").to_str().unwrap(),
+        "--prompt",
+        "a cat",
+        "--width",
+        "7",
+        "--height",
+        "8",
+        "--output-image",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "a non-multiple-of-8 width must fail"
+    );
+    assert!(
+        stderr(&output).contains("multiples of 8"),
+        "message: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn show_reports_a_models_resolved_files() {
+    let output = run(&["show", fixture("tiny-llm").to_str().unwrap()]);
+
+    assert!(output.status.success(), "show failed: {}", stderr(&output));
+    let report = stdout(&output);
+    assert!(report.contains("model directory:"), "{report}");
+    assert!(report.contains("tokenizer:"), "{report}");
+}
+
+#[test]
+fn show_accepts_a_config_file_inside_the_model_directory() {
+    let output = run(&[
+        "show",
+        fixture("tiny-txt2img")
+            .join("inference_metadata.yaml")
+            .to_str()
+            .unwrap(),
+    ]);
+
+    // A file argument resolves to its parent directory; a diffusion package has
+    // no single decoder graph, so this must fail with a real message rather
+    // than silently treating the file as a directory.
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("tiny-txt2img"),
+        "the resolved package must be named: {combined}"
+    );
+}
+
+#[test]
+fn list_enumerates_model_directories() {
+    let output = run(&[
+        "list",
+        "--models-dir",
+        repository_root().join("tests/fixtures").to_str().unwrap(),
+    ]);
+
+    assert!(output.status.success(), "list failed: {}", stderr(&output));
+    let listing = stdout(&output);
+    assert!(listing.contains("tiny-llm"), "{listing}");
+    assert!(listing.contains("tiny-txt2img"), "{listing}");
+}
+
+#[test]
+fn version_reports_the_available_execution_providers() {
+    let output = run(&["version"]);
+
+    assert!(
+        output.status.success(),
+        "version failed: {}",
+        stderr(&output)
+    );
+    let report = stdout(&output);
+    assert!(report.contains("onnx-genai "), "{report}");
+    assert!(report.contains("execution providers:"), "{report}");
+}

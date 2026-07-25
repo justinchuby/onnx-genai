@@ -319,7 +319,16 @@ pub fn text_encode(
         .clone();
     let ids_value =
         Value::from_slice_i64(input_ids, &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64])?;
-    let outputs = session.run(&[(input_name.as_str(), &ids_value)])?;
+    let outputs = session
+        .run(&[(input_name.as_str(), &ids_value)])
+        .with_context(|| {
+            format!(
+                "What: the prompt could not be encoded for a batch of {batch_size}. \
+                 Why: {} rejected an input of shape [{batch_size}, {CLIP_CONTEXT_LENGTH}]. \
+                 How: a package exported with a fixed batch of 1 must be rendered one image at a time.",
+                text_encoder_path.display()
+            )
+        })?;
     let hidden = outputs
         .into_iter()
         .next()
@@ -366,8 +375,8 @@ pub fn vae_decode(
     Ok((image.to_vec_f32_lossy()?, height, width))
 }
 
-/// Save one image as an RGB8 PNG, mapping `[-1, 1]` to `[0, 255]`.
-pub fn save_png(image: &RenderedImage, path: &Path) -> Result<()> {
+/// Convert one rendered image to an RGB8 buffer, mapping `[-1, 1]` to `[0, 255]`.
+pub fn to_rgb8(image: &RenderedImage) -> Result<image::RgbImage> {
     let RenderedImage {
         width,
         height,
@@ -393,8 +402,25 @@ pub fn save_png(image: &RenderedImage, path: &Path) -> Result<()> {
             }
         }
     }
-    let buffer = image::RgbImage::from_raw(*width as u32, *height as u32, pixels)
-        .context("image buffer size mismatch")?;
+    image::RgbImage::from_raw(*width as u32, *height as u32, pixels)
+        .context("image buffer size mismatch")
+}
+
+/// Encode one rendered image as PNG bytes into `output`.
+///
+/// Used by callers that return images in-band (for example the server's
+/// base64 image responses) rather than writing a file.
+pub fn write_png(image: &RenderedImage, output: &mut Vec<u8>) -> Result<()> {
+    let buffer = to_rgb8(image)?;
+    buffer
+        .write_to(&mut std::io::Cursor::new(output), image::ImageFormat::Png)
+        .context("What: the rendered image could not be PNG-encoded. Why: the encoder rejected the RGB8 buffer. How: report this as a renderer bug.")?;
+    Ok(())
+}
+
+/// Save one image as an RGB8 PNG, mapping `[-1, 1]` to `[0, 255]`.
+pub fn save_png(image: &RenderedImage, path: &Path) -> Result<()> {
+    let buffer = to_rgb8(image)?;
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

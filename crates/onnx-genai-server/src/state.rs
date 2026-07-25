@@ -15,7 +15,7 @@ use onnx_genai_engine::FimConfig;
 use crate::{
     driver::EngineDriver,
     models_config::ModelSpec,
-    registry::{EvictionPolicy, ModelHandle, ModelRegistry},
+    registry::{EvictionPolicy, ModelHandle, ModelHandleParts, ModelRegistry},
     session::SessionRegistry,
 };
 
@@ -254,17 +254,21 @@ impl AppState {
         let config = config.validate().expect("validated server config");
         let fim_config = engine.fim_config().cloned();
         let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
-        let handle = ModelHandle::new(
-            model_id,
-            engine_driver,
-            Arc::new(tokenizer),
-            chat_template.map(Arc::new),
+        let handle = ModelHandle::new(ModelHandleParts {
+            id: model_id,
+            // Test-only constructor: the model was handed in already loaded, so
+            // there is no package directory to resolve files against.
+            model_dir: std::path::PathBuf::new(),
+            engine: engine_driver,
+            tokenizer: Arc::new(tokenizer),
+            chat_template: chat_template.map(Arc::new),
             model_max_context,
             fim_config,
-            false,
-            None,
-            None,
-        );
+            pipeline: false,
+            vision_input: None,
+            audio_input: None,
+            text_to_image: false,
+        });
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
             registry,
@@ -359,17 +363,19 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
     let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
     let fim_config = engine.fim_config().cloned();
     let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
-    Ok(ModelHandle::new(
-        model_id,
-        engine_driver,
-        Arc::new(tokenizer),
-        chat_template.map(Arc::new),
+    Ok(ModelHandle::new(ModelHandleParts {
+        id: model_id,
+        model_dir: model_dir.to_path_buf(),
+        engine: engine_driver,
+        tokenizer: Arc::new(tokenizer),
+        chat_template: chat_template.map(Arc::new),
         model_max_context,
         fim_config,
-        false,
-        None,
-        None,
-    ))
+        pipeline: false,
+        vision_input: None,
+        audio_input: None,
+        text_to_image: false,
+    }))
 }
 
 fn build_pipeline_handle(
@@ -392,16 +398,20 @@ fn build_pipeline_handle(
     } = crate::multimodal::build(&directory, &models)?;
     drop(models);
 
+    // A package that declares a denoise loop can serve image generation.
+    let text_to_image = directory.spec.strategy.denoiser.is_some();
     let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
-    Ok(ModelHandle::new(
-        model_id,
-        EngineDriver::start_pipeline(engine, config.max_queue_depth),
-        Arc::new(tokenizer),
-        chat_template.map(Arc::new),
+    Ok(ModelHandle::new(ModelHandleParts {
+        id: model_id,
+        model_dir: model_dir.to_path_buf(),
+        engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
+        tokenizer: Arc::new(tokenizer),
+        chat_template: chat_template.map(Arc::new),
         model_max_context,
-        None,
-        true,
+        fim_config: None,
+        pipeline: true,
         vision_input,
         audio_input,
-    ))
+        text_to_image,
+    }))
 }

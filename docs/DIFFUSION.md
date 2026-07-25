@@ -177,6 +177,23 @@ latent scaling — are rendered by adding `--vae-decoder vae_decoder/model.onnx`
 pipeline actually produced. The shared implementation lives in `onnx_genai::text_to_image`, which
 also backs the `render_sd` and `run_comfyui` binaries.
 
+### 3.4 Rendering over HTTP
+
+The same renderer is exposed as the OpenAI-compatible `POST /v1/images/generations`:
+
+```bash
+curl http://127.0.0.1:8080/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "sd", "prompt": "an astronaut riding a horse",
+       "negative_prompt": "blurry", "size": "512x512", "steps": 25,
+       "guidance_scale": 7.5, "seed": 0}'
+```
+
+`negative_prompt`, `steps`, `guidance_scale`, and `seed` are onnx-genai extensions to the OpenAI
+schema; omitted values fall back to the package's declared `num_steps` / `guidance_scale`. Only
+`response_format: "b64_json"` is supported, because the server does not host generated images. A
+model whose package declares no `strategy.denoiser` is rejected with a 400 that says so.
+
 ---
 
 ## 4. img2img (partial denoise)

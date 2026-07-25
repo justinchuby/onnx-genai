@@ -1,6 +1,7 @@
-use std::{collections::HashMap, sync::Arc, thread};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
 use anyhow::Context;
+use onnx_genai::text_to_image::{RenderedImage, TextToImageRequest};
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -80,6 +81,11 @@ pub(crate) enum DriverCommand {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
+    },
+    RenderImages {
+        pipeline_dir: PathBuf,
+        request: Box<TextToImageRequest>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<RenderedImage>>>,
     },
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
     SetVramLimit {
@@ -244,6 +250,36 @@ impl EngineDriver {
         Ok(rx)
     }
 
+    /// Render images on the engine thread that owns the pipeline.
+    ///
+    /// Diffusion is a single long synchronous call rather than a token stream,
+    /// so this is a plain request/response command instead of an event channel.
+    pub(crate) async fn render_images(
+        &self,
+        pipeline_dir: PathBuf,
+        request: TextToImageRequest,
+    ) -> Result<anyhow::Result<Vec<RenderedImage>>, GenerateSubmitError> {
+        let _permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(DriverCommand::RenderImages {
+                pipeline_dir,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
+    }
+
     pub(crate) async fn generate_fim(
         &self,
         prefix: String,
@@ -346,6 +382,17 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                 events,
                 permit,
             } => run_pipeline_generation(engine, *request, input, events, permit),
+            DriverCommand::RenderImages {
+                pipeline_dir,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(onnx_genai::text_to_image::render(
+                    &pipeline_dir,
+                    engine,
+                    &request,
+                ));
+            }
             DriverCommand::CreateSession(response) => {
                 let _ = response.send(Err(anyhow::anyhow!(
                     "sessions are not supported by pipeline models"
@@ -609,6 +656,13 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             reply,
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
+        }
+        DriverCommand::RenderImages { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "What: image generation was routed to a single-model engine. \
+                 Why: only a declared diffusion pipeline can run a denoise loop. \
+                 How: request a model whose package declares `strategy.denoiser`."
+            )));
         }
         DriverCommand::ResourceSnapshot(reply) => {
             let _ = reply.send(Ok(engine.resource_snapshot()));

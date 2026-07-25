@@ -760,9 +760,12 @@ async fn audio_chat_against_non_audio_model_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        body["error"]["message"],
-        "this model does not support audio input"
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+    assert!(
+        message.contains("single decoder graph"),
+        "the rejection must explain why this model cannot take audio: {message}"
     );
 }
 
@@ -954,9 +957,12 @@ async fn vision_request_against_non_pipeline_model_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        body["error"]["message"],
-        "this model does not support image input"
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+    assert!(
+        message.contains("single decoder graph"),
+        "the rejection must explain why this model cannot take images: {message}"
     );
 }
 
@@ -2313,4 +2319,453 @@ async fn concurrent_lazy_loads_of_same_id_load_once() {
     let mut ids = state.registry.ids();
     ids.sort();
     assert_eq!(ids, vec!["model-a", "model-b"]);
+}
+
+// ── OpenAI multimodal API surface ─────────────────────────────────────────────
+
+fn txt2img_state() -> AppState {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-txt2img");
+    AppState::load(&model_dir, Some("tiny-txt2img".to_string()))
+        .expect("load the tiny txt2img fixture")
+}
+
+async fn post_json(state: AppState, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+fn error_message(body: &Value) -> String {
+    body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn assert_actionable(message: &str) {
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("Why:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+}
+
+#[tokio::test]
+async fn images_generations_returns_a_base64_png() {
+    let (status, body) = post_json(
+        txt2img_state(),
+        "/v1/images/generations",
+        json!({
+            "model": "tiny-txt2img",
+            "prompt": "an astronaut riding a horse",
+            "negative_prompt": "blurry low quality",
+            "size": "8x8",
+            "steps": 3,
+            "seed": 7
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["created"].as_u64().unwrap() > 0);
+    let data = body["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 1);
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let png = STANDARD
+        .decode(data[0]["b64_json"].as_str().expect("b64_json"))
+        .expect("the payload must be standard base64");
+    let decoded = image::load_from_memory(&png).expect("the payload must be a PNG");
+    assert_eq!((decoded.width(), decoded.height()), (8, 8));
+}
+
+#[tokio::test]
+async fn images_generations_is_deterministic_for_a_fixed_seed() {
+    let request = json!({
+        "model": "tiny-txt2img",
+        "prompt": "a cat",
+        "size": "8x8",
+        "steps": 3,
+        "seed": 11
+    });
+    let (_, first) = post_json(txt2img_state(), "/v1/images/generations", request.clone()).await;
+    let (_, second) = post_json(txt2img_state(), "/v1/images/generations", request).await;
+
+    assert_eq!(first["data"][0]["b64_json"], second["data"][0]["b64_json"]);
+
+    let mut reseeded = json!({
+        "model": "tiny-txt2img",
+        "prompt": "a cat",
+        "size": "8x8",
+        "steps": 3,
+        "seed": 12
+    });
+    reseeded["seed"] = json!(12);
+    let (_, other) = post_json(txt2img_state(), "/v1/images/generations", reseeded).await;
+    assert_ne!(first["data"][0]["b64_json"], other["data"][0]["b64_json"]);
+}
+
+#[tokio::test]
+async fn images_generations_rejects_url_response_format_and_bad_size_and_n() {
+    for (body, expected) in [
+        (
+            json!({"model": "tiny-txt2img", "prompt": "x", "response_format": "url"}),
+            "response_format",
+        ),
+        (
+            json!({"model": "tiny-txt2img", "prompt": "x", "size": "512"}),
+            "size",
+        ),
+        (
+            json!({"model": "tiny-txt2img", "prompt": "x", "n": 0}),
+            "n=0",
+        ),
+        (
+            json!({"model": "tiny-txt2img", "prompt": "x", "n": 99}),
+            "n=99",
+        ),
+    ] {
+        let (status, response) = post_json(txt2img_state(), "/v1/images/generations", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "response: {response}");
+        let message = error_message(&response);
+        assert_actionable(&message);
+        assert!(message.contains(expected), "message: {message}");
+    }
+}
+
+#[tokio::test]
+async fn images_generations_rejects_a_model_without_a_denoise_loop() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/images/generations",
+        json!({"model": "tiny-llm", "prompt": "a cat"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert_actionable(&message);
+    assert!(message.contains("denoiser"), "message: {message}");
+}
+
+#[tokio::test]
+async fn unknown_content_part_types_are_rejected_by_name() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "input_video", "input_video": {"data": "..."}}
+                ]
+            }],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert_actionable(&message);
+    assert!(
+        message.contains("input_video") && message.contains("content part 1"),
+        "the offending part and its index must be named: {message}"
+    );
+    assert!(
+        message.contains("image_url"),
+        "the accepted types must be listed: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_image_url_part_names_the_part_and_the_expected_shape() {
+    // A common client mistake: image_url sent as a bare string.
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": "https://example.invalid/cat.png"}]
+            }],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert_actionable(&message);
+    assert!(
+        message.contains("content part 0") && message.contains("image_url"),
+        "message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn content_parts_must_be_objects_with_a_type() {
+    for (content, expected) in [
+        (json!(["just a string"]), "content part 0"),
+        (json!([{"text": "no type here"}]), "`type`"),
+        (json!(42), "content"),
+    ] {
+        let (status, body) = post_json(
+            tiny_state(),
+            "/v1/chat/completions",
+            json!({
+                "model": "tiny-llm",
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 1
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        let message = error_message(&body);
+        assert_actionable(&message);
+        assert!(message.contains(expected), "message: {message}");
+    }
+}
+
+#[tokio::test]
+async fn image_url_detail_is_accepted_for_client_compatibility() {
+    // The official OpenAI clients always send `detail`; it must not be a 400.
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri(), "detail": "low"}}
+                ]
+            }],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    // The request parses; it is then rejected because tiny-llm has no vision
+    // contract, which proves `detail` was accepted rather than fatal.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert!(
+        message.contains("image input was rejected"),
+        "detail must parse, not fail deserialization: {message}"
+    );
+}
+
+#[tokio::test]
+async fn mixed_image_and_audio_parts_are_rejected_with_guidance() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}},
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]
+            }],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert_actionable(&message);
+    assert!(message.contains("separate requests"), "message: {message}");
+}
+
+#[tokio::test]
+async fn a_json_syntax_error_is_reported_as_an_actionable_400() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{\"model\": "))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_actionable(&error_message(&body));
+}
+
+#[tokio::test]
+async fn chat_completions_routes_an_image_url_through_the_declared_vision_contract() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
+    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string()))
+        .expect("load the vision-input fixture");
+
+    let (status, body) = post_json(
+        state,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-vlm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe <image>"},
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri(), "detail": "auto"}}
+                ]
+            }],
+            "max_tokens": 3
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content");
+    // The fixture's decoder always predicts the image token, rendered as `img`.
+    // Seeing it proves the data URI was decoded, preprocessed into
+    // `encoder.pixel_values`, and that the placeholder was expanded.
+    assert!(content.contains("img"), "content: {content:?}");
+    assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn chat_completions_streams_an_image_turn() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
+    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string()))
+        .expect("load the vision-input fixture");
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-vlm",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe <image>"},
+                                {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
+                            ]
+                        }],
+                        "max_tokens": 2,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let events = sse_json_events(&bytes);
+    assert!(!events.is_empty(), "the image turn must stream chunks");
+    let streamed: String = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert!(streamed.contains("img"), "streamed: {streamed:?}");
+}
+
+#[tokio::test]
+async fn chat_completions_transcribes_input_audio() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-whisper");
+    let state = AppState::load(&model_dir, Some("tiny-whisper".to_string()))
+        .expect("load the audio fixture");
+    let wav = std::fs::read(model_dir.join("tiny.wav")).expect("fixture WAV");
+
+    let (status, body) = post_json(
+        state,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-whisper",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": STANDARD.encode(&wav), "format": "wav"}}
+                ]
+            }],
+            "max_tokens": 2
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("assistant content");
+    assert!(!content.is_empty(), "the transcript must not be empty");
+}
+
+#[tokio::test]
+async fn an_unsupported_audio_format_names_the_supported_one() {
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-whisper");
+    let state = AppState::load(&model_dir, Some("tiny-whisper".to_string()))
+        .expect("load the audio fixture");
+
+    let (status, body) = post_json(
+        state,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-whisper",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}}
+                ]
+            }],
+            "max_tokens": 2
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert!(message.contains("WAV"), "message: {message}");
+}
+
+#[test]
+fn serde_position_suffixes_are_stripped_from_rejection_messages() {
+    use crate::routes::strip_serde_position;
+
+    assert_eq!(
+        strip_serde_position("What: bad part. How: fix it. at line 1 column 74"),
+        "What: bad part. How: fix it."
+    );
+    // A message that merely mentions a line is left alone.
+    assert_eq!(
+        strip_serde_position("What: something at line boundaries"),
+        "What: something at line boundaries"
+    );
 }
