@@ -778,7 +778,7 @@ fn msft_attention_asymmetric_value_and_present_cache_shapes() {
 }
 
 #[test]
-fn msft_attention_without_past_leaves_present_unresolved() {
+fn msft_attention_without_past_propagates_present_dtype_but_not_shape() {
     let mut n = with_attr(
         msft_attention_node(5, 2, 4),
         "qkv_hidden_sizes",
@@ -797,9 +797,19 @@ fn msft_attention_without_past_leaves_present_unresolved() {
         1,
     );
     assert_eq!(shape_at(&outs, 0), vec![c(2), c(3), c(64)]);
+    // ORT propagates the present cache's element type even when `past` is
+    // absent; only the SHAPE stays unresolved. In this IR an unranked shape is
+    // the empty dimension vector, so the present output must carry the
+    // propagated dtype with an EMPTY shape -- neither fully absent (dtype
+    // dropped) nor a fabricated ranked shape.
+    let present = outs[1]
+        .type_info
+        .as_ref()
+        .expect("present cache dtype must be propagated when past is absent");
+    assert_eq!(present.dtype, DataType::Float32);
     assert!(
-        outs[1].type_info.is_none(),
-        "present shape must remain unresolved when past is absent"
+        present.shape.is_empty(),
+        "present shape must stay unranked (empty) when past is absent"
     );
 }
 

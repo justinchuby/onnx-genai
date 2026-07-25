@@ -380,7 +380,10 @@ pub fn attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// optional packed present cache is
 /// `(2, batch, num_heads, past_sequence + sequence, q_head_size)`, except when
 /// `past_present_share_buffer=1`, where present and past share a buffer so the
-/// present cache keeps the past input's shape (dim 3 preserved).
+/// present cache keeps the past input's shape (dim 3 preserved). The present
+/// cache's dtype is propagated independently of its shape: even when `past` is
+/// absent (so the shape stays unranked) the element type is still set, matching
+/// ORT's `AttentionTypeAndShapeInference`.
 pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let input = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
     let weights = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
@@ -438,44 +441,57 @@ pub fn msft_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError>
     let sequence = input[1].clone();
     ctx.set_output(0, dtype, vec![batch.clone(), sequence.clone(), v_hidden]);
 
-    if ctx.num_outputs() > 1
-        && let Some(past) = ctx.input_shape(4).map(<[DimExpr]>::to_vec)
-        && past.len() == 5
-    {
-        let head_size = q_hidden
-            .checked_div(&num_heads)
-            .unwrap_or_else(|| ctx.fresh_dim());
-        // When `past_present_share_buffer=1`, present and past alias the same
-        // buffer, so ORT's `AttentionTypeAndShapeInference` keeps the present
-        // cache the SAME shape as the past input (dim 3 = the shared buffer's
-        // `max_sequence_length`). Only with the default `0` does dim 3 grow to
-        // `past_sequence_length + sequence_length`, and only when both lengths
-        // are statically known. Without a past shape, ORT leaves present
-        // unresolved.
-        let share_buffer = ctx
-            .node
-            .attr("past_present_share_buffer")
-            .and_then(Attribute::as_int)
-            .unwrap_or(0)
-            != 0;
-        let total_sequence = if share_buffer {
-            past[3].clone()
-        } else if past[3].as_const().is_some() && sequence.as_const().is_some() {
-            past[3].add(&sequence)
-        } else {
-            ctx.fresh_dim()
+    if ctx.num_outputs() > 1 {
+        // ORT's `AttentionTypeAndShapeInference` propagates the present cache's
+        // ELEMENT TYPE (`propagateElemTypeFromInputToOutput`) unconditionally
+        // and *before* any shape reasoning; only the present *shape* depends on
+        // the `past` cache. The dtype is therefore set here in every case,
+        // while the shape is resolved only when `past` supplies one.
+        //
+        // When `past` is absent ORT emits output 1 with an element type but no
+        // `TensorShapeProto` -- dtype known, shape unranked. This IR encodes an
+        // absent shape as the empty dimension vector: the loader maps a missing
+        // `TensorShapeProto` to an empty `Shape` (see `onnx_runtime_ir::shape`),
+        // so an empty `TypedShape` here reproduces ORT's exact output-1 state.
+        // This is deliberately NOT a rank-0 scalar claim about the KV cache; the
+        // framework's `TypeInfo` couples dtype with a known-rank shape and has
+        // no dtype-only channel, so the empty shape is the honest expressible
+        // representation of "dtype propagated, shape unresolved".
+        let present_shape = match ctx.input_shape(4).map(<[DimExpr]>::to_vec) {
+            Some(past) if past.len() == 5 => {
+                let head_size = q_hidden
+                    .checked_div(&num_heads)
+                    .unwrap_or_else(|| ctx.fresh_dim());
+                // When `past_present_share_buffer=1`, present and past alias the
+                // same buffer, so ORT keeps the present cache the SAME shape as
+                // the past input (dim 3 = the shared buffer's
+                // `max_sequence_length`). Only with the default `0` does dim 3
+                // grow to `past_sequence_length + sequence_length`, and only
+                // when both lengths are statically known.
+                let share_buffer = ctx
+                    .node
+                    .attr("past_present_share_buffer")
+                    .and_then(Attribute::as_int)
+                    .unwrap_or(0)
+                    != 0;
+                let total_sequence = if share_buffer {
+                    past[3].clone()
+                } else if past[3].as_const().is_some() && sequence.as_const().is_some() {
+                    past[3].add(&sequence)
+                } else {
+                    ctx.fresh_dim()
+                };
+                vec![
+                    DimExpr::constant(2),
+                    batch,
+                    num_heads,
+                    total_sequence,
+                    head_size,
+                ]
+            }
+            _ => Vec::new(),
         };
-        ctx.set_output(
-            1,
-            dtype,
-            vec![
-                DimExpr::constant(2),
-                batch,
-                num_heads,
-                total_sequence,
-                head_size,
-            ],
-        );
+        ctx.set_output(1, dtype, present_shape);
     }
     Ok(())
 }
