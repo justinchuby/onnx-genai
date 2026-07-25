@@ -176,14 +176,29 @@ pub(crate) fn rms_norm_dense(
     };
 
     let mut y = vec![0.0f32; x.len()];
-    for g in 0..num_groups {
-        let base = g * norm_size;
-        let slice = &x[base..base + norm_size];
-        let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
-        let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
-        for e in 0..norm_size {
-            let idx = base + e;
-            y[idx] = x[idx] * inv_rms * scale[scale_index(idx)];
+    if crate::kernels::simd_normalize::scale_shape_is_exact_identity(x_shape, axis, scale_shape) {
+        for g in 0..num_groups {
+            let base = g * norm_size;
+            let slice = &x[base..base + norm_size];
+            let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
+            let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
+            crate::kernels::simd_normalize::normalize_and_scale(
+                slice,
+                &mut y[base..base + norm_size],
+                inv_rms,
+                scale,
+            );
+        }
+    } else {
+        for g in 0..num_groups {
+            let base = g * norm_size;
+            let slice = &x[base..base + norm_size];
+            let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
+            let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
+            for e in 0..norm_size {
+                let idx = base + e;
+                y[idx] = x[idx] * inv_rms * scale[scale_index(idx)];
+            }
         }
     }
 
@@ -438,11 +453,42 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_scale_varying_by_group_does_not_use_identity_path() {
+        let x_data = [1.0f32; 4];
+        let scale_data = [10.0f32, 20.0];
+        assert!(
+            !crate::kernels::simd_normalize::scale_shape_is_exact_identity(&[2, 2], 1, &[2, 1],)
+        );
+
+        let output = rms_norm_dense(&x_data, &[2, 2], &scale_data, &[2, 1], 1, 1e-5).unwrap();
+        let inverse_rms = 1.0 / (1.0f32 + 1e-5).sqrt();
+        let expected = [
+            inverse_rms * 10.0,
+            inverse_rms * 10.0,
+            inverse_rms * 20.0,
+            inverse_rms * 20.0,
+        ];
+        assert_eq!(
+            output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rmsnorm_scale_full_normalized_shape() {
         // X=[2,3,4], axis=1, Scale=[3,4] → full normalized-axes shape.
         let x_data: Vec<f32> = (0..24).map(|v| (v as f32) - 12.0).collect();
         let x = Owned::f32(&[2, 3, 4], &x_data);
         let scale_data: Vec<f32> = (1..13).map(|v| v as f32 * 0.25).collect();
+        assert!(
+            crate::kernels::simd_normalize::scale_shape_is_exact_identity(&[2, 3, 4], 1, &[3, 4],)
+        );
         let scale = Owned::f32(&[3, 4], &scale_data);
         let mut out = Owned::zeros_f32(&[2, 3, 4]);
         RmsNormKernel {
@@ -451,10 +497,23 @@ mod tests {
         }
         .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
         .unwrap();
-        let want = reference_bcast(&x_data, &[2, 3, 4], &scale_data, &[3, 4], 1, 1e-5);
-        for (g, w) in out.to_f32().iter().zip(&want) {
-            assert!((g - w).abs() < 1e-4, "got {g}, want {w}");
+        let mut want = Vec::with_capacity(x_data.len());
+        for row in x_data.chunks_exact(12) {
+            let inverse_rms =
+                1.0 / (crate::kernels::simd_sumsq::sum_of_squares(row) / 12.0 + 1e-5).sqrt();
+            want.extend(
+                row.iter()
+                    .zip(&scale_data)
+                    .map(|(value, scale)| value * inverse_rms * scale),
+            );
         }
+        assert_eq!(
+            out.to_f32()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            want.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
