@@ -3910,6 +3910,12 @@ impl MatMulNBitsKernel {
         // and uses only registers, warp shuffles, and `__syncthreads` — no
         // per-call allocation or host synchronization — so it is legal to record
         // into and replay from a CUDA graph.
+        // Clamp the K-sized activation stage to the device's shared-memory
+        // budget: opt into >48 KB when the card allows it, and fail loudly
+        // (rather than launch-crash on a smaller consumer GPU) if K exceeds even
+        // the opt-in ceiling.
+        self.runtime
+            .configure_dynamic_shared_memory(&function, shared_mem_bytes)?;
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
@@ -4367,6 +4373,12 @@ impl MatMulNBitsKernel {
         // using only registers, warp shuffles, and `__syncthreads` — no per-call
         // allocation or host sync — so it is legal to record into and replay
         // from a CUDA graph.
+        // Clamp the K-sized activation stage to the device's shared-memory
+        // budget: opt into >48 KB when the card allows it, and fail loudly
+        // (rather than launch-crash on a smaller consumer GPU) if K exceeds even
+        // the opt-in ceiling.
+        self.runtime
+            .configure_dynamic_shared_memory(&function, shared_mem_bytes)?;
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
@@ -4762,6 +4774,12 @@ impl MatMulNBitsKernel {
         // and uses only registers, warp shuffles, and `__syncthreads` — no
         // per-call allocation or host synchronization — so it is legal to record
         // into and replay from a CUDA graph.
+        // Clamp the K-sized activation stage to the device's shared-memory
+        // budget: opt into >48 KB when the card allows it, and fail loudly
+        // (rather than launch-crash on a smaller consumer GPU) if K exceeds even
+        // the opt-in ceiling.
+        self.runtime
+            .configure_dynamic_shared_memory(&function, shared_mem_bytes)?;
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),

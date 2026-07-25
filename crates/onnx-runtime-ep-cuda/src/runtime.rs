@@ -151,6 +151,30 @@ fn reduction_launch_params(
     Some((threads, threads * bytes_per_thread))
 }
 
+/// Decide how a dynamic shared-memory request maps onto a device's per-block
+/// budgets. `default_budget` is the non-opt-in ceiling (~48&nbsp;KB on every
+/// architecture) and `optin_budget` the device-specific opt-in ceiling, both
+/// already net of the kernel's static shared memory. Returns:
+/// * `Err(())` — the request exceeds even the opt-in ceiling, so no launch on
+///   this GPU can satisfy it and the caller must route to a portable fallback.
+/// * `Ok(None)` — the request fits the default budget; launch as-is.
+/// * `Ok(Some(bytes))` — the request needs the function opted into `bytes` of
+///   dynamic shared memory before it can launch.
+fn dynamic_shared_memory_optin(
+    requested_bytes: u32,
+    default_budget: u32,
+    optin_budget: u32,
+) -> std::result::Result<Option<u32>, ()> {
+    if requested_bytes > optin_budget {
+        return Err(());
+    }
+    if requested_bytes > default_budget {
+        Ok(Some(requested_bytes))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Device context, stream, and vendor-library backends shared across the EP.
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
@@ -412,6 +436,70 @@ impl CudaRuntime {
         CudaAllocationCounts {
             allocations: self.allocations.load(Ordering::Relaxed),
             frees: self.frees.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Validate a requested dynamic shared-memory allocation against the device
+    /// limits and, when it exceeds the default (non-opt-in) per-block budget,
+    /// opt the function into the larger dynamic size the hardware supports.
+    ///
+    /// Every architecture caps *non-opt-in* dynamic shared memory at roughly
+    /// 48&nbsp;KB, while the opt-in ceiling is device specific (for example
+    /// ~100&nbsp;KB on sm_86/sm_89 consumer cards, ~163&nbsp;KB on sm_80, and
+    /// ~227&nbsp;KB on sm_90). A kernel that requests more than 48&nbsp;KB without
+    /// setting `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` fails to launch
+    /// on *any* GPU, and one that requests more than the device's opt-in ceiling
+    /// fails on that specific GPU — a request sized for an H200 can therefore
+    /// crash a consumer card outright. This helper returns a loud error (never
+    /// launching) when even the opt-in maximum cannot satisfy the request, so the
+    /// caller can route to a portable fallback instead of hitting a hard launch
+    /// failure. The static shared memory the function already reserves is
+    /// subtracted from both budgets.
+    pub fn configure_dynamic_shared_memory(
+        &self,
+        function: &CudaFunction,
+        requested_bytes: u32,
+    ) -> Result<()> {
+        let static_shared_memory = function
+            .shared_size_bytes()
+            .map_err(|error| driver_err("querying CUDA function static shared memory", error))?;
+        let static_shared_memory = u32::try_from(static_shared_memory).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: CUDA function reported invalid static shared memory {static_shared_memory}"
+            ))
+        })?;
+        let optin_budget = self
+            .capabilities
+            .max_shared_memory_per_block_optin
+            .saturating_sub(static_shared_memory);
+        let default_budget = self
+            .capabilities
+            .max_shared_memory_per_block
+            .saturating_sub(static_shared_memory);
+        match dynamic_shared_memory_optin(requested_bytes, default_budget, optin_budget) {
+            Err(()) => Err(EpError::KernelFailed(format!(
+                "cuda_ep: kernel requests {requested_bytes} dynamic shared-memory bytes, but \
+                 device SM {}.{} allows at most {optin_budget} opt-in bytes \
+                 ({static_shared_memory} already reserved statically); route this shape to a \
+                 portable kernel instead of launching",
+                self.capabilities.compute_capability.0, self.capabilities.compute_capability.1,
+            ))),
+            Ok(None) => Ok(()),
+            Ok(Some(bytes)) => {
+                let bytes_i32 = i32::try_from(bytes).map_err(|_| {
+                    EpError::KernelFailed(format!(
+                        "cuda_ep: dynamic shared-memory request {bytes} exceeds i32"
+                    ))
+                })?;
+                function
+                    .set_attribute(
+                        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        bytes_i32,
+                    )
+                    .map_err(|error| {
+                        driver_err("opting CUDA function into dynamic shared memory", error)
+                    })
+            }
         }
     }
 
@@ -870,6 +958,33 @@ mod tests {
         );
         assert_eq!(reduction_launch_params(256, 1024, 4, 768), Some((128, 512)));
         assert_eq!(reduction_launch_params(256, 1024, 8, 0), None);
+    }
+
+    #[test]
+    fn dynamic_shared_memory_optin_respects_device_budgets() {
+        let default_budget = 48 * 1024;
+        // Fits the 48 KB non-opt-in budget: launch as-is, no attribute change.
+        assert_eq!(
+            dynamic_shared_memory_optin(32 * 1024, default_budget, 227 * 1024),
+            Ok(None)
+        );
+        // Boundary: exactly the default budget still needs no opt-in.
+        assert_eq!(
+            dynamic_shared_memory_optin(default_budget, default_budget, 100 * 1024),
+            Ok(None)
+        );
+        // Over 48 KB but within a consumer (sm_86/sm_89) ~100 KB opt-in ceiling:
+        // must opt the function into the exact request.
+        assert_eq!(
+            dynamic_shared_memory_optin(64 * 1024, default_budget, 100 * 1024),
+            Ok(Some(64 * 1024))
+        );
+        // Sized for an H200 (227 KB) but launched on a 100 KB consumer card:
+        // reject loudly rather than crash at launch.
+        assert_eq!(
+            dynamic_shared_memory_optin(160 * 1024, default_budget, 100 * 1024),
+            Err(())
+        );
     }
 
     #[test]
