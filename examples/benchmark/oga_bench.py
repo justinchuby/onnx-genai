@@ -10,6 +10,7 @@ Environment:
     OGA_THREADS  ORT intra-op thread count (inter-op is fixed at 1)
     OGA_DECODE_SKIP  emitted tokens excluded before steady decode timing (default 8)
     OGA_RAW      set to 1 to encode the bare prompt WITHOUT the chat template.
+    OGA_EXPECTED_TOKEN_IDS  JSON array of token IDs required for exact parity.
                  By default the prompt is chat-templated so the input matches
                  `profile_decode` (which chat-templates too); feeding oga a raw,
                  untemplated prompt makes it decode a different base-completion
@@ -29,6 +30,8 @@ warmups = int(os.environ.get("OGA_WARMUPS", "2"))
 runs = int(os.environ.get("OGA_RUNS", "3"))
 threads = int(os.environ.get("OGA_THREADS", "0"))
 decode_skip = int(os.environ.get("OGA_DECODE_SKIP", "8"))
+expected_tokens_json = os.environ.get("OGA_EXPECTED_TOKEN_IDS")
+expected_tokens = json.loads(expected_tokens_json) if expected_tokens_json else None
 # Apply the model's chat template by default so this matches profile_decode
 # (which chat-templates the prompt). Set OGA_RAW=1 to encode the bare prompt.
 use_chat_template = os.environ.get("OGA_RAW", "0") != "1"
@@ -67,6 +70,10 @@ def one_run():
         max_length=prompt_len + max_new,
         min_length=prompt_len + max_new,
         do_sample=False,
+        repetition_penalty=1.0,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
     )
     gen = og.Generator(model, params)
     t0 = time.perf_counter()
@@ -95,6 +102,12 @@ for run in range(1, runs + 1):
         reference_tokens = generated_tokens
     elif generated_tokens != reference_tokens:
         sys.exit("greedy decode was not deterministic across measured runs")
+    if expected_tokens is not None and generated_tokens != expected_tokens:
+        sys.exit(
+            "generated token IDs diverged from OGA_EXPECTED_TOKEN_IDS:\n"
+            f"expected: {expected_tokens}\n"
+            f"actual:   {generated_tokens}"
+        )
     if len(token_times) <= decode_skip:
         sys.exit(f"only {len(token_times)} tokens emitted; OGA_DECODE_SKIP={decode_skip}")
     prefill_ms = token_times[0] * 1000.0
