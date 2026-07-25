@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //! - `serve`    — start the OpenAI-compatible HTTP server
-//! - `generate` — one-shot text generation
+//! - `generate` — one-shot text generation, or text-to-image with `--output-image`
 //! - `run`      — interactive generation REPL
 //! - `show`     — inspect a model's resolved files and metadata
 //! - `list`     — list model directories under a models directory
@@ -10,6 +10,11 @@
 //!
 //! `generate`, `run`, and `show` accept either a model directory or a config
 //! file inside it (a file resolves to its parent directory).
+//!
+//! `generate` and `run` accept image and audio input on any package whose
+//! metadata declares the corresponding contract, reusing the same preprocessing
+//! and placeholder-expansion path as the server (`onnx_genai_server::multimodal`)
+//! so both front ends behave identically.
 //!
 //! This crate is built two ways:
 //! - as the `onnx-genai` binary (`src/main.rs`) for local development, and
@@ -27,11 +32,15 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Args, Parser, Subcommand};
+use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
-use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory};
+use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer, Value};
+use onnx_genai::text_to_image::{self, TextToImageRequest, VaeDecoder};
 use onnx_genai::{
-    Engine, EngineConfig, GenerateOptions, GenerateRequest, GenerateToken, StopSequence,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken,
+    GenerateTokenCallback, StopSequence,
 };
+use onnx_genai_server::multimodal::{self, MultimodalSpecs};
 use onnx_genai_server::{ServeArgs, from_models_dir, run_serve};
 
 /// Process exit code for termination via SIGINT (Ctrl-C), matching the POSIX
@@ -40,12 +49,17 @@ const EXIT_INTERRUPTED: i32 = 130;
 
 /// Set while a generation is running so the Ctrl-C handler can distinguish an
 /// interrupt during generation (soft-cancel the current turn) from an interrupt
-/// at an idle prompt (exit the process).
+/// at an idle prompt (arm the exit).
 static GENERATING: AtomicBool = AtomicBool::new(false);
 
 /// Set by the Ctrl-C handler when a generation should be aborted. The streaming
 /// callback polls this and returns [`Interrupted`] to unwind out of the engine.
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Set once a Ctrl-C has already been observed, so the next one exits the
+/// process. Cleared whenever the user submits a new REPL line, which proves
+/// they meant to keep working rather than quit.
+static EXIT_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Guards one-time installation of the Ctrl-C handler.
 static CTRLC_HANDLER: Once = Once::new();
@@ -71,18 +85,63 @@ fn is_interrupt_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Interrupted>().is_some()
 }
 
+/// What a Ctrl-C press should do, given the session's current state.
+#[derive(Debug, PartialEq, Eq)]
+enum InterruptAction {
+    /// Abort the running generation and arm the exit.
+    CancelGeneration,
+    /// Warn that one more press exits, and arm the exit.
+    WarnThenExit,
+    /// A press already warned or cancelled: leave now.
+    Exit,
+}
+
+/// Decide what a Ctrl-C means. One press stops what is happening; two in a row
+/// exit the process.
+///
+/// `generating` is whether a turn is running, `already_cancelled` whether the
+/// current turn was already asked to stop, and `exit_armed` whether an earlier
+/// press has already offered the exit.
+fn interrupt_action(
+    generating: bool,
+    already_cancelled: bool,
+    exit_armed: bool,
+) -> InterruptAction {
+    match (generating, already_cancelled, exit_armed) {
+        (true, true, _) => InterruptAction::Exit,
+        (true, false, _) => InterruptAction::CancelGeneration,
+        (false, _, true) => InterruptAction::Exit,
+        (false, _, false) => InterruptAction::WarnThenExit,
+    }
+}
+
 /// Install the process-wide Ctrl-C handler exactly once.
 ///
-/// While a generation is running, Ctrl-C requests a soft-cancel of the current
-/// turn (the streaming callback observes the flag and aborts). At an idle prompt
-/// it exits the process cleanly with code 130, matching typical REPL semantics.
+/// One Ctrl-C stops what is happening; two in a row exit the process:
+/// - during a generation, the first press soft-cancels the current turn (the
+///   streaming callback observes the flag and aborts) and arms the exit, so a
+///   second press while the turn is still unwinding exits immediately;
+/// - at an idle prompt, the first press prints a hint and arms the exit, and
+///   the second exits cleanly with code 130.
+///
+/// Submitting a new REPL line disarms the exit, so a Ctrl-C much later in the
+/// session still needs two presses.
 fn install_ctrlc_handler() {
     CTRLC_HANDLER.call_once(|| {
         let result = ctrlc::set_handler(|| {
-            if GENERATING.load(Ordering::SeqCst) {
-                INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
-            } else {
-                std::process::exit(EXIT_INTERRUPTED);
+            let generating = GENERATING.load(Ordering::SeqCst);
+            let already_cancelled = INTERRUPT_REQUESTED.load(Ordering::SeqCst);
+            let exit_armed = EXIT_ARMED.load(Ordering::SeqCst);
+            match interrupt_action(generating, already_cancelled, exit_armed) {
+                InterruptAction::CancelGeneration => {
+                    INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+                    EXIT_ARMED.store(true, Ordering::SeqCst);
+                }
+                InterruptAction::WarnThenExit => {
+                    EXIT_ARMED.store(true, Ordering::SeqCst);
+                    eprintln!("\n^C  (press Ctrl-C again to exit)");
+                }
+                InterruptAction::Exit => std::process::exit(EXIT_INTERRUPTED),
             }
         });
         if let Err(error) = result {
@@ -130,16 +189,259 @@ fn build_turn_prompt(
     }
 }
 
-/// Run one generation turn, streaming tokens through `callback` and returning the
-/// accumulated assistant text.
+/// One turn's input: the rendered prompt plus any attachments staged for it.
+#[derive(Debug, Default)]
+struct TurnInput {
+    prompt: String,
+    images: Vec<PathBuf>,
+    audio: Vec<PathBuf>,
+    options: GenerateOptions,
+}
+
+/// The loaded model, which is either a single decoder graph or a declared
+/// multi-component pipeline. Only pipeline packages can accept image or audio
+/// input, and only when their metadata declares the corresponding contract.
+enum Backend {
+    Text(Box<Engine>),
+    Pipeline(Box<PipelineBackend>),
+}
+
+/// A loaded pipeline package plus the contracts needed to feed it.
+struct PipelineBackend {
+    engine: PipelineEngine,
+    tokenizer: Tokenizer,
+    multimodal: MultimodalSpecs,
+}
+
+impl Backend {
+    /// Load `model_dir`, preferring its declared pipeline when it has one.
+    fn load(model_dir: &Path) -> anyhow::Result<Self> {
+        match multimodal::load(model_dir)? {
+            Some(setup) => {
+                let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "What: the pipeline's prompt tokenizer could not be loaded from {}. \
+                         Why: {error}. \
+                         How: verify the package ships a valid tokenizer.json.",
+                        setup.tokenizer_path.display()
+                    )
+                })?;
+                let engine = Engine::from_pipeline_dir(model_dir, EngineConfig::default())?;
+                Ok(Self::Pipeline(Box::new(PipelineBackend {
+                    engine,
+                    tokenizer,
+                    multimodal: setup.multimodal,
+                })))
+            }
+            None => Ok(Self::Text(Box::new(Engine::from_dir(
+                model_dir,
+                EngineConfig::default(),
+            )?))),
+        }
+    }
+
+    /// Human-readable summary of the modalities this model accepts.
+    fn accepted_modalities(&self) -> String {
+        let mut modalities = vec!["text"];
+        if let Self::Pipeline(pipeline) = self {
+            let multimodal = &pipeline.multimodal;
+            if multimodal.vision.is_some() {
+                modalities.push("image");
+            }
+            if multimodal.audio.is_some() {
+                modalities.push("audio");
+            }
+        }
+        modalities.join(" + ")
+    }
+
+    fn supports_images(&self) -> bool {
+        matches!(self, Self::Pipeline(pipeline) if pipeline.multimodal.vision.is_some())
+    }
+
+    fn supports_audio(&self) -> bool {
+        matches!(self, Self::Pipeline(pipeline) if pipeline.multimodal.audio.is_some())
+    }
+
+    /// Reject an attachment the loaded model cannot consume, naming what it does accept.
+    fn reject_unsupported(&self, turn: &TurnInput) -> anyhow::Result<()> {
+        if !turn.images.is_empty() && !self.supports_images() {
+            anyhow::bail!(
+                "What: the staged image input was rejected. \
+                 Why: this model accepts {} input; its metadata declares no image preprocessing program (`preprocessing.image` + `pipeline.vision`). \
+                 How: load a vision-language package, or send the prompt without /image.",
+                self.accepted_modalities()
+            );
+        }
+        if !turn.audio.is_empty() && !self.supports_audio() {
+            anyhow::bail!(
+                "What: the staged audio input was rejected. \
+                 Why: this model accepts {} input; no pipeline component declares an `input_features` audio input. \
+                 How: load a speech package, or send the prompt without /audio.",
+                self.accepted_modalities()
+            );
+        }
+        if !turn.images.is_empty() && !turn.audio.is_empty() {
+            anyhow::bail!(
+                "What: the staged attachments were rejected. \
+                 Why: image and audio inputs cannot be combined in one turn. \
+                 How: send them as separate turns, or /reset to clear the staged attachments."
+            );
+        }
+        Ok(())
+    }
+
+    /// Run one turn, streaming tokens through `callback`.
+    fn generate(
+        &mut self,
+        turn: TurnInput,
+        callback: &mut GenerateTokenCallback<'_>,
+    ) -> anyhow::Result<()> {
+        self.reject_unsupported(&turn)?;
+        match self {
+            Self::Text(engine) => {
+                let request = GenerateRequest {
+                    prompt: GeneratePrompt::Text(turn.prompt),
+                    options: turn.options,
+                };
+                engine.generate_with_callback(request, Some(callback))?;
+                Ok(())
+            }
+            Self::Pipeline(pipeline) => {
+                let attachments = turn.images.len() + turn.audio.len();
+                let required = sole_modality(&pipeline.multimodal);
+                let request =
+                    build_pipeline_request(&pipeline.tokenizer, &pipeline.multimodal, turn)?;
+                pipeline
+                    .engine
+                    .generate_with_callback(request, Some(callback))
+                    .map_err(|error| match required {
+                        // A multimodal package can require its non-text input;
+                        // say so rather than leaving a bare "missing input".
+                        Some(modality) if attachments == 0 => error.context(format!(
+                            "the turn carried no attachment, but this model declares {modality} input. \
+                             How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
+                        )),
+                        _ => error,
+                    })?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The single non-text modality this package declares, if exactly one.
+///
+/// Used to turn a bare "missing required pipeline input" into advice about the
+/// attachment flag the user most likely forgot.
+fn sole_modality(multimodal: &MultimodalSpecs) -> Option<&'static str> {
+    match (multimodal.vision.is_some(), multimodal.audio.is_some()) {
+        (true, false) => Some("image"),
+        (false, true) => Some("audio"),
+        _ => None,
+    }
+}
+
+/// Turn a prompt plus its attachments into a pipeline generation request.///
+/// Audio replaces the prompt entirely: the transcription decoder is seeded with
+/// the model's own transcription token sequence because the spoken audio, not
+/// the typed text, carries the content. Images keep the prompt and expand each
+/// placeholder token into the declared image-token run.
+fn build_pipeline_request(
+    tokenizer: &Tokenizer,
+    multimodal: &MultimodalSpecs,
+    turn: TurnInput,
+) -> anyhow::Result<PipelineGenerateRequest> {
+    let TurnInput {
+        prompt,
+        images,
+        audio,
+        options,
+    } = turn;
+
+    if let Some(audio_path) = audio.first() {
+        let spec = multimodal
+            .audio
+            .as_ref()
+            .expect("audio support checked before building the request");
+        let bytes = std::fs::read(audio_path).map_err(|error| {
+            anyhow::anyhow!(
+                "What: the audio file {} could not be read. \
+                 Why: {error}. \
+                 How: check the path and that the file is readable.",
+                audio_path.display()
+            )
+        })?;
+        let tensor = multimodal::preprocess_wav(&bytes, spec).map_err(|error| {
+            anyhow::anyhow!(
+                "What: the audio file {} could not be preprocessed. \
+                 Why: {error:#}. \
+                 How: provide a PCM16 WAV file.",
+                audio_path.display()
+            )
+        })?;
+        let token_ids = multimodal::audio_decoder_prompt(tokenizer, None)?;
+        let request = GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(token_ids),
+            options,
+        };
+        return Ok(PipelineGenerateRequest::new(request).with_input(
+            tensor.endpoint,
+            Value::from_vec_f32(tensor.data, &tensor.shape)?,
+        ));
+    }
+
+    let mut token_ids = tokenizer.encode(&prompt).map_err(|error| {
+        anyhow::anyhow!(
+            "What: the prompt could not be tokenized. \
+             Why: {error}. \
+             How: verify the package's tokenizer.json matches its decoder."
+        )
+    })?;
+    let mut request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(Vec::new()),
+        options,
+    });
+
+    if !images.is_empty() {
+        let spec = multimodal
+            .vision
+            .as_ref()
+            .expect("image support checked before building the request");
+        let mut encoded = Vec::with_capacity(images.len());
+        for path in &images {
+            encoded.push(std::fs::read(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "What: the image file {} could not be read. \
+                     Why: {error}. \
+                     How: check the path and that the file is readable.",
+                    path.display()
+                )
+            })?);
+        }
+        let bundle = multimodal::preprocess_encoded_images(&encoded, spec)?;
+        token_ids =
+            spec.expand_prompt(&token_ids, &bundle, multimodal::MAX_EXPANDED_PROMPT_TOKENS)?;
+        for tensor in bundle.tensors {
+            let endpoint = tensor.endpoint.clone();
+            request = request.with_input(endpoint, multimodal::image_tensor_value(tensor)?);
+        }
+    }
+
+    request.request.prompt = GeneratePrompt::TokenIds(token_ids);
+    Ok(request)
+}
+
+/// Run one generation turn, streaming tokens through the terminal and returning
+/// the accumulated assistant text.
 ///
 /// The interrupt flag is reset at entry so a stale Ctrl-C cannot cancel this
 /// turn, and the `GENERATING` flag is held for the duration so the Ctrl-C handler
 /// soft-cancels instead of exiting. A Ctrl-C during the turn surfaces as an
 /// [`Interrupted`] error (recognizable via [`is_interrupt_error`]).
 fn run_generation_turn(
-    engine: &mut Engine,
-    request: GenerateRequest,
+    backend: &mut Backend,
+    turn: TurnInput,
     stream: bool,
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
@@ -158,7 +460,7 @@ fn run_generation_turn(
         Ok(())
     };
 
-    let result = engine.generate_with_callback(request, Some(&mut callback));
+    let result = backend.generate(turn, &mut callback);
     GENERATING.store(false, Ordering::SeqCst);
     result?;
     Ok(output)
@@ -306,6 +608,98 @@ impl SamplingArgs {
     }
 }
 
+/// Shared multimodal attachment flags for `generate` and `run`.
+#[derive(Debug, Args, Default, Clone)]
+struct AttachmentArgs {
+    /// Image file sent with the prompt. May be provided multiple times.
+    /// Requires a pipeline package that declares an image preprocessing program.
+    #[arg(long = "image", value_name = "PATH")]
+    images: Vec<PathBuf>,
+
+    /// PCM16 WAV file sent with the prompt. Requires a pipeline package that
+    /// declares an `input_features` audio input.
+    #[arg(long = "audio", value_name = "PATH")]
+    audio: Vec<PathBuf>,
+}
+
+/// Text-to-image flags for `generate --output-image`.
+#[derive(Debug, Args)]
+struct ImageOutputArgs {
+    /// Render the prompt to this PNG file instead of generating text. Requires a
+    /// diffusion package whose metadata declares `strategy.kind: iterative`.
+    /// With `--batch-size > 1` the images are written as `<stem>_0.png`, ...
+    #[arg(long, value_name = "PATH")]
+    output_image: Option<PathBuf>,
+
+    /// Negative prompt, used as the classifier-free-guidance unconditional embedding.
+    #[arg(long, default_value = "")]
+    negative_prompt: String,
+
+    /// Number of denoise steps. Defaults to the package's declared `num_steps`.
+    #[arg(long)]
+    steps: Option<usize>,
+
+    /// Classifier-free-guidance scale; 1.0 disables guidance. Defaults to the
+    /// package's declared `guidance_scale`.
+    #[arg(long)]
+    guidance_scale: Option<f32>,
+
+    /// Seed for the initial latent.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// Output image height in pixels (must be a multiple of 8).
+    #[arg(long, default_value_t = 512)]
+    height: usize,
+
+    /// Output image width in pixels (must be a multiple of 8).
+    #[arg(long, default_value_t = 512)]
+    width: usize,
+
+    /// Number of images to render in one batch.
+    #[arg(long, default_value_t = 1)]
+    batch_size: usize,
+
+    /// CLIP tokenizer.json (defaults to `<model>/tokenizer.json`).
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
+
+    /// Prompt encoder ONNX file (defaults to the component declared in metadata).
+    #[arg(long)]
+    text_encoder: Option<PathBuf>,
+
+    /// Standalone latent→image ONNX decoder, for packages whose pipeline stops
+    /// at the latent instead of declaring a final image phase.
+    #[arg(long)]
+    vae_decoder: Option<PathBuf>,
+
+    /// Latent scaling factor applied before `--vae-decoder` (Stable Diffusion 1.x uses 0.18215).
+    #[arg(long, default_value_t = 0.18215)]
+    vae_scaling_factor: f32,
+}
+
+impl ImageOutputArgs {
+    fn to_request(&self, prompt: String) -> TextToImageRequest {
+        TextToImageRequest {
+            prompt,
+            negative_prompt: self.negative_prompt.clone(),
+            steps: self.steps,
+            guidance_scale: self.guidance_scale,
+            start_step: None,
+            seed: self.seed,
+            height: self.height,
+            width: self.width,
+            batch_size: self.batch_size,
+            tokenizer_path: self.tokenizer.clone(),
+            text_encoder_path: self.text_encoder.clone(),
+            vae_decoder: self.vae_decoder.clone().map(|model_path| VaeDecoder {
+                model_path,
+                scaling_factor: self.vae_scaling_factor,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct GenerateArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
@@ -313,6 +707,12 @@ struct GenerateArgs {
 
     #[command(flatten)]
     sampling: SamplingArgs,
+
+    #[command(flatten)]
+    attachments: AttachmentArgs,
+
+    #[command(flatten)]
+    image_output: ImageOutputArgs,
 
     /// Print generated tokens as they arrive.
     #[arg(long)]
@@ -330,6 +730,9 @@ struct RunArgs {
 
     #[command(flatten)]
     sampling: SamplingArgs,
+
+    #[command(flatten)]
+    attachments: AttachmentArgs,
 }
 
 #[derive(Debug, Args)]
@@ -395,18 +798,23 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
+    if args.image_output.output_image.is_some() {
+        return generate_image(&model_dir, args);
+    }
     let options = args.sampling.to_options();
 
     let template = load_chat_template(&model_dir, args.sampling.raw);
     let history = vec![ChatMessage::user(args.prompt)];
     let prompt = build_turn_prompt(template.as_ref(), &history)?;
-    let request = GenerateRequest {
-        prompt: prompt.into(),
+    let turn = TurnInput {
+        prompt,
+        images: args.attachments.images.clone(),
+        audio: args.attachments.audio.clone(),
         options,
     };
 
-    let mut engine = Engine::from_dir(&model_dir, EngineConfig::default())?;
-    match run_generation_turn(&mut engine, request, args.stream) {
+    let mut backend = Backend::load(&model_dir)?;
+    match run_generation_turn(&mut backend, turn, args.stream) {
         Ok(output) => {
             if args.stream {
                 println!();
@@ -424,16 +832,76 @@ fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Render `--prompt` to PNG(s) through the model's declared diffusion pipeline.
+fn generate_image(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
+    let output = args
+        .image_output
+        .output_image
+        .clone()
+        .expect("image output path checked by the caller");
+    if args.image_output.batch_size == 0 {
+        anyhow::bail!(
+            "What: --batch-size 0 was rejected. \
+             Why: at least one image must be rendered. \
+             How: pass --batch-size 1 or more."
+        );
+    }
+    let request = args.image_output.to_request(args.prompt.clone());
+    let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "What: {} could not be loaded as a diffusion pipeline. \
+                 Why: {error:#}. \
+                 How: point --output-image at a package whose inference metadata declares a `pipeline` with `strategy.kind: iterative`.",
+                model_dir.display()
+            )
+        })?;
+
+    let images = text_to_image::render(model_dir, &mut engine, &request)?;
+    if images.is_empty() {
+        anyhow::bail!(
+            "What: no image was produced. \
+             Why: the pipeline returned fewer images than the requested batch size of {}. \
+             How: render with --batch-size 1, or report this as a pipeline output-shape bug.",
+            request.batch_size
+        );
+    }
+    for (index, image) in images.iter().enumerate() {
+        let path = if images.len() == 1 {
+            output.clone()
+        } else {
+            let stem = output
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "out".to_string());
+            let extension = output
+                .extension()
+                .map(|extension| extension.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "png".to_string());
+            output.with_file_name(format!("{stem}_{index}.{extension}"))
+        };
+        text_to_image::save_png(image, &path)?;
+        println!(
+            "saved {} ({}x{})",
+            path.display(),
+            image.width,
+            image.height
+        );
+    }
+    Ok(())
+}
+
 fn run_repl(args: RunArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
-    let mut engine = Engine::from_dir(&model_dir, EngineConfig::default())?;
+    let mut backend = Backend::load(&model_dir)?;
     let mut raw_mode = args.sampling.raw;
     let mut template = load_chat_template(&model_dir, raw_mode);
 
     eprintln!(
-        "onnx-genai interactive session. Enter a prompt, or an empty line / Ctrl-D to exit.\n\
-         Ctrl-C aborts the current generation; press it again at the prompt to exit."
+        "onnx-genai interactive session ({} input). Enter a prompt, or an empty line / Ctrl-D to exit.\n\
+         Ctrl-C aborts the current generation; press it twice to exit. Type /help for commands.",
+        backend.accepted_modalities()
     );
 
     // Multi-turn conversation history. Each turn appends the user message, the
@@ -441,8 +909,8 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
     // reply is appended so later turns retain context. In raw mode there is no
     // template so only the latest user message is sent.
     let mut history: Vec<ChatMessage> = Vec::new();
-    let mut image_attachments: Vec<PathBuf> = Vec::new();
-    let mut audio_attachments: Vec<PathBuf> = Vec::new();
+    let mut image_attachments: Vec<PathBuf> = args.attachments.images.clone();
+    let mut audio_attachments: Vec<PathBuf> = args.attachments.audio.clone();
     let stdin = io::stdin();
     loop {
         print!(">>> ");
@@ -453,6 +921,8 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
             eprintln!();
             break;
         }
+        // The user is still working, so a later Ctrl-C needs two presses again.
+        EXIT_ARMED.store(false, Ordering::SeqCst);
         let line = line.trim_end_matches(['\n', '\r']);
         let prompt = match parse_repl_line(line) {
             ReplLine::Empty => break,
@@ -493,30 +963,30 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
                 None
             }
             ReplLine::Command(ReplCommand::Image { path, prompt }) => {
-                if let Some(path) = path {
-                    let path = PathBuf::from(path);
-                    if path.exists() {
+                match stage_attachment(path, "image", backend.supports_images()) {
+                    Ok(Some(path)) => {
                         image_attachments.push(path);
-                    } else {
-                        eprintln!("warning: image path does not exist: {}", path.display());
+                        prompt
                     }
-                } else {
-                    eprintln!("usage: /image <path> [prompt text]");
+                    Ok(None) => prompt,
+                    Err(error) => {
+                        eprintln!("{error:#}");
+                        None
+                    }
                 }
-                prompt
             }
             ReplLine::Command(ReplCommand::Audio { path, prompt }) => {
-                if let Some(path) = path {
-                    let path = PathBuf::from(path);
-                    if path.exists() {
+                match stage_attachment(path, "audio", backend.supports_audio()) {
+                    Ok(Some(path)) => {
                         audio_attachments.push(path);
-                    } else {
-                        eprintln!("warning: audio path does not exist: {}", path.display());
+                        prompt
                     }
-                } else {
-                    eprintln!("usage: /audio <path> [prompt text]");
+                    Ok(None) => prompt,
+                    Err(error) => {
+                        eprintln!("{error:#}");
+                        None
+                    }
                 }
-                prompt
             }
             ReplLine::Command(ReplCommand::Unknown(command)) => {
                 eprintln!("unknown command: {command} (try /help)");
@@ -530,35 +1000,23 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
         history.push(ChatMessage::user(prompt));
         let staged_images = std::mem::take(&mut image_attachments);
         let staged_audio = std::mem::take(&mut audio_attachments);
-        if !staged_images.is_empty() {
-            let paths = staged_images
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "⚠ image input staged ({}) but multimodal execution is not yet wired — sending text only for now.",
-                paths
-            );
-        }
         if !staged_audio.is_empty() {
-            let paths = staged_audio
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
             println!(
-                "⚠ audio input staged ({}) but multimodal execution is not yet wired — sending text only for now.",
-                paths
+                "(transcribing {} — the model's audio decoder prompt replaces the typed text)",
+                display_paths(&staged_audio)
             );
+        } else if !staged_images.is_empty() {
+            println!("(sending {})", display_paths(&staged_images));
         }
         let rendered = build_turn_prompt(template.as_ref(), &history)?;
-        let request = GenerateRequest {
-            prompt: rendered.into(),
+        let turn = TurnInput {
+            prompt: rendered,
+            images: staged_images,
+            audio: staged_audio,
             options: args.sampling.to_options(),
         };
 
-        match run_generation_turn(&mut engine, request, true) {
+        match run_generation_turn(&mut backend, turn, true) {
             Ok(output) => {
                 println!();
                 history.push(ChatMessage::assistant(output));
@@ -567,13 +1025,57 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
                 // Drop the interrupted turn from history so a partial/aborted
                 // reply never pollutes the conversation context, then return to
                 // the prompt instead of exiting.
-                eprintln!("\n^C interrupted");
+                eprintln!("\n^C interrupted (press Ctrl-C again to exit)");
                 history.pop();
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // A rejected attachment or unreadable file is a user error, not
+                // a reason to end the session: report it and keep the REPL alive.
+                eprintln!("error: {error:#}");
+                history.pop();
+            }
         }
     }
     Ok(())
+}
+
+/// Validate a `/image` or `/audio` argument, returning the path to stage.
+///
+/// `Ok(None)` means the command was informational (usage was printed) and the
+/// turn should continue without an attachment.
+fn stage_attachment(
+    path: Option<String>,
+    kind: &str,
+    supported: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(path) = path else {
+        anyhow::bail!("usage: /{kind} <path> [prompt text]");
+    };
+    if !supported {
+        anyhow::bail!(
+            "What: the /{kind} attachment was rejected. \
+             Why: the loaded model declares no {kind} input contract in its metadata. \
+             How: load a package that declares one, or send the prompt as text."
+        );
+    }
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        anyhow::bail!(
+            "What: the {kind} file {} could not be staged. \
+             Why: no readable file exists at that path. \
+             How: pass a path relative to the current directory, or an absolute path.",
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn show(model: &Path) -> anyhow::Result<()> {
@@ -685,6 +1187,191 @@ mod tests {
     #[test]
     fn run_rejects_model_flag() {
         assert!(Cli::try_parse_from(["onnx-genai", "run", "--model", "./m"]).is_err());
+    }
+
+    #[test]
+    fn one_ctrl_c_stops_the_generation_and_two_exit() {
+        // Idle prompt: the first press only warns, the second leaves.
+        assert_eq!(
+            interrupt_action(false, false, false),
+            InterruptAction::WarnThenExit
+        );
+        assert_eq!(interrupt_action(false, false, true), InterruptAction::Exit);
+
+        // During a generation: the first press cancels the turn, a second while
+        // it is still unwinding leaves immediately.
+        assert_eq!(
+            interrupt_action(true, false, false),
+            InterruptAction::CancelGeneration
+        );
+        assert_eq!(interrupt_action(true, true, true), InterruptAction::Exit);
+    }
+
+    #[test]
+    fn a_cancelled_turn_leaves_the_exit_armed_for_the_next_press() {
+        // After `run_generation_turn` returns, GENERATING is false again but the
+        // cancelling press already armed the exit, so the next press exits —
+        // "one press stops the generation, two exit".
+        assert_eq!(interrupt_action(false, true, true), InterruptAction::Exit);
+    }
+
+    #[test]
+    fn a_new_prompt_disarms_the_exit() {
+        // `run_repl` clears EXIT_ARMED after each submitted line, so a much
+        // later Ctrl-C warns again instead of quitting outright.
+        assert_eq!(
+            interrupt_action(false, true, false),
+            InterruptAction::WarnThenExit
+        );
+    }
+
+    #[test]
+    fn generate_accepts_repeated_image_and_audio_attachments() {
+        let parsed = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "describe",
+            "--image",
+            "a.png",
+            "--image",
+            "b.png",
+            "--audio",
+            "c.wav",
+        ])
+        .unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                assert_eq!(
+                    args.attachments.images,
+                    vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
+                );
+                assert_eq!(args.attachments.audio, vec![PathBuf::from("c.wav")]);
+                assert!(args.image_output.output_image.is_none());
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_accepts_text_to_image_flags() {
+        let parsed = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "an astronaut riding a horse",
+            "--output-image",
+            "out.png",
+            "--negative-prompt",
+            "blurry",
+            "--steps",
+            "20",
+            "--guidance-scale",
+            "7.5",
+            "--seed",
+            "42",
+            "--width",
+            "768",
+            "--height",
+            "512",
+        ])
+        .unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                let request = args.image_output.to_request(args.prompt.clone());
+                assert_eq!(
+                    args.image_output.output_image,
+                    Some(PathBuf::from("out.png"))
+                );
+                assert_eq!(request.negative_prompt, "blurry");
+                assert_eq!(request.steps, Some(20));
+                assert_eq!(request.guidance_scale, Some(7.5));
+                assert_eq!(request.seed, 42);
+                assert_eq!((request.width, request.height), (768, 512));
+                assert!(request.vae_decoder.is_none());
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn image_output_args_carry_the_standalone_vae_decoder() {
+        let parsed = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "a cat",
+            "--output-image",
+            "out.png",
+            "--vae-decoder",
+            "vae_decoder/model.onnx",
+            "--vae-scaling-factor",
+            "0.13025",
+        ])
+        .unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                let decoder = args
+                    .image_output
+                    .to_request(args.prompt.clone())
+                    .vae_decoder
+                    .expect("--vae-decoder must be carried through");
+                assert_eq!(decoder.model_path, PathBuf::from("vae_decoder/model.onnx"));
+                assert!((decoder.scaling_factor - 0.13025).abs() < 1e-6);
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn stage_attachment_requires_a_path() {
+        let error =
+            stage_attachment(None, "image", true).expect_err("a bare /image must report its usage");
+
+        assert!(error.to_string().contains("usage: /image <path>"));
+    }
+
+    #[test]
+    fn stage_attachment_rejects_unsupported_modalities_before_touching_the_disk() {
+        let error = stage_attachment(Some("nonexistent.png".to_string()), "image", false)
+            .expect_err("a text-only model must reject image attachments");
+
+        let message = error.to_string();
+        assert!(message.contains("What:"), "message: {message}");
+        assert!(message.contains("How:"), "message: {message}");
+    }
+
+    #[test]
+    fn stage_attachment_rejects_missing_files() {
+        let error = stage_attachment(
+            Some("definitely-not-a-real-file.png".to_string()),
+            "image",
+            true,
+        )
+        .expect_err("a missing file must fail closed");
+
+        assert!(
+            error.to_string().contains("definitely-not-a-real-file.png"),
+            "the rejected path must be named: {error}"
+        );
+    }
+
+    #[test]
+    fn stage_attachment_accepts_an_existing_file() {
+        let dir = temp_dir("stage-attachment");
+        let path = dir.join("cat.png");
+        fs::write(&path, b"not really a png").unwrap();
+
+        let staged = stage_attachment(Some(path.display().to_string()), "image", true).unwrap();
+
+        assert_eq!(staged, Some(path));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn temp_dir(name: &str) -> PathBuf {

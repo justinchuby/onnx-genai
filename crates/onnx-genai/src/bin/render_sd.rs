@@ -28,29 +28,15 @@ use onnx_genai::engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, IterativeOverrides,
     PipelineGenerateRequest,
 };
-use onnx_genai::ort::{DataType, Environment, Session, SessionOptions, Value};
+use onnx_genai::ort::{Environment, Value};
+use onnx_genai::text_to_image::{
+    CLIP_CONTEXT_LENGTH, DEFAULT_LATENT_CHANNELS as LATENT_CHANNELS, RenderedImage, VAE_DOWNSCALE,
+    load_clip_tokenizer, save_png, text_encode, tokenize_clip as tokenize, vae_decode,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
-use std::path::{Path, PathBuf};
-use tokenizers::{
-    PaddingDirection, PaddingParams, PaddingStrategy, TruncationDirection, TruncationParams,
-    TruncationStrategy,
-};
-
-/// CLIP context length: prompts are tokenized to exactly this many ids (fixed
-/// padding + truncation), matching diffusers `CLIPTokenizer`.
-const CLIP_CONTEXT_LENGTH: usize = 77;
-
-/// CLIP end-of-text token id, used as the padding id (diffusers pads to
-/// `max_length` with this token rather than id 0).
-const CLIP_END_OF_TEXT_ID: u32 = 49407;
-
-/// Number of latent channels for a classic Stable Diffusion 1.x VAE.
-const LATENT_CHANNELS: usize = 4;
-
-/// VAE spatial downsampling factor (latent side = image side / 8).
-const VAE_DOWNSCALE: usize = 8;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(about = "Render a classic Stable Diffusion 1.x prompt through the onnx-genai pipeline.")]
@@ -100,142 +86,6 @@ struct Arguments {
     /// Output PNG path.
     #[arg(long, short, default_value = "render_sd_out.png")]
     output: PathBuf,
-}
-
-/// Load a CLIP tokenizer configured for fixed-length (77) padding + truncation,
-/// so its ids match the diffusers `padding="max_length", truncation=True` path.
-fn load_clip_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
-    let mut tokenizer = tokenizers::Tokenizer::from_file(path)
-        .map_err(|err| anyhow::anyhow!("loading tokenizer {}: {err}", path.display()))?;
-    tokenizer.with_padding(Some(PaddingParams {
-        strategy: PaddingStrategy::Fixed(CLIP_CONTEXT_LENGTH),
-        direction: PaddingDirection::Right,
-        pad_to_multiple_of: None,
-        pad_id: CLIP_END_OF_TEXT_ID,
-        pad_type_id: 0,
-        pad_token: "<|endoftext|>".to_string(),
-    }));
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: CLIP_CONTEXT_LENGTH,
-            strategy: TruncationStrategy::LongestFirst,
-            direction: TruncationDirection::Right,
-            stride: 0,
-        }))
-        .map_err(|err| anyhow::anyhow!("configuring truncation: {err}"))?;
-    Ok(tokenizer)
-}
-
-/// Tokenize `text` to exactly `CLIP_CONTEXT_LENGTH` `i64` ids.
-fn tokenize(tokenizer: &tokenizers::Tokenizer, text: &str) -> Result<Vec<i64>> {
-    let encoding = tokenizer
-        .encode(text, true)
-        .map_err(|err| anyhow::anyhow!("tokenizing {text:?}: {err}"))?;
-    Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
-}
-
-/// Build a float tensor `Value` from f32 data matching a model input's declared
-/// float dtype (fp16 packages need fp16 inputs). Falls back to f32 for any
-/// non-float target dtype.
-fn float_input(data: &[f32], shape: &[i64], dtype: DataType) -> Result<Value> {
-    match dtype {
-        DataType::Float16 | DataType::BFloat16 => {
-            Value::from_f32_slice_as(data, shape, dtype).map_err(Into::into)
-        }
-        _ => Value::from_slice_f32(data, shape).map_err(Into::into),
-    }
-}
-
-/// Run the text encoder once on `input_ids` and return `(hidden_states, shape)`.
-fn text_encode(
-    environment: &Environment,
-    text_encoder_path: &Path,
-    input_ids: &[i64],
-) -> Result<(Vec<f32>, Vec<i64>)> {
-    let session = Session::new(environment, text_encoder_path, SessionOptions::default())
-        .with_context(|| format!("loading {}", text_encoder_path.display()))?;
-    let input_name = session
-        .input_names()
-        .first()
-        .context("text_encoder has no inputs")?
-        .clone();
-    let ids_value = Value::from_slice_i64(input_ids, &[1, CLIP_CONTEXT_LENGTH as i64])?;
-    let outputs = session.run(&[(input_name.as_str(), &ids_value)])?;
-    let hidden = outputs
-        .into_iter()
-        .next()
-        .context("text_encoder produced no output")?;
-    let shape = hidden.shape().to_vec();
-    Ok((hidden.to_vec_f32_lossy()?, shape))
-}
-
-/// Decode a `[1, LATENT_CHANNELS, h, w]` latent (already scaled by
-/// `1 / scaling_factor`) through the VAE decoder, returning the `[3, H, W]`
-/// image in `[-1, 1]` and its `(height, width)`.
-fn vae_decode(
-    environment: &Environment,
-    vae_decoder_path: &Path,
-    latent: &[f32],
-    latent_channels: usize,
-    latent_height: usize,
-    latent_width: usize,
-) -> Result<(Vec<f32>, usize, usize)> {
-    let session = Session::new(environment, vae_decoder_path, SessionOptions::default())
-        .with_context(|| format!("loading {}", vae_decoder_path.display()))?;
-    let input_name = session
-        .input_names()
-        .first()
-        .context("vae_decoder has no inputs")?
-        .clone();
-    let input_dtype = session
-        .inputs()
-        .first()
-        .context("vae_decoder has no inputs")?
-        .dtype;
-    let latent_value = float_input(
-        latent,
-        &[
-            1,
-            latent_channels as i64,
-            latent_height as i64,
-            latent_width as i64,
-        ],
-        input_dtype,
-    )?;
-    let outputs = session.run(&[(input_name.as_str(), &latent_value)])?;
-    let image = outputs
-        .into_iter()
-        .next()
-        .context("vae_decoder produced no output")?;
-    let shape = image.shape().to_vec();
-    let height = shape[shape.len() - 2] as usize;
-    let width = shape[shape.len() - 1] as usize;
-    Ok((image.to_vec_f32_lossy()?, height, width))
-}
-
-/// Save a single `[3, height, width]` f32 image in `[-1, 1]` as an RGB8 PNG.
-fn save_png(image_chw: &[f32], height: usize, width: usize, path: &Path) -> Result<()> {
-    let mut pixels = Vec::with_capacity(height * width * 3);
-    for y in 0..height {
-        for x in 0..width {
-            for channel in 0..3 {
-                let value = image_chw[channel * height * width + y * width + x];
-                let normalized = (value / 2.0 + 0.5).clamp(0.0, 1.0);
-                pixels.push((normalized * 255.0).round() as u8);
-            }
-        }
-    }
-    let buffer = image::RgbImage::from_raw(width as u32, height as u32, pixels)
-        .context("image buffer size mismatch")?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).ok();
-    }
-    buffer
-        .save(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -288,8 +138,12 @@ fn main() -> Result<()> {
     // Classifier-free guidance unconditional embedding: the encoding of the
     // negative prompt (empty by default), NOT zeros.
     let uncond = if uses_cfg {
-        let (encoded, _shape) = text_encode(&environment, &text_encoder_path, &negative_ids)?;
-        Some(encoded)
+        Some(text_encode(
+            &environment,
+            &text_encoder_path,
+            &negative_ids,
+            1,
+        )?)
     } else {
         None
     };
@@ -348,9 +202,12 @@ fn main() -> Result<()> {
         &environment,
         &vae_decoder_path,
         &latent,
-        LATENT_CHANNELS,
-        latent_height,
-        latent_width,
+        &[
+            1,
+            LATENT_CHANNELS as i64,
+            latent_height as i64,
+            latent_width as i64,
+        ],
     )?;
 
     let finite = image_data.iter().all(|value| value.is_finite());
@@ -359,7 +216,14 @@ fn main() -> Result<()> {
     let mean = image_data.iter().sum::<f32>() / image_data.len() as f32;
     eprintln!("[render] finite={finite} min={minimum:.4} max={maximum:.4} mean={mean:.4}");
 
-    save_png(&image_data, height, width, &arguments.output)?;
+    save_png(
+        &RenderedImage {
+            width,
+            height,
+            pixels_chw: image_data.clone(),
+        },
+        &arguments.output,
+    )?;
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
     let steps_per_second = arguments.steps as f64 / (denoise_ms / 1000.0);
     eprintln!("saved: {}", arguments.output.display());

@@ -700,7 +700,7 @@ impl PipelineTensor {
 }
 
 fn pipeline_value(tensor: PipelineTensor) -> anyhow::Result<Value> {
-    let (endpoint, expected_dtype, expected_shape, shape, data) = match tensor {
+    match tensor {
         PipelineTensor::Fp32(tensor) => {
             if tensor.num_tiles.is_some() {
                 anyhow::bail!(
@@ -708,13 +708,12 @@ fn pipeline_value(tensor: PipelineTensor) -> anyhow::Result<Value> {
                     tensor.endpoint
                 );
             }
-            return Value::from_vec_f32(tensor.data, &tensor.shape)
-                .with_context(|| {
-                    format!(
-                        "What: pipeline endpoint '{}' tensor construction failed. Why: expected Float32 shape {:?}. How: correct the processor output shape/data length.",
-                        tensor.endpoint, tensor.shape
-                    )
-                });
+            Value::from_vec_f32(tensor.data, &tensor.shape).with_context(|| {
+                format!(
+                    "What: pipeline endpoint '{}' tensor construction failed. Why: expected Float32 shape {:?}. How: correct the processor output shape/data length.",
+                    tensor.endpoint, tensor.shape
+                )
+            })
         }
         PipelineTensor::Typed {
             endpoint,
@@ -722,58 +721,14 @@ fn pipeline_value(tensor: PipelineTensor) -> anyhow::Result<Value> {
             expected_shape,
             shape,
             data,
-        } => (endpoint, expected_dtype, expected_shape, shape, data),
-    };
-    let actual_dtype = match &data {
-        ImageTensorData::Fp32(_) => DataType::Float32,
-        ImageTensorData::Fp16(_) => DataType::Float16,
-        ImageTensorData::Bf16(_) => DataType::BFloat16,
-        ImageTensorData::Int64(_) => DataType::Int64,
-        ImageTensorData::Int32(_) => DataType::Int32,
-        ImageTensorData::Int8(_) => DataType::Int8,
-        ImageTensorData::Uint8(_) => DataType::Uint8,
-        ImageTensorData::Bool(_) => DataType::Bool,
-    };
-    if actual_dtype != expected_dtype || !shape_matches(&expected_shape, &shape) {
-        anyhow::bail!(
-            "What: pipeline endpoint '{}' could not be injected. \
-             Why: expected dtype {:?} shape {:?}, got dtype {:?} shape {:?}. \
-             How: correct the typed preprocessing output and its endpoint binding.",
+        } => crate::image_input::image_tensor_value(crate::image_input::ImageTensor {
             endpoint,
             expected_dtype,
             expected_shape,
-            actual_dtype,
-            shape
-        );
+            shape,
+            data,
+        }),
     }
-    let value = match data {
-        ImageTensorData::Fp32(data) => Value::from_vec_f32(data, &shape),
-        ImageTensorData::Fp16(data) => Value::from_vec_f16_bits(data, &shape),
-        ImageTensorData::Bf16(data) => Value::from_vec_bf16_bits(data, &shape),
-        ImageTensorData::Int64(data) => Value::from_vec_i64(data, &shape),
-        ImageTensorData::Int32(_)
-        | ImageTensorData::Int8(_)
-        | ImageTensorData::Uint8(_)
-        | ImageTensorData::Bool(_) => anyhow::bail!(
-            "What: pipeline endpoint '{endpoint}' could not be materialized. \
-             Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, but onnx-genai-ort has no owned Value constructor for this typed processor output. \
-             How: add the matching Value constructor operation before serving this metadata contract."
-        ),
-    }
-    .with_context(|| {
-        format!(
-            "What: pipeline endpoint '{endpoint}' tensor construction failed. Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, received shape {shape:?}. How: correct the processor output shape/data length."
-        )
-    })?;
-    Ok(value)
-}
-
-fn shape_matches(expected: &[i64], actual: &[i64]) -> bool {
-    expected.len() == actual.len()
-        && expected
-            .iter()
-            .zip(actual)
-            .all(|(&expected, &actual)| expected < 0 || expected == actual)
 }
 
 fn run_fallback_generation(

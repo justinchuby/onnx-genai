@@ -1764,26 +1764,8 @@ fn audio_decoder_prompt(
     tokenizer: &Tokenizer,
     language: Option<&str>,
 ) -> Result<Vec<u32>, ApiError> {
-    let mut token_ids = vec![
-        tokenizer
-            .token_id("<|startoftranscript|>")
-            .or_else(|| tokenizer.eos_token_id())
-            .unwrap_or(0),
-    ];
-    if let Some(language) = language.filter(|value| !value.is_empty()) {
-        let token = format!("<|{}|>", language.to_ascii_lowercase());
-        token_ids.push(tokenizer.token_id(&token).ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "language '{language}' is not supported by this model tokenizer"
-            ))
-        })?);
-    }
-    for token in ["<|transcribe|>", "<|notimestamps|>"] {
-        if let Some(token_id) = tokenizer.token_id(token) {
-            token_ids.push(token_id);
-        }
-    }
-    Ok(token_ids)
+    crate::multimodal::audio_decoder_prompt(tokenizer, language)
+        .map_err(|error| ApiError::bad_request(format!("{error:#}")))
 }
 
 fn validate_request(

@@ -25,6 +25,7 @@ mod driver;
 mod image_input;
 mod metrics;
 mod models_config;
+pub mod multimodal;
 mod registry;
 mod routes;
 mod session;
@@ -34,6 +35,7 @@ mod types;
 
 pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
+pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;
 pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,

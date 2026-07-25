@@ -90,6 +90,58 @@ cargo build --release -p onnx-genai -p onnx-genai-server
   --prompt "Write a short Rust hello-world program."
 ```
 
+`onnx-genai run <model>` starts an interactive REPL. One Ctrl-C stops the
+current generation; two in a row exit. Slash commands control the session:
+
+```text
+>>> /help
+>>> /system Be concise.
+>>> /image ./cat.png What is in this image?
+>>> /audio ./speech.wav
+>>> /raw
+>>> /reset
+```
+
+### Image and audio input
+
+Vision-language and speech packages declare their preprocessing contract in
+inference metadata (`preprocessing.image` + `pipeline.vision` for images, an
+`input_features` component input for audio). `run` and `generate` accept those
+modalities on any package that declares one:
+
+```bash
+./target/release/onnx-genai generate models/tiny-vlm \
+  --image ./cat.png \
+  --prompt "What is in this image?"
+
+./target/release/onnx-genai generate models/whisper-tiny \
+  --audio ./speech.wav \
+  --prompt ""
+```
+
+Audio is transcription: the model's own decoder prompt replaces the typed text,
+because the clip carries the content. A model that declares neither contract
+rejects the attachment with an error naming what it does accept.
+
+### Generate images
+
+`generate --output-image` renders a prompt through a diffusion package (see
+[docs/DIFFUSION.md](docs/DIFFUSION.md)):
+
+```bash
+./target/release/onnx-genai generate models/stable-diffusion-1.5 \
+  --prompt "an astronaut riding a horse" \
+  --negative-prompt "blurry, low quality" \
+  --steps 25 --guidance-scale 7.5 --seed 0 \
+  --width 512 --height 512 \
+  --output-image out.png
+```
+
+Steps, guidance scale, and the sampler default to the values the package
+declares. For packages whose pipeline stops at the latent instead of declaring
+a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
+`--vae-scaling-factor`).
+
 ### Run the OpenAI-compatible server
 
 ```bash

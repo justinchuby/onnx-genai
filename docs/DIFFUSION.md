@@ -149,6 +149,34 @@ ONNX (`denoiser.onnx` / `text_encoder.onnx` / `vae.onnx` in the package).
 own noise schedule (betas / `num_train_timesteps`, which the ComfyUI JSON never carries), computes
 the exact diffusers timesteps, and writes `inference_metadata.yaml` + `run.json`.
 
+### 3.3 Rendering from the unified CLI
+
+`onnx-genai generate --output-image` renders a prompt directly, without a ComfyUI workflow:
+
+```bash
+onnx-genai generate out/ \
+  --prompt "an astronaut riding a horse" \
+  --negative-prompt "blurry, low quality" \
+  --steps 25 --guidance-scale 7.5 --seed 0 \
+  --width 512 --height 512 \
+  --output-image image.png
+```
+
+It resolves every endpoint from the package's declared metadata rather than assuming conventional
+names: the denoiser comes from `strategy.denoiser`, its loop-carried latent port from the
+denoiser's dataflow self-edge, the unconditional embedding port from
+`strategy.cfg_conditioning_input`, the prompt encoder from the edge feeding that port (or the single
+`run_on: prompt_only` component), and the image from the `run_on: final_only` component's output.
+`--steps` / `--guidance-scale` default to the package's declared `num_steps` / `guidance_scale`, and
+ancestral schedulers automatically get a seeded per-step noise tensor (§5).
+
+Packages whose pipeline stops at the latent instead of declaring a final VAE phase — for example
+Mobius's `text_encoder/`, `unet/`, `vae_decoder/` layout, where the decoder does not bake in the
+latent scaling — are rendered by adding `--vae-decoder vae_decoder/model.onnx`
+`--vae-scaling-factor 0.18215`. Without it the CLI fails with an error listing the endpoints the
+pipeline actually produced. The shared implementation lives in `onnx_genai::text_to_image`, which
+also backs the `render_sd` and `run_comfyui` binaries.
+
 ---
 
 ## 4. img2img (partial denoise)

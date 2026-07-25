@@ -23,24 +23,16 @@ use onnx_genai::engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, IterativeOverrides,
     PipelineGenerateRequest,
 };
-use onnx_genai::ort::{Environment, Session, SessionOptions, Value};
+use onnx_genai::ort::{Environment, Value};
+use onnx_genai::text_to_image::{
+    CLIP_CONTEXT_LENGTH, RenderedImage, latent_channels, load_clip_tokenizer, save_png,
+    text_encode, tile_ids, tokenize_clip as tokenize,
+};
 use onnx_genai_comfyui_config::parse_workflow_file;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 use std::path::{Path, PathBuf};
-use tokenizers::{
-    PaddingDirection, PaddingParams, PaddingStrategy, TruncationDirection, TruncationParams,
-    TruncationStrategy,
-};
-
-/// CLIP context length: the positive/negative prompts are tokenized to exactly
-/// this many ids (fixed padding + truncation), matching diffusers.
-const CLIP_CONTEXT_LENGTH: usize = 77;
-
-/// CLIP end-of-text token id. diffusers' `CLIPTokenizer` pads to `max_length`
-/// with this token (not id 0), so the runner must match to reproduce the ids.
-const CLIP_END_OF_TEXT_ID: u32 = 49407;
 
 #[derive(Parser, Debug)]
 #[command(about = "Render a ComfyUI workflow through the onnx-genai diffusion pipeline.")]
@@ -97,108 +89,6 @@ fn read_i64(path: &Path) -> Result<Vec<i64>> {
         .chunks_exact(8)
         .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
         .collect())
-}
-
-/// Load a CLIP tokenizer configured for fixed-length (77) padding + truncation,
-/// so its ids match the diffusers `padding="max_length", truncation=True` path.
-fn load_clip_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
-    let mut tokenizer = tokenizers::Tokenizer::from_file(path)
-        .map_err(|err| anyhow::anyhow!("loading tokenizer {}: {err}", path.display()))?;
-    tokenizer.with_padding(Some(PaddingParams {
-        strategy: PaddingStrategy::Fixed(CLIP_CONTEXT_LENGTH),
-        direction: PaddingDirection::Right,
-        pad_to_multiple_of: None,
-        pad_id: CLIP_END_OF_TEXT_ID,
-        pad_type_id: 0,
-        pad_token: "<|endoftext|>".to_string(),
-    }));
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: CLIP_CONTEXT_LENGTH,
-            strategy: TruncationStrategy::LongestFirst,
-            direction: TruncationDirection::Right,
-            stride: 0,
-        }))
-        .map_err(|err| anyhow::anyhow!("configuring truncation: {err}"))?;
-    Ok(tokenizer)
-}
-
-/// Tokenize `text` to exactly `CLIP_CONTEXT_LENGTH` `i64` ids.
-fn tokenize(tokenizer: &tokenizers::Tokenizer, text: &str) -> Result<Vec<i64>> {
-    let encoding = tokenizer
-        .encode(text, true)
-        .map_err(|err| anyhow::anyhow!("tokenizing {text:?}: {err}"))?;
-    Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
-}
-
-/// Tile a single-row `[len]` id vector into `[batch_size, len]`, row-major.
-fn tile_ids(ids: &[i64], batch_size: usize) -> Vec<i64> {
-    let mut tiled = Vec::with_capacity(ids.len() * batch_size);
-    for _ in 0..batch_size {
-        tiled.extend_from_slice(ids);
-    }
-    tiled
-}
-
-/// Run the text encoder once on `input_ids` and return `(hidden_states, shape)`.
-fn text_encode(
-    environment: &Environment,
-    text_encoder_path: &Path,
-    input_ids: &[i64],
-    batch_size: usize,
-) -> Result<(Vec<f32>, Vec<i64>)> {
-    let session = Session::new(environment, text_encoder_path, SessionOptions::default())
-        .with_context(|| format!("loading {}", text_encoder_path.display()))?;
-    let input_name = session
-        .input_names()
-        .first()
-        .context("text_encoder has no inputs")?
-        .clone();
-    let ids_value =
-        Value::from_slice_i64(input_ids, &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64])?;
-    let outputs = session.run(&[(input_name.as_str(), &ids_value)])?;
-    let hidden = outputs
-        .into_iter()
-        .next()
-        .context("text_encoder produced no output")?;
-    let shape = hidden.shape().to_vec();
-    Ok((hidden.to_vec_f32()?, shape))
-}
-
-/// Save a single `[3, height, width]` f32 image in `[-1, 1]` as an RGB8 PNG.
-fn save_png(image_chw: &[f32], height: usize, width: usize, path: &Path) -> Result<()> {
-    let mut pixels = Vec::with_capacity(height * width * 3);
-    for y in 0..height {
-        for x in 0..width {
-            for channel in 0..3 {
-                let value = image_chw[channel * height * width + y * width + x];
-                let normalized = (value / 2.0 + 0.5).clamp(0.0, 1.0);
-                pixels.push((normalized * 255.0).round() as u8);
-            }
-        }
-    }
-    let buffer = image::RgbImage::from_raw(width as u32, height as u32, pixels)
-        .context("image buffer size mismatch")?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).ok();
-    }
-    buffer
-        .save(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-/// Read `latent_channels` from `run.json`, defaulting to 4 when absent.
-fn latent_channels(pipeline_dir: &Path) -> usize {
-    let run_json_path = pipeline_dir.join("run.json");
-    std::fs::read_to_string(&run_json_path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.get("latent_channels").and_then(|c| c.as_u64()))
-        .map(|channels| channels as usize)
-        .unwrap_or(4)
 }
 
 fn main() -> Result<()> {
@@ -275,13 +165,12 @@ fn main() -> Result<()> {
             })
             .collect();
         let uncond = if uses_cfg {
-            let (encoded, _shape) = text_encode(
+            Some(text_encode(
                 &environment,
                 &text_encoder_path,
                 &tile_ids(&negative_ids, batch_size),
                 batch_size,
-            )?;
-            Some(encoded)
+            )?)
         } else {
             None
         };
@@ -396,7 +285,14 @@ fn main() -> Result<()> {
     );
 
     if batch_size == 1 {
-        save_png(&image_data[..per_image], height, width, &arguments.output)?;
+        save_png(
+            &RenderedImage {
+                width,
+                height,
+                pixels_chw: image_data[..per_image].to_vec(),
+            },
+            &arguments.output,
+        )?;
         eprintln!("saved: {}", arguments.output.display());
     } else {
         let stem = arguments
@@ -414,7 +310,14 @@ fn main() -> Result<()> {
             let path = arguments
                 .output
                 .with_file_name(format!("{stem}_{index}.{extension}"));
-            save_png(&image_data[start..start + per_image], height, width, &path)?;
+            save_png(
+                &RenderedImage {
+                    width,
+                    height,
+                    pixels_chw: image_data[start..start + per_image].to_vec(),
+                },
+                &path,
+            )?;
             eprintln!("saved: {}", path.display());
         }
     }

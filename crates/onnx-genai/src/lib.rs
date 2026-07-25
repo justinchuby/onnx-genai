@@ -5,6 +5,8 @@
 //! Reference implementation of the ONNX inference metadata standard
 //! ([onnx/onnx#8184](https://github.com/onnx/onnx/issues/8184)).
 
+pub mod text_to_image;
+
 pub use onnx_genai_engine as engine;
 pub use onnx_genai_kv as kv;
 pub use onnx_genai_metadata as metadata;
