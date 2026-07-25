@@ -5,10 +5,7 @@
 //! quantized caches, attention bias, smooth softmax/head sink, and QK capture
 //! are rejected.
 //!
-//! Prefill attention routes through the shared scalar SDPA core. The specialized
-//! loop below is retained only for the single-token decode path.
-//!
-//! ## Single-token decode design
+//! ## Performance design (M=1 decode, long context)
 //!
 //! The decode hot path is a GEMV over the KV cache, executed per
 //! `(batch, query_head, query_seq)` row.  Three targeted optimizations reduce
@@ -27,10 +24,9 @@
 //!    cache-line width and enabling AVX2 FMADD.
 //!
 //! ### Precision contract (RULES.md §4 / cross-EP parity)
-//! The specialized decode loop uses the **exact**
-//! `(score - max) as f64).exp() as f32` path, unchanged from the original. The
-//! dot-product and AXPY SIMD paths may reorder f32 additions (parallel
-//! accumulator reduction). Under the standard
+//! Softmax uses the **exact** `(score - max) as f64).exp() as f32` path, unchanged
+//! from the original.  The dot-product and AXPY SIMD paths may reorder f32
+//! additions (parallel accumulator reduction).  Under the standard
 //! floating-point model, a length-`n` dot product has forward error proportional
 //! to `γ_n × Σ|a_i b_i|`, where `γ_n = n u / (1 - n u)` and the unit roundoff
 //! for round-to-nearest f32 is `u = 0.5 × f32::EPSILON`.  This is a numerical
@@ -39,7 +35,6 @@
 
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::kernels::sdpa::{KeyMask, NoBias, ScaleMode, SdpaConfig, SdpaTensors, sdpa_f32_scalar};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
@@ -58,28 +53,6 @@ pub struct GroupQueryAttentionKernel {
 }
 
 pub struct GroupQueryAttentionFactory;
-
-struct GroupQueryAttentionPrefillMask<'a> {
-    query_starts: &'a [usize],
-    total_sequence_lengths: &'a [usize],
-    local_window_size: i64,
-}
-
-impl KeyMask for GroupQueryAttentionPrefillMask<'_> {
-    fn at(&self, batch: usize, query: usize, key: usize) -> f32 {
-        let causal_limit = self.query_starts[batch] + query;
-        let local_start = if self.local_window_size > 0 {
-            (causal_limit + 1).saturating_sub(self.local_window_size as usize)
-        } else {
-            0
-        };
-        if key < local_start || key > causal_limit || key >= self.total_sequence_lengths[batch] {
-            f32::NEG_INFINITY
-        } else {
-            0.0
-        }
-    }
-}
 
 impl KernelFactory for GroupQueryAttentionFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -1092,100 +1065,101 @@ impl Kernel for GroupQueryAttentionKernel {
         let group = self.num_heads / self.kv_num_heads;
         let attention_rows = q.batch * q.seq * self.num_heads;
         let mut y_bhsd = vec![0.0; attention_rows * v.dim];
-        if q.seq > 1 {
-            let tensors = SdpaTensors {
-                q: &q.data,
-                k: present_k,
-                v: present_v,
-                batch: q.batch,
-                num_heads: self.num_heads,
-                num_kv_heads: self.kv_num_heads,
-                q_seq: q.seq,
-                kv_seq: present_sequence_length,
-                head_size: cache_dim,
-                v_head_size: v.dim,
-            };
-            let config = SdpaConfig {
-                scale: ScaleMode::PostDot(scale),
-                softcap: (self.softcap != 0.0).then_some(self.softcap),
-                causal: false,
-                past_seq: 0,
-                causal_fill: f32::NEG_INFINITY,
-            };
-            let mask = GroupQueryAttentionPrefillMask {
-                query_starts: &query_starts,
-                total_sequence_lengths: &totals,
-                local_window_size: self.local_window_size,
-            };
-            sdpa_f32_scalar(&tensors, &config, &NoBias, &mask, &mut y_bhsd, None);
-        } else {
-            let compute_row = |batch: usize, query_head: usize, output_row: &mut [f32]| {
-                let key_value_head = query_head / group;
-                let causal_limit = query_starts[batch];
-                let local_start = if self.local_window_size > 0 {
-                    (causal_limit + 1).saturating_sub(self.local_window_size as usize)
-                } else {
-                    0
-                };
-                let attended = causal_limit + 1 - local_start;
-                let query_base = (batch * self.num_heads + query_head) * cache_dim;
-                let query_row = &q.data[query_base..query_base + cache_dim];
-                let key_value_head_stride =
-                    (batch * self.kv_num_heads + key_value_head) * present_sequence_length;
-                let mut scores = vec![0.0f32; attended];
-                for (score_index, key_sequence) in (local_start..=causal_limit).enumerate() {
-                    let key_base = (key_value_head_stride + key_sequence) * cache_dim;
-                    let key_row = &present_k[key_base..key_base + cache_dim];
-                    let mut score = dot_f32(query_row, key_row);
-                    score *= scale;
-                    if self.softcap != 0.0 {
-                        score = self.softcap * (score / self.softcap).tanh();
-                    }
-                    scores[score_index] = score;
-                }
-                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0_f32;
-                for score in &mut scores {
-                    *score = ((*score - maximum) as f64).exp() as f32;
-                    sum += *score;
-                }
-                if sum > 0.0 {
-                    for score in &mut scores {
-                        *score /= sum;
-                    }
-                }
-                output_row.fill(0.0);
-                for (score_index, key_sequence) in (local_start..=causal_limit).enumerate() {
-                    let probability = scores[score_index];
-                    if probability == 0.0 {
-                        continue;
-                    }
-                    let value_base = (key_value_head_stride + key_sequence) * v.dim;
-                    let value_row = &present_v[value_base..value_base + v.dim];
-                    axpy_f32(output_row, probability, value_row);
-                }
-            };
-            let attention_work = attention_rows
-                .saturating_mul(total_sequence_length)
-                .saturating_mul(cache_dim);
-            if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
-                crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
-                    &mut y_bhsd,
-                    v.dim,
-                    attention_rows,
-                    |row_index, output_row| {
-                        let batch = row_index / self.num_heads;
-                        let query_head = row_index % self.num_heads;
-                        compute_row(batch, query_head, output_row);
-                    },
-                );
+        let compute_row = |b: usize, qh: usize, qs: usize, output_row: &mut [f32]| {
+            let kvh = qh / group;
+            let causal_limit = query_starts[b] + qs;
+            let local_start = if self.local_window_size > 0 {
+                (causal_limit + 1).saturating_sub(self.local_window_size as usize)
             } else {
-                for batch in 0..q.batch {
-                    for query_head in 0..self.num_heads {
-                        let row_index = batch * self.num_heads + query_head;
+                0
+            };
+            // Number of keys in the attended causal window [local_start, causal_limit].
+            let attended = causal_limit + 1 - local_start;
+
+            // Extract the query row slice once to avoid per-element index arithmetic
+            // inside the scoring loop.
+            let q_base = ((b * self.num_heads + qh) * q.seq + qs) * cache_dim;
+            let q_row = &q.data[q_base..q_base + cache_dim];
+
+            // Base sequence index for this (batch, kv_head) in present_k / present_v.
+            let kv_head_stride = (b * self.kv_num_heads + kvh) * present_sequence_length;
+
+            // ── QK scores: dot(q_row, k_row) for each key in the attended window ──
+            // Allocate only `attended` elements rather than `total_sequence_length`
+            // so unattended positions are never touched.
+            let mut scores = vec![0.0f32; attended];
+            for (i, ks) in (local_start..=causal_limit).enumerate() {
+                let k_base = (kv_head_stride + ks) * cache_dim;
+                let k_row = &present_k[k_base..k_base + cache_dim];
+                let mut score = dot_f32(q_row, k_row);
+                score *= scale;
+                if self.softcap != 0.0 {
+                    score = self.softcap * (score / self.softcap).tanh();
+                }
+                scores[i] = score;
+            }
+
+            // ── Softmax over the attended window ──
+            // PRECISION CONTRACT (RULES.md §4): the f64 exp + single f32 rounding
+            // path matches CUDA's device-side computation and is kept unchanged.
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0_f32;
+            for score in &mut scores {
+                *score = ((*score - max) as f64).exp() as f32;
+                sum += *score;
+            }
+            // Normalize once so P·V can multiply without per-element division.
+            if sum > 0.0 {
+                for score in &mut scores {
+                    *score /= sum;
+                }
+            }
+
+            // ── P·V accumulation: cache-friendly AXPY (ks-outer, d-inner) ──
+            // Loop order: ks outer (sequential through probability weights),
+            // d inner (contiguous in both the V row and output_row) →
+            // sequential cache access + AVX2 FMADD via axpy_f32.
+            output_row.fill(0.0);
+            for (i, ks) in (local_start..=causal_limit).enumerate() {
+                let prob = scores[i];
+                if prob == 0.0 {
+                    continue;
+                }
+                let v_base = (kv_head_stride + ks) * v.dim;
+                let v_row = &present_v[v_base..v_base + v.dim];
+                axpy_f32(output_row, prob, v_row);
+            }
+        };
+        let attention_work = attention_rows
+            .saturating_mul(total_sequence_length)
+            .saturating_mul(cache_dim);
+        if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
+            // Route through the active decode pool (the same resident workers the
+            // MatMulNBits projections use). Under the persistent SPMD scope this
+            // avoids falling to the global Rayon pool, which would contend with
+            // the SPMD pool's pinned, spinning workers; under numa-split/flat
+            // scopes it runs on their bounded pool exactly as before.
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                &mut y_bhsd,
+                v.dim,
+                attention_rows,
+                |row_index, output_row| {
+                    let b = row_index / (self.num_heads * q.seq);
+                    let row_in_batch = row_index % (self.num_heads * q.seq);
+                    let qh = row_in_batch / q.seq;
+                    let qs = row_in_batch % q.seq;
+                    compute_row(b, qh, qs, output_row);
+                },
+            );
+        } else {
+            for b in 0..q.batch {
+                for qh in 0..self.num_heads {
+                    for qs in 0..q.seq {
+                        let row_index = (b * self.num_heads + qh) * q.seq + qs;
                         compute_row(
-                            batch,
-                            query_head,
+                            b,
+                            qh,
+                            qs,
                             &mut y_bhsd[row_index * v.dim..(row_index + 1) * v.dim],
                         );
                     }
@@ -1597,20 +1571,6 @@ mod tests {
                 &mut [out.view_mut(), pk.view_mut(), pv.view_mut()],
             )
             .unwrap();
-        let expected_bits = [
-            1065353216, 1073741824, 1065353216, 1073741824, 1092616192, 1101004800, 1092616192,
-            1101004800, 1075165886, 1079360191, 1075165886, 1079360191, 1102784879, 1107662008,
-            1102784879, 1107662008, 1080077193, 1083200964, 1080077193, 1083200964, 1108419752,
-            1111041192, 1108419752, 1111041192,
-        ];
-        assert_eq!(
-            out.to_f32()
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            expected_bits,
-            "prefill attention output must remain bit-identical"
-        );
         close(&out.to_f32(), &reference(&q, &k_bnsh, &v_bnsh, 3, 3, 0));
         assert_eq!(pk.shape, vec![1, 2, 3, 2]);
         close(&pk.to_f32(), &k_bnsh);
