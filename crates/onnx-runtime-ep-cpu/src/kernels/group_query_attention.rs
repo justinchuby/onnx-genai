@@ -14,14 +14,9 @@
 //! 1. **Attended-window scoring only**: scores are computed and stored only for
 //!    the `[local_start, causal_limit]` range; unattended positions are never
 //!    written to a full-length scratch buffer.
-//! 2. **SIMD dot-product** ([`dot_f32`] / [`dot_avx2_fma`]): the Q·K dot
-//!    product uses AVX2+FMA (two accumulators to hide latency, scalar tail) on
-//!    x86-64 hosts where `is_x86_feature_detected!("avx2") && "fma"` holds;
-//!    falls back to a scalar sum on other targets.
-//! 3. **Cache-friendly P·V accumulation** ([`axpy_f32`] / [`axpy_avx2_fma`]):
-//!    the weighted-sum loop is reordered to ks-outer, d-inner so that the V row
-//!    (`head_dim` contiguous f32s) is accessed sequentially per key, matching
-//!    cache-line width and enabling AVX2 FMADD.
+//! 2. **Shared decode SDPA core**: Q·K scoring, softcap, softmax, and P·V
+//!    accumulation delegate to [`super::sdpa::sdpa_decode_row`], including its
+//!    AVX2+FMA dot/AXPY implementation.
 //!
 //! ### Precision contract (RULES.md §4 / cross-EP parity)
 //! Softmax uses the **exact** `(score - max) as f64).exp() as f32` path, unchanged
@@ -33,6 +28,7 @@
 //! parity contract, not a universal greedy-token identity guarantee; model-level
 //! greedy parity is established empirically by profiling.
 
+use super::sdpa::{SoftmaxExp, sdpa_decode_row};
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -446,136 +442,6 @@ fn write_decode_output(out: &mut TensorMut, data: &[f32]) -> Result<()> {
     let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), data.len()) };
     dst.copy_from_slice(data);
     Ok(())
-}
-
-// ── SIMD helpers ─────────────────────────────────────────────────────────────
-
-/// Dot product `sum(a[i] * b[i])` using AVX2+FMA when available, scalar
-/// otherwise.  Two AVX2 accumulators hide FMA latency; a scalar tail handles
-/// lengths that are not a multiple of 16.
-///
-/// The AVX2 path reorders f32 additions across the two accumulators relative to
-/// a purely sequential scalar sum.  Its standard forward-error scale is
-/// `γ_n × Σ|a_i b_i|`, where `γ_n = n u / (1 - n u)` and
-/// `u = 0.5 × f32::EPSILON`; cancellation can therefore make a relative-error
-/// bound inappropriate.
-#[inline(always)]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if crate::backend::has_simd_x86() {
-        // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
-        return unsafe { dot_avx2_fma(a, b) };
-    }
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// AXPY `dst[d] += scalar * src[d]` for all d, using AVX2+FMA when available.
-///
-/// Used for the probability-weighted V accumulation (P·V step).  The inner
-/// loop is over `head_dim` contiguous f32s, which maps directly to 256-bit
-/// vector FMADD instructions.
-#[inline(always)]
-fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
-    debug_assert_eq!(dst.len(), src.len());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if crate::backend::has_simd_x86() {
-        // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
-        unsafe { axpy_avx2_fma(dst, scalar, src) };
-        return;
-    }
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d += scalar * s;
-    }
-}
-
-/// AVX2+FMA dot product.  Two accumulators hide the 5-cycle FMA latency on
-/// Sapphire Rapids; the 8-lane reduction is a standard 4→2→1 horizontal add.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let n = a.len();
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-
-    unsafe {
-        let mut acc0 = _mm256_setzero_ps();
-        let mut acc1 = _mm256_setzero_ps();
-
-        // Process 16 elements per iteration (two 8-wide AVX2 loads + FMAs).
-        let chunks16 = n / 16;
-        for i in 0..chunks16 {
-            let av0 = _mm256_loadu_ps(a_ptr.add(i * 16));
-            let bv0 = _mm256_loadu_ps(b_ptr.add(i * 16));
-            acc0 = _mm256_fmadd_ps(av0, bv0, acc0);
-            let av1 = _mm256_loadu_ps(a_ptr.add(i * 16 + 8));
-            let bv1 = _mm256_loadu_ps(b_ptr.add(i * 16 + 8));
-            acc1 = _mm256_fmadd_ps(av1, bv1, acc1);
-        }
-
-        // Remaining 8-element chunk (if any).
-        let mut tail = chunks16 * 16;
-        if tail + 8 <= n {
-            let av = _mm256_loadu_ps(a_ptr.add(tail));
-            let bv = _mm256_loadu_ps(b_ptr.add(tail));
-            acc0 = _mm256_fmadd_ps(av, bv, acc0);
-            tail += 8;
-        }
-
-        // Merge the two accumulators.
-        let acc = _mm256_add_ps(acc0, acc1);
-
-        // Horizontal reduce: 8 → 4 → 2 → 1 lane.
-        let lo = _mm256_extractf128_ps(acc, 0);
-        let hi = _mm256_extractf128_ps(acc, 1);
-        let v4 = _mm_add_ps(lo, hi);
-        let shuf = _mm_movehdup_ps(v4);
-        let v2 = _mm_add_ps(v4, shuf);
-        let shuf2 = _mm_movehl_ps(shuf, v2);
-        let v1 = _mm_add_ss(v2, shuf2);
-        let mut result = _mm_cvtss_f32(v1);
-
-        // Scalar tail for lengths not a multiple of 8.
-        for i in tail..n {
-            result += *a_ptr.add(i) * *b_ptr.add(i);
-        }
-        result
-    }
-}
-
-/// AVX2+FMA AXPY: `dst[d] += scalar * src[d]` for all d.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let n = dst.len();
-    let s = _mm256_set1_ps(scalar);
-    let dst_ptr = dst.as_mut_ptr();
-    let src_ptr = src.as_ptr();
-
-    unsafe {
-        let mut i = 0;
-        while i + 8 <= n {
-            let d = _mm256_loadu_ps(dst_ptr.add(i));
-            let x = _mm256_loadu_ps(src_ptr.add(i));
-            _mm256_storeu_ps(dst_ptr.add(i), _mm256_fmadd_ps(s, x, d));
-            i += 8;
-        }
-        // Scalar tail.
-        while i < n {
-            *dst_ptr.add(i) += scalar * *src_ptr.add(i);
-            i += 1;
-        }
-    }
 }
 
 // ── temporary within-GQA phase profiling (gated by ONNX_GENAI_PROFILE_GQA) ────
@@ -1073,62 +939,25 @@ impl Kernel for GroupQueryAttentionKernel {
             } else {
                 0
             };
-            // Number of keys in the attended causal window [local_start, causal_limit].
-            let attended = causal_limit + 1 - local_start;
-
-            // Extract the query row slice once to avoid per-element index arithmetic
-            // inside the scoring loop.
             let q_base = ((b * self.num_heads + qh) * q.seq + qs) * cache_dim;
             let q_row = &q.data[q_base..q_base + cache_dim];
-
-            // Base sequence index for this (batch, kv_head) in present_k / present_v.
-            let kv_head_stride = (b * self.kv_num_heads + kvh) * present_sequence_length;
-
-            // ── QK scores: dot(q_row, k_row) for each key in the attended window ──
-            // Allocate only `attended` elements rather than `total_sequence_length`
-            // so unattended positions are never touched.
-            let mut scores = vec![0.0f32; attended];
-            for (i, ks) in (local_start..=causal_limit).enumerate() {
-                let k_base = (kv_head_stride + ks) * cache_dim;
-                let k_row = &present_k[k_base..k_base + cache_dim];
-                let mut score = dot_f32(q_row, k_row);
-                score *= scale;
-                if self.softcap != 0.0 {
-                    score = self.softcap * (score / self.softcap).tanh();
-                }
-                scores[i] = score;
-            }
-
-            // ── Softmax over the attended window ──
-            // PRECISION CONTRACT (RULES.md §4): the f64 exp + single f32 rounding
-            // path matches CUDA's device-side computation and is kept unchanged.
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0_f32;
-            for score in &mut scores {
-                *score = ((*score - max) as f64).exp() as f32;
-                sum += *score;
-            }
-            // Normalize once so P·V can multiply without per-element division.
-            if sum > 0.0 {
-                for score in &mut scores {
-                    *score /= sum;
-                }
-            }
-
-            // ── P·V accumulation: cache-friendly AXPY (ks-outer, d-inner) ──
-            // Loop order: ks outer (sequential through probability weights),
-            // d inner (contiguous in both the V row and output_row) →
-            // sequential cache access + AVX2 FMADD via axpy_f32.
-            output_row.fill(0.0);
-            for (i, ks) in (local_start..=causal_limit).enumerate() {
-                let prob = scores[i];
-                if prob == 0.0 {
-                    continue;
-                }
-                let v_base = (kv_head_stride + ks) * v.dim;
-                let v_row = &present_v[v_base..v_base + v.dim];
-                axpy_f32(output_row, prob, v_row);
-            }
+            let kv_head_base = (b * self.kv_num_heads + kvh) * present_sequence_length;
+            let k_head = &present_k
+                [kv_head_base * cache_dim..(kv_head_base + present_sequence_length) * cache_dim];
+            let v_head =
+                &present_v[kv_head_base * v.dim..(kv_head_base + present_sequence_length) * v.dim];
+            sdpa_decode_row(
+                q_row,
+                k_head,
+                v_head,
+                present_sequence_length,
+                local_start,
+                causal_limit + 1,
+                scale,
+                (self.softcap != 0.0).then_some(self.softcap),
+                SoftmaxExp::F64Intermediate,
+                output_row,
+            );
         };
         let attention_work = attention_rows
             .saturating_mul(total_sequence_length)
@@ -1253,16 +1082,6 @@ fn normalized_sequence_lengths(view: &TensorView, batch: usize) -> Result<Vec<i6
 mod tests {
     use super::*;
 
-    fn has_simd_x86_for_test() -> bool {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            crate::backend::has_simd_x86()
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            false
-        }
-    }
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
@@ -1438,18 +1257,6 @@ mod tests {
         let signed_unit = (((state >> 40) as u32) as f32 / ((1_u32 << 24) as f32)) * 2.0 - 1.0;
         let scale = [0.03125_f32, 0.125, 0.5, 2.0][((state >> 8) & 3) as usize];
         signed_unit * scale
-    }
-
-    fn dot_comparison_tolerance(left: &[f32], right: &[f32]) -> f32 {
-        let unit_roundoff = 0.5 * f32::EPSILON;
-        let operation_count = left.len() as f32;
-        let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
-        let absolute_product_sum: f32 = left
-            .iter()
-            .zip(right)
-            .map(|(left_element, right_element)| (left_element * right_element).abs())
-            .sum();
-        2.0 * gamma * absolute_product_sum + 2.0 * f32::MIN_POSITIVE
     }
 
     fn close(got: &[f32], want: &[f32]) {
@@ -2937,123 +2744,6 @@ mod tests {
         }
     }
 
-    /// Verifies SIMD dot products against a scalar sequential sum using the
-    /// standard `2 γ_n Σ|a_i b_i|` comparison tolerance. The factor two accounts
-    /// for comparing two rounded evaluation orders rather than either one to the
-    /// exact real-number dot product.
-    #[test]
-    fn dot_f32_matches_scalar_reference_for_various_lengths() {
-        let lengths = [1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133];
-        if !has_simd_x86_for_test() {
-            eprintln!("skipping AVX2+FMA dot-product regression: SIMD is unavailable");
-            return;
-        }
-        for length in lengths {
-            let left: Vec<f32> = (0..length)
-                .map(|index| mixed_scale_value(index, 0x1357))
-                .collect();
-            let right: Vec<f32> = (0..length)
-                .map(|index| mixed_scale_value(index, 0x9753))
-                .collect();
-            let scalar: f32 = left
-                .iter()
-                .zip(&right)
-                .map(|(left_element, right_element)| left_element * right_element)
-                .sum();
-            let actual = dot_f32(&left, &right);
-            let tolerance = dot_comparison_tolerance(&left, &right);
-            assert!(
-                (actual - scalar).abs() <= tolerance,
-                "dot_f32 length={length}: actual {actual}, scalar {scalar}, difference {}, tolerance {}",
-                (actual - scalar).abs(),
-                tolerance
-            );
-        }
-    }
-
-    /// Verifies that `axpy_f32` accumulates `dst[d] += scalar * src[d]`
-    /// correctly for various lengths relative to the scalar path.
-    #[test]
-    fn axpy_f32_matches_scalar_reference_for_various_lengths() {
-        let lengths = [1, 7, 8, 9, 15, 16, 17, 32, 64, 128, 133];
-        for n in lengths {
-            let src: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) / 13.0).collect();
-            let init: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) / 7.0).collect();
-            let scalar_val = 0.37_f32;
-
-            // Scalar reference.
-            let mut want = init.clone();
-            for (d, s) in want.iter_mut().zip(&src) {
-                *d += scalar_val * s;
-            }
-
-            // axpy_f32 path.
-            let mut got = init.clone();
-            axpy_f32(&mut got, scalar_val, &src);
-
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() < 1e-6,
-                    "axpy_f32 n={n} i={i}: got {g}, want {w}"
-                );
-            }
-        }
-    }
-
-    /// Mirrors the P·V decode loop by applying 257 probability-weighted value
-    /// rows. This covers repeated AVX2 FMADD accumulation rather than only one
-    /// helper call.
-    #[test]
-    fn axpy_f32_many_weighted_rows_matches_scalar_reference() {
-        const KEY_COUNT: usize = 257;
-        const HEAD_WIDTH: usize = 128;
-
-        if !has_simd_x86_for_test() {
-            eprintln!("skipping AVX2+FMA AXPY regression: SIMD is unavailable");
-            return;
-        }
-
-        let unnormalized_probabilities: Vec<f32> = (0..KEY_COUNT)
-            .map(|key_index| (mixed_scale_value(key_index, 0xabcd).abs() + 0.01).exp())
-            .collect();
-        let probability_sum: f32 = unnormalized_probabilities.iter().sum();
-        let probabilities: Vec<f32> = unnormalized_probabilities
-            .iter()
-            .map(|probability| probability / probability_sum)
-            .collect();
-        let values: Vec<f32> = (0..KEY_COUNT * HEAD_WIDTH)
-            .map(|index| mixed_scale_value(index, 0xcafe))
-            .collect();
-
-        let mut expected = vec![0.0_f32; HEAD_WIDTH];
-        let mut actual = vec![0.0_f32; HEAD_WIDTH];
-        for (key_index, probability) in probabilities.iter().copied().enumerate() {
-            let value_row = &values[key_index * HEAD_WIDTH..(key_index + 1) * HEAD_WIDTH];
-            for (destination, source) in expected.iter_mut().zip(value_row) {
-                *destination += probability * source;
-            }
-            axpy_f32(&mut actual, probability, value_row);
-        }
-
-        for dimension_index in 0..HEAD_WIDTH {
-            let absolute_term_sum: f32 = (0..KEY_COUNT)
-                .map(|key_index| {
-                    (probabilities[key_index] * values[key_index * HEAD_WIDTH + dimension_index])
-                        .abs()
-                })
-                .sum();
-            let unit_roundoff = 0.5 * f32::EPSILON;
-            let gamma = KEY_COUNT as f32 * unit_roundoff / (1.0 - KEY_COUNT as f32 * unit_roundoff);
-            let tolerance = 2.0 * gamma * absolute_term_sum + 2.0 * f32::MIN_POSITIVE;
-            assert!(
-                (actual[dimension_index] - expected[dimension_index]).abs() <= tolerance,
-                "P·V dimension {dimension_index}: actual {}, expected {}, difference {}, tolerance {tolerance}",
-                actual[dimension_index],
-                expected[dimension_index],
-                (actual[dimension_index] - expected[dimension_index]).abs()
-            );
-        }
-    }
     #[test]
     fn decode_bf16_kv_state_matches_widened_f32_reference() {
         let q = vec![1., 0., 1., 0., 0., 1., 0., 1.];
