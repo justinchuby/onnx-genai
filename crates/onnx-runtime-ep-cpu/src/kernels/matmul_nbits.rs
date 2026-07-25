@@ -2154,7 +2154,7 @@ fn selected_dot_kernel() -> DotKernel {
         // NEON/AdvSIMD is baseline on aarch64, so the SIMD int8 dot is always
         // available — never fall back to the slow scalar path on ARM. The
         // kernel uses the widen-`vmlal` baseline, bit-exact vs scalar.
-        return DotKernel::Neon;
+        DotKernel::Neon
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
