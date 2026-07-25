@@ -968,6 +968,26 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     if total == 0 {
         return None;
     }
+    // Cpuset-aware dispatcher headroom: when the requested spinning-worker count
+    // would occupy *every* CPU the process is allowed to run on, a single
+    // allowed CPU leaves no core for the inline dispatcher (the engine thread
+    // that publishes each op and spins on the per-node completion counters).
+    // With N spinning workers pinned across all N allowed CPUs the dispatcher is
+    // migrated onto a busy worker core and can no longer publish jobs / read
+    // counters promptly, collapsing throughput ~20-60x (measured 1.47 tok/s at
+    // 32 workers on `taskset -c 0-31` vs ~29 tok/s once one CPU is spare). If the
+    // whole allowed cpuset is a single CPU there is no core to reserve, so the
+    // pool cannot run without starving itself -- fall back to the flat path.
+    if let Some(allowed) = crate::decode_affinity::allowed_cpus()
+        && allowed.len() == 1
+    {
+        report_spmd_fallback(
+            "the process is confined to a single CPU (cpuset/taskset), which leaves no core \
+             for the inline dispatcher alongside a spinning worker -- leaving decode on the \
+             flat path instead of starving the persistent SPMD pool",
+        );
+        return None;
+    }
     report_pool_built(mode);
     let shards = node_shards(total);
     Some(SpmdDecodePools::build(&shards))
@@ -984,22 +1004,84 @@ fn explicit_decode_affinity_set() -> bool {
 
 /// Resolve the node shards for `total` workers: the multi-node split when the
 /// (cpuset-restricted) topology exposes >=2 nodes, otherwise a single group.
+///
+/// In both cases the pinned-worker count is capped so the inline dispatcher
+/// always keeps at least one allowed CPU free (see [`DISPATCHER_RESERVED_CPUS`]
+/// and [`reserve_single_group_headroom`] / [`reserve_split_headroom`]). Without
+/// that reservation a fully-subscribed cpuset (workers == allowed CPUs) pins a
+/// spinning worker on every core, starving the dispatcher and collapsing
+/// throughput.
 fn node_shards(total: usize) -> Vec<NodeShard> {
     let allowed = crate::decode_affinity::allowed_cpus();
     if let Some(topology) = NumaTopology::detect() {
         let topology = topology.restrict_to_allowed(allowed.as_deref());
-        if let Some(shards) = topology.split_workers(total) {
+        if let Some(mut shards) = topology.split_workers(total) {
+            // Reserve a dispatcher core on every node so the engine thread has a
+            // free core on whichever socket the scheduler places it, and each
+            // node's completion counter can be read without contending with a
+            // pinned spinning worker.
+            reserve_split_headroom(&mut shards);
             return shards;
         }
     }
     // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
     // process's allowed CPUs when known (best-effort), else leave unpinned.
     let cpus = allowed.unwrap_or_default();
+    let workers = reserve_single_group_headroom(total, cpus.len());
     vec![NodeShard {
         index: 0,
         cpus,
-        workers: total,
+        workers,
     }]
+}
+
+/// Allowed CPUs kept free for the inline dispatcher per pinned worker group.
+///
+/// The dispatcher is a single thread, so one spare core is sufficient for it to
+/// run; reserving *per node* (see [`reserve_split_headroom`]) rather than once
+/// globally guarantees the spare core lands on whichever socket the scheduler
+/// places the dispatcher on, and keeps every node's completion-counter reads
+/// unblocked on a NUMA-split layout. One is enough because the workers already
+/// plateau around half the logical CPUs (memory-bandwidth bound), so giving up
+/// the single highest-index core costs nothing measurable while removing the
+/// starvation cliff.
+const DISPATCHER_RESERVED_CPUS: usize = 1;
+
+/// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]
+/// allowed CPU stays free for the inline dispatcher.
+///
+/// `allowed_count == 0` means the allowed set is unknown, so workers run
+/// unpinned and cannot starve the dispatcher by occupying every core -- the
+/// count is returned unchanged. When there is already headroom
+/// (`total < allowed_count`) the count is likewise unchanged, so this is a
+/// strict no-op unless the group would otherwise be fully subscribed. The result
+/// is floored at one worker: even a user who sets
+/// `ONNX_GENAI_CPU_DECODE_THREADS=N` on an exactly-N-CPU cpuset gets N-1 pinned
+/// workers (never zero); the single-CPU case is handled earlier by falling back
+/// to the flat path in [`build_from_env`].
+fn reserve_single_group_headroom(total: usize, allowed_count: usize) -> usize {
+    if allowed_count == 0 || total < allowed_count {
+        return total;
+    }
+    allowed_count
+        .saturating_sub(DISPATCHER_RESERVED_CPUS)
+        .max(1)
+}
+
+/// Cap each NUMA-split shard so at least [`DISPATCHER_RESERVED_CPUS`] CPU of that
+/// node stays free for the inline dispatcher. Only nodes that would be fully
+/// subscribed (`workers == node CPUs`) are reduced; a node that already has a
+/// spare core is left untouched, so this is a no-op wherever headroom exists.
+/// Each shard keeps at least one worker.
+fn reserve_split_headroom(shards: &mut [NodeShard]) {
+    for shard in shards.iter_mut() {
+        let cap = shard
+            .cpus
+            .len()
+            .saturating_sub(DISPATCHER_RESERVED_CPUS)
+            .max(1);
+        shard.workers = shard.workers.min(cap);
+    }
 }
 
 /// Log the first persistent-pool fallback/pinning problem once so a restricted
@@ -1299,6 +1381,68 @@ mod tests {
             workers,
         }];
         SpmdDecodePools::build(&shards)
+    }
+
+    #[test]
+    fn reserve_single_group_headroom_frees_a_dispatcher_cpu_when_fully_subscribed() {
+        // The pathological forced case: requested workers == allowed CPUs (e.g.
+        // `taskset -c 0-31` with THREADS=32). One CPU must be reserved for the
+        // inline dispatcher, so 31 workers are pinned and the highest-index
+        // allowed CPU stays free (workers pin to cpus[0..workers] round-robin).
+        assert_eq!(reserve_single_group_headroom(32, 32), 31);
+        // Oversubscription (workers > allowed) is likewise capped to allowed - 1.
+        assert_eq!(reserve_single_group_headroom(40, 32), 31);
+        // Even an explicit THREADS=N on an exactly-N-CPU cpuset still reserves the
+        // dispatcher core: N-1 workers, never N and never zero.
+        assert_eq!(reserve_single_group_headroom(2, 2), 1);
+    }
+
+    #[test]
+    fn reserve_single_group_headroom_is_a_noop_when_headroom_exists_or_affinity_unknown() {
+        // Requested workers < allowed CPUs: genuine headroom already exists, so
+        // the count is unchanged (the numa-split / flat paths are untouched too).
+        assert_eq!(reserve_single_group_headroom(16, 32), 16);
+        assert_eq!(reserve_single_group_headroom(31, 32), 31);
+        // allowed_count == 0 means the allowed set is unknown; workers run
+        // unpinned and cannot occupy every core, so nothing is capped.
+        assert_eq!(reserve_single_group_headroom(32, 0), 32);
+        assert_eq!(reserve_single_group_headroom(1, 0), 1);
+    }
+
+    #[test]
+    fn reserve_split_headroom_reserves_one_cpu_per_node_only_when_fully_subscribed() {
+        // Both nodes fully subscribed (workers == node CPUs): each is reduced by
+        // one so every socket keeps a free core for the dispatcher, whichever
+        // node it lands on. A node with existing headroom is left untouched.
+        let mut shards = vec![
+            NodeShard {
+                index: 0,
+                cpus: (0..16).collect(),
+                workers: 16,
+            },
+            NodeShard {
+                index: 1,
+                cpus: (16..32).collect(),
+                workers: 10,
+            },
+        ];
+        reserve_split_headroom(&mut shards);
+        assert_eq!(shards[0].workers, 15);
+        assert_eq!(shards[1].workers, 10);
+        // CPU lists are preserved; only the pinned-worker count shrinks, so the
+        // reserved (highest-index) CPU of a capped node stays unpinned.
+        assert_eq!(shards[0].cpus.len(), 16);
+    }
+
+    #[test]
+    fn reserve_split_headroom_floors_at_one_worker_per_node() {
+        let mut shards = vec![NodeShard {
+            index: 0,
+            cpus: vec![7],
+            workers: 1,
+        }];
+        reserve_split_headroom(&mut shards);
+        assert_eq!(shards[0].workers, 1);
     }
 
     #[test]
