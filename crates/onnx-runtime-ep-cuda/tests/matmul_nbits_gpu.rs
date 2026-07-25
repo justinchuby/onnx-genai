@@ -1357,7 +1357,8 @@ fn accuracy4_reference_asymmetric(
                 } else {
                     zp_byte & 0x0f
                 });
-                let mut dot = 0i32;
+                let mut weighted = 0i32;
+                let mut activation_sum = 0i32;
                 for depth in begin..end {
                     let within = depth - begin;
                     let quantized_activation = (activations[depth] * inverse_scale)
@@ -1369,9 +1370,12 @@ fn accuracy4_reference_asymmetric(
                     } else {
                         byte >> 4
                     };
-                    dot += quantized_activation * (i32::from(quantized_weight) - zero_point);
+                    weighted += quantized_activation * i32::from(quantized_weight);
+                    activation_sum += quantized_activation;
                 }
-                value += dot as f32 * activation_scale * scales[column * blocks + block];
+                let dot = weighted - zero_point * activation_sum;
+                let combined_scale = activation_scale * scales[column * blocks + block];
+                value += dot as f32 * combined_scale;
             }
             value
         })
@@ -1438,6 +1442,19 @@ fn matmul_nbits_gpu_accuracy4_blockwise_block128_matches_quantized_reference() {
         )
         .unwrap();
         assert_close(&actual_zp, &expected_zp);
+        if k == 300 {
+            assert_eq!(
+                actual_zp
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected_zp
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "block128 asymmetric partial-K dp4a output must match the scalar reference bit-for-bit"
+            );
+        }
     }
     eprintln!("verified accuracy_level=4 blockwise block128 symmetric + asymmetric CUDA GEMV");
 }
