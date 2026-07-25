@@ -83,11 +83,11 @@ MOBIUS_DIR=/path/to/mobius STATIC_CACHE=1 MAX_SEQ_LEN=8192 scripts/build_qwen.sh
 cargo build --release -p onnx-genai -p onnx-genai-server
 
 ./target/release/onnx-genai generate \
-  --model models/qwen2.5-0.5b \
+  models/qwen2.5-0.5b \
   --max-new-tokens 64 \
   --temperature 0 \
   --stream \
-  "Write a short Rust hello-world program."
+  --prompt "Write a short Rust hello-world program."
 ```
 
 ### Run the OpenAI-compatible server

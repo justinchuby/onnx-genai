@@ -309,7 +309,6 @@ impl SamplingArgs {
 #[derive(Debug, Args)]
 struct GenerateArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
-    #[arg(long)]
     model: PathBuf,
 
     #[command(flatten)]
@@ -320,13 +319,13 @@ struct GenerateArgs {
     stream: bool,
 
     /// Prompt text.
+    #[arg(long)]
     prompt: String,
 }
 
 #[derive(Debug, Args)]
 struct RunArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
-    #[arg(long)]
     model: PathBuf,
 
     #[command(flatten)]
@@ -645,6 +644,48 @@ fn version() {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn generate_accepts_positional_model_and_prompt_flag() {
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.model, PathBuf::from("./m"));
+                assert_eq!(args.prompt, "hi");
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_requires_prompt_flag() {
+        assert!(Cli::try_parse_from(["onnx-genai", "generate", "./m"]).is_err());
+    }
+
+    #[test]
+    fn generate_rejects_model_flag() {
+        assert!(
+            Cli::try_parse_from(["onnx-genai", "generate", "--model", "./m", "--prompt", "hi"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn run_accepts_positional_model() {
+        let parsed_command_line = Cli::try_parse_from(["onnx-genai", "run", "./m"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Run(args) => assert_eq!(args.model, PathBuf::from("./m")),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_rejects_model_flag() {
+        assert!(Cli::try_parse_from(["onnx-genai", "run", "--model", "./m"]).is_err());
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir().unwrap().join(format!(
