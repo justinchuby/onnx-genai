@@ -1380,6 +1380,13 @@ pub(crate) async fn image_generations(
     onnx_genai::text_to_image::validate_batch_size(count)
         .map_err(|error| ApiError::bad_request(format!("{error:#} (field: n)")))?;
     let (width, height) = parse_image_size(request.size.as_deref())?;
+    // Bounded before anything is allocated: size and steps are caller-supplied.
+    onnx_genai::text_to_image::validate_image_size(width, height)
+        .map_err(|error| ApiError::bad_request(format!("{error:#} (field: size)")))?;
+    if let Some(steps) = request.steps {
+        onnx_genai::text_to_image::validate_steps(steps)
+            .map_err(|error| ApiError::bad_request(format!("{error:#} (field: steps)")))?;
+    }
 
     let render_request = TextToImageRequest {
         prompt: request.prompt.clone(),

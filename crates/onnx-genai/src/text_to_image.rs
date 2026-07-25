@@ -58,6 +58,44 @@ pub const DEFAULT_LATENT_CHANNELS: usize = 4;
 /// exactly the same range.
 pub const MAX_BATCH_SIZE: usize = 4;
 
+/// Largest image side this renderer will attempt, in pixels.
+///
+/// The latent buffer is allocated from width x height before any model runs, so
+/// an unbounded size is an allocation an untrusted caller controls.
+pub const MAX_IMAGE_SIDE: usize = 4_096;
+
+/// Largest denoise loop this renderer will run.
+///
+/// Each step is a full denoiser pass, so an unbounded count is unbounded
+/// compute for a single request.
+pub const MAX_STEPS: usize = 1_000;
+
+/// Validate a requested image size against [`MAX_IMAGE_SIDE`].
+pub fn validate_image_size(width: usize, height: usize) -> Result<()> {
+    for (axis, value) in [("width", width), ("height", height)] {
+        if value == 0 || value > MAX_IMAGE_SIDE {
+            bail!(
+                "What: an image {axis} of {value} was rejected. \
+                 Why: this renderer allocates the latent buffer up front, so each side must be between 1 and {MAX_IMAGE_SIDE} pixels. \
+                 How: request a {axis} within that range."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate a requested step count against [`MAX_STEPS`].
+pub fn validate_steps(steps: usize) -> Result<()> {
+    if steps == 0 || steps > MAX_STEPS {
+        bail!(
+            "What: a denoise loop of {steps} steps was rejected. \
+             Why: every step is a full denoiser pass, so the count must be between 1 and {MAX_STEPS}. \
+             How: request a step count within that range."
+        );
+    }
+    Ok(())
+}
+
 /// Validate a requested batch size against [`MAX_BATCH_SIZE`].
 pub fn validate_batch_size(batch_size: usize) -> Result<()> {
     if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
@@ -486,6 +524,7 @@ pub fn render(
         );
     }
     validate_batch_size(request.batch_size)?;
+    validate_image_size(request.width, request.height)?;
     let batch_size = request.batch_size;
     let endpoints = resolve_endpoints(engine.spec())?;
     let guidance_scale = request
@@ -497,6 +536,7 @@ pub fn render(
         .steps
         .or(engine.spec().strategy.num_steps)
         .unwrap_or(25);
+    validate_steps(num_steps)?;
 
     let tokenizer_path = request
         .tokenizer_path

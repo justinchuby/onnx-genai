@@ -203,6 +203,13 @@ kv page activity:
   allocation failures             1  (pool exhausted)
 ```
 
+`--vram-limit` sets the ceiling those pages come out of — a byte count (`8GiB`),
+a fraction of detected capacity (`0.9`), or `auto`. An explicit byte value is
+authoritative: the runtime's device-capacity probe is still provisional, so this
+is how you tell it what is really available. Raising it enlarges the KV cache and
+therefore the context that fits. `--host-ram-limit` does the same for the warm
+offload tier.
+
 Evictions and allocation failures are the signal that a context no longer fits:
 they explain a latency cliff that no per-token number does. The last three lines
 appear only when they happen, and a run that touched no pages says nothing

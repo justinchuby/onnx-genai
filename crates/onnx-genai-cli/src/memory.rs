@@ -30,8 +30,12 @@ fn peak_resident_bytes_impl() -> Option<u64> {
     parse_vm_hwm(&status)
 }
 
-/// macOS and the BSDs report the high-water mark from `getrusage`, in bytes.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS reports the high-water mark from `getrusage` in bytes.
+///
+/// Deliberately macOS-only: `ru_maxrss` units are not portable across the BSDs
+/// (several report kibibytes), and a silently wrong unit is worse than no
+/// number. Other unix targets report nothing until each is verified.
+#[cfg(target_os = "macos")]
 fn peak_resident_bytes_impl() -> Option<u64> {
     // SAFETY: `getrusage` writes a fully-initialized `rusage` into the pointer
     // we own; it reads no memory from us and cannot fail for RUSAGE_SELF except
@@ -44,7 +48,7 @@ fn peak_resident_bytes_impl() -> Option<u64> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn peak_resident_bytes_impl() -> Option<u64> {
     None
 }

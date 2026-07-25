@@ -224,7 +224,7 @@ struct PipelineBackend {
 
 impl Backend {
     /// Load `model_dir`, preferring its declared pipeline when it has one.
-    fn load(model_dir: &Path) -> anyhow::Result<Self> {
+    fn load(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
         match multimodal::load(model_dir)? {
             Some(setup) => {
                 let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).map_err(|error| {
@@ -235,17 +235,14 @@ impl Backend {
                         setup.tokenizer_path.display()
                     )
                 })?;
-                let engine = Engine::from_pipeline_dir(model_dir, EngineConfig::default())?;
+                let engine = Engine::from_pipeline_dir(model_dir, config)?;
                 Ok(Self::Pipeline(Box::new(PipelineBackend {
                     engine,
                     tokenizer,
                     multimodal: setup.multimodal,
                 })))
             }
-            None => Ok(Self::Text(Box::new(Engine::from_dir(
-                model_dir,
-                EngineConfig::default(),
-            )?))),
+            None => Ok(Self::Text(Box::new(Engine::from_dir(model_dir, config)?))),
         }
     }
 
@@ -643,6 +640,48 @@ impl SamplingArgs {
     }
 }
 
+/// Shared engine-tuning flags.
+#[derive(Debug, Args, Default, Clone)]
+struct EngineArgs {
+    /// Memory ceiling the engine may use for weights and KV cache: a byte count
+    /// (`8GiB`), a fraction of detected capacity (`0.9`), or `auto`.
+    ///
+    /// An explicit byte value is authoritative — the runtime's device-capacity
+    /// probe is still provisional, so this is how you tell it what is really
+    /// available. Raising it enlarges the KV cache, and therefore the context
+    /// that fits.
+    #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
+    vram_limit: Option<onnx_genai::engine::ResourceLimit>,
+
+    /// Host RAM ceiling for the warm offload tier, in the same format.
+    #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
+    host_ram_limit: Option<onnx_genai::engine::ResourceLimit>,
+}
+
+impl EngineArgs {
+    fn to_config(&self) -> EngineConfig {
+        let mut config = EngineConfig::default();
+        if let Some(limit) = self.vram_limit {
+            config.limits.vram_limit = limit;
+        }
+        if let Some(limit) = self.host_ram_limit {
+            config.limits.host_ram_limit = limit;
+        }
+        config
+    }
+}
+
+/// Parse a `--vram-limit` / `--host-ram-limit` value.
+fn parse_limit(input: &str) -> Result<onnx_genai::engine::ResourceLimit, String> {
+    onnx_genai::engine::parse_resource_limit(input).map_err(|error| {
+        format!(
+            "What: the memory limit {input:?} was rejected. \
+             Why: {error}. \
+             How: pass a byte count such as 8GiB, a fraction such as 0.9, or auto."
+        )
+    })
+}
+
 /// Shared profiling flags.
 #[derive(Debug, Args, Default, Clone)]
 struct ProfileArgs {
@@ -861,6 +900,9 @@ struct GenerateArgs {
     attachments: AttachmentArgs,
 
     #[command(flatten)]
+    engine: EngineArgs,
+
+    #[command(flatten)]
     image_output: ImageOutputArgs,
 
     #[command(flatten)]
@@ -885,6 +927,9 @@ struct RunArgs {
 
     #[command(flatten)]
     attachments: AttachmentArgs,
+
+    #[command(flatten)]
+    engine: EngineArgs,
 }
 
 /// Output shape for `transcribe`.
@@ -947,6 +992,9 @@ struct TranscribeArgs {
     /// Maximum tokens to decode per segment.
     #[arg(long)]
     max_new_tokens: Option<usize>,
+
+    #[command(flatten)]
+    engine: EngineArgs,
 }
 
 #[derive(Debug, Args)]
@@ -1045,7 +1093,7 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     };
 
     let load_started = std::time::Instant::now();
-    let mut backend = Backend::load(&model_dir)?;
+    let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
     profile.phase("model load", load_started.elapsed());
     profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
     if let Some(memory) = backend.kv_usage() {
@@ -1176,7 +1224,7 @@ fn generate_audio(
         )
     })?;
     let load_started = std::time::Instant::now();
-    let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())?;
+    let mut engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())?;
     profile.phase("model load", load_started.elapsed());
 
     let request = args
@@ -1211,7 +1259,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
     let load_started = std::time::Instant::now();
-    let mut backend = Backend::load(&model_dir)?;
+    let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
     let load_elapsed = load_started.elapsed();
     let mut raw_mode = args.sampling.raw;
     let mut template = load_chat_template(&model_dir, raw_mode);
@@ -1520,7 +1568,7 @@ impl Transcriber {
                 setup.tokenizer_path.display()
             )
         })?;
-        let engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())?;
+        let engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())?;
         Ok(Self {
             engine,
             tokenizer,
@@ -1856,6 +1904,10 @@ enum StreamHeader {
 /// to keep latency low and large enough to avoid a syscall per sample.
 const STREAM_CHUNK_BYTES: usize = 8_192;
 
+/// Largest `fmt ` chunk this reader will hold. A PCM format chunk is 16-40
+/// bytes; the cap keeps an untrusted declared size from becoming an allocation.
+const MAX_WAV_FORMAT_CHUNK_BYTES: usize = 4_096;
+
 impl<R: BufRead> PcmStreamReader<R> {
     fn new(mut reader: R, sample_rate: u32, channels: u16) -> anyhow::Result<Self> {
         if channels == 0 {
@@ -1877,11 +1929,21 @@ impl<R: BufRead> PcmStreamReader<R> {
                 (sample_rate, channels)
             }
         };
+        // Re-validated after the header override: a WAV `fmt ` chunk supplies
+        // its own values, and a zero channel count would make the frame size
+        // zero and panic every later modulo.
         if sample_rate == 0 {
             anyhow::bail!(
-                "What: --sample-rate 0 was rejected. \
-                 Why: a stream needs a positive sample rate. \
+                "What: a sample rate of zero was rejected. \
+                 Why: the stream declared it, or --sample-rate 0 was passed, and audio needs a positive rate. \
                  How: pass the rate the source produces, e.g. --sample-rate 16000."
+            );
+        }
+        if channels == 0 {
+            anyhow::bail!(
+                "What: a channel count of zero was rejected. \
+                 Why: the WAV header declared it, but audio needs at least one channel. \
+                 How: re-encode the stream with a valid channel count, e.g. `ffmpeg ... -ac 1`."
             );
         }
         Ok(Self {
@@ -2007,6 +2069,15 @@ fn read_wav_stream_header<R: BufRead>(reader: &mut R) -> anyhow::Result<StreamHe
         let id = [header[0], header[1], header[2], header[3]];
         let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         if &id == b"fmt " {
+            // The size is attacker-controlled on a pipe: a 12-byte header must
+            // not be able to request a multi-gigabyte zeroed allocation.
+            if size > MAX_WAV_FORMAT_CHUNK_BYTES {
+                anyhow::bail!(
+                    "What: the WAV format chunk was rejected. \
+                     Why: it declares {size} bytes, far beyond the {MAX_WAV_FORMAT_CHUNK_BYTES} a PCM format chunk needs. \
+                     How: pipe a standard PCM WAV stream."
+                );
+            }
             let mut chunk = vec![0_u8; size];
             reader.read_exact(&mut chunk).map_err(|_| {
                 anyhow::anyhow!(
@@ -2021,6 +2092,17 @@ fn read_wav_stream_header<R: BufRead>(reader: &mut R) -> anyhow::Result<StreamHe
                      Why: it is {} bytes, too short to declare a channel count and sample rate. \
                      How: pipe a standard PCM WAV stream.",
                     chunk.len()
+                );
+            }
+            // Format tag 1 is uncompressed PCM; 0xFFFE is extensible, whose
+            // sub-format this reader does not inspect. Anything else would be
+            // decoded as PCM16 and produce noise.
+            let format_tag = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if !matches!(format_tag, 1 | 0xFFFE) {
+                anyhow::bail!(
+                    "What: the WAV stream was rejected. \
+                     Why: its format tag {format_tag} is not uncompressed PCM, so its bytes are not samples. \
+                     How: convert with `ffmpeg ... -acodec pcm_s16le -f wav -`."
                 );
             }
             let channels = u16::from_le_bytes([chunk[2], chunk[3]]);
@@ -2046,14 +2128,22 @@ fn read_wav_stream_header<R: BufRead>(reader: &mut R) -> anyhow::Result<StreamHe
             });
         } else {
             // Skip any other chunk (LIST, fact, ...), padded to even length.
-            let mut skip = vec![0_u8; size + size % 2];
-            reader.read_exact(&mut skip).map_err(|_| {
-                anyhow::anyhow!(
-                    "What: the WAV stream ended inside a header chunk. \
-                     Why: it was truncated. \
-                     How: pipe a complete WAV stream."
-                )
-            })?;
+            // Discarded in bounded blocks: the declared size is untrusted, so it
+            // must never become an allocation.
+            let padded = u64::from(size as u64) + u64::from(size as u64 % 2);
+            let mut remaining = padded;
+            let mut sink = [0_u8; 8192];
+            while remaining > 0 {
+                let want = remaining.min(sink.len() as u64) as usize;
+                reader.read_exact(&mut sink[..want]).map_err(|_| {
+                    anyhow::anyhow!(
+                        "What: the WAV stream ended inside a header chunk. \
+                         Why: it was truncated. \
+                         How: pipe a complete WAV stream."
+                    )
+                })?;
+                remaining -= want as u64;
+            }
         }
     }
 }

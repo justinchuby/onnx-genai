@@ -24,6 +24,9 @@ pub(crate) struct TokenTimings {
     last_token_at: Option<Instant>,
     /// Gap before each token after the first: the inter-token latencies.
     gaps: Vec<Duration>,
+    /// Elapsed time at the last token, so decode throughput measures decoding
+    /// rather than any teardown that happens after the final callback.
+    last_token: Option<Duration>,
     total: Option<Duration>,
     tokens: usize,
 }
@@ -47,6 +50,7 @@ impl TokenTimings {
             self.gaps.push(now.duration_since(previous));
         }
         self.last_token_at = Some(now);
+        self.last_token = Some(now.duration_since(started));
         self.tokens += 1;
     }
 
@@ -75,9 +79,9 @@ impl TokenTimings {
     /// scale differently: a long prompt inflates the end-to-end number without
     /// the model decoding any faster or slower.
     pub(crate) fn decode_tokens_per_second(&self) -> Option<f64> {
-        let total = self.total?;
+        let last = self.last_token?;
         let first = self.first_token?;
-        let decode = total.checked_sub(first)?.as_secs_f64();
+        let decode = last.checked_sub(first)?.as_secs_f64();
         let decoded = self.tokens.checked_sub(1)? as f64;
         (decode > 0.0 && decoded > 0.0).then(|| decoded / decode)
     }
@@ -635,6 +639,9 @@ mod tests {
                 .iter()
                 .map(|millis| Duration::from_millis(*millis))
                 .collect(),
+            last_token: Some(Duration::from_millis(
+                first_ms + gaps_ms.iter().sum::<u64>(),
+            )),
             ..TokenTimings::default()
         };
         let total: u64 = first_ms + gaps_ms.iter().sum::<u64>();
@@ -660,6 +667,22 @@ mod tests {
         assert!(
             decode > end_to_end,
             "prefill must drag the end-to-end rate below the decode rate"
+        );
+    }
+
+    #[test]
+    fn decode_throughput_ignores_teardown_after_the_last_token() {
+        // 100 ms of prefill, four tokens 100 ms apart, then 5 s of cleanup
+        // before the call returns. Decoding did not get slower.
+        let mut timings = timings(100, &[100, 100, 100, 100]);
+        timings.total = Some(Duration::from_millis(100 + 400 + 5_000));
+
+        let decode = timings.decode_tokens_per_second().unwrap();
+
+        assert!((decode - 10.0).abs() < 1e-6, "decode: {decode}");
+        assert!(
+            timings.end_to_end_tokens_per_second().unwrap() < 1.5,
+            "end-to-end still reflects the whole wall time"
         );
     }
 

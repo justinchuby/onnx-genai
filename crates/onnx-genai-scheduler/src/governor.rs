@@ -121,6 +121,12 @@ pub struct DerivedBudget {
     pub total_pages: u64,
     pub max_total_tokens: u64,
     pub reserved_bytes: u64,
+    /// Whether the fixed reservation was actually subtracted from the ceiling.
+    ///
+    /// False when honoring it would have left no room for even one KV page. The
+    /// reservation is an estimate carved out of a ceiling that may itself be
+    /// provisional, so it must never be the reason a model refuses to start.
+    pub reservation_applied: bool,
 }
 
 /// Concrete per-tier ceilings after capacity resolution.
@@ -292,7 +298,12 @@ pub fn resolve_limit(
     };
 
     match limit {
-        ResourceLimit::Bytes(bytes) => Ok(bytes.min(capacity.total_bytes())),
+        // An explicit byte limit is the caller's assertion about the device and
+        // is taken at face value. Clamping it to the reported capacity would be
+        // right only if that capacity were measured; while it is a provisional
+        // constant, clamping silently discards the one knob a user has for
+        // telling the runtime how much memory it may actually use.
+        ResourceLimit::Bytes(bytes) => Ok(bytes),
         ResourceLimit::Auto => Ok(resolve_fraction(default_fraction, capacity.total_bytes())),
         ResourceLimit::Fraction(fraction)
             if fraction.is_finite() && (0.0..=1.0).contains(&fraction) =>
@@ -323,6 +334,33 @@ pub fn derive_kv_budget(
                 operation: "summing model weights, activations, and runtime overhead",
                 reason: "the fixed VRAM reservations exceed the representable byte range".into(),
             })?;
+    let minimum_bytes = reserved_bytes
+        .checked_add(kv_config.page_size_bytes)
+        .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+            operation: "adding one KV page to the fixed VRAM reservations",
+            reason: "even the one-page minimum exceeds the representable byte range".into(),
+        })?;
+    // The reservation is an estimate (measured weights) carved out of a ceiling
+    // that may itself be provisional. When the two cannot both hold, drop the
+    // reservation rather than refuse to start: the previous behaviour reserved
+    // nothing at all, so failing here would be a pure regression.
+    let (reserved_bytes, reservation_applied) = if kv_config.page_size_bytes > 0
+        && resolved_vram_bytes < minimum_bytes
+        && reserved_bytes > 0
+    {
+        tracing::warn!(
+            reserved_bytes,
+            resolved_vram_bytes,
+            page_size_bytes = kv_config.page_size_bytes,
+            "fixed memory reservation does not fit under the resolved ceiling; \
+                 deriving the KV budget without it. Raise the VRAM limit \
+                 (--vram-limit / serving.memory.limits.vram_limit) so the KV cache \
+                 is sized against real capacity."
+        );
+        (0, false)
+    } else {
+        (reserved_bytes, reserved_bytes > 0)
+    };
     let minimum_bytes = reserved_bytes
         .checked_add(kv_config.page_size_bytes)
         .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
@@ -388,6 +426,7 @@ pub fn derive_kv_budget(
         total_pages,
         max_total_tokens,
         reserved_bytes,
+        reservation_applied,
     })
 }
 
@@ -621,9 +660,12 @@ mod tests {
     #[test]
     fn resolves_bytes_fraction_and_auto_against_total_capacity() {
         let capacity = FixedCapacity::new(1_000, 100);
+        // An explicit byte limit is authoritative, not clamped to the reported
+        // capacity: that capacity is still a provisional constant, so clamping
+        // would silently discard the caller's only way to state the real budget.
         assert_eq!(
             resolve_limit(ResourceLimit::Bytes(2_000), &capacity, "vram").unwrap(),
-            1_000
+            2_000
         );
         assert_eq!(
             resolve_limit(ResourceLimit::Fraction(0.5), &capacity, "vram").unwrap(),
@@ -662,32 +704,40 @@ mod tests {
                 total_pages: 80,
                 max_total_tokens: 1_280,
                 reserved_bytes: 200,
+                reservation_applied: true,
             }
         );
     }
 
     #[test]
-    fn derive_rejects_ceiling_below_weights_and_overhead() {
-        let error = derive_kv_budget(150, &breakdown(), &kv_config()).unwrap_err();
-        assert!(matches!(
-            error,
-            ResourceError::CannotSatisfyLoweredLimit {
-                requested_bytes: 150,
-                minimum_bytes: 210,
-                ..
-            }
-        ));
-        assert!(error.to_string().contains("raise the limit"));
+    fn a_ceiling_below_the_fixed_reservation_drops_it_rather_than_failing() {
+        // The reservation is an estimate carved from a ceiling that may itself
+        // be provisional, so it must never be the reason a model cannot start:
+        // the previous behaviour reserved nothing at all.
+        let derived = derive_kv_budget(150, &breakdown(), &kv_config()).unwrap();
+
+        assert!(!derived.reservation_applied);
+        assert_eq!(derived.reserved_bytes, 0);
+        assert_eq!(derived.kv_bytes, 150);
+        assert!(derived.total_pages >= 1);
     }
 
     #[test]
     fn derive_rejects_budget_too_small_for_one_page() {
-        let error = derive_kv_budget(205, &breakdown(), &kv_config()).unwrap_err();
+        // With no fixed reservation to drop, a ceiling under one page is a
+        // genuine configuration error and still fails.
+        let no_reservation = VramBreakdown {
+            model_weights_bytes: 0,
+            activations_bytes: 0,
+            ort_overhead_bytes: 0,
+        };
+
+        let error = derive_kv_budget(5, &no_reservation, &kv_config()).unwrap_err();
+
         assert!(matches!(
             error,
             ResourceError::CannotSatisfyLoweredLimit {
-                requested_bytes: 205,
-                minimum_bytes: 210,
+                requested_bytes: 5,
                 ..
             }
         ));
@@ -703,6 +753,7 @@ mod tests {
                 total_pages: 1,
                 max_total_tokens: 16,
                 reserved_bytes: 200,
+                reservation_applied: true,
             }
         );
     }
@@ -743,8 +794,10 @@ mod tests {
         governor.byte_budget().try_reserve(300).unwrap();
         let before = governor.snapshot();
 
+        // Below one KV page: impossible even after the fixed reservation is
+        // dropped, so this still fails atomically.
         let error = governor
-            .set_vram_limit(ResourceLimit::Bytes(205))
+            .set_vram_limit(ResourceLimit::Bytes(5))
             .unwrap_err();
         assert!(matches!(
             error,

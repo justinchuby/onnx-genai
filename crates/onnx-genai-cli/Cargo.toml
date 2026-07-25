@@ -59,7 +59,7 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 # getrusage for the peak-RSS probe; Linux reads /proc/self/status instead.
 libc = "0.2"
 

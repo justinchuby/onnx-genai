@@ -359,14 +359,13 @@ impl StreamSegmenter {
         let voiced = self.pending.len().saturating_sub(self.trailing_silence);
         let keep = if forced { self.pending.len() } else { voiced };
         if keep == 0 || (!forced && keep < self.config.min_samples) {
-            // Nothing worth transcribing. Silence is discarded as it arrives so
-            // an idle stream runs in bounded memory; a too-short burst is kept
-            // until more audio arrives or the window bound forces it out.
-            if self.trailing_silence >= self.pending.len() {
-                self.pending_start += self.pending.len();
-                self.pending.clear();
-                self.trailing_silence = 0;
-            }
+            // Nothing worth transcribing. A silence boundary means the burst is
+            // over, so a sub-minimum one is dropped here rather than held:
+            // keeping it would let a click merge with unrelated speech that
+            // arrives later, and would report a start time from before the gap.
+            self.pending_start += self.pending.len();
+            self.pending.clear();
+            self.trailing_silence = 0;
             return None;
         }
         let start_sample = self.pending_start;
@@ -744,6 +743,38 @@ mod segmenter_tests {
         samples.extend(tone(100));
         samples.extend(silence(2_000));
         assert!(segmenter.push(&samples).is_empty());
+    }
+
+    #[test]
+    fn a_sub_minimum_burst_is_dropped_at_its_silence_boundary() {
+        let config = SegmentConfig::from_seconds(RATE, 10.0, 0.05, 0.01, 0.5)
+            .expect("a valid segment configuration");
+        let mut segmenter = StreamSegmenter::new(config);
+
+        // A click, then a long silence: the click is discarded at the boundary
+        // rather than buffered until the window bound flushes it with silence.
+        let mut samples = tone(100);
+        samples.extend(silence(RATE as usize * 3));
+        assert!(segmenter.push(&samples).is_empty());
+        assert!(
+            segmenter.pending.len() <= segmenter.config.silence_samples,
+            "a dropped burst must not keep accumulating: {} pending",
+            segmenter.pending.len()
+        );
+
+        // Real speech afterwards must not be merged with the discarded click,
+        // and must report its own start time.
+        let speech_start = samples.len();
+        let mut later = tone(RATE as usize);
+        later.extend(silence(2_000));
+        let segments = segmenter.push(&later);
+
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert_eq!(segments[0].samples.len(), RATE as usize);
+        assert_eq!(
+            segments[0].start_sample, speech_start,
+            "the timestamp must point at the speech, not before the discarded click"
+        );
     }
 
     #[test]
