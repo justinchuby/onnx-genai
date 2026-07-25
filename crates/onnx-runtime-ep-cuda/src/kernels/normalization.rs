@@ -406,7 +406,8 @@ __device__ __forceinline__ float load_skip_val(
         : ((const float*)values)[index];
 }
 
-extern "C" __global__ void skip_rmsnorm_f32(
+template <bool DenseSkip>
+__device__ __forceinline__ void skip_rmsnorm_f32_tpl(
     const float* input,
     const float* skip,
     const float* gamma,
@@ -432,30 +433,35 @@ extern "C" __global__ void skip_rmsnorm_f32(
     const int tid = threadIdx.x;
     const int nt  = blockDim.x;
 
+    float sum_squares = 0.0f;
     for (int j = tid; j < norm_size; j += nt) {
-        unsigned long long linear = (unsigned long long)base + j;
-        unsigned long long skip_index = 0;
-        for (int d = rank - 1; d >= 0; --d) {
-            const unsigned long long coord = linear % shape[d];
-            linear /= shape[d];
-            skip_index += coord * skip_strides[d];
+        unsigned long long skip_index = (unsigned long long)base + j;
+        if (!DenseSkip) {
+            unsigned long long linear = skip_index;
+            skip_index = 0;
+            for (int d = rank - 1; d >= 0; --d) {
+                const unsigned long long coord = linear % shape[d];
+                linear /= shape[d];
+                skip_index += coord * skip_strides[d];
+            }
         }
         float sv = input[base + j] + skip[skip_index];
         if (has_bias) sv += bias[j];
         y[base + j] = sv;
         if (sum_out) sum_out[base + j] = sv;
+        sum_squares = __fadd_rn(sum_squares, __fmul_rn(sv, sv));
     }
+
+    // Fixed block tree: every thread owns the same strided subsequence, then
+    // power-of-two offsets combine partials in a launch-invariant order.
+    red[tid] = sum_squares;
     __syncthreads();
-    if (tid == 0) {
-        float ss = 0.0f;
-        for (int j = 0; j < norm_size; ++j) {
-            const float sv = y[base + j];
-            // Keep the residual RMS reduction bit-identical to the CPU kernel.
-            ss = __fadd_rn(ss, __fmul_rn(sv, sv));
+    for (int offset = nt >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            red[tid] = __fadd_rn(red[tid], red[tid + offset]);
         }
-        red[0] = ss;
+        __syncthreads();
     }
-    __syncthreads();
     const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) mean_out[g] = 0.0f;
@@ -464,6 +470,46 @@ extern "C" __global__ void skip_rmsnorm_f32(
     __syncthreads();
     for (int j = tid; j < norm_size; j += nt)
         y[base + j] = (y[base + j] * inv_std) * gamma[j];
+}
+
+extern "C" __global__ void skip_rmsnorm_f32_dense(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,
+    float* y,
+    float* sum_out,
+    float* mean_out,
+    float* invstd_out,
+    const unsigned long long* metadata,
+    const int rank,
+    const int num_groups,
+    const int norm_size,
+    const int has_bias,
+    const float epsilon)
+{
+    skip_rmsnorm_f32_tpl<true>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f32(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,
+    float* y,
+    float* sum_out,
+    float* mean_out,
+    float* invstd_out,
+    const unsigned long long* metadata,
+    const int rank,
+    const int num_groups,
+    const int norm_size,
+    const int has_bias,
+    const float epsilon)
+{
+    skip_rmsnorm_f32_tpl<false>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
 }
 
 union SkipHalf4 {
@@ -808,8 +854,19 @@ const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 const NORM_BLOCK: u32 = 256;
 const SKIP_RMSNORM_WARP_HALF4_MULTIPLE: usize = 32 * 4;
 
+fn preferred_norm_block_threads(norm_size: usize, max_threads_per_block: u32) -> u32 {
+    let reported_limit = max_threads_per_block.max(32).min(NORM_BLOCK);
+    let device_limit = 1 << (31 - reported_limit.leading_zeros());
+    let useful_threads = norm_size
+        .max(32)
+        .next_power_of_two()
+        .min(NORM_BLOCK as usize) as u32;
+    useful_threads.min(device_limit)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SkipRmsnormVariant {
+    F32Dense,
     F32,
     F16Generic,
     F16WarpHalf4,
@@ -869,6 +926,12 @@ fn select_skip_rmsnorm_variant(
             entry: "skip_rmsnorm_f16",
             reason: "variant=generic;dtype=fp16;not(dense_skip & bias=none & \
                      hidden%128==0)",
+        }
+    } else if dense_skip {
+        SkipRmsnormSelection {
+            variant: SkipRmsnormVariant::F32Dense,
+            entry: "skip_rmsnorm_f32_dense",
+            reason: "variant=parallel_block_tree;dtype=fp32;dense_skip;fixed_reduction_order",
         }
     } else {
         SkipRmsnormSelection {
@@ -1660,6 +1723,7 @@ impl SkipSimplifiedLayerNormKernel {
             gamma_is_half != 0,
         );
         let variant_name = match selection.variant {
+            SkipRmsnormVariant::F32Dense => "skip_rmsnorm_f32_dense",
             SkipRmsnormVariant::F32 => "skip_rmsnorm_f32",
             SkipRmsnormVariant::F16Generic => "skip_rmsnorm_f16_generic",
             SkipRmsnormVariant::F16WarpHalf4 => "skip_rmsnorm_f16_warp_half4",
@@ -1708,10 +1772,14 @@ impl SkipSimplifiedLayerNormKernel {
                 shared_mem_bytes: 0,
             }
         } else {
+            let preferred_threads = preferred_norm_block_threads(
+                norm_size,
+                self.runtime.capabilities().max_threads_per_block(),
+            );
             self.runtime.reduction_launch_config(
                 &func,
                 groups_u,
-                NORM_BLOCK,
+                preferred_threads,
                 std::mem::size_of::<f32>() as u32,
             )?
         };
@@ -2102,6 +2170,7 @@ mod tests {
         assert!(RMSNORM_SRC.contains("rmsnorm_bf16"));
         assert!(SKIP_LAYERNORM_SRC.contains("skip_layernorm_f32"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_dense"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_half4"));
     }
@@ -2114,6 +2183,14 @@ mod tests {
         assert_eq!(rmsnorm_entry(DataType::Float16), "rmsnorm_f16");
         assert_eq!(rmsnorm_entry(DataType::Float32), "rmsnorm_f32");
         assert_eq!(rmsnorm_entry(DataType::BFloat16), "rmsnorm_bf16");
+    }
+
+    #[test]
+    fn norm_block_width_respects_shape_and_device_limit() {
+        assert_eq!(preferred_norm_block_threads(3584, 1024), 256);
+        assert_eq!(preferred_norm_block_threads(96, 1024), 128);
+        assert_eq!(preferred_norm_block_threads(3584, 128), 128);
+        assert_eq!(preferred_norm_block_threads(17, 1024), 32);
     }
 
     fn skip_rmsnorm_residuals(hidden: usize) -> (Vec<f16>, Vec<f16>) {
@@ -2440,6 +2517,178 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fp32_dense_skip_rmsnorm_matches_reference_and_optional_outputs() {
+        let Ok(ep) = CudaExecutionProvider::new(0) else {
+            eprintln!("skipping fp32 dense skip RMSNorm test: CUDA unavailable");
+            return;
+        };
+        let hidden = 3584usize;
+        let shape = [1, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let gamma_shape = [hidden];
+        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let stat_shape = [1usize];
+        let stat_strides = [1i64];
+        let input = (0..hidden)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 31.0)
+            .collect::<Vec<_>>();
+        let skip = (0..hidden)
+            .map(|index| ((index * 17 % 67) as f32 - 33.0) / 47.0)
+            .collect::<Vec<_>>();
+        let gamma = (0..hidden)
+            .map(|index| 0.75 + (index * 13 % 41) as f32 / 64.0)
+            .collect::<Vec<_>>();
+        let residual = input
+            .iter()
+            .zip(&skip)
+            .map(|(input, skip)| input + skip)
+            .collect::<Vec<_>>();
+        let sum_squares = residual.iter().fold(0.0f64, |sum, value| {
+            sum + f64::from(*value) * f64::from(*value)
+        });
+        let inverse_standard_deviation =
+            (sum_squares / hidden as f64 + 1e-5f64).sqrt().recip() as f32;
+
+        let allocate = |elements: usize| {
+            ep.allocate(elements * std::mem::size_of::<f32>(), 256)
+                .unwrap()
+        };
+        let input_buffer = allocate(hidden);
+        let skip_buffer = allocate(hidden);
+        let gamma_buffer = allocate(hidden);
+        let mut output_buffer = allocate(hidden);
+        let mut mean_buffer = allocate(1);
+        let mut inverse_standard_deviation_buffer = allocate(1);
+        let mut sum_buffer = allocate(hidden);
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(f32_bytes(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f32_bytes(&skip), cuptr(skip_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f32_bytes(&gamma), cuptr(gamma_buffer.as_ptr()))
+                .unwrap();
+        }
+        let inputs = [
+            TensorView::new(
+                DevicePtr(input_buffer.as_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            ),
+            TensorView::new(
+                DevicePtr(skip_buffer.as_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            ),
+            TensorView::new(
+                DevicePtr(gamma_buffer.as_ptr()),
+                DataType::Float32,
+                &gamma_shape,
+                &gamma_strides,
+                ep.device_id(),
+            ),
+        ];
+        let mut outputs = [
+            TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            ),
+            TensorMut::new(
+                DevicePtrMut(mean_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &stat_shape,
+                &stat_strides,
+                ep.device_id(),
+            ),
+            TensorMut::new(
+                DevicePtrMut(inverse_standard_deviation_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &stat_shape,
+                &stat_strides,
+                ep.device_id(),
+            ),
+            TensorMut::new(
+                DevicePtrMut(sum_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            ),
+        ];
+        let kernel = SkipSimplifiedLayerNormKernel {
+            epsilon: 1e-5,
+            runtime: runtime.clone(),
+            metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+        kernel.run(&inputs, &mut outputs).unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut output = vec![0.0f32; hidden];
+        let mut mean = [f32::NAN];
+        let mut got_inverse_standard_deviation = [f32::NAN];
+        let mut sum = vec![0.0f32; hidden];
+        unsafe {
+            runtime
+                .dtoh(f32_bytes_mut(&mut output), cuptr(output_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .dtoh(f32_bytes_mut(&mut mean), cuptr(mean_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .dtoh(
+                    f32_bytes_mut(&mut got_inverse_standard_deviation),
+                    cuptr(inverse_standard_deviation_buffer.as_ptr()),
+                )
+                .unwrap();
+            runtime
+                .dtoh(f32_bytes_mut(&mut sum), cuptr(sum_buffer.as_ptr()))
+                .unwrap();
+        }
+        assert_eq!(mean[0], 0.0);
+        assert_eq!(sum, residual);
+        assert!((got_inverse_standard_deviation[0] - inverse_standard_deviation).abs() < 2e-6);
+        for index in 0..hidden {
+            let reference = residual[index] * inverse_standard_deviation * gamma[index];
+            assert!(
+                (output[index] - reference).abs() < 2e-5,
+                "output mismatch at {index}: {} vs {reference}",
+                output[index]
+            );
+        }
+        for buffer in [
+            input_buffer,
+            skip_buffer,
+            gamma_buffer,
+            output_buffer,
+            mean_buffer,
+            inverse_standard_deviation_buffer,
+            sum_buffer,
+        ] {
+            ep.deallocate(buffer).unwrap();
+        }
+    }
+
+    fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+        // SAFETY: f32 is plain-old-data; reinterpreting as bytes is sound.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(values),
+            )
+        }
+    }
     fn bf16_bytes(values: &[bf16]) -> &[u8] {
         // SAFETY: bf16 is plain two-byte data and the byte slice retains the input lifetime.
         unsafe {
