@@ -22,6 +22,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -286,6 +287,34 @@ struct SamplingArgs {
     raw: bool,
 }
 
+/// Shared CPU resource controls for `generate` and `run`.
+#[derive(Debug, Args)]
+struct CpuArgs {
+    /// Cap native CPU decode to N worker cores. Overrides
+    /// ONNX_GENAI_CPU_DECODE_THREADS; when neither is set, automatic sizing is
+    /// unchanged. Where supported, persistent workers are pinned to at most N
+    /// allowed CPUs.
+    #[arg(long, value_name = "N")]
+    cpu_cores: Option<NonZeroUsize>,
+}
+
+impl CpuArgs {
+    fn apply(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        {
+            onnx_genai_engine::set_cpu_decode_thread_budget(
+                self.cpu_cores.map(NonZeroUsize::get),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            let _ = self.cpu_cores;
+        }
+        Ok(())
+    }
+}
+
 impl SamplingArgs {
     fn to_options(&self) -> GenerateOptions {
         let mut options = GenerateOptions::default();
@@ -314,6 +343,9 @@ struct GenerateArgs {
     #[command(flatten)]
     sampling: SamplingArgs,
 
+    #[command(flatten)]
+    cpu: CpuArgs,
+
     /// Print generated tokens as they arrive.
     #[arg(long)]
     stream: bool,
@@ -330,6 +362,9 @@ struct RunArgs {
 
     #[command(flatten)]
     sampling: SamplingArgs,
+
+    #[command(flatten)]
+    cpu: CpuArgs,
 }
 
 #[derive(Debug, Args)]
@@ -394,6 +429,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 
 fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
+    args.cpu.apply()?;
     let model_dir = resolve_model_dir(&args.model);
     let options = args.sampling.to_options();
 
@@ -426,6 +462,7 @@ fn generate(args: GenerateArgs) -> anyhow::Result<()> {
 
 fn run_repl(args: RunArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
+    args.cpu.apply()?;
     let model_dir = resolve_model_dir(&args.model);
     let mut engine = Engine::from_dir(&model_dir, EngineConfig::default())?;
     let mut raw_mode = args.sampling.raw;
@@ -657,6 +694,50 @@ mod tests {
             }
             _ => panic!("expected generate command"),
         }
+    }
+
+    #[test]
+    fn cpu_cores_is_shared_by_generate_and_run() {
+        let generate = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--cpu-cores",
+            "8",
+        ])
+        .unwrap();
+        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--cpu-cores", "4"]).unwrap();
+
+        match generate.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(8));
+            }
+            _ => panic!("expected generate command"),
+        }
+        match run.command {
+            Commands::Run(args) => {
+                assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(4));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cpu_cores_rejects_zero() {
+        assert!(
+            Cli::try_parse_from([
+                "onnx-genai",
+                "generate",
+                "./m",
+                "--prompt",
+                "hi",
+                "--cpu-cores",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

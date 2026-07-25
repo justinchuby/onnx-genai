@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -106,6 +107,9 @@ mod mm_profile {
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Process-local override set by first-class callers such as the CLI. Zero means
+/// no override, so the environment variable and automatic default still apply.
+static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// Decode is bandwidth-bound and pays one fork/join per projection. Profiling
 /// across the existing 4--96 worker sweep found no gain above eight workers and
 /// clear regressions at 16+, so topology scaling is capped here; the environment
@@ -1441,7 +1445,7 @@ fn dequantize_nbits_value(
 fn configured_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_decode_threads(value.as_deref(), available)
+    resolve_decode_threads_with_override(decode_threads_override(), value.as_deref(), available)
 }
 
 /// The worker count for the persistent SPMD decode pool ([`crate::decode_spmd`]).
@@ -1459,7 +1463,31 @@ fn configured_decode_threads() -> Option<usize> {
 pub fn configured_persistent_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_persistent_decode_threads(value.as_deref(), available)
+    resolve_persistent_decode_threads_with_override(
+        decode_threads_override(),
+        value.as_deref(),
+        available,
+    )
+}
+
+/// Set or clear a process-local CPU decode worker budget.
+///
+/// This is the programmatic equivalent of `ONNX_GENAI_CPU_DECODE_THREADS`, with
+/// higher precedence. Call it before constructing a native decode session; pools
+/// are initialized lazily and retain their initial size for the process lifetime.
+pub fn set_decode_thread_budget(
+    threads: Option<usize>,
+) -> std::result::Result<(), &'static str> {
+    if threads == Some(0) {
+        return Err("CPU decode thread budget must be greater than zero");
+    }
+    DECODE_THREADS_OVERRIDE.store(threads.unwrap_or(0), Ordering::Release);
+    Ok(())
+}
+
+fn decode_threads_override() -> Option<usize> {
+    std::num::NonZeroUsize::new(DECODE_THREADS_OVERRIDE.load(Ordering::Acquire))
+        .map(std::num::NonZeroUsize::get)
 }
 
 /// Default persistent-pool worker count for `available` logical CPUs: half of
@@ -1481,17 +1509,29 @@ fn default_persistent_threads(available: usize) -> Option<usize> {
 /// value and the host's logical CPU count. `Some("0")` opts out (`None`); an
 /// explicit positive count is honored (clamped to `available`); an unset or
 /// unparseable value falls back to [`default_persistent_threads`].
+#[cfg(test)]
 fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    resolve_persistent_decode_threads_with_override(None, raw, available)
+}
+
+fn resolve_persistent_decode_threads_with_override(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let default = default_persistent_threads(available)?;
-    let threads = match raw {
-        Some("0") => return None,
-        Some(raw) => raw
-            .parse::<usize>()
-            .ok()
-            .filter(|threads| *threads > 0)
-            .unwrap_or(default),
-        None => default,
+    let threads = match override_threads {
+        Some(threads) => threads,
+        None => match raw {
+            Some("0") => return None,
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|threads| *threads > 0)
+                .unwrap_or(default),
+            None => default,
+        },
     };
     Some(threads.min(available))
 }
@@ -1519,13 +1559,25 @@ fn default_decode_threads(available: usize) -> Option<usize> {
     )
 }
 
+#[cfg(test)]
 fn resolve_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    resolve_decode_threads_with_override(None, raw, available)
+}
+
+fn resolve_decode_threads_with_override(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let default = default_decode_threads(available)?;
-    let threads = match raw {
-        Some("0") => return None,
-        Some(raw) => raw.parse::<usize>().unwrap_or(default),
-        None => default,
+    let threads = match override_threads {
+        Some(threads) => threads,
+        None => match raw {
+            Some("0") => return None,
+            Some(raw) => raw.parse::<usize>().unwrap_or(default),
+            None => default,
+        },
     };
     (threads > 0).then(|| threads.min(available))
 }
@@ -1554,17 +1606,29 @@ fn default_dense_decode_threads(available: usize) -> Option<usize> {
 /// `Some("0")` opts out (`None` → run on the global Rayon pool); an explicit
 /// positive count is honored (clamped to `available`); unset/unparseable falls
 /// back to [`default_dense_decode_threads`].
+#[cfg(test)]
 fn resolve_dense_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
+    resolve_dense_decode_threads_with_override(None, raw, available)
+}
+
+fn resolve_dense_decode_threads_with_override(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     let default = default_dense_decode_threads(available)?;
-    let threads = match raw {
-        Some("0") => return None,
-        Some(raw) => raw
-            .parse::<usize>()
-            .ok()
-            .filter(|threads| *threads > 0)
-            .unwrap_or(default),
-        None => default,
+    let threads = match override_threads {
+        Some(threads) => threads,
+        None => match raw {
+            Some("0") => return None,
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|threads| *threads > 0)
+                .unwrap_or(default),
+            None => default,
+        },
     };
     Some(threads.min(available))
 }
@@ -1572,7 +1636,11 @@ fn resolve_dense_decode_threads(raw: Option<&str>, available: usize) -> Option<u
 fn configured_dense_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_dense_decode_threads(value.as_deref(), available)
+    resolve_dense_decode_threads_with_override(
+        decode_threads_override(),
+        value.as_deref(),
+        available,
+    )
 }
 
 #[cfg(feature = "mlas")]
@@ -6590,6 +6658,27 @@ mod tests {
         assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
         assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
         assert_eq!(resolve_persistent_decode_threads(Some("8"), 0), None);
+    }
+
+    #[test]
+    fn explicit_budget_precedes_env_for_every_decode_pool() {
+        assert_eq!(
+            resolve_decode_threads_with_override(Some(6), Some("2"), 96),
+            Some(6)
+        );
+        assert_eq!(
+            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96),
+            Some(8)
+        );
+        assert_eq!(
+            resolve_dense_decode_threads_with_override(Some(12), Some("0"), 96),
+            Some(12)
+        );
+        assert_eq!(
+            resolve_persistent_decode_threads_with_override(None, None, 96),
+            Some(48),
+            "the uncapped automatic default must remain unchanged"
+        );
     }
 
     #[test]
