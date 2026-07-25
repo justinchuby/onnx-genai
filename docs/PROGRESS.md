@@ -21,13 +21,17 @@ _Last updated: 2026-07-25T01:15:00Z_
   **907.87 vs. 583.31 tok/s (1.556×)**, and DeepSeek-R1-Distill-Qwen-1.5B
   measured **633.69 vs. 445.92 tok/s (1.421×)**. Their fp16 option was the
   expected no-op because the graphs already use fp16 activation/scales.
-- **Honest ORT caveat for generic-CPU artifacts:** Phi and Coder measured
-  native-model/ORT ratios of **25.302×** and **5.357×**, but ORT inserted 67/57
-  `Memcpy` nodes and warned of partial CUDA EP assignment. Those ratios describe
-  the exact available artifacts, not optimized CUDA-targeted ORT exports.
-  Generated text was readable; Qwen2.5-Coder-7B had an identical backend-neutral
-  EOS/newline tail. Full medians, spreads, commands, host state, and sanity
-  notes: `docs/benchmarks/2026-07-25-uncontended-native-vs-ort-sweep.md`.
+- **Invalid ORT baseline for generic-CPU artifacts (not a "vs ORT" claim):**
+  Phi and Coder measured native-model/ORT ratios of 25.302× and 5.357×, but ORT
+  appended the CUDA EP yet could not place the `generic-cpu` graph on the GPU
+  (67/57 inserted `Memcpy` nodes; partial CUDA EP assignment), so ORT ran
+  largely on the CPU. Those ratios compare native CUDA against a broken
+  CPU-fallback baseline and are **excluded from any headline vs-ORT claim**; the
+  only valid native-vs-ORT rows are the CUDA-targeted Qwen2.5-0.5B (1.556×) and
+  DeepSeek (1.421×) above. Generated text was readable; Qwen2.5-Coder-7B had an
+  identical backend-neutral EOS/newline tail. Full medians, spreads, commands,
+  host state, and sanity notes:
+  `docs/benchmarks/2026-07-25-uncontended-native-vs-ort-sweep.md`.
 
 ## 2026-07-24 — Accuracy-level-4 correctness and opt-in fp16 decode payoff
 
