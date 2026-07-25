@@ -65,6 +65,9 @@ unsafe extern "C" {
     /// Vectorized logistic (sigmoid) over `n` contiguous f32s: single-threaded
     /// MLAS SIMD sigmoid, used to build SiLU without a scalar `expf` loop.
     fn mlas_compute_logistic(input: *const f32, output: *mut f32, n: usize);
+    /// Vectorized fused SiLU over `n` contiguous f32s. MLAS runtime-dispatches
+    /// to its one-pass AVX-512F kernel when supported.
+    fn mlas_compute_silu(input: *const f32, output: *mut f32, n: usize);
     fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
@@ -292,6 +295,24 @@ pub fn compute_logistic(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_logistic(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Compute elementwise SiLU `output = input / (1 + exp(-input))` over
+/// equal-length contiguous f32 slices. MLAS runtime-dispatches to its fused
+/// one-pass AVX-512F kernel when available and uses a portable fallback
+/// elsewhere. Single threaded; callers shard across threads themselves.
+pub fn compute_silu(input: &[f32], output: &mut [f32]) {
+    assert_eq!(
+        input.len(),
+        output.len(),
+        "compute_silu input and output must have equal length"
+    );
+    if input.is_empty() {
+        return;
+    }
+    // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
+    // and writes `output`, and Rust's borrow rules prove they do not alias.
+    unsafe { mlas_compute_silu(input.as_ptr(), output.as_mut_ptr(), input.len()) };
 }
 
 /// Compute contiguous Float32 elementwise addition with MLAS SIMD.

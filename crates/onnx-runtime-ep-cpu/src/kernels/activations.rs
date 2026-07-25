@@ -313,26 +313,19 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
 
 /// SiLU (`x * sigmoid(x)`) over equal-length contiguous f32 slices.
 ///
-/// With the `mlas` feature the sigmoid comes from MLAS's SIMD logistic (the same
-/// vectorized routine ORT's activations use), turning the hot MLP activation
-/// into two vectorized passes instead of a scalar `expf`/`exp` loop that LLVM
-/// cannot autovectorize. Without `mlas` we keep the scalar reference.
+/// With the `mlas` feature this uses MLAS's fused one-pass SiLU, including its
+/// AVX-512F runtime path. Without `mlas` we keep the scalar reference.
 pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "mlas")]
     {
-        // MLAS's SIMD logistic clamps its input to [-18, 18] internally, so for
-        // out-of-range or non-finite inputs `sigmoid(x) * x` is wrong (e.g.
+        // MLAS's SIMD SiLU clamps its logistic input to [-18, 18] internally, so
+        // out-of-range or non-finite results need correction (e.g.
         // SiLU(-1e30) would leak sigmoid(-18)≈1.5e-8 instead of decaying to 0,
-        // and SiLU(±Inf)/SiLU(NaN) would be corrupted). Run MLAS over the whole
-        // slice for the vectorized common case, then correct only the elements
-        // outside the safe band with the accurate scalar SiLU. The correction
-        // predicate is a single branch-predictable finite/threshold compare per
-        // element, so in-range activations keep MLAS speed.
-        mlas_sys::compute_logistic(input, output);
+        // and SiLU(±Inf)/SiLU(NaN) would be corrupted). Keep the existing exact
+        // scalar correction semantics outside MLAS's safe band.
+        mlas_sys::compute_silu(input, output);
         for (output, &input) in output.iter_mut().zip(input) {
-            if input.is_finite() && input.abs() <= SILU_MLAS_SAFE_BOUND {
-                *output *= input;
-            } else {
+            if !input.is_finite() || input.abs() > SILU_MLAS_SAFE_BOUND {
                 *output = silu(input);
             }
         }
@@ -580,16 +573,10 @@ mod tests {
             1e30, -1e30, 1e-30, -1e-30, 18.0, -18.0, 18.5, -18.5, 17.5, -17.5, -0.0, 0.0,
         ]);
 
-        let n = xs.len();
-        let x = Owned::f32(&[n], &xs);
-        let mut out = Owned::zeros_f32(&[n]);
-        ActivationKernel {
-            activation: Activation::Silu,
-        }
-        .execute(&[x.view()], &mut [out.view_mut()])
-        .unwrap();
+        let mut out = vec![0.0; xs.len()];
+        silu_f32_slice(&xs, &mut out);
 
-        for (got, input) in out.to_f32().into_iter().zip(xs) {
+        for (got, input) in out.into_iter().zip(xs) {
             let want = silu_ref(input as f64);
             let abs_err = (got as f64 - want).abs();
             let rel_err = if want.abs() > 1.0 {
@@ -600,7 +587,7 @@ mod tests {
             // In-range region matches ORT's logistic approximation; extremes are
             // recomputed exactly. Both stay within a tight tolerance.
             assert!(
-                abs_err <= 1e-5 || rel_err <= 1e-5,
+                abs_err <= 2e-6 || rel_err <= 2e-6,
                 "silu({input}) = {got}, want {want}, abs_err {abs_err}, rel_err {rel_err}"
             );
         }

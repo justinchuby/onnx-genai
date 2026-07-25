@@ -319,6 +319,17 @@ extern "C" void mlas_compute_logistic(
     MlasComputeLogistic(input, output, n);
 }
 
+// ---- Vectorized SiLU -------------------------------------------------------
+// MLAS selects its fused AVX-512F implementation at runtime when available,
+// with a portable logistic-then-multiply fallback on other architectures.
+extern "C" void mlas_compute_silu(
+    const float* input,
+    float* output,
+    size_t n)
+{
+    MlasComputeSilu(input, output, n);
+}
+
 extern "C" void mlas_eltwise_add(
     const float* left,
     const float* right,
