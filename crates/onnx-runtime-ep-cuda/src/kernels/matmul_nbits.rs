@@ -22,6 +22,7 @@ const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
 const GEMV_INT8_F32_ENTRY: &str = "matmul_nbits_gemv_int8_f32";
 const QUANTIZE_ACCURACY4_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32";
 const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
+const GEMV_ACCURACY4_STAGE64_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32_stage64";
 // General-block-size fp32-activation accuracy_level=4 decode entries. These give
 // the fp32 `run` path the same "quantize the activation to int8 once, then run a
 // parallelized GEMV" treatment the block-32 path already enjoys, but for any
@@ -38,6 +39,7 @@ const BLOCK_THREADS: u32 = 256;
 const GEMV_ACCURACY4_THREADS: u32 = 256;
 const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
 const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
+const GEMV_ACCURACY4_STAGE64_SHARED_BYTES: u32 = 64 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
 const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
@@ -408,6 +410,69 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
                 dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
             }
             // Per-block int8 activation scale times the per-block weight scale.
+            const float block_scale = __fmul_rn(
+                activation_scale_ptr[block],
+                scales[(long)column * k_blocks + block]);
+            value = __fadd_rn(value, __fmul_rn((float)dot, block_scale));
+        }
+        __syncthreads();
+    }
+
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = bias ? __fadd_rn(value, bias[column]) : value;
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32_stage64(
+    const signed char* quantized_activation,
+    const float* activation_scale_ptr,
+    const unsigned char* packed,
+    const float* scales,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    extern __shared__ signed char activation_tile[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int column = (int)blockIdx.x * 8 + warp;
+
+    float value = 0.0f;
+    for (int tile_block = 0; tile_block < k_blocks; tile_block += 64) {
+        const int tile_blocks = min(64, k_blocks - tile_block);
+        const int tile_depths = tile_blocks * 32;
+        for (int depth = tid; depth < tile_depths; depth += (int)blockDim.x) {
+            activation_tile[depth] =
+                quantized_activation[tile_block * 32 + depth];
+        }
+        __syncthreads();
+
+        for (int tile_offset = lane; tile_offset < tile_blocks; tile_offset += 32) {
+            const int block = tile_block + tile_offset;
+            if (column >= n) {
+                continue;
+            }
+            const long packed_start = ((long)column * k_blocks + block) * 16;
+            const uint4 packed_weights =
+                *reinterpret_cast<const uint4*>(packed + packed_start);
+            const unsigned int words[4] = {
+                packed_weights.x, packed_weights.y, packed_weights.z, packed_weights.w
+            };
+            const signed char* activation_block = activation_tile + tile_offset * 32;
+            int dot = 0;
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                const int activation0 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8);
+                const int activation1 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
+                dot = __dp4a(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
+            }
             const float block_scale = __fmul_rn(
                 activation_scale_ptr[block],
                 scales[(long)column * k_blocks + block]);
@@ -2983,8 +3048,7 @@ const DOWN_FILL_CTAS_PER_SM: usize = 12;
 /// the gain). Keys only on `N` and the SM count — no per-model magic — and
 /// returns a launch-time constant that is stable across CUDA-graph replays.
 fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static str) {
-    let target =
-        (multiprocessor_count.max(1) as usize).saturating_mul(DOWN_FILL_CTAS_PER_SM);
+    let target = (multiprocessor_count.max(1) as usize).saturating_mul(DOWN_FILL_CTAS_PER_SM);
     for (cols, entry) in [
         (GEMV_F16_DOWN_COLUMNS_PER_BLOCK, GEMV_F16_DOWN_ENTRY),
         (4usize, GEMV_F16_DOWN_C4_ENTRY),
@@ -3027,6 +3091,29 @@ fn select_accuracy4_gemv_warps(n: usize, multiprocessor_count: u32) -> u32 {
         }
     }
     1
+}
+
+/// Select the wider activation stage only when the fixed 8-warp block-32 launch
+/// does not provide one resident CTA wave. The estimate uses architectural warp
+/// limits: datacenter sm_80/sm_90 parts expose 64 warps/SM, while sm_86/sm_89
+/// consumer parts expose 48. Hudson's general blockwise path keeps its separate
+/// device-derived warp-width selection.
+fn use_accuracy4_stage64(
+    n: usize,
+    multiprocessor_count: u32,
+    compute_capability: (u32, u32),
+    max_shared_memory_per_block: u32,
+) -> bool {
+    if max_shared_memory_per_block < GEMV_ACCURACY4_STAGE64_SHARED_BYTES {
+        return false;
+    }
+    let resident_warps = match compute_capability {
+        (8, 0) | (9.., _) => 64usize,
+        _ => 48usize,
+    };
+    let resident_ctas = resident_warps / (GEMV_ACCURACY4_THREADS as usize / 32);
+    let one_wave = (multiprocessor_count.max(1) as usize).saturating_mul(resident_ctas);
+    n.div_ceil(GEMV_ACCURACY4_COLUMNS_PER_BLOCK) < one_wave
 }
 
 /// Optional developer override for the down-projection columns-per-CTA, used to
@@ -5109,9 +5196,21 @@ impl MatMulNBitsKernel {
         let quantize_function =
             self.runtime
                 .nvrtc_function(GEMV_MODULE, GEMV_SRC, QUANTIZE_ACCURACY4_ENTRY)?;
-        let gemv_function =
-            self.runtime
-                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_ENTRY)?;
+        let capabilities = self.runtime.capabilities();
+        let stage64 = use_accuracy4_stage64(
+            self.n,
+            capabilities.multiprocessor_count(),
+            capabilities.compute_capability(),
+            capabilities.max_shared_memory_per_block_optin(),
+        );
+        let gemv_entry = if stage64 {
+            GEMV_ACCURACY4_STAGE64_ENTRY
+        } else {
+            GEMV_ACCURACY4_ENTRY
+        };
+        let gemv_function = self
+            .runtime
+            .nvrtc_function(GEMV_MODULE, GEMV_SRC, gemv_entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -5165,7 +5264,11 @@ impl MatMulNBitsKernel {
                     1,
                 ),
                 block_dim: (GEMV_ACCURACY4_THREADS, 1, 1),
-                shared_mem_bytes: GEMV_ACCURACY4_SHARED_BYTES,
+                shared_mem_bytes: if stage64 {
+                    GEMV_ACCURACY4_STAGE64_SHARED_BYTES
+                } else {
+                    GEMV_ACCURACY4_SHARED_BYTES
+                },
             })
         }
         .map(|_| ())
@@ -6551,6 +6654,15 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         // wide-enough N stays on the cheapest 8-column launch instead of
         // over-splitting.
         assert_eq!(select_down_columns(3584, 0), (8, GEMV_F16_DOWN_ENTRY));
+    }
+
+    #[test]
+    fn accuracy4_stage64_is_limited_to_sub_wave_block32_grids() {
+        assert!(use_accuracy4_stage64(4608, 132, (9, 0), 64 * 1024));
+        assert!(!use_accuracy4_stage64(4608, 46, (8, 9), 48 * 1024));
+        assert!(!use_accuracy4_stage64(4608, 28, (8, 6), 48 * 1024));
+        assert!(!use_accuracy4_stage64(4608, 132, (9, 0), 1024));
+        assert!(!use_accuracy4_stage64(65_536, 132, (9, 0), 64 * 1024));
     }
 
     #[test]
