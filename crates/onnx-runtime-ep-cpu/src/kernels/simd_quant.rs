@@ -13,8 +13,8 @@
 //! Numerics — **bit-identical** to the scalar path (this is stricter than the
 //! f64-parity bar used for float reductions, and is achievable because the
 //! output is integer codes):
-//!   * The per-block `max_abs` scale is a `max` reduction. `max` is associative
-//!     and commutative for the finite activation values here (each partial max
+//!   * The per-block `max_abs` scale is a `max` reduction. For **finite**
+//!     activation values `max` is associative and commutative (each partial max
 //!     is exactly one of the inputs), so the lane-parallel reduction returns the
 //!     identical f32 bit pattern as the serial scalar fold — hence an identical
 //!     `scale` and `inverse_scale`.
@@ -25,10 +25,30 @@
 //!   * The clamp bounds, the int cast (truncation of an already-integer f32),
 //!     and the unsigned `+128` offset all match the scalar code exactly.
 //!
+//! Non-finite inputs (NaN, +/-inf) are the one place SIMD and scalar `max`
+//! disagree, and the disagreement is twofold, so both the scale and the codes
+//! would diverge:
+//!   * The scalar reduction folds with `f32::max`, which **ignores** NaN
+//!     (returns the other operand), so an all-NaN block yields `0.0` and a
+//!     mixed block yields the finite maximum. Intel `_mm512_max_ps` instead
+//!     returns its second operand on an unordered compare, so a NaN lane can
+//!     survive `_mm512_reduce_max_ps` and poison the scale.
+//!   * Even with a matching scale, a NaN or infinite element scales to NaN
+//!     (`inf * 0.0 == NaN`); the scalar `as i8` cast saturates NaN to `0`,
+//!     whereas the SIMD `min`/`max` clamp turns it into a saturated `-127`.
+//!
+//! Because both the scale and the per-lane codes diverge, the AVX-512
+//! quantizers detect any non-finite lane during the max reduction and fall back
+//! to the exact scalar routine for that block. NaN/inf activations never occur
+//! in healthy decode, so the vectorized fast path still covers 100% of real
+//! traffic; the fallback exists purely to preserve exact bit-identity. The
+//! fast path costs one extra ordered compare per 16 lanes.
+//!
 //! The unit tests assert bit-identical output between the SIMD and scalar paths
 //! across random and edge-case inputs (zeros, saturating values, mixed signs,
-//! block-boundary lengths), and only exercise the SIMD path when the host
-//! actually supports the required features.
+//! block-boundary lengths, NaN in any lane, leading NaN, all-NaN, +/-inf, and
+//! signed zeros), and only exercise the SIMD path when the host actually
+//! supports the required features.
 
 /// Symmetric int8 activation quantization of one K-block.
 ///
@@ -151,17 +171,29 @@ fn quantize_block_i16_scalar(src: &[f32], out: &mut [i16]) -> f32 {
     scale
 }
 
-/// AVX-512 `max(|src|)` reduction, initialized at 0.0.
+/// Outcome of the AVX-512 max-abs reduction.
 ///
-/// Bit-identical to [`max_abs_scalar`]: `max` returns exactly one of its inputs,
-/// so the lane-parallel reduction and the serial fold agree bit-for-bit for the
-/// finite activation values here.
+/// `all_finite` is false when any lane held a NaN or an infinity, signalling the
+/// caller to fall back to the scalar routine so the block stays bit-identical.
+#[cfg(target_arch = "x86_64")]
+struct MaxAbsReduction {
+    max_abs: f32,
+    all_finite: bool,
+}
+
+/// AVX-512 `max(|src|)` reduction, initialized at 0.0, plus a finiteness check.
+///
+/// For finite input this is bit-identical to [`max_abs_scalar`]: `max` returns
+/// exactly one of its inputs, so the lane-parallel reduction and the serial fold
+/// agree bit-for-bit. When any lane is non-finite `all_finite` is false and the
+/// caller must use the scalar path, because SIMD and scalar `max`/cast semantics
+/// diverge on NaN and infinities (see the module docs).
 ///
 /// # Safety
 /// The host must support `avx512f`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn max_abs_avx512(src: &[f32]) -> f32 {
+unsafe fn max_abs_avx512(src: &[f32]) -> MaxAbsReduction {
     use std::arch::x86_64::*;
     // SAFETY: the caller guarantees `avx512f`. Full 16-wide loads are bounded by
     // `i + 16 <= n`; the remainder folds in with a scalar `max`.
@@ -169,20 +201,28 @@ unsafe fn max_abs_avx512(src: &[f32]) -> f32 {
         let n = src.len();
         let ptr = src.as_ptr();
         let sign = _mm512_set1_ps(-0.0);
+        let infinity = _mm512_set1_ps(f32::INFINITY);
         let mut acc = _mm512_setzero_ps();
+        let mut all_finite = true;
         let mut i = 0;
         while i + 16 <= n {
             let value = _mm512_loadu_ps(ptr.add(i));
             let magnitude = _mm512_andnot_ps(sign, value);
+            // Ordered `< +inf`: true only for finite magnitudes (both NaN and
+            // +inf compare false), so a full mask means every lane is finite.
+            let finite = _mm512_cmp_ps_mask::<_CMP_LT_OQ>(magnitude, infinity);
+            all_finite &= finite == 0xFFFF;
             acc = _mm512_max_ps(acc, magnitude);
             i += 16;
         }
         let mut max_abs = _mm512_reduce_max_ps(acc);
         while i < n {
-            max_abs = max_abs.max((*ptr.add(i)).abs());
+            let magnitude = (*ptr.add(i)).abs();
+            all_finite &= magnitude.is_finite();
+            max_abs = max_abs.max(magnitude);
             i += 1;
         }
-        max_abs
+        MaxAbsReduction { max_abs, all_finite }
     }
 }
 
@@ -230,7 +270,13 @@ unsafe fn quantize_block_i8_avx512(src: &[f32], out: &mut [i8]) -> f32 {
     // scalar per-element formula.
     unsafe {
         let n = src.len();
-        let max_abs = max_abs_avx512(src);
+        let reduction = max_abs_avx512(src);
+        if !reduction.all_finite {
+            // NaN/inf lanes diverge from scalar `max`/cast semantics; defer to
+            // the scalar routine to keep the block bit-identical.
+            return quantize_block_i8_scalar(src, out);
+        }
+        let max_abs = reduction.max_abs;
         if max_abs == 0.0 {
             out.fill(0);
             return 0.0;
@@ -273,7 +319,13 @@ unsafe fn quantize_block_u8_offset_avx512(src: &[f32], out: &mut [u8]) -> f32 {
     // SAFETY: the caller guarantees the required features and equal lengths.
     unsafe {
         let n = src.len();
-        let max_abs = max_abs_avx512(src);
+        let reduction = max_abs_avx512(src);
+        if !reduction.all_finite {
+            // NaN/inf lanes diverge from scalar `max`/cast semantics; defer to
+            // the scalar routine to keep the block bit-identical.
+            return quantize_block_u8_offset_scalar(src, out);
+        }
+        let max_abs = reduction.max_abs;
         if max_abs == 0.0 {
             out.fill(128);
             return 0.0;
@@ -320,7 +372,13 @@ unsafe fn quantize_block_i16_avx512(src: &[f32], out: &mut [i16]) -> f32 {
     // SAFETY: the caller guarantees the required features and equal lengths.
     unsafe {
         let n = src.len();
-        let max_abs = max_abs_avx512(src);
+        let reduction = max_abs_avx512(src);
+        if !reduction.all_finite {
+            // NaN/inf lanes diverge from scalar `max`/cast semantics; defer to
+            // the scalar routine to keep the block bit-identical.
+            return quantize_block_i16_scalar(src, out);
+        }
+        let max_abs = reduction.max_abs;
         if max_abs == 0.0 {
             out.fill(0);
             return 0.0;
@@ -479,6 +537,89 @@ mod tests {
                 quantize_block_i16_scalar(row, &mut i16_scalar).to_bits()
             );
             assert_eq!(i16_simd, i16_scalar);
+        }
+    }
+
+    /// Non-finite and signed-zero inputs, where SIMD `max`/cast semantics differ
+    /// from the scalar path: a NaN in a non-first lane, a leading NaN followed by
+    /// finite values, an all-NaN block, +inf and -inf, and signed zeros. Each
+    /// block must still round-trip bit-identically because the AVX-512 path falls
+    /// back to the scalar routine whenever a lane is non-finite.
+    #[test]
+    fn quantize_non_finite_and_signed_zero_bit_identical() {
+        let nan = f32::NAN;
+        let inf = f32::INFINITY;
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+
+        // (a) NaN in lane 15 of a full 16-lane block, finite elsewhere.
+        {
+            let mut row: Vec<f32> = (0..16).map(|i| (i as f32) - 7.5).collect();
+            row[15] = nan;
+            rows.push(row);
+        }
+        // NaN in the last lane of a longer block spanning two vectors.
+        {
+            let mut row: Vec<f32> = (0..40).map(|i| ((i as f32) - 20.0) * 0.3).collect();
+            row[15] = nan;
+            rows.push(row);
+        }
+        // (b) A leading NaN followed by finite values.
+        {
+            let mut row: Vec<f32> = (0..40).map(|i| (i as f32) - 20.0).collect();
+            row[0] = nan;
+            rows.push(row);
+        }
+        // (c) An all-NaN block (scalar fold yields the 0.0 accumulator).
+        rows.push(vec![nan; 40]);
+        rows.push(vec![nan; 16]);
+        rows.push(vec![nan; 7]);
+        // (d) +inf and -inf present, mixed with finite values.
+        {
+            let mut row = vec![1.0f32; 40];
+            row[5] = inf;
+            row[6] = -inf;
+            rows.push(row);
+        }
+        rows.push(vec![inf; 16]);
+        rows.push(vec![-inf; 20]);
+        // (e) Signed zeros (finite: exercises the fast path, must match too).
+        rows.push(vec![-0.0f32; 40]);
+        rows.push((0..40).map(|i| if i % 2 == 0 { -0.0 } else { 0.0 }).collect());
+        // Mixed NaN, inf, signed zero, and finite values in one block.
+        {
+            let mut row = vec![0.0f32; 33];
+            row[3] = nan;
+            row[8] = inf;
+            row[9] = -inf;
+            row[10] = -0.0;
+            row[17] = 12.5;
+            row[31] = -9.25;
+            rows.push(row);
+        }
+
+        for row in &rows {
+            let len = row.len();
+
+            let mut i8_simd = vec![0i8; len];
+            let mut i8_scalar = vec![0i8; len];
+            let s8_simd = quantize_block_i8(row, &mut i8_simd);
+            let s8_scalar = quantize_block_i8_scalar(row, &mut i8_scalar);
+            assert_eq!(s8_simd.to_bits(), s8_scalar.to_bits(), "i8 scale, len {len}");
+            assert_eq!(i8_simd, i8_scalar, "i8 codes, len {len}");
+
+            let mut u8_simd = vec![0u8; len];
+            let mut u8_scalar = vec![0u8; len];
+            let su_simd = quantize_block_u8_offset(row, &mut u8_simd);
+            let su_scalar = quantize_block_u8_offset_scalar(row, &mut u8_scalar);
+            assert_eq!(su_simd.to_bits(), su_scalar.to_bits(), "u8 scale, len {len}");
+            assert_eq!(u8_simd, u8_scalar, "u8 codes, len {len}");
+
+            let mut i16_simd = vec![0i16; len];
+            let mut i16_scalar = vec![0i16; len];
+            let s16_simd = quantize_block_i16(row, &mut i16_simd);
+            let s16_scalar = quantize_block_i16_scalar(row, &mut i16_scalar);
+            assert_eq!(s16_simd.to_bits(), s16_scalar.to_bits(), "i16 scale, len {len}");
+            assert_eq!(i16_simd, i16_scalar, "i16 codes, len {len}");
         }
     }
 }
