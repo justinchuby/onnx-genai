@@ -66,7 +66,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 "{OP}: hidden (last) dimension must be non-empty"
             )));
         }
-        if gamma.len() != hidden || inputs[2].shape != [hidden] {
+        let gamma_is_exact_identity = crate::kernels::simd_normalize::scale_shape_is_exact_identity(
+            shape,
+            shape.len() - 1,
+            inputs[2].shape,
+        );
+        if gamma.len() != hidden || !gamma_is_exact_identity {
             return Err(EpError::KernelFailed(format!(
                 "{OP}: gamma must have shape [{hidden}], got {:?}",
                 inputs[2].shape
@@ -127,13 +132,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 .zip(output.chunks_exact_mut(hidden))
                 .enumerate()
             {
-                let square_sum =
-                    crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
-                        input_row,
-                        skip_row,
-                        bias.as_deref(),
-                        sum_row,
-                    );
+                let square_sum = crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
+                    input_row,
+                    skip_row,
+                    bias.as_deref(),
+                    sum_row,
+                );
                 let variance = square_sum / hidden as f32;
                 let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
                 if let Some(values) = inv_std_vars.as_mut() {

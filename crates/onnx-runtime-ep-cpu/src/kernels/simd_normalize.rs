@@ -1,5 +1,13 @@
 //! Vectorized elementwise normalize-and-scale for RMS normalization kernels.
 
+pub(crate) fn scale_shape_is_exact_identity(
+    input_shape: &[usize],
+    normalization_axis: usize,
+    scale_shape: &[usize],
+) -> bool {
+    scale_shape == &input_shape[normalization_axis..]
+}
+
 /// Writes `(input[index] * inverse_rms) * scale[index]` for each element.
 ///
 /// The two multiplications remain separate and in scalar evaluation order so
