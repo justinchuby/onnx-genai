@@ -105,6 +105,87 @@ use crate::kernels::matmul_nbits::output_chunk_len;
 /// See `.squad/decisions.md` (Voight 2026-07-24; Hudson 2026-07-24 auto-enable).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 
+/// Adaptive decode-GEMV shard-granularity cap.
+///
+/// The persistent pool fans every M=1 projection across *all* resident workers.
+/// For a small projection (e.g. Qwen3-0.6B's N=1024 `o_proj`/`down_proj`) split
+/// ~32-48 ways, each worker gets only a few dozen output columns -- below the
+/// point where a worker reaches steady-state throughput -- so aggregate GB/s
+/// *regresses* past a saturation worker count (microbench: `kv_proj` 1024x1024
+/// peaks ~138 GB/s at W=16 then falls to ~73 at W=48; the effect scales with the
+/// projection's total work `N*K`, not `N` alone). Capping the active worker
+/// count so each worker owns at least a minimum amount of work keeps small
+/// projections at their per-projection peak while large projections (`lm_head`,
+/// fused `gate_up`, all 2B projections) still use every worker.
+///
+/// `NXRT_GEMV_MIN_WORK_PER_WORKER` sets the minimum dot-products (`cols * K`) per
+/// active worker; the default [`DEFAULT_GEMV_MIN_WORK_PER_WORKER`] matches the
+/// observed knee. `0` disables the cap (fan to all workers -- the prior
+/// behaviour). `NXRT_GEMV_MIN_COLS_PER_WORKER`, when set non-zero, overrides with
+/// a pure minimum-columns-per-worker cap (ignores `K`), for experimentation.
+///
+/// The cap only reduces the *within-node* worker fan-out; the proportional
+/// node-column split is unchanged, so each active worker still reads node-local
+/// weight (its wider segment is the union of adjacent same-node placement
+/// segments) and the concatenated output is bit-identical (row-major
+/// N-partitioning computes each output column independently of the partition).
+const GEMV_MIN_WORK_ENV: &str = "NXRT_GEMV_MIN_WORK_PER_WORKER";
+const GEMV_MIN_COLS_ENV: &str = "NXRT_GEMV_MIN_COLS_PER_WORKER";
+/// Default minimum dot-products per active decode-GEMV worker. `64Ki` matches
+/// both the measured small-projection saturation knee and the existing
+/// many-thread work-per-thread constant in `matmul_nbits::output_chunk_len`.
+const DEFAULT_GEMV_MIN_WORK_PER_WORKER: usize = 64 * 1024;
+
+/// Resolved `(min_work_per_worker, min_cols_per_worker)` shard-granularity cap.
+/// `min_cols` takes precedence when non-zero. `min_work == 0 && min_cols == 0`
+/// disables the cap. Parsed once.
+fn gemv_shard_cap() -> (usize, usize) {
+    static CAP: OnceLock<(usize, usize)> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let min_cols = std::env::var(GEMV_MIN_COLS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let min_work = std::env::var(GEMV_MIN_WORK_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_GEMV_MIN_WORK_PER_WORKER);
+        (min_work, min_cols)
+    })
+}
+
+/// Active worker count for a node holding `node_len` output columns of a GEMV
+/// with reduction length `k`, given the resolved shard-granularity cap. Returns
+/// at least 1 (so a non-empty node always keeps a worker) and never more than
+/// `node_workers`.
+fn capped_node_workers(node_len: usize, k: usize, node_workers: usize) -> usize {
+    let (min_work, min_cols) = gemv_shard_cap();
+    capped_node_workers_with(node_len, k, node_workers, min_work, min_cols)
+}
+
+/// Pure shard-granularity cap math (env-free, for testing). `min_cols` takes
+/// precedence when non-zero; else `min_work` (dot-products per worker) applies;
+/// `0/0` disables the cap. Always in `1..=node_workers` for a non-empty node.
+fn capped_node_workers_with(
+    node_len: usize,
+    k: usize,
+    node_workers: usize,
+    min_work: usize,
+    min_cols: usize,
+) -> usize {
+    if node_len == 0 || node_workers <= 1 {
+        return node_workers;
+    }
+    let allowed = if min_cols > 0 {
+        node_len.div_ceil(min_cols)
+    } else if let Some(by_work) = node_len.saturating_mul(k).checked_div(min_work) {
+        by_work
+    } else {
+        node_workers
+    };
+    allowed.clamp(1, node_workers)
+}
+
 /// Spin iterations a worker or the dispatcher busy-waits before yielding /
 /// parking. Sized so back-to-back decode projections (microseconds apart) are
 /// always caught while spinning; only genuinely idle gaps fall through to park.
@@ -477,6 +558,37 @@ impl SpmdDecodePools {
         segments
     }
 
+    /// Contiguous `(start, len)` output-row segment for each global worker index
+    /// with the [`capped_node_workers`] shard-granularity cap applied: the
+    /// proportional node split is unchanged, but within each node only the first
+    /// `capped_node_workers` workers receive columns (the rest get `len == 0`) so
+    /// each active worker owns at least the configured minimum work. Covers
+    /// `0..n` exactly once, so dispatch stays bit-identical to the uncapped
+    /// split; only the *number of active workers* (hence per-worker slice width)
+    /// changes.
+    fn capped_worker_row_segments(&self, n: usize, k: usize) -> Vec<(usize, usize)> {
+        let node_lengths = self.node_row_lengths(n);
+        let mut segments = Vec::with_capacity(self.total_workers);
+        let mut node_start = 0;
+        for (&node_len, &node_workers) in node_lengths.iter().zip(&self.node_worker_counts) {
+            let active = capped_node_workers(node_len, k, node_workers);
+            let base = node_len / active;
+            let remainder = node_len % active;
+            let mut offset = node_start;
+            for worker in 0..node_workers {
+                let len = if worker < active {
+                    base + usize::from(worker < remainder)
+                } else {
+                    0
+                };
+                segments.push((offset, len));
+                offset += len;
+            }
+            node_start += node_len;
+        }
+        segments
+    }
+
     /// Shard `result`'s output rows across the workers and run `compute` on each
     /// worker's contiguous slice under one lightweight barrier.
     ///
@@ -484,7 +596,10 @@ impl SpmdDecodePools {
     /// `output_start .. output_start + outputs.len()` -- the same closure the
     /// flat path hands to `par_chunks_mut`, so the arithmetic is identical.
     /// Tiny ops (below the flat path's parallelization threshold) run serially
-    /// on the dispatcher, so the same set of ops parallelize as before.
+    /// on the dispatcher, so the same set of ops parallelize as before. The
+    /// active worker fan-out is capped by the shard-granularity policy (see
+    /// [`capped_node_workers`]); the output is bit-identical regardless of the
+    /// cap because row-major N-partitioning computes each column independently.
     pub fn dispatch_output_rows<F>(&self, result: &mut [f32], k: usize, compute: &F)
     where
         F: Fn(usize, &mut [f32]) + Sync,
@@ -494,7 +609,41 @@ impl SpmdDecodePools {
             compute(0, result);
             return;
         }
-        self.dispatch_rows_across_workers(result, &compute);
+        let (min_work, min_cols) = gemv_shard_cap();
+        if min_work == 0 && min_cols == 0 {
+            // Cap disabled: fan across every resident worker (prior behaviour).
+            self.dispatch_rows_across_workers(result, &compute);
+        } else {
+            self.dispatch_rows_capped(result, k, &compute);
+        }
+    }
+
+    /// Broadcast the [`Self::capped_worker_row_segments`] shards to every worker
+    /// under one barrier. Trailing zero-length segments (workers parked past the
+    /// shard-granularity cap) run no work but still participate in the barrier.
+    fn dispatch_rows_capped<F>(&self, result: &mut [f32], k: usize, compute: &F)
+    where
+        F: Fn(usize, &mut [f32]) + Sync,
+    {
+        let n = result.len();
+        let segments = self.capped_worker_row_segments(n, k);
+        let table = RowTable {
+            base: result.as_mut_ptr(),
+            segments: &segments,
+        };
+        let table = &table;
+        let job = move |global_index: usize| {
+            let (start, len) = table.segments[global_index];
+            if len == 0 {
+                return;
+            }
+            // SAFETY: `capped_worker_row_segments` produces disjoint, in-bounds
+            // row ranges covering `0..n` exactly once, so each worker touches
+            // only its own segment and these mutable slices never alias.
+            let outputs = unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+            compute(start, outputs);
+        };
+        self.dispatch(&job);
     }
 
     /// Public view of the contiguous `(start, len)` output-column segment each
@@ -1507,6 +1656,61 @@ mod tests {
                 "align=1 must reproduce the unaligned split (n={n})"
             );
         }
+    }
+
+    #[test]
+    fn capped_node_workers_math_respects_min_work_and_min_cols() {
+        // min_work: active = floor(node_len*k / min_work), clamped 1..=workers.
+        // node_len=512, k=1024 -> 512*1024=524288 / 65536 = 8 active (< 32).
+        assert_eq!(capped_node_workers_with(512, 1024, 32, 64 * 1024, 0), 8);
+        // Large work saturates to the full worker count.
+        assert_eq!(capped_node_workers_with(4096, 1024, 32, 64 * 1024, 0), 32);
+        // A non-empty node never drops below one active worker.
+        assert_eq!(capped_node_workers_with(8, 128, 32, 64 * 1024, 0), 1);
+        // Empty node / single worker: unchanged.
+        assert_eq!(capped_node_workers_with(0, 1024, 32, 64 * 1024, 0), 32);
+        assert_eq!(capped_node_workers_with(512, 1024, 1, 64 * 1024, 0), 1);
+        // min_cols overrides min_work (ignores k): 512 cols / 64 = 8 active.
+        assert_eq!(capped_node_workers_with(512, 999999, 32, 64 * 1024, 64), 8);
+        // 0/0 disables the cap -> fan across every worker.
+        assert_eq!(capped_node_workers_with(512, 1024, 32, 0, 0), 32);
+    }
+
+    #[test]
+    fn capped_worker_row_segments_cover_every_row_exactly_once() {
+        // Whatever the resolved cap, the capped split must stay a contiguous,
+        // disjoint partition of 0..n (so dispatch remains bit-identical); only
+        // some trailing per-node workers may carry a zero-length segment.
+        let pool = two_group_pool();
+        for &(n, k) in &[(1024usize, 1024usize), (37, 4096), (1, 1024), (0, 1024), (151936, 1024)] {
+            let segments = pool.capped_worker_row_segments(n, k);
+            assert_eq!(segments.len(), pool.total_workers());
+            let mut expected_start = 0;
+            for &(start, len) in &segments {
+                assert_eq!(start, expected_start, "n={n} k={k}");
+                expected_start += len;
+            }
+            assert_eq!(expected_start, n, "n={n} k={k}: must cover 0..n");
+        }
+    }
+
+    #[test]
+    fn capped_dispatch_matches_flat_computation_bit_for_bit() {
+        // The cap changes only the work partition, never the per-column math, so
+        // the sharded result must equal the single-shot computation exactly.
+        let pool = two_group_pool();
+        let n = 1024usize;
+        let k = 1024usize;
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            for (offset, out) in outputs.iter_mut().enumerate() {
+                *out = ((output_start + offset) as f32).mul_add(1.5, -0.25);
+            }
+        };
+        let mut sharded = vec![0.0f32; n];
+        pool.dispatch_rows_capped(&mut sharded, k, &compute);
+        let mut flat = vec![0.0f32; n];
+        compute(0, &mut flat);
+        assert_eq!(sharded, flat);
     }
 
     #[test]
