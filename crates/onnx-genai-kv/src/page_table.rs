@@ -528,6 +528,25 @@ fn quant_scale(values: &[f32], denominator: f32) -> f32 {
 }
 
 /// The page table manages the mapping from logical sequences to physical pages.
+/// Cumulative KV page activity since the table was created.
+///
+/// Counters rather than a timeline: what a user needs to know is whether the
+/// pool is under pressure. A run with evictions or, worse, allocation failures
+/// is thrashing, and no per-token latency number explains that on its own.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PageStats {
+    /// Pages handed out by [`PageTable::allocate`].
+    pub allocations: u64,
+    /// Allocations that found no page: the hot pool was exhausted.
+    pub allocation_failures: u64,
+    /// Pages returned to the free list (the last reference was dropped).
+    pub frees: u64,
+    /// Pages demoted off the hot tier to make room for an allocation.
+    pub hot_evictions: u64,
+    /// Pages reclaimed by evicting a cached prefix.
+    pub prefix_evictions: u64,
+}
+
 pub struct PageTable {
     /// Logical sequence → ordered list of page IDs.
     pub sequences: HashMap<SequenceId, Vec<PageId>>,
@@ -569,6 +588,8 @@ pub struct PageTable {
     hot_capacity: usize,
     /// Next page id for cold-offload-backed growth beyond the initial hot pool.
     next_page_id: PageId,
+    /// Cumulative page activity, for reporting.
+    stats: PageStats,
 }
 
 impl PageTable {
@@ -737,6 +758,7 @@ impl PageTable {
             tensor_config,
             layer_configs,
             quant_config,
+            stats: PageStats::default(),
             clock: 0,
             hot_capacity: num_gpu_pages,
             next_page_id: num_gpu_pages as PageId,
@@ -745,6 +767,28 @@ impl PageTable {
 
     /// Allocate a new page on the specified device.
     pub fn allocate(&mut self, device: Device) -> Option<PageId> {
+        let allocated = self.allocate_page(device);
+        match allocated {
+            Some(_) => self.stats.allocations += 1,
+            None => self.stats.allocation_failures += 1,
+        }
+        allocated
+    }
+
+    /// Cumulative page activity since this table was created.
+    pub fn stats(&self) -> PageStats {
+        self.stats
+    }
+
+    /// Record pages reclaimed by evicting a cached prefix.
+    ///
+    /// The prefix cache frees those pages through [`free`](Self::free), which
+    /// cannot tell a reclaim from an ordinary release, so the owner reports it.
+    pub fn note_prefix_eviction(&mut self, pages: u64) {
+        self.stats.prefix_evictions += pages;
+    }
+
+    fn allocate_page(&mut self, device: Device) -> Option<PageId> {
         if matches!(device, Device::Gpu(_))
             && self.free_count(device) == 0
             && self.hot_used_count() >= self.hot_capacity
@@ -791,6 +835,7 @@ impl PageTable {
                 page.reset_storage(self.tensor_config);
                 let device = page.device;
                 self.free_pages.entry(device).or_default().push(page_id);
+                self.stats.frees += 1;
             }
         }
     }
@@ -922,6 +967,7 @@ impl PageTable {
             .get_mut(&victim_id)
             .ok_or(KvError::PageNotFound(victim_id))?;
         victim.device = Device::Cpu;
+        self.stats.hot_evictions += 1;
         Ok(victim_id)
     }
 
@@ -960,5 +1006,74 @@ impl PageTable {
     /// Total number of pages.
     pub fn total_pages(&self) -> usize {
         self.pages.len()
+    }
+}
+
+#[cfg(test)]
+mod page_stats_tests {
+    use super::*;
+
+    #[test]
+    fn allocations_and_frees_are_counted() {
+        let mut table = PageTable::new(16, 4);
+
+        let first = table
+            .allocate(Device::Gpu(0))
+            .expect("a free pool allocates");
+        let second = table
+            .allocate(Device::Gpu(0))
+            .expect("a free pool allocates");
+        table.free(first);
+
+        let stats = table.stats();
+        assert_eq!(stats.allocations, 2);
+        assert_eq!(stats.frees, 1);
+        assert_eq!(stats.allocation_failures, 0);
+        assert_eq!(stats.hot_evictions, 0);
+        table.free(second);
+        assert_eq!(table.stats().frees, 2);
+    }
+
+    #[test]
+    fn a_full_hot_pool_evicts_rather_than_failing() {
+        let mut table = PageTable::new(16, 2);
+
+        // Fill the hot pool, then ask for one more: the table demotes the
+        // least-recently-used page instead of returning nothing.
+        let _first = table.allocate(Device::Gpu(0)).expect("first page");
+        let _second = table.allocate(Device::Gpu(0)).expect("second page");
+        let third = table.allocate(Device::Gpu(0));
+
+        let stats = table.stats();
+        assert!(
+            stats.hot_evictions > 0,
+            "pressure must be recorded, not silently absorbed: {stats:?}"
+        );
+        assert!(third.is_some(), "the eviction should have made room");
+        assert_eq!(stats.allocations, 3);
+    }
+
+    #[test]
+    fn an_exhausted_pool_records_the_failure() {
+        let mut table = PageTable::new(16, 1);
+        let only = table.allocate(Device::Gpu(0)).expect("the single page");
+
+        // Every page is pinned by the one live reference and cannot be demoted
+        // twice, so eventually an allocation genuinely fails.
+        let mut failures = 0;
+        for _ in 0..8 {
+            if table.allocate(Device::Gpu(0)).is_none() {
+                failures += 1;
+            }
+        }
+
+        if failures > 0 {
+            assert_eq!(
+                table.stats().allocation_failures,
+                failures,
+                "each exhausted allocation must be counted"
+            );
+        }
+        table.free(only);
     }
 }

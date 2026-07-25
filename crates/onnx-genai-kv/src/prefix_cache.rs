@@ -164,6 +164,7 @@ impl PrefixCache {
             for page_id in &pages {
                 page_table.free(*page_id);
             }
+            page_table.note_prefix_eviction(pages.len() as u64);
             released.extend(pages);
         }
         released
@@ -354,5 +355,31 @@ mod tests {
         );
         assert_eq!(cache.evict_lru(1, &mut table), vec![page]);
         assert!(cache.evict_lru(1, &mut table).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod eviction_stats_tests {
+    use super::*;
+    use crate::Device;
+
+    #[test]
+    fn reclaiming_a_cached_prefix_is_counted_as_an_eviction() {
+        let mut table = PageTable::new(16, 8);
+        let pages: Vec<PageId> = (0..3)
+            .map(|_| table.allocate(Device::Gpu(0)).expect("pool has room"))
+            .collect();
+        let mut cache = PrefixCache::new();
+        cache.insert(&[1, 2, 3], &pages);
+        let before = table.stats().prefix_evictions;
+
+        let released = cache.evict_lru(3, &mut table);
+
+        assert_eq!(released.len(), pages.len());
+        assert_eq!(
+            table.stats().prefix_evictions - before,
+            pages.len() as u64,
+            "pages reclaimed from the prefix cache must be distinguishable from ordinary frees"
+        );
     }
 }

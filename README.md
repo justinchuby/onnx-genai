@@ -189,6 +189,25 @@ Each mode adds its own counters: denoise steps and ms/step for `--output-image`,
 audio produced and real-time factor for `--output-audio`, and segments, audio
 transcribed, real-time factor and slowest segment for `transcribe`.
 
+#### KV page activity
+
+`--profile` also reports what the run did to the KV page pool, as a delta rather
+than lifetime totals:
+
+```text
+kv page activity:
+  allocated                       5
+  freed                           5
+  evicted from hot tier           3  (pool under pressure)
+  reclaimed from prefixes         7
+  allocation failures             1  (pool exhausted)
+```
+
+Evictions and allocation failures are the signal that a context no longer fits:
+they explain a latency cliff that no per-token number does. The last three lines
+appear only when they happen, and a run that touched no pages says nothing
+rather than printing zeros.
+
 #### What the memory numbers cover
 
 Memory is reported from two independent sources, because neither alone is the

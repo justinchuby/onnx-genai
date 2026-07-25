@@ -157,6 +157,48 @@ pub(crate) struct RunProfile {
     pub(crate) finish_reason: Option<String>,
     pub(crate) prefix_cache_hit: Option<usize>,
     pub(crate) memory: MemoryUsage,
+    pub(crate) pages: Option<PageActivity>,
+}
+
+/// KV page pool activity over the run.
+///
+/// Reported as deltas across the generation, not lifetime totals: what matters
+/// is what *this* run did to the pool.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PageActivity {
+    pub(crate) allocations: u64,
+    pub(crate) frees: u64,
+    pub(crate) hot_evictions: u64,
+    pub(crate) prefix_evictions: u64,
+    pub(crate) allocation_failures: u64,
+}
+
+impl PageActivity {
+    /// Difference between two samples, so the report covers only this run.
+    pub(crate) fn since(
+        before: onnx_genai::kv::PageStats,
+        after: onnx_genai::kv::PageStats,
+    ) -> Self {
+        Self {
+            allocations: after.allocations.saturating_sub(before.allocations),
+            frees: after.frees.saturating_sub(before.frees),
+            hot_evictions: after.hot_evictions.saturating_sub(before.hot_evictions),
+            prefix_evictions: after
+                .prefix_evictions
+                .saturating_sub(before.prefix_evictions),
+            allocation_failures: after
+                .allocation_failures
+                .saturating_sub(before.allocation_failures),
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.allocations == 0
+            && self.frees == 0
+            && self.hot_evictions == 0
+            && self.prefix_evictions == 0
+            && self.allocation_failures == 0
+    }
 }
 
 /// Memory the run needed, from the kernel and from the engine's own accounting.
@@ -321,6 +363,32 @@ impl RunProfile {
         }
         if let Some(reason) = &self.finish_reason {
             let _ = writeln!(out, "{:<24} {}", "finish reason", reason);
+        }
+        if let Some(pages) = self.pages.filter(|pages| !pages.is_idle()) {
+            let _ = writeln!(out, "kv page activity:");
+            let _ = writeln!(out, "{:<24} {:>10}", "  allocated", pages.allocations);
+            let _ = writeln!(out, "{:<24} {:>10}", "  freed", pages.frees);
+            if pages.hot_evictions > 0 {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}  (pool under pressure)",
+                    "  evicted from hot tier", pages.hot_evictions
+                );
+            }
+            if pages.prefix_evictions > 0 {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}",
+                    "  reclaimed from prefixes", pages.prefix_evictions
+                );
+            }
+            if pages.allocation_failures > 0 {
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>10}  (pool exhausted)",
+                    "  allocation failures", pages.allocation_failures
+                );
+            }
         }
         if !self.memory.is_empty() {
             if let Some(peak) = self.memory.peak_resident_bytes {
@@ -487,6 +555,16 @@ impl RunProfile {
         if let Some(reason) = &self.finish_reason {
             fields.push(format!("\"finish_reason\":{}", json_string(reason)));
         }
+        if let Some(pages) = self.pages.filter(|pages| !pages.is_idle()) {
+            fields.push(format!(
+                "\"kv_pages\":{{\"allocated\":{},\"freed\":{},\"hot_evictions\":{},\"prefix_evictions\":{},\"allocation_failures\":{}}}",
+                pages.allocations,
+                pages.frees,
+                pages.hot_evictions,
+                pages.prefix_evictions,
+                pages.allocation_failures
+            ));
+        }
         if let Some(peak) = self.memory.peak_resident_bytes {
             fields.push(format!("\"peak_resident_bytes\":{peak}"));
         }
@@ -647,6 +725,54 @@ mod tests {
         assert!((value["denoise_steps"].as_f64().unwrap() - 25.0).abs() < 1e-6);
         assert!((value["time_to_first_token_ms"].as_f64().unwrap() - 200.0).abs() < 1e-6);
         assert!(value["decode_tokens_per_second"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn page_activity_is_reported_as_a_delta_and_flags_pressure() {
+        let before = onnx_genai::kv::PageStats {
+            allocations: 100,
+            frees: 90,
+            hot_evictions: 0,
+            prefix_evictions: 0,
+            allocation_failures: 0,
+        };
+        let after = onnx_genai::kv::PageStats {
+            allocations: 140,
+            frees: 120,
+            hot_evictions: 3,
+            prefix_evictions: 7,
+            allocation_failures: 1,
+        };
+
+        let activity = PageActivity::since(before, after);
+
+        // Only this run's activity, not the pool's lifetime totals.
+        assert_eq!(activity.allocations, 40);
+        assert_eq!(activity.frees, 30);
+
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        profile.pages = Some(activity);
+        let text = profile.to_text();
+        assert!(text.contains("kv page activity"), "{text}");
+        assert!(text.contains("pool under pressure"), "{text}");
+        assert!(text.contains("pool exhausted"), "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert_eq!(value["kv_pages"]["allocated"], 40);
+        assert_eq!(value["kv_pages"]["hot_evictions"], 3);
+    }
+
+    #[test]
+    fn an_idle_page_pool_is_not_reported() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.timings = timings(10, &[10]);
+        // A run that touched no pages says nothing rather than printing zeros.
+        profile.pages = Some(PageActivity::default());
+
+        assert!(!profile.to_text().contains("kv page activity"));
+        let value: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+        assert!(value.get("kv_pages").is_none());
     }
 
     #[test]

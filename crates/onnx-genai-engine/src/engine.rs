@@ -1240,6 +1240,14 @@ impl Engine {
         self.governor.set_vram_limit(limit)
     }
 
+    /// Cumulative KV page activity: allocations, frees, and evictions.
+    ///
+    /// Evictions or allocation failures mean the KV pool is under pressure,
+    /// which no per-token latency figure explains on its own.
+    pub fn page_stats(&self) -> onnx_genai_kv::PageStats {
+        self.kv_cache.page_table.stats()
+    }
+
     /// External KV connector activity from the most recent generation.
     ///
     /// Reflects lookups, would-be prefix extensions, tokens actually fetched and

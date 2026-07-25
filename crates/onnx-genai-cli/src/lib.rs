@@ -274,6 +274,14 @@ impl Backend {
     }
 
     /// Run one turn, streaming tokens through `callback`.
+    /// Cumulative KV page counters, when the backend keeps a page pool.
+    fn page_stats(&self) -> Option<onnx_genai::kv::PageStats> {
+        match self {
+            Self::Text(engine) => Some(engine.page_stats()),
+            Self::Pipeline(_) => None,
+        }
+    }
+
     /// KV-cache accounting from the engine's resource governor.
     ///
     /// Only a single-model engine runs a governor; a pipeline reports nothing
@@ -1043,12 +1051,16 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     if let Some(memory) = backend.kv_usage() {
         profile.memory = memory;
     }
+    let pages_before = backend.page_stats();
     match run_generation_turn(&mut backend, turn, args.stream, Some(&mut profile)) {
         Ok(output) => {
             if args.stream {
                 println!();
             } else {
                 println!("{output}");
+            }
+            if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
+                profile.pages = Some(profile::PageActivity::since(before, after));
             }
             profiling.emit(&mut profile)?;
             Ok(())
@@ -1328,10 +1340,14 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
         if let Some(memory) = backend.kv_usage() {
             profile.memory = memory;
         }
+        let pages_before = backend.page_stats();
         match run_generation_turn(&mut backend, turn, true, Some(&mut profile)) {
             Ok(output) => {
                 println!();
                 history.push(ChatMessage::assistant(output));
+                if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
+                    profile.pages = Some(profile::PageActivity::since(before, after));
+                }
                 // Report per turn: in a session the interesting comparison is
                 // between turns, not a single number at exit.
                 profiling.emit(&mut profile)?;
